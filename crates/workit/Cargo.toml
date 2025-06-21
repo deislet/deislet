@@ -1,0 +1,26 @@
+[package]
+name = "workit"
+version = "0.1.0"
+edition = "2024"
+description = "Worker communication toolkit for Denira supervisor integration"
+
+[dependencies]
+anyhow = "1.0.98"
+chrono = { version = "0.4.41", features = ["serde"] }
+hex = "0.4.3"
+hmac = "0.12.1"
+nonce-auth = "0.4.0"
+uuid = { version = "1.17.0", features = ["v4", "serde"] }
+pwrzv = "0.5.0"
+yasm = { version = "0.4.0", features = ["serde"] }
+reqwest = { version = "0.12.20", features = ["json"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+tokio = { version = "1.45.1", features = ["full"] }
+tracing = "0.1.41"
+toml = "0.8.23"
+url = "2.5.4"
+
+[dev-dependencies]
+tracing-subscriber = "0.3.18"
