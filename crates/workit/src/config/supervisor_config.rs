@@ -4,8 +4,6 @@ use std::time::Duration;
 const DEFAULT_HEARTBEAT_INTERVAL: u64 = 30; // seconds
 const DEFAULT_REQUEST_TIMEOUT: u64 = 10; // seconds
 const DEFAULT_RETRY_COUNT: u32 = 3; // max 5
-const REGISTER_PATH: &str = "/api/resources/register";
-const HEARTBEAT_PATH: &str = "/api/heartbeat";
 
 /// Supervisor connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -73,21 +71,16 @@ impl SupervisorConfig {
             return Err("addr cannot be empty".to_string());
         }
 
-        if !self.addr.starts_with("http://") && !self.addr.starts_with("https://") {
-            return Err("addr must start with http:// or https://".to_string());
+        if !self.addr.starts_with("ws://") && !self.addr.starts_with("wss://") {
+            return Err("addr must start with ws:// or wss://".to_string());
         }
 
         Ok(())
     }
 
-    /// Build register endpoint URL
-    pub fn register_url(&self) -> String {
-        format!("{}{REGISTER_PATH}", self.addr.trim_end_matches('/'))
-    }
-
-    /// Build heartbeat endpoint URL
-    pub fn heartbeat_url(&self) -> String {
-        format!("{}{HEARTBEAT_PATH}", self.addr.trim_end_matches('/'))
+    /// Build WebSocket connection URL
+    pub fn websocket_url(&self) -> String {
+        format!("{}/ws", self.addr.trim_end_matches('/'))
     }
 }
 
@@ -138,39 +131,20 @@ mod tests {
     }
 
     #[test]
-    fn test_url_building() {
-        let config = SupervisorConfig::new(
+    fn test_websocket_url_building() {
+        let ws_config = SupervisorConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
-            "http://localhost:8080".to_string(),
+            "ws://localhost:8080".to_string(),
         );
+        assert_eq!(ws_config.websocket_url(), "ws://localhost:8080/ws");
 
-        assert_eq!(
-            config.register_url(),
-            "http://localhost:8080/api/resources/register"
-        );
-        assert_eq!(
-            config.heartbeat_url(),
-            "http://localhost:8080/api/heartbeat"
-        );
-    }
-
-    #[test]
-    fn test_url_building_with_trailing_slash() {
-        let config = SupervisorConfig::new(
+        let wss_config = SupervisorConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
-            "http://localhost:8080/".to_string(),
+            "wss://example.com:8443".to_string(),
         );
-
-        assert_eq!(
-            config.register_url(),
-            "http://localhost:8080/api/resources/register"
-        );
-        assert_eq!(
-            config.heartbeat_url(),
-            "http://localhost:8080/api/heartbeat"
-        );
+        assert_eq!(wss_config.websocket_url(), "wss://example.com:8443/ws");
     }
 
     #[test]
@@ -178,7 +152,7 @@ mod tests {
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
-            "https://example.com".to_string(),
+            "ws://localhost:8080".to_string(),
         );
 
         assert!(config.validate().is_ok());
@@ -189,7 +163,7 @@ mod tests {
         let config = SupervisorConfig::new(
             "".to_string(),
             VALID_SECRET.to_string(),
-            "http://localhost:8080".to_string(),
+            "ws://localhost:8080".to_string(),
         );
 
         let result = config.validate();
@@ -202,7 +176,7 @@ mod tests {
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             "".to_string(),
-            "http://localhost:8080".to_string(),
+            "ws://localhost:8080".to_string(),
         );
 
         let result = config.validate();
@@ -215,7 +189,7 @@ mod tests {
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             "short".to_string(),
-            "http://localhost:8080".to_string(),
+            "ws://localhost:8080".to_string(),
         );
 
         let result = config.validate();
@@ -228,14 +202,13 @@ mod tests {
 
     #[test]
     fn test_validation_invalid_secret_characters() {
-        // Use a string with invalid hex characters (g, h, etc.) but correct length
         let invalid_secret = "g1h2i3j4k5l6m7n8o9p0q1r2s3t4u5v6w7x8y9z0a1b2c3d4e5f6g7h8i9j0k1l2";
-        assert_eq!(invalid_secret.len(), 64); // Verify length is correct
+        assert_eq!(invalid_secret.len(), 64);
 
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             invalid_secret.to_string(),
-            "http://localhost:8080".to_string(),
+            "ws://localhost:8080".to_string(),
         );
 
         let result = config.validate();
@@ -264,15 +237,12 @@ mod tests {
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
-            "ftp://example.com".to_string(),
+            "http://example.com".to_string(),
         );
 
         let result = config.validate();
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "addr must start with http:// or https://"
-        );
+        assert_eq!(result.unwrap_err(), "addr must start with ws:// or wss://");
     }
 
     #[test]

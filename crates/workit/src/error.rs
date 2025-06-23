@@ -22,6 +22,12 @@ pub enum WorkitError {
     InstanceStatusError(String),
     /// Serialization error
     SerializationError(String),
+    /// Connection error
+    ConnectionError(String),
+    /// Registration error
+    RegistrationError(String),
+    /// Communication error
+    CommunicationError(String),
 }
 
 impl fmt::Display for WorkitError {
@@ -46,21 +52,24 @@ impl fmt::Display for WorkitError {
             }
             WorkitError::InstanceStatusError(msg) => write!(f, "Instance status error: {msg}"),
             WorkitError::SerializationError(msg) => write!(f, "Serialization error: {msg}"),
+            WorkitError::ConnectionError(msg) => write!(f, "Connection error: {msg}"),
+            WorkitError::RegistrationError(msg) => write!(f, "Registration error: {msg}"),
+            WorkitError::CommunicationError(msg) => write!(f, "Communication error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for WorkitError {}
 
-impl From<reqwest::Error> for WorkitError {
-    fn from(err: reqwest::Error) -> Self {
-        WorkitError::NetworkError(err.to_string())
-    }
-}
-
 impl From<serde_json::Error> for WorkitError {
     fn from(err: serde_json::Error) -> Self {
         WorkitError::SerializationError(err.to_string())
+    }
+}
+
+impl From<String> for WorkitError {
+    fn from(err: String) -> Self {
+        WorkitError::ConfigurationError(err)
     }
 }
 
@@ -140,22 +149,6 @@ mod tests {
     }
 
     #[test]
-    fn test_from_reqwest_error() {
-        // Test the conversion trait by creating a mock error
-        // Since we can't easily create a reqwest::Error, we'll test the trait implementation
-        // by using a different approach
-
-        // This test verifies that the From<reqwest::Error> trait is implemented
-        fn test_conversion(error: reqwest::Error) -> WorkitError {
-            WorkitError::from(error)
-        }
-
-        // We can't easily create a reqwest::Error in tests, so let's just verify
-        // the trait exists by checking the function compiles
-        let _test_fn: fn(reqwest::Error) -> WorkitError = test_conversion;
-    }
-
-    #[test]
     fn test_from_serde_json_error() {
         let json_error = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
         let sdk_error = WorkitError::from(json_error);
@@ -206,7 +199,7 @@ mod tests {
     #[test]
     fn test_sdk_error_debug() {
         let error = WorkitError::NetworkError("test".to_string());
-        let debug_string = format!("{:?}", error);
+        let debug_string = format!("{error:?}");
         assert!(debug_string.contains("NetworkError"));
         assert!(debug_string.contains("test"));
     }

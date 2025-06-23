@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// Heartbeat request
 /// send (id, power_reserve) to supervisor
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     /// Instance (associated) Id
     pub id: String,

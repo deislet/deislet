@@ -1,267 +1,245 @@
 # Workit
 
-Workit 是一个用于 Denira supervisor 和 Worker server 之间通信的 Rust 库。它提供了完整的认证、注册、心跳等功能，简化了 Worker server 与 supervisor 的集成过程。
+[![Crates.io](https://img.shields.io/crates/v/workit.svg)](https://crates.io/crates/workit)
+[![Documentation](https://docs.rs/workit/badge.svg)](https://docs.rs/workit)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Workit 是一个用于 Denira supervisor 和 Worker 服务器（Denix/Deflux）之间基于 WebSocket 通信的 Rust SDK。它提供安全、实时的双向通信，具有**可扩展消息系统**、认证、注册、心跳监控和命令执行功能。
 
 ## 特性
 
-- **安全认证**: 基于 PSK + Nonce 的 HMAC-SHA256 签名认证
-- **自动注册**: 简化的 worker 实例注册流程
-- **心跳管理**: 自动心跳发送和状态监控
-- **错误处理**: 完善的错误类型和重试机制
-- **配置验证**: 自动验证配置参数的有效性
-- **异步支持**: 基于 tokio 的异步编程支持
+- 🚀 **WebSocket 通信**: 通过 WebSocket 进行实时双向通信
+- 🔐 **安全认证**: 基于连接时 PSK 认证和 HMAC-SHA256 签名
+- 💓 **心跳监控**: 自动心跳发送和连接监控
+- 📡 **命令处理**: 来自 supervisor 的命令处理
+- 🎯 **类型安全**: 强类型可扩展消息系统，具有编译时验证
+- ⚡ **异步支持**: 基于 Tokio 的完全异步 API
+- 🔧 **可扩展**: 支持自定义消息类型和扩展
 
-## 快速开始
+## 消息系统架构
 
-### 添加依赖
+Workit 基于**统一消息系统**构建，允许类型安全、可扩展的通信：
 
-在你的 `Cargo.toml` 中添加：
+### 核心消息类型
+
+- **AuthMessage**: 与 supervisor 的认证
+- **RegisterMessage**: Worker 注册
+- **HeartbeatMessage**: 定期健康检查
+- **CommandMessage**: 命令执行请求
+- **CommandResponseMessage**: 命令执行结果
+- **StatusUpdateMessage**: Worker 状态更新
+
+### 扩展消息类型
+
+- **SupervisorMessage**: 批量操作和管理
+- **DenixMessage**: 容器部署和编排
+- **DefluxMessage**: 数据管道管理
+
+### 自定义消息类型
+
+您可以通过实现 `Message` trait 轻松创建自定义消息类型：
+
+```rust
+use workit::models::messages::{Message, WorkitMessage};
+use serde::{Serialize, Deserialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomData {
+    pub field1: String,
+    pub field2: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomMessage {
+    pub data: CustomData,
+    pub message_id: Option<Uuid>,
+}
+
+impl Message for CustomMessage {
+    const MESSAGE_TYPE: &'static str = "custom_message";
+    type Data = CustomData;
+
+    fn data(&self) -> &Self::Data {
+        &self.data
+    }
+
+    fn message_id(&self) -> Option<Uuid> {
+        self.message_id
+    }
+
+    fn new(data: Self::Data) -> Self {
+        Self {
+            data,
+            message_id: Some(Uuid::new_v4()),
+        }
+    }
+
+    fn with_id(data: Self::Data, message_id: Uuid) -> Self {
+        Self {
+            data,
+            message_id: Some(message_id),
+        }
+    }
+}
+```
+
+## 安装
+
+将以下内容添加到您的 `Cargo.toml`:
 
 ```toml
 [dependencies]
-workit = { path = "../denira/crates/workit" }
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
+workit = "0.1.0"
 ```
+
+## 快速开始
 
 ### 基本使用
 
 ```rust
-use denira_sdk::{DeniraClient, SupervisorConfig, WorkerInfo, SystemStatus};
+use workit::{WorkitClient, SupervisorConfig, WorkerInfo, WorkerType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 配置 Supervisor 连接
-    let supervisor_config = SupervisorConfig::new(
+    // 配置 supervisor 连接信息
+    let config = SupervisorConfig::new(
         "worker-001".to_string(),
-        "your-64-char-hex-secret".to_string(),
-        "http://supervisor.example.com:8080".to_string(),
+        "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
+        "ws://localhost:8080".to_string(),
     );
-
-    // 配置 Worker 信息
+    
+    // 配置 worker 信息
     let worker_info = WorkerInfo::new(
-        "worker-001".to_string(),
-        "192.168.1.100".to_string(),
-        "1.0.0".to_string(),
-        "192.168.1.100:3000".to_string(),
+        WorkerType::Denix("1.0.0".to_string()),
+        "127.0.0.1".to_string(),
+        vec![3000],
     );
-
+    
     // 创建客户端
-    let client = DeniraClient::new(supervisor_config, worker_info)?;
-
-    // 创建系统状态提供器
-    let system_status_provider = || {
-        SystemStatus::new(
-            "15%".to_string(),    // CPU 使用率
-            "256MB".to_string(),  // 内存使用量
-            42,                   // 请求计数
-        )
-    };
-
-    // 启动完整服务（注册 + 心跳）
-    let handle = client.start_full_service(system_status_provider).await?;
-
-    // 服务运行...
-    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-
-    // 停止服务
-    handle.abort();
+    let mut client = WorkitClient::new(config, worker_info);
+    
+    // 建立连接
+    client.connect().await?;
+    
+    // 与 supervisor 认证
+    client.authenticate().await?;
+    
+    // 注册 worker
+    client.register().await?;
+    
+    // 发送心跳
+    client.send_heartbeat().await?;
+    
+    // 运行主客户端循环（处理心跳和传入消息）
+    client.run().await?;
     
     Ok(())
 }
 ```
 
-## 详细用法
-
-### 分步骤操作
-
-如果你需要更细粒度的控制，可以分步骤执行：
+### 使用消息构建器
 
 ```rust
-// 1. 注册到 Supervisor
-let register_response = client.register().await?;
-println!("注册成功: {}", register_response.message);
+use workit::models::{AuthData, HeartbeatRequest, RegisterRequest};
+use workit::models::messages::{MessageBuilder, WorkitMessage};
 
-// 2. 发送单次心跳
-let system_status = SystemStatus::new("10%".to_string(), "128MB".to_string(), 100);
-let heartbeat_response = client.send_heartbeat(&system_status).await?;
-println!("心跳发送成功: {}", heartbeat_response.message);
+// 创建认证消息
+let auth_data = AuthData::new("worker-001".to_string(), b"secret_key")?;
+let auth_message = MessageBuilder::auth(auth_data);
 
-// 3. 启动自动心跳任务
-let heartbeat_handle = client.start_heartbeat_task(|| {
-    // 返回当前系统状态
-    get_current_system_status()
-}).await?;
-```
-
-### 配置说明
-
-#### SupervisorConfig
-
-```rust
-let config = SupervisorConfig {
-    associated_id: "worker-001".to_string(),        // 实例关联 ID
-    secret: "64-char-hex-secret".to_string(),       // 预共享密钥（64 字符十六进制）
-    addr: "http://supervisor:8080".to_string(),     // Supervisor 地址
-    heartbeat_interval: 30,                         // 心跳间隔（秒）
-    request_timeout: 10,                            // 请求超时（秒）
-    retry_count: 3,                                 // 重试次数
+// 创建注册消息
+let register_data = RegisterRequest {
+    id: "worker-001".to_string(),
+    info: worker_info,
 };
-```
+let register_message = MessageBuilder::register(register_data);
 
-#### WorkerInfo
-
-```rust
-let worker_info = WorkerInfo {
-    id: "worker-001".to_string(),                   // Worker 实例 ID
-    host: "192.168.1.100".to_string(),             // 主机地址
-    version: "1.0.0".to_string(),                  // 版本号
-    listen_addr: "192.168.1.100:3000".to_string(), // 监听地址
+// 创建心跳消息
+let heartbeat_data = HeartbeatRequest {
+    id: "worker-001".to_string(),
+    power_reserve: 85,
 };
+let heartbeat_message = MessageBuilder::heartbeat(heartbeat_data);
 ```
 
-### 错误处理
-
-工具包 提供了详细的错误类型：
+### 扩展消息
 
 ```rust
-use denira_sdk::WorkitError;
+use workit::models::messages::MessageBuilder;
+use serde_json::json;
 
-match client.register().await {
-    Ok(response) => println!("注册成功: {}", response.message),
-    Err(WorkitError::AuthenticationError(msg)) => {
-        eprintln!("认证失败: {}", msg);
-    }
-    Err(WorkitError::NetworkError(msg)) => {
-        eprintln!("网络错误: {}", msg);
-    }
-    Err(WorkitError::SupervisorError { code, message, help }) => {
-        eprintln!("Supervisor 错误 [{}]: {}", code, message);
-        if let Some(help_text) = help {
-            eprintln!("帮助: {}", help_text);
-        }
-    }
-    Err(e) => eprintln!("其他错误: {}", e),
-}
-```
+// Supervisor 批量操作
+let supervisor_message = MessageBuilder::supervisor_operation(
+    "batch_deploy".to_string(),
+    vec!["worker-001".to_string(), "worker-002".to_string()],
+    json!({
+        "image": "myapp:v1.2.3",
+        "replicas": 3
+    }),
+    Some(2), // 并行限制
+);
 
-### 状态监控
+// Denix 容器部署
+let denix_message = MessageBuilder::denix_deployment(
+    "nginx:1.21".to_string(),
+    3, // 副本数
+    "production".to_string(), // 命名空间
+    "500m".to_string(), // CPU
+    "1Gi".to_string(),  // 内存
+);
 
-```rust
-// 获取当前状态
-let status = client.get_status().await;
-println!("当前状态: {}", status);
-
-// 获取详细信息
-let details = client.get_instance_details().await;
-println!("实例详细信息: {:#?}", details);
-
-// 获取请求计数
-let count = client.get_request_count().await;
-println!("处理的请求数: {}", count);
+// Deflux 数据管道
+let deflux_message = MessageBuilder::deflux_pipeline(
+    "analytics_pipeline".to_string(),
+    "数据处理管道".to_string(),
+    pipeline_stages,
+);
 ```
 
 ## API 参考
 
 ### 主要类型
 
-- `DeniraClient`: 主要的 工具包 客户端
+- `WorkitClient`: 与 supervisor 通信的主客户端
 - `SupervisorConfig`: Supervisor 连接配置
 - `WorkerInfo`: Worker 实例信息
-- `SystemStatus`: 系统状态信息
-- `WorkitError`: 工具包 错误类型
+- `WorkerType`: Worker 类型（Denix 或 Deflux）
+- `Message`: 所有消息类型的 trait
+- `WorkitMessage<M>`: 通用消息包装器
+- `MessageBuilder`: 便捷的消息创建
 
 ### 主要方法
 
-- `DeniraClient::new()`: 创建客户端
-- `register()`: 注册到 Supervisor
-- `send_heartbeat()`: 发送心跳
-- `start_heartbeat_task()`: 启动心跳任务
-- `start_full_service()`: 启动完整服务
+- `connect()`: 建立 WebSocket 连接
+- `authenticate()`: 与 supervisor 认证
+- `register()`: 向 supervisor 注册 worker
+- `send_heartbeat()`: 发送心跳消息
+- `run()`: 启动主客户端循环
+- `disconnect()`: 断开与 supervisor 的连接
 
-## 认证机制
+### 配置
 
-工具包 使用基于 PSK (Pre-Shared Key) + Nonce 的 HMAC-SHA256 签名认证：
+`SupervisorConfig` 支持以下配置选项：
 
-1. **预注册**: 在 Supervisor 中预先创建实例并获取 `associated_id` 和 `secret`
-2. **签名生成**: 使用 nonce-auth 库生成带时间戳和随机数的签名
-3. **防重放**: 通过时间窗口验证和 nonce 唯一性防止重放攻击
+- `associated_id`: Worker 实例 ID
+- `secret`: 64 字符的十六进制 PSK 密钥
+- `addr`: Supervisor WebSocket 地址 (ws:// 或 wss://)
 
-### 密钥要求
+### 消息系统
 
-- 长度: 必须是 64 个字符
-- 格式: 十六进制字符串 (0-9, a-f)
-- 示例: `a1b2c3d4e5f67890123456789012345678901234567890123456789012345678`
+- 类型安全的消息创建和处理
+- 自定义消息类型的可扩展架构
+- 内置序列化/反序列化
+- 请求-响应关联支持
+- 时间戳和 ID 跟踪
 
-## 集成示例
+## 示例
 
-### 与 Axum 集成
+查看 `examples/` 目录获取更详细的使用示例：
 
-```rust
-use axum::{Router, response::Json};
-use denira_sdk::DeniraClient;
-use std::sync::Arc;
-
-#[derive(Clone)]
-struct AppState {
-    denira_client: Arc<DeniraClient>,
-}
-
-async fn health_check(state: axum::extract::State<AppState>) -> Json<serde_json::Value> {
-    let status = state.denira_client.get_status().await;
-    Json(serde_json::json!({
-        "status": status.to_string(),
-        "requests": state.denira_client.get_request_count().await
-    }))
-}
-
-#[tokio::main]
-async fn main() {
-    // 创建 Denira 客户端
-    let denira_client = Arc::new(DeniraClient::new(config, worker_info).unwrap());
-    
-    // 启动 Denira 服务
-    denira_client.start_full_service(system_status_provider).await.unwrap();
-    
-    // 创建 Axum 应用
-    let app = Router::new()
-        .route("/health", axum::routing::get(health_check))
-        .with_state(AppState { denira_client });
-    
-    // 启动服务器...
-}
-```
-
-## 故障排除
-
-### 常见错误
-
-1. **密钥格式错误**
-   - 确保密钥是 64 字符的十六进制字符串
-   - 检查是否包含非法字符
-
-2. **时间同步问题**
-   - 确保 worker 和 supervisor 的系统时间同步
-   - 时间差不应超过 1 分钟
-
-3. **网络连接问题**
-   - 检查 supervisor 地址是否正确
-   - 确保网络连通性和防火墙设置
-
-4. **实例未预注册**
-   - 在 supervisor 中预先创建实例记录
-   - 确保 associated_id 和 secret 匹配
-
-### 调试日志
-
-启用详细日志来调试问题：
-
-```rust
-tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::DEBUG)
-    .init();
-```
+- `extensible_messages.rs`: 演示可扩展消息系统
 
 ## 许可证
 
-此项目使用与 Denira 主项目相同的许可证。 
+本项目基于 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。 

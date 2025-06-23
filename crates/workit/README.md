@@ -1,291 +1,245 @@
 # Workit
 
-Workit is a Rust library for communication between Denira supervisor and Worker servers. It provides complete authentication, registration, and heartbeat functionality, simplifying the integration process between Worker servers and supervisors.
+[![Crates.io](https://img.shields.io/crates/v/workit.svg)](https://crates.io/crates/workit)
+[![Documentation](https://docs.rs/workit/badge.svg)](https://docs.rs/workit)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Workit is a Rust SDK for WebSocket-based communication between Denira supervisor and Worker servers (Denix/Deflux). It provides secure, real-time bidirectional communication with **extensible message system**, authentication, registration, heartbeat monitoring, and command execution capabilities.
 
 ## Features
 
-- **Secure Authentication**: PSK + Nonce based HMAC-SHA256 signature authentication
-- **Automatic Registration**: Simplified worker instance registration workflow
-- **Heartbeat Management**: Automatic heartbeat sending and status monitoring
-- **Error Handling**: Comprehensive error types and retry mechanisms
-- **Configuration Validation**: Automatic validation of configuration parameters
-- **Async Support**: Built on tokio for asynchronous programming support
-- **Worker Types**: Support for different worker types (Denix, Deflux)
+- 🚀 **WebSocket Communication**: Real-time bidirectional communication via WebSocket
+- 🔐 **Secure Authentication**: Connection-time PSK authentication with HMAC-SHA256 signatures
+- 💓 **Heartbeat Monitoring**: Automatic heartbeat sending and connection monitoring
+- 📡 **Command Processing**: Command processing from supervisor
+- 🎯 **Type Safety**: Strongly-typed extensible message system with compile-time validation
+- ⚡ **Async Support**: Fully asynchronous API built on Tokio
+- 🔧 **Extensible**: Support for custom message types and extensions
 
-## Quick Start
+## Message System Architecture
 
-### Add Dependencies
+Workit is built around a **unified message system** that allows for type-safe, extensible communication:
 
-Add to your `Cargo.toml`:
+### Core Message Types
+
+- **AuthMessage**: Authentication with supervisor
+- **RegisterMessage**: Worker registration
+- **HeartbeatMessage**: Periodic health checks
+- **CommandMessage**: Command execution requests
+- **CommandResponseMessage**: Command execution results
+- **StatusUpdateMessage**: Worker status updates
+
+### Extension Message Types
+
+- **SupervisorMessage**: Batch operations and management
+- **DenixMessage**: Container deployment and orchestration
+- **DefluxMessage**: Data pipeline management
+
+### Custom Message Types
+
+You can easily create custom message types by implementing the `Message` trait:
+
+```rust
+use workit::models::messages::{Message, WorkitMessage};
+use serde::{Serialize, Deserialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomData {
+    pub field1: String,
+    pub field2: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomMessage {
+    pub data: CustomData,
+    pub message_id: Option<Uuid>,
+}
+
+impl Message for CustomMessage {
+    const MESSAGE_TYPE: &'static str = "custom_message";
+    type Data = CustomData;
+
+    fn data(&self) -> &Self::Data {
+        &self.data
+    }
+
+    fn message_id(&self) -> Option<Uuid> {
+        self.message_id
+    }
+
+    fn new(data: Self::Data) -> Self {
+        Self {
+            data,
+            message_id: Some(Uuid::new_v4()),
+        }
+    }
+
+    fn with_id(data: Self::Data, message_id: Uuid) -> Self {
+        Self {
+            data,
+            message_id: Some(message_id),
+        }
+    }
+}
+```
+
+## Installation
+
+Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-workit = { path = "../denira/crates/supervisor/workit" }
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
+workit = "0.1.0"
 ```
+
+## Quick Start
 
 ### Basic Usage
 
 ```rust
-use workit::{Workit, SupervisorConfig, WorkerInfo, WorkerType};
+use workit::{WorkitClient, SupervisorConfig, WorkerInfo, WorkerType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure Supervisor connection
-    let supervisor_config = SupervisorConfig::new(
+    // Configure supervisor connection
+    let config = SupervisorConfig::new(
         "worker-001".to_string(),
         "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
-        "http://supervisor.example.com:8080".to_string(),
+        "ws://localhost:8080".to_string(),
     );
-
-    // Configure Worker information with type
-    let worker_info = WorkerInfo::new_single_port(
-        WorkerType::Denix("1.0.0".to_string()),  // JavaScript Runtime Worker
-        "192.168.1.100".to_string(),
-        3000,
+    
+    // Configure worker information
+    let worker_info = WorkerInfo::new(
+        WorkerType::Denix("1.0.0".to_string()),
+        "127.0.0.1".to_string(),
+        vec![3000],
     );
-
+    
     // Create client
-    let client = Workit::new(supervisor_config, worker_info)?;
-
-    // Register with supervisor
-    let register_response = client.register().await?;
-    println!("Registration successful: {}", register_response.message);
-
-    // Start heartbeat task
-    let heartbeat_handle = client.start_heartbeat_task().await;
-
-    // Service running...
-    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-
-    // Stop service
-    heartbeat_handle.abort();
+    let mut client = WorkitClient::new(config, worker_info);
+    
+    // Establish connection
+    client.connect().await?;
+    
+    // Authenticate with supervisor
+    client.authenticate().await?;
+    
+    // Register worker
+    client.register().await?;
+    
+    // Send heartbeat
+    client.send_heartbeat().await?;
+    
+    // Run main client loop (handles heartbeats and incoming messages)
+    client.run().await?;
     
     Ok(())
 }
 ```
 
-## Worker Types
+### Using Message Builder
 
-Workit supports two types of workers:
-
-### Denix Worker (JavaScript Runtime)
 ```rust
-let worker_info = WorkerInfo::new_single_port(
-    WorkerType::Denix("1.0.0".to_string()),
-    "127.0.0.1".to_string(),
-    3000,
-);
+use workit::models::{AuthData, HeartbeatRequest, RegisterRequest};
+use workit::models::messages::{MessageBuilder, WorkitMessage};
+
+// Create authentication message
+let auth_data = AuthData::new("worker-001".to_string(), b"secret_key")?;
+let auth_message = MessageBuilder::auth(auth_data);
+
+// Create registration message
+let register_data = RegisterRequest {
+    id: "worker-001".to_string(),
+    info: worker_info,
+};
+let register_message = MessageBuilder::register(register_data);
+
+// Create heartbeat message
+let heartbeat_data = HeartbeatRequest {
+    id: "worker-001".to_string(),
+    power_reserve: 85,
+};
+let heartbeat_message = MessageBuilder::heartbeat(heartbeat_data);
 ```
 
-### Deflux Worker (Load Balancer/HTTP Proxy)
-```rust
-let worker_info = WorkerInfo::new_single_port(
-    WorkerType::Deflux("1.2.0".to_string()),
-    "127.0.0.1".to_string(),
-    8080,
-);
-```
-
-## Detailed Usage
-
-### Step-by-Step Operations
-
-For more granular control, you can execute operations step by step:
+### Extension Messages
 
 ```rust
-// 1. Register with Supervisor
-let register_response = client.register().await?;
-println!("Registration successful: {}", register_response.message);
+use workit::models::messages::MessageBuilder;
+use serde_json::json;
 
-// 2. Send single heartbeat
-let heartbeat_response = client.heartbeat().await?;
-println!("Heartbeat sent successfully: {}", heartbeat_response.message);
-
-// 3. Start automatic heartbeat task
-let heartbeat_handle = client.start_heartbeat_task().await;
-```
-
-### Configuration
-
-#### SupervisorConfig
-
-```rust
-let config = SupervisorConfig::new(
-    "worker-001".to_string(),                       // Instance associated ID
-    "64-char-hex-secret".to_string(),               // Pre-shared key (64 hex chars)
-    "http://supervisor:8080".to_string(),           // Supervisor address
+// Supervisor batch operation
+let supervisor_message = MessageBuilder::supervisor_operation(
+    "batch_deploy".to_string(),
+    vec!["worker-001".to_string(), "worker-002".to_string()],
+    json!({
+        "image": "myapp:v1.2.3",
+        "replicas": 3
+    }),
+    Some(2), // parallel limit
 );
 
-// Optional: customize intervals
-config.heartbeat_interval = 30;    // Heartbeat interval (seconds)
-config.request_timeout = 10;       // Request timeout (seconds)
-config.retry_count = 3;            // Retry count
-```
-
-#### WorkerInfo
-
-```rust
-// Single port worker
-let worker_info = WorkerInfo::new_single_port(
-    WorkerType::Denix("1.0.0".to_string()),
-    "192.168.1.100".to_string(),
-    3000,
+// Denix container deployment
+let denix_message = MessageBuilder::denix_deployment(
+    "nginx:1.21".to_string(),
+    3, // replicas
+    "production".to_string(), // namespace
+    "500m".to_string(), // CPU
+    "1Gi".to_string(),  // Memory
 );
 
-// Multiple ports worker
-let worker_info = WorkerInfo::new(
-    WorkerType::Deflux("1.2.0".to_string()),
-    "192.168.1.100".to_string(),
-    vec![80, 443, 8080],
+// Deflux data pipeline
+let deflux_message = MessageBuilder::deflux_pipeline(
+    "analytics_pipeline".to_string(),
+    "Data processing pipeline".to_string(),
+    pipeline_stages,
 );
-```
-
-### Error Handling
-
-Workit provides detailed error types:
-
-```rust
-use workit::WorkitError;
-
-match client.register().await {
-    Ok(response) => println!("Registration successful: {}", response.message),
-    Err(WorkitError::AuthenticationError(msg)) => {
-        eprintln!("Authentication failed: {}", msg);
-    }
-    Err(WorkitError::NetworkError(msg)) => {
-        eprintln!("Network error: {}", msg);
-    }
-    Err(WorkitError::SupervisorError { code, message, help }) => {
-        eprintln!("Supervisor error [{}]: {}", code, message);
-        if let Some(help_text) = help {
-            eprintln!("Help: {}", help_text);
-        }
-    }
-    Err(e) => eprintln!("Other error: {}", e),
-}
-```
-
-### Status Monitoring
-
-```rust
-// Get current status
-let status = client.get_status().await;
-println!("Current status: {:?}", status);
-
-// Get detailed information
-let details = client.get_instance_details().await;
-println!("Instance details: {:#?}", details);
 ```
 
 ## API Reference
 
 ### Main Types
 
-- `Workit`: Main Workit client
+- `WorkitClient`: Main client for supervisor communication
 - `SupervisorConfig`: Supervisor connection configuration
 - `WorkerInfo`: Worker instance information
-- `WorkerType`: Worker type enumeration (Denix/Deflux)
-- `WorkitError`: Workit error types
+- `WorkerType`: Worker type (Denix or Deflux)
+- `Message`: Trait for all message types
+- `WorkitMessage<M>`: Universal message wrapper
+- `MessageBuilder`: Convenient message creation
 
 ### Main Methods
 
-- `Workit::new()`: Create client
-- `register()`: Register with Supervisor
-- `heartbeat()`: Send heartbeat
-- `start_heartbeat_task()`: Start heartbeat task
-- `get_status()`: Get current status
-- `get_instance_details()`: Get instance details
+- `connect()`: Establish WebSocket connection
+- `authenticate()`: Authenticate with supervisor
+- `register()`: Register worker with supervisor
+- `send_heartbeat()`: Send heartbeat message
+- `run()`: Start main client loop
+- `disconnect()`: Disconnect from supervisor
 
-## Authentication Mechanism
+### Configuration
 
-Workit uses PSK (Pre-Shared Key) + Nonce based HMAC-SHA256 signature authentication:
+`SupervisorConfig` supports the following configuration options:
 
-1. **Pre-registration**: Pre-create instance in Supervisor and obtain `associated_id` and `secret`
-2. **Signature Generation**: Use nonce-auth library to generate signatures with timestamp and nonce
-3. **Replay Protection**: Prevent replay attacks through time window validation and nonce uniqueness
+- `associated_id`: Worker instance ID
+- `secret`: 64-character hexadecimal PSK key
+- `addr`: Supervisor WebSocket address (ws:// or wss://)
 
-### Key Requirements
+### Message System
 
-- Length: Must be exactly 64 characters
-- Format: Hexadecimal string (0-9, a-f)
-- Example: `a1b2c3d4e5f67890123456789012345678901234567890123456789012345678`
+- Type-safe message creation and handling
+- Extensible architecture for custom message types
+- Built-in serialization/deserialization
+- Request-response correlation support
+- Timestamp and ID tracking
 
-## Integration Examples
+## Examples
 
-### Integration with Axum
+See the `examples/` directory for more detailed usage examples:
 
-```rust
-use axum::{Router, response::Json};
-use workit::Workit;
-use std::sync::Arc;
-
-#[derive(Clone)]
-struct AppState {
-    workit_client: Arc<Workit>,
-}
-
-async fn health_check(state: axum::extract::State<AppState>) -> Json<serde_json::Value> {
-    let status = state.workit_client.get_status().await;
-    let details = state.workit_client.get_instance_details().await;
-    
-    Json(serde_json::json!({
-        "status": format!("{:?}", status),
-        "worker_type": details.info.worker_type,
-        "version": details.info.version(),
-        "listen_address": details.info.listen_address()
-    }))
-}
-
-#[tokio::main]
-async fn main() {
-    // Create Workit client
-    let workit_client = Arc::new(Workit::new(config, worker_info).unwrap());
-    
-    // Register and start heartbeat
-    workit_client.register().await.unwrap();
-    let _heartbeat_handle = workit_client.start_heartbeat_task().await;
-    
-    // Create Axum application
-    let app = Router::new()
-        .route("/health", axum::routing::get(health_check))
-        .with_state(AppState { workit_client });
-    
-    // Start server...
-}
-```
-
-## Troubleshooting
-
-### Common Errors
-
-1. **Key Format Error**
-   - Ensure key is 64-character hexadecimal string
-   - Check for invalid characters
-
-2. **Time Synchronization Issues**
-   - Ensure worker and supervisor system time are synchronized
-   - Time difference should not exceed 1 minute
-
-3. **Network Connection Issues**
-   - Check if supervisor address is correct
-   - Ensure network connectivity and firewall settings
-
-4. **Instance Not Pre-registered**
-   - Pre-create instance record in supervisor
-   - Ensure associated_id and secret match
-
-### Debug Logging
-
-Enable verbose logging to debug issues:
-
-```rust
-tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::DEBUG)
-    .init();
-```
+- `extensible_messages.rs`: Demonstrates the extensible message system
 
 ## License
 
-This project uses the same license as the main Denira project. 
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
