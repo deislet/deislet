@@ -1,0 +1,86 @@
+# Deflux Load Balancer Configuration Example
+# 
+# This file demonstrates the local configuration options for Deflux.
+# System configuration follows the layering pattern:
+# Final Config = Default + Local (this file) + Supervisor (remote)
+
+# Supervisor client configuration
+# Required for connecting to the management supervisor
+[supervisor_client]
+# WebSocket endpoint for supervisor connection
+address = "wss://supervisor.example.com/ws"
+
+# Unique instance identifier for this deflux instance
+instance_id = "deflux-prod-01"
+
+# Authentication secret (should be kept secure)
+secret = "your-secret-key-here"
+
+# Optional: Heartbeat interval in seconds (default: 30)
+heartbeat_interval = 30
+
+# Optional: Request timeout in seconds (default: 10)
+request_timeout = 10
+
+# Optional: Number of retry attempts (default: 3)
+retry_attempts = 3
+
+# Upstream server configurations
+# These are the backend servers that deflux will proxy to
+[[upstreams]]
+address = "127.0.0.1"
+port = 8001
+weight = 1
+
+[[upstreams]]
+address = "127.0.0.1"
+port = 8002
+weight = 2
+
+# Load balancing strategy configuration
+[balancing_strategy]
+# Options: "round_robin", "least_connections", "weighted_round_robin", "max_power_reserve"
+algorithm = "max_power_reserve"
+
+# Cache configuration
+[cache]
+# Enable or disable caching
+enabled = true
+
+# Cache size in MB
+size_mb = 512
+
+# Cache TTL in seconds
+ttl_seconds = 3600
+
+# Compression configuration
+[compression]
+# Enable or disable compression
+enabled = true
+
+# Compression algorithms to use
+algorithms = ["gzip", "br"]
+
+# Minimum response size to compress (in bytes)
+min_size = 1024
+
+# Logging configuration
+[log]
+# Log level: "trace", "debug", "info", "warn", "error"
+level = "info"
+
+# Log format: "json", "text"
+format = "json"
+
+# Enable access logging
+access_log = true
+
+# Access log path (optional, defaults to stdout)
+access_log_path = "/var/log/deflux/access.log"
+
+# Error log path (optional, defaults to stderr)
+error_log_path = "/var/log/deflux/error.log"
+
+# Note: Application-specific configurations (domains, certificates, etc.) 
+# are managed by the supervisor and stored in the database.
+# They are not configured in this file.
