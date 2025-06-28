@@ -1,52 +1,48 @@
 #!/bin/bash
+#
+# Start test backend servers for Deflux load balancer testing
+#
 
-# 启动多个测试后端服务器的脚本
+set -e
 
-echo "正在启动测试后端服务器..."
+# Check if Python 3 is available
+if ! command -v python3 &> /dev/null; then
+    echo "Error: Python 3 is required but not found"
+    exit 1
+fi
 
-# 定义后端服务器端口
-PORTS=(8001 8002 8003)
-
-# 存储后台进程 PID
-PIDS=()
-
-# 启动后端服务器
-for port in "${PORTS[@]}"; do
-    echo "启动后端服务器，端口: $port"
-    python3 test_backend.py $port &
-    PIDS+=($!)
-    sleep 1
-done
-
-echo "所有后端服务器已启动"
-echo "后端服务器进程 PID: ${PIDS[*]}"
-echo ""
-echo "测试 URL:"
-echo "  http://127.0.0.1:8001"
-echo "  http://127.0.0.1:8002"
-echo "  http://127.0.0.1:8003"
-echo ""
-echo "负载均衡器测试 URL:"
-echo "  http://127.0.0.1:6188"
-echo ""
-echo "按 Ctrl+C 停止所有服务器"
-
-# 清理函数
-cleanup() {
-    echo ""
-    echo "正在停止所有后端服务器..."
-    for pid in "${PIDS[@]}"; do
-        if kill -0 $pid 2>/dev/null; then
-            echo "停止进程 $pid"
-            kill $pid
-        fi
-    done
-    echo "所有服务器已停止"
-    exit 0
+# Install required Python packages if not available
+echo "Checking Python dependencies..."
+python3 -c "import aiohttp, aiohttp_cors" 2>/dev/null || {
+    echo "Installing required Python packages..."
+    pip3 install aiohttp aiohttp-cors
 }
 
-# 捕获中断信号
-trap cleanup SIGINT SIGTERM
+# Default configuration
+DEFAULT_PORTS="8001 8002 8003"
+DEFAULT_NAME="test-backend"
+DEFAULT_DELAY=0
+DEFAULT_ERROR_RATE=0.0
 
-# 等待所有后台进程
-wait 
+# Parse command line arguments
+PORTS=${1:-$DEFAULT_PORTS}
+NAME=${2:-$DEFAULT_NAME}
+DELAY=${3:-$DEFAULT_DELAY}
+ERROR_RATE=${4:-$DEFAULT_ERROR_RATE}
+
+echo "Starting test backend servers..."
+echo "Ports: $PORTS"
+echo "Name: $NAME"
+echo "Delay: ${DELAY}ms"
+echo "Error Rate: ${ERROR_RATE}"
+echo
+
+# Check if test_backend.py exists
+if [ ! -f "test_backend.py" ]; then
+    echo "Error: test_backend.py not found in current directory"
+    exit 1
+fi
+
+# Start backend servers
+echo "Starting backend servers..."
+exec python3 test_backend.py $PORTS --name "$NAME" --delay "$DELAY" --error-rate "$ERROR_RATE"

@@ -2,9 +2,7 @@ use std::fs::File;
 use std::os::unix::process::parent_id;
 use anyhow::{Context, Result};
 use daemonize_me::{Daemon, Group, User};
-use tracing::{info, warn};
-use users::{get_user_by_name, get_group_by_gid};
-use nix::unistd::{setgid, setuid};
+use tracing::info;
 
 /// 检查当前进程是否以守护进程模式运行
 pub fn is_daemon() -> bool {

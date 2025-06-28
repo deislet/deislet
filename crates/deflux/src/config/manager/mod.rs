@@ -90,7 +90,9 @@ impl ConfigManager {
         let latest_version_timestamp = updates.iter()
             .map(|update| update.version_timestamp)
             .max()
-            .unwrap();
+            .ok_or_else(|| ConfigError::ValidationError {
+                message: "No updates provided to apply".to_string(),
+            })?;
 
         let result_timestamp = {
             let mut db = self.local_database.write().await;

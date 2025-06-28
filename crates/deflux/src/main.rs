@@ -17,6 +17,7 @@ use deflux::config::system::log::LogLevel;
 use deflux::config::system::process::{self, is_daemon};
 use deflux::config::{ConfigDatabase, ConfigManager, system::SystemConfig};
 use deflux::proxy::service::ProxyService;
+use deflux::supervisor::client::DefluxSupervisorClient;
 
 /// Initialize Tokio runtime with configuration
 fn init_runtime(system_config: &SystemConfig) -> Result<tokio::runtime::Runtime> {
@@ -48,6 +49,57 @@ fn init_runtime(system_config: &SystemConfig) -> Result<tokio::runtime::Runtime>
         .enable_all()
         .build()
         .context("Failed to initialize Tokio runtime")
+}
+
+/// Start supervisor client if configured
+async fn start_supervisor_client(
+    system_config: &SystemConfig,
+    tasks: &mut JoinSet<Result<()>>,
+) -> Result<Option<Arc<tokio::sync::Mutex<DefluxSupervisorClient>>>> {
+    if let Some(supervisor_config) = &system_config.supervisor {
+        info!("Starting supervisor client with address: {}", supervisor_config.addr);
+        
+        match DefluxSupervisorClient::new(supervisor_config.clone()) {
+            Ok(supervisor_client) => {
+                let supervisor_client = Arc::new(tokio::sync::Mutex::new(supervisor_client));
+                let supervisor_client_task = Arc::clone(&supervisor_client);
+                
+                // Start supervisor client in background task
+                tasks.spawn(async move {
+                    let mut client = supervisor_client_task.lock().await;
+                    match client.start().await {
+                        Ok(_) => {
+                            info!("Supervisor client started successfully");
+                            // Keep the client running
+                            match client.run().await {
+                                Ok(_) => {
+                                    info!("Supervisor client terminated gracefully");
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    error!("Supervisor client error: {}", e);
+                                    Err(anyhow::anyhow!("Supervisor client error: {}", e))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to start supervisor client: {}", e);
+                            Err(anyhow::anyhow!("Failed to start supervisor client: {}", e))
+                        }
+                    }
+                });
+                
+                Ok(Some(supervisor_client))
+            }
+            Err(e) => {
+                error!("Failed to create supervisor client: {}", e);
+                Err(anyhow::anyhow!("Failed to create supervisor client: {}", e))
+            }
+        }
+    } else {
+        info!("No supervisor configuration found, running in standalone mode");
+        Ok(None)
+    }
 }
 
 /// Start proxy server and handle incoming connections
@@ -116,8 +168,11 @@ async fn start_proxy_server(
     // 创建关闭信号通道
     let (shutdown_tx, _) = broadcast::channel(1);
 
-    // 使用 JoinSet 管理所有监听任务
+    // 使用 JoinSet 管理所有任务（监听器和supervisor客户端）
     let mut tasks = JoinSet::new();
+    
+    // 启动supervisor客户端（如果配置了）
+    let _supervisor_client = start_supervisor_client(system_config, &mut tasks).await?;
 
     // 为每个监听器创建一个任务
     for (listener, addr) in listeners.into_iter().zip(bound_addrs.iter()) {
@@ -145,7 +200,7 @@ async fn start_proxy_server(
                                 error!("Error accepting connection on {}: {}", addr, e);
                                 // If the error is not a normal error, break the loop
                                 if e.kind() == std::io::ErrorKind::Other {
-                                    break;
+                                    return Err(anyhow::anyhow!("Listener error on {}: {}", addr, e));
                                 }
                             }
                         }
@@ -156,12 +211,12 @@ async fn start_proxy_server(
                     }
                 }
             }
-            // return the listener address, so we can know which listener exited
-            addr
+            info!("Listener on {} shut down gracefully", addr);
+            Ok(())
         });
     }
 
-    // 只有在非 daemon 模式下才处理 Ctrl-C 信号
+    // 设置信号处理和任务监控
     if !is_daemon() {
         let sigint = signal::ctrl_c();
         tokio::select! {
@@ -169,25 +224,51 @@ async fn start_proxy_server(
                 info!("Received Ctrl-C, initiating graceful shutdown...");
                 let _ = shutdown_tx.send(());
             }
-            else => {
-                info!("All tasks completed normally");
+            task_result = tasks.join_next() => {
+                match task_result {
+                    Some(Ok(Ok(()))) => {
+                        info!("A task completed successfully");
+                    }
+                    Some(Ok(Err(e))) => {
+                        error!("A task failed: {}", e);
+                        // Initiate shutdown on task failure
+                        let _ = shutdown_tx.send(());
+                    }
+                    Some(Err(e)) => {
+                        error!("Task join error: {}", e);
+                        let _ = shutdown_tx.send(());
+                    }
+                    None => {
+                        info!("All tasks completed");
+                    }
+                }
+            }
+        }
+    } else {
+        // In daemon mode, just wait for task completion or failure
+        while let Some(task_result) = tasks.join_next().await {
+            match task_result {
+                Ok(Ok(())) => {
+                    info!("A task completed successfully");
+                }
+                Ok(Err(e)) => {
+                    error!("A task failed: {}", e);
+                    // In daemon mode, restart failed tasks or exit
+                    break;
+                }
+                Err(e) => {
+                    error!("Task join error: {}", e);
+                    break;
+                }
             }
         }
     }
 
-    // wait for the tasks to complete (usually not completed, unless an error occurs)
-    while let Some(res) = tasks.join_next().await {
-        match res {
-            Ok(addr) => {
-                info!("Listener on {} gracefully shut down", addr);
-            }
-            Err(e) => {
-                error!("Listener task failed: {}", e);
-            }
-        }
-    }
+    // Wait for remaining tasks to complete
+    tasks.shutdown().await;
+    
+    info!("All tasks have been shut down");
 
-    info!("All listeners have been shut down");
     Ok(())
 }
 

@@ -50,6 +50,8 @@ impl DefluxSupervisorClient {
         // 创建 worker 信息
         let worker_info = WorkerInfo::new(
             WorkerType::Deflux(env!("CARGO_PKG_VERSION").to_string()),
+            "0.0.0.0".to_string(),
+            vec![80, 443],
         );
 
         // 创建 workit 客户端
@@ -124,8 +126,16 @@ impl DefluxSupervisorClient {
             // 检查连接状态
             if !self.is_ready().await {
                 warn!("Supervisor connection lost, attempting to reconnect...");
-                // TODO: 实现重连逻辑
-                break;
+                match self.reconnect_with_backoff().await {
+                    Ok(_) => {
+                        info!("Successfully reconnected to supervisor");
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Failed to reconnect after multiple attempts: {}", e);
+                        break;
+                    }
+                }
             }
         }
 
@@ -219,7 +229,9 @@ impl DefluxSupervisorClient {
                     Ok(_) => debug!("Heartbeat sent successfully for {}", instance_id),
                     Err(e) => {
                         error!("Failed to send heartbeat for {}: {}", instance_id, e);
-                        // TODO: 实现重连逻辑
+                        // Heartbeat failure indicates connection issue
+                        // The main loop will detect this and trigger reconnection
+                        break;
                     }
                 }
             }
@@ -492,6 +504,59 @@ impl DefluxSupervisorClient {
     /// 获取当前状态
     pub async fn current_state(&self) -> State {
         self.state_manager.current_state().await
+    }
+
+    /// Reconnect with exponential backoff
+    async fn reconnect_with_backoff(&mut self) -> SdkResult<()> {
+        const MAX_RETRIES: u32 = 5;
+        const BASE_DELAY_MS: u64 = 1000;
+        const MAX_DELAY_MS: u64 = 30000;
+
+        for attempt in 1..=MAX_RETRIES {
+            let delay_ms = std::cmp::min(
+                BASE_DELAY_MS * 2_u64.pow(attempt - 1),
+                MAX_DELAY_MS
+            );
+
+            info!("Reconnection attempt {} of {} (delay: {}ms)", attempt, MAX_RETRIES, delay_ms);
+            
+            // Wait before attempting reconnection
+            if attempt > 1 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+
+            // Try to reconnect
+            match self.connect_and_register().await {
+                Ok(_) => {
+                    info!("Reconnection successful on attempt {}", attempt);
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("Reconnection attempt {} failed: {}", attempt, e);
+                    if attempt == MAX_RETRIES {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Err(WorkitError::ConfigurationError(
+            "Maximum reconnection attempts exceeded".to_string()
+        ))
+    }
+
+    /// Force disconnect and reconnect
+    pub async fn force_reconnect(&mut self) -> SdkResult<()> {
+        info!("Forcing reconnection to supervisor");
+        
+        // Try to disconnect gracefully first
+        let _ = self.disconnect().await;
+        
+        // Wait a bit before reconnecting
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        
+        // Reconnect with backoff
+        self.reconnect_with_backoff().await
     }
 
     /// 获取状态管理器（用于测试）
