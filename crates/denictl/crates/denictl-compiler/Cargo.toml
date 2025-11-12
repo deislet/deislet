@@ -1,0 +1,21 @@
+[package]
+name = "denictl-compiler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+denictl-core = { path = "../denictl-core" }
+denictl-parser = { path = "../denictl-parser" }
+denictl-adapters = { path = "../denictl-adapters" }
+
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+anyhow.workspace = true
+
+swc_core.workspace = true
+swc_common.workspace = true
+swc_ecma_ast.workspace = true
+swc_ecma_visit.workspace = true

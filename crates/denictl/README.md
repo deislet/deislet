@@ -11,16 +11,18 @@ DeniCTL 是一个用于 Edge Function 开发和部署的统一工具链,支持�
 - **平台无关**: 禁止平台特定代码,编译器自动适配各平台实现
 - **完整工具链**: 提供 init、dev、build、validate、deploy 等完整命令
 - **类型安全**: 完整的 TypeScript 类型定义
+- **高性能**: Rust 实现,快速的编译和验证
 
 ## 架构
 
 ```
 denictl/
-├── packages/
-│   ├── types/       # 核心类型定义 (Context, Handler, Config)
-│   ├── cli/         # CLI 工具 (命令行接口)
-│   ├── compiler/    # 编译器 (Parser, Validator, Transformer)
-│   └── adapters/    # 平台适配器 (Cloudflare, Deno, Tencent)
+├── crates/
+│   ├── denictl/           # CLI 可执行文件
+│   ├── denictl-core/      # 核心类型和配置
+│   ├── denictl-parser/    # TypeScript/JavaScript 解析器 (SWC)
+│   ├── denictl-compiler/  # 编译器 (验证、转换)
+│   └── denictl-adapters/  # 平台适配器代码生成
 ```
 
 ## 技术思路
@@ -54,34 +56,34 @@ denictl/
 git clone https://github.com/deislet/denictl.git
 cd denictl
 
-# 安装依赖
-pnpm install
+# 构建 (需要 Rust 1.70+)
+cargo build --release
 
-# 构建
-pnpm build
+# 安装到系统
+cargo install --path crates/denictl
 ```
 
 ### 使用
 
 ```bash
 # 初始化新项目
-pnpm cli init my-edge-app
+denictl init my-edge-app
 cd my-edge-app
 
 # 安装依赖
 npm install
 
 # 启动开发服务器
-npm run dev
+denictl dev
 
 # 验证项目规范
-npm run validate
+denictl validate
 
 # 构建所有平台
-npm run build
+denictl build
 
 # 部署到生产环境
-npm run deploy
+denictl deploy
 ```
 
 ## CLI 命令
@@ -188,16 +190,20 @@ const kv = context.services.kv;
 
 ## 开发状态
 
-这是一个初步实现版本,包含:
+这是一个 **Rust 实现**版本,包含:
 
-- ✅ 完整的类型定义系统
-- ✅ CLI 工具框架和基础命令
-- ✅ 编译器核心 (Parser, Validator, Transformer)
-- ✅ Cloudflare/Deno/Tencent 适配器基础
+- ✅ 完整的 Rust 工作空间结构 (5 个 crates)
+- ✅ CLI 工具 (使用 clap)
+- ✅ TypeScript/JavaScript 解析器 (使用 SWC)
+- ✅ 代码验证器 (平台特定代码检测)
+- ✅ 代码转换器框架
+- ✅ Cloudflare/Deno/Tencent 适配器代码生成
 - 🚧 本地开发服务器 (待实现)
 - 🚧 完整的代码转换和打包 (待完善)
 - 🚧 实际部署集成 (待实现)
 - 🚧 测试套件 (待添加)
+
+**技术栈**: Rust + SWC (JavaScript/TypeScript 解析器)
 
 ## 路线图
 
