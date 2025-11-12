@@ -1,0 +1,42 @@
+{
+  "name": "@denictl/adapters",
+  "version": "0.1.0",
+  "description": "Platform adapters for Edge Function services (KV, Database, Cache)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./cloudflare": {
+      "types": "./dist/cloudflare/index.d.ts",
+      "import": "./dist/cloudflare/index.js"
+    },
+    "./deno": {
+      "types": "./dist/deno/index.d.ts",
+      "import": "./dist/deno/index.js"
+    },
+    "./tencent": {
+      "types": "./dist/tencent/index.d.ts",
+      "import": "./dist/tencent/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@denictl/types": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "typescript": "^5.3.3"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "name": "denictl",
+  "version": "0.1.0",
+  "description": "Universal Edge Function CLI and Compiler - Write once, deploy anywhere",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --parallel dev",
+    "test": "pnpm -r test",
+    "lint": "eslint .",
+    "clean": "pnpm -r clean && rm -rf node_modules",
+    "cli": "node packages/cli/dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  },
+  "keywords": [
+    "edge-function",
+    "serverless",
+    "cloudflare",
+    "deno",
+    "tencent",
+    "multi-platform",
+    "compiler",
+    "cli"
+  ],
+  "author": "Deislet Team",
+  "license": "MIT"
+}
