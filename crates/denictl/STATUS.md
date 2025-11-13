@@ -160,13 +160,19 @@ export function onRequest(context: EventContext): Response | Promise<Response> {
 - ✅ Cookie 解析
 - 🔲 部署 API 集成
 
-### 测试 (30%)
-- ✅ Transformer 基础测试
+### 测试 (55%) ⬆️
+- ✅ Transformer 基础测试 (2 tests)
 - ✅ 路由转换测试
-- 🔲 Parser 测试
-- 🔲 Validator 测试
+- ✅ **Parser 测试** (13 tests) ⬆️ 新增
+- ✅ **Validator 测试** (5 tests) ⬆️ 新增
+- ✅ Mock KV 测试 (4 tests)
 - 🔲 集成测试
 - 🔲 E2E 测试
+
+**新增测试覆盖**:
+- Parser: 导出检测、导入分析、路由转换、TypeScript类型、错误处理
+- Validator: 导出验证、命名导出、上下文使用、严重性级别
+- 总计: **24 unit tests** 全部通过 ✅
 
 ### 文档 (85%)
 - ✅ README.md (项目概览)
@@ -191,10 +197,10 @@ export function onRequest(context: EventContext): Response | Promise<Response> {
 | Deno 适配器 | 85% | ⭐ 生产就绪 (已验证文档) |
 | Tencent 适配器 | 80% | ⭐ 生产就绪 (已修复+验证) |
 | **Dev Server** | **90%** | ⭐ 功能完善 (含热重载) |
-| 测试 | 30% | 🔲 待完善 |
+| 测试 | 55% | ⬆️ 显著提升 (24 tests) |
 | 文档 | 85% | ✅ 可用 |
 
-**总体进度**: 约 **88% MVP 完成** ⬆️⬆️⬆️ (Dev Server 90% + 热重载完成)
+**总体进度**: 约 **90% MVP 完成** ⬆️⬆️⬆️ (测试覆盖 30%→55%)
 
 ## 🎯 MVP 状态 (v0.1.0)
 
