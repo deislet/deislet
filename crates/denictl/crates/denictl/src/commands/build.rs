@@ -12,7 +12,7 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
     let compiler = Compiler::new();
 
     // First validate
-    println!("{}", "Validating project...".dim());
+    println!("{}", "Validating project...".dimmed());
     let validation = compiler.validate(&project_dir, false)?;
 
     if !validation.is_valid() {
@@ -21,7 +21,7 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
         std::process::exit(1);
     }
 
-    println!("{}", "Building...".dim());
+    println!("{}", "Building...".dimmed());
 
     let result = compiler.compile(&project_dir, vendors.clone(), minify)?;
 
@@ -62,7 +62,7 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
             "\n{}",
             format!("✓ Build completed in {:.2}s", duration.as_secs_f64()).green()
         );
-        println!("{}", format!("  Total output: {:.2} KB", total_size as f64 / 1024.0).dim());
+        println!("{}", format!("  Total output: {:.2} KB", total_size as f64 / 1024.0).dimmed());
     } else {
         println!("\n{}", "Build failed".red().bold());
 

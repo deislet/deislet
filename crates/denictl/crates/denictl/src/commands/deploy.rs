@@ -29,28 +29,28 @@ pub async fn execute(
         println!("{}", format!("  ✓ Deployed to {}", vendor).green());
         println!(
             "{}",
-            format!("    URL: https://{}.example.{}.dev", env, vendor).dim()
+            format!("    URL: https://{}.example.{}.dev", env, vendor).dimmed()
         );
         println!(
             "{}",
-            format!("    Deployment ID: {}-{}", vendor, chrono::Utc::now().timestamp()).dim()
+            format!("    Deployment ID: {}-{}", vendor, chrono::Utc::now().timestamp()).dimmed()
         );
         println!();
     }
 
     println!("{}", "✅ All platforms deployed successfully".green());
-    println!("{}", format!("📋 Environment: {}", env).dim());
+    println!("{}", format!("📋 Environment: {}", env).dimmed());
     if let Some(tag) = tag {
-        println!("{}", format!("🏷️  Tag: {}", tag).dim());
+        println!("{}", format!("🏷️  Tag: {}", tag).dimmed());
     }
     println!();
 
     println!("{}", "ℹ Deployment implementation coming soon...".yellow());
-    println!("{}", "Full implementation will include:".dim());
-    println!("{}", "  - Actual platform API integration".dim());
-    println!("{}", "  - Deployment status tracking".dim());
-    println!("{}", "  - Rollback capabilities".dim());
-    println!("{}", "  - Deployment history\n".dim());
+    println!("{}", "Full implementation will include:".dimmed());
+    println!("{}", "  - Actual platform API integration".dimmed());
+    println!("{}", "  - Deployment status tracking".dimmed());
+    println!("{}", "  - Rollback capabilities".dimmed());
+    println!("{}", "  - Deployment history\n".dimmed());
 
     Ok(())
 }

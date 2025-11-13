@@ -41,7 +41,7 @@ impl Validator {
 
         // Parse for deeper validation
         let source_file = self.source_map.new_source_file(
-            Lrc::new(FileName::Custom(handler_info.path.clone())),
+            FileName::Custom(handler_info.path.clone()),
             code.to_string(),
         );
 

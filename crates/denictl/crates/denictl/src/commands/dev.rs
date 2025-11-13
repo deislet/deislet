@@ -28,15 +28,15 @@ pub async fn execute(port: u16, watch: bool, debug: bool) -> Result<()> {
     println!("{}{}{}", "│".bold(), "   ✓ Cache                                     ".green(), "│".bold());
     println!("{}", "├──────────────────────────────────────────────────────┤".bold());
     println!("{}{}{}", "│".bold(), " Watching: functions/                             ".yellow(), "│".bold());
-    println!("{}{}{}", "│".bold(), " Press [r] reload, [c] clear, [q] quit          ".dim(), "│".bold());
+    println!("{}{}{}", "│".bold(), " Press [r] reload, [c] clear, [q] quit          ".dimmed(), "│".bold());
     println!("{}", "└──────────────────────────────────────────────────────┘".bold());
 
     println!("\n{}", "ℹ Development server implementation coming soon...".yellow());
-    println!("{}", "This is a placeholder. Full implementation includes:".dim());
-    println!("{}", "  - HTTP server with hot reload".dim());
-    println!("{}", "  - Mock KV/Database services".dim());
-    println!("{}", "  - Request/response logging".dim());
-    println!("{}", "  - Interactive REPL\n".dim());
+    println!("{}", "This is a placeholder. Full implementation includes:".dimmed());
+    println!("{}", "  - HTTP server with hot reload".dimmed());
+    println!("{}", "  - Mock KV/Database services".dimmed());
+    println!("{}", "  - Request/response logging".dimmed());
+    println!("{}", "  - Interactive REPL\n".dimmed());
 
     Ok(())
 }

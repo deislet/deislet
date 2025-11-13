@@ -3,7 +3,6 @@ mod deno;
 mod tencent;
 
 use denictl_core::ProjectConfig;
-use std::fs;
 use std::path::Path;
 
 pub fn generate_vendor_files(

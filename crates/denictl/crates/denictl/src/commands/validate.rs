@@ -18,7 +18,7 @@ pub async fn execute(strict: bool) -> Result<()> {
             println!("\n{}", format!("⚠ {} warning(s):", result.warnings.len()).yellow());
             for warning in &result.warnings {
                 println!("\n  {}:{}", warning.file.yellow(), warning.line.to_string().yellow());
-                println!("  {}", warning.message.dim());
+                println!("  {}", warning.message.dimmed());
                 if let Some(suggestion) = &warning.suggestion {
                     println!("  {}: {}", "Suggestion".cyan(), suggestion.cyan());
                 }

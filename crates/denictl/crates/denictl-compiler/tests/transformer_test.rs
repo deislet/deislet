@@ -13,7 +13,7 @@ export default async function handler(context) {
 }
 "#;
 
-    let result = transformer.transform(code, "functions/index.ts", "cloudflare", &config);
+    let result = transformer.transform(code, "./functions/index.ts", "cloudflare", &config);
     assert!(result.is_ok());
 
     let transformed = result.unwrap();
@@ -33,7 +33,7 @@ export default async function handler(context) {
 }
 "#;
 
-    let result = transformer.transform(code, "functions/api/test.ts", "cloudflare", &config);
+    let result = transformer.transform(code, "./functions/api/test.ts", "cloudflare", &config);
     assert!(result.is_ok());
 
     let transformed = result.unwrap();
