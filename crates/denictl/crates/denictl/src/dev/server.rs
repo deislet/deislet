@@ -1,4 +1,5 @@
 use super::mock_kv::MockKVStore;
+use super::watcher::{RouteInfo, discover_routes, start_file_watcher};
 use anyhow::Result;
 use axum::{
     Router,
@@ -9,29 +10,20 @@ use axum::{
 };
 use colored::Colorize;
 use denictl_core::ProjectConfig;
-use denictl_parser::TypeScriptParser;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-use walkdir::WalkDir;
-
-#[derive(Clone)]
-struct RouteInfo {
-    path: String,
-    file_path: PathBuf,
-    method: String,
-}
 
 struct AppState {
     config: ProjectConfig,
-    routes: RwLock<Vec<RouteInfo>>,
+    routes: Arc<RwLock<Vec<RouteInfo>>>,
     kv_store: MockKVStore,
 }
 
-pub async fn run_dev_server(port: u16, _watch: bool, _debug: bool) -> Result<()> {
+pub async fn run_dev_server(port: u16, watch: bool, _debug: bool) -> Result<()> {
     println!("{}", "Starting development server...".green());
 
     // Load project config
@@ -41,14 +33,21 @@ pub async fn run_dev_server(port: u16, _watch: bool, _debug: bool) -> Result<()>
     let routes = discover_routes(&config)?;
 
     // Create shared state with Mock KV
+    let routes_arc = Arc::new(RwLock::new(routes.clone()));
     let app_state = Arc::new(AppState {
-        config,
-        routes: RwLock::new(routes.clone()),
+        config: config.clone(),
+        routes: routes_arc.clone(),
         kv_store: MockKVStore::new(),
     });
 
+    // Start file watcher if enabled
+    if watch {
+        let function_root = std::path::PathBuf::from(&config.function_root);
+        start_file_watcher(function_root, config.clone(), routes_arc.clone()).await?;
+    }
+
     // Print server info
-    print_server_info(port, &routes);
+    print_server_info(port, &routes, watch);
 
     // Build router with function routes and KV management API
     let app = Router::new()
@@ -309,51 +308,6 @@ fn match_route(route: &str, path: &str) -> bool {
     })
 }
 
-fn discover_routes(config: &ProjectConfig) -> Result<Vec<RouteInfo>> {
-    let mut routes = Vec::new();
-    let function_root = Path::new(&config.function_root);
-
-    if !function_root.exists() {
-        return Err(anyhow::anyhow!(
-            "Functions directory not found: {}",
-            function_root.display()
-        ));
-    }
-
-    let parser = TypeScriptParser::new();
-
-    for entry in WalkDir::new(function_root) {
-        let entry = entry?;
-        if entry.file_type().is_file() {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                if ext == "ts" || ext == "js" || ext == "tsx" || ext == "jsx" {
-                    if let Ok(code) = std::fs::read_to_string(path) {
-                        if let Ok(handler_info) = parser.parse(&code, path.to_str().unwrap_or("")) {
-                            if handler_info.has_default_export {
-                                let route = handler_info.route.clone();
-                                routes.push(RouteInfo {
-                                    path: route,
-                                    file_path: path.to_path_buf(),
-                                    method: "ALL".to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    routes.sort_by(|a, b| {
-        let a_parts = a.path.split('/').count();
-        let b_parts = b.path.split('/').count();
-        b_parts.cmp(&a_parts)
-    });
-
-    Ok(routes)
-}
-
 fn load_config() -> Result<ProjectConfig> {
     let config_path = Path::new(".config.json");
     if !config_path.exists() {
@@ -367,7 +321,7 @@ fn load_config() -> Result<ProjectConfig> {
     Ok(config)
 }
 
-fn print_server_info(port: u16, routes: &[RouteInfo]) {
+fn print_server_info(port: u16, routes: &[RouteInfo], watch: bool) {
     println!("\n{}", "┌──────────────────────────────────────────────────────┐".bold());
     println!(
         "{}{}{}",
@@ -382,6 +336,16 @@ fn print_server_info(port: u16, routes: &[RouteInfo]) {
         format!(" Local:   http://localhost:{:<26}", port).bright_white(),
         "│".bold()
     );
+
+    if watch {
+        println!(
+            "{}{}{}",
+            "│".bold(),
+            " Hot Reload: Enabled ♻️                            ".bright_green(),
+            "│".bold()
+        );
+    }
+
     println!("{}", "├──────────────────────────────────────────────────────┤".bold());
     println!("{}{}{}", "│".bold(), " Function Routes:                                 ".bright_white(), "│".bold());
 
