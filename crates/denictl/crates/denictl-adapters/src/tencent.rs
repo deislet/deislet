@@ -55,76 +55,71 @@ url = "{}.edgeone.ai"
     let adapters_dir = output_dir.join("adapters");
     fs::create_dir_all(&adapters_dir)?;
 
-    // Generate context builder
-    let context_builder = r#"/**
- * Tencent EdgeOne Context Builder
+    // Generate KV adapter if KV service is enabled
+    if config.services.as_ref()
+        .and_then(|s| s.kv.as_ref())
+        .map(|kv| kv.enabled)
+        .unwrap_or(false)
+    {
+        let kv_adapter = r#"/**
+ * Tencent EdgeOne KV Adapter
+ * Wraps EdgeOne KV binding with unified interface
  */
 
-export function createContextBuilder() {
-  return function buildContext(request: Request, route: string) {
-    const url = new URL(request.url);
-
-    return {
-      request,
-      env: {},
-      params: extractParams(url.pathname, route),
-      path: url.pathname,
-      method: request.method,
-      query: Object.fromEntries(url.searchParams),
-      headers: request.headers,
-      cookies: parseCookies(request),
-      services: {},
-      log: {
-        debug: (...args: any[]) => console.debug(...args),
-        info: (...args: any[]) => console.info(...args),
-        warn: (...args: any[]) => console.warn(...args),
-        error: (...args: any[]) => console.error(...args),
-      },
-      cache: {
-        match: async () => undefined,
-        put: async () => {},
-        delete: async () => false,
-      },
-      waitUntil: () => {},
-    };
-  };
-}
-
-function extractParams(pathname: string, route: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
-
-  routeParts.forEach((part, i) => {
-    if (part.startsWith(':')) {
-      params[part.slice(1)] = pathParts[i] || '';
-    }
-  });
-
-  return params;
-}
-
-function parseCookies(request: Request): any {
-  const cookies: Record<string, string> = {};
-  const cookieHeader = request.headers.get('Cookie');
-
-  if (cookieHeader) {
-    cookieHeader.split(';').forEach(cookie => {
-      const [name, ...rest] = cookie.split('=');
-      cookies[name.trim()] = rest.join('=').trim();
-    });
-  }
-
+export function createKVAdapter(kvNamespace) {
   return {
-    get: (name: string) => cookies[name],
-    set: (name: string, value: string) => { cookies[name] = value; },
-    delete: (name: string) => { delete cookies[name]; },
-    getAll: () => ({ ...cookies }),
+    async get(key, options = {}) {
+      const value = await kvNamespace.get(key, options.type || 'text');
+      return value;
+    },
+
+    async getJSON(key) {
+      const value = await kvNamespace.get(key, 'json');
+      return value;
+    },
+
+    async getWithMetadata(key) {
+      const value = await kvNamespace.getWithMetadata(key);
+      return {
+        value: value.value,
+        metadata: value.metadata || null,
+      };
+    },
+
+    async put(key, value, options = {}) {
+      await kvNamespace.put(key, value, options);
+    },
+
+    async putJSON(key, value, options = {}) {
+      await kvNamespace.put(key, JSON.stringify(value), options);
+    },
+
+    async delete(key) {
+      await kvNamespace.delete(key);
+    },
+
+    async deleteMultiple(keys) {
+      await Promise.all(keys.map(key => kvNamespace.delete(key)));
+    },
+
+    async list(options = {}) {
+      const result = await kvNamespace.list(options);
+      return {
+        keys: result.keys || [],
+        list_complete: result.list_complete ?? true,
+        cursor: result.cursor,
+      };
+    },
+
+    async exists(key) {
+      const value = await kvNamespace.get(key);
+      return value !== null;
+    },
   };
 }
 "#;
-
-    fs::write(adapters_dir.join("context-builder.ts"), context_builder)?;
+        fs::write(adapters_dir.join("kv-adapter.js"), kv_adapter)?;
+    }
 
     Ok(())
 }
@@ -134,17 +129,20 @@ fn generate_router(output_dir: &Path, routes: &[(String, String)]) -> anyhow::Re
     let mut route_handlers = String::new();
 
     for (i, (route, import_path)) in routes.iter().enumerate() {
+        // Import onRequest handlers from transformed files
         imports.push_str(&format!(
-            "import {{ handleRequest as handler{} }} from '{}';\n",
+            "import {{ onRequest as handler{} }} from '{}';\n",
             i, import_path
         ));
 
         route_handlers.push_str(&format!(
-            r#"  if (matchRoute(url.pathname, '{}')) {{
-    return handler{}(request);
+            r#"  if (matchRoute(pathname, '{}')) {{
+    // Update params with matched route parameters
+    context.params = extractParams(pathname, '{}');
+    return handler{}(context);
   }}
 "#,
-            route, i
+            route, route, i
         ));
     }
 
@@ -152,19 +150,23 @@ fn generate_router(output_dir: &Path, routes: &[(String, String)]) -> anyhow::Re
         r#"/**
  * Tencent EdgeOne Main Entry
  * Auto-generated router
+ * Uses EdgeOne's EventContext pattern
  */
 
 {}
 
-export async function handleRequest(request: Request): Promise<Response> {{
-  const url = new URL(request.url);
+// EdgeOne main router using onRequest pattern
+export function onRequest(context) {{
+  // EdgeOne provides: {{ request, params, env, waitUntil }}
+  const url = new URL(context.request.url);
+  const pathname = url.pathname;
 
 {}
   // 404 Not Found
   return new Response('Not Found', {{ status: 404 }});
 }}
 
-function matchRoute(pathname: string, route: string): boolean {{
+function matchRoute(pathname, route) {{
   // Exact match
   if (pathname === route) return true;
 
@@ -178,6 +180,20 @@ function matchRoute(pathname: string, route: string): boolean {{
     if (part.startsWith(':')) return true;
     return part === pathParts[i];
   }});
+}}
+
+function extractParams(pathname, route) {{
+  const params = {{}};
+  const routeParts = route.split('/');
+  const pathParts = pathname.split('/');
+
+  routeParts.forEach((part, i) => {{
+    if (part.startsWith(':')) {{
+      params[part.slice(1)] = pathParts[i] || '';
+    }}
+  }});
+
+  return params;
 }}
 "#,
         imports,

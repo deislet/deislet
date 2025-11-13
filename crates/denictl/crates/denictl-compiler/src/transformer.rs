@@ -179,8 +179,14 @@ function parseCookies(request: Request): any {{
         code: &str,
         filename: &str,
         route: &str,
-        _config: &ProjectConfig,
+        config: &ProjectConfig,
     ) -> anyhow::Result<String> {
+        let has_kv = config.services.as_ref()
+            .and_then(|s| s.kv.as_ref())
+            .map(|kv| kv.enabled)
+            .unwrap_or(false);
+
+        // EdgeOne uses onRequest pattern with EventContext
         let transformed = format!(
             r#"/**
  * Tencent EdgeOne Handler
@@ -188,49 +194,42 @@ function parseCookies(request: Request): any {{
  * Route: {}
  */
 
+{}
 // Original handler code
 {}
 
-// Tencent EdgeOne handler
-export async function handleRequest(request: Request): Promise<Response> {{
-  const url = new URL(request.url);
-  const context = {{
-    request,
-    env: {{}},
-    params: extractParams(url.pathname, '{}'),
-    path: url.pathname,
-    method: request.method,
-    query: Object.fromEntries(url.searchParams),
-    headers: request.headers,
-    cookies: parseCookies(request),
-    services: {{}},
-    log: {{
-      debug: (...args: any[]) => console.debug(...args),
-      info: (...args: any[]) => console.info(...args),
-      warn: (...args: any[]) => console.warn(...args),
-      error: (...args: any[]) => console.error(...args),
+// Tencent EdgeOne export (EventContext pattern)
+export function onRequest(context) {{
+  // EdgeOne provides: {{ request, params, env, waitUntil }}
+  // Extend context with our unified interface
+  const enhancedContext = {{
+    ...context,
+    path: new URL(context.request.url).pathname,
+    method: context.request.method,
+    query: Object.fromEntries(new URL(context.request.url).searchParams),
+    headers: context.request.headers,
+    cookies: parseCookies(context.request),
+    services: {{
+      kv: {}context.env.KV ? createKVAdapter(context.env.KV) : undefined,
     }},
-    cache: {{ match: async () => undefined, put: async () => {{}}, delete: async () => false }},
-    waitUntil: () => {{}},
+    log: {{
+      debug: (...args) => console.debug(...args),
+      info: (...args) => console.info(...args),
+      warn: (...args) => console.warn(...args),
+      error: (...args) => console.error(...args),
+    }},
+    cache: {{
+      match: async () => undefined,
+      put: async () => ({{}}),
+      delete: async () => false
+    }},
   }};
 
-  return handler(context);
+  return handler(enhancedContext);
 }}
 
-function extractParams(pathname: string, route: string): Record<string, string> {{
-  const params: Record<string, string> = {{}};
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
-  routeParts.forEach((part, i) => {{
-    if (part.startsWith(':')) {{
-      params[part.slice(1)] = pathParts[i] || '';
-    }}
-  }});
-  return params;
-}}
-
-function parseCookies(request: Request): any {{
-  const cookies: Record<string, string> = {{}};
+function parseCookies(request) {{
+  const cookies = {{}};
   const cookieHeader = request.headers.get('Cookie');
   if (cookieHeader) {{
     cookieHeader.split(';').forEach(cookie => {{
@@ -239,17 +238,18 @@ function parseCookies(request: Request): any {{
     }});
   }}
   return {{
-    get: (name: string) => cookies[name],
-    set: (name: string, value: string) => {{ cookies[name] = value; }},
-    delete: (name: string) => {{ delete cookies[name]; }},
+    get: (name) => cookies[name],
+    set: (name, value) => {{ cookies[name] = value; }},
+    delete: (name) => {{ delete cookies[name]; }},
     getAll: () => ({{ ...cookies }}),
   }};
 }}
 "#,
             filename,
             route,
+            if has_kv { "import { createKVAdapter } from './adapters/kv-adapter.js';\n" } else { "" },
             code,
-            route
+            if has_kv { "" } else { "// " }
         );
 
         Ok(transformed)
