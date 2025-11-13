@@ -4,6 +4,7 @@ use colored::Colorize;
 use tracing_subscriber;
 
 mod commands;
+mod dev;
 
 #[derive(Parser)]
 #[command(name = "denictl")]

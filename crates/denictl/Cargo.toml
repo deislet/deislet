@@ -52,6 +52,9 @@ notify = "6.1"
 walkdir = "2.4"
 glob = "0.3"
 
+# URL parsing
+url = "2.5"
+
 # Template engine
 handlebars = "5.1"
 
