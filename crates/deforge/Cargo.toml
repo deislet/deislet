@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 authors = ["kookyleo <kookyleo@gmail.com>"]
 license = "Apache-2.0"
+description = "Universal Edge Function Compiler - Transform standard code to platform-specific deployables"
 repository = "https://github.com/deislet/deforge"
+homepage = "https://github.com/deislet/deforge"
+keywords = ["edge", "serverless", "compiler", "cloudflare", "deno"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
 
 [[bin]]
 name = "deforge"
@@ -25,6 +29,7 @@ edition = "2021"
 authors = ["kookyleo <kookyleo@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/deislet/deforge"
+homepage = "https://github.com/deislet/deforge"
 
 [dependencies]
 deforge-core = { path = "crates/deforge-core" }
