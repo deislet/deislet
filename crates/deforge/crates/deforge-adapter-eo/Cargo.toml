@@ -1,0 +1,12 @@
+[package]
+name = "deforge-adapter-eo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+deforge-core = { path = "../deforge-core" }
+
+anyhow.workspace = true
+walkdir.workspace = true

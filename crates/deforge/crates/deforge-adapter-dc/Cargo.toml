@@ -1,0 +1,14 @@
+[package]
+name = "deforge-adapter-dc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+deforge-core = { path = "../deforge-core" }
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+walkdir.workspace = true
