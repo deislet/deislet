@@ -32,10 +32,10 @@ repository = "https://github.com/deislet/deforge"
 homepage = "https://github.com/deislet/deforge"
 
 [dependencies]
-deforge-core = { path = "crates/deforge-core" }
-deforge-adapter-cf = { path = "crates/deforge-adapter-cf" }
-deforge-adapter-dc = { path = "crates/deforge-adapter-dc" }
-deforge-adapter-eo = { path = "crates/deforge-adapter-eo" }
+deforge-core = { version = "0.1.0", path = "crates/deforge-core" }
+deforge-adapter-cf = { version = "0.1.0", path = "crates/deforge-adapter-cf" }
+deforge-adapter-dc = { version = "0.1.0", path = "crates/deforge-adapter-dc" }
+deforge-adapter-eo = { version = "0.1.0", path = "crates/deforge-adapter-eo" }
 
 clap.workspace = true
 colored.workspace = true

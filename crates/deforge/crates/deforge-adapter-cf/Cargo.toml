@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "Cloudflare Workers adapter for deforge"
 
 [dependencies]
-deforge-core = { path = "../deforge-core" }
+deforge-core = { version = "0.1.0", path = "../deforge-core" }
 
 handlebars.workspace = true
 serde.workspace = true

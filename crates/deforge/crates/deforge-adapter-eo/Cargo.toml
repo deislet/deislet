@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "Tencent EdgeOne adapter for deforge"
 
 [dependencies]
-deforge-core = { path = "../deforge-core" }
+deforge-core = { version = "0.1.0", path = "../deforge-core" }
 
 anyhow.workspace = true
 walkdir.workspace = true

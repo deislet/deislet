@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "Deno Cloud adapter for deforge"
 
 [dependencies]
-deforge-core = { path = "../deforge-core" }
+deforge-core = { version = "0.1.0", path = "../deforge-core" }
 
 serde.workspace = true
 serde_json.workspace = true
