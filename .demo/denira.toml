@@ -1,0 +1,5 @@
+bind_addr = "0.0.0.0"
+port = 8085
+heartbeat_interval = 30
+heartbeat_timeout = 90
+worker_preshared_keys = ["016d425102bea4abcdf34deb656c0f8820a56903d45cbc66d5e4c0ddc8cf4299"]

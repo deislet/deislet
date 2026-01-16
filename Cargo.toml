@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/denira",
+    "crates/denira-workit",
+    "crates/deflux",
+    "crates/denix",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["kookyleo <kookyleo@gmail.com>"]
+
+[workspace.dependencies]
+# 共享依赖
+tokio = { version = "1.45", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+anyhow = "1.0"
+rusqlite = { version = "0.36", features = ["bundled"] }
+denira-workit = { path = "crates/denira-workit" }

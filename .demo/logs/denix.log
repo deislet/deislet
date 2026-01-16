@@ -1,0 +1,230 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /mnt/sdb1/deislet/deislet/crates/denix/Cargo.toml
+workspace: /mnt/sdb1/deislet/deislet/Cargo.toml
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+warning: use of deprecated method `tonic_build::Builder::compile`: renamed to `compile_protos()`
+ --> crates/denira-workit/build.rs:5:10
+  |
+5 |         .compile(
+  |          ^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: `denira-workit` (build script) generated 1 warning
+warning: unused import: `ConfigPushMessage`
+  --> crates/denix/src/supervisor/client.rs:11:67
+   |
+11 | use denira_workit::models::{ConfigPushAckMessage, ConfigPushData, ConfigPushMessage, WorkitMessage};
+   |                                                                   ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `CommandRequest` and `ConfigUpdate`
+   --> crates/denix/src/supervisor/client.rs:199:24
+    |
+199 |     SupervisorMessage, CommandRequest, ConfigUpdate, CommandResponse,
+    |                        ^^^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused variable: `app_manager`
+   --> crates/denix/src/supervisor/client.rs:419:29
+    |
+419 |                 if let Some(app_manager) = &self.app_manager {
+    |                             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_app_manager`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `response`
+   --> crates/denix/src/supervisor/client.rs:262:32
+    |
+262 | ...                   Ok(response) => {
+    |                          ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_response`
+
+warning: method `execute_scheduled` is never used
+   --> crates/denix/src/runtime/isolate.rs:160:18
+    |
+ 41 | impl AppRuntime {
+    | --------------- method in this implementation
+...
+160 |     pub async fn execute_scheduled(&mut self, scheduled_time: i64, cron: Option<String>) -> Result<()> {
+    |                  ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `FetchResponse` is never constructed
+  --> crates/denix/src/runtime/http_ops.rs:24:12
+   |
+24 | pub struct FetchResponse {
+   |            ^^^^^^^^^^^^^
+
+warning: `denix` (lib) generated 6 warnings (run `cargo fix --lib -p denix` to apply 2 suggestions)
+warning: unused imports: `AppConfig` and `App`
+ --> crates/denix/src/app/mod.rs:5:17
+  |
+5 | pub use types::{App, AppConfig, AppState, CreateAppRequest, UpdateAppRequest};
+  |                 ^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `CacheStore`, `create_cache_store`, and `init_cache_extension`
+  --> crates/denix/src/runtime/mod.rs:14:21
+   |
+14 | pub use cache_ops::{CacheStore, create_cache_store, init_cache_extension};
+   |                     ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `db_ops::init_db_extension`
+  --> crates/denix/src/runtime/mod.rs:15:9
+   |
+15 | pub use db_ops::init_db_extension;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `http_ops::init_http_extension`
+  --> crates/denix/src/runtime/mod.rs:16:9
+   |
+16 | pub use http_ops::init_http_extension;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `WebSocketManager`, `create_ws_manager`, and `init_ws_extension`
+  --> crates/denix/src/runtime/mod.rs:17:18
+   |
+17 | pub use ws_ops::{WebSocketManager, create_ws_manager, init_ws_extension};
+   |                  ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `create_ws_server_manager` and `init_ws_server_extension`
+  --> crates/denix/src/runtime/mod.rs:18:59
+   |
+18 | pub use ws_server_ops::{WsServerManager, WsServerMessage, create_ws_server_manager, init_ws_server_extension};
+   |                                                           ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CronEvent` and `init_cron_extension`
+  --> crates/denix/src/runtime/mod.rs:19:20
+   |
+19 | pub use cron_ops::{CronEvent, init_cron_extension};
+   |                    ^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `kv_client::KvClient`
+  --> crates/denix/src/runtime/mod.rs:20:9
+   |
+20 | pub use kv_client::KvClient;
+   |         ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `db_client::DbClient`
+  --> crates/denix/src/runtime/mod.rs:21:9
+   |
+21 | pub use db_client::DbClient;
+   |         ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ConfigPushMessage`
+  --> crates/denix/src/supervisor/client.rs:11:67
+   |
+11 | use denira_workit::models::{ConfigPushAckMessage, ConfigPushData, ConfigPushMessage, WorkitMessage};
+   |                                                                   ^^^^^^^^^^^^^^^^^
+
+warning: struct `Resource` is never constructed
+ --> crates/denix/src/resource/types.rs:7:12
+  |
+7 | pub struct Resource {
+  |            ^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `execute_scheduled` is never used
+   --> crates/denix/src/runtime/isolate.rs:160:18
+    |
+ 41 | impl AppRuntime {
+    | --------------- method in this implementation
+...
+160 |     pub async fn execute_scheduled(&mut self, scheduled_time: i64, cron: Option<String>) -> Result<()> {
+    |                  ^^^^^^^^^^^^^^^^^
+
+warning: associated items `connect` and `has` are never used
+   --> crates/denix/src/runtime/kv_client.rs:35:18
+    |
+ 26 | impl KvClient {
+    | ------------- associated items in this implementation
+...
+ 35 |     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
+    |                  ^^^^^^^
+...
+147 |     pub async fn has(&self, key: String) -> Result<bool> {
+    |                  ^^^
+
+warning: associated function `connect` is never used
+  --> crates/denix/src/runtime/db_client.rs:35:18
+   |
+26 | impl DbClient {
+   | ------------- associated function in this implementation
+...
+35 |     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
+   |                  ^^^^^^^
+
+warning: methods `start`, `handle_config_push`, `disconnect`, `is_connected`, and `is_ready` are never used
+   --> crates/denix/src/supervisor/client.rs:88:18
+    |
+ 25 | impl DenixSupervisorClient {
+    | -------------------------- methods in this implementation
+...
+ 88 |     pub async fn start(&mut self) -> SdkResult<()> {
+    |                  ^^^^^
+...
+333 |     pub async fn handle_config_push(
+    |                  ^^^^^^^^^^^^^^^^^^
+...
+544 |     pub async fn disconnect(&mut self) -> SdkResult<()> {
+    |                  ^^^^^^^^^^
+...
+555 |     pub fn is_connected(&self) -> bool {
+    |            ^^^^^^^^^^^^
+...
+559 |     pub fn is_ready(&self) -> bool {
+    |            ^^^^^^^^
+
+warning: associated function `load` is never used
+  --> crates/denix/src/supervisor/config.rs:44:12
+   |
+43 | impl DenixSupervisorConfig {
+   | -------------------------- associated function in this implementation
+44 |     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
+   |            ^^^^
+
+warning: `denix` (bin "denix") generated 20 warnings (4 duplicates) (run `cargo fix --bin "denix"` to apply 10 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.74s
+     Running `target/debug/denix`
+[2m2026-01-16T04:56:13.296515Z[0m [32m INFO[0m ThreadId(01) 🚀 Starting Denix Platform (Rust)
+[2m2026-01-16T04:56:13.296612Z[0m [32m INFO[0m ThreadId(01) ====================================
+[2m2026-01-16T04:56:13.300049Z[0m [32m INFO[0m ThreadId(01) Creating runtime pool with 16 threads
+[2m2026-01-16T04:56:13.300488Z[0m [32m INFO[0m ThreadId(18) Runtime thread 0 started
+[2m2026-01-16T04:56:13.300954Z[0m [32m INFO[0m ThreadId(19) Runtime thread 1 started
+[2m2026-01-16T04:56:13.301321Z[0m [32m INFO[0m ThreadId(20) Runtime thread 2 started
+[2m2026-01-16T04:56:13.301691Z[0m [32m INFO[0m ThreadId(21) Runtime thread 3 started
+[2m2026-01-16T04:56:13.302022Z[0m [32m INFO[0m ThreadId(22) Runtime thread 4 started
+[2m2026-01-16T04:56:13.302342Z[0m [32m INFO[0m ThreadId(23) Runtime thread 5 started
+[2m2026-01-16T04:56:13.302695Z[0m [32m INFO[0m ThreadId(24) Runtime thread 6 started
+[2m2026-01-16T04:56:13.303040Z[0m [32m INFO[0m ThreadId(25) Runtime thread 7 started
+[2m2026-01-16T04:56:13.303362Z[0m [32m INFO[0m ThreadId(26) Runtime thread 8 started
+[2m2026-01-16T04:56:13.303679Z[0m [32m INFO[0m ThreadId(27) Runtime thread 9 started
+[2m2026-01-16T04:56:13.304028Z[0m [32m INFO[0m ThreadId(28) Runtime thread 10 started
+[2m2026-01-16T04:56:13.304347Z[0m [32m INFO[0m ThreadId(29) Runtime thread 11 started
+[2m2026-01-16T04:56:13.304655Z[0m [32m INFO[0m ThreadId(30) Runtime thread 12 started
+[2m2026-01-16T04:56:13.317687Z[0m [32m INFO[0m ThreadId(31) Runtime thread 13 started
+[2m2026-01-16T04:56:13.318014Z[0m [32m INFO[0m ThreadId(32) Runtime thread 14 started
+[2m2026-01-16T04:56:13.318319Z[0m [32m INFO[0m ThreadId(33) Runtime thread 15 started
+[2m2026-01-16T04:56:13.318705Z[0m [32m INFO[0m ThreadId(17) 尝试连接 supervisor http://127.0.0.1:8085
+[2m2026-01-16T04:56:13.318823Z[0m [32m INFO[0m ThreadId(17) Connecting to supervisor at http://127.0.0.1:8085
+[2m2026-01-16T04:56:13.319143Z[0m [32m INFO[0m ThreadId(01) ====================================
+[2m2026-01-16T04:56:13.319176Z[0m [32m INFO[0m ThreadId(01) ✅ Denix Platform is ready!
+[2m2026-01-16T04:56:13.319189Z[0m [32m INFO[0m ThreadId(01) 📡 HTTP Server: http://localhost:8093
+[2m2026-01-16T04:56:13.319202Z[0m [32m INFO[0m ThreadId(01) 📊 Health Check: http://localhost:8093/health
+[2m2026-01-16T04:56:13.319215Z[0m [32m INFO[0m ThreadId(01) 📚 API Docs: http://localhost:8093/
+[2m2026-01-16T04:56:13.319227Z[0m [32m INFO[0m ThreadId(01) ====================================
+[2m2026-01-16T04:56:13.363252Z[0m [32m INFO[0m ThreadId(14) Connected to supervisor
+[2m2026-01-16T04:56:13.363402Z[0m [32m INFO[0m ThreadId(14) Authenticating with supervisor
+Authentication successful: Authenticated: denix-demo-01
+[2m2026-01-16T04:56:13.364678Z[0m [32m INFO[0m ThreadId(02) Authentication successful
+[2m2026-01-16T04:56:13.364727Z[0m [32m INFO[0m ThreadId(02) Registering with supervisor
+Registration successful: Registered as f703c40b-5e4b-4b17-a962-1919e02c290c-214dff8c
+[2m2026-01-16T04:56:13.369034Z[0m [32m INFO[0m ThreadId(14) Registration successful
+[2m2026-01-16T04:56:13.369074Z[0m [32m INFO[0m ThreadId(14) Supervisor 连接建立成功: http://127.0.0.1:8085
+[2m2026-01-16T04:56:13.369177Z[0m [32m INFO[0m ThreadId(14) Command listener started for denix-demo-01

@@ -1,0 +1,15 @@
+listen_addr = ["127.0.0.1"]
+listen_ports = [8093]
+
+[[upstreams]]
+host = "127.0.0.1"
+port = 8093
+
+[log.error_log]
+level = "info"
+path = "/mnt/sdb1/deislet/deislet/.demo/logs/deflux_error.log"
+
+[supervisor]
+addr = "http://127.0.0.1:8085"
+associated_id = "deflux-demo-01"
+secret = "016d425102bea4abcdf34deb656c0f8820a56903d45cbc66d5e4c0ddc8cf4299"

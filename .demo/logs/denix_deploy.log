@@ -1,0 +1,5 @@
+🚀 Deploying example apps to Denix (Rust)...
+📡 Target: http://127.0.0.1:8093
+
+❌ Error: Denix server is not running!
+   Please start it first: cargo run
