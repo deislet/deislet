@@ -109,10 +109,7 @@ mod tests {
 
         // 先加载 runtime.js
         runtime
-            .execute_script(
-                "<runtime>",
-                include_str!("../../runtime_js/runtime.js"),
-            )
+            .execute_script("<runtime>", include_str!("../../runtime_js/runtime.js"))
             .unwrap();
 
         runtime.execute_script("<test>", code).unwrap();

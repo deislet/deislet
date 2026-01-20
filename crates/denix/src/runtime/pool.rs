@@ -25,6 +25,7 @@ pub enum RuntimeMessage {
     LoadApp {
         app_id: String,
         code: String,
+        env: HashMap<String, String>,
         response: oneshot::Sender<Result<()>>,
     },
     /// 卸载应用
@@ -126,10 +127,11 @@ impl RuntimeThread {
                 RuntimeMessage::LoadApp {
                     app_id,
                     code,
+                    env,
                     response,
                 } => {
                     tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
-                    let result = match AppRuntime::new(app_id.clone(), code) {
+                    let result = match AppRuntime::new(app_id.clone(), code, env) {
                         Ok(runtime) => {
                             runtimes.insert(app_id.clone(), runtime);
                             Ok(())
@@ -186,7 +188,9 @@ impl RuntimeThread {
                     let result = match runtimes.get_mut(&app_id) {
                         Some(runtime) => {
                             // 注册 sender 到 WsServerManager，这样 JavaScript 可以发送消息到客户端
-                            runtime.register_ws_connection(ws_id.clone(), js_to_client_tx).await
+                            runtime
+                                .register_ws_connection(ws_id.clone(), js_to_client_tx)
+                                .await
                         }
                         None => Err(anyhow::anyhow!("App not found")),
                     };
@@ -228,7 +232,11 @@ impl RuntimeThread {
                     );
 
                     let result = match runtimes.get_mut(&app_id) {
-                        Some(runtime) => runtime.close_ws_connection(ws_id, 1000, "Gateway closed".to_string()).await,
+                        Some(runtime) => {
+                            runtime
+                                .close_ws_connection(ws_id, 1000, "Gateway closed".to_string())
+                                .await
+                        }
                         None => Err(anyhow::anyhow!("App not found")),
                     };
 
@@ -243,7 +251,11 @@ impl RuntimeThread {
         }
 
         // 显式清理所有 runtimes，确保在正确的上下文中 drop
-        tracing::debug!("Cleaning up {} runtimes in thread {}", runtimes.len(), thread_id);
+        tracing::debug!(
+            "Cleaning up {} runtimes in thread {}",
+            runtimes.len(),
+            thread_id
+        );
         runtimes.clear();
 
         tracing::info!("Runtime thread {} stopped", thread_id);
@@ -281,9 +293,7 @@ impl RuntimePool {
         let num_threads = num_threads.unwrap_or_else(num_cpus::get);
         tracing::info!("Creating runtime pool with {} threads", num_threads);
 
-        let threads = (0..num_threads)
-            .map(|i| RuntimeThread::new(i))
-            .collect();
+        let threads = (0..num_threads).map(|i| RuntimeThread::new(i)).collect();
 
         Self {
             threads,
@@ -316,7 +326,7 @@ impl RuntimePool {
     }
 
     /// 加载应用
-    pub async fn load_app(&self, app_id: String, code: String) -> Result<()> {
+    pub async fn load_app(&self, app_id: String, code: String, env: HashMap<String, String>) -> Result<()> {
         // 检查是否已存在
         if self.get_thread_id(&app_id).await.is_some() {
             return Err(anyhow::anyhow!("App already exists"));
@@ -331,11 +341,14 @@ impl RuntimePool {
         self.threads[thread_id].send(RuntimeMessage::LoadApp {
             app_id: app_id.clone(),
             code,
+            env,
             response: tx,
         })?;
 
         // 等待结果
-        let result = rx.await.map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?;
+        let result = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?;
 
         // 如果成功，记录分配
         if result.is_ok() {
@@ -361,7 +374,9 @@ impl RuntimePool {
         })?;
 
         // 等待结果
-        let result = rx.await.map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?;
+        let result = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?;
 
         // 如果成功，移除分配记录
         if result.is_ok() {
@@ -398,7 +413,8 @@ impl RuntimePool {
         })?;
 
         // 等待结果
-        rx.await.map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
     /// 列出所有应用
@@ -459,7 +475,8 @@ impl RuntimePool {
             response: tx,
         })?;
 
-        rx.await.map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
     /// 发送 WebSocket 消息到 JavaScript
@@ -472,7 +489,12 @@ impl RuntimePool {
     /// # 返回
     /// - Ok(()) 成功
     /// - Err(...) 应用不存在或发送失败
-    pub async fn send_ws_message(&self, app_id: &str, ws_id: String, message: String) -> Result<()> {
+    pub async fn send_ws_message(
+        &self,
+        app_id: &str,
+        ws_id: String,
+        message: String,
+    ) -> Result<()> {
         let thread_id = self
             .get_thread_id(app_id)
             .await
@@ -486,7 +508,8 @@ impl RuntimePool {
             response: tx,
         })?;
 
-        rx.await.map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
     /// 注销 WebSocket 连接
@@ -511,7 +534,8 @@ impl RuntimePool {
             response: tx,
         })?;
 
-        rx.await.map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 }
 
@@ -522,9 +546,8 @@ mod tests {
     use std::sync::Mutex;
 
     // 使用全局的 RuntimePool 避免多次创建/销毁导致的 V8 问题
-    static TEST_POOL: Lazy<Mutex<RuntimePool>> = Lazy::new(|| {
-        Mutex::new(RuntimePool::new(Some(4)))
-    });
+    static TEST_POOL: Lazy<Mutex<RuntimePool>> =
+        Lazy::new(|| Mutex::new(RuntimePool::new(Some(4))));
 
     #[tokio::test]
     async fn test_pool_creation() {
@@ -545,7 +568,9 @@ mod tests {
         "#;
 
         // 加载应用
-        let result = pool.load_app("test_load_exec_app".to_string(), code.to_string()).await;
+        let result = pool
+            .load_app("test_load_exec_app".to_string(), code.to_string(), HashMap::new())
+            .await;
         assert!(result.is_ok());
 
         // 执行请求
@@ -575,7 +600,7 @@ mod tests {
         // 加载多个应用
         for i in 0..4 {
             let code = r#"globalThis.default = { fetch() { return new Response("ok"); } }"#;
-            pool.load_app(format!("lb_app{}", i), code.to_string())
+            pool.load_app(format!("lb_app{}", i), code.to_string(), HashMap::new())
                 .await
                 .unwrap();
         }
@@ -596,7 +621,7 @@ mod tests {
         let pool = TEST_POOL.lock().unwrap();
 
         let code = r#"globalThis.default = { fetch() { return new Response("ok"); } }"#;
-        pool.load_app("unload_test_app".to_string(), code.to_string())
+        pool.load_app("unload_test_app".to_string(), code.to_string(), HashMap::new())
             .await
             .unwrap();
 

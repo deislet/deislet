@@ -26,7 +26,8 @@ pub enum WsServerMessage {
 
 /// WebSocket 服务端连接管理器
 /// 存储每个连接的发送通道
-pub type WsServerManager = Arc<RwLock<HashMap<WsConnectionId, mpsc::UnboundedSender<WsServerMessage>>>>;
+pub type WsServerManager =
+    Arc<RwLock<HashMap<WsConnectionId, mpsc::UnboundedSender<WsServerMessage>>>>;
 
 /// 创建 WebSocket 服务端管理器
 pub fn create_ws_server_manager() -> WsServerManager {

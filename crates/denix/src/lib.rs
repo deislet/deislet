@@ -1,4 +1,5 @@
 pub mod app;
+pub mod app_store;
 pub mod config;
 pub mod config_store;
 pub mod gateway;

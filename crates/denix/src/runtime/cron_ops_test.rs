@@ -108,7 +108,10 @@ mod tests {
         let mut runtime = setup_test_runtime();
 
         // 测试多种 cron 表达式
-        runtime.execute_script("<test>", r#"
+        runtime
+            .execute_script(
+                "<test>",
+                r#"
             {
                 const result = Deno.core.ops.op_cron_register("0 0 * * *", "midnight");
                 if (!result.success) throw new Error(`Failed: ${JSON.stringify(result)}`);
@@ -125,6 +128,8 @@ mod tests {
                 const result = Deno.core.ops.op_cron_register("0 0 1 * *", "first-of-month");
                 if (!result.success) throw new Error(`Failed: ${JSON.stringify(result)}`);
             }
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
     }
 }

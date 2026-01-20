@@ -21,6 +21,7 @@ pub struct FetchRequest {
 
 /// HTTP 响应结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct FetchResponse {
     pub status: u16,
     pub status_text: String,
@@ -40,10 +41,7 @@ pub struct FetchResponse {
 ///   或 { error: string }
 #[op2(async)]
 #[serde]
-async fn op_fetch(
-    _state: Rc<RefCell<OpState>>,
-    #[string] request_json: String,
-) -> JsonValue {
+async fn op_fetch(_state: Rc<RefCell<OpState>>, #[string] request_json: String) -> JsonValue {
     // 解析请求
     let request: FetchRequest = match serde_json::from_str(&request_json) {
         Ok(req) => req,
@@ -114,7 +112,11 @@ async fn op_fetch(
 
     // 提取响应信息
     let status = response.status().as_u16();
-    let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+    let status_text = response
+        .status()
+        .canonical_reason()
+        .unwrap_or("")
+        .to_string();
 
     // 提取响应头
     let mut headers = HashMap::new();
@@ -144,10 +146,7 @@ async fn op_fetch(
 }
 
 // 定义 http extension
-extension!(
-    denix_http_ops,
-    ops = [op_fetch],
-);
+extension!(denix_http_ops, ops = [op_fetch],);
 
 /// 初始化 http ops extension
 pub fn init_http_extension() -> deno_core::Extension {

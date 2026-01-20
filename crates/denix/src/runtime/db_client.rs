@@ -52,12 +52,11 @@ impl DbClient {
     ///
     /// # 返回
     /// - (rows_affected, last_insert_id): 影响行数和插入 ID
-    pub async fn execute(
-        &self,
-        sql: String,
-        params: Option<String>,
-    ) -> Result<(i64, Option<i64>)> {
-        let request = tonic::Request::new(ExecuteRequest { sql: sql.clone(), params });
+    pub async fn execute(&self, sql: String, params: Option<String>) -> Result<(i64, Option<i64>)> {
+        let request = tonic::Request::new(ExecuteRequest {
+            sql: sql.clone(),
+            params,
+        });
 
         tracing::debug!("DB Execute: {}", sql);
 
@@ -66,7 +65,9 @@ impl DbClient {
         let exec_response = response.into_inner();
 
         if !exec_response.success {
-            let error_msg = exec_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = exec_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("DB Execute failed: {}", error_msg);
         }
 
@@ -86,7 +87,10 @@ impl DbClient {
         sql: String,
         params: Option<String>,
     ) -> Result<(String, Vec<String>)> {
-        let request = tonic::Request::new(QueryRequest { sql: sql.clone(), params });
+        let request = tonic::Request::new(QueryRequest {
+            sql: sql.clone(),
+            params,
+        });
 
         tracing::debug!("DB Query: {}", sql);
 
@@ -95,7 +99,9 @@ impl DbClient {
         let query_response = response.into_inner();
 
         if !query_response.success {
-            let error_msg = query_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = query_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("DB Query failed: {}", error_msg);
         }
 
@@ -122,14 +128,19 @@ impl DbClient {
             statements: execute_requests,
         });
 
-        tracing::debug!("DB Batch: {} statements", request.get_ref().statements.len());
+        tracing::debug!(
+            "DB Batch: {} statements",
+            request.get_ref().statements.len()
+        );
 
         let mut client = self.client.lock().await;
         let response = client.batch(request).await?;
         let batch_response = response.into_inner();
 
         if !batch_response.success {
-            let error_msg = batch_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = batch_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("DB Batch failed: {}", error_msg);
         }
 
@@ -181,7 +192,10 @@ impl DbClient {
         statement_id: String,
         params: Option<String>,
     ) -> Result<(i64, Option<i64>)> {
-        let request = tonic::Request::new(ExecutePreparedRequest { statement_id, params });
+        let request = tonic::Request::new(ExecutePreparedRequest {
+            statement_id,
+            params,
+        });
 
         tracing::debug!("DB ExecutePrepared");
 
@@ -190,7 +204,9 @@ impl DbClient {
         let exec_response = response.into_inner();
 
         if !exec_response.success {
-            let error_msg = exec_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = exec_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("DB ExecutePrepared failed: {}", error_msg);
         }
 
@@ -210,7 +226,10 @@ impl DbClient {
         statement_id: String,
         params: Option<String>,
     ) -> Result<(String, Vec<String>)> {
-        let request = tonic::Request::new(QueryPreparedRequest { statement_id, params });
+        let request = tonic::Request::new(QueryPreparedRequest {
+            statement_id,
+            params,
+        });
 
         tracing::debug!("DB QueryPrepared");
 
@@ -219,7 +238,9 @@ impl DbClient {
         let query_response = response.into_inner();
 
         if !query_response.success {
-            let error_msg = query_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = query_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("DB QueryPrepared failed: {}", error_msg);
         }
 
@@ -252,7 +273,10 @@ mod tests {
 
         // Create table
         client
-            .execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)".to_string(), None)
+            .execute(
+                "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)".to_string(),
+                None,
+            )
             .await
             .expect("Failed to create table");
 
@@ -269,7 +293,10 @@ mod tests {
 
         // Query
         let (rows, columns) = client
-            .query("SELECT * FROM users WHERE name = ?".to_string(), Some("[\"Alice\"]".to_string()))
+            .query(
+                "SELECT * FROM users WHERE name = ?".to_string(),
+                Some("[\"Alice\"]".to_string()),
+            )
             .await
             .expect("Failed to query");
         assert!(columns.contains(&"name".to_string()));
@@ -278,8 +305,14 @@ mod tests {
         // Batch
         let batch_results = client
             .batch(vec![
-                ("INSERT INTO users (name) VALUES (?)".to_string(), Some("[\"Bob\"]".to_string())),
-                ("INSERT INTO users (name) VALUES (?)".to_string(), Some("[\"Carol\"]".to_string())),
+                (
+                    "INSERT INTO users (name) VALUES (?)".to_string(),
+                    Some("[\"Bob\"]".to_string()),
+                ),
+                (
+                    "INSERT INTO users (name) VALUES (?)".to_string(),
+                    Some("[\"Carol\"]".to_string()),
+                ),
             ])
             .await
             .expect("Failed to batch");

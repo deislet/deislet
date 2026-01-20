@@ -39,10 +39,7 @@ pub struct WsConnectRequest {
 /// - JSON 对象: { success: bool, ws_id?: string, error?: string }
 #[op2(async)]
 #[serde]
-async fn op_ws_connect(
-    state: Rc<RefCell<OpState>>,
-    #[string] request_json: String,
-) -> JsonValue {
+async fn op_ws_connect(state: Rc<RefCell<OpState>>, #[string] request_json: String) -> JsonValue {
     // 解析请求
     let request: WsConnectRequest = match serde_json::from_str(&request_json) {
         Ok(req) => req,
@@ -230,10 +227,7 @@ async fn op_ws_close(state: Rc<RefCell<OpState>>, #[string] ws_id: String) -> Js
 }
 
 // 定义 ws extension
-extension!(
-    denix_ws_ops,
-    ops = [op_ws_connect, op_ws_send, op_ws_close],
-);
+extension!(denix_ws_ops, ops = [op_ws_connect, op_ws_send, op_ws_close],);
 
 /// 初始化 ws ops extension
 pub fn init_ws_extension() -> deno_core::Extension {

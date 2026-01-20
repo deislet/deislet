@@ -1,32 +1,32 @@
-// HTTP 网关模块
+// HTTP Gateway Module
 
 pub mod handlers;
 
 use crate::app::ApplicationManager;
+use crate::app_store::AppStore;
 use crate::config_store::ConfigStore;
 use crate::management::ManagementServer;
 use anyhow::Result;
 use axum::{
-    body::Body,
-    http::{Request, header::CONTENT_TYPE},
     routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
-use tower::{Service, ServiceExt};
+
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-/// 应用状态
+/// Application State
 #[derive(Clone)]
 pub struct AppState {
     pub app_manager: Arc<ApplicationManager>,
 }
 
-/// 启动 HTTP + gRPC 服务器（复用同一端口）
+/// Start HTTP + gRPC server (reuse the same port)
 pub async fn start_server(
     app_manager: Arc<ApplicationManager>,
     config_store: Arc<ConfigStore>,
+    app_store: Arc<AppStore>,
     worker_id: String,
     port: u16,
 ) -> Result<()> {
@@ -34,54 +34,75 @@ pub async fn start_server(
         app_manager: app_manager.clone(),
     };
 
-    // 创建 gRPC 管理服务
-    let grpc_service = ManagementServer::create_service(
-        app_manager.clone(),
-        config_store,
-        worker_id,
-    );
+    // Create gRPC management service
+    let grpc_service =
+        ManagementServer::create_service(app_manager.clone(), config_store, app_store, worker_id);
 
-    // 构建 HTTP 路由
+    // Build HTTP routes - 所有请求通过 x-app-id header 路由
+    // 添加通配符路由来处理所有 HTTP 请求
     let http_router = Router::new()
-        // 根路径
-        .route("/", get(handlers::handle_root))
-        // 健康检查
-        .route("/health", get(handlers::handle_health))
-        // 管理 API
-        .route("/api/apps", post(handlers::handle_create_app))
-        .route("/api/apps", get(handlers::handle_list_apps))
-        .route("/api/apps/:id", get(handlers::handle_get_app))
-        .route("/api/apps/:id", put(handlers::handle_update_app))
-        .route("/api/apps/:id", delete(handlers::handle_delete_app))
-        // 应用路由 - 必须最后，因为它是通配符
-        .route("/apps/:id", get(handlers::handle_app_request))
-        .route("/apps/:id", post(handlers::handle_app_request))
-        .route("/apps/:id", put(handlers::handle_app_request))
-        .route("/apps/:id", delete(handlers::handle_app_request))
-        .route("/apps/:id/*path", get(handlers::handle_app_request))
-        .route("/apps/:id/*path", post(handlers::handle_app_request))
-        .route("/apps/:id/*path", put(handlers::handle_app_request))
-        .route("/apps/:id/*path", delete(handlers::handle_app_request))
+        .route("/*path", axum::routing::any(handlers::handle_request))
+        .route("/", axum::routing::any(handlers::handle_request))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    // 合并 HTTP 和 gRPC 服务
-    // gRPC 请求通过 content-type: application/grpc 识别，不会与 HTTP 路由冲突
+    // Merge HTTP and gRPC services
+    // HTTP 路由优先，gRPC 作为 fallback（但实际上 HTTP 会处理所有非 gRPC 的请求）
     let app = http_router.fallback_service(grpc_service);
 
-    // 绑定地址
+    // Bind address
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    // 预加载系统管理应用
+    let system_app_code = include_str!("system_app.js");
+    match app_manager
+        .load_app(
+            "_system".to_string(),
+            system_app_code.to_string(),
+            crate::app::AppConfig::default(),
+        )
+        .await
+    {
+        Ok(_) => info!("✅ 系统管理应用已加载 (app_id: _system)"),
+        Err(e) => {
+            tracing::error!("❌ 加载系统管理应用失败: {}", e);
+            anyhow::bail!("Failed to load system app: {}", e);
+        }
+    }
+
+    // 预加载测试应用（可选）
+    let test_app_code = r#"
+export default {
+  fetch(request, env) {
+    return new Response("Hello from x-app-id: hello! Path: " + request.url);
+  }
+}
+"#;
+    match app_manager.load_app("hello".to_string(), test_app_code.to_string(), crate::app::AppConfig::default()).await {
+        Ok(_) => info!("✅ 测试应用已加载 (app_id: hello)"),
+        Err(e) => tracing::warn!("⚠️ 加载测试应用失败: {}", e),
+    }
 
     info!("====================================");
     info!("✅ Denix Platform is ready!");
     info!("📡 HTTP Server: http://localhost:{}", port);
-    info!("📡 gRPC Management: localhost:{} (content-type: application/grpc)", port);
-    info!("📊 Health Check: http://localhost:{}/health", port);
-    info!("📚 API Docs: http://localhost:{}/", port);
+    info!(
+        "📡 gRPC Management: localhost:{} (content-type: application/grpc)",
+        port
+    );
+    info!("🎯 New Routing: x-app-id header based");
+    info!(
+        "📊 Health Check: curl -H \"x-app-id: _system\" http://localhost:{}/health",
+        port
+    );
+    info!(
+        "📚 Platform Info: curl -H \"x-app-id: _system\" http://localhost:{}/",
+        port
+    );
     info!("====================================");
 
-    // 启动服务器
+    // Start server
     axum::serve(listener, app).await?;
 
     Ok(())

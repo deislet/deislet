@@ -48,7 +48,7 @@ impl ApplicationManager {
         };
 
         // 在 runtime pool 中加载应用
-        match self.runtime_pool.load_app(id.clone(), code).await {
+        match self.runtime_pool.load_app(id.clone(), code, std::collections::HashMap::new()).await {
             Ok(()) => {
                 app_info.state = AppState::Running;
                 app_info.updated_at = SystemTime::now();
@@ -84,10 +84,18 @@ impl ApplicationManager {
     }
 
     /// 更新应用
-    pub async fn update_app(&self, id: &str, code: String, config: Option<AppConfig>) -> Result<()> {
+    pub async fn update_app(
+        &self,
+        id: &str,
+        code: String,
+        config: Option<AppConfig>,
+    ) -> Result<()> {
         tracing::info!("Updating app: {}", id);
 
-        let entry = self.apps.get(id).ok_or_else(|| anyhow!("App {} not found", id))?;
+        let entry = self
+            .apps
+            .get(id)
+            .ok_or_else(|| anyhow!("App {} not found", id))?;
 
         // 获取当前配置
         let current_config = config.unwrap_or_else(|| entry.config.clone());
@@ -97,7 +105,7 @@ impl ApplicationManager {
         self.runtime_pool.unload_app(id).await?;
 
         // 加载新版本
-        self.runtime_pool.load_app(id.to_string(), code).await?;
+        self.runtime_pool.load_app(id.to_string(), code, std::collections::HashMap::new()).await?;
 
         // 更新应用信息
         if let Some(mut entry) = self.apps.get_mut(id) {
@@ -119,11 +127,22 @@ impl ApplicationManager {
         method: String,
         headers: std::collections::HashMap<String, String>,
         body: Option<String>,
-    ) -> Result<(u16, std::collections::HashMap<String, String>, Option<String>)> {
-        let entry = self.apps.get(id).ok_or_else(|| anyhow!("App {} not found", id))?;
+    ) -> Result<(
+        u16,
+        std::collections::HashMap<String, String>,
+        Option<String>,
+    )> {
+        let entry = self
+            .apps
+            .get(id)
+            .ok_or_else(|| anyhow!("App {} not found", id))?;
 
         if entry.state != AppState::Running {
-            return Err(anyhow!("App {} is not running (state: {:?})", id, entry.state));
+            return Err(anyhow!(
+                "App {} is not running (state: {:?})",
+                id,
+                entry.state
+            ));
         }
 
         drop(entry);
@@ -135,6 +154,7 @@ impl ApplicationManager {
     }
 
     /// 获取应用信息
+    #[allow(dead_code)]
     pub fn get_app(&self, id: &str) -> Option<App> {
         self.apps.get(id).map(|entry| entry.clone())
     }
@@ -145,6 +165,7 @@ impl ApplicationManager {
     }
 
     /// 获取统计信息
+    #[allow(dead_code)]
     pub async fn get_stats(&self) -> serde_json::Value {
         let apps: Vec<App> = self.apps.iter().map(|entry| entry.clone()).collect();
         let pool_stats = self.runtime_pool.get_stats().await;
@@ -159,7 +180,10 @@ impl ApplicationManager {
 
         // 添加线程池统计
         if let Some(obj) = stats.as_object_mut() {
-            obj.insert("pool".to_string(), serde_json::to_value(pool_stats).unwrap());
+            obj.insert(
+                "pool".to_string(),
+                serde_json::to_value(pool_stats).unwrap(),
+            );
         }
 
         stats
@@ -190,7 +214,12 @@ impl ApplicationManager {
     /// - app_id: 应用 ID
     /// - ws_id: WebSocket 连接 ID
     /// - message: 消息内容
-    pub async fn send_ws_message(&self, app_id: &str, ws_id: String, message: String) -> Result<()> {
+    pub async fn send_ws_message(
+        &self,
+        app_id: &str,
+        ws_id: String,
+        message: String,
+    ) -> Result<()> {
         self.runtime_pool
             .send_ws_message(app_id, ws_id, message)
             .await
@@ -202,7 +231,9 @@ impl ApplicationManager {
     /// - app_id: 应用 ID
     /// - ws_id: WebSocket 连接 ID
     pub async fn unregister_ws_connection(&self, app_id: &str, ws_id: String) -> Result<()> {
-        self.runtime_pool.unregister_ws_connection(app_id, ws_id).await
+        self.runtime_pool
+            .unregister_ws_connection(app_id, ws_id)
+            .await
     }
 }
 

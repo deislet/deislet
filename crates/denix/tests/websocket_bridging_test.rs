@@ -1,13 +1,13 @@
-// WebSocket 消息桥接集成测试
+// WebSocket message bridging integration test
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 #[tokio::test]
 async fn test_websocket_echo_bridging() {
-    println!("\n🧪 测试 WebSocket 消息桥接功能");
+    println!("\n🧪 Testing WebSocket message bridging functionality");
 
-    // 部署 WebSocket echo 应用
+    // Deploy WebSocket echo app
     let code = r#"
         globalThis.default = {
           async fetch(request) {
@@ -43,7 +43,7 @@ async fn test_websocket_echo_bridging() {
         };
     "#;
 
-    // 部署应用
+    // Deploy app
     let client = reqwest::Client::new();
     let response = client
         .post("http://localhost:8000/api/apps")
@@ -55,84 +55,93 @@ async fn test_websocket_echo_bridging() {
         .await;
 
     if let Err(e) = response {
-        println!("⚠️  服务器未运行，跳过测试: {}", e);
+        println!("⚠️  Server not running, skipping test: {}", e);
         return;
     }
 
     let response = response.unwrap();
     if !response.status().is_success() {
-        println!("⚠️  应用部署失败，跳过测试");
+        println!("⚠️  App deployment failed, skipping test");
         return;
     }
 
-    println!("✅ 应用部署成功");
+    println!("✅ App deployed successfully");
 
-    // 连接 WebSocket
+    // Connect WebSocket
     let url = "ws://localhost:8000/apps/ws-bridge-test";
-    println!("🔗 连接到: {}", url);
+    println!("🔗 Connecting to: {}", url);
 
     match connect_async(url).await {
         Ok((mut ws_stream, _)) => {
-            println!("✅ WebSocket 连接已建立");
+            println!("✅ WebSocket connection established");
 
-            // 接收欢迎消息
+            // Receive welcome message
             if let Some(Ok(Message::Text(welcome))) = ws_stream.next().await {
-                println!("📥 接收: {}", welcome);
-                assert!(welcome.contains("Welcome"), "应该收到欢迎消息");
+                println!("📥 Received: {}", welcome);
+                assert!(
+                    welcome.contains("Welcome"),
+                    "Should receive welcome message"
+                );
             } else {
-                panic!("未收到欢迎消息");
+                panic!("Did not receive welcome message");
             }
 
-            // 发送测试消息 1
+            // Send test message 1
             let test_msg1 = "Hello WebSocket!";
-            println!("📤 发送: {}", test_msg1);
+            println!("📤 Sending: {}", test_msg1);
             ws_stream
                 .send(Message::Text(test_msg1.to_string()))
                 .await
-                .expect("发送消息失败");
+                .expect("Failed to send message");
 
-            // 接收回显
+            // Receive echo
             if let Some(Ok(Message::Text(echo1))) = ws_stream.next().await {
-                println!("📥 接收: {}", echo1);
-                assert!(echo1.contains("Echo:"), "应该收到 echo 回复");
-                assert!(echo1.contains(test_msg1), "回复应包含原始消息");
+                println!("📥 Received: {}", echo1);
+                assert!(echo1.contains("Echo:"), "Should receive echo reply");
+                assert!(
+                    echo1.contains(test_msg1),
+                    "Reply should contain original message"
+                );
             } else {
-                panic!("未收到 echo 回复");
+                panic!("Did not receive echo reply");
             }
 
-            // 发送测试消息 2
+            // Send test message 2
             let test_msg2 = "Second message!";
-            println!("📤 发送: {}", test_msg2);
+            println!("📤 Sending: {}", test_msg2);
             ws_stream
                 .send(Message::Text(test_msg2.to_string()))
                 .await
-                .expect("发送消息失败");
+                .expect("Failed to send message");
 
-            // 接收回显
+            // Receive echo
             if let Some(Ok(Message::Text(echo2))) = ws_stream.next().await {
-                println!("📥 接收: {}", echo2);
-                assert!(echo2.contains("Echo:"), "应该收到 echo 回复");
-                assert!(echo2.contains(test_msg2), "回复应包含原始消息");
+                println!("📥 Received: {}", echo2);
+                assert!(echo2.contains("Echo:"), "Should receive echo reply");
+                assert!(
+                    echo2.contains(test_msg2),
+                    "Reply should contain original message"
+                );
             } else {
-                panic!("未收到 echo 回复");
+                panic!("Did not receive echo reply");
             }
 
-            // 关闭连接
-            println!("🔌 关闭连接");
+            // Close connection
+            println!("🔌 Closing connection");
             ws_stream
                 .send(Message::Close(None))
                 .await
-                .expect("关闭连接失败");
+                .expect("Failed to close connection");
 
-            println!("✅ WebSocket 消息桥接测试成功！");
+            println!("✅ WebSocket message bridging test successful!");
         }
         Err(e) => {
-            println!("⚠️  WebSocket 连接失败: {}", e);
-            println!("这可能是因为服务器未运行或应用未正确部署");
+            println!("⚠️  WebSocket connection failed: {}", e);
+            println!("This may be because the server is not running or the app was not deployed correctly");
         }
     }
 
-    // 清理：删除应用
+    // Cleanup: delete app
     let _ = client
         .delete("http://localhost:8000/api/apps/ws-bridge-test")
         .send()

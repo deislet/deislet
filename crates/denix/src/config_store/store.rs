@@ -48,8 +48,7 @@ impl ConfigStore {
 
     /// 初始化数据库表（同步函数）
     fn init_db(db_path: &str) -> Result<()> {
-        let conn = rusqlite::Connection::open(db_path)
-            .context("Failed to open database")?;
+        let conn = rusqlite::Connection::open(db_path).context("Failed to open database")?;
 
         conn.execute(
             r#"

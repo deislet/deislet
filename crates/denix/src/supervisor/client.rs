@@ -1,14 +1,16 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::{interval, interval_at, Instant};
 use tracing::{debug, error, info, warn};
 
+use denira_workit::models::{
+    ConfigPushAckMessage, ConfigPushData, WorkitMessage,
+};
 use denira_workit::{
     MessageBuilder, SdkResult, SupervisorConfig, WorkerCommand, WorkerInfo, WorkerType,
     WorkitClient, WorkitError,
 };
-use denira_workit::models::{ConfigPushAckMessage, ConfigPushData, ConfigPushMessage, WorkitMessage};
 
 use super::config::DenixSupervisorConfig;
 use crate::app::ApplicationManager;
@@ -86,7 +88,10 @@ impl DenixSupervisorClient {
     }
 
     pub async fn start(&mut self) -> SdkResult<()> {
-        info!("Starting denix supervisor client for {}", self.config.associated_id);
+        info!(
+            "Starting denix supervisor client for {}",
+            self.config.associated_id
+        );
 
         self.connect().await?;
         self.authenticate().await?;
@@ -195,12 +200,12 @@ impl DenixSupervisorClient {
             info!("Command listener started for {}", instance_id);
 
             loop {
-use denira_workit::pb::{
-    SupervisorMessage, CommandRequest, ConfigUpdate, CommandResponse,
-    supervisor_message::Payload
-};
+                use denira_workit::pb::{
+                    supervisor_message::Payload, CommandResponse,
+                    SupervisorMessage,
+                };
 
-// ...
+                // ...
 
                 // 从 supervisor 接收消息
                 let payload = {
@@ -210,7 +215,7 @@ use denira_workit::pb::{
                         Ok(None) => {
                             warn!("Stream closed for {}", instance_id);
                             break;
-                        },
+                        }
                         Err(e) => {
                             error!("Failed to receive message for {}: {}", instance_id, e);
                             break;
@@ -224,18 +229,29 @@ use denira_workit::pb::{
                     Payload::CommandRequest(cmd_req) => {
                         // 构建 WorkerCommand
                         // 解析 args_json
-                        let args: Vec<String> = match cmd_req.args_json.is_empty() || cmd_req.args_json == "null" {
+                        let args: Vec<String> = match cmd_req.args_json.is_empty()
+                            || cmd_req.args_json == "null"
+                        {
                             true => Vec::new(),
                             false => serde_json::from_str(&cmd_req.args_json).unwrap_or_default(),
                         };
 
                         let command = match cmd_req.command.as_str() {
-                            "shutdown" => WorkerCommand::Shutdown { timeout_seconds: None, reason: None },
-                            "restart" => WorkerCommand::Restart { timeout_seconds: None, preserve_state: false },
+                            "shutdown" => WorkerCommand::Shutdown {
+                                timeout_seconds: None,
+                                reason: None,
+                            },
+                            "restart" => WorkerCommand::Restart {
+                                timeout_seconds: None,
+                                preserve_state: false,
+                            },
                             "reload" => WorkerCommand::Reload,
                             "get_status" => WorkerCommand::GetStatus,
                             "get_metrics" => WorkerCommand::GetMetrics,
-                            custom => WorkerCommand::Custom { command: custom.to_string(), args },
+                            custom => WorkerCommand::Custom {
+                                command: custom.to_string(),
+                                args,
+                            },
                         };
 
                         info!("Processing command for {}: {:?}", instance_id, command);
@@ -270,8 +286,10 @@ use denira_workit::pb::{
                                     payload: Some(Payload::CommandResponse(response_msg)),
                                 };
                                 let client_guard = client.lock().await;
-                                if let Err(e) = client_guard.send_message(msg.payload.unwrap()).await {
-                                     error!("Failed to send response: {}", e);
+                                if let Err(e) =
+                                    client_guard.send_message(msg.payload.unwrap()).await
+                                {
+                                    error!("Failed to send response: {}", e);
                                 }
                             }
                             Err(e) => {
@@ -285,8 +303,10 @@ use denira_workit::pb::{
                                     payload: Some(Payload::CommandResponse(response_msg)),
                                 };
                                 let client_guard = client.lock().await;
-                                if let Err(e) = client_guard.send_message(msg.payload.unwrap()).await {
-                                     error!("Failed to send error response: {}", e);
+                                if let Err(e) =
+                                    client_guard.send_message(msg.payload.unwrap()).await
+                                {
+                                    error!("Failed to send error response: {}", e);
                                 }
                             }
                         }
@@ -373,7 +393,10 @@ use denira_workit::pb::{
         };
 
         let (success, message) = match result {
-            Ok(_) => (true, format!("Config {} applied successfully", config_data.config_key)),
+            Ok(_) => (
+                true,
+                format!("Config {} applied successfully", config_data.config_key),
+            ),
             Err(e) => (false, format!("Failed to apply config: {}", e)),
         };
 
@@ -391,8 +414,14 @@ use denira_workit::pb::{
         info!("Handling command: {:?}", command);
 
         match command {
-            WorkerCommand::Shutdown { timeout_seconds, reason } => {
-                info!("Shutdown requested: timeout={:?}, reason={:?}", timeout_seconds, reason);
+            WorkerCommand::Shutdown {
+                timeout_seconds,
+                reason,
+            } => {
+                info!(
+                    "Shutdown requested: timeout={:?}, reason={:?}",
+                    timeout_seconds, reason
+                );
 
                 // 实际的关闭逻辑
                 if let Some(app_manager) = &self.app_manager {
@@ -412,8 +441,14 @@ use denira_workit::pb::{
                 }))
             }
 
-            WorkerCommand::Restart { timeout_seconds, preserve_state } => {
-                info!("Restart requested: timeout={:?}, preserve_state={}", timeout_seconds, preserve_state);
+            WorkerCommand::Restart {
+                timeout_seconds,
+                preserve_state,
+            } => {
+                info!(
+                    "Restart requested: timeout={:?}, preserve_state={}",
+                    timeout_seconds, preserve_state
+                );
 
                 // 实际的重启逻辑
                 if let Some(app_manager) = &self.app_manager {
@@ -476,7 +511,10 @@ use denira_workit::pb::{
             WorkerCommand::GetStatus => {
                 let (total_apps, running_apps) = if let Some(app_manager) = &self.app_manager {
                     let apps = app_manager.list_apps();
-                    let running = apps.iter().filter(|a| a.state == crate::app::AppState::Running).count();
+                    let running = apps
+                        .iter()
+                        .filter(|a| a.state == crate::app::AppState::Running)
+                        .count();
                     (apps.len(), running)
                 } else {
                     (0, 0)
@@ -530,12 +568,10 @@ use denira_workit::pb::{
                             }))
                         }
                     }
-                    _ => {
-                        Ok(serde_json::json!({
-                            "success": false,
-                            "error": format!("Unknown command: {}", command)
-                        }))
-                    }
+                    _ => Ok(serde_json::json!({
+                        "success": false,
+                        "error": format!("Unknown command: {}", command)
+                    })),
                 }
             }
         }

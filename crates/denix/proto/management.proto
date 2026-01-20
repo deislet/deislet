@@ -65,10 +65,10 @@ message DeployAppRequest {
     // 应用 ID
     string app_id = 1;
 
-    // 应用代码
-    string code = 2;
+    // 应用 ZIP 包数据
+    bytes package_data = 2;
 
-    // 应用配置
+    // 应用配置（可选，会覆盖 manifest 中的配置）
     AppConfig config = 3;
 }
 
@@ -126,7 +126,9 @@ message UnloadAppResponse {
 // 更新应用请求
 message UpdateAppRequest {
     string app_id = 1;
-    string code = 2;
+    // 应用 ZIP 包数据
+    bytes package_data = 2;
+    // 应用配置（可选，会覆盖 manifest 中的配置）
     AppConfig config = 3;
 }
 

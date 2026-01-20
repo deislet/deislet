@@ -1,237 +1,52 @@
-// HTTP 请求处理器
+// HTTP request handlers
 
 use super::AppState;
-use crate::app::{CreateAppRequest, UpdateAppRequest};
 use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Request, State,
     },
-    http::{HeaderMap, Method, StatusCode},
-    response::{Html, IntoResponse, Response},
-    Json,
+    http::{HeaderMap, Method, StatusCode, Uri},
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-/// 处理根路径
-pub async fn handle_root(State(state): State<AppState>) -> impl IntoResponse {
-    let stats = state.app_manager.get_stats().await;
-    let apps = state.app_manager.list_apps();
-
-    let apps_html = if apps.is_empty() {
-        "<p>No applications deployed yet.</p>".to_string()
-    } else {
-        apps.iter()
-            .map(|app| {
-                format!(
-                    r#"
-                    <div class="app-item">
-                        <div>
-                            <div class="app-id">{}</div>
-                            <div style="color: #666; font-size: 0.875rem;">
-                                Created: {:?}
-                            </div>
-                        </div>
-                        <span class="app-state state-{:?}">{:?}</span>
-                    </div>
-                    "#,
-                    app.id, app.created_at, app.state, app.state
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let html = format!(
-        r#"
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Denix - Rust Multi-tenant Platform</title>
-  <style>
-    body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1200px; margin: 0 auto; padding: 2rem; background: #f5f5f5; }}
-    h1 {{ color: #333; }}
-    .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 2rem 0; }}
-    .stat-card {{ background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-    .stat-value {{ font-size: 2rem; font-weight: bold; color: #4a90e2; }}
-    .stat-label {{ color: #666; margin-top: 0.5rem; }}
-    .apps {{ background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-    .app-item {{ padding: 1rem; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }}
-    .app-item:last-child {{ border-bottom: none; }}
-    .app-id {{ font-weight: bold; }}
-    .app-state {{ padding: 0.25rem 0.75rem; border-radius: 12px; font-size: 0.875rem; }}
-    .state-Running {{ background: #d4edda; color: #155724; }}
-    .state-Stopped {{ background: #f8d7da; color: #721c24; }}
-    .state-Error {{ background: #f8d7da; color: #721c24; }}
-    .state-Loading {{ background: #fff3cd; color: #856404; }}
-    pre {{ background: #f4f4f4; padding: 1rem; border-radius: 4px; overflow-x: auto; }}
-  </style>
-</head>
-<body>
-  <h1>🦀 Denix Platform (Rust + deno_core)</h1>
-  <p>High-performance multi-tenant platform for TypeScript/JavaScript applications</p>
-
-  <h2>Statistics</h2>
-  <div class="stats">
-    <div class="stat-card">
-      <div class="stat-value">{}</div>
-      <div class="stat-label">Total Apps</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-value">{}</div>
-      <div class="stat-label">Running</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-value">{}</div>
-      <div class="stat-label">Stopped</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-value">{}</div>
-      <div class="stat-label">Errors</div>
-    </div>
-  </div>
-
-  <h2>Applications</h2>
-  <div class="apps">
-    {}
-  </div>
-
-  <div style="background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-top: 2rem;">
-    <h2>Quick Start</h2>
-    <p>Deploy an application:</p>
-    <pre>curl -X POST http://localhost:8000/api/apps \
-  -H "Content-Type: application/json" \
-  -d '{{
-    "id": "hello",
-    "code": "export default {{ fetch() {{ return new Response(\\\"Hello from Rust!\\\") }} }}"
-  }}'</pre>
-    <p>Access your application:</p>
-    <pre>curl http://localhost:8000/apps/hello</pre>
-  </div>
-</body>
-</html>
-        "#,
-        stats["total"], stats["running"], stats["stopped"], stats["error"], apps_html
-    );
-
-    Html(html)
-}
-
-/// 处理健康检查
-pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
-    let stats = state.app_manager.get_stats().await;
-
-    Json(json!({
-        "status": "healthy",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "stats": stats,
-    }))
-}
-
-/// 创建应用
-pub async fn handle_create_app(
+/// 统一请求处理器 - 通过 x-app-id header 路由到对应应用
+pub async fn handle_request(
     State(state): State<AppState>,
-    Json(req): Json<CreateAppRequest>,
-) -> impl IntoResponse {
-    match state.app_manager.load_app(req.id.clone(), req.code, req.config).await {
-        Ok(_) => (
-            StatusCode::CREATED,
-            Json(json!({
-                "success": true,
-                "appId": req.id
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": e.to_string()
-            })),
-        )
-            .into_response(),
-    }
-}
-
-/// 列出应用
-pub async fn handle_list_apps(State(state): State<AppState>) -> impl IntoResponse {
-    let apps = state.app_manager.list_apps();
-    Json(json!({ "apps": apps }))
-}
-
-/// 获取应用信息
-pub async fn handle_get_app(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    match state.app_manager.get_app(&id) {
-        Some(app) => Json(json!(app)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "App not found" })),
-        )
-            .into_response(),
-    }
-}
-
-/// 更新应用
-pub async fn handle_update_app(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateAppRequest>,
-) -> impl IntoResponse {
-    match state.app_manager.update_app(&id, req.code, req.config).await {
-        Ok(_) => Json(json!({ "success": true })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-/// 删除应用
-pub async fn handle_delete_app(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    match state.app_manager.unload_app(&id).await {
-        Ok(_) => Json(json!({ "success": true })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-/// 处理应用请求
-pub async fn handle_app_request(
-    State(state): State<AppState>,
-    Path(params): Path<HashMap<String, String>>,
     method: Method,
+    uri: Uri,
     headers: HeaderMap,
     ws: Option<WebSocketUpgrade>,
     body: String,
 ) -> impl IntoResponse {
-    let app_id = match params.get("id") {
-        Some(id) => id.clone(),
+    // 从 header 中获取 app_id
+    let app_id = match headers.get("x-app-id").and_then(|v| v.to_str().ok()) {
+        Some(id) => id.to_string(),
         None => {
+            tracing::warn!("请求缺少 x-app-id header: {} {}", method, uri);
             return (
                 StatusCode::BAD_REQUEST,
-                "Missing app ID".to_string(),
+                "Missing x-app-id header".to_string(),
             )
                 .into_response();
         }
     };
 
-    let path = params.get("path").map(|s| s.as_str()).unwrap_or("");
-    let url = format!("http://localhost/{}", path);
+    // 使用完整的 URI（包含 path 和 query）
+    let url = format!("http://localhost{}", uri);
+
+    tracing::debug!(
+        "路由请求: app_id={}, method={}, url={}",
+        app_id,
+        method,
+        url
+    );
 
     // 转换 headers
-    let mut header_map = HashMap::new();
+    let mut header_map = std::collections::HashMap::new();
     for (key, value) in headers.iter() {
         if let Ok(value_str) = value.to_str() {
             header_map.insert(key.to_string(), value_str.to_string());
@@ -294,7 +109,10 @@ pub async fn handle_app_request(
                 .unwrap()
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            tracing::error!("应用 {} 执行失败: {}", app_id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -325,11 +143,7 @@ async fn handle_websocket_bridged(
         .register_ws_connection(&app_id, ws_id.clone(), js_to_client_tx)
         .await
     {
-        tracing::error!(
-            "Failed to register WebSocket connection {}: {}",
-            ws_id,
-            e
-        );
+        tracing::error!("Failed to register WebSocket connection {}: {}", ws_id, e);
         let _ = ws_sender
             .send(Message::Close(Some(axum::extract::ws::CloseFrame {
                 code: 1011, // Internal Error
@@ -365,7 +179,8 @@ async fn handle_websocket_bridged(
                         ws_id_clone
                     );
                     // 将二进制数据转换为 base64 字符串
-                    let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+                    let base64_data =
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
                     let json_message = format!(r#"{{"type":"binary","data":"{}"}}"#, base64_data);
                     if let Err(e) = app_manager_clone
                         .send_ws_message(&app_id_clone, ws_id_clone.clone(), json_message)
@@ -458,9 +273,16 @@ async fn handle_websocket_bridged(
     }
 
     // 清理：注销 WebSocket 连接
-    if let Err(e) = app_manager.unregister_ws_connection(&app_id, ws_id.clone()).await {
+    if let Err(e) = app_manager
+        .unregister_ws_connection(&app_id, ws_id.clone())
+        .await
+    {
         tracing::error!("Failed to unregister WebSocket {}: {}", ws_id, e);
     }
 
-    tracing::info!("WebSocket bridge closed for app: {}, ws_id: {}", app_id, ws_id);
+    tracing::info!(
+        "WebSocket bridge closed for app: {}, ws_id: {}",
+        app_id,
+        ws_id
+    );
 }

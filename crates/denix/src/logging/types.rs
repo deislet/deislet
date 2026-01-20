@@ -50,28 +50,28 @@ impl From<tracing::Level> for LogLevel {
     }
 }
 
-/// 日志条目
+/// Log entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// 时间戳
+    /// Timestamp
     pub timestamp: SystemTime,
 
-    /// 日志级别
+    /// Log level
     pub level: LogLevel,
 
-    /// 日志来源（worker ID）
+    /// Log source (worker ID)
     pub source: String,
 
-    /// 应用 ID（可选）
+    /// Application ID (optional)
     pub app_id: Option<String>,
 
-    /// 日志消息
+    /// Log message
     pub message: String,
 
-    /// 结构化字段
+    /// Structured fields
     pub fields: HashMap<String, String>,
 
-    /// 跟踪 ID（用于分布式追踪）
+    /// Trace ID (for distributed tracing)
     pub trace_id: Option<String>,
 
     /// Span ID
@@ -79,11 +79,7 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    pub fn new(
-        source: String,
-        level: LogLevel,
-        message: String,
-    ) -> Self {
+    pub fn new(source: String, level: LogLevel, message: String) -> Self {
         Self {
             timestamp: SystemTime::now(),
             level,

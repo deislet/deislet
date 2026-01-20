@@ -79,10 +79,7 @@ fn op_cron_register(
 }
 
 // 定义 cron extension
-extension!(
-    denix_cron_ops,
-    ops = [op_cron_get_event, op_cron_register],
-);
+extension!(denix_cron_ops, ops = [op_cron_get_event, op_cron_register],);
 
 /// 初始化 cron ops extension
 pub fn init_cron_extension() -> deno_core::Extension {

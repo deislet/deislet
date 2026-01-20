@@ -24,10 +24,7 @@ pub type CacheStore = Arc<Cache<String, String>>;
 /// - None: 缓存未命中或已过期
 #[op2(async)]
 #[string]
-async fn op_cache_get(
-    state: Rc<RefCell<OpState>>,
-    #[string] key: String,
-) -> Option<String> {
+async fn op_cache_get(state: Rc<RefCell<OpState>>, #[string] key: String) -> Option<String> {
     let cache = {
         let state_borrow = state.borrow();
         state_borrow.borrow::<CacheStore>().clone()
@@ -69,10 +66,7 @@ async fn op_cache_set(
 /// # 参数
 /// - key: 缓存键
 #[op2(async)]
-async fn op_cache_delete(
-    state: Rc<RefCell<OpState>>,
-    #[string] key: String,
-) {
+async fn op_cache_delete(state: Rc<RefCell<OpState>>, #[string] key: String) {
     let cache = {
         let state_borrow = state.borrow();
         state_borrow.borrow::<CacheStore>().clone()
@@ -91,10 +85,7 @@ async fn op_cache_delete(
 /// - true: 存在且未过期
 /// - false: 不存在或已过期
 #[op2(async)]
-async fn op_cache_has(
-    state: Rc<RefCell<OpState>>,
-    #[string] key: String,
-) -> bool {
+async fn op_cache_has(state: Rc<RefCell<OpState>>, #[string] key: String) -> bool {
     let cache = {
         let state_borrow = state.borrow();
         state_borrow.borrow::<CacheStore>().clone()

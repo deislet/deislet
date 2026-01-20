@@ -18,8 +18,12 @@ mod tests {
   },
 };"#;
 
-        let result = AppRuntime::new("test_esm".to_string(), ts_code.to_string());
-        assert!(result.is_ok(), "Failed to parse TypeScript ESM: {:?}", result.err());
+        let result = AppRuntime::new("test_esm".to_string(), ts_code.to_string(), HashMap::new());
+        assert!(
+            result.is_ok(),
+            "Failed to parse TypeScript ESM: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -31,8 +35,12 @@ mod tests {
   },
 };"#;
 
-        let result = AppRuntime::new("test_counter".to_string(), ts_code.to_string());
-        assert!(result.is_ok(), "Failed to parse counter app: {:?}", result.err());
+        let result = AppRuntime::new("test_counter".to_string(), ts_code.to_string(), HashMap::new());
+        assert!(
+            result.is_ok(),
+            "Failed to parse counter app: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -49,8 +57,12 @@ export default {
   },
 };"#;
 
-        let result = AppRuntime::new("test_interface".to_string(), ts_code.to_string());
-        assert!(result.is_ok(), "Failed to parse TypeScript with interface: {:?}", result.err());
+        let result = AppRuntime::new("test_interface".to_string(), ts_code.to_string(), HashMap::new());
+        assert!(
+            result.is_ok(),
+            "Failed to parse TypeScript with interface: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -67,8 +79,12 @@ export default {
   },
 };"#;
 
-        let result = AppRuntime::new("test_echo".to_string(), ts_code.to_string());
-        assert!(result.is_ok(), "Failed to parse echo app: {:?}", result.err());
+        let result = AppRuntime::new("test_echo".to_string(), ts_code.to_string(), HashMap::new());
+        assert!(
+            result.is_ok(),
+            "Failed to parse echo app: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -82,14 +98,14 @@ export default {
             }
         "#;
 
-        let result = AppRuntime::new("test_app".to_string(), code.to_string());
+        let result = AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new());
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_create_runtime_with_invalid_code() {
         let invalid_code = "this is not valid javascript {{{";
-        let result = AppRuntime::new("test_app".to_string(), invalid_code.to_string());
+        let result = AppRuntime::new("test_app".to_string(), invalid_code.to_string(), HashMap::new());
         assert!(result.is_err());
     }
 
@@ -103,7 +119,7 @@ export default {
             }
         "#;
 
-        let result = AppRuntime::new("test_app".to_string(), code.to_string());
+        let result = AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new());
         assert!(result.is_ok());
 
         let runtime = result.unwrap();
@@ -123,7 +139,7 @@ export default {
             }
         "#;
 
-        let mut runtime = AppRuntime::new("test_app".to_string(), code.to_string()).unwrap();
+        let mut runtime = AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new()).unwrap();
 
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "localhost".to_string());
@@ -148,15 +164,15 @@ export default {
     async fn test_execute_fetch_with_kv() {
         let code = r#"
             globalThis.default = {
-                async fetch(request, env) {
-                    await env.kv.set("test", "value123");
-                    const val = await env.kv.get("test");
+                async fetch(request, env, ctx) {
+                    await ctx.services.kv.put("test", "value123");
+                    const val = await ctx.services.kv.get("test");
                     return new Response(val);
                 }
             }
         "#;
 
-        let mut runtime = AppRuntime::new("test_app".to_string(), code.to_string()).unwrap();
+        let mut runtime = AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new()).unwrap();
 
         let result = runtime
             .execute_fetch(
@@ -183,7 +199,7 @@ export default {
             }
         "#;
 
-        let mut runtime = AppRuntime::new("test_app".to_string(), code.to_string()).unwrap();
+        let mut runtime = AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new()).unwrap();
 
         let result = runtime
             .execute_fetch(

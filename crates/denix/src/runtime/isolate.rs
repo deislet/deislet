@@ -4,9 +4,9 @@ use super::cache_ops::{create_cache_store, init_cache_extension, CacheStore};
 use super::cron_ops::{init_cron_extension, CronEvent};
 use super::db_ops::init_db_extension;
 use super::http_ops::init_http_extension;
+use super::ops::{init_ops_extension, KVStore, ResponseStore, EnvStore};
 use super::ws_ops::{create_ws_manager, init_ws_extension, WebSocketManager};
 use super::ws_server_ops::{create_ws_server_manager, init_ws_server_extension, WsServerManager};
-use super::ops::{init_ops_extension, KVStore, ResponseStore};
 use anyhow::Result;
 use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ pub struct AppRuntime {
 
 impl AppRuntime {
     /// 创建新的 Runtime
-    pub fn new(app_id: String, code: String) -> Result<Self> {
+    pub fn new(app_id: String, code: String, env: HashMap<String, String>) -> Result<Self> {
         // 创建 Runtime
         let mut runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![
@@ -55,10 +55,14 @@ impl AppRuntime {
             ..Default::default()
         });
 
-        // 在 OpState 中注入 KV Store、Cache Store 和 Response Store
+        // 在 OpState 中注入资源
         {
             let op_state = runtime.op_state();
             let mut state = op_state.borrow_mut();
+
+            // 环境变量
+            let env_store: EnvStore = Rc::new(RefCell::new(env));
+            state.put(env_store);
 
             // KV Store (内存 HashMap)
             let kv_store: KVStore = Rc::new(RefCell::new(HashMap::new()));
@@ -83,13 +87,9 @@ impl AppRuntime {
         }
 
         // 加载 runtime polyfills
-        runtime.execute_script(
-            "<runtime>",
-            include_str!("../../runtime_js/runtime.js"),
-        )?;
+        runtime.execute_script("<runtime>", include_str!("../../runtime_js/runtime.js"))?;
 
         // 转换 ES 模块语法为普通脚本
-        // export default { ... } -> globalThis.default = { ... }
         let code = Self::transform_esm_to_script(&code);
 
         // 加载应用代码
@@ -118,12 +118,12 @@ impl AppRuntime {
         // 序列化 request
         let request_json = serde_json::to_string(&request)?;
 
-        // 调用 JavaScript 的 __denix_fetch 函数并通过 op 设置响应
+        // 调用 JavaScript 的 __denix_invoke 函数并通过 op 设置响应
         let code = format!(
             r#"
             (async () => {{
                 const request = {};
-                const response = await __denix_fetch(request);
+                const response = await __denix_invoke(request);
                 Deno.core.ops.op_set_response(JSON.stringify(response));
             }})()
             "#,
@@ -157,7 +157,12 @@ impl AppRuntime {
     /// 执行定时任务
     ///
     /// 当 cron 触发时调用应用的 scheduled 函数
-    pub async fn execute_scheduled(&mut self, scheduled_time: i64, cron: Option<String>) -> Result<()> {
+    #[allow(dead_code)]
+    pub async fn execute_scheduled(
+        &mut self,
+        scheduled_time: i64,
+        cron: Option<String>,
+    ) -> Result<()> {
         // 注入 CronEvent 到 OpState
         {
             let op_state = self.runtime.op_state();
@@ -247,7 +252,12 @@ impl AppRuntime {
     /// 关闭 WebSocket 连接
     ///
     /// 调用 JavaScript 的 WebSocketServer._handleClose() 方法并清理连接
-    pub async fn close_ws_connection(&mut self, ws_id: String, code: u16, reason: String) -> Result<()> {
+    pub async fn close_ws_connection(
+        &mut self,
+        ws_id: String,
+        code: u16,
+        reason: String,
+    ) -> Result<()> {
         // 调用 JavaScript 的 _handleClose
         let js_code = format!(
             r#"
@@ -261,7 +271,11 @@ impl AppRuntime {
                 }}
             }})()
             "#,
-            ws_id, ws_id, code, serde_json::to_string(&reason)?, ws_id
+            ws_id,
+            ws_id,
+            code,
+            serde_json::to_string(&reason)?,
+            ws_id
         );
 
         let promise = self.runtime.execute_script("<ws_close>", js_code)?;
@@ -300,21 +314,22 @@ impl AppRuntime {
         let re_type_alias = Regex::new(r"type\s+\w+\s*=\s*[^;]+;\s*").unwrap();
         let transformed = re_type_alias.replace_all(&transformed, "");
 
-        // export default { ... } -> globalThis.default = { ... }
+        // export default { ... } -> globalThis.user_module.default = { ... }
         let re_export_default = Regex::new(r"export\s+default\s+").unwrap();
-        let transformed = re_export_default.replace_all(&transformed, "globalThis.default = ");
+        let transformed = re_export_default.replace_all(&transformed, "globalThis.user_module.default = ");
 
-        // export const/let/var name = ... -> globalThis.name = ...
+        // export const/let/var name = ... -> globalThis.user_module.name = ...
         let re_export_decl = Regex::new(r"export\s+(const|let|var)\s+(\w+)\s*=").unwrap();
-        let transformed = re_export_decl.replace_all(&transformed, "globalThis.$2 =");
+        let transformed = re_export_decl.replace_all(&transformed, "globalThis.user_module.$2 =");
 
-        // export function name(...) -> globalThis.name = function(...)
+        // export function name(...) -> globalThis.user_module.name = function(...)
         let re_export_func = Regex::new(r"export\s+function\s+(\w+)\s*\(").unwrap();
-        let transformed = re_export_func.replace_all(&transformed, "globalThis.$1 = function(");
+        let transformed = re_export_func.replace_all(&transformed, "globalThis.user_module.$1 = function(");
 
-        // export async function name(...) -> globalThis.name = async function(...)
+        // export async function name(...) -> globalThis.user_module.name = async function(...)
         let re_export_async_func = Regex::new(r"export\s+async\s+function\s+(\w+)\s*\(").unwrap();
-        let transformed = re_export_async_func.replace_all(&transformed, "globalThis.$1 = async function(");
+        let transformed =
+            re_export_async_func.replace_all(&transformed, "globalThis.user_module.$1 = async function(");
 
         // import ... from "..." -> 移除 (简化处理，假设依赖已内置)
         let re_import = Regex::new(r#"import\s+.*?\s+from\s+["'][^"']+["'];?\s*"#).unwrap();
@@ -330,8 +345,10 @@ impl AppRuntime {
 
         // TypeScript: 移除函数签名中的参数类型标注
         // 匹配函数签名: name( ... ) 或 async name( ... )，在括号内移除类型标注
-        let re_func_sig = Regex::new(r"((?:async\s+)?(?:function\s+)?\w+\s*\()([^)]*)(\))").unwrap();
-        let re_param_type_inner = Regex::new(r"(\w+)\s*:\s*[A-Za-z_]\w*(?:<[^>]*>)?(?:\[\])?").unwrap();
+        let re_func_sig =
+            Regex::new(r"((?:async\s+)?(?:function\s+)?\w+\s*\()([^)]*)(\))").unwrap();
+        let re_param_type_inner =
+            Regex::new(r"(\w+)\s*:\s*[A-Za-z_]\w*(?:<[^>]*>)?(?:\[\])?").unwrap();
         let transformed = re_func_sig.replace_all(&transformed, |caps: &regex::Captures| {
             let prefix = &caps[1];
             let params = &caps[2];
@@ -341,7 +358,8 @@ impl AppRuntime {
         });
 
         // TypeScript: 移除变量类型标注 const/let/var name: Type = -> const/let/var name =
-        let re_var_type = Regex::new(r"(const|let|var)\s+(\w+)\s*:\s*[A-Za-z_][\w<>,\s\[\]|&]*\s*=").unwrap();
+        let re_var_type =
+            Regex::new(r"(const|let|var)\s+(\w+)\s*:\s*[A-Za-z_][\w<>,\s\[\]|&]*\s*=").unwrap();
         let transformed = re_var_type.replace_all(&transformed, "$1 $2 =");
 
         transformed.to_string()

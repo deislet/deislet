@@ -13,10 +13,7 @@ pub type KVStore = Rc<RefCell<HashMap<String, String>>>;
 /// KV Get 操作（优先使用 gRPC 客户端，fallback 到内存存储）
 #[op2(async)]
 #[string]
-async fn op_kv_get(
-    state: Rc<RefCell<OpState>>,
-    #[string] key: String,
-) -> Option<String> {
+async fn op_kv_get(state: Rc<RefCell<OpState>>, #[string] key: String) -> Option<String> {
     // 优先尝试使用 KvClient
     let client_opt = {
         let state_borrow = state.borrow();
@@ -44,11 +41,7 @@ async fn op_kv_get(
 
 /// KV Set 操作
 #[op2(async)]
-async fn op_kv_set(
-    state: Rc<RefCell<OpState>>,
-    #[string] key: String,
-    #[string] value: String,
-) {
+async fn op_kv_set(state: Rc<RefCell<OpState>>, #[string] key: String, #[string] value: String) {
     // 优先尝试使用 KvClient
     let client_opt = {
         let state_borrow = state.borrow();
@@ -75,10 +68,7 @@ async fn op_kv_set(
 
 /// KV Delete 操作
 #[op2(async)]
-async fn op_kv_delete(
-    state: Rc<RefCell<OpState>>,
-    #[string] key: String,
-) {
+async fn op_kv_delete(state: Rc<RefCell<OpState>>, #[string] key: String) {
     // 优先尝试使用 KvClient
     let client_opt = {
         let state_borrow = state.borrow();
@@ -106,10 +96,7 @@ async fn op_kv_delete(
 /// KV List 操作（返回所有键）
 #[op2(async)]
 #[serde]
-async fn op_kv_list(
-    state: Rc<RefCell<OpState>>,
-    #[string] prefix: String,
-) -> Vec<String> {
+async fn op_kv_list(state: Rc<RefCell<OpState>>, #[string] prefix: String) -> Vec<String> {
     // 优先尝试使用 KvClient
     let client_opt = {
         let state_borrow = state.borrow();
@@ -155,18 +142,35 @@ pub type ResponseStore = Rc<RefCell<Option<String>>>;
 
 /// 内部 op：设置响应
 #[op2(fast)]
-fn op_set_response(
-    state: &mut OpState,
-    #[string] response_json: String,
-) {
+fn op_set_response(state: &mut OpState, #[string] response_json: String) {
     let store = state.borrow::<ResponseStore>().clone();
     *store.borrow_mut() = Some(response_json);
+}
+
+// 环境变量存储
+pub type EnvStore = Rc<RefCell<HashMap<String, String>>>;
+
+/// 内部 op：获取环境变量
+#[op2]
+#[serde]
+fn op_get_env(state: &mut OpState) -> HashMap<String, String> {
+    let env_store = state.borrow::<EnvStore>().clone();
+    let map = env_store.borrow().clone();
+    map
 }
 
 // 定义 extension
 extension!(
     denix_ops,
-    ops = [op_kv_get, op_kv_set, op_kv_delete, op_kv_list, op_log, op_set_response],
+    ops = [
+        op_kv_get,
+        op_kv_set,
+        op_kv_delete,
+        op_kv_list,
+        op_log,
+        op_set_response,
+        op_get_env
+    ],
 );
 
 /// 初始化 ops extension

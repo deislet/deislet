@@ -2,4 +2,4 @@ mod manager;
 pub mod types;
 
 pub use manager::ApplicationManager;
-pub use types::{App, AppConfig, AppState, CreateAppRequest, UpdateAppRequest};
+pub use types::{AppConfig, AppState};

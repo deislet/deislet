@@ -5,32 +5,32 @@ use tracing::{debug, warn};
 
 use super::types::LogEntry;
 
-/// 日志缓冲区
+/// Log buffer
 pub struct LogBuffer {
-    /// 环形缓冲区
+    /// Circular buffer
     buffer: Arc<RwLock<VecDeque<LogEntry>>>,
 
-    /// 最大容量
+    /// Maximum capacity
     max_size: usize,
 
-    /// 统计信息
+    /// Statistics
     stats: Arc<RwLock<BufferStats>>,
 }
 
 #[derive(Debug, Default, Clone)]
 struct BufferStats {
-    /// 总接收日志数
+    /// Total received logs count
     total_received: u64,
 
-    /// 总丢弃日志数（因容量满）
+    /// Total dropped logs count (due to full capacity)
     total_dropped: u64,
 
-    /// 总推送日志数
+    /// Total shipped logs count
     total_shipped: u64,
 }
 
 impl LogBuffer {
-    /// 创建新的日志缓冲区
+    /// Create new log buffer
     pub fn new(max_size: usize) -> Self {
         Self {
             buffer: Arc::new(RwLock::new(VecDeque::with_capacity(max_size))),
@@ -39,7 +39,7 @@ impl LogBuffer {
         }
     }
 
-    /// 添加日志条目
+    /// Add log entry
     pub async fn push(&self, entry: LogEntry) {
         let mut buffer = self.buffer.write().await;
         let mut stats = self.stats.write().await;
@@ -47,7 +47,7 @@ impl LogBuffer {
         stats.total_received += 1;
 
         if buffer.len() >= self.max_size {
-            // 缓冲区满，移除最旧的日志
+            // Buffer full, remove oldest log
             buffer.pop_front();
             stats.total_dropped += 1;
             warn!(
@@ -59,7 +59,7 @@ impl LogBuffer {
         buffer.push_back(entry);
     }
 
-    /// 批量取出日志（最多 count 条）
+    /// Drain logs in batch (up to count entries)
     pub async fn drain(&self, count: usize) -> Vec<LogEntry> {
         let mut buffer = self.buffer.write().await;
         let mut stats = self.stats.write().await;
@@ -73,23 +73,23 @@ impl LogBuffer {
         entries
     }
 
-    /// 获取缓冲区当前大小
+    /// Get current buffer size
     pub async fn len(&self) -> usize {
         self.buffer.read().await.len()
     }
 
-    /// 检查缓冲区是否为空
+    /// Check if buffer is empty
     pub async fn is_empty(&self) -> bool {
         self.buffer.read().await.is_empty()
     }
 
-    /// 获取统计信息
+    /// Get statistics
     pub async fn stats(&self) -> (u64, u64, u64) {
         let stats = self.stats.read().await;
         (stats.total_received, stats.total_dropped, stats.total_shipped)
     }
 
-    /// 清空缓冲区
+    /// Clear buffer
     pub async fn clear(&self) {
         let mut buffer = self.buffer.write().await;
         buffer.clear();
@@ -105,7 +105,7 @@ mod tests {
     async fn test_log_buffer() {
         let buffer = LogBuffer::new(3);
 
-        // 添加日志
+        // Add logs
         for i in 0..5 {
             buffer
                 .push(LogEntry::new(
@@ -116,15 +116,15 @@ mod tests {
                 .await;
         }
 
-        // 由于容量为 3，应该只保留后 3 条
+        // Since capacity is 3, should only keep last 3 entries
         assert_eq!(buffer.len().await, 3);
 
-        // 取出 2 条
+        // Drain 2 entries
         let entries = buffer.drain(2).await;
         assert_eq!(entries.len(), 2);
         assert_eq!(buffer.len().await, 1);
 
-        // 统计信息
+        // Statistics
         let (received, dropped, shipped) = buffer.stats().await;
         assert_eq!(received, 5);
         assert_eq!(dropped, 2);

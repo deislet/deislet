@@ -92,8 +92,8 @@ async fn op_db_query(
     match client.query(sql, params).await {
         Ok((rows_json, columns)) => {
             // 解析行数据
-            let rows: JsonValue = serde_json::from_str(&rows_json)
-                .unwrap_or_else(|_| JsonValue::Array(vec![]));
+            let rows: JsonValue =
+                serde_json::from_str(&rows_json).unwrap_or_else(|_| JsonValue::Array(vec![]));
 
             serde_json::json!({
                 "rows": rows,
@@ -119,10 +119,7 @@ async fn op_db_query(
 /// - JSON 数组: [{ rows_affected: number, last_insert_id?: number }, ...]
 #[op2(async)]
 #[serde]
-async fn op_db_batch(
-    state: Rc<RefCell<OpState>>,
-    #[string] statements_json: String,
-) -> JsonValue {
+async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: String) -> JsonValue {
     // 获取 DbClient
     let client = {
         let state_borrow = state.borrow();
@@ -206,10 +203,7 @@ async fn op_db_batch(
 /// - statement_id: 预处理语句 ID
 #[op2(async)]
 #[string]
-async fn op_db_prepare(
-    state: Rc<RefCell<OpState>>,
-    #[string] sql: String,
-) -> String {
+async fn op_db_prepare(state: Rc<RefCell<OpState>>, #[string] sql: String) -> String {
     // 获取 DbClient
     let client = {
         let state_borrow = state.borrow();
@@ -317,8 +311,8 @@ async fn op_db_query_prepared(
     match client.query_prepared(statement_id, params).await {
         Ok((rows_json, columns)) => {
             // 解析行数据
-            let rows: JsonValue = serde_json::from_str(&rows_json)
-                .unwrap_or_else(|_| JsonValue::Array(vec![]));
+            let rows: JsonValue =
+                serde_json::from_str(&rows_json).unwrap_or_else(|_| JsonValue::Array(vec![]));
 
             serde_json::json!({
                 "rows": rows,

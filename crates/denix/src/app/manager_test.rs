@@ -2,15 +2,17 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::app::{ApplicationManager, types::{AppConfig, AppState}};
-    use std::collections::HashMap;
+    use crate::app::{
+        types::{AppConfig, AppState},
+        ApplicationManager,
+    };
     use once_cell::sync::Lazy;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     // 使用全局单例 ApplicationManager 避免多次创建 RuntimePool
-    static TEST_MANAGER: Lazy<Mutex<ApplicationManager>> = Lazy::new(|| {
-        Mutex::new(ApplicationManager::with_threads(Some(2)))
-    });
+    static TEST_MANAGER: Lazy<Mutex<ApplicationManager>> =
+        Lazy::new(|| Mutex::new(ApplicationManager::with_threads(Some(2))));
 
     #[tokio::test]
     async fn test_load_app() {
@@ -238,16 +240,16 @@ mod tests {
 
         let code = r#"
             globalThis.default = {
-                async fetch(request, env) {
+                async fetch(request, env, ctx) {
                     const url = new URL(request.url);
 
                     if (url.pathname === "/set") {
-                        await env.kv.set("counter", "42");
+                        await ctx.services.kv.put("counter", "42");
                         return new Response("set");
                     }
 
                     if (url.pathname === "/get") {
-                        const val = await env.kv.get("counter");
+                        const val = await ctx.services.kv.get("counter");
                         return new Response(val || "not found");
                     }
 

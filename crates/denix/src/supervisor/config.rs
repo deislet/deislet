@@ -19,11 +19,21 @@ pub struct DenixSupervisorConfig {
     pub reconnect_interval: u64,
 }
 
-fn default_enabled() -> bool { false }
-fn default_heartbeat_interval() -> u64 { 30 }
-fn default_request_timeout() -> u64 { 10 }
-fn default_retry_count() -> u32 { 3 }
-fn default_reconnect_interval() -> u64 { 5 }
+fn default_enabled() -> bool {
+    false
+}
+fn default_heartbeat_interval() -> u64 {
+    30
+}
+fn default_request_timeout() -> u64 {
+    10
+}
+fn default_retry_count() -> u32 {
+    3
+}
+fn default_reconnect_interval() -> u64 {
+    5
+}
 
 impl Default for DenixSupervisorConfig {
     fn default() -> Self {
