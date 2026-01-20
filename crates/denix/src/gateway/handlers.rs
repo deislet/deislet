@@ -4,8 +4,7 @@ use super::AppState;
 use axum::{
     body::Body,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Request, State,
+        ws::{Message, WebSocket, WebSocketUpgrade}, State,
     },
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},

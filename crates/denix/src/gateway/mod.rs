@@ -7,10 +7,7 @@ use crate::app_store::AppStore;
 use crate::config_store::ConfigStore;
 use crate::management::ManagementServer;
 use anyhow::Result;
-use axum::{
-    routing::{delete, get, post, put},
-    Router,
-};
+use axum::Router;
 use std::sync::Arc;
 
 use tower_http::trace::TraceLayer;

@@ -275,7 +275,7 @@ impl DenixSupervisorClient {
                         };
 
                         match temp_client.handle_command(command).await {
-                            Ok(response) => {
+                            Ok(_response) => {
                                 let response_msg = CommandResponse {
                                     id: cmd_req.id,
                                     success: true,
@@ -451,7 +451,7 @@ impl DenixSupervisorClient {
                 );
 
                 // 实际的重启逻辑
-                if let Some(app_manager) = &self.app_manager {
+                if let Some(_app_manager) = &self.app_manager {
                     if preserve_state {
                         info!("Preserving application state during restart");
                     } else {
