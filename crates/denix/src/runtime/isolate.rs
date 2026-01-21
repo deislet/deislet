@@ -3,17 +3,30 @@
 use super::blob_ops::init_blob_extension;
 use super::cache_ops::{create_cache_store, init_cache_extension, CacheStore};
 use super::db_ops::init_db_extension;
-use super::http_ops::init_http_extension;
+// use super::http_ops::init_http_extension;
 use super::ops::{init_ops_extension, EnvStore, ResponseStore};
 use super::queue_ops::{init_queue_extension, MemoryQueue};
-use super::ws_ops::{create_ws_manager, init_ws_extension, WebSocketManager};
+// use super::ws_ops::{create_ws_manager, /* init_ws_extension, */ WebSocketManager};
 use super::ws_server_ops::{create_ws_server_manager, init_ws_server_extension, WsServerManager};
 use anyhow::Result;
 use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
+// use deno_runtime::deno_console;
+use deno_runtime::deno_crypto;
+use deno_runtime::deno_fetch;
+// use deno_runtime::deno_fs::RealFs;
+use deno_runtime::deno_net;
+use deno_runtime::deno_permissions;
+// use deno_runtime::deno_tls;
+// use deno_runtime::deno_url;
+use deno_runtime::deno_web;
+use deno_runtime::deno_webidl;
+use deno_runtime::deno_websocket;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use sys_traits::impls::RealSys;
 use tokio::sync::oneshot;
 
 type FetchResult = (u16, HashMap<String, String>, Option<String>);
@@ -59,22 +72,54 @@ impl AppRuntime {
         let mut runtime = JsRuntime::new(RuntimeOptions {
             create_params: Some(create_params),
             extensions: vec![
+                deno_webidl::deno_webidl::init(),
+                deno_web::deno_web::lazy_init(),
+                deno_fetch::deno_fetch::lazy_init(),
+                deno_websocket::deno_websocket::lazy_init(),
+                deno_crypto::deno_crypto::lazy_init(),
+                deno_runtime::deno_tls::deno_tls::init(),
+                deno_net::deno_net::lazy_init(),
                 init_ops_extension(),
                 init_cache_extension(),
                 init_db_extension(),
                 init_blob_extension(),
-                init_http_extension(),
-                init_ws_extension(),
                 init_ws_server_extension(),
                 init_queue_extension(),
             ],
             ..Default::default()
         });
 
-        // 在 OpState 中注入资源
+        // Initialize Lazy Extensions & State
         {
+            let blob_store = Arc::new(deno_web::BlobStore::default());
+            let broadcast_channel = deno_web::InMemoryBroadcastChannel::default();
+            
+            // Permissions
+            let sys = RealSys;
+            let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(sys));
+            let permissions = deno_permissions::PermissionsContainer::allow_all(parser);
+
+            runtime.lazy_init_extensions(vec![
+                deno_web::deno_web::args(
+                    blob_store,
+                    Some(deno_core::url::Url::parse("file:///").unwrap()),
+                    broadcast_channel,
+                ),
+                deno_fetch::deno_fetch::args(deno_fetch::Options {
+                    user_agent: "denix/1.0".to_string(),
+                    root_cert_store_provider: None,
+                    ..Default::default()
+                }),
+                deno_websocket::deno_websocket::args(),
+                deno_crypto::deno_crypto::args(None),
+                deno_net::deno_net::args(None, None),
+            ])?;
+
+            // Inject State
             let op_state = runtime.op_state();
             let mut state = op_state.borrow_mut();
+
+            state.put(permissions);
 
             // 环境变量
             let env_store: EnvStore = Rc::new(RefCell::new(env));
@@ -84,10 +129,6 @@ impl AppRuntime {
             // 配置: 最大 10000 条目，10 分钟空闲过期
             let cache_store: CacheStore = create_cache_store(10_000, 600);
             state.put(cache_store);
-
-            // WebSocket Manager (WebSocket 客户端连接管理)
-            let ws_manager: WebSocketManager = create_ws_manager();
-            state.put(ws_manager);
 
             // WebSocket Server Manager (WebSocket 服务端连接管理)
             let ws_server_manager: WsServerManager = create_ws_server_manager();
@@ -114,6 +155,8 @@ impl AppRuntime {
 
         Ok(Self { runtime, app_id })
     }
+
+
 
     /// 执行 fetch 请求
     pub async fn execute_fetch(

@@ -6,7 +6,7 @@ mod tests {
     use crate::runtime::ws_server_ops::{create_ws_server_manager, init_ws_server_extension};
     use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    // use std::collections::HashMap;
     use std::rc::Rc;
 
     fn setup_test_runtime() -> JsRuntime {

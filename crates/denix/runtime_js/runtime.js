@@ -1,223 +1,24 @@
 (function() { const DenoCore = Deno.core; delete globalThis.Deno;
-// Edge Canon Runtime (v0.1.0) for Denix
-// Compliance Level: Strict
+// Edge Canon Runtime (v0.2.0) for Denix
+// Native Deno Runtime extensions enabled.
 
 // ---------------------------------------------------------
-// 1. Core Classes & Polyfills
+// 1. WebSocket Support (Custom Bridge)
 // ---------------------------------------------------------
 
-// Console
-globalThis.console = {
-  log: (...args) => DenoCore.ops.op_log("info", args.join(" ")),
-  info: (...args) => DenoCore.ops.op_log("info", args.join(" ")),
-  warn: (...args) => DenoCore.ops.op_log("warn", args.join(" ")),
-  error: (...args) => DenoCore.ops.op_log("error", args.join(" ")),
-  debug: (...args) => DenoCore.ops.op_log("debug", args.join(" ")),
-};
-
-// Headers Class (Minimal)
-class Headers {
-  constructor(init = {}) {
-    this._map = new Map();
-    if (init instanceof Headers) {
-      init.forEach((v, k) => this._map.set(k, v));
-    } else if (Array.isArray(init)) {
-      init.forEach(([k, v]) => this._map.set(k.toLowerCase(), v));
-    } else {
-      for (const [k, v] of Object.entries(init)) {
-        this._map.set(k.toLowerCase(), v);
-      }
-    }
-  }
-  get(name) { return this._map.get(name.toLowerCase()) || null; }
-  set(name, value) { this._map.set(name.toLowerCase(), value); }
-  has(name) { return this._map.has(name.toLowerCase()); }
-  forEach(callback) { this._map.forEach((v, k) => callback(v, k)); }
-}
-globalThis.Headers = Headers;
-
-// Request Class
-class Request {
-  constructor(input, init = {}) {
-    if (typeof input === 'string') {
-      this.url = input;
-    } else {
-      this.url = input.url;
-      this.method = input.method;
-      this.headers = new Headers(input.headers);
-      this.body = input.body;
-    }
-    this.method = init.method || this.method || 'GET';
-    this.headers = new Headers(init.headers || this.headers || {});
-    this.body = init.body || this.body;
-  }
-  async text() { return this.body || ""; }
-  async json() { return JSON.parse(this.body || "{}"); }
-}
-
-// Response Class
-class Response {
-  constructor(body, init = {}) {
-    this.body = typeof body === 'object' ? JSON.stringify(body) : body;
-    this.status = init.status || 200;
-    // Normalize headers to object for Rust serde compatibility
-    this.headers = {};
-    if (init.headers) {
-        if (init.headers instanceof Headers) {
-            init.headers.forEach((v, k) => this.headers[k] = v);
-        } else {
-            Object.assign(this.headers, init.headers);
-        }
-    }
-    
-    // WebSocket Upgrade Support
-    if (init.webSocket) {
-      this.status = 101;
-      this.headers["Upgrade"] = "websocket";
-      if (init.webSocket.ws_id) {
-        this.headers["X-Denix-WebSocket-ID"] = init.webSocket.ws_id;
-      }
-    }
-  }
-}
-
-globalThis.Request = Request;
-globalThis.Response = Response;
-
-// URL Class (Regex Fallback Only)
-class URL {
-  constructor(url, base) {
-    let fullUrl = url;
-    if (base && !url.match(/^[a-z]+:\/\//)) {
-       fullUrl = base.replace(/\/+$/, '') + '/' + url.replace(/^\/+/, '');
-    }
-
-    const match = fullUrl.match(/^(https?:)\/\/([^/:]+)(:(\d+))?([^?#]*)(\?[^#]*)?(#.*)?$/);
-    if (match) {
-      this.href = fullUrl;
-      this.protocol = match[1];
-      this.hostname = match[2];
-      this.port = match[4] || "";
-      this.pathname = match[5] || "/";
-      this.search = match[6] || "";
-      this.hash = match[7] || "";
-      this.searchParams = new URLSearchParams(this.search);
-    } else {
-      this.href = fullUrl;
-      this.pathname = fullUrl;
-      this.search = "";
-      this.searchParams = new URLSearchParams("");
-    }
-  }
-}
-
-// URLSearchParams Polyfill
-if (!globalThis.URLSearchParams) {
-  globalThis.URLSearchParams = class {
-    constructor(search) {
-      this.params = new Map();
-      if (search && search.startsWith('?')) {
-        search.slice(1).split('&').forEach(pair => {
-          const [k, v] = pair.split('=');
-          if (k) this.params.set(decodeURIComponent(k), decodeURIComponent(v || ''));
-        });
-      }
-    }
-    get(name) { return this.params.get(name); }
-  };
-}
-
-globalThis.URL = URL;
-
-globalThis.fetch = async function(input, init) {
-  const request = new Request(input, init);
-  const reqInit = {
-    url: request.url,
-    method: request.method,
-    headers: {},
-    body: request.body || null,
-    timeout: 30
-  };
-  request.headers.forEach((v, k) => { reqInit.headers[k] = v; });
-  
-  const res = await DenoCore.ops.op_fetch(JSON.stringify(reqInit));
-  if (res.error) throw new Error(res.error);
-  
-  return new Response(res.body, {
-    status: res.status,
-    statusText: res.statusText,
-    headers: res.headers
-  });
-};
-
-// EventTarget Polyfill
-class EventTarget {
-  constructor() { this.listeners = {}; }
-  addEventListener(type, callback) {
-    if (!this.listeners[type]) this.listeners[type] = [];
-    this.listeners[type].push(callback);
-  }
-  removeEventListener(type, callback) {
-    if (!this.listeners[type]) return;
-    this.listeners[type] = this.listeners[type].filter(cb => cb !== callback);
-  }
-  dispatchEvent(event) {
-    if (!this.listeners[event.type]) return true;
-    this.listeners[event.type].forEach(cb => cb(event));
-    return !event.defaultPrevented;
-  }
-}
-globalThis.EventTarget = EventTarget;
-
-class Event { constructor(type) { this.type = type; } }
-globalThis.Event = Event;
-
-// ---------------------------------------------------------
-// 2. WebSocket Support
-// ---------------------------------------------------------
-
-class WebSocket extends EventTarget {
-  constructor(url, protocols = []) {
+// BridgeWebSocket: A placeholder WebSocket for the client side of a WebSocketPair.
+// It mainly serves to carry the ws_id back to the platform via Response.
+class BridgeWebSocket extends EventTarget {
+  constructor() {
     super();
-    this.url = url;
-    this.protocols = protocols;
-    this.readyState = 0; // CONNECTING
-    this.ws_id = null;
-    this._connect();
+    this.ws_id = `ws-bridge-${Date.now()}-${Math.random()}`;
+    this.readyState = 1; // OPEN (Simulated)
   }
   
-  async _connect() {
-    try {
-      const result = await DenoCore.ops.op_ws_connect(JSON.stringify({
-        ws_id: `ws-client-${Date.now()}-${Math.random()}`,
-        url: this.url,
-        protocols: Array.isArray(this.protocols) ? this.protocols : [this.protocols]
-      }));
-      
-      if (result.success) {
-        this.ws_id = result.ws_id;
-        this.readyState = 1; // OPEN
-        this.dispatchEvent(new Event("open"));
-      } else {
-        this.dispatchEvent(new Event("error")); // Minimal
-      }
-    } catch (e) {
-      this.dispatchEvent(new Event("error"));
-    }
-  }
-  
-  async send(data) {
-    if (this.readyState !== 1) throw new Error("WebSocket not open");
-    await DenoCore.ops.op_ws_send(this.ws_id, data);
-  }
-  
-  close() {
-    if (this.ws_id) DenoCore.ops.op_ws_close(this.ws_id);
-    this.readyState = 3;
-    this.dispatchEvent(new Event("close"));
-  }
+  send(data) { console.warn("BridgeWebSocket.send ignored"); }
+  close() { this.readyState = 3; }
+  accept() {} 
 }
-globalThis.WebSocket = WebSocket;
 
 if (!globalThis.__denix_ws_servers) {
   globalThis.__denix_ws_servers = {};
@@ -225,17 +26,14 @@ if (!globalThis.__denix_ws_servers) {
 
 class WebSocketServer {
   constructor(ws_id) {
-    this.ws_id = ws_id || `wss-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    this.ws_id = ws_id;
     this.readyState = 0; // CONNECTING
-    this.onopen = null;
-    this.onmessage = null;
-    this.onerror = null;
-    this.onclose = null;
     this._accepted = false;
-
-    globalThis.__denix_ws_servers[this.ws_id] = this;
+    // Register global reference for Rust ops to find
+    globalThis.__denix_ws_servers[ws_id] = this;
   }
 
+  // Called by user to accept the connection
   accept() {
     if (this._accepted) throw new Error("WebSocket already accepted");
     this._accepted = true;
@@ -244,9 +42,36 @@ class WebSocketServer {
     if (result.success) {
       if (this.onopen) this.onopen({ type: "open" });
     } else {
-      this.readyState = 3;
       if (this.onerror) this.onerror({ type: "error", error: result.error });
     }
+  }
+
+  // Called by Rust when message received from client
+  _handleMessage(message) {
+    if (this.onmessage) {
+        let data = message;
+        // Check if binary
+        try {
+            const json = JSON.parse(message);
+            if (json.type === "binary" && json.data) {
+                // Decode base64
+                const binaryString = atob(json.data);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                data = bytes.buffer; // Return ArrayBuffer
+            }
+        } catch (e) {}
+        
+        this.onmessage({ type: "message", data });
+    }
+  }
+
+  // Called by Rust when connection closed
+  _handleClose(code, reason) {
+    this.readyState = 3; // CLOSED
+    if (this.onclose) this.onclose({ type: "close", code, reason });
   }
 
   async send(data) {
@@ -263,52 +88,31 @@ class WebSocketServer {
     this.readyState = 3; // CLOSED
     if (this.onclose) this.onclose({ type: "close", code, reason });
   }
-
-  _handleMessage(data) {
-    if (this.onmessage) this.onmessage({ type: "message", data });
-  }
-
-  _handleClose(code, reason) {
-    this.readyState = 3;
-    if (this.onclose) this.onclose({ type: "close", code, reason });
-  }
-
-  addEventListener(type, listener) {
-    if (type === 'message') {
-      this.onmessage = (event) => listener(event);
-    } else if (type === 'close') {
-      this.onclose = (event) => listener(event);
-    } else if (type === 'error') {
-      this.onerror = (event) => listener(event);
-    } else if (type === 'open') {
-      this.onopen = (event) => listener(event);
-    }
-  }
 }
 
 class WebSocketPair {
   constructor() {
-    const ws_id = `wsp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    this.server = new WebSocketServer(`${ws_id}-server`);
-    this.client = { ws_id: `${ws_id}-server` };
-    return { 0: this.client, 1: this.server }; 
+    // 0: Client (returned to response), 1: Server (used by app)
+    const client = new BridgeWebSocket();
+    const server = new WebSocketServer(client.ws_id);
+    this[0] = client;
+    this[1] = server;
   }
 }
-
-globalThis.WebSocketServer = WebSocketServer;
 globalThis.WebSocketPair = WebSocketPair;
 
 // ---------------------------------------------------------
-// 3. Service Adapters (The Bridge)
+// 2. Service Adapters (The Bridge)
 // ---------------------------------------------------------
 
 class Cache {
   async put(request, response) {
     const url = typeof request === 'string' ? request : request.url;
-    const body = response.body; 
+    // Clone response to avoid consuming the body if reused
+    const body = await response.clone().text(); 
     const meta = {
       status: response.status,
-      headers: response.headers,
+      headers: Object.fromEntries(response.headers.entries()),
       body: body
     };
     await DenoCore.ops.op_cache_set(url, JSON.stringify(meta));
@@ -359,7 +163,7 @@ class NativeDB {
     return res.rows; 
   }
   async transaction(callback) {
-    return await callback(this); 
+    // Not implemented in op layer yet
   }
 }
 
@@ -402,7 +206,7 @@ class Queue {
 }
 
 // ---------------------------------------------------------
-// 4. The Context & Invocation Logic
+// 3. The Context & Invocation Logic
 // ---------------------------------------------------------
 
 const SENSITIVE_KEYS = /pass|secret|token|key|pwd|authorization/i;
@@ -436,12 +240,6 @@ function createContext(requestData) {
       blob: new BlobStore(),
       queue: new Queue("default"),
     },
-    log: {
-      info: (msg) => console.info(typeof msg === 'string' ? msg : JSON.stringify(redact(msg))),
-      error: (msg) => console.error(typeof msg === 'string' ? msg : JSON.stringify(redact(msg))),
-      warn: (msg) => console.warn(typeof msg === 'string' ? msg : JSON.stringify(redact(msg))),
-      debug: (msg) => console.debug(typeof msg === 'string' ? msg : JSON.stringify(redact(msg))),
-    },
     waitUntil: (promise) => {
       if (!globalThis.__pending_wait_until) globalThis.__pending_wait_until = [];
       globalThis.__pending_wait_until.push(promise);
@@ -458,7 +256,6 @@ globalThis.__denix_wait_until_all = async function() {
     } catch (e) {
         console.error("Error in waitUntil promise:", e);
     }
-    // Recursively check if new promises were added
     if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
       await globalThis.__denix_wait_until_all();
     }
@@ -468,44 +265,57 @@ globalThis.__denix_wait_until_all = async function() {
 globalThis.__denix_invoke = async function(requestPayload) {
   try {
     let handler;
-    const userMod = globalThis.user_module || {};
-    
-    // Priority 1: globalThis.user_module.default
-    if (typeof userMod.default === 'function') {
-      handler = userMod.default;
-    } 
-    // Priority 2: globalThis.user_module.default.fetch
-    else if (userMod.default?.fetch) {
-      handler = (ctx) => userMod.default.fetch(ctx.request, ctx.env, ctx);
-    }
-    // Priority 3: globalThis.user_module.onRequest
-    else if (typeof userMod.onRequest === 'function') {
-      handler = userMod.onRequest;
-    }
-    // Legacy Fallback: globalThis.default
-    else if (globalThis.default?.fetch) {
-       handler = (ctx) => globalThis.default.fetch(ctx.request, ctx.env, ctx);
+    // Support export default { fetch }
+    if (globalThis.user_module && globalThis.user_module.default) {
+      if (typeof globalThis.user_module.default.fetch === 'function') {
+        handler = globalThis.user_module.default.fetch;
+      }
     }
     
     if (!handler) {
-      throw new Error("No valid handler found. Export 'default function handler(ctx)' or 'onRequest'.");
+      return { status: 500, headers: {}, body: "No fetch handler found in user module" };
     }
 
-    const context = createContext(requestPayload);
-    const response = await handler(context);
+    const ctx = createContext(requestPayload);
+    
+    // Execute handler
+    // Cloudflare style: fetch(request, env, ctx)
+    const resp = await handler(ctx.request, ctx.env, ctx);
+    
+    if (!(resp instanceof Response)) {
+       return { status: 500, headers: {}, body: "Handler did not return a Response object" };
+    }
+
+    // Prepare response
+    const headers = {};
+    resp.headers.forEach((v, k) => headers[k] = v);
+    
+    // Check for WebSocket upgrade
+    // Check if user attached webSocket to the response object dynamically
+    let webSocketId = undefined;
+    
+    if (resp.webSocket && resp.webSocket.ws_id) {
+        webSocketId = resp.webSocket.ws_id;
+        headers["X-Denix-WebSocket-ID"] = webSocketId;
+    }
+
+    // Read body
+    let body = null;
+    if (!webSocketId && resp.body) {
+        body = await resp.text();
+    }
 
     return {
-      status: response.status || 200,
-      headers: response.headers || {},
-      body: response.body || ""
+      status: resp.status,
+      headers: headers,
+      body: body
     };
-
   } catch (e) {
-    console.error("Runtime Error:", e);
+    console.error("Runtime invoke error:", e);
     return {
       status: 500,
       headers: {},
-      body: JSON.stringify({ error: { code: "INTERNAL_ERROR", message: e.message } })
+      body: `Runtime Error: ${e.message}`
     };
   }
 };

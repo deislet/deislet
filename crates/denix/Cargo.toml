@@ -14,8 +14,14 @@ axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
-# V8 引擎集成及标准库
-deno_core = "0.367"
+# Deno Runtime
+deno_runtime = { git = "https://github.com/kookyleo/deno", branch = "bump-fqdn-0-5" }
+
+# Deno Core (for op2 macro compatibility)
+deno_core = "0.380"
+
+# System Traits (for permissions)
+sys_traits = "0.1.22"
 
 # 序列化
 
@@ -33,7 +39,7 @@ dashmap = "5.5"
 moka = { version = "0.12", features = ["future"] }
 
 # 配置存储
-rusqlite = { version = "0.36", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 arc-swap = "1.7"
 
 # 错误处理
