@@ -1,11 +1,9 @@
-use std::io::{Cursor, Read};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
-use zip::ZipArchive;
 
 use crate::app::{AppConfig as InternalAppConfig, ApplicationManager};
-use crate::app_store::{AppManifest, AppPackage, AppPackageStatus, AppStore};
+use crate::app_repo::{AppPackageStatus, AppRepo};
 use crate::config_store::{ConfigEntry, ConfigStore};
 
 use super::proto::denix_management_server::DenixManagement;
@@ -15,7 +13,7 @@ use super::proto::*;
 pub struct DenixManagementService {
     app_manager: Arc<ApplicationManager>,
     config_store: Arc<ConfigStore>,
-    app_store: Arc<AppStore>,
+    app_repo: Arc<AppRepo>,
     worker_id: String,
 }
 
@@ -23,51 +21,15 @@ impl DenixManagementService {
     pub fn new(
         app_manager: Arc<ApplicationManager>,
         config_store: Arc<ConfigStore>,
-        app_store: Arc<AppStore>,
+        app_repo: Arc<AppRepo>,
         worker_id: String,
     ) -> Self {
         Self {
             app_manager,
             config_store,
-            app_store,
+            app_repo,
             worker_id,
         }
-    }
-
-    /// 从 ZIP 包中提取 manifest.json
-    fn extract_manifest(package_data: &[u8]) -> Result<AppManifest, String> {
-        let cursor = Cursor::new(package_data);
-        let mut archive = ZipArchive::new(cursor).map_err(|e| format!("无效的 ZIP 包: {}", e))?;
-
-        // 查找 manifest.json
-        let mut manifest_file = archive
-            .by_name("manifest.json")
-            .map_err(|_| "ZIP 包中缺少 manifest.json".to_string())?;
-
-        let mut manifest_content = String::new();
-        manifest_file
-            .read_to_string(&mut manifest_content)
-            .map_err(|e| format!("读取 manifest.json 失败: {}", e))?;
-
-        serde_json::from_str(&manifest_content)
-            .map_err(|e| format!("manifest.json 格式错误: {}", e))
-    }
-
-    /// 从 ZIP 包中提取入口文件代码
-    fn extract_entry_code(package_data: &[u8], entry_point: &str) -> Result<String, String> {
-        let cursor = Cursor::new(package_data);
-        let mut archive = ZipArchive::new(cursor).map_err(|e| format!("无效的 ZIP 包: {}", e))?;
-
-        let mut entry_file = archive
-            .by_name(entry_point)
-            .map_err(|_| format!("入口文件不存在: {}", entry_point))?;
-
-        let mut code = String::new();
-        entry_file
-            .read_to_string(&mut code)
-            .map_err(|e| format!("读取入口文件失败: {}", e))?;
-
-        Ok(code)
     }
 }
 
@@ -137,74 +99,51 @@ impl DenixManagement for DenixManagementService {
             req.package_data.len()
         );
 
-        // 1. 提取 manifest
-        let manifest = match Self::extract_manifest(&req.package_data) {
-            Ok(m) => m,
+        let package = match self.app_repo.install_package(req.app_id.clone(), req.package_data).await {
+            Ok(pkg) => pkg,
             Err(e) => {
-                error!("提取 manifest 失败: {}", e);
+                error!("安装应用包失败: {}", e);
                 return Ok(Response::new(DeployAppResponse {
                     success: false,
-                    message: format!("提取 manifest 失败: {}", e),
+                    message: format!("安装应用包失败: {}", e),
                     app_id: req.app_id,
                 }));
             }
         };
 
-        // 验证应用 ID 匹配
-        if manifest.id != req.app_id {
-            warn!(
-                "应用 ID 不匹配: 请求={}, manifest={}",
-                req.app_id, manifest.id
-            );
-            return Ok(Response::new(DeployAppResponse {
-                success: false,
-                message: format!(
-                    "应用 ID 不匹配: 请求={}, manifest={}",
-                    req.app_id, manifest.id
-                ),
-                app_id: req.app_id,
-            }));
-        }
-
-        // 2. 创建应用包
-        let app_package = AppPackage::new(
-            req.app_id.clone(),
-            manifest.clone(),
-            req.package_data.clone(),
-        );
-
-        // 3. 保存到 AppStore
-        if let Err(e) = self.app_store.save_package(app_package).await {
-            error!("保存应用包失败: {}", e);
-            return Ok(Response::new(DeployAppResponse {
-                success: false,
-                message: format!("保存应用包失败: {}", e),
-                app_id: req.app_id,
-            }));
-        }
-
-        // 4. 提取入口文件代码
-        let entry_code = match Self::extract_entry_code(&req.package_data, &manifest.entry_point) {
-            Ok(code) => code,
-            Err(e) => {
-                error!("提取入口文件失败: {}", e);
-                // 标记应用为失败状态
-                let _ = self
-                    .app_store
-                    .update_status(&req.app_id, AppPackageStatus::Failed)
-                    .await;
+        let entry_point = &package.manifest.entry_point;
+        let entry_code = match self.app_repo.get_file(&req.app_id, entry_point).await {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("入口文件不是有效的 UTF-8: {}", e);
+                    return Ok(Response::new(DeployAppResponse {
+                        success: false,
+                        message: format!("入口文件不是有效的 UTF-8: {}", e),
+                        app_id: req.app_id,
+                    }));
+                }
+            },
+            Ok(None) => {
+                error!("入口文件不存在: {}", entry_point);
                 return Ok(Response::new(DeployAppResponse {
                     success: false,
-                    message: format!("提取入口文件失败: {}", e),
+                    message: format!("入口文件不存在: {}", entry_point),
+                    app_id: req.app_id,
+                }));
+            }
+            Err(e) => {
+                error!("读取入口文件失败: {}", e);
+                return Ok(Response::new(DeployAppResponse {
+                    success: false,
+                    message: format!("读取入口文件失败: {}", e),
                     app_id: req.app_id,
                 }));
             }
         };
 
-        // 5. 转换配置
-        let config = InternalAppConfig::default(); // TODO: 从 manifest 和 req.config 合并配置
+        let config = InternalAppConfig::default();
 
-        // 6. 部署应用
         match self
             .app_manager
             .load_app(req.app_id.clone(), entry_code, config)
@@ -212,9 +151,8 @@ impl DenixManagement for DenixManagementService {
         {
             Ok(_) => {
                 info!("应用 {} 部署成功", req.app_id);
-                // 标记应用为已部署状态
                 let _ = self
-                    .app_store
+                    .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Deployed)
                     .await;
                 Ok(Response::new(DeployAppResponse {
@@ -225,9 +163,8 @@ impl DenixManagement for DenixManagementService {
             }
             Err(e) => {
                 error!("应用 {} 部署失败: {}", req.app_id, e);
-                // 标记应用为失败状态
                 let _ = self
-                    .app_store
+                    .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Failed)
                     .await;
                 Ok(Response::new(DeployAppResponse {
@@ -249,9 +186,8 @@ impl DenixManagement for DenixManagementService {
         match self.app_manager.unload_app(&req.app_id).await {
             Ok(_) => {
                 info!("应用 {} 卸载成功", req.app_id);
-                // 更新应用包状态为已停止
                 let _ = self
-                    .app_store
+                    .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Stopped)
                     .await;
                 Ok(Response::new(UnloadAppResponse {
@@ -280,69 +216,47 @@ impl DenixManagement for DenixManagementService {
             req.package_data.len()
         );
 
-        // 1. 提取 manifest
-        let manifest = match Self::extract_manifest(&req.package_data) {
-            Ok(m) => m,
+        let package = match self.app_repo.install_package(req.app_id.clone(), req.package_data).await {
+            Ok(pkg) => pkg,
             Err(e) => {
-                error!("提取 manifest 失败: {}", e);
+                error!("安装应用包失败: {}", e);
                 return Ok(Response::new(UpdateAppResponse {
                     success: false,
-                    message: format!("提取 manifest 失败: {}", e),
+                    message: format!("安装应用包失败: {}", e),
                 }));
             }
         };
 
-        // 验证应用 ID 匹配
-        if manifest.id != req.app_id {
-            warn!(
-                "应用 ID 不匹配: 请求={}, manifest={}",
-                req.app_id, manifest.id
-            );
-            return Ok(Response::new(UpdateAppResponse {
-                success: false,
-                message: format!(
-                    "应用 ID 不匹配: 请求={}, manifest={}",
-                    req.app_id, manifest.id
-                ),
-            }));
-        }
-
-        // 2. 创建应用包
-        let app_package = AppPackage::new(
-            req.app_id.clone(),
-            manifest.clone(),
-            req.package_data.clone(),
-        );
-
-        // 3. 保存到 AppStore（会覆盖现有包）
-        if let Err(e) = self.app_store.save_package(app_package).await {
-            error!("保存应用包失败: {}", e);
-            return Ok(Response::new(UpdateAppResponse {
-                success: false,
-                message: format!("保存应用包失败: {}", e),
-            }));
-        }
-
-        // 4. 提取入口文件代码
-        let entry_code = match Self::extract_entry_code(&req.package_data, &manifest.entry_point) {
-            Ok(code) => code,
-            Err(e) => {
-                error!("提取入口文件失败: {}", e);
-                let _ = self
-                    .app_store
-                    .update_status(&req.app_id, AppPackageStatus::Failed)
-                    .await;
+        let entry_point = &package.manifest.entry_point;
+        let entry_code = match self.app_repo.get_file(&req.app_id, entry_point).await {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("入口文件不是有效的 UTF-8: {}", e);
+                    return Ok(Response::new(UpdateAppResponse {
+                        success: false,
+                        message: format!("入口文件不是有效的 UTF-8: {}", e),
+                    }));
+                }
+            },
+            Ok(None) => {
+                error!("入口文件不存在: {}", entry_point);
                 return Ok(Response::new(UpdateAppResponse {
                     success: false,
-                    message: format!("提取入口文件失败: {}", e),
+                    message: format!("入口文件不存在: {}", entry_point),
+                }));
+            }
+            Err(e) => {
+                error!("读取入口文件失败: {}", e);
+                return Ok(Response::new(UpdateAppResponse {
+                    success: false,
+                    message: format!("读取入口文件失败: {}", e),
                 }));
             }
         };
 
-        // 5. 转换配置
-        let config = req.config.map(|_| InternalAppConfig::default()); // TODO: 从 manifest 和 req.config 合并
+        let config = req.config.map(|_| InternalAppConfig::default());
 
-        // 6. 更新应用
         match self
             .app_manager
             .update_app(&req.app_id, entry_code, config)
@@ -351,7 +265,7 @@ impl DenixManagement for DenixManagementService {
             Ok(_) => {
                 info!("应用 {} 更新成功", req.app_id);
                 let _ = self
-                    .app_store
+                    .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Deployed)
                     .await;
                 Ok(Response::new(UpdateAppResponse {
@@ -362,7 +276,7 @@ impl DenixManagement for DenixManagementService {
             Err(e) => {
                 error!("应用 {} 更新失败: {}", req.app_id, e);
                 let _ = self
-                    .app_store
+                    .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Failed)
                     .await;
                 Ok(Response::new(UpdateAppResponse {
@@ -409,9 +323,9 @@ impl DenixManagement for DenixManagementService {
                     error_message: app.error.unwrap_or_default(),
                 })
                 .collect()
-        } else {
-            Vec::new()
-        };
+            } else {
+                Vec::new()
+            };
 
         // 资源使用情况（简化版）
         let resource_usage = Some(ResourceUsage {

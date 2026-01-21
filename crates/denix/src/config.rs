@@ -3,14 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::{Path, PathBuf};
 
-use crate::supervisor::DenixSupervisorConfig;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenixConfig {
     #[serde(default = "default_http_port")]
     pub http_port: u16,
-    #[serde(default)]
-    pub supervisor: DenixSupervisorConfig,
 }
 
 fn default_http_port() -> u16 {
@@ -21,7 +17,6 @@ impl Default for DenixConfig {
     fn default() -> Self {
         Self {
             http_port: default_http_port(),
-            supervisor: DenixSupervisorConfig::default(),
         }
     }
 }
@@ -61,8 +56,8 @@ impl DenixConfig {
     fn load_from(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        Ok(toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?)
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
     fn apply_env_overrides(&mut self) -> Result<()> {
@@ -74,56 +69,6 @@ impl DenixConfig {
             self.http_port = parse_u16(&value, "PORT")?;
         }
 
-        let mut enabled_override = None;
-        if let Ok(value) = env::var("DENIX_SUPERVISOR_ENABLED") {
-            let enabled = parse_bool(&value, "DENIX_SUPERVISOR_ENABLED")?;
-            self.supervisor.enabled = enabled;
-            enabled_override = Some(enabled);
-        }
-
-        let mut supervisor_touched = false;
-        if let Ok(value) = env::var("DENIX_SUPERVISOR_ADDR") {
-            self.supervisor.addr = value;
-            supervisor_touched = true;
-        }
-
-        if let Ok(value) = env::var("DENIX_SUPERVISOR_ID") {
-            self.supervisor.associated_id = value;
-            supervisor_touched = true;
-        }
-
-        if let Ok(value) = env::var("DENIX_SUPERVISOR_SECRET") {
-            self.supervisor.secret = value;
-            supervisor_touched = true;
-        }
-
-        if let Ok(value) = env::var("DENIX_SUPERVISOR_HEARTBEAT_INTERVAL") {
-            self.supervisor.heartbeat_interval =
-                parse_u64(&value, "DENIX_SUPERVISOR_HEARTBEAT_INTERVAL")?;
-            supervisor_touched = true;
-        }
-
-        if let Ok(value) = env::var("DENIX_SUPERVISOR_REQUEST_TIMEOUT") {
-            self.supervisor.request_timeout =
-                parse_u64(&value, "DENIX_SUPERVISOR_REQUEST_TIMEOUT")?;
-            supervisor_touched = true;
-        }
-
-        if let Ok(value) = env::var("DENIX_SUPERVISOR_RETRY_COUNT") {
-            self.supervisor.retry_count = parse_u32(&value, "DENIX_SUPERVISOR_RETRY_COUNT")?;
-            supervisor_touched = true;
-        }
-
-        if let Ok(value) = env::var("DENIX_SUPERVISOR_RECONNECT_INTERVAL") {
-            self.supervisor.reconnect_interval =
-                parse_u64(&value, "DENIX_SUPERVISOR_RECONNECT_INTERVAL")?;
-            supervisor_touched = true;
-        }
-
-        if enabled_override.is_none() && supervisor_touched {
-            self.supervisor.enabled = true;
-        }
-
         Ok(())
     }
 }
@@ -132,24 +77,4 @@ fn parse_u16(value: &str, name: &str) -> Result<u16> {
     value
         .parse::<u16>()
         .with_context(|| format!("{} is not a valid u16: {}", name, value))
-}
-
-fn parse_u32(value: &str, name: &str) -> Result<u32> {
-    value
-        .parse::<u32>()
-        .with_context(|| format!("{} is not a valid u32: {}", name, value))
-}
-
-fn parse_u64(value: &str, name: &str) -> Result<u64> {
-    value
-        .parse::<u64>()
-        .with_context(|| format!("{} is not a valid u64: {}", name, value))
-}
-
-fn parse_bool(value: &str, name: &str) -> Result<bool> {
-    match value.to_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
-        _ => Err(anyhow!("{} is not a valid boolean: {}", name, value)),
-    }
 }

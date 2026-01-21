@@ -94,7 +94,7 @@ impl ConfigStore {
                 let created_at_secs: i64 = row.get(4)?;
                 let updated_at_secs: i64 = row.get(5)?;
 
-                let config_type = ConfigType::from_str(&config_type_str)
+                let config_type = ConfigType::parse(&config_type_str)
                     .ok_or_else(|| rusqlite::Error::InvalidParameterName(config_type_str))?;
 
                 Ok(ConfigEntry {

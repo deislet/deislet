@@ -41,14 +41,19 @@ impl ApplicationManager {
         let mut app_info = App {
             id: id.clone(),
             state: AppState::Loading,
-            config,
+            config: config.clone(),
             created_at: now,
             updated_at: now,
             error: None,
         };
 
         // 在 runtime pool 中加载应用
-        match self.runtime_pool.load_app(id.clone(), code, std::collections::HashMap::new()).await {
+        let memory_limit = config.limits.as_ref().map(|l| l.memory_mb);
+        match self
+            .runtime_pool
+            .load_app(id.clone(), code, config.env.clone(), memory_limit)
+            .await
+        {
             Ok(()) => {
                 app_info.state = AppState::Running;
                 app_info.updated_at = SystemTime::now();
@@ -105,7 +110,10 @@ impl ApplicationManager {
         self.runtime_pool.unload_app(id).await?;
 
         // 加载新版本
-        self.runtime_pool.load_app(id.to_string(), code, std::collections::HashMap::new()).await?;
+        let memory_limit = current_config.limits.as_ref().map(|l| l.memory_mb);
+        self.runtime_pool
+            .load_app(id.to_string(), code, current_config.env.clone(), memory_limit)
+            .await?;
 
         // 更新应用信息
         if let Some(mut entry) = self.apps.get_mut(id) {

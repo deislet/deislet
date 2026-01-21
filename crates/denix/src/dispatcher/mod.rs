@@ -3,9 +3,10 @@
 pub mod handlers;
 
 use crate::app::ApplicationManager;
-use crate::app_store::AppStore;
+use crate::app_repo::AppRepo;
 use crate::config_store::ConfigStore;
 use crate::management::ManagementServer;
+use crate::trigger::TriggerServer;
 use anyhow::Result;
 use axum::Router;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ pub struct AppState {
 pub async fn start_server(
     app_manager: Arc<ApplicationManager>,
     config_store: Arc<ConfigStore>,
-    app_store: Arc<AppStore>,
+    app_repo: Arc<AppRepo>,
     worker_id: String,
     port: u16,
 ) -> Result<()> {
@@ -31,9 +32,49 @@ pub async fn start_server(
         app_manager: app_manager.clone(),
     };
 
-    // Create gRPC management service
-    let grpc_service =
-        ManagementServer::create_service(app_manager.clone(), config_store, app_store, worker_id);
+    // Create gRPC services
+    let management_service =
+        ManagementServer::create_service(app_manager.clone(), config_store, app_repo, worker_id);
+    let trigger_service = TriggerServer::create_service(app_manager.clone());
+
+    // Combine gRPC services
+    let grpc_service = tower::service_fn(move |req: axum::extract::Request| {
+        let mut management_service = management_service.clone();
+        let mut trigger_service = trigger_service.clone();
+        async move {
+            let path = req.uri().path();
+            if path.starts_with("/denix.management.") {
+                match tower::Service::call(&mut management_service, req).await {
+                    Ok(res) => {
+                        let (parts, body) = res.into_parts();
+                        let body = axum::body::Body::new(body);
+                        Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(parts, body))
+                    }
+                    Err(_) => Ok(axum::http::Response::builder()
+                        .status(500)
+                        .body(axum::body::Body::empty())
+                        .unwrap()),
+                }
+            } else if path.starts_with("/denix.trigger.") {
+                match tower::Service::call(&mut trigger_service, req).await {
+                    Ok(res) => {
+                        let (parts, body) = res.into_parts();
+                        let body = axum::body::Body::new(body);
+                        Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(parts, body))
+                    }
+                    Err(_) => Ok(axum::http::Response::builder()
+                        .status(500)
+                        .body(axum::body::Body::empty())
+                        .unwrap()),
+                }
+            } else {
+                Ok(axum::http::Response::builder()
+                    .status(404)
+                    .body(axum::body::Body::empty())
+                    .unwrap())
+            }
+        }
+    });
 
     // Build HTTP routes - 所有请求通过 x-app-id header 路由
     // 添加通配符路由来处理所有 HTTP 请求
@@ -76,7 +117,14 @@ export default {
   }
 }
 "#;
-    match app_manager.load_app("hello".to_string(), test_app_code.to_string(), crate::app::AppConfig::default()).await {
+    match app_manager
+        .load_app(
+            "hello".to_string(),
+            test_app_code.to_string(),
+            crate::app::AppConfig::default(),
+        )
+        .await
+    {
         Ok(_) => info!("✅ 测试应用已加载 (app_id: hello)"),
         Err(e) => tracing::warn!("⚠️ 加载测试应用失败: {}", e),
     }

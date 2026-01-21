@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::ops::{init_ops_extension, KVStore, ResponseStore};
+    use crate::runtime::ops::{init_ops_extension, ResponseStore};
     use crate::runtime::ws_ops::{create_ws_manager, init_ws_extension};
     use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
     use std::cell::RefCell;
@@ -18,9 +18,7 @@ mod tests {
         // 注入必要的 Store
         let op_state = runtime.op_state();
         let mut state = op_state.borrow_mut();
-        let kv_store: KVStore = Rc::new(RefCell::new(HashMap::new()));
         let response_store: ResponseStore = Rc::new(RefCell::new(None));
-        state.put(kv_store);
         state.put(response_store);
         state.put(create_ws_manager());
 

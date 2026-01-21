@@ -8,7 +8,8 @@ use axum::{
     Router,
 };
 use denix::app::ApplicationManager;
-use denix::gateway::AppState;
+use denix::dispatcher::AppState;
+use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::ServiceExt; // for oneshot
 
@@ -16,7 +17,9 @@ use tower::ServiceExt; // for oneshot
 async fn test_gateway_execution() {
     // Setup
     let app_manager = Arc::new(ApplicationManager::new());
-    let state = AppState { app_manager: app_manager.clone() };
+    let state = AppState {
+        app_manager: app_manager.clone(),
+    };
 
     // Create a test app
     let code = r#"
@@ -26,21 +29,19 @@ async fn test_gateway_execution() {
             }
         }
     "#;
-    
-    app_manager.load_app("test_app".to_string(), code.to_string(), Default::default())
+
+    app_manager
+        .load_app("test_app".to_string(), code.to_string(), Default::default())
         .await
         .expect("Failed to load app");
 
     // Create Router with the actual handler
     let app = Router::new()
-        .route("/", any(denix::gateway::handlers::handle_request))
+        .route("/", any(denix::dispatcher::handlers::handle_request))
         .with_state(state);
 
     // 1. Test missing x-app-id header (Should fail)
-    let req_missing_header = Request::builder()
-        .uri("/")
-        .body(Body::empty())
-        .unwrap();
+    let req_missing_header = Request::builder().uri("/").body(Body::empty()).unwrap();
 
     let response = app.clone().oneshot(req_missing_header).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -54,8 +55,8 @@ async fn test_gateway_execution() {
 
     let response = app.oneshot(req_valid).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    
-    // We would verify body here, but extracting body from response in test requires 
-    // http-body-util which might not be in dev-dependencies.
-    // Checking status 200 is sufficient proof that handle_request -> execute_app worked.
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body_bytes).unwrap();
+    assert_eq!(body, "Hello from Gateway!");
 }

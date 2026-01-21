@@ -1,3 +1,4 @@
+(function() { const DenoCore = Deno.core; delete globalThis.Deno;
 // Edge Canon Runtime (v0.1.0) for Denix
 // Compliance Level: Strict
 
@@ -7,11 +8,11 @@
 
 // Console
 globalThis.console = {
-  log: (...args) => Deno.core.ops.op_log("info", args.join(" ")),
-  info: (...args) => Deno.core.ops.op_log("info", args.join(" ")),
-  warn: (...args) => Deno.core.ops.op_log("warn", args.join(" ")),
-  error: (...args) => Deno.core.ops.op_log("error", args.join(" ")),
-  debug: (...args) => Deno.core.ops.op_log("debug", args.join(" ")),
+  log: (...args) => DenoCore.ops.op_log("info", args.join(" ")),
+  info: (...args) => DenoCore.ops.op_log("info", args.join(" ")),
+  warn: (...args) => DenoCore.ops.op_log("warn", args.join(" ")),
+  error: (...args) => DenoCore.ops.op_log("error", args.join(" ")),
+  debug: (...args) => DenoCore.ops.op_log("debug", args.join(" ")),
 };
 
 // Headers Class (Minimal)
@@ -128,9 +129,95 @@ if (!globalThis.URLSearchParams) {
 
 globalThis.URL = URL;
 
+globalThis.fetch = async function(input, init) {
+  const request = new Request(input, init);
+  const reqInit = {
+    url: request.url,
+    method: request.method,
+    headers: {},
+    body: request.body || null,
+    timeout: 30
+  };
+  request.headers.forEach((v, k) => { reqInit.headers[k] = v; });
+  
+  const res = await DenoCore.ops.op_fetch(JSON.stringify(reqInit));
+  if (res.error) throw new Error(res.error);
+  
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers
+  });
+};
+
+// EventTarget Polyfill
+class EventTarget {
+  constructor() { this.listeners = {}; }
+  addEventListener(type, callback) {
+    if (!this.listeners[type]) this.listeners[type] = [];
+    this.listeners[type].push(callback);
+  }
+  removeEventListener(type, callback) {
+    if (!this.listeners[type]) return;
+    this.listeners[type] = this.listeners[type].filter(cb => cb !== callback);
+  }
+  dispatchEvent(event) {
+    if (!this.listeners[event.type]) return true;
+    this.listeners[event.type].forEach(cb => cb(event));
+    return !event.defaultPrevented;
+  }
+}
+globalThis.EventTarget = EventTarget;
+
+class Event { constructor(type) { this.type = type; } }
+globalThis.Event = Event;
+
 // ---------------------------------------------------------
 // 2. WebSocket Support
 // ---------------------------------------------------------
+
+class WebSocket extends EventTarget {
+  constructor(url, protocols = []) {
+    super();
+    this.url = url;
+    this.protocols = protocols;
+    this.readyState = 0; // CONNECTING
+    this.ws_id = null;
+    this._connect();
+  }
+  
+  async _connect() {
+    try {
+      const result = await DenoCore.ops.op_ws_connect(JSON.stringify({
+        ws_id: `ws-client-${Date.now()}-${Math.random()}`,
+        url: this.url,
+        protocols: Array.isArray(this.protocols) ? this.protocols : [this.protocols]
+      }));
+      
+      if (result.success) {
+        this.ws_id = result.ws_id;
+        this.readyState = 1; // OPEN
+        this.dispatchEvent(new Event("open"));
+      } else {
+        this.dispatchEvent(new Event("error")); // Minimal
+      }
+    } catch (e) {
+      this.dispatchEvent(new Event("error"));
+    }
+  }
+  
+  async send(data) {
+    if (this.readyState !== 1) throw new Error("WebSocket not open");
+    await DenoCore.ops.op_ws_send(this.ws_id, data);
+  }
+  
+  close() {
+    if (this.ws_id) DenoCore.ops.op_ws_close(this.ws_id);
+    this.readyState = 3;
+    this.dispatchEvent(new Event("close"));
+  }
+}
+globalThis.WebSocket = WebSocket;
 
 if (!globalThis.__denix_ws_servers) {
   globalThis.__denix_ws_servers = {};
@@ -153,7 +240,7 @@ class WebSocketServer {
     if (this._accepted) throw new Error("WebSocket already accepted");
     this._accepted = true;
     this.readyState = 1; // OPEN
-    const result = Deno.core.ops.op_ws_server_accept(this.ws_id);
+    const result = DenoCore.ops.op_ws_server_accept(this.ws_id);
     if (result.success) {
       if (this.onopen) this.onopen({ type: "open" });
     } else {
@@ -165,14 +252,14 @@ class WebSocketServer {
   async send(data) {
     if (this.readyState !== 1) throw new Error("WebSocket is not open");
     const message = typeof data === "string" ? data : JSON.stringify(data);
-    const result = await Deno.core.ops.op_ws_server_send(this.ws_id, message);
+    const result = await DenoCore.ops.op_ws_server_send(this.ws_id, message);
     if (!result.success) throw new Error(`Failed to send: ${result.error}`);
   }
 
   async close(code = 1000, reason = "") {
     this.readyState = 2; // CLOSING
     const request = { ws_id: this.ws_id, code, reason };
-    await Deno.core.ops.op_ws_server_close(JSON.stringify(request));
+    await DenoCore.ops.op_ws_server_close(JSON.stringify(request));
     this.readyState = 3; // CLOSED
     if (this.onclose) this.onclose({ type: "close", code, reason });
   }
@@ -215,24 +302,60 @@ globalThis.WebSocketPair = WebSocketPair;
 // 3. Service Adapters (The Bridge)
 // ---------------------------------------------------------
 
+class Cache {
+  async put(request, response) {
+    const url = typeof request === 'string' ? request : request.url;
+    const body = response.body; 
+    const meta = {
+      status: response.status,
+      headers: response.headers,
+      body: body
+    };
+    await DenoCore.ops.op_cache_set(url, JSON.stringify(meta));
+  }
+  async match(request) {
+    const url = typeof request === 'string' ? request : request.url;
+    const val = await DenoCore.ops.op_cache_get(url);
+    if (!val) return undefined;
+    try {
+      const meta = JSON.parse(val);
+      return new Response(meta.body, {
+        status: meta.status,
+        headers: meta.headers
+      });
+    } catch {
+      return undefined;
+    }
+  }
+  async delete(request) {
+    const url = typeof request === 'string' ? request : request.url;
+    await DenoCore.ops.op_cache_delete(url);
+    return true; 
+  }
+}
+
+globalThis.caches = {
+  default: new Cache()
+};
+
 class NativeKV {
   async get(key) {
-    return await Deno.core.ops.op_kv_get(key);
+    return await DenoCore.ops.op_kv_get(key);
   }
   async put(key, value) {
-    await Deno.core.ops.op_kv_set(key, value); 
+    await DenoCore.ops.op_kv_set(key, value); 
   }
   async delete(key) {
-    await Deno.core.ops.op_kv_delete(key);
+    await DenoCore.ops.op_kv_delete(key);
   }
 }
 
 class NativeDB {
   async execute(sql, params = []) {
-    return await Deno.core.ops.op_db_execute(sql, JSON.stringify(params));
+    return await DenoCore.ops.op_db_execute(sql, JSON.stringify(params));
   }
   async query(sql, params = []) {
-    const res = await Deno.core.ops.op_db_query(sql, JSON.stringify(params));
+    const res = await DenoCore.ops.op_db_query(sql, JSON.stringify(params));
     return res.rows; 
   }
   async transaction(callback) {
@@ -240,9 +363,63 @@ class NativeDB {
   }
 }
 
+class BlobStore {
+  async get(key) {
+    const data = await DenoCore.ops.op_blob_get(key);
+    if (!data) return null;
+    return {
+      arrayBuffer: async () => data.buffer,
+      text: async () => new TextDecoder().decode(data),
+      json: async () => JSON.parse(new TextDecoder().decode(data))
+    };
+  }
+  async put(key, data) {
+    let buffer;
+    if (typeof data === 'string') {
+      buffer = new TextEncoder().encode(data);
+    } else if (data instanceof ArrayBuffer) {
+      buffer = new Uint8Array(data);
+    } else if (ArrayBuffer.isView(data)) {
+      buffer = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    } else {
+      throw new Error("Invalid data type for BlobStore.put");
+    }
+    await DenoCore.ops.op_blob_put(key, buffer);
+  }
+  async delete(key) {
+    await DenoCore.ops.op_blob_delete(key);
+  }
+}
+
+class Queue {
+  constructor(name = "default") {
+    this.name = name;
+  }
+  async send(message) {
+    const msgStr = typeof message === "string" ? message : JSON.stringify(message);
+    await DenoCore.ops.op_queue_send(this.name, msgStr);
+  }
+}
+
 // ---------------------------------------------------------
 // 4. The Context & Invocation Logic
 // ---------------------------------------------------------
+
+const SENSITIVE_KEYS = /pass|secret|token|key|pwd|authorization/i;
+
+function redact(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(redact);
+  const newObj = {};
+  for (const key in obj) {
+    if (SENSITIVE_KEYS.test(key)) {
+      newObj[key] = "[REDACTED]";
+    } else {
+      newObj[key] = redact(obj[key]);
+    }
+  }
+  return newObj;
+}
 
 function createContext(requestData) {
   return {
@@ -251,17 +428,19 @@ function createContext(requestData) {
       headers: requestData.headers,
       body: requestData.body
     }),
-    env: Deno.core.ops.op_get_env() || {}, 
+    env: DenoCore.ops.op_get_env() || {}, 
     params: requestData.params || {},      
     services: {
       kv: new NativeKV(),
       database: new NativeDB(),
+      blob: new BlobStore(),
+      queue: new Queue("default"),
     },
     log: {
-      info: (msg) => console.info(typeof msg === 'string' ? msg : JSON.stringify(msg)),
-      error: (msg) => console.error(typeof msg === 'string' ? msg : JSON.stringify(msg)),
-      warn: (msg) => console.warn(typeof msg === 'string' ? msg : JSON.stringify(msg)),
-      debug: (msg) => console.debug(typeof msg === 'string' ? msg : JSON.stringify(msg)),
+      info: (msg) => console.info(typeof msg === 'string' ? msg : JSON.stringify(redact(msg))),
+      error: (msg) => console.error(typeof msg === 'string' ? msg : JSON.stringify(redact(msg))),
+      warn: (msg) => console.warn(typeof msg === 'string' ? msg : JSON.stringify(redact(msg))),
+      debug: (msg) => console.debug(typeof msg === 'string' ? msg : JSON.stringify(redact(msg))),
     },
     waitUntil: (promise) => {
       if (!globalThis.__pending_wait_until) globalThis.__pending_wait_until = [];
@@ -269,6 +448,22 @@ function createContext(requestData) {
     }
   };
 }
+
+globalThis.__denix_wait_until_all = async function() {
+  if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
+    const promises = globalThis.__pending_wait_until;
+    globalThis.__pending_wait_until = [];
+    try {
+        await Promise.all(promises);
+    } catch (e) {
+        console.error("Error in waitUntil promise:", e);
+    }
+    // Recursively check if new promises were added
+    if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
+      await globalThis.__denix_wait_until_all();
+    }
+  }
+};
 
 globalThis.__denix_invoke = async function(requestPayload) {
   try {
@@ -315,4 +510,5 @@ globalThis.__denix_invoke = async function(requestPayload) {
   }
 };
 
-globalThis.user_module = {}; 
+globalThis.user_module = {}; globalThis.__denix_set_response = (json) => DenoCore.ops.op_set_response(json); 
+})();

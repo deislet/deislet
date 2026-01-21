@@ -4,7 +4,7 @@
 use denix::runtime::isolate::AppRuntime;
 use denix::runtime::WsServerMessage;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 #[tokio::test]
 async fn test_websocket_direct_bridging() {
@@ -47,28 +47,38 @@ async fn test_websocket_direct_bridging() {
 
     // 2. Create Runtime
     let mut runtime = AppRuntime::new(
-        "ws_test_app".to_string(), 
-        code.to_string(), 
-        HashMap::new()
-    ).expect("Failed to create runtime");
+        "ws_test_app".to_string(),
+        code.to_string(),
+        HashMap::new(),
+        None,
+    )
+    .expect("Failed to create runtime");
 
     // 3. Simulate Gateway Handshake
     // Step A: Execute Fetch to trigger Upgrade
     let mut headers = HashMap::new();
     headers.insert("upgrade".to_string(), "websocket".to_string());
-    
-    let (status, resp_headers, _) = runtime.execute_fetch(
-        "http://localhost/".to_string(),
-        "GET".to_string(),
-        headers,
-        None
-    ).await.expect("Fetch failed");
+
+    let (tx, rx) = oneshot::channel();
+    runtime
+        .execute_fetch(
+            "http://localhost/".to_string(),
+            "GET".to_string(),
+            headers,
+            None,
+            tx,
+        )
+        .await
+        .expect("Fetch execution failed");
+
+    let (status, resp_headers, _) = rx.await.expect("Channel closed").expect("Fetch returned error");
 
     assert_eq!(status, 101);
-    let ws_id = resp_headers.get("X-Denix-WebSocket-ID")
+    let ws_id = resp_headers
+        .get("X-Denix-WebSocket-ID")
         .expect("Missing WebSocket ID header")
         .clone();
-    
+
     println!("✅ Handshake successful, ws_id: {}", ws_id);
 
     // 4. Setup Bridge Channels
@@ -76,33 +86,36 @@ async fn test_websocket_direct_bridging() {
     let (js_to_client_tx, mut js_to_client_rx) = mpsc::unbounded_channel();
 
     // Register connection (simulating what Gateway does)
-    runtime.register_ws_connection(ws_id.clone(), js_to_client_tx)
+    runtime
+        .register_ws_connection(ws_id.clone(), js_to_client_tx)
         .await
         .expect("Failed to register connection");
 
     // 5. Test Rust -> JS Message
     let test_msg = "Hello Direct WS!";
-    runtime.dispatch_ws_message(ws_id.clone(), test_msg.to_string())
+    runtime
+        .dispatch_ws_message(ws_id.clone(), test_msg.to_string())
         .await
         .expect("Failed to dispatch message");
 
     // 6. Test JS -> Rust Message (Echo)
     // Expecting WsServerMessage::Text("Echo: Hello Direct WS!")
-    let received = tokio::time::timeout(
-        std::time::Duration::from_secs(1), 
-        js_to_client_rx.recv()
-    ).await.expect("Timeout waiting for echo").expect("Channel closed");
+    let received = tokio::time::timeout(std::time::Duration::from_secs(1), js_to_client_rx.recv())
+        .await
+        .expect("Timeout waiting for echo")
+        .expect("Channel closed");
 
     match received {
         WsServerMessage::Text(text) => {
             assert_eq!(text, format!("Echo: {}", test_msg));
             println!("✅ Received Echo: {}", text);
-        },
+        }
         _ => panic!("Expected Text message, got {:?}", received),
     }
 
     // 7. Test Close
-    runtime.close_ws_connection(ws_id, 1000, "Done".to_string())
+    runtime
+        .close_ws_connection(ws_id, 1000, "Done".to_string())
         .await
         .expect("Failed to close");
 }

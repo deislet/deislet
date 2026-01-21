@@ -7,123 +7,98 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-// KV 存储（简单的内存实现，作为 fallback，使用 Rc<RefCell<>> 因为在单线程 runtime 中）
-pub type KVStore = Rc<RefCell<HashMap<String, String>>>;
-
-/// KV Get 操作（优先使用 gRPC 客户端，fallback 到内存存储）
+/// KV Get 操作
 #[op2(async)]
 #[string]
-async fn op_kv_get(state: Rc<RefCell<OpState>>, #[string] key: String) -> Option<String> {
-    // 优先尝试使用 KvClient
+async fn op_kv_get(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+) -> Result<Option<String>, std::io::Error> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
     if let Some(client) = client_opt {
-        // 使用 gRPC 客户端
-        match client.get(key.clone()).await {
-            Ok(value) => return value,
-            Err(e) => {
-                tracing::error!("KV Get failed via gRPC: {}", e);
-                // 出错则回退到内存存储
-            }
-        }
+        return client.get(key).await.map_err(|e| std::io::Error::other(e));
     }
 
-    // Fallback 到内存存储
-    let state_borrow = state.borrow();
-    let kv = state_borrow.borrow::<KVStore>().clone();
-    drop(state_borrow);
-    let store = kv.borrow();
-    store.get(&key).cloned()
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "KV service not available",
+    ))
 }
 
 /// KV Set 操作
 #[op2(async)]
-async fn op_kv_set(state: Rc<RefCell<OpState>>, #[string] key: String, #[string] value: String) {
-    // 优先尝试使用 KvClient
+async fn op_kv_set(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+    #[string] value: String,
+) -> Result<(), std::io::Error> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
     if let Some(client) = client_opt {
-        // 使用 gRPC 客户端
-        match client.set(key.clone(), value.clone()).await {
-            Ok(_) => return,
-            Err(e) => {
-                tracing::error!("KV Set failed via gRPC: {}", e);
-                // 出错则回退到内存存储
-            }
-        }
+        return client
+            .set(key, value)
+            .await
+            .map_err(|e| std::io::Error::other(e));
     }
 
-    // Fallback 到内存存储
-    let state_borrow = state.borrow();
-    let kv = state_borrow.borrow::<KVStore>().clone();
-    drop(state_borrow);
-    kv.borrow_mut().insert(key, value);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "KV service not available",
+    ))
 }
 
 /// KV Delete 操作
 #[op2(async)]
-async fn op_kv_delete(state: Rc<RefCell<OpState>>, #[string] key: String) {
-    // 优先尝试使用 KvClient
+async fn op_kv_delete(state: Rc<RefCell<OpState>>, #[string] key: String) -> Result<(), std::io::Error> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
     if let Some(client) = client_opt {
-        // 使用 gRPC 客户端
-        match client.delete(key.clone()).await {
-            Ok(_) => return,
-            Err(e) => {
-                tracing::error!("KV Delete failed via gRPC: {}", e);
-                // 出错则回退到内存存储
-            }
-        }
+        return client
+            .delete(key)
+            .await
+            .map_err(|e| std::io::Error::other(e));
     }
 
-    // Fallback 到内存存储
-    let state_borrow = state.borrow();
-    let kv = state_borrow.borrow::<KVStore>().clone();
-    drop(state_borrow);
-    kv.borrow_mut().remove(&key);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "KV service not available",
+    ))
 }
 
-/// KV List 操作（返回所有键）
+/// KV List 操作
 #[op2(async)]
 #[serde]
-async fn op_kv_list(state: Rc<RefCell<OpState>>, #[string] prefix: String) -> Vec<String> {
-    // 优先尝试使用 KvClient
+async fn op_kv_list(
+    state: Rc<RefCell<OpState>>,
+    #[string] prefix: String,
+) -> Result<Vec<String>, std::io::Error> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
     if let Some(client) = client_opt {
-        // 使用 gRPC 客户端
-        match client.list(prefix.clone(), None).await {
-            Ok((keys, _)) => return keys,
-            Err(e) => {
-                tracing::error!("KV List failed via gRPC: {}", e);
-                // 出错则回退到内存存储
-            }
-        }
+        return client
+            .list(prefix, None)
+            .await
+            .map(|(keys, _)| keys)
+            .map_err(|e| std::io::Error::other(e));
     }
 
-    // Fallback 到内存存储
-    let state_borrow = state.borrow();
-    let kv = state_borrow.borrow::<KVStore>().clone();
-    drop(state_borrow);
-    let store = kv.borrow();
-    store
-        .keys()
-        .filter(|k| k.starts_with(&prefix))
-        .cloned()
-        .collect()
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "KV service not available",
+    ))
 }
 
 /// 日志操作

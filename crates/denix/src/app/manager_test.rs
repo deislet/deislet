@@ -235,6 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // KV now requires remote gRPC
     async fn test_app_with_kv() {
         let manager = TEST_MANAGER.lock().unwrap();
 

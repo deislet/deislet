@@ -1,10 +1,11 @@
 // V8 Runtime Isolate 封装
 
+use super::blob_ops::init_blob_extension;
 use super::cache_ops::{create_cache_store, init_cache_extension, CacheStore};
-use super::cron_ops::{init_cron_extension, CronEvent};
 use super::db_ops::init_db_extension;
 use super::http_ops::init_http_extension;
-use super::ops::{init_ops_extension, KVStore, ResponseStore, EnvStore};
+use super::ops::{init_ops_extension, EnvStore, ResponseStore};
+use super::queue_ops::{init_queue_extension, MemoryQueue};
 use super::ws_ops::{create_ws_manager, init_ws_extension, WebSocketManager};
 use super::ws_server_ops::{create_ws_server_manager, init_ws_server_extension, WsServerManager};
 use anyhow::Result;
@@ -13,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use tokio::sync::oneshot;
+
+type FetchResult = (u16, HashMap<String, String>, Option<String>);
 
 /// JavaScript Request 对象
 #[derive(Serialize)]
@@ -40,17 +44,29 @@ pub struct AppRuntime {
 
 impl AppRuntime {
     /// 创建新的 Runtime
-    pub fn new(app_id: String, code: String, env: HashMap<String, String>) -> Result<Self> {
+    pub fn new(
+        app_id: String,
+        code: String,
+        env: HashMap<String, String>,
+        memory_limit_mb: Option<usize>,
+    ) -> Result<Self> {
+        let mut create_params = deno_core::v8::CreateParams::default();
+        if let Some(mb) = memory_limit_mb {
+            create_params = create_params.heap_limits(0, mb * 1024 * 1024);
+        }
+
         // 创建 Runtime
         let mut runtime = JsRuntime::new(RuntimeOptions {
+            create_params: Some(create_params),
             extensions: vec![
                 init_ops_extension(),
                 init_cache_extension(),
                 init_db_extension(),
+                init_blob_extension(),
                 init_http_extension(),
                 init_ws_extension(),
                 init_ws_server_extension(),
-                init_cron_extension(),
+                init_queue_extension(),
             ],
             ..Default::default()
         });
@@ -63,10 +79,6 @@ impl AppRuntime {
             // 环境变量
             let env_store: EnvStore = Rc::new(RefCell::new(env));
             state.put(env_store);
-
-            // KV Store (内存 HashMap)
-            let kv_store: KVStore = Rc::new(RefCell::new(HashMap::new()));
-            state.put(kv_store);
 
             // Cache Store (moka 高性能缓存)
             // 配置: 最大 10000 条目，10 分钟空闲过期
@@ -84,6 +96,10 @@ impl AppRuntime {
             // Response Store (临时响应存储)
             let response_store: ResponseStore = Rc::new(RefCell::new(None));
             state.put(response_store);
+
+            // Memory Queue (本地队列 Fallback)
+            let memory_queue: MemoryQueue = Rc::new(RefCell::new(Vec::new()));
+            state.put(memory_queue);
         }
 
         // 加载 runtime polyfills
@@ -106,7 +122,8 @@ impl AppRuntime {
         method: String,
         headers: HashMap<String, String>,
         body: Option<String>,
-    ) -> Result<(u16, HashMap<String, String>, Option<String>)> {
+        response_tx: oneshot::Sender<Result<FetchResult>>,
+    ) -> Result<()> {
         // 构造 Request 对象
         let request = JsRequest {
             url,
@@ -124,7 +141,7 @@ impl AppRuntime {
             (async () => {{
                 const request = {};
                 const response = await __denix_invoke(request);
-                Deno.core.ops.op_set_response(JSON.stringify(response));
+                __denix_set_response(JSON.stringify(response));
             }})()
             "#,
             request_json
@@ -151,51 +168,20 @@ impl AppRuntime {
         // 反序列化 response
         let response: JsResponse = serde_json::from_str(&json_str)?;
 
-        Ok((response.status, response.headers, response.body))
-    }
+        // 发送响应给客户端
+        let _ = response_tx.send(Ok((response.status, response.headers, response.body)));
 
-    /// 执行定时任务
-    ///
-    /// 当 cron 触发时调用应用的 scheduled 函数
-    #[allow(dead_code)]
-    pub async fn execute_scheduled(
-        &mut self,
-        scheduled_time: i64,
-        cron: Option<String>,
-    ) -> Result<()> {
-        // 注入 CronEvent 到 OpState
-        {
-            let op_state = self.runtime.op_state();
-            let mut state = op_state.borrow_mut();
-            let event = CronEvent {
-                scheduled_time,
-                cron,
-            };
-            state.put(event);
-        }
-
-        // 调用 JavaScript 的 __denix_scheduled 函数
-        let code = r#"
-            (async () => {
-                if (typeof globalThis.__denix_scheduled === "function") {
-                    await __denix_scheduled();
-                } else {
-                    console.log("No scheduled handler defined");
-                }
-            })()
-        "#;
-
-        // 执行代码，返回 Promise
-        let promise = self.runtime.execute_script("<scheduled>", code)?;
-
-        // 使用正确的模式：resolve + with_event_loop_promise
-        let resolve_future = self.runtime.resolve(promise);
+        // 等待 waitUntil 任务完成
+        let wait_code = "__denix_wait_until_all()";
+        let wait_promise = self.runtime.execute_script("<wait_until>", wait_code)?;
+        let wait_resolve = self.runtime.resolve(wait_promise);
         self.runtime
-            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
+            .with_event_loop_promise(wait_resolve, PollEventLoopOptions::default())
             .await?;
 
         Ok(())
     }
+
 
     /// 注册 WebSocket 连接
     ///
@@ -205,12 +191,14 @@ impl AppRuntime {
         ws_id: String,
         sender: tokio::sync::mpsc::UnboundedSender<super::WsServerMessage>,
     ) -> Result<()> {
-        let op_state = self.runtime.op_state();
-        let mut state = op_state.borrow_mut();
-
-        let ws_manager = state
-            .try_borrow_mut::<super::WsServerManager>()
-            .ok_or_else(|| anyhow::anyhow!("WsServerManager not available"))?;
+        let ws_manager = {
+            let op_state = self.runtime.op_state();
+            let mut state = op_state.borrow_mut();
+            state
+                .try_borrow_mut::<super::WsServerManager>()
+                .ok_or_else(|| anyhow::anyhow!("WsServerManager not available"))?
+                .clone()
+        };
 
         let mut manager = ws_manager.write().await;
         manager.insert(ws_id.clone(), sender);
@@ -285,10 +273,13 @@ impl AppRuntime {
             .await?;
 
         // 从 WsServerManager 中移除
-        let op_state = self.runtime.op_state();
-        let mut state = op_state.borrow_mut();
+        let ws_manager_opt = {
+            let op_state = self.runtime.op_state();
+            let mut state = op_state.borrow_mut();
+            state.try_borrow_mut::<super::WsServerManager>().cloned()
+        };
 
-        if let Some(ws_manager) = state.try_borrow_mut::<super::WsServerManager>() {
+        if let Some(ws_manager) = ws_manager_opt {
             let mut manager = ws_manager.write().await;
             manager.remove(&ws_id);
             tracing::debug!("Closed WebSocket connection: {}", ws_id);
@@ -316,7 +307,8 @@ impl AppRuntime {
 
         // export default { ... } -> globalThis.user_module.default = { ... }
         let re_export_default = Regex::new(r"export\s+default\s+").unwrap();
-        let transformed = re_export_default.replace_all(&transformed, "globalThis.user_module.default = ");
+        let transformed =
+            re_export_default.replace_all(&transformed, "globalThis.user_module.default = ");
 
         // export const/let/var name = ... -> globalThis.user_module.name = ...
         let re_export_decl = Regex::new(r"export\s+(const|let|var)\s+(\w+)\s*=").unwrap();
@@ -324,12 +316,13 @@ impl AppRuntime {
 
         // export function name(...) -> globalThis.user_module.name = function(...)
         let re_export_func = Regex::new(r"export\s+function\s+(\w+)\s*\(").unwrap();
-        let transformed = re_export_func.replace_all(&transformed, "globalThis.user_module.$1 = function(");
+        let transformed =
+            re_export_func.replace_all(&transformed, "globalThis.user_module.$1 = function(");
 
         // export async function name(...) -> globalThis.user_module.name = async function(...)
         let re_export_async_func = Regex::new(r"export\s+async\s+function\s+(\w+)\s*\(").unwrap();
-        let transformed =
-            re_export_async_func.replace_all(&transformed, "globalThis.user_module.$1 = async function(");
+        let transformed = re_export_async_func
+            .replace_all(&transformed, "globalThis.user_module.$1 = async function(");
 
         // import ... from "..." -> 移除 (简化处理，假设依赖已内置)
         let re_import = Regex::new(r#"import\s+.*?\s+from\s+["'][^"']+["'];?\s*"#).unwrap();

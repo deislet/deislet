@@ -86,7 +86,11 @@ impl LogBuffer {
     /// Get statistics
     pub async fn stats(&self) -> (u64, u64, u64) {
         let stats = self.stats.read().await;
-        (stats.total_received, stats.total_dropped, stats.total_shipped)
+        (
+            stats.total_received,
+            stats.total_dropped,
+            stats.total_shipped,
+        )
     }
 
     /// Clear buffer

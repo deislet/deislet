@@ -17,10 +17,22 @@ pub enum AppState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+
+    pub limits: Option<ResourceLimits>,
+
+    #[serde(default)]
     pub resources: Vec<String>,
 
     #[serde(default)]
     pub routes: Vec<String>,
+}
+
+/// 资源限制
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    pub memory_mb: usize,
+    pub cpu_milli: u32,
 }
 
 /// 应用信息

@@ -1,10 +1,10 @@
 pub mod app;
-pub mod app_store;
+pub mod app_repo;
 pub mod config;
 pub mod config_store;
-pub mod gateway;
+pub mod dispatcher;
 pub mod logging;
 pub mod management;
 pub mod resource;
 pub mod runtime;
-pub mod supervisor;
+pub mod trigger;

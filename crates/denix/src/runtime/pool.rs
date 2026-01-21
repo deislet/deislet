@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 /// 确保 V8 平台只初始化一次
 static V8_INIT: Once = Once::new();
 
+type FetchResult = (u16, HashMap<String, String>, Option<String>);
+
 /// 初始化 V8 平台（每个进程只能调用一次）
 fn init_v8_platform() {
     V8_INIT.call_once(|| {
@@ -26,6 +28,7 @@ pub enum RuntimeMessage {
         app_id: String,
         code: String,
         env: HashMap<String, String>,
+        memory_limit_mb: Option<usize>,
         response: oneshot::Sender<Result<()>>,
     },
     /// 卸载应用
@@ -40,7 +43,7 @@ pub enum RuntimeMessage {
         method: String,
         headers: HashMap<String, String>,
         body: Option<String>,
-        response: oneshot::Sender<Result<(u16, HashMap<String, String>, Option<String>)>>,
+        response: oneshot::Sender<Result<FetchResult>>,
     },
     /// 获取应用列表
     #[allow(dead_code)]
@@ -128,11 +131,13 @@ impl RuntimeThread {
                     app_id,
                     code,
                     env,
+                    memory_limit_mb,
                     response,
                 } => {
                     tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
-                    let result = match AppRuntime::new(app_id.clone(), code, env) {
+                    let result = match AppRuntime::new(app_id.clone(), code, env, memory_limit_mb) {
                         Ok(runtime) => {
+
                             runtimes.insert(app_id.clone(), runtime);
                             Ok(())
                         }
@@ -160,11 +165,19 @@ impl RuntimeThread {
                     response,
                 } => {
                     tracing::debug!("Thread {}: Executing request for app {}", thread_id, app_id);
-                    let result = match runtimes.get_mut(&app_id) {
-                        Some(runtime) => runtime.execute_fetch(url, method, headers, body).await,
-                        None => Err(anyhow::anyhow!("App not found")),
+                    match runtimes.get_mut(&app_id) {
+                        Some(runtime) => {
+                            if let Err(e) = runtime
+                                .execute_fetch(url, method, headers, body, response)
+                                .await
+                            {
+                                tracing::error!("Error executing fetch: {}", e);
+                            }
+                        }
+                        None => {
+                            let _ = response.send(Err(anyhow::anyhow!("App not found")));
+                        }
                     };
-                    let _ = response.send(result);
                 }
 
                 RuntimeMessage::ListApps { response } => {
@@ -293,7 +306,7 @@ impl RuntimePool {
         let num_threads = num_threads.unwrap_or_else(num_cpus::get);
         tracing::info!("Creating runtime pool with {} threads", num_threads);
 
-        let threads = (0..num_threads).map(|i| RuntimeThread::new(i)).collect();
+        let threads = (0..num_threads).map(RuntimeThread::new).collect();
 
         Self {
             threads,
@@ -326,7 +339,13 @@ impl RuntimePool {
     }
 
     /// 加载应用
-    pub async fn load_app(&self, app_id: String, code: String, env: HashMap<String, String>) -> Result<()> {
+    pub async fn load_app(
+        &self,
+        app_id: String,
+        code: String,
+        env: HashMap<String, String>,
+        memory_limit_mb: Option<usize>,
+    ) -> Result<()> {
         // 检查是否已存在
         if self.get_thread_id(&app_id).await.is_some() {
             return Err(anyhow::anyhow!("App already exists"));
@@ -342,6 +361,7 @@ impl RuntimePool {
             app_id: app_id.clone(),
             code,
             env,
+            memory_limit_mb,
             response: tx,
         })?;
 
@@ -569,7 +589,12 @@ mod tests {
 
         // 加载应用
         let result = pool
-            .load_app("test_load_exec_app".to_string(), code.to_string(), HashMap::new())
+            .load_app(
+                "test_load_exec_app".to_string(),
+                code.to_string(),
+                HashMap::new(),
+                None,
+            )
             .await;
         assert!(result.is_ok());
 
@@ -600,9 +625,14 @@ mod tests {
         // 加载多个应用
         for i in 0..4 {
             let code = r#"globalThis.default = { fetch() { return new Response("ok"); } }"#;
-            pool.load_app(format!("lb_app{}", i), code.to_string(), HashMap::new())
-                .await
-                .unwrap();
+            pool.load_app(
+                format!("lb_app{}", i),
+                code.to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // 检查应用分配
@@ -621,9 +651,14 @@ mod tests {
         let pool = TEST_POOL.lock().unwrap();
 
         let code = r#"globalThis.default = { fetch() { return new Response("ok"); } }"#;
-        pool.load_app("unload_test_app".to_string(), code.to_string(), HashMap::new())
-            .await
-            .unwrap();
+        pool.load_app(
+            "unload_test_app".to_string(),
+            code.to_string(),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
 
         // 卸载应用
         let result = pool.unload_app("unload_test_app").await;

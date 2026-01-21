@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::ops::{init_ops_extension, KVStore, ResponseStore};
+    use crate::runtime::ops::{init_ops_extension, EnvStore, ResponseStore};
     use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -14,26 +14,28 @@ mod tests {
             ..Default::default()
         });
 
-        // 注入 KV Store 和 Response Store
+        // 注入 Response Store 和 Env Store
         let op_state = runtime.op_state();
         let mut state = op_state.borrow_mut();
-        let kv_store: KVStore = Rc::new(RefCell::new(HashMap::new()));
         let response_store: ResponseStore = Rc::new(RefCell::new(None));
-        state.put(kv_store);
+        let env_store: EnvStore = Rc::new(RefCell::new(HashMap::from([(
+            "ENV_KEY".to_string(),
+            "env_value".to_string(),
+        )])));
         state.put(response_store);
+        state.put(env_store);
 
         runtime
     }
 
     #[tokio::test]
-    async fn test_kv_set_and_get() {
+    async fn test_get_env() {
         let mut runtime = setup_test_runtime();
 
-        // Set and get value (ops are now async)
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_kv_set("test_key", "test_value");
-                return await Deno.core.ops.op_kv_get("test_key");
+                const env = Deno.core.ops.op_get_env();
+                Deno.core.ops.op_set_response(JSON.stringify(env));
             })()
         "#;
 
@@ -44,78 +46,12 @@ mod tests {
             .await
             .unwrap();
 
-        // 验证结果通过 OpState 直接访问
         let op_state = runtime.op_state();
         let state = op_state.borrow();
-        let kv = state.borrow::<KVStore>().clone();
-        let store = kv.borrow();
+        let store = state.borrow::<ResponseStore>().clone();
+        let response = store.borrow().clone().unwrap();
+        let env: HashMap<String, String> = serde_json::from_str(&response).unwrap();
 
-        assert_eq!(store.get("test_key"), Some(&"test_value".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_kv_delete() {
-        let mut runtime = setup_test_runtime();
-
-        // Set then delete (ops are now async)
-        let code = r#"
-            (async () => {
-                await Deno.core.ops.op_kv_set("del_key", "del_value");
-                await Deno.core.ops.op_kv_delete("del_key");
-            })()
-        "#;
-
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
-
-        // 验证结果通过 OpState 直接访问
-        let op_state = runtime.op_state();
-        let state = op_state.borrow();
-        let kv = state.borrow::<KVStore>().clone();
-        let store = kv.borrow();
-
-        assert_eq!(store.get("del_key"), None);
-    }
-
-    #[tokio::test]
-    async fn test_kv_list() {
-        let mut runtime = setup_test_runtime();
-
-        // Set keys and list (ops are now async)
-        let code = r#"
-            (async () => {
-                await Deno.core.ops.op_kv_set("prefix:key1", "val1");
-                await Deno.core.ops.op_kv_set("prefix:key2", "val2");
-                await Deno.core.ops.op_kv_set("other:key3", "val3");
-            })()
-        "#;
-
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
-
-        // 验证结果通过 OpState 直接访问
-        let op_state = runtime.op_state();
-        let state = op_state.borrow();
-        let kv = state.borrow::<KVStore>().clone();
-        let store = kv.borrow();
-
-        // 检查存储的键
-        let keys: Vec<String> = store
-            .keys()
-            .filter(|k| k.starts_with("prefix:"))
-            .cloned()
-            .collect();
-
-        assert_eq!(keys.len(), 2);
-        assert!(keys.contains(&"prefix:key1".to_string()));
-        assert!(keys.contains(&"prefix:key2".to_string()));
+        assert_eq!(env.get("ENV_KEY"), Some(&"env_value".to_string()));
     }
 }

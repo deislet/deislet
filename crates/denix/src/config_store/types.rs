@@ -22,7 +22,7 @@ impl ConfigType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "global" => Some(ConfigType::Global),
             "app" => Some(ConfigType::App),
