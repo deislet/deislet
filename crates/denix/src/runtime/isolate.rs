@@ -254,7 +254,7 @@ impl AppRuntime {
         // 如果快照已加载，则跳过 bootstrap 加载（因为已经包含在快照中）
         if !self.snapshot_loaded {
             let bootstrap_specifier =
-                deno_core::ModuleSpecifier::parse("ext:denix_bootstrap/bootstrap.js")?;
+                deno_core::ModuleSpecifier::parse("ext:denix_bootstrap/src/runtime/js/bootstrap.js")?;
             let bootstrap_id = self
                 .runtime
                 .load_side_es_module(&bootstrap_specifier)
@@ -266,7 +266,7 @@ impl AppRuntime {
         }
 
         self.runtime
-            .execute_script("<runtime>", include_str!("../../runtime_js/runtime.js"))?;
+            .execute_script("<runtime>", include_str!("js/runtime.js"))?;
 
         let mod_id = self
             .runtime

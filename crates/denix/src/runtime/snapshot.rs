@@ -63,7 +63,7 @@ fn create_startup_snapshot() -> Result<&'static [u8]> {
 
                     // 执行 bootstrap.js 以初始化 Web API 全局对象
                     let bootstrap_specifier =
-                        ModuleSpecifier::parse("ext:denix_bootstrap/bootstrap.js")
+                        ModuleSpecifier::parse("ext:denix_bootstrap/src/runtime/js/bootstrap.js")
                             .expect("Failed to parse bootstrap specifier");
 
                     // 创建临时的 tokio runtime 来执行 async 模块加载
