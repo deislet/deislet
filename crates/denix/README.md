@@ -1,10 +1,11 @@
 # Denix - 自治型边缘运行时
 
-基于 **Rust + deno_core** 的高性能、多租户、自治型 JavaScript/Wasm 运行时平台，专为边缘计算场景设计。
+基于 **Rust + deno_core** 的高性能、多租户、自治型 JavaScript/TypeScript/Wasm 运行时平台，专为边缘计算场景设计。
 
 ## 🎯 核心特性
 
 - 🦀 **Rust 核心**: 极致性能与内存安全。
+- 📦 **多语言支持**: 原生支持 JavaScript, TypeScript (自动转译), WebAssembly。
 - 🔒 **多租户隔离**: 每个应用独享 V8 Isolate，毫秒级冷启动。
 - 🛡️ **资源治理**: 
   - **硬限制**: 30s CPU 时间，128MB 内存 (OOM 自动终止)。
