@@ -20,7 +20,7 @@ async fn op_kv_get(
     };
 
     if let Some(client) = client_opt {
-        return client.get(key).await.map_err(|e| std::io::Error::other(e));
+        return client.get(key).await.map_err(std::io::Error::other);
     }
 
     Err(std::io::Error::new(
@@ -42,10 +42,7 @@ async fn op_kv_set(
     };
 
     if let Some(client) = client_opt {
-        return client
-            .set(key, value)
-            .await
-            .map_err(|e| std::io::Error::other(e));
+        return client.set(key, value).await.map_err(std::io::Error::other);
     }
 
     Err(std::io::Error::new(
@@ -56,17 +53,17 @@ async fn op_kv_set(
 
 /// KV Delete 操作
 #[op2(async)]
-async fn op_kv_delete(state: Rc<RefCell<OpState>>, #[string] key: String) -> Result<(), std::io::Error> {
+async fn op_kv_delete(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+) -> Result<(), std::io::Error> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
     if let Some(client) = client_opt {
-        return client
-            .delete(key)
-            .await
-            .map_err(|e| std::io::Error::other(e));
+        return client.delete(key).await.map_err(std::io::Error::other);
     }
 
     Err(std::io::Error::new(
@@ -92,7 +89,7 @@ async fn op_kv_list(
             .list(prefix, None)
             .await
             .map(|(keys, _)| keys)
-            .map_err(|e| std::io::Error::other(e));
+            .map_err(std::io::Error::other);
     }
 
     Err(std::io::Error::new(
@@ -105,10 +102,10 @@ async fn op_kv_list(
 #[op2(fast)]
 fn op_log(#[string] level: String, #[string] message: String) {
     match level.as_str() {
-        "info" => tracing::info!("[App] {}", message),
-        "warn" => tracing::warn!("[App] {}", message),
-        "error" => tracing::error!("[App] {}", message),
-        _ => tracing::debug!("[App] {}", message),
+        "info" => tracing::info!(target: "app", "{}", message),
+        "warn" => tracing::warn!(target: "app", "{}", message),
+        "error" => tracing::error!(target: "app", "{}", message),
+        _ => tracing::debug!(target: "app", "{}", message),
     }
 }
 

@@ -1,9 +1,6 @@
-// 应用类型定义
-
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
-/// 应用状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AppState {
@@ -13,7 +10,6 @@ pub enum AppState {
     Error,
 }
 
-/// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
@@ -26,16 +22,28 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub routes: Vec<String>,
+
+    #[serde(default)]
+    pub permissions: AppPermissions,
 }
 
-/// 资源限制
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppPermissions {
+    #[serde(default)]
+    pub allow_net: Vec<String>,
+
+    #[serde(default)]
+    pub allow_env: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub memory_mb: usize,
     pub cpu_milli: u32,
+    #[serde(default)]
+    pub resource_table_max: Option<usize>,
 }
 
-/// 应用信息
 #[derive(Debug, Clone, Serialize)]
 pub struct App {
     pub id: String,
@@ -48,7 +56,6 @@ pub struct App {
     pub error: Option<String>,
 }
 
-/// 创建应用请求
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
     pub id: String,
@@ -58,7 +65,6 @@ pub struct CreateAppRequest {
     pub config: AppConfig,
 }
 
-/// 更新应用请求
 #[derive(Debug, Deserialize)]
 pub struct UpdateAppRequest {
     pub code: String,

@@ -15,9 +15,10 @@ async fn op_blob_get(
     };
 
     if let Some(client) = client_opt {
-        return client.get(key).await.map_err(|e| {
-            std::io::Error::other(e.to_string())
-        });
+        return client
+            .get(key)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()));
     }
 
     Err(std::io::Error::new(
@@ -39,9 +40,10 @@ async fn op_blob_put(
     };
 
     if let Some(client) = client_opt {
-        return client.put(key, data).await.map_err(|e| {
-            std::io::Error::other(e.to_string())
-        });
+        return client
+            .put(key, data)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()));
     }
 
     Err(std::io::Error::new(
@@ -62,9 +64,10 @@ async fn op_blob_delete(
     };
 
     if let Some(client) = client_opt {
-        return client.delete(key).await.map_err(|e| {
-            std::io::Error::other(e.to_string())
-        });
+        return client
+            .delete(key)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()));
     }
 
     Err(std::io::Error::new(

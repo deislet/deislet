@@ -48,7 +48,9 @@ pub async fn start_server(
                     Ok(res) => {
                         let (parts, body) = res.into_parts();
                         let body = axum::body::Body::new(body);
-                        Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(parts, body))
+                        Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
+                            parts, body,
+                        ))
                     }
                     Err(_) => Ok(axum::http::Response::builder()
                         .status(500)
@@ -60,7 +62,9 @@ pub async fn start_server(
                     Ok(res) => {
                         let (parts, body) = res.into_parts();
                         let body = axum::body::Body::new(body);
-                        Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(parts, body))
+                        Ok::<_, std::convert::Infallible>(axum::http::Response::from_parts(
+                            parts, body,
+                        ))
                     }
                     Err(_) => Ok(axum::http::Response::builder()
                         .status(500)
@@ -76,7 +80,7 @@ pub async fn start_server(
         }
     });
 
-    // Build HTTP routes - 所有请求通过 x-app-id header 路由
+    // Build HTTP routes - 所有请求通过 x-deis-app-id header 路由
     // 添加通配符路由来处理所有 HTTP 请求
     let http_router = Router::new()
         .route("/*path", axum::routing::any(handlers::handle_request))
@@ -99,6 +103,7 @@ pub async fn start_server(
             "_system".to_string(),
             system_app_code.to_string(),
             crate::app::AppConfig::default(),
+            None,
         )
         .await
     {
@@ -111,17 +116,16 @@ pub async fn start_server(
 
     // 预加载测试应用（可选）
     let test_app_code = r#"
-export default {
-  fetch(request, env) {
-    return new Response("Hello from x-app-id: hello! Path: " + request.url);
-  }
-}
+ export default function handler(context) {
+   return new Response("Hello from x-deis-app-id: hello! Path: " + context.request.url);
+ }
 "#;
     match app_manager
         .load_app(
             "hello".to_string(),
             test_app_code.to_string(),
             crate::app::AppConfig::default(),
+            None,
         )
         .await
     {
@@ -136,13 +140,13 @@ export default {
         "📡 gRPC Management: localhost:{} (content-type: application/grpc)",
         port
     );
-    info!("🎯 New Routing: x-app-id header based");
+    info!("🎯 New Routing: x-deis-app-id header based");
     info!(
-        "📊 Health Check: curl -H \"x-app-id: _system\" http://localhost:{}/health",
+        "📊 Health Check: curl -H \"x-deis-app-id: _system\" http://localhost:{}/health",
         port
     );
     info!(
-        "📚 Platform Info: curl -H \"x-app-id: _system\" http://localhost:{}/",
+        "📚 Platform Info: curl -H \"x-deis-app-id: _system\" http://localhost:{}/",
         port
     );
     info!("====================================");

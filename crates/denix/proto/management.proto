@@ -24,6 +24,24 @@ service DenixManagement {
 
     // 健康检查
     rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+    // 开启调试
+    rpc StartInspect(StartInspectRequest) returns (StartInspectResponse);
+}
+
+// ============ 调试管理 ============
+
+message StartInspectRequest {
+    string app_id = 1;
+    // 调试会话有效期（秒），默认 300秒
+    int32 ttl_seconds = 2;
+}
+
+message StartInspectResponse {
+    // 调试用 App ID (例如: _inspect:<app_id>)
+    string inspect_app_id = 1;
+    // 调试 Token (需放入 x-denix-inspect-token header)
+    string token = 2;
 }
 
 // ============ 配置管理 ============
@@ -94,6 +112,9 @@ message ResourceLimits {
 
     // 最大请求并发数
     int32 max_concurrency = 3;
+
+    // ResourceTable 最大数量
+    int32 resource_table_max = 4;
 }
 
 // 路由规则
@@ -156,6 +177,23 @@ message GetStatusResponse {
 
     // 系统资源使用情况
     ResourceUsage resource_usage = 3;
+
+    // 应用 OpMetrics 汇总
+    repeated AppOpMetrics op_metrics = 4;
+}
+
+// 应用 OpMetrics 汇总
+message AppOpMetrics {
+    string app_id = 1;
+    OpMetricsSummary summary = 2;
+}
+
+// OpMetrics 汇总
+message OpMetricsSummary {
+    uint64 ops_dispatched_sync = 1;
+    uint64 ops_dispatched_async = 2;
+    uint64 ops_dispatched_fast = 3;
+    uint64 ops_completed_async = 4;
 }
 
 // Worker 信息

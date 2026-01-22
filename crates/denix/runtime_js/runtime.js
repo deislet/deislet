@@ -1,10 +1,200 @@
-(function() { const DenoCore = Deno.core; delete globalThis.Deno;
+const DenoCore = Deno.core; delete globalThis.Deno;
 // Edge Canon Runtime (v0.2.0) for Denix
 // Native Deno Runtime extensions enabled.
 
 // ---------------------------------------------------------
 // 1. WebSocket Support (Custom Bridge)
 // ---------------------------------------------------------
+
+if (typeof globalThis.EventTarget === "undefined") {
+  class EventTarget {
+    constructor() {
+      this.__listeners = new Map();
+    }
+    addEventListener(type, listener) {
+      if (!listener) return;
+      const listeners = this.__listeners.get(type) || new Set();
+      listeners.add(listener);
+      this.__listeners.set(type, listeners);
+    }
+    removeEventListener(type, listener) {
+      const listeners = this.__listeners.get(type);
+      if (!listeners) return;
+      listeners.delete(listener);
+      if (listeners.size === 0) this.__listeners.delete(type);
+    }
+    dispatchEvent(event) {
+      if (!event || !event.type) return false;
+      const listeners = this.__listeners.get(event.type);
+      if (!listeners) return false;
+      for (const listener of listeners) {
+        listener.call(this, event);
+      }
+      return true;
+    }
+  }
+  globalThis.EventTarget = EventTarget;
+}
+
+if (typeof globalThis.Headers === "undefined") {
+  class Headers {
+    constructor(init = {}) {
+      this._map = new Map();
+      if (init instanceof Headers) {
+        init.forEach((value, key) => this._map.set(key.toLowerCase(), String(value)));
+      } else if (Array.isArray(init)) {
+        for (const [key, value] of init) {
+          this._map.set(String(key).toLowerCase(), String(value));
+        }
+      } else if (init && typeof init === "object") {
+        for (const key of Object.keys(init)) {
+          this._map.set(String(key).toLowerCase(), String(init[key]));
+        }
+      }
+    }
+    set(key, value) {
+      this._map.set(String(key).toLowerCase(), String(value));
+    }
+    get(key) {
+      const value = this._map.get(String(key).toLowerCase());
+      return value === undefined ? null : value;
+    }
+    forEach(callback) {
+      for (const [key, value] of this._map.entries()) {
+        callback(value, key, this);
+      }
+    }
+    entries() {
+      return this._map.entries();
+    }
+  }
+  globalThis.Headers = Headers;
+}
+
+if (typeof globalThis.Request === "undefined") {
+  class Request {
+    constructor(url, init = {}) {
+      this.url = String(url);
+      this.method = (init.method || "GET").toUpperCase();
+      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
+      this._body = init.body ?? null;
+    }
+    clone() {
+      return new Request(this.url, { method: this.method, headers: this.headers, body: this._body });
+    }
+  }
+  globalThis.Request = Request;
+}
+
+if (typeof globalThis.Response === "undefined") {
+  class Response {
+    constructor(body = null, init = {}) {
+      this.status = init.status || 200;
+      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
+      this._body = body;
+      if (init && init.webSocket) {
+        this.webSocket = init.webSocket;
+      }
+    }
+    async text() {
+      return this._body == null ? "" : String(this._body);
+    }
+    clone() {
+      return new Response(this._body, { status: this.status, headers: this.headers });
+    }
+    get body() {
+      return this._body;
+    }
+  }
+  globalThis.Response = Response;
+}
+
+if (typeof globalThis.URLSearchParams === "undefined") {
+  class URLSearchParams {
+    constructor(query = "") {
+      this._map = new Map();
+      let raw = String(query);
+      if (raw.startsWith("?")) raw = raw.slice(1);
+      if (!raw) return;
+      for (const part of raw.split("&")) {
+        if (!part) continue;
+        const [key, value = ""] = part.split("=");
+        const decodedKey = decodeURIComponent(key.replace(/\+/g, " "));
+        const decodedValue = decodeURIComponent(value.replace(/\+/g, " "));
+        this._map.set(decodedKey, decodedValue);
+      }
+    }
+    get(key) {
+      return this._map.has(key) ? this._map.get(key) : null;
+    }
+  }
+  globalThis.URLSearchParams = URLSearchParams;
+}
+
+if (typeof globalThis.URL === "undefined") {
+  class URL {
+    constructor(url) {
+      const href = String(url);
+      this.href = href;
+      this.pathname = URL._extractPathname(href);
+      this.search = URL._extractSearch(href);
+      this.searchParams = new URLSearchParams(this.search);
+    }
+    toString() {
+      return this.href;
+    }
+    static _extractPathname(href) {
+      if (!href) return "/";
+      let path = "/";
+      const schemeIndex = href.indexOf("://");
+      if (schemeIndex >= 0) {
+        const pathIndex = href.indexOf("/", schemeIndex + 3);
+        if (pathIndex >= 0) {
+          path = href.slice(pathIndex);
+        }
+      } else if (href.startsWith("/")) {
+        path = href;
+      }
+      const queryIndex = path.indexOf("?");
+      if (queryIndex >= 0) path = path.slice(0, queryIndex);
+      const hashIndex = path.indexOf("#");
+      if (hashIndex >= 0) path = path.slice(0, hashIndex);
+      return path || "/";
+    }
+    static _extractSearch(href) {
+      if (!href) return "";
+      const queryIndex = href.indexOf("?");
+      if (queryIndex < 0) return "";
+      const hashIndex = href.indexOf("#", queryIndex);
+      if (hashIndex >= 0) return href.slice(queryIndex, hashIndex);
+      return href.slice(queryIndex);
+    }
+  }
+  globalThis.URL = URL;
+}
+
+if (typeof globalThis.setTimeout === "undefined") {
+  globalThis.setTimeout = (callback, _ms, ...args) => {
+    const id = Math.random();
+    Promise.resolve().then(() => callback(...args));
+    return id;
+  };
+  globalThis.clearTimeout = (_id) => {};
+}
+
+if (globalThis.Response && !globalThis.Response.__denix_patched) {
+  const OriginalResponse = globalThis.Response;
+  class ResponseWrapper extends OriginalResponse {
+    constructor(body = null, init = {}) {
+      super(body, init);
+      if (init && init.webSocket) {
+        this.webSocket = init.webSocket;
+      }
+    }
+  }
+  ResponseWrapper.__denix_patched = true;
+  globalThis.Response = ResponseWrapper;
+}
 
 // BridgeWebSocket: A placeholder WebSocket for the client side of a WebSocketPair.
 // It mainly serves to carry the ws_id back to the platform via Response.
@@ -24,8 +214,9 @@ if (!globalThis.__denix_ws_servers) {
   globalThis.__denix_ws_servers = {};
 }
 
-class WebSocketServer {
+class WebSocketServer extends EventTarget {
   constructor(ws_id) {
+    super();
     this.ws_id = ws_id;
     this.readyState = 0; // CONNECTING
     this._accepted = false;
@@ -40,7 +231,9 @@ class WebSocketServer {
     this.readyState = 1; // OPEN
     const result = DenoCore.ops.op_ws_server_accept(this.ws_id);
     if (result.success) {
-      if (this.onopen) this.onopen({ type: "open" });
+      const event = { type: "open" };
+      if (this.onopen) this.onopen(event);
+      this.dispatchEvent(event);
     } else {
       if (this.onerror) this.onerror({ type: "error", error: result.error });
     }
@@ -48,30 +241,30 @@ class WebSocketServer {
 
   // Called by Rust when message received from client
   _handleMessage(message) {
-    if (this.onmessage) {
-        let data = message;
-        // Check if binary
-        try {
-            const json = JSON.parse(message);
-            if (json.type === "binary" && json.data) {
-                // Decode base64
-                const binaryString = atob(json.data);
-                const bytes = new Uint8Array(binaryString.length);
-                for (let i = 0; i < binaryString.length; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                }
-                data = bytes.buffer; // Return ArrayBuffer
-            }
-        } catch (e) {}
-        
-        this.onmessage({ type: "message", data });
-    }
+    let data = message;
+    try {
+      const json = JSON.parse(message);
+      if (json.type === "binary" && json.data) {
+        const binaryString = atob(json.data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        data = bytes.buffer;
+      }
+    } catch (e) {}
+
+    const event = { type: "message", data };
+    if (this.onmessage) this.onmessage(event);
+    this.dispatchEvent(event);
   }
 
   // Called by Rust when connection closed
   _handleClose(code, reason) {
     this.readyState = 3; // CLOSED
-    if (this.onclose) this.onclose({ type: "close", code, reason });
+    const event = { type: "close", code, reason };
+    if (this.onclose) this.onclose(event);
+    this.dispatchEvent(event);
   }
 
   async send(data) {
@@ -89,6 +282,8 @@ class WebSocketServer {
     if (this.onclose) this.onclose({ type: "close", code, reason });
   }
 }
+
+globalThis.WebSocketServer = WebSocketServer;
 
 class WebSocketPair {
   constructor() {
@@ -265,22 +460,18 @@ globalThis.__denix_wait_until_all = async function() {
 globalThis.__denix_invoke = async function(requestPayload) {
   try {
     let handler;
-    // Support export default { fetch }
-    if (globalThis.user_module && globalThis.user_module.default) {
-      if (typeof globalThis.user_module.default.fetch === 'function') {
-        handler = globalThis.user_module.default.fetch;
-      }
+    if (globalThis.user_module && typeof globalThis.user_module.default === 'function') {
+        handler = globalThis.user_module.default;
     }
     
     if (!handler) {
-      return { status: 500, headers: {}, body: "No fetch handler found in user module" };
+      return { status: 500, headers: {}, body: "No default export handler found (Edge Canon requires 'export default function(context)')" };
     }
 
     const ctx = createContext(requestPayload);
     
-    // Execute handler
-    // Cloudflare style: fetch(request, env, ctx)
-    const resp = await handler(ctx.request, ctx.env, ctx);
+    let resp;
+    resp = await handler(ctx);
     
     if (!(resp instanceof Response)) {
        return { status: 500, headers: {}, body: "Handler did not return a Response object" };
@@ -311,14 +502,14 @@ globalThis.__denix_invoke = async function(requestPayload) {
       body: body
     };
   } catch (e) {
-    console.error("Runtime invoke error:", e);
+    const errorText = e && e.stack ? e.stack : String(e);
+    console.error("Runtime invoke error:", errorText);
     return {
       status: 500,
       headers: {},
-      body: `Runtime Error: ${e.message}`
+      body: `Runtime Error: ${errorText}`
     };
   }
 };
 
-globalThis.user_module = {}; globalThis.__denix_set_response = (json) => DenoCore.ops.op_set_response(json); 
-})();
+globalThis.user_module = {}; globalThis.__denix_set_response = (json) => DenoCore.ops.op_set_response(json);

@@ -25,6 +25,13 @@ Cargo.lock
 *.swo
 *~
 
+# Coverage
+coverage/
+*.xml
+
+# Snapshots
+*.snapshot
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,9 +1,11 @@
 // 应用管理器
 
 use super::types::{App, AppConfig, AppState};
+use crate::app_repo::AppRepo;
 use crate::runtime::RuntimePool;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use deno_core::OpMetricsSummary;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -11,6 +13,8 @@ use std::time::SystemTime;
 pub struct ApplicationManager {
     apps: DashMap<String, App>,
     runtime_pool: Arc<RuntimePool>,
+    // 调试会话: app_id -> (token, expires_at)
+    inspect_sessions: DashMap<String, (String, SystemTime)>,
 }
 
 impl ApplicationManager {
@@ -19,16 +23,35 @@ impl ApplicationManager {
         Self::with_threads(None)
     }
 
+    pub fn new_with_repo(app_repo: Arc<AppRepo>) -> Self {
+        Self::with_threads_and_repo(None, app_repo)
+    }
+
     /// 创建新的应用管理器（指定线程数）
     pub fn with_threads(num_threads: Option<usize>) -> Self {
         Self {
             apps: DashMap::new(),
             runtime_pool: Arc::new(RuntimePool::new(num_threads)),
+            inspect_sessions: DashMap::new(),
+        }
+    }
+
+    pub fn with_threads_and_repo(num_threads: Option<usize>, app_repo: Arc<AppRepo>) -> Self {
+        Self {
+            apps: DashMap::new(),
+            runtime_pool: Arc::new(RuntimePool::new_with_repo(num_threads, Some(app_repo))),
+            inspect_sessions: DashMap::new(),
         }
     }
 
     /// 加载应用
-    pub async fn load_app(&self, id: String, code: String, config: AppConfig) -> Result<()> {
+    pub async fn load_app(
+        &self,
+        id: String,
+        code: String,
+        config: AppConfig,
+        entry_point: Option<String>,
+    ) -> Result<()> {
         // 检查应用是否已存在
         if self.apps.contains_key(&id) {
             return Err(anyhow!("App {} already exists", id));
@@ -49,9 +72,18 @@ impl ApplicationManager {
 
         // 在 runtime pool 中加载应用
         let memory_limit = config.limits.as_ref().map(|l| l.memory_mb);
+        let resource_table_max = config.limits.as_ref().and_then(|l| l.resource_table_max);
         match self
             .runtime_pool
-            .load_app(id.clone(), code, config.env.clone(), memory_limit)
+            .load_app(
+                id.clone(),
+                code,
+                entry_point,
+                config.env.clone(),
+                config.permissions.clone(),
+                memory_limit,
+                resource_table_max,
+            )
             .await
         {
             Ok(()) => {
@@ -69,6 +101,55 @@ impl ApplicationManager {
                 Err(e)
             }
         }
+    }
+
+    /// 开启调试会话
+    pub fn start_inspect(&self, app_id: String, ttl_seconds: u64) -> Result<(String, String)> {
+        // 检查应用是否已存在
+        if !self.apps.contains_key(&app_id) {
+            return Err(anyhow!("App {} not found", app_id));
+        }
+
+        // 生成 Token
+        let token = uuid::Uuid::new_v4().to_string();
+        let expires_at = SystemTime::now() + std::time::Duration::from_secs(ttl_seconds);
+
+        let inspect_app_id = format!("_inspect:{}", app_id);
+
+        // 存储会话
+        self.inspect_sessions
+            .insert(app_id.clone(), (token.clone(), expires_at));
+
+        tracing::info!(
+            "Started debug session for app {}: token={}, ttl={}s",
+            app_id,
+            token,
+            ttl_seconds
+        );
+
+        Ok((inspect_app_id, token))
+    }
+
+    /// 验证调试 Token
+    pub fn validate_inspect_token(&self, app_id: &str, token: &str) -> bool {
+        if let Some(entry) = self.inspect_sessions.get(app_id) {
+            let (stored_token, expires_at) = entry.value();
+            if stored_token == token && SystemTime::now() < *expires_at {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 连接调试器
+    pub async fn connect_inspector(
+        &self,
+        app_id: &str,
+    ) -> Result<(
+        tokio::sync::mpsc::UnboundedSender<String>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    )> {
+        self.runtime_pool.connect_inspector(app_id).await
     }
 
     /// 卸载应用
@@ -94,6 +175,7 @@ impl ApplicationManager {
         id: &str,
         code: String,
         config: Option<AppConfig>,
+        entry_point: Option<String>,
     ) -> Result<()> {
         tracing::info!("Updating app: {}", id);
 
@@ -111,8 +193,20 @@ impl ApplicationManager {
 
         // 加载新版本
         let memory_limit = current_config.limits.as_ref().map(|l| l.memory_mb);
+        let resource_table_max = current_config
+            .limits
+            .as_ref()
+            .and_then(|l| l.resource_table_max);
         self.runtime_pool
-            .load_app(id.to_string(), code, current_config.env.clone(), memory_limit)
+            .load_app(
+                id.to_string(),
+                code,
+                entry_point,
+                current_config.env.clone(),
+                current_config.permissions.clone(),
+                memory_limit,
+                resource_table_max,
+            )
             .await?;
 
         // 更新应用信息
@@ -195,6 +289,29 @@ impl ApplicationManager {
         }
 
         stats
+    }
+
+    /// 获取各应用的 OpMetrics 汇总
+    pub async fn get_op_metrics(&self) -> Vec<(String, OpMetricsSummary)> {
+        let app_ids: Vec<String> = self.apps.iter().map(|entry| entry.key().clone()).collect();
+        let mut results = Vec::new();
+
+        for app_id in app_ids {
+            match self.runtime_pool.get_op_metrics(&app_id).await {
+                Ok(summary) => {
+                    results.push((app_id, summary));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to get OpMetrics summary: app_id={}, error={}",
+                        app_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        results
     }
 
     /// 注册 WebSocket 连接

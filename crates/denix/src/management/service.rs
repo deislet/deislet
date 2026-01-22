@@ -17,6 +17,67 @@ pub struct DenixManagementService {
     worker_id: String,
 }
 
+fn map_proto_limits(
+    limits: Option<super::proto::ResourceLimits>,
+) -> Option<crate::app::types::ResourceLimits> {
+    limits.map(|limits| {
+        let memory_mb = if limits.memory_mb < 0 {
+            warn!("ResourceLimits.memory_mb is negative: {}", limits.memory_mb);
+            0
+        } else {
+            limits.memory_mb as usize
+        };
+
+        let cpu_milli = if limits.cpu_milli < 0 {
+            warn!("ResourceLimits.cpu_milli is negative: {}", limits.cpu_milli);
+            0
+        } else {
+            limits.cpu_milli as u32
+        };
+
+        let resource_table_max = if limits.resource_table_max > 0 {
+            Some(limits.resource_table_max as usize)
+        } else {
+            None
+        };
+
+        crate::app::types::ResourceLimits {
+            memory_mb,
+            cpu_milli,
+            resource_table_max,
+        }
+    })
+}
+
+fn map_proto_config(config: Option<super::proto::AppConfig>) -> InternalAppConfig {
+    match config {
+        Some(config) => {
+            let mut internal = InternalAppConfig {
+                env: config.env,
+                limits: map_proto_limits(config.limits),
+                ..Default::default()
+            };
+
+            if !config.routes.is_empty() {
+                let mut routes = Vec::new();
+                for route in config.routes {
+                    if !route.methods.is_empty() {
+                        warn!(
+                            "Route methods are ignored in current runtime: path={}, methods={:?}",
+                            route.path, route.methods
+                        );
+                    }
+                    routes.push(route.path);
+                }
+                internal.routes = routes;
+            }
+
+            internal
+        }
+        None => InternalAppConfig::default(),
+    }
+}
+
 impl DenixManagementService {
     pub fn new(
         app_manager: Arc<ApplicationManager>,
@@ -99,7 +160,11 @@ impl DenixManagement for DenixManagementService {
             req.package_data.len()
         );
 
-        let package = match self.app_repo.install_package(req.app_id.clone(), req.package_data).await {
+        let package = match self
+            .app_repo
+            .install_package(req.app_id.clone(), req.package_data)
+            .await
+        {
             Ok(pkg) => pkg,
             Err(e) => {
                 error!("安装应用包失败: {}", e);
@@ -142,11 +207,16 @@ impl DenixManagement for DenixManagementService {
             }
         };
 
-        let config = InternalAppConfig::default();
+        let config = map_proto_config(req.config);
 
         match self
             .app_manager
-            .load_app(req.app_id.clone(), entry_code, config)
+            .load_app(
+                req.app_id.clone(),
+                entry_code,
+                config,
+                Some(entry_point.clone()),
+            )
             .await
         {
             Ok(_) => {
@@ -216,7 +286,11 @@ impl DenixManagement for DenixManagementService {
             req.package_data.len()
         );
 
-        let package = match self.app_repo.install_package(req.app_id.clone(), req.package_data).await {
+        let package = match self
+            .app_repo
+            .install_package(req.app_id.clone(), req.package_data)
+            .await
+        {
             Ok(pkg) => pkg,
             Err(e) => {
                 error!("安装应用包失败: {}", e);
@@ -255,11 +329,11 @@ impl DenixManagement for DenixManagementService {
             }
         };
 
-        let config = req.config.map(|_| InternalAppConfig::default());
+        let config = req.config.map(|config| map_proto_config(Some(config)));
 
         match self
             .app_manager
-            .update_app(&req.app_id, entry_code, config)
+            .update_app(&req.app_id, entry_code, config, Some(entry_point.clone()))
             .await
         {
             Ok(_) => {
@@ -323,9 +397,23 @@ impl DenixManagement for DenixManagementService {
                     error_message: app.error.unwrap_or_default(),
                 })
                 .collect()
-            } else {
-                Vec::new()
-            };
+        } else {
+            Vec::new()
+        };
+
+        let op_metrics = self.app_manager.get_op_metrics().await;
+        let op_metrics = op_metrics
+            .into_iter()
+            .map(|(app_id, summary)| AppOpMetrics {
+                app_id,
+                summary: Some(OpMetricsSummary {
+                    ops_dispatched_sync: summary.ops_dispatched_sync,
+                    ops_dispatched_async: summary.ops_dispatched_async,
+                    ops_dispatched_fast: summary.ops_dispatched_fast,
+                    ops_completed_async: summary.ops_completed_async,
+                }),
+            })
+            .collect::<Vec<_>>();
 
         // 资源使用情况（简化版）
         let resource_usage = Some(ResourceUsage {
@@ -338,6 +426,7 @@ impl DenixManagement for DenixManagementService {
             worker_info,
             apps,
             resource_usage,
+            op_metrics,
         }))
     }
 
@@ -357,6 +446,31 @@ impl DenixManagement for DenixManagementService {
             output: String::new(),
             error: "Command execution not implemented".to_string(),
         }))
+    }
+
+    async fn start_inspect(
+        &self,
+        request: Request<StartInspectRequest>,
+    ) -> Result<Response<StartInspectResponse>, Status> {
+        let req = request.into_inner();
+        let ttl = if req.ttl_seconds <= 0 {
+            300
+        } else {
+            req.ttl_seconds as u64
+        };
+
+        info!("Start inspect for app: {}, ttl: {}s", req.app_id, ttl);
+
+        match self.app_manager.start_inspect(req.app_id.clone(), ttl) {
+            Ok((inspect_app_id, token)) => Ok(Response::new(StartInspectResponse {
+                inspect_app_id,
+                token,
+            })),
+            Err(e) => {
+                warn!("Failed to start inspect session: {}", e);
+                Err(Status::internal(e.to_string()))
+            }
+        }
     }
 
     async fn health_check(

@@ -113,12 +113,12 @@ impl LogShipper {
             }
 
             // 检查缓冲区是否有日志
-            if buffer.is_empty().await {
+            if buffer.is_empty() {
                 continue;
             }
 
             // 取出一批日志
-            let entries = buffer.drain(config.batch_size).await;
+            let entries = buffer.drain(config.batch_size);
             if entries.is_empty() {
                 continue;
             }
@@ -211,13 +211,11 @@ mod tests {
 
         // 添加一些日志
         for i in 0..15 {
-            buffer
-                .push(LogEntry::new(
-                    "test".to_string(),
-                    LogLevel::Info,
-                    format!("message {}", i),
-                ))
-                .await;
+            buffer.push(LogEntry::new(
+                "test".to_string(),
+                LogLevel::Info,
+                format!("message {}", i),
+            ));
         }
 
         // 启动 shipper
@@ -231,7 +229,7 @@ mod tests {
         shipper.stop().await;
 
         // 验证日志被推送（缓冲区应该被清空或减少）
-        let remaining = buffer.len().await;
+        let remaining = buffer.len();
         assert!(remaining < 15);
     }
 }

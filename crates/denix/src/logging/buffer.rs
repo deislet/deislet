@@ -1,6 +1,6 @@
+use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use super::types::LogEntry;
@@ -40,9 +40,9 @@ impl LogBuffer {
     }
 
     /// Add log entry
-    pub async fn push(&self, entry: LogEntry) {
-        let mut buffer = self.buffer.write().await;
-        let mut stats = self.stats.write().await;
+    pub fn push(&self, entry: LogEntry) {
+        let mut buffer = self.buffer.write();
+        let mut stats = self.stats.write();
 
         stats.total_received += 1;
 
@@ -60,9 +60,9 @@ impl LogBuffer {
     }
 
     /// Drain logs in batch (up to count entries)
-    pub async fn drain(&self, count: usize) -> Vec<LogEntry> {
-        let mut buffer = self.buffer.write().await;
-        let mut stats = self.stats.write().await;
+    pub fn drain(&self, count: usize) -> Vec<LogEntry> {
+        let mut buffer = self.buffer.write();
+        let mut stats = self.stats.write();
 
         let drain_count = count.min(buffer.len());
         let entries: Vec<LogEntry> = buffer.drain(..drain_count).collect();
@@ -74,18 +74,18 @@ impl LogBuffer {
     }
 
     /// Get current buffer size
-    pub async fn len(&self) -> usize {
-        self.buffer.read().await.len()
+    pub fn len(&self) -> usize {
+        self.buffer.read().len()
     }
 
     /// Check if buffer is empty
-    pub async fn is_empty(&self) -> bool {
-        self.buffer.read().await.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.buffer.read().is_empty()
     }
 
     /// Get statistics
-    pub async fn stats(&self) -> (u64, u64, u64) {
-        let stats = self.stats.read().await;
+    pub fn stats(&self) -> (u64, u64, u64) {
+        let stats = self.stats.read();
         (
             stats.total_received,
             stats.total_dropped,
@@ -94,8 +94,8 @@ impl LogBuffer {
     }
 
     /// Clear buffer
-    pub async fn clear(&self) {
-        let mut buffer = self.buffer.write().await;
+    pub fn clear(&self) {
+        let mut buffer = self.buffer.write();
         buffer.clear();
     }
 }
@@ -105,31 +105,29 @@ mod tests {
     use super::*;
     use crate::logging::LogLevel;
 
-    #[tokio::test]
-    async fn test_log_buffer() {
+    #[test]
+    fn test_log_buffer() {
         let buffer = LogBuffer::new(3);
 
         // Add logs
         for i in 0..5 {
-            buffer
-                .push(LogEntry::new(
-                    "test".to_string(),
-                    LogLevel::Info,
-                    format!("message {}", i),
-                ))
-                .await;
+            buffer.push(LogEntry::new(
+                "test".to_string(),
+                LogLevel::Info,
+                format!("message {}", i),
+            ));
         }
 
         // Since capacity is 3, should only keep last 3 entries
-        assert_eq!(buffer.len().await, 3);
+        assert_eq!(buffer.len(), 3);
 
         // Drain 2 entries
-        let entries = buffer.drain(2).await;
+        let entries = buffer.drain(2);
         assert_eq!(entries.len(), 2);
-        assert_eq!(buffer.len().await, 1);
+        assert_eq!(buffer.len(), 1);
 
         // Statistics
-        let (received, dropped, shipped) = buffer.stats().await;
+        let (received, dropped, shipped) = buffer.stats();
         assert_eq!(received, 5);
         assert_eq!(dropped, 2);
         assert_eq!(shipped, 2);

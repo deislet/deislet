@@ -12,17 +12,20 @@ async fn test_gateway_http_e2e() {
     };
 
     let code = r#"
-        globalThis.default = {
-            fetch(request) {
-                const url = new URL(request.url);
-                const name = url.searchParams.get("name") || "world";
-                return new Response("Hello " + name);
-            }
+        export default function handler(context) {
+            const url = new URL(context.request.url);
+            const name = url.searchParams.get("name") || "world";
+            return new Response("Hello " + name);
         }
     "#;
 
     app_manager
-        .load_app("e2e_app".to_string(), code.to_string(), Default::default())
+        .load_app(
+            "e2e_app".to_string(),
+            code.to_string(),
+            Default::default(),
+            None,
+        )
         .await
         .expect("Failed to load app");
 
@@ -46,7 +49,7 @@ async fn test_gateway_http_e2e() {
     let url = format!("http://{}/hello?name=denix", addr);
     let response = client
         .get(url)
-        .header("x-app-id", "e2e_app")
+        .header("x-deis-app-id", "e2e_app")
         .send()
         .await
         .expect("Request failed");

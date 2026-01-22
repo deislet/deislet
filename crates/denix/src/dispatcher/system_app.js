@@ -1,18 +1,18 @@
 // 系统管理应用 - 提供平台管理 API
-// 通过 x-app-id: _system 访问
+// 通过 x-deis-app-id: _system 访问
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
+export default async function handler(context) {
+  const request = context.request;
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const method = request.method;
 
     // 健康检查
     if (path === "/health" && method === "GET") {
       return new Response(
         JSON.stringify({
           status: "healthy",
-          message: "Denix Platform is running with x-app-id routing",
+          message: "Denix Platform is running with x-deis-app-id routing",
         }),
         {
           status: 200,
@@ -24,7 +24,7 @@ export default {
     // 根路径 - 欢迎页面
     if (path === "/" && method === "GET") {
       return new Response(
-        "<html><body><h1>Denix Platform</h1><p>Use x-app-id header to route requests</p></body></html>",
+        "<html><body><h1>Denix Platform</h1><p>Use x-deis-app-id header to route requests</p></body></html>",
         {
           status: 200,
           headers: { "Content-Type": "text/html" },
@@ -41,5 +41,4 @@ export default {
       }),
       { status: 404, headers: { "Content-Type": "application/json" } }
     );
-  },
-};
+}

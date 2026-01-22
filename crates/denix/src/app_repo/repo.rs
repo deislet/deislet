@@ -113,10 +113,12 @@ impl AppRepo {
                         )
                     })?;
 
-                    let uploaded_at = UNIX_EPOCH + std::time::Duration::from_secs(uploaded_at_secs as u64);
+                    let uploaded_at =
+                        UNIX_EPOCH + std::time::Duration::from_secs(uploaded_at_secs as u64);
                     let deployed_at = deployed_at_secs
                         .map(|secs| UNIX_EPOCH + std::time::Duration::from_secs(secs as u64));
-                    let updated_at = UNIX_EPOCH + std::time::Duration::from_secs(updated_at_secs as u64);
+                    let updated_at =
+                        UNIX_EPOCH + std::time::Duration::from_secs(updated_at_secs as u64);
 
                     Ok((
                         id.clone(),
@@ -141,11 +143,11 @@ impl AppRepo {
 
     pub async fn install_package(&self, id: String, zip_data: Vec<u8>) -> Result<AppPackage> {
         let _lock = self.write_lock.write().await;
-        
+
         let db_path = self.db_path.clone();
         let id_clone = id.clone();
         let size = zip_data.len() as i64;
-        
+
         let checksum = {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -161,7 +163,7 @@ impl AppRepo {
 
             let reader = Cursor::new(&zip_data);
             let mut archive = zip::ZipArchive::new(reader)?;
-            
+
             let mut manifest: Option<AppManifest> = None;
             let mut files: Vec<(String, Vec<u8>)> = Vec::new();
 
@@ -182,10 +184,15 @@ impl AppRepo {
                 files.push((name, content));
             }
 
-            let manifest = manifest.ok_or_else(|| anyhow::anyhow!("manifest.json not found in package"))?;
-            
+            let manifest =
+                manifest.ok_or_else(|| anyhow::anyhow!("manifest.json not found in package"))?;
+
             if manifest.id != id_clone {
-                return Err(anyhow::anyhow!("App ID mismatch: manifest says {}, install request says {}", manifest.id, id_clone));
+                return Err(anyhow::anyhow!(
+                    "App ID mismatch: manifest says {}, install request says {}",
+                    manifest.id,
+                    id_clone
+                ));
             }
 
             let package = AppPackage::new(id_clone.clone(), manifest.clone(), size, checksum_clone);
@@ -211,9 +218,14 @@ impl AppRepo {
                 ],
             )?;
 
-            tx.execute("DELETE FROM app_files WHERE app_id = ?1", params![package.id])?;
+            tx.execute(
+                "DELETE FROM app_files WHERE app_id = ?1",
+                params![package.id],
+            )?;
 
-            let mut stmt = tx.prepare("INSERT INTO app_files (app_id, file_path, content) VALUES (?1, ?2, ?3)")?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO app_files (app_id, file_path, content) VALUES (?1, ?2, ?3)",
+            )?;
             for (path, content) in files {
                 stmt.execute(params![package.id, path, content])?;
             }
@@ -237,7 +249,7 @@ impl AppRepo {
     pub fn get_package(&self, id: &str) -> Option<AppPackage> {
         self.cache.load().get(id).cloned()
     }
-    
+
     pub fn get_manifest(&self, id: &str) -> Option<AppManifest> {
         self.cache.load().get(id).map(|p| p.manifest.clone())
     }
@@ -253,7 +265,8 @@ impl AppRepo {
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path)?;
-            let mut stmt = conn.prepare("SELECT content FROM app_files WHERE app_id = ?1 AND file_path = ?2")?;
+            let mut stmt =
+                conn.prepare("SELECT content FROM app_files WHERE app_id = ?1 AND file_path = ?2")?;
             let content: Option<Vec<u8>> = stmt
                 .query_row(params![id, path], |row| row.get(0))
                 .optional()?;
@@ -263,7 +276,9 @@ impl AppRepo {
     }
 
     pub async fn update_status(&self, id: &str, status: AppPackageStatus) -> Result<()> {
-        let mut package = self.get_package(id).with_context(|| format!("App not found: {}", id))?;
+        let mut package = self
+            .get_package(id)
+            .with_context(|| format!("App not found: {}", id))?;
 
         match status {
             AppPackageStatus::Deployed => package.mark_deployed(),
@@ -283,12 +298,20 @@ impl AppRepo {
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path)?;
-            let updated_at_secs = pkg_for_db.updated_at.duration_since(UNIX_EPOCH)?.as_secs() as i64;
-            let deployed_at_secs = pkg_for_db.deployed_at.map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64);
+            let updated_at_secs =
+                pkg_for_db.updated_at.duration_since(UNIX_EPOCH)?.as_secs() as i64;
+            let deployed_at_secs = pkg_for_db
+                .deployed_at
+                .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64);
 
             conn.execute(
                 "UPDATE apps SET status = ?1, updated_at = ?2, deployed_at = ?3 WHERE id = ?4",
-                params![pkg_for_db.status.as_str(), updated_at_secs, deployed_at_secs, pkg_for_db.id],
+                params![
+                    pkg_for_db.status.as_str(),
+                    updated_at_secs,
+                    deployed_at_secs,
+                    pkg_for_db.id
+                ],
             )?;
             Ok::<_, anyhow::Error>(())
         })

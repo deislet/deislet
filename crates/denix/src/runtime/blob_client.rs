@@ -41,7 +41,9 @@ impl BlobClient {
         let response = client.put(request).await?.into_inner();
 
         if !response.success {
-            let err = response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let err = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("Blob put failed: {}", err);
         }
         Ok(())
@@ -53,7 +55,9 @@ impl BlobClient {
         let response = client.delete(request).await?.into_inner();
 
         if !response.success {
-            let err = response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let err = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("Blob delete failed: {}", err);
         }
         Ok(())

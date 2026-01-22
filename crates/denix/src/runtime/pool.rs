@@ -1,8 +1,10 @@
 // Runtime 线程池 - 多核支持
 
 use super::isolate::AppRuntime;
+use crate::app_repo::AppRepo;
 use anyhow::Result;
 use deno_core::JsRuntime;
+use deno_core::OpMetricsSummary;
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
 use std::thread;
@@ -27,8 +29,12 @@ pub enum RuntimeMessage {
     LoadApp {
         app_id: String,
         code: String,
+        entry_point: Option<String>,
+        app_repo: Option<Arc<AppRepo>>,
         env: HashMap<String, String>,
+        permissions: super::super::app::types::AppPermissions,
         memory_limit_mb: Option<usize>,
+        resource_table_max: Option<usize>,
         response: oneshot::Sender<Result<()>>,
     },
     /// 卸载应用
@@ -71,6 +77,21 @@ pub enum RuntimeMessage {
         ws_id: String,
         response: oneshot::Sender<Result<()>>,
     },
+    /// 获取 OpMetrics 汇总
+    GetOpMetrics {
+        app_id: String,
+        response: oneshot::Sender<Result<OpMetricsSummary>>,
+    },
+    /// 连接调试器
+    ConnectInspector {
+        app_id: String,
+        response: oneshot::Sender<
+            Result<(
+                mpsc::UnboundedSender<String>,
+                mpsc::UnboundedReceiver<String>,
+            )>,
+        >,
+    },
     /// 关闭线程
     Shutdown,
 }
@@ -79,14 +100,15 @@ pub enum RuntimeMessage {
 struct RuntimeThread {
     #[allow(dead_code)]
     thread_id: usize,
-    sender: mpsc::UnboundedSender<RuntimeMessage>,
+    sender: mpsc::Sender<RuntimeMessage>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl RuntimeThread {
     /// 创建新的 runtime 线程
     fn new(thread_id: usize) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // 设置通道容量为 100，超过将触发背压（拒绝请求）
+        let (tx, rx) = mpsc::channel(100);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
         let handle = thread::spawn(move || {
@@ -114,7 +136,7 @@ impl RuntimeThread {
     /// 运行事件循环
     async fn run_event_loop(
         thread_id: usize,
-        mut rx: mpsc::UnboundedReceiver<RuntimeMessage>,
+        mut rx: mpsc::Receiver<RuntimeMessage>,
         ready_tx: std::sync::mpsc::Sender<()>,
     ) {
         tracing::info!("Runtime thread {} started", thread_id);
@@ -130,17 +152,32 @@ impl RuntimeThread {
                 RuntimeMessage::LoadApp {
                     app_id,
                     code,
+                    entry_point,
+                    app_repo,
                     env,
+                    permissions,
                     memory_limit_mb,
+                    resource_table_max,
                     response,
                 } => {
                     tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
-                    let result = match AppRuntime::new(app_id.clone(), code, env, memory_limit_mb) {
-                        Ok(runtime) => {
-
-                            runtimes.insert(app_id.clone(), runtime);
-                            Ok(())
-                        }
+                    let result = match AppRuntime::new(
+                        app_id.clone(),
+                        code,
+                        entry_point,
+                        app_repo,
+                        env,
+                        permissions,
+                        memory_limit_mb,
+                        resource_table_max,
+                    ) {
+                        Ok(mut runtime) => match runtime.init_module().await {
+                            Ok(()) => {
+                                runtimes.insert(app_id.clone(), runtime);
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        },
                         Err(e) => Err(e),
                     };
                     let _ = response.send(result);
@@ -256,6 +293,22 @@ impl RuntimeThread {
                     let _ = response.send(result);
                 }
 
+                RuntimeMessage::GetOpMetrics { app_id, response } => {
+                    let result = match runtimes.get(&app_id) {
+                        Some(runtime) => Ok(runtime.op_metrics_summary()),
+                        None => Err(anyhow::anyhow!("App not found")),
+                    };
+                    let _ = response.send(result);
+                }
+
+                RuntimeMessage::ConnectInspector { app_id, response } => {
+                    let result = match runtimes.get_mut(&app_id) {
+                        Some(runtime) => runtime.connect_inspector(),
+                        None => Err(anyhow::anyhow!("App not found")),
+                    };
+                    let _ = response.send(result);
+                }
+
                 RuntimeMessage::Shutdown => {
                     tracing::info!("Runtime thread {} shutting down", thread_id);
                     break;
@@ -276,15 +329,18 @@ impl RuntimeThread {
 
     /// 发送消息
     fn send(&self, msg: RuntimeMessage) -> Result<()> {
-        self.sender
-            .send(msg)
-            .map_err(|_| anyhow::anyhow!("Runtime thread has stopped"))
+        self.sender.try_send(msg).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                anyhow::anyhow!("Runtime thread overloaded (queue full)")
+            }
+            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("Runtime thread has stopped"),
+        })
     }
 }
 
 impl Drop for RuntimeThread {
     fn drop(&mut self) {
-        let _ = self.sender.send(RuntimeMessage::Shutdown);
+        let _ = self.sender.try_send(RuntimeMessage::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -295,11 +351,16 @@ impl Drop for RuntimeThread {
 pub struct RuntimePool {
     threads: Vec<RuntimeThread>,
     app_assignments: Arc<RwLock<HashMap<String, usize>>>, // app_id -> thread_id
+    app_repo: Option<Arc<AppRepo>>,
 }
 
 impl RuntimePool {
     /// 创建新的线程池
     pub fn new(num_threads: Option<usize>) -> Self {
+        Self::new_with_repo(num_threads, None)
+    }
+
+    pub fn new_with_repo(num_threads: Option<usize>, app_repo: Option<Arc<AppRepo>>) -> Self {
         // 确保 V8 平台已初始化（每个进程只初始化一次）
         init_v8_platform();
 
@@ -311,6 +372,7 @@ impl RuntimePool {
         Self {
             threads,
             app_assignments: Arc::new(RwLock::new(HashMap::new())),
+            app_repo,
         }
     }
 
@@ -339,12 +401,16 @@ impl RuntimePool {
     }
 
     /// 加载应用
+    #[allow(clippy::too_many_arguments)]
     pub async fn load_app(
         &self,
         app_id: String,
         code: String,
+        entry_point: Option<String>,
         env: HashMap<String, String>,
+        permissions: super::super::app::types::AppPermissions,
         memory_limit_mb: Option<usize>,
+        resource_table_max: Option<usize>,
     ) -> Result<()> {
         // 检查是否已存在
         if self.get_thread_id(&app_id).await.is_some() {
@@ -360,8 +426,12 @@ impl RuntimePool {
         self.threads[thread_id].send(RuntimeMessage::LoadApp {
             app_id: app_id.clone(),
             code,
+            entry_point,
+            app_repo: self.app_repo.clone(),
             env,
+            permissions,
             memory_limit_mb,
+            resource_table_max,
             response: tx,
         })?;
 
@@ -557,11 +627,52 @@ impl RuntimePool {
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
+
+    /// 获取应用 OpMetrics 汇总
+    pub async fn get_op_metrics(&self, app_id: &str) -> Result<OpMetricsSummary> {
+        let thread_id = self
+            .get_thread_id(app_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.threads[thread_id].send(RuntimeMessage::GetOpMetrics {
+            app_id: app_id.to_string(),
+            response: tx,
+        })?;
+
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+    }
+
+    /// 连接调试器
+    pub async fn connect_inspector(
+        &self,
+        app_id: &str,
+    ) -> Result<(
+        mpsc::UnboundedSender<String>,
+        mpsc::UnboundedReceiver<String>,
+    )> {
+        let thread_id = self
+            .get_thread_id(app_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.threads[thread_id].send(RuntimeMessage::ConnectInspector {
+            app_id: app_id.to_string(),
+            response: tx,
+        })?;
+
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::types::AppPermissions;
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
 
@@ -580,10 +691,8 @@ mod tests {
         let pool = TEST_POOL.lock().unwrap();
 
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
-                    return new Response("Hello from pool!");
-                }
+            export default function handler(context) {
+                return new Response("Hello from pool!");
             }
         "#;
 
@@ -592,7 +701,10 @@ mod tests {
             .load_app(
                 "test_load_exec_app".to_string(),
                 code.to_string(),
+                None,
                 HashMap::new(),
+                AppPermissions::default(),
+                None,
                 None,
             )
             .await;
@@ -624,11 +736,14 @@ mod tests {
 
         // 加载多个应用
         for i in 0..4 {
-            let code = r#"globalThis.default = { fetch() { return new Response("ok"); } }"#;
+            let code = r#"export default function handler(context) { return new Response("ok"); }"#;
             pool.load_app(
                 format!("lb_app{}", i),
                 code.to_string(),
+                None,
                 HashMap::new(),
+                AppPermissions::default(),
+                None,
                 None,
             )
             .await
@@ -650,11 +765,14 @@ mod tests {
     async fn test_unload_app() {
         let pool = TEST_POOL.lock().unwrap();
 
-        let code = r#"globalThis.default = { fetch() { return new Response("ok"); } }"#;
+        let code = r#"export default function handler(context) { return new Response("ok"); }"#;
         pool.load_app(
             "unload_test_app".to_string(),
             code.to_string(),
+            None,
             HashMap::new(),
+            AppPermissions::default(),
+            None,
             None,
         )
         .await

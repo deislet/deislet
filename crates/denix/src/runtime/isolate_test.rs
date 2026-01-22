@@ -1,25 +1,31 @@
-// App Runtime Isolate 单元测试
-
 #[cfg(test)]
 mod tests {
+    use crate::app::types::AppPermissions;
     use crate::runtime::isolate::AppRuntime;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
     #[test]
     fn test_transform_esm_typescript() {
-        let ts_code = r#"export default {
-  async fetch(_request: Request): Promise<Response> {
+        let ts_code = r#"export default function handler(_request: Request): Response {
     return new Response("Hello from Denix!", {
       status: 200,
       headers: {
         "Content-Type": "text/plain",
       },
     });
-  },
 };"#;
 
-        let result = AppRuntime::new("test_esm".to_string(), ts_code.to_string(), HashMap::new(), None);
+        let result = AppRuntime::new(
+            "test_esm".to_string(),
+            ts_code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+        );
         assert!(
             result.is_ok(),
             "Failed to parse TypeScript ESM: {:?}",
@@ -29,17 +35,19 @@ mod tests {
 
     #[test]
     fn test_transform_counter_app() {
-        let ts_code = r#"export default {
-  async fetch(request: Request, env: any): Promise<Response> {
-    const url = new URL(request.url);
+        let ts_code = r#"export default function handler(context: any): Response {
+    const url = new URL(context.request.url);
     return new Response("ok");
-  },
 };"#;
 
         let result = AppRuntime::new(
             "test_counter".to_string(),
             ts_code.to_string(),
+            None,
+            None,
             HashMap::new(),
+            AppPermissions::default(),
+            None,
             None,
         );
         assert!(
@@ -56,17 +64,19 @@ mod tests {
   title: string;
 }
 
-export default {
-  async fetch(request: Request, env: any): Promise<Response> {
+export default function handler(context: any): Response {
     const todos: Todo[] = [];
     return new Response(JSON.stringify(todos));
-  },
 };"#;
 
         let result = AppRuntime::new(
             "test_interface".to_string(),
             ts_code.to_string(),
+            None,
+            None,
             HashMap::new(),
+            AppPermissions::default(),
+            None,
             None,
         );
         assert!(
@@ -78,8 +88,8 @@ export default {
 
     #[test]
     fn test_transform_echo_app() {
-        let ts_code = r#"export default {
-  async fetch(request: Request): Promise<Response> {
+        let ts_code = r#"export default function handler(context: any): Response {
+    const request = context.request;
     const url = new URL(request.url);
     const info: any = {
       method: request.method,
@@ -87,10 +97,18 @@ export default {
       path: url.pathname,
     };
     return new Response(JSON.stringify(info));
-  },
 };"#;
 
-        let result = AppRuntime::new("test_echo".to_string(), ts_code.to_string(), HashMap::new(), None);
+        let result = AppRuntime::new(
+            "test_echo".to_string(),
+            ts_code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+        );
         assert!(
             result.is_ok(),
             "Failed to parse echo app: {:?}",
@@ -101,15 +119,21 @@ export default {
     #[test]
     fn test_create_runtime_with_valid_code() {
         let code = r#"
-            const message = "Hello";
-            globalThis.default = {
-                fetch() {
-                    return new Response(message);
-                }
+            export default function handler() {
+                    return new Response("Hello");
             }
         "#;
 
-        let result = AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new(), None);
+        let result = AppRuntime::new(
+            "test_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+        );
         assert!(result.is_ok());
     }
 
@@ -119,7 +143,11 @@ export default {
         let result = AppRuntime::new(
             "test_app".to_string(),
             invalid_code.to_string(),
+            None,
+            None,
             HashMap::new(),
+            AppPermissions::default(),
+            None,
             None,
         );
         assert!(result.is_err());
@@ -128,14 +156,21 @@ export default {
     #[tokio::test]
     async fn test_create_runtime() {
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
+            export default function handler() {
                     return new Response("test");
-                }
             }
         "#;
 
-        let result = AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new(), None);
+        let result = AppRuntime::new(
+            "test_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+        );
         assert!(result.is_ok());
 
         let runtime = result.unwrap();
@@ -145,18 +180,27 @@ export default {
     #[tokio::test]
     async fn test_execute_fetch() {
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
+            export default function handler() {
                     return new Response("Hello from test", {
                         status: 200,
                         headers: { "content-type": "text/plain" }
                     });
-                }
             }
         "#;
 
-        let mut runtime =
-            AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new(), None).unwrap();
+        let mut runtime = AppRuntime::new(
+            "test_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        runtime.init_module().await.unwrap();
 
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "localhost".to_string());
@@ -181,20 +225,29 @@ export default {
     }
 
     #[tokio::test]
-    #[ignore] // KV now requires remote gRPC
+    #[ignore]
     async fn test_execute_fetch_with_kv() {
         let code = r#"
-            globalThis.default = {
-                async fetch(request, env, ctx) {
+            export default async function handler(ctx) {
                     await ctx.services.kv.put("test", "value123");
                     const val = await ctx.services.kv.get("test");
                     return new Response(val);
-                }
             }
         "#;
 
-        let mut runtime =
-            AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new(), None).unwrap();
+        let mut runtime = AppRuntime::new(
+            "test_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        runtime.init_module().await.unwrap();
 
         let (tx, rx) = oneshot::channel();
         let result = runtime
@@ -217,15 +270,24 @@ export default {
     #[tokio::test]
     async fn test_execute_fetch_error_handling() {
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
+            export default function handler() {
                     throw new Error("Test error");
-                }
             }
         "#;
 
-        let mut runtime =
-            AppRuntime::new("test_app".to_string(), code.to_string(), HashMap::new(), None).unwrap();
+        let mut runtime = AppRuntime::new(
+            "test_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        runtime.init_module().await.unwrap();
 
         let (tx, rx) = oneshot::channel();
         let result = runtime
@@ -244,5 +306,55 @@ export default {
         let (status, _headers, body) = result_data;
         assert_eq!(status, 500);
         assert!(body.unwrap().contains("Test error"));
+    }
+
+    #[tokio::test]
+    async fn test_web_api_console_url_timers() {
+        let code = r#"
+            export default async function handler(ctx) {
+                    console.log("web api ok");
+                    const url = new URL(ctx.request.url);
+                    await new Promise((resolve) => setTimeout(resolve, 1));
+                    return new Response(url.pathname, {
+                        status: 200,
+                        headers: { "content-type": "text/plain" }
+                    });
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "test_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        runtime.init_module().await.unwrap();
+
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "localhost".to_string());
+
+        let (tx, rx) = oneshot::channel();
+        let result = runtime
+            .execute_fetch(
+                "http://localhost/test".to_string(),
+                "GET".to_string(),
+                headers,
+                None,
+                tx,
+            )
+            .await;
+
+        assert!(result.is_ok());
+
+        let result_data = rx.await.unwrap().unwrap();
+        let (status, _headers, body) = result_data;
+        assert_eq!(status, 200);
+        assert_eq!(body, Some("/test".to_string()));
     }
 }

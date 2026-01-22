@@ -19,9 +19,10 @@ async fn op_queue_send(
     };
 
     if let Some(client) = client_opt {
-        return client.send(queue_name, message).await.map_err(|e| {
-            std::io::Error::other(e.to_string())
-        });
+        return client
+            .send(queue_name, message)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()));
     }
 
     // Fallback to memory
@@ -38,10 +39,7 @@ async fn op_queue_send(
     ))
 }
 
-extension!(
-    denix_queue_ops,
-    ops = [op_queue_send],
-);
+extension!(denix_queue_ops, ops = [op_queue_send],);
 
 pub fn init_queue_extension() -> deno_core::Extension {
     denix_queue_ops::init()

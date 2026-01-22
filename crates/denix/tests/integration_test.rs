@@ -23,15 +23,18 @@ async fn test_gateway_execution() {
 
     // Create a test app
     let code = r#"
-        globalThis.default = {
-            fetch(request) {
-                return new Response("Hello from Gateway!");
-            }
+        export default function handler(context) {
+            return new Response("Hello from Gateway!");
         }
     "#;
 
     app_manager
-        .load_app("test_app".to_string(), code.to_string(), Default::default())
+        .load_app(
+            "test_app".to_string(),
+            code.to_string(),
+            Default::default(),
+            None,
+        )
         .await
         .expect("Failed to load app");
 
@@ -40,7 +43,7 @@ async fn test_gateway_execution() {
         .route("/", any(denix::dispatcher::handlers::handle_request))
         .with_state(state);
 
-    // 1. Test missing x-app-id header (Should fail)
+    // 1. Test missing x-deis-app-id header (Should fail)
     let req_missing_header = Request::builder().uri("/").body(Body::empty()).unwrap();
 
     let response = app.clone().oneshot(req_missing_header).await.unwrap();
@@ -49,7 +52,7 @@ async fn test_gateway_execution() {
     // 2. Test valid execution
     let req_valid = Request::builder()
         .uri("/")
-        .header("x-app-id", "test_app")
+        .header("x-deis-app-id", "test_app")
         .body(Body::empty())
         .unwrap();
 

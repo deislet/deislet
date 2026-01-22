@@ -23,10 +23,13 @@ impl Trigger for TriggerServiceImpl {
         request: Request<QueueEvent>,
     ) -> Result<Response<TriggerResponse>, Status> {
         let req = request.into_inner();
-        info!("Queue trigger: app={}, queue={}", req.app_id, req.queue_name);
-        
+        info!(
+            "Queue trigger: app={}, queue={}",
+            req.app_id, req.queue_name
+        );
+
         // TODO: Call app_manager.execute_queue(...)
-        
+
         Ok(Response::new(TriggerResponse {
             success: true,
             failed_message_ids: vec![],
@@ -40,9 +43,9 @@ impl Trigger for TriggerServiceImpl {
     ) -> Result<Response<TriggerResponse>, Status> {
         let req = request.into_inner();
         info!("Scheduled trigger: app={}, cron={}", req.app_id, req.cron);
-        
+
         // TODO: Call app_manager.execute_scheduled(...)
-        
+
         Ok(Response::new(TriggerResponse {
             success: true,
             failed_message_ids: vec![],

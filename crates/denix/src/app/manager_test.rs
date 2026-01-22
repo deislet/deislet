@@ -19,15 +19,18 @@ mod tests {
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
-                    return new Response("test app");
-                }
+            export default function handler(context) {
+                return new Response("test app");
             }
         "#;
 
         let result = manager
-            .load_app("test1".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "test1".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await;
 
         assert!(result.is_ok());
@@ -48,20 +51,28 @@ mod tests {
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
-                    return new Response("test");
-                }
+            export default function handler(context) {
+                return new Response("test");
             }
         "#;
 
         manager
-            .load_app("dup".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "dup".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
         let result = manager
-            .load_app("dup".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "dup".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await;
 
         assert!(result.is_err());
@@ -76,15 +87,18 @@ mod tests {
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
-                    return new Response("test");
-                }
+            export default function handler(context) {
+                return new Response("test");
             }
         "#;
 
         manager
-            .load_app("test2".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "test2".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -101,27 +115,30 @@ mod tests {
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code1 = r#"
-            globalThis.default = {
-                fetch(request) {
-                    return new Response("version 1");
-                }
+            export default function handler(context) {
+                return new Response("version 1");
             }
         "#;
 
         manager
-            .load_app("test3".to_string(), code1.to_string(), AppConfig::default())
+            .load_app(
+                "test3".to_string(),
+                code1.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
         let code2 = r#"
-            globalThis.default = {
-                fetch(request) {
-                    return new Response("version 2");
-                }
+            export default function handler(context) {
+                return new Response("version 2");
             }
         "#;
 
-        let result = manager.update_app("test3", code2.to_string(), None).await;
+        let result = manager
+            .update_app("test3", code2.to_string(), None, None)
+            .await;
         assert!(result.is_ok());
 
         let app = manager.get_app("test3").unwrap();
@@ -136,16 +153,19 @@ mod tests {
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
-                    const url = new URL(request.url);
-                    return new Response(`Path: ${url.pathname}`);
-                }
+            export default function handler(context) {
+                const url = new URL(context.request.url);
+                return new Response(`Path: ${url.pathname}`);
             }
         "#;
 
         manager
-            .load_app("test4".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "test4".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -174,20 +194,28 @@ mod tests {
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
-                    return new Response("test");
-                }
+            export default function handler(context) {
+                return new Response("test");
             }
         "#;
 
         manager
-            .load_app("app1".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "app1".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
         manager
-            .load_app("app2".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "app2".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -208,20 +236,28 @@ mod tests {
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code = r#"
-            globalThis.default = {
-                fetch(request) {
-                    return new Response("test");
-                }
+            export default function handler(context) {
+                return new Response("test");
             }
         "#;
 
         manager
-            .load_app("s1".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "s1".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
         manager
-            .load_app("s2".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "s2".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -240,27 +276,30 @@ mod tests {
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code = r#"
-            globalThis.default = {
-                async fetch(request, env, ctx) {
-                    const url = new URL(request.url);
+            export default async function handler(context) {
+                const url = new URL(context.request.url);
 
-                    if (url.pathname === "/set") {
-                        await ctx.services.kv.put("counter", "42");
-                        return new Response("set");
-                    }
-
-                    if (url.pathname === "/get") {
-                        const val = await ctx.services.kv.get("counter");
-                        return new Response(val || "not found");
-                    }
-
-                    return new Response("ok");
+                if (url.pathname === "/set") {
+                    await context.services.kv.put("counter", "42");
+                    return new Response("set");
                 }
+
+                if (url.pathname === "/get") {
+                    const val = await context.services.kv.get("counter");
+                    return new Response(val || "not found");
+                }
+
+                return new Response("ok");
             }
         "#;
 
         manager
-            .load_app("kvtest".to_string(), code.to_string(), AppConfig::default())
+            .load_app(
+                "kvtest".to_string(),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
             .await
             .unwrap();
 

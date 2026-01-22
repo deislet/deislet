@@ -13,7 +13,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 
-/// 统一请求处理器 - 通过 x-app-id header 路由到对应应用
+/// 统一请求处理器 - 通过 x-deis-app-id header 路由到对应应用
 pub async fn handle_request(
     State(state): State<AppState>,
     method: Method,
@@ -23,17 +23,48 @@ pub async fn handle_request(
     body: String,
 ) -> impl IntoResponse {
     // 从 header 中获取 app_id
-    let app_id = match headers.get("x-app-id").and_then(|v| v.to_str().ok()) {
+    let app_id = match headers.get("x-deis-app-id").and_then(|v| v.to_str().ok()) {
         Some(id) => id.to_string(),
         None => {
-            tracing::warn!("请求缺少 x-app-id header: {} {}", method, uri);
+            tracing::warn!("请求缺少 x-deis-app-id header: {} {}", method, uri);
             return (
                 StatusCode::BAD_REQUEST,
-                "Missing x-app-id header".to_string(),
+                "Missing x-deis-app-id header".to_string(),
             )
                 .into_response();
         }
     };
+
+    // 检查是否是调试请求
+    if let Some(target_app_id) = app_id.strip_prefix("_inspect:") {
+        let token = headers
+            .get("x-denix-inspect-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !state
+            .app_manager
+            .validate_inspect_token(target_app_id, token)
+        {
+            return (StatusCode::FORBIDDEN, "Invalid or expired inspector token").into_response();
+        }
+
+        if let Some(ws_upgrade) = ws {
+            let app_manager = state.app_manager.clone();
+            let target_app_id = target_app_id.to_string();
+            return ws_upgrade
+                .on_upgrade(move |socket| {
+                    handle_inspector_session(socket, target_app_id, app_manager)
+                })
+                .into_response();
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Inspector requires WebSocket connection",
+            )
+                .into_response();
+        }
+    }
 
     // 使用完整的 URI（包含 path 和 query）
     let url = format!("http://localhost{}", uri);
@@ -285,4 +316,55 @@ async fn handle_websocket_bridged(
         app_id,
         ws_id
     );
+}
+
+/// 处理调试器会话
+async fn handle_inspector_session(
+    socket: WebSocket,
+    app_id: String,
+    app_manager: Arc<crate::app::ApplicationManager>,
+) {
+    tracing::info!("Inspector session started for app: {}", app_id);
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    match app_manager.connect_inspector(&app_id).await {
+        Ok((in_tx, mut out_rx)) => {
+            // Task: WS -> V8
+            let ws_to_v8 = tokio::spawn(async move {
+                while let Some(msg) = ws_receiver.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            if in_tx.send(text).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+
+            // Task: V8 -> WS
+            let v8_to_ws = tokio::spawn(async move {
+                while let Some(text) = out_rx.recv().await {
+                    if ws_sender.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let _ = tokio::join!(ws_to_v8, v8_to_ws);
+        }
+        Err(e) => {
+            tracing::error!("Failed to connect inspector for app {}: {}", app_id, e);
+            let _ = ws_sender
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: std::borrow::Cow::from(format!("Failed to connect: {}", e)),
+                })))
+                .await;
+        }
+    }
+    tracing::info!("Inspector session ended for app: {}", app_id);
 }

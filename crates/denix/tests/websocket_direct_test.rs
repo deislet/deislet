@@ -45,14 +45,19 @@ async fn test_websocket_direct_bridging() {
         }
     "#;
 
-    // 2. Create Runtime
     let mut runtime = AppRuntime::new(
         "ws_test_app".to_string(),
         code.to_string(),
+        None,
+        None,
         HashMap::new(),
+        denix::app::types::AppPermissions::default(),
+        None,
         None,
     )
     .expect("Failed to create runtime");
+
+    runtime.init_module().await.expect("Failed to init module");
 
     // 3. Simulate Gateway Handshake
     // Step A: Execute Fetch to trigger Upgrade
@@ -71,7 +76,10 @@ async fn test_websocket_direct_bridging() {
         .await
         .expect("Fetch execution failed");
 
-    let (status, resp_headers, _) = rx.await.expect("Channel closed").expect("Fetch returned error");
+    let (status, resp_headers, _) = rx
+        .await
+        .expect("Channel closed")
+        .expect("Fetch returned error");
 
     assert_eq!(status, 101);
     let ws_id = resp_headers
