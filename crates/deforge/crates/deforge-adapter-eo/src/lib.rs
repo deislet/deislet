@@ -38,23 +38,44 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
     // Generate main router
     generate_router(output_dir, &routes)?;
 
-    // Generate edgeone.toml
-    let edgeone_toml = format!(
-        r#"name = "{}"
-language = "typescript"
-runtime = "edge-functions"
-entry_point = "index.ts"
+    // Generate package.json for bundling
+    let package_json = serde_json::json!({
+        "name": format!("{}-edgeone", config.name),
+        "private": true,
+        "scripts": {
+            "build": "esbuild index.ts --bundle --outfile=dist/worker.js --format=esm --platform=neutral --target=es2020"
+        },
+        "devDependencies": {
+            "esbuild": "^0.19.0",
+            "typescript": "^5.0.0"
+        }
+    });
 
-[environments.staging]
-url = "staging.{}.edgeone.ai"
+    fs::write(
+        output_dir.join("package.json"),
+        serde_json::to_string_pretty(&package_json)?,
+    )?;
 
-[environments.production]
-url = "{}.edgeone.ai"
-"#,
-        config.name, config.name, config.name
-    );
+    // Generate build script
+    let build_script = r#"#!/bin/bash
+if ! command -v esbuild &> /dev/null; then
+    echo "esbuild not found. Installing dependencies..."
+    npm install
+fi
 
-    fs::write(output_dir.join("edgeone.toml"), edgeone_toml)?;
+echo "Bundling for Tencent EdgeOne..."
+npm run build
+echo "Done! Output: dist/worker.js"
+"#;
+
+    fs::write(output_dir.join("build.sh"), build_script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(output_dir.join("build.sh"))?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(output_dir.join("build.sh"), perms)?;
+    }
 
     // Create adapters directory
     let adapters_dir = output_dir.join("adapters");
@@ -70,46 +91,31 @@ url = "{}.edgeone.ai"
     {
         let kv_adapter = r#"/**
  * Tencent EdgeOne KV Adapter
- * Wraps EdgeOne KV binding with unified interface
  */
 
-export function createKVAdapter(kvNamespace) {
+export function createKVAdapter(kvNamespace: any) {
   return {
-    async get(key, options = {}) {
-      const value = await kvNamespace.get(key, options.type || 'text');
-      return value;
+    async get(key: string, options: any = {}): Promise<string | null> {
+      return kvNamespace.get(key, options.type || 'text');
     },
 
-    async getJSON(key) {
-      const value = await kvNamespace.get(key, 'json');
-      return value;
+    async getJSON<T = any>(key: string): Promise<T | null> {
+      return kvNamespace.get(key, 'json');
     },
 
-    async getWithMetadata(key) {
-      const value = await kvNamespace.getWithMetadata(key);
-      return {
-        value: value.value,
-        metadata: value.metadata || null,
-      };
-    },
-
-    async put(key, value, options = {}) {
+    async put(key: string, value: string, options: any = {}): Promise<void> {
       await kvNamespace.put(key, value, options);
     },
 
-    async putJSON(key, value, options = {}) {
+    async putJSON<T = any>(key: string, value: T, options: any = {}): Promise<void> {
       await kvNamespace.put(key, JSON.stringify(value), options);
     },
 
-    async delete(key) {
+    async delete(key: string): Promise<void> {
       await kvNamespace.delete(key);
     },
 
-    async deleteMultiple(keys) {
-      await Promise.all(keys.map(key => kvNamespace.delete(key)));
-    },
-
-    async list(options = {}) {
+    async list(options: any = {}) {
       const result = await kvNamespace.list(options);
       return {
         keys: result.keys || [],
@@ -118,15 +124,83 @@ export function createKVAdapter(kvNamespace) {
       };
     },
 
-    async exists(key) {
+    async exists(key: string): Promise<boolean> {
       const value = await kvNamespace.get(key);
       return value !== null;
     },
   };
 }
 "#;
-        fs::write(adapters_dir.join("kv-adapter.js"), kv_adapter)?;
+        fs::write(adapters_dir.join("kv-adapter.ts"), kv_adapter)?;
     }
+
+    // Generate Context Builder
+    let context_builder = r#"/**
+ * EdgeOne Context Builder
+ */
+import { createKVAdapter } from './kv-adapter';
+
+export function createContextBuilder(event: any) {
+  return function buildContext(request: Request, route: string = '/') {
+    const url = new URL(request.url);
+    
+    // Extract KV if present (EdgeOne typically exposes it globally or via env)
+    // Adjust based on specific EdgeOne runtime environment
+    const kv = typeof globalThis.EdgeKV !== 'undefined' ? createKVAdapter(globalThis.EdgeKV) : undefined;
+
+    return {
+      request,
+      env: {}, // EdgeOne env vars usually injected globally
+      params: extractParams(url.pathname, route),
+      path: url.pathname,
+      method: request.method,
+      query: Object.fromEntries(url.searchParams),
+      headers: request.headers,
+      cookies: parseCookies(request),
+      services: {
+        kv,
+      },
+      log: console,
+      waitUntil: (promise: Promise<any>) => event.waitUntil(promise),
+    };
+  };
+}
+
+function extractParams(pathname: string, route: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  const routeParts = route.split('/');
+  const pathParts = pathname.split('/');
+
+  routeParts.forEach((part, i) => {
+    if (part.startsWith(':')) {
+      const paramName = part.slice(1);
+      params[paramName] = pathParts[i] || '';
+    }
+  });
+
+  return params;
+}
+
+function parseCookies(request: Request): any {
+  const cookies: Record<string, string> = {};
+  const cookieHeader = request.headers.get('Cookie');
+
+  if (cookieHeader) {
+    cookieHeader.split(';').forEach(cookie => {
+      const [name, ...rest] = cookie.split('=');
+      cookies[name.trim()] = rest.join('=').trim();
+    });
+  }
+
+  return {
+    get(name: string) { return cookies[name]; },
+    set(name: string, value: string) { cookies[name] = value; },
+    delete(name: string) { delete cookies[name]; },
+    getAll() { return { ...cookies }; }
+  };
+}
+"#;
+    fs::write(adapters_dir.join("context-builder.ts"), context_builder)?;
 
     Ok(())
 }
@@ -136,15 +210,11 @@ fn generate_router(output_dir: &Path, routes: &[(String, String)]) -> anyhow::Re
     let mut route_handlers = String::new();
 
     for (i, (route, import_path)) in routes.iter().enumerate() {
-        // Import onRequest handlers from transformed files
-        imports.push_str(&format!(
-            "import {{ onRequest as handler{i} }} from '{import_path}';\n"
-        ));
+        imports.push_str(&format!("import handler{i} from '{import_path}';\n"));
 
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(pathname, '{route}')) {{
-    // Update params with matched route parameters
-    context.params = extractParams(pathname, '{route}');
+    const context = buildContext(request, '{route}');
     return handler{i}(context);
   }}
 "#
@@ -155,23 +225,24 @@ fn generate_router(output_dir: &Path, routes: &[(String, String)]) -> anyhow::Re
         r#"/**
  * Tencent EdgeOne Main Entry
  * Auto-generated router
- * Uses EdgeOne's EventContext pattern
  */
 
+import {{ createContextBuilder }} from './adapters/context-builder';
 {imports}
 
-// EdgeOne main router using onRequest pattern
-export function onRequest(context) {{
-  // EdgeOne provides: {{ request, params, env, waitUntil }}
-  const url = new URL(context.request.url);
-  const pathname = url.pathname;
+export default {{
+  async fetch(request, event) {{
+    const buildContext = createContextBuilder(event);
+    const url = new URL(request.url);
+    const pathname = url.pathname;
 
 {route_handlers}
-  // 404 Not Found
-  return new Response('Not Found', {{ status: 404 }});
-}}
+    // 404 Not Found
+    return new Response('Not Found', {{ status: 404 }});
+  }}
+}};
 
-function matchRoute(pathname, route) {{
+function matchRoute(pathname: string, route: string): boolean {{
   // Exact match
   if (pathname === route) return true;
 
@@ -185,20 +256,6 @@ function matchRoute(pathname, route) {{
     if (part.startsWith(':')) return true;
     return part === pathParts[i];
   }});
-}}
-
-function extractParams(pathname, route) {{
-  const params = {{}};
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
-
-  routeParts.forEach((part, i) => {{
-    if (part.startsWith(':')) {{
-      params[part.slice(1)] = pathParts[i] || '';
-    }}
-  }});
-
-  return params;
 }}
 "#
     );

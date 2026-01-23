@@ -51,7 +51,8 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
     let wrangler_toml = format!(
         r#"name = "{}"
 main = "index.ts"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
 
 [env.staging]
 route = "staging.{}.workers.dev"
@@ -85,6 +86,28 @@ database_id = ""    # Add your D1 database ID
     );
 
     fs::write(output_dir.join("wrangler.toml"), wrangler_toml)?;
+
+    // Copy package.json if it exists
+    let src_package_json = output_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("package.json");
+    if src_package_json.exists() {
+        fs::copy(src_package_json, output_dir.join("package.json"))?;
+    } else {
+        // Create a minimal package.json if none exists
+        let minimal_package_json = format!(
+            r#"{{
+  "name": "{}",
+  "private": true,
+  "main": "index.ts"
+}}"#,
+            config.name
+        );
+        fs::write(output_dir.join("package.json"), minimal_package_json)?;
+    }
 
     // Generate KV adapter
     let kv_adapter = r#"/**
@@ -227,7 +250,8 @@ fn generate_router(output_dir: &Path, routes: &[(String, String)]) -> anyhow::Re
 
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(url.pathname, '{route}')) {{
-    return handler{i}.fetch(request, env, ctx);
+    const context = buildContext(request, '{route}');
+    return handler{i}(context);
   }}
 "#
         ));
@@ -239,10 +263,12 @@ fn generate_router(output_dir: &Path, routes: &[(String, String)]) -> anyhow::Re
  * Auto-generated entry point
  */
 
+import {{ createContextBuilder }} from './adapters/context-builder';
 {imports}
 
 export default {{
   async fetch(request, env, ctx) {{
+    const buildContext = createContextBuilder(env, ctx);
     const url = new URL(request.url);
 
 {route_handlers}

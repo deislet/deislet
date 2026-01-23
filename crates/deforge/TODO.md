@@ -1,274 +1,274 @@
-# DeniCTL 开发 TODO 清单
+# DeniCTL Development TODO List
 
-## 🚀 第一优先级 - 核心功能完善
+## 🚀 P1 - Core Functionality Completion
 
-### 编译器增强
-- [ ] **完善代码转换器** (`denictl-compiler/src/transformer.rs`)
-  - [ ] 实现完整的 AST 转换逻辑
-  - [ ] 生成平台特定的入口点包装代码
-  - [ ] 自动注入适配器导入语句
-  - [ ] 处理动态路由参数映射
-  - [ ] 支持中间件转换
+### Compiler Enhancements
+- [ ] **Complete code transformer** (`denictl-compiler/src/transformer.rs`)
+  - [ ] Implement full AST transformation logic
+  - [ ] Generate platform-specific entry point wrapper code
+  - [ ] Auto-inject adapter import statements
+  - [ ] Handle dynamic route parameter mapping
+  - [ ] Support middleware transformation
 
-- [ ] **增强验证器** (`denictl-compiler/src/validator.rs`)
-  - [ ] 添加更精确的行号和列号定位
-  - [ ] 检测更多平台特定模式 (如 `import.meta`, `__dirname`)
-  - [ ] 验证环境变量使用 (区分 binding 和普通环境变量)
-  - [ ] 检查服务使用与配置的一致性
-  - [ ] 添加循环依赖检测
+- [ ] **Enhance validator** (`denictl-compiler/src/validator.rs`)
+  - [ ] Add more precise line and column numbering
+  - [ ] Detect more platform-specific patterns (e.g., `import.meta`, `__dirname`)
+  - [ ] Validate environment variable usage (distinguishing between bindings and standard env vars)
+  - [ ] Verify consistency between service usage and configuration
+  - [ ] Add circular dependency detection
 
-- [ ] **优化解析器** (`denictl-parser/src/lib.rs`)
-  - [ ] 提取更详细的类型信息
-  - [ ] 识别异步函数签名
-  - [ ] 检测 Context 类型使用
-  - [ ] 支持 JSX/TSX 解析
+- [ ] **Optimize parser** (`denictl-parser/src/lib.rs`)
+  - [ ] Extract more detailed type information
+  - [ ] Identify asynchronous function signatures
+  - [ ] Detect Context type usage
+  - [ ] Support JSX/TSX parsing
 
-### 适配器完善
-- [ ] **Cloudflare Workers 适配器**
-  - [ ] 生成完整的 Worker 入口点
-  - [ ] 实现路由匹配逻辑
-  - [ ] D1 Database 适配器实现
-  - [ ] Durable Objects 支持
-  - [ ] Workers AI 集成
+### Adapter Refinement
+- [ ] **Cloudflare Workers Adapter**
+  - [ ] Generate complete Worker entry points
+  - [ ] Implement routing logic
+  - [ ] D1 Database adapter implementation
+  - [ ] Durable Objects support
+  - [ ] Workers AI integration
 
-- [ ] **Deno Deploy 适配器**
-  - [ ] 生成 Deno.serve 入口点
-  - [ ] 实现完整的 Context 构建
-  - [ ] Deno KV 完整适配
-  - [ ] 环境变量映射
+- [ ] **Deno Deploy Adapter**
+  - [ ] Generate Deno.serve entry points
+  - [ ] Implement full Context construction
+  - [ ] Complete Deno KV adaptation
+  - [ ] Environment variable mapping
 
-- [ ] **Tencent EdgeOne 适配器**
-  - [ ] 研究 EdgeOne API 规范
-  - [ ] 实现 EdgeOne 特定的入口点
-  - [ ] KV/Storage 适配器
-  - [ ] 配置文件生成
+- [ ] **Tencent EdgeOne Adapter**
+  - [ ] Research EdgeOne API specifications
+  - [ ] Implement EdgeOne-specific entry points
+  - [ ] KV/Storage adapter
+  - [ ] Configuration file generation
 
-## 🔨 第二优先级 - 开发体验
+## 🔨 P2 - Development Experience
 
-### 本地开发服务器
-- [ ] **HTTP 服务器实现** (`denictl/src/commands/dev.rs`)
-  - [ ] 使用 `axum` 或 `warp` 创建 HTTP 服务器
-  - [ ] 实现路由匹配和分发
-  - [ ] Context 对象构建
-  - [ ] 请求/响应日志
+### Local Development Server
+- [ ] **HTTP server implementation** (`denictl/src/commands/dev.rs`)
+  - [ ] Create HTTP server using `axum` or `warp`
+  - [ ] Implement routing and dispatch
+  - [ ] Context object construction
+  - [ ] Request/response logging
 
-- [ ] **热重载**
-  - [ ] 使用 `notify` 监听文件变化
-  - [ ] 增量重新编译修改的文件
-  - [ ] 动态重新加载 handler
-  - [ ] WebSocket 通知浏览器刷新
+- [ ] **Hot Reloading**
+  - [ ] Use `notify` to watch for file changes
+  - [ ] Incrementally recompile modified files
+  - [ ] Dynamically reload handlers
+  - [ ] WebSocket notification for browser refresh
 
-- [ ] **Mock 服务**
-  - [ ] 内存 KV Store 实现
-  - [ ] SQLite 本地数据库
-  - [ ] 内存 Cache 实现
-  - [ ] 请求拦截和 Mock 响应
+- [ ] **Mock Services**
+  - [ ] In-memory KV Store implementation
+  - [ ] Local SQLite database
+  - [ ] In-memory Cache implementation
+  - [ ] Request interception and Mock responses
 
-### 项目模板
-- [ ] **模板系统**
-  - [ ] 基础模板 (Hello World)
-  - [ ] API 模板 (RESTful API)
-  - [ ] 全栈模板 (前端 + API)
-  - [ ] Websocket 模板
-  - [ ] Scheduled Worker 模板
+### Project Templates
+- [ ] **Template System**
+  - [ ] Basic template (Hello World)
+  - [ ] API template (RESTful API)
+  - [ ] Full-stack template (Frontend + API)
+  - [ ] WebSocket template
+  - [ ] Scheduled Worker template
 
-- [ ] **模板引擎集成**
-  - [ ] 使用 handlebars 生成项目文件
-  - [ ] 支持变量替换
-  - [ ] 条件生成 (基于选择的功能)
+- [ ] **Template Engine Integration**
+  - [ ] Use handlebars to generate project files
+  - [ ] Support variable substitution
+  - [ ] Conditional generation (based on selected features)
 
-## 📦 第三优先级 - 部署和发布
+## 📦 P3 - Deployment and Publishing
 
-### 部署集成
-- [ ] **Cloudflare Workers 部署**
-  - [ ] 调用 wrangler CLI
-  - [ ] 或直接使用 Cloudflare API
-  - [ ] 处理认证 (API Token)
-  - [ ] 上传代码和资源
-  - [ ] 获取部署状态和 URL
+### Deployment Integration
+- [ ] **Cloudflare Workers Deployment**
+  - [ ] Call wrangler CLI
+  - [ ] Or use Cloudflare API directly
+  - [ ] Handle authentication (API Token)
+  - [ ] Upload code and assets
+  - [ ] Get deployment status and URL
 
-- [ ] **Deno Deploy 部署**
-  - [ ] 使用 deployctl
-  - [ ] 或 Deno Deploy API
-  - [ ] GitHub 集成
-  - [ ] 环境变量设置
+- [ ] **Deno Deploy Deployment**
+  - [ ] Use deployctl
+  - [ ] Or Deno Deploy API
+  - [ ] GitHub integration
+  - [ ] Environment variable settings
 
-- [ ] **Tencent EdgeOne 部署**
-  - [ ] 研究 EdgeOne 部署 API
-  - [ ] 实现认证和上传
-  - [ ] 域名绑定
+- [ ] **Tencent EdgeOne Deployment**
+  - [ ] Research EdgeOne deployment API
+  - [ ] Implement authentication and upload
+  - [ ] Domain binding
 
-### 配置管理
-- [ ] **配置存储** (`denictl/src/commands/config.rs`)
-  - [ ] 全局配置存储 (~/.denictl/config.toml)
-  - [ ] 项目级配置 (.denictl/config.toml)
-  - [ ] 密钥加密存储
-  - [ ] 配置继承和覆盖
+### Configuration Management
+- [ ] **Configuration Storage** (`denictl/src/commands/config.rs`)
+  - [ ] Global configuration storage (~/.denictl/config.toml)
+  - [ ] Project-level configuration (.denictl/config.toml)
+  - [ ] Encrypted secret storage
+  - [ ] Configuration inheritance and overrides
 
-- [ ] **环境管理**
-  - [ ] 多环境支持 (dev, staging, production)
-  - [ ] 环境变量管理
-  - [ ] Secrets 管理
+- [ ] **Environment Management**
+  - [ ] Multi-environment support (dev, staging, production)
+  - [ ] Environment variable management
+  - [ ] Secrets management
 
-## 🧪 第四优先级 - 测试和质量
+## 🧪 P4 - Testing and Quality
 
-### 测试框架
-- [ ] **单元测试**
-  - [ ] denictl-core 测试
-  - [ ] denictl-parser 测试
-  - [ ] denictl-compiler 测试
-  - [ ] denictl-adapters 测试
+### Testing Framework
+- [ ] **Unit Testing**
+  - [ ] denictl-core tests
+  - [ ] denictl-parser tests
+  - [ ] denictl-compiler tests
+  - [ ] denictl-adapters tests
 
-- [ ] **集成测试**
-  - [ ] 完整编译流程测试
-  - [ ] 跨平台一致性测试
-  - [ ] CLI 命令测试
+- [ ] **Integration Testing**
+  - [ ] Full compilation flow testing
+  - [ ] Cross-platform consistency testing
+  - [ ] CLI command testing
 
-- [ ] **E2E 测试**
-  - [ ] 实际部署测试
-  - [ ] 平台运行时测试
-  - [ ] 性能基准测试
+- [ ] **E2E Testing**
+  - [ ] Actual deployment testing
+  - [ ] Platform runtime testing
+  - [ ] Performance benchmarks
 
-### 代码质量
-- [ ] **Linting 和格式化**
-  - [ ] 配置 clippy
-  - [ ] 配置 rustfmt
-  - [ ] CI/CD 集成
+### Code Quality
+- [ ] **Linting and Formatting**
+  - [ ] Configure clippy
+  - [ ] Configure rustfmt
+  - [ ] CI/CD integration
 
-- [ ] **错误处理**
-  - [ ] 统一错误类型
-  - [ ] 友好的错误消息
-  - [ ] 错误恢复建议
+- [ ] **Error Handling**
+  - [ ] Unified error types
+  - [ ] User-friendly error messages
+  - [ ] Error recovery suggestions
 
-## 📚 第五优先级 - 文档和示例
+## 📚 P5 - Documentation and Examples
 
-### 文档
-- [ ] **用户文档**
-  - [ ] 快速开始指南
-  - [ ] CLI 命令详细文档
-  - [ ] 配置文件参考
-  - [ ] 最佳实践
+### Documentation
+- [ ] **User Documentation**
+  - [ ] Quick Start Guide
+  - [ ] Detailed CLI command documentation
+  - [ ] Configuration file reference
+  - [ ] Best Practices
 
-- [ ] **开发者文档**
-  - [ ] 架构设计文档
-  - [ ] 适配器开发指南
-  - [ ] 贡献指南
-  - [ ] API 参考
+- [ ] **Developer Documentation**
+  - [ ] Architecture design documentation
+  - [ ] Adapter development guide
+  - [ ] Contribution guide
+  - [ ] API reference
 
-### 示例项目
-- [ ] **示例集合**
+### Example Projects
+- [ ] **Example Collection**
   - [ ] Hello World
   - [ ] RESTful API
-  - [ ] KV Store 使用
-  - [ ] Database 集成
-  - [ ] WebSocket 示例
+  - [ ] KV Store usage
+  - [ ] Database integration
+  - [ ] WebSocket example
   - [ ] Scheduled Worker
 
-## 🎨 第六优先级 - 高级特性
+## 🎨 P6 - Advanced Features
 
-### 插件系统
-- [ ] **插件架构**
-  - [ ] 插件 API 设计
-  - [ ] 插件加载机制
-  - [ ] 生命周期钩子
-  - [ ] 插件配置
+### Plugin System
+- [ ] **Plugin Architecture**
+  - [ ] Plugin API design
+  - [ ] Plugin loading mechanism
+  - [ ] Lifecycle hooks
+  - [ ] Plugin configuration
 
-### 中间件支持
-- [ ] **中间件框架**
-  - [ ] 中间件接口定义
-  - [ ] 中间件链执行
-  - [ ] 内置中间件 (CORS, 日志, 认证等)
-  - [ ] 自定义中间件支持
+### Middleware Support
+- [ ] **Middleware Framework**
+  - [ ] Middleware interface definition
+  - [ ] Middleware chain execution
+  - [ ] Built-in middleware (CORS, logging, auth, etc.)
+  - [ ] Custom middleware support
 
-### 监控和分析
-- [ ] **性能监控**
-  - [ ] 构建时间统计
-  - [ ] 产物大小分析
-  - [ ] 依赖分析
+### Monitoring and Analysis
+- [ ] **Performance Monitoring**
+  - [ ] Build time statistics
+  - [ ] Artifact size analysis
+  - [ ] Dependency analysis
 
-- [ ] **运行时监控**
-  - [ ] 日志聚合
-  - [ ] 错误追踪
-  - [ ] 性能指标
+- [ ] **Runtime Monitoring**
+  - [ ] Log aggregation
+  - [ ] Error tracking
+  - [ ] Performance metrics
 
-## 🔧 第七优先级 - 工具和生态
+## 🔧 P7 - Tooling and Ecosystem
 
-### 开发工具
-- [ ] **VSCode 扩展**
-  - [ ] 语法高亮
-  - [ ] 代码补全
-  - [ ] 错误检查
-  - [ ] 一键部署
+### Development Tools
+- [ ] **VSCode Extension**
+  - [ ] Syntax highlighting
+  - [ ] Code completion
+  - [ ] Error checking
+  - [ ] One-click deployment
 
-### 包管理
-- [ ] **发布到 crates.io**
-  - [ ] 准备发布
-  - [ ] 版本管理
-  - [ ] 变更日志
+### Package Management
+- [ ] **Publishing to crates.io**
+  - [ ] Prepare for publishing
+  - [ ] Version management
+  - [ ] Changelog
 
-- [ ] **预编译二进制**
-  - [ ] GitHub Actions 自动构建
-  - [ ] 多平台二进制 (Linux, macOS, Windows)
+- [ ] **Precompiled Binaries**
+  - [ ] Auto-build with GitHub Actions
+  - [ ] Multi-platform binaries (Linux, macOS, Windows)
   - [ ] GitHub Releases
 
-## 🌐 第八优先级 - 平台扩展
+## 🌐 P8 - Platform Extensions
 
-### 新平台支持
+### New Platform Support
 - [ ] **Vercel Edge Functions**
-  - [ ] 适配器实现
-  - [ ] 部署集成
-  - [ ] 文档
+  - [ ] Adapter implementation
+  - [ ] Deployment integration
+  - [ ] Documentation
 
 - [ ] **Netlify Edge Functions**
-  - [ ] 适配器实现
-  - [ ] 部署集成
-  - [ ] 文档
+  - [ ] Adapter implementation
+  - [ ] Deployment integration
+  - [ ] Documentation
 
 - [ ] **AWS Lambda@Edge**
-  - [ ] 适配器实现
-  - [ ] 部署集成
-  - [ ] 文档
+  - [ ] Adapter implementation
+  - [ ] Deployment integration
+  - [ ] Documentation
 
-## 📊 进度追踪
+## 📊 Progress Tracking
 
-### 当前完成度
-- ✅ 项目架构搭建 (100%)
-- ✅ CLI 框架 (100%)
-- ✅ 基础解析器 (80%)
-- ✅ 基础验证器 (60%)
-- 🚧 代码转换器 (30%)
-- 🚧 适配器生成 (50%)
-- ⏳ 开发服务器 (0%)
-- ⏳ 部署集成 (0%)
-- ⏳ 测试套件 (0%)
+### Current Progress
+- ✅ Project architecture setup (100%)
+- ✅ CLI framework (100%)
+- ✅ Basic parser (80%)
+- ✅ Basic validator (60%)
+- 🚧 Code transformer (30%)
+- 🚧 Adapter generation (50%)
+- ⏳ Development server (0%)
+- ⏳ Deployment integration (0%)
+- ⏳ Test suite (0%)
 
-### 里程碑
+### Milestones
 
-**v0.1.0 - MVP** (目标: 4 周)
-- 完整的验证和编译
-- Cloudflare Workers 完整支持
-- 基本文档
+**v0.1.0 - MVP** (Target: 4 weeks)
+- Full validation and compilation
+- Complete Cloudflare Workers support
+- Basic documentation
 
-**v0.2.0 - 开发体验** (目标: 8 周)
-- 本地开发服务器
-- 热重载
-- Deno Deploy 支持
+**v0.2.0 - Development Experience** (Target: 8 weeks)
+- Local development server
+- Hot reloading
+- Deno Deploy support
 
-**v0.3.0 - 生产就绪** (目标: 12 周)
-- 实际部署集成
-- 完整测试覆盖
-- 性能优化
+**v0.3.0 - Production Ready** (Target: 12 weeks)
+- Actual deployment integration
+- Full test coverage
+- Performance optimization
 
-**v1.0.0 - 正式发布** (目标: 16 周)
-- 所有主要平台支持
-- 完整文档
-- 生态工具
+**v1.0.0 - Official Release** (Target: 16 weeks)
+- Support for all major platforms
+- Complete documentation
+- Ecosystem tooling
 
 ---
 
-**优先处理顺序建议**:
-1. 完善编译器核心功能 (验证器 + 转换器)
-2. 实现 Cloudflare Workers 完整适配
-3. 添加基础测试
-4. 实现本地开发服务器
-5. 完善文档和示例
+**Suggested Priority Order**:
+1. Refine compiler core features (validator + transformer)
+2. Implement full Cloudflare Workers adaptation
+3. Add basic tests
+4. Implement local development server
+5. Complete documentation and examples

@@ -2,6 +2,7 @@ mod transformer;
 mod validator;
 
 use crate::parser::TypeScriptParser;
+use colored::Colorize;
 use deforge_core::*;
 use std::collections::HashMap;
 use std::fs;
@@ -69,6 +70,15 @@ impl Compiler {
 
         for vendor in target_vendors {
             let build = self.build_for_vendor(project_dir, &vendor, &config, minify)?;
+
+            // Verify artifacts (Smoke Test)
+            if let Err(e) = self.verify_artifacts(&vendor, Path::new(&build.output_path)) {
+                println!(
+                    "{}",
+                    format!("  ⚠ Verification failed for {}: {}", vendor, e).yellow()
+                );
+            }
+
             builds.insert(vendor, build);
         }
 
@@ -77,6 +87,56 @@ impl Compiler {
             builds,
             errors: Vec::new(),
         })
+    }
+
+    fn verify_artifacts(&self, vendor: &str, output_dir: &Path) -> anyhow::Result<()> {
+        match vendor {
+            "cloudflare" => {
+                use std::process::Command;
+                // Check for wrangler
+                if Command::new("wrangler").arg("--version").output().is_ok() {
+                    println!(
+                        "{}",
+                        "  Create smoke test (wrangler deploy --dry-run)...".dimmed()
+                    );
+                    let status = Command::new("wrangler")
+                        .args(&["deploy", "--dry-run", "--outdir", "dist-check"])
+                        .current_dir(output_dir)
+                        .status()?;
+
+                    if !status.success() {
+                        return Err(anyhow::anyhow!("Wrangler verification failed"));
+                    }
+                } else {
+                    println!(
+                        "{}",
+                        "  ⚠ Skipping verification: 'wrangler' not found".dimmed()
+                    );
+                }
+            }
+            "deno" => {
+                use std::process::Command;
+                // Check for deno
+                if Command::new("deno").arg("--version").output().is_ok() {
+                    println!("{}", "  Create smoke test (deno check)...".dimmed());
+                    let entry_point = output_dir.join("main.ts");
+                    if entry_point.exists() {
+                        let status = Command::new("deno")
+                            .args(&["check", entry_point.to_str().unwrap()])
+                            .current_dir(output_dir)
+                            .status()?;
+
+                        if !status.success() {
+                            return Err(anyhow::anyhow!("Deno verification failed"));
+                        }
+                    }
+                } else {
+                    println!("{}", "  ⚠ Skipping verification: 'deno' not found".dimmed());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn load_config(&self, project_dir: &Path) -> anyhow::Result<ProjectConfig> {
