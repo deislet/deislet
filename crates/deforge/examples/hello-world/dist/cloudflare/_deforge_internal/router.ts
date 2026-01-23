@@ -1,20 +1,19 @@
 /**
- * Tencent EdgeOne Main Entry
- * Auto-generated router
+ * Cloudflare Workers Router
+ * Auto-generated entry point
  */
 
 import { createContextBuilder } from './adapters/context-builder';
-import handler0 from './router';
+import handler0 from '../src/index.ts';
 
 
 export default {
-  async fetch(request, event) {
-    const buildContext = createContextBuilder(event);
+  async fetch(request, env, ctx) {
+    const buildContext = createContextBuilder(env, ctx);
     const url = new URL(request.url);
-    const pathname = url.pathname;
 
-  if (matchRoute(pathname, '/router')) {
-    const context = buildContext(request, '/router');
+  if (matchRoute(url.pathname, '/')) {
+    const context = buildContext(request, '/');
     return handler0(context);
   }
 

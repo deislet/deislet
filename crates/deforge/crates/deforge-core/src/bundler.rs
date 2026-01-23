@@ -15,13 +15,13 @@ pub struct DeforgeBundler {
 }
 
 impl DeforgeBundler {
-    pub fn new(entry: &Path, platform: TargetPlatform) -> Self {
+    pub fn new(entry: &str, platform: TargetPlatform) -> Self {
         let mut options = BundlerOptions::default();
         
         // Input config
         options.input = Some(vec![InputItem {
             name: Some("index".to_string()),
-            import: entry.to_string_lossy().to_string(),
+            import: entry.to_string(),
         }]);
 
         // Platform config

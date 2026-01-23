@@ -21,7 +21,7 @@ impl Transformer {
         Ok(code.to_string())
     }
 
-    fn filename_to_route(filename: &str, function_root: &str) -> String {
+    pub fn filename_to_route(filename: &str, function_root: &str) -> String {
         // Remove function root prefix
         let relative = filename
             .trim_start_matches(function_root)

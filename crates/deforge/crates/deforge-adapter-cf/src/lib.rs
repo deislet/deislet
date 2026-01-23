@@ -1,46 +1,9 @@
-use deforge_core::ProjectConfig;
-use std::fs;
-use std::path::Path;
-use walkdir::WalkDir;
+use deforge_core::{AdapterArtifacts, ProjectConfig};
 
-pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()> {
-    // Collect all handlers for router
-    let mut routes = Vec::new();
-    let src_dir = output_dir.join("src");
-
-    if src_dir.exists() {
-        for entry in WalkDir::new(&src_dir) {
-            let entry = entry?;
-            let path = entry.path();
-            let filename = path.file_name().unwrap().to_string_lossy();
-
-            // Skip generated entry points
-            if filename == "index.ts" || filename == "index.js" || filename == "wrangler.toml" {
-                continue;
-            }
-
-            if entry.file_type().is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext == "ts" || ext == "js" {
-                        let relative = path.strip_prefix(&src_dir).unwrap();
-                        let route = filename_to_route(relative.to_string_lossy().as_ref());
-                        let import_path = relative
-                            .to_string_lossy()
-                            .to_string()
-                            .trim_end_matches(".ts")
-                            .trim_end_matches(".js")
-                            .to_string();
-                        routes.push((route, import_path));
-                    }
-                }
-            }
-        }
-    }
-
-    // Generate main router
-    generate_router(output_dir, &routes)?;
-
-    // Generate wrangler.toml
+pub fn generate(
+    routes: &[(String, String)],
+    config: &ProjectConfig,
+) -> anyhow::Result<AdapterArtifacts> {
     let has_kv = config
         .services
         .as_ref()
@@ -55,6 +18,23 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
         .map(|db| db.enabled)
         .unwrap_or(false);
 
+    // 1. Generate Context Builder Code
+    let context_builder_code = generate_context_builder_code(has_kv);
+
+    // 2. Generate KV Adapter Code
+    let kv_adapter_code = if has_kv {
+        Some(generate_kv_adapter_code())
+    } else {
+        None
+    };
+
+    // 3. Generate Router Code
+    let router_code = generate_router_code(routes, has_kv);
+
+    // 4. Generate Config Files
+    let mut config_files = Vec::new();
+
+    // wrangler.toml
     let wrangler_toml = format!(
         r#"name = "{}"
 main = "index.js"
@@ -91,33 +71,174 @@ database_id = ""    # Add your D1 database ID
             ""
         }
     );
+    config_files.push(("wrangler.toml".to_string(), wrangler_toml));
 
-    fs::write(output_dir.join("wrangler.toml"), wrangler_toml)?;
-
-    // Copy package.json if it exists
-    let src_package_json = output_dir
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("package.json");
-    if src_package_json.exists() {
-        fs::copy(src_package_json, output_dir.join("package.json"))?;
-    } else {
-        // Create a minimal package.json if none exists
-        let minimal_package_json = format!(
-            r#"{{
+    // package.json
+    let package_json = format!(
+        r#"{{
   "name": "{}",
   "private": true,
-  "main": "index.ts"
+  "main": "index.js"
 }}"#,
-            config.name
-        );
-        fs::write(output_dir.join("package.json"), minimal_package_json)?;
+        config.name
+    );
+    config_files.push(("package.json".to_string(), package_json));
+
+    Ok(AdapterArtifacts {
+        router_code,
+        context_builder_code,
+        kv_adapter_code,
+        config_files,
+    })
+}
+
+fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
+    let mut imports = String::new();
+    let mut route_handlers = String::new();
+
+    for (i, (route, import_path)) in routes.iter().enumerate() {
+        // Use provided import path directly (absolute path handled by Compiler)
+        imports.push_str(&format!("import handler{i} from '{import_path}';\n"));
+
+        route_handlers.push_str(&format!(
+            r#"  if (matchRoute(url.pathname, '{route}')) {{
+    const context = buildContext(request, '{route}');
+    return handler{i}(context);
+  }}
+"#
+        ));
     }
 
-    // Generate KV adapter
-    let kv_adapter = r#"/**
+    let kv_import = if has_kv {
+        "import { createKVAdapter } from './adapters/kv-adapter';\n"
+    } else {
+        ""
+    };
+
+    format!(
+        r#"/**
+ * Cloudflare Workers Router
+ * Auto-generated entry point
+ */
+
+import {{ createContextBuilder }} from './adapters/context-builder';
+{imports}
+
+export default {{
+  async fetch(request, env, ctx) {{
+    const buildContext = createContextBuilder(env, ctx);
+    const url = new URL(request.url);
+
+{route_handlers}
+    // 404 Not Found
+    return new Response('Not Found', {{ status: 404 }});
+  }}
+}};
+
+function matchRoute(pathname: string, route: string): boolean {{
+  // Exact match
+  if (pathname === route) return true;
+
+  // Dynamic parameter match
+  const routeParts = route.split('/');
+  const pathParts = pathname.split('/');
+
+  if (routeParts.length !== pathParts.length) return false;
+
+  return routeParts.every((part, i) => {{
+    if (part.startsWith(':')) return true;
+    return part === pathParts[i];
+  }});
+}}
+"#
+    )
+}
+
+fn generate_context_builder_code(has_kv: bool) -> String {
+    let kv_import = if has_kv {
+        "import { createKVAdapter } from './kv-adapter';\n"
+    } else {
+        ""
+    };
+
+    format!(
+        r#"/**
+ * Cloudflare Context Builder
+ */
+
+{kv_import}
+
+export function createContextBuilder(env: any, ctx: any) {{
+  return function buildContext(request: Request, route: string = '/') {{
+    const url = new URL(request.url);
+
+    return {{
+      request,
+      env: {{}},
+      params: extractParams(url.pathname, route),
+      path: url.pathname,
+      method: request.method,
+      query: Object.fromEntries(url.searchParams),
+      headers: request.headers,
+      cookies: parseCookies(request),
+      services: {{
+        kv: env.KV ? createKVAdapter(env.KV) : undefined,
+      }},
+      log: {{
+        debug: (...args: any[]) => console.debug(...args),
+        info: (...args: any[]) => console.info(...args),
+        warn: (...args: any[]) => console.warn(...args),
+        error: (...args: any[]) => console.error(...args),
+      }},
+      cache: {{
+        match: async (req: Request | string) => caches.default.match(req),
+        put: async (req: Request | string, res: Response) => caches.default.put(req, res),
+        delete: async (req: Request | string) => caches.default.delete(req),
+      }},
+      waitUntil: (promise: Promise<any>) => ctx.waitUntil(promise),
+    }};
+  }};
+}}
+
+function extractParams(pathname: string, route: string): Record<string, string> {{
+  const params: Record<string, string> = {{}};
+  const routeParts = route.split('/');
+  const pathParts = pathname.split('/');
+
+  routeParts.forEach((part, i) => {{
+    if (part.startsWith(':')) {{
+      const paramName = part.slice(1);
+      params[paramName] = pathParts[i] || '';
+    }}
+  }});
+
+  return params;
+}}
+
+function parseCookies(request: Request): any {{
+  const cookies: Record<string, string> = {{}};
+  const cookieHeader = request.headers.get('Cookie');
+
+  if (cookieHeader) {{
+    cookieHeader.split(';').forEach(cookie => {{
+      const [name, ...rest] = cookie.split('=');
+      cookies[name.trim()] = rest.join('=').trim();
+    }});
+  }}
+
+  return {{
+    get(name: string) {{ return cookies[name]; }},
+    set(name: string, value: string) {{ cookies[name] = value; }},
+    delete(name: string) {{ delete cookies[name]; }},
+    getAll() {{ return {{ ...cookies }}; }}
+  }};
+}}
+"#
+    )
+}
+
+fn generate_kv_adapter_code() -> String {
+    r#"/**
  * Cloudflare KV Adapter
  */
 
@@ -163,166 +284,6 @@ export function createKVAdapter(namespace: any) {
     }
   };
 }
-"#;
-
-    let adapters_dir = output_dir.join("adapters");
-    fs::create_dir_all(&adapters_dir)?;
-    fs::write(adapters_dir.join("kv-adapter.ts"), kv_adapter)?;
-
-    // Generate Context builder
-    let context_builder = r#"/**
- * Cloudflare Context Builder
- */
-
-import { createKVAdapter } from './kv-adapter';
-
-export function createContextBuilder(env: any, ctx: any) {
-  return function buildContext(request: Request, route: string = '/') {
-    const url = new URL(request.url);
-
-    return {
-      request,
-      env: {},
-      params: extractParams(url.pathname, route),
-      path: url.pathname,
-      method: request.method,
-      query: Object.fromEntries(url.searchParams),
-      headers: request.headers,
-      cookies: parseCookies(request),
-      services: {
-        kv: env.KV ? createKVAdapter(env.KV) : undefined,
-      },
-      log: {
-        debug: (...args: any[]) => console.debug(...args),
-        info: (...args: any[]) => console.info(...args),
-        warn: (...args: any[]) => console.warn(...args),
-        error: (...args: any[]) => console.error(...args),
-      },
-      cache: {
-        match: async (req: Request | string) => caches.default.match(req),
-        put: async (req: Request | string, res: Response) => caches.default.put(req, res),
-        delete: async (req: Request | string) => caches.default.delete(req),
-      },
-      waitUntil: (promise: Promise<any>) => ctx.waitUntil(promise),
-    };
-  };
-}
-
-function extractParams(pathname: string, route: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
-
-  routeParts.forEach((part, i) => {
-    if (part.startsWith(':')) {
-      const paramName = part.slice(1);
-      params[paramName] = pathParts[i] || '';
-    }
-  });
-
-  return params;
-}
-
-function parseCookies(request: Request): any {
-  const cookies: Record<string, string> = {};
-  const cookieHeader = request.headers.get('Cookie');
-
-  if (cookieHeader) {
-    cookieHeader.split(';').forEach(cookie => {
-      const [name, ...rest] = cookie.split('=');
-      cookies[name.trim()] = rest.join('=').trim();
-    });
-  }
-
-  return {
-    get(name: string) { return cookies[name]; },
-    set(name: string, value: string) { cookies[name] = value; },
-    delete(name: string) { delete cookies[name]; },
-    getAll() { return { ...cookies }; }
-  };
-}
-"#;
-
-    fs::write(adapters_dir.join("context-builder.ts"), context_builder)?;
-
-    Ok(())
-}
-
-fn generate_router(output_dir: &Path, routes: &[(String, String)]) -> anyhow::Result<()> {
-    let mut imports = String::new();
-    let mut route_handlers = String::new();
-
-    for (i, (route, import_path)) in routes.iter().enumerate() {
-        imports.push_str(&format!("import handler{i} from './src/{import_path}';\n"));
-
-        route_handlers.push_str(&format!(
-            r#"  if (matchRoute(url.pathname, '{route}')) {{
-    const context = buildContext(request, '{route}');
-    return handler{i}(context);
-  }}
 "#
-        ));
-    }
-
-    let router = format!(
-        r#"/**
- * Cloudflare Workers Router
- * Auto-generated entry point
- */
-
-import {{ createContextBuilder }} from './adapters/context-builder';
-{imports}
-
-export default {{
-  async fetch(request, env, ctx) {{
-    const buildContext = createContextBuilder(env, ctx);
-    const url = new URL(request.url);
-
-{route_handlers}
-    // 404 Not Found
-    return new Response('Not Found', {{ status: 404 }});
-  }}
-}};
-
-function matchRoute(pathname: string, route: string): boolean {{
-  // Exact match
-  if (pathname === route) return true;
-
-  // Dynamic parameter match
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
-
-  if (routeParts.length !== pathParts.length) return false;
-
-  return routeParts.every((part, i) => {{
-    if (part.startsWith(':')) return true;
-    return part === pathParts[i];
-  }});
-}}
-"#
-    );
-
-    fs::write(output_dir.join("router.ts"), router)?;
-
-    Ok(())
-}
-
-fn filename_to_route(filename: &str) -> String {
-    let without_ext = filename.trim_end_matches(".ts").trim_end_matches(".js");
-
-    let route = if without_ext == "index" {
-        "/"
-    } else if without_ext.ends_with("/index") {
-        without_ext.trim_end_matches("/index")
-    } else {
-        without_ext
-    };
-
-    let route = route.replace("[", ":").replace("]", "");
-
-    if route.starts_with('/') {
-        route.to_string()
-    } else {
-        format!("/{route}")
-    }
+    .to_string()
 }

@@ -95,6 +95,7 @@ chrono = "0.4"
 # Bundler
 rolldown = { path = "/ext/deislet/resource/rolldown/crates/rolldown", features = ["experimental"] }
 rolldown_common = { path = "/ext/deislet/resource/rolldown/crates/rolldown_common" }
+rolldown_plugin = { path = "/ext/deislet/resource/rolldown/crates/rolldown_plugin" }
 
 [profile.release]
 opt-level = 3

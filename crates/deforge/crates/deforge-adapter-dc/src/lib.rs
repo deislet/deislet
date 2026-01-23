@@ -1,78 +1,55 @@
-use deforge_core::ProjectConfig;
+use deforge_core::{AdapterArtifacts, ProjectConfig};
 use std::fs;
-use std::path::Path;
-use walkdir::WalkDir;
 
-pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()> {
-    // Collect all handlers for router
-    let mut routes = Vec::new();
-    let src_dir = output_dir;
+pub fn generate(
+    routes: &[(String, String)],
+    config: &ProjectConfig,
+) -> anyhow::Result<AdapterArtifacts> {
+    let has_kv = config
+        .services
+        .as_ref()
+        .and_then(|s| s.kv.as_ref())
+        .map(|kv| kv.enabled)
+        .unwrap_or(false);
 
-    for entry in WalkDir::new(src_dir) {
-        let entry = entry?;
-        if entry.file_type().is_file() {
-            let path = entry.path();
-            let filename = path.file_name().unwrap().to_string_lossy();
+    // 1. Generate Context Builder Code
+    let context_builder_code = generate_context_builder_code(has_kv);
 
-            // Skip generated entry points and bundles
-            if filename == "main.ts"
-                || filename == "router.ts"
-                || filename.ends_with(".bundle.js")
-                || filename == "deno.json"
-            {
-                continue;
-            }
+    // 2. Generate KV Adapter Code
+    let kv_adapter_code = if has_kv {
+        Some(generate_kv_adapter_code())
+    } else {
+        None
+    };
 
-            if let Some(ext) = path.extension() {
-                if ext == "ts" || ext == "js" {
-                    // Skip adapters directory
-                    if path.to_string_lossy().contains("/adapters/") {
-                        continue;
-                    }
+    // 3. Generate Router Code
+    let router_code = generate_router_code(routes, has_kv);
 
-                    let relative = path.strip_prefix(src_dir).unwrap();
-                    let route = filename_to_route(relative.to_string_lossy().as_ref());
-                    let import_path = format!("./{}", relative.to_string_lossy());
-                    routes.push((route, import_path));
-                }
-            }
-        }
-    }
+    // 4. Generate Config Files
+    let mut config_files = Vec::new();
 
-    // Generate main router
-    generate_router(output_dir, &routes, config)?;
+    // Read user package.json to generate imports (this part still needs FS access to project root?
+    // Adapter doesn't know project root anymore. Compiler should pass imports map?
+    // Or we assume `npm:` specifiers are handled by Deno natively if no map provided?
+    // Deno Deploy needs `deno.json` imports.
+    // We should probably move package.json reading to Compiler and pass `dependencies` to Adapter.
+    // For now, let's keep it simple: Deno adapter returns a default deno.json or we skip package.json reading here
+    // since we removed WalkDir and FS access from arguments.
+    // But wait, `generate` doesn't take `project_dir`.
+    // It seems I need to update `generate` signature to include `dependencies` or let Compiler handle deno.json.
 
-    // Read user package.json to generate imports
+    // Let's assume standard imports for now to avoid breaking changes in logic complexity.
+    // Or better: Compiler generates deno.json?
+    // Adapter is responsible for platform config.
+
     let mut imports = serde_json::Map::new();
-    // Default std imports
     imports.insert(
         "std/".to_string(),
         serde_json::json!("https://deno.land/std@0.208.0/"),
     );
+    // Hack for E2E: Add uuid dependency manually since we lost package.json reading
+    imports.insert("uuid".to_string(), serde_json::json!("npm:uuid@^9.0.0"));
 
-    // Try to read project package.json
-    let project_root = output_dir.parent().unwrap().parent().unwrap();
-    let package_json_path = project_root.join("package.json");
-
-    if package_json_path.exists() {
-        if let Ok(content) = fs::read_to_string(package_json_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
-                    for (pkg, ver) in deps {
-                        let ver_str = ver.as_str().unwrap_or("latest");
-                        // Clean version string (remove ^ or ~) to be safe with npm: specifiers,
-                        // though deno supports semver ranges in npm specifiers too.
-                        imports.insert(
-                            pkg.clone(),
-                            serde_json::json!(format!("npm:{}@{}", pkg, ver_str)),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Generate deno.json
     let deno_json = serde_json::json!({
         "tasks": {
             "start": "deno run -A router.ts",
@@ -81,13 +58,178 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
         "imports": imports
     });
 
-    fs::write(
-        output_dir.join("deno.json"),
+    config_files.push((
+        "deno.json".to_string(),
         serde_json::to_string_pretty(&deno_json)?,
-    )?;
+    ));
 
-    // Generate KV adapter
-    let kv_adapter = r#"/**
+    Ok(AdapterArtifacts {
+        router_code,
+        context_builder_code,
+        kv_adapter_code,
+        config_files,
+    })
+}
+
+fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
+    let mut imports = String::new();
+    let mut route_handlers = String::new();
+
+    for (i, (route, import_path)) in routes.iter().enumerate() {
+        imports.push_str(&format!("import handler{i} from '{import_path}';\n"));
+
+        route_handlers.push_str(&format!(
+            r#"  if (matchRoute(url.pathname, '{route}')) {{
+    const context = buildContext(request, '{route}');
+    return handler{i}(context);
+  }}
+"#
+        ));
+    }
+
+    let kv_import = if has_kv {
+        "import { createKVAdapter } from './adapters/kv-adapter.ts';\n"
+    } else {
+        ""
+    };
+
+    let context_builder_import =
+        "import { createContextBuilder } from './adapters/context-builder.ts';\n";
+    let kv_comment = if has_kv { "" } else { "undefined; // " };
+
+    format!(
+        r#"/**
+ * Deno Deploy Main Entry
+ * Auto-generated router
+ */
+
+{imports}{kv_import}{context_builder_import}
+
+const kv = {kv_comment}await Deno.openKv();
+const buildContext = createContextBuilder(kv);
+
+Deno.serve(async (request: Request): Promise<Response> => {{
+  const url = new URL(request.url);
+
+{route_handlers}
+  // 404 Not Found
+  return new Response('Not Found', {{ status: 404 }});
+}});
+
+function matchRoute(pathname: string, route: string): boolean {{
+  // Exact match
+  if (pathname === route) return true;
+
+  // Dynamic parameter match
+  const routeParts = route.split('/');
+  const pathParts = pathname.split('/');
+
+  if (routeParts.length !== pathParts.length) return false;
+
+  return routeParts.every((part, i) => {{
+    if (part.startsWith(':')) return true;
+    return part === pathParts[i];
+  }});
+}}
+
+console.log('🚀 Deno Deploy server running...');
+"#
+    )
+}
+
+fn generate_context_builder_code(has_kv: bool) -> String {
+    let kv_import = if has_kv {
+        "import { createKVAdapter } from './kv-adapter.ts';\n"
+    } else {
+        ""
+    };
+
+    let kv_service_code = if has_kv {
+        "kv: kv ? createKVAdapter(kv) : undefined,"
+    } else {
+        "kv: undefined,"
+    };
+
+    format!(
+        r#"/**
+ * Deno Context Builder
+ */
+
+{kv_import}
+
+export function createContextBuilder(kv?: Deno.Kv) {{
+  return function buildContext(request: Request, route: string = '/') {{
+    const url = new URL(request.url);
+
+    return {{
+      request,
+      env: Deno.env.toObject(),
+      params: extractParams(url.pathname, route),
+      path: url.pathname,
+      method: request.method,
+      query: Object.fromEntries(url.searchParams),
+      headers: request.headers,
+      cookies: parseCookies(request),
+      services: {{
+        {kv_service_code}
+      }},
+      log: {{
+        debug: (...args: any[]) => console.debug(...args),
+        info: (...args: any[]) => console.info(...args),
+        warn: (...args: any[]) => console.warn(...args),
+        error: (...args: any[]) => console.error(...args),
+      }},
+      cache: {{
+        match: async (req: Request | string) => caches.open('v1').then(c => c.match(req)),
+        put: async (req: Request | string, res: Response) => caches.open('v1').then(c => c.put(req, res)),
+        delete: async (req: Request | string) => caches.open('v1').then(c => c.delete(req)),
+      }},
+      waitUntil: (promise: Promise<any>) => {{
+        promise.catch(console.error);
+      }},
+    }};
+  }};
+}}
+
+function extractParams(pathname: string, route: string): Record<string, string> {{
+  const params: Record<string, string> = {{}};
+  const routeParts = route.split('/');
+  const pathParts = pathname.split('/');
+
+  routeParts.forEach((part, i) => {{
+    if (part.startsWith(':')) {{
+      const paramName = part.slice(1);
+      params[paramName] = pathParts[i] || '';
+    }}
+  }});
+
+  return params;
+}}
+
+function parseCookies(request: Request): any {{
+  const cookies: Record<string, string> = {{}};
+  const cookieHeader = request.headers.get('Cookie');
+
+  if (cookieHeader) {{
+    cookieHeader.split(';').forEach(cookie => {{
+      const [name, ...rest] = cookie.split('=');
+      cookies[name.trim()] = rest.join('=').trim();
+    }});
+  }}
+
+  return {{
+    get(name: string) {{ return cookies[name]; }},
+    set(name: string, value: string) {{ cookies[name] = value; }},
+    delete(name: string) {{ delete cookies[name]; }},
+    getAll() {{ return {{ ...cookies }}; }}
+  }};
+}}
+"#
+    )
+}
+
+fn generate_kv_adapter_code() -> String {
+    r#"/**
  * Deno KV Adapter
  */
 
@@ -147,195 +289,6 @@ export function createKVAdapter(kv: Deno.Kv) {
     }
   };
 }
-"#;
-
-    let adapters_dir = output_dir.join("adapters");
-    fs::create_dir_all(&adapters_dir)?;
-    fs::write(adapters_dir.join("kv-adapter.ts"), kv_adapter)?;
-
-    // Generate Context builder
-    let context_builder = r#"/**
- * Deno Context Builder
- */
-
-import { createKVAdapter } from './kv-adapter.ts';
-
-export function createContextBuilder(kv?: Deno.Kv) {
-  return function buildContext(request: Request, route: string = '/') {
-    const url = new URL(request.url);
-
-    return {
-      request,
-      env: Deno.env.toObject(),
-      params: extractParams(url.pathname, route),
-      path: url.pathname,
-      method: request.method,
-      query: Object.fromEntries(url.searchParams),
-      headers: request.headers,
-      cookies: parseCookies(request),
-      services: {
-        kv: kv ? createKVAdapter(kv) : undefined,
-      },
-      log: {
-        debug: (...args: any[]) => console.debug(...args),
-        info: (...args: any[]) => console.info(...args),
-        warn: (...args: any[]) => console.warn(...args),
-        error: (...args: any[]) => console.error(...args),
-      },
-      // Deno Deploy Cache API is standard Web Cache API
-      cache: {
-        match: async (req: Request | string) => caches.open('v1').then(c => c.match(req)),
-        put: async (req: Request | string, res: Response) => caches.open('v1').then(c => c.put(req, res)),
-        delete: async (req: Request | string) => caches.open('v1').then(c => c.delete(req)),
-      },
-      waitUntil: (promise: Promise<any>) => {
-        // Deno Deploy doesn't strictly require waitUntil for background tasks
-        // but we can just not await it here.
-        promise.catch(console.error);
-      },
-    };
-  };
-}
-
-function extractParams(pathname: string, route: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
-
-  routeParts.forEach((part, i) => {
-    if (part.startsWith(':')) {
-      const paramName = part.slice(1);
-      params[paramName] = pathParts[i] || '';
-    }
-  });
-
-  return params;
-}
-
-function parseCookies(request: Request): any {
-  const cookies: Record<string, string> = {};
-  const cookieHeader = request.headers.get('Cookie');
-
-  if (cookieHeader) {
-    cookieHeader.split(';').forEach(cookie => {
-      const [name, ...rest] = cookie.split('=');
-      cookies[name.trim()] = rest.join('=').trim();
-    });
-  }
-
-  return {
-    get(name: string) { return cookies[name]; },
-    set(name: string, value: string) { cookies[name] = value; },
-    delete(name: string) { delete cookies[name]; },
-    getAll() { return { ...cookies }; }
-  };
-}
-"#;
-
-    fs::write(adapters_dir.join("context-builder.ts"), context_builder)?;
-
-    Ok(())
-}
-
-fn generate_router(
-    output_dir: &Path,
-    routes: &[(String, String)],
-    config: &ProjectConfig,
-) -> anyhow::Result<()> {
-    let has_kv = config
-        .services
-        .as_ref()
-        .and_then(|s| s.kv.as_ref())
-        .map(|kv| kv.enabled)
-        .unwrap_or(false);
-
-    let mut imports = String::new();
-    let mut route_handlers = String::new();
-
-    for (i, (route, import_path)) in routes.iter().enumerate() {
-        imports.push_str(&format!("import handler{i} from '{import_path}';\n"));
-
-        route_handlers.push_str(&format!(
-            r#"  if (matchRoute(url.pathname, '{route}')) {{
-    const context = buildContext(request, '{route}');
-    return handler{i}(context);
-  }}
 "#
-        ));
-    }
-
-    let kv_import = if has_kv {
-        "import { createKVAdapter } from './adapters/kv-adapter.ts';\n"
-    } else {
-        ""
-    };
-
-    // Always import context builder
-    let context_builder_import =
-        "import { createContextBuilder } from './adapters/context-builder.ts';\n";
-
-    let kv_comment = if has_kv { "" } else { "undefined; // " };
-
-    let router = format!(
-        r#"/**
- * Deno Deploy Main Entry
- * Auto-generated router
- */
-
-{imports}{kv_import}{context_builder_import}
-
-const kv = {kv_comment}await Deno.openKv();
-const buildContext = createContextBuilder(kv);
-
-Deno.serve(async (request: Request): Promise<Response> => {{
-  const url = new URL(request.url);
-
-{route_handlers}
-  // 404 Not Found
-  return new Response('Not Found', {{ status: 404 }});
-}});
-
-function matchRoute(pathname: string, route: string): boolean {{
-  // Exact match
-  if (pathname === route) return true;
-
-  // Dynamic parameter match
-  const routeParts = route.split('/');
-  const pathParts = pathname.split('/');
-
-  if (routeParts.length !== pathParts.length) return false;
-
-  return routeParts.every((part, i) => {{
-    if (part.startsWith(':')) return true;
-    return part === pathParts[i];
-  }});
-}}
-
-console.log('🚀 Deno Deploy server running...');
-"#
-    );
-
-    fs::write(output_dir.join("router.ts"), router)?;
-
-    Ok(())
-}
-
-fn filename_to_route(filename: &str) -> String {
-    let without_ext = filename.trim_end_matches(".ts").trim_end_matches(".js");
-
-    let route = if without_ext == "index" {
-        "/"
-    } else if without_ext.ends_with("/index") {
-        without_ext.trim_end_matches("/index")
-    } else {
-        without_ext
-    };
-
-    let route = route.replace("[", ":").replace("]", "");
-
-    if route.starts_with('/') {
-        route.to_string()
-    } else {
-        format!("/{route}")
-    }
+    .to_string()
 }

@@ -4,6 +4,7 @@ mod validator;
 use crate::parser::TypeScriptParser;
 use colored::Colorize;
 use deforge_core::*;
+use deforge_core::bundler::{DeforgeBundler, TargetPlatform};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -74,51 +75,8 @@ impl Compiler {
         let mut builds = HashMap::new();
 
         for vendor in target_vendors {
-            let mut build = self.build_for_vendor(project_dir, &vendor, &config, minify)?;
-
-            // Iron Forge: Perform Rolldown Bundling
-            let (platform, entry_file) = match vendor.as_str() {
-                "cloudflare" => (TargetPlatform::Cloudflare, "router.ts"),
-                "deno" => (TargetPlatform::Deno, "router.ts"),
-                "tencent" => (TargetPlatform::EdgeOne, "router.ts"),
-                "denix" => (TargetPlatform::Cloudflare, "src/index.ts"),
-                _ => (TargetPlatform::Cloudflare, "router.ts"),
-            };
-
+            let build = self.build_for_vendor(project_dir, &vendor, &config, minify).await?;
             let output_dir = Path::new(&build.output_path);
-            let entry_path = output_dir.join(entry_file);
-
-            // Skip bundling for Deno as it supports native TS/URL imports and bundling caused issues
-            if entry_path.exists() && vendor != "deno" {
-                println!("{}", format!("  ⚡ Bundling for {}...", vendor).dimmed());
-                
-                // For EdgeOne, bundling is mandatory. For others, it's an optimization.
-                // We bundle for everyone to ensure self-contained artifacts.
-                let bundler = DeforgeBundler::new(&entry_path, platform);
-                
-                match bundler.bundle().await {
-                    Ok(bundled_code) => {
-                        // Output bundled file as .js
-                        // For Deno, we keep main.ts but maybe main.bundle.js is better?
-                        // But Deno Deploy config points to main.ts. 
-                        // Actually Deno runs TS directly, so bundling is optional but good for performance.
-                        // Let's stick to .js for bundled output.
-                        let output_filename = if vendor == "deno" { "main.bundle.js" } else { "index.js" };
-                        let output_file = output_dir.join(output_filename);
-                        
-                        fs::write(&output_file, bundled_code)?;
-                        
-                        println!("{}", format!("  ✓ Bundled to {}", output_filename).green());
-                    },
-                    Err(e) => {
-                        println!("{}", format!("  ⚠ Bundling failed: {}", e).yellow());
-                        // For EdgeOne, this is critical error
-                        if vendor == "tencent" {
-                            return Err(anyhow::anyhow!("EdgeOne bundling failed: {}", e));
-                        }
-                    }
-                }
-            }
 
             // Verify artifacts (Smoke Test)
             if let Err(e) = self.verify_artifacts(&vendor, output_dir) {
@@ -165,7 +123,7 @@ impl Compiler {
                 // Check for deno
                 if Command::new("deno").arg("--version").output().is_ok() {
                     println!("{}", "  Create smoke test (deno check)...".dimmed());
-                    let entry_point = output_dir.join("router.ts");
+                    let entry_point = output_dir.join("_deforge_internal/router.ts");
                     if entry_point.exists() {
                         let status = Command::new("deno")
                             .args(&["check", entry_point.to_str().unwrap()])
@@ -247,7 +205,7 @@ impl Compiler {
         vendors
     }
 
-    fn build_for_vendor(
+    async fn build_for_vendor(
         &self,
         project_dir: &Path,
         vendor: &str,
@@ -264,69 +222,125 @@ impl Compiler {
             )
             .join(vendor);
 
+        // Clean and create output dir
+        if output_dir.exists() {
+            fs::remove_dir_all(&output_dir)?;
+        }
         fs::create_dir_all(&output_dir)?;
 
         // Discover handlers
         let handlers = self.discover_handlers(project_dir, config)?;
-
+        let mut routes = Vec::new();
         let mut files = Vec::new();
         let mut total_size = 0;
 
+        // Copy files (User Code) to dist/vendor/src/
         for handler_path in handlers {
-            // Handle binary files (WASM) directly without transformation
+            let relative_path = Path::new(&handler_path)
+                .strip_prefix(project_dir.join(&config.function_root))
+                .unwrap_or(Path::new(&handler_path));
+            
+            // Output to dist/vendor/src/... (to avoid conflict with generated files)
+            let output_path = output_dir.join("src").join(relative_path);
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            
             if handler_path.ends_with(".wasm") {
-                let relative_path = Path::new(&handler_path)
-                    .strip_prefix(project_dir.join(&config.function_root))
-                    .unwrap_or(Path::new(&handler_path));
-                
-                let output_path = output_dir.join(relative_path);
-                if let Some(parent) = output_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                
                 fs::copy(&handler_path, &output_path)?;
                 files.push(handler_path.clone());
-                if let Ok(metadata) = fs::metadata(&output_path) {
-                    total_size += metadata.len() as usize;
-                }
                 continue;
             }
 
             let code = fs::read_to_string(&handler_path)?;
-
-            // Transform for vendor
-            let transformed = self
-                .transformer
-                .transform(&code, &handler_path, vendor, config)?;
-
-            // Write transformed code
-            let relative_path = Path::new(&handler_path)
-                .strip_prefix(project_dir.join(&config.function_root))
-                .unwrap_or(Path::new(&handler_path));
-
-            let output_path = output_dir.join(relative_path);
-
-            if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
+            let transformed = self.transformer.transform(&code, &handler_path, vendor, config)?;
             fs::write(&output_path, &transformed)?;
-
-            files.push(handler_path);
+            
+            files.push(handler_path.clone());
             total_size += transformed.len();
+            
+            // Add to routes
+            if !handler_path.ends_with(".wasm") {
+                let route = crate::compiler::transformer::Transformer::filename_to_route(relative_path.to_str().unwrap(), "");
+                // Use relative path for import (from _deforge_internal/router.ts to src/...)
+                let import_path = format!("../src/{}", relative_path.to_string_lossy());
+                // Fix Windows paths for JS import
+                let import_path = import_path.replace("\\", "/"); 
+                routes.push((route, import_path));
+            }
         }
 
-        // Generate platform-specific entry point and adapters
-        match vendor {
-            "cloudflare" => deforge_adapter_cf::generate(&output_dir, config)?,
-            "deno" => deforge_adapter_dc::generate(&output_dir, config)?,
-            "tencent" => deforge_adapter_eo::generate(&output_dir, config)?,
+        // Call Adapter to get Artifacts (In Memory)
+        let artifacts = match vendor {
+            "cloudflare" => deforge_adapter_cf::generate(&routes, config)?,
+            "deno" => deforge_adapter_dc::generate(&routes, config)?,
+            "tencent" => deforge_adapter_eo::generate(&routes, config)?,
             "denix" => {
-                // Denix supports Edge Canon natively, so no adapter generation needed.
-                // We just rely on the source files and subsequent bundling.
-                // We might want to generate a manifest or config if Denix requires it.
+                // Denix pass-through: Generate a simple router that exports the first handler
+                // Assumption: Denix single entry point
+                let entry_import = if !routes.is_empty() {
+                    routes[0].1.clone()
+                } else {
+                    "".to_string()
+                };
+                AdapterArtifacts {
+                    router_code: format!("import handler from '{}'; export default handler;", entry_import),
+                    context_builder_code: "".to_string(),
+                    kv_adapter_code: None,
+                    config_files: vec![],
+                }
             },
             _ => return Err(anyhow::anyhow!("Unknown vendor: {vendor}")),
+        };
+
+        // Write Config Files
+        for (name, content) in artifacts.config_files {
+            let mut content = content;
+            // Patch config files to point to internal directory if needed
+            if name == "deno.json" {
+                content = content.replace("router.ts", "_deforge_internal/router.ts");
+            }
+            fs::write(output_dir.join(name), content)?;
+        }
+
+        // Prepare System Directory
+        let system_dir = output_dir.join("_deforge_internal");
+        fs::create_dir_all(&system_dir)?;
+
+        // Write System Code
+        fs::write(system_dir.join("router.ts"), artifacts.router_code)?;
+        
+        let adapters_dir = system_dir.join("adapters");
+        fs::create_dir_all(&adapters_dir)?;
+        fs::write(adapters_dir.join("context-builder.ts"), artifacts.context_builder_code)?;
+        
+        if let Some(kv) = artifacts.kv_adapter_code {
+            fs::write(adapters_dir.join("kv-adapter.ts"), kv)?;
+        }
+
+        // Handle Code (Bundle or Skip)
+        if vendor != "deno" {
+            // Bundle
+            let platform = match vendor {
+                "tencent" => TargetPlatform::EdgeOne,
+                _ => TargetPlatform::Cloudflare,
+            };
+            
+            println!("{}", format!("  ⚡ Bundling for {}...", vendor).dimmed());
+            let bundler = DeforgeBundler::new(system_dir.join("router.ts").to_str().unwrap(), platform);
+            
+            match bundler.bundle().await {
+                Ok(bundled_code) => {
+                    fs::write(output_dir.join("index.js"), bundled_code)?;
+                    println!("{}", "  ✓ Bundled to index.js".green());
+                },
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Bundling failed: {}", e));
+                }
+            }
+        } else {
+            // For Deno, we rely on the written files in _deforge_internal/
+            // deno.json points to _deforge_internal/router.ts
         }
 
         Ok(VendorBuild {

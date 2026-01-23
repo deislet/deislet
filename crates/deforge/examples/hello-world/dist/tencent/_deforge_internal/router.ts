@@ -1,16 +1,22 @@
 /**
- * Cloudflare Workers Router
- * Auto-generated entry point
+ * Tencent EdgeOne Main Entry
+ * Auto-generated router
  */
 
 import { createContextBuilder } from './adapters/context-builder';
+import handler0 from '../src/index.ts';
 
 
 export default {
-  async fetch(request, env, ctx) {
-    const buildContext = createContextBuilder(env, ctx);
+  async fetch(request, event) {
+    const buildContext = createContextBuilder(event);
     const url = new URL(request.url);
+    const pathname = url.pathname;
 
+  if (matchRoute(pathname, '/')) {
+    const context = buildContext(request, '/');
+    return handler0(context);
+  }
 
     // 404 Not Found
     return new Response('Not Found', { status: 404 });

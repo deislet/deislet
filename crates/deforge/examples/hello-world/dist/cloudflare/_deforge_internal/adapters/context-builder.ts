@@ -2,7 +2,7 @@
  * Cloudflare Context Builder
  */
 
-import { createKVAdapter } from './kv-adapter';
+
 
 export function createContextBuilder(env: any, ctx: any) {
   return function buildContext(request: Request, route: string = '/') {

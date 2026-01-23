@@ -3,7 +3,7 @@
  * Auto-generated router
  */
 
-import handler0 from './index.ts';
+import handler0 from '../src/index.ts';
 import { createContextBuilder } from './adapters/context-builder.ts';
 
 

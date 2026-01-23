@@ -2,7 +2,7 @@
  * Deno Context Builder
  */
 
-import { createKVAdapter } from './kv-adapter.ts';
+
 
 export function createContextBuilder(kv?: Deno.Kv) {
   return function buildContext(request: Request, route: string = '/') {
@@ -18,7 +18,7 @@ export function createContextBuilder(kv?: Deno.Kv) {
       headers: request.headers,
       cookies: parseCookies(request),
       services: {
-        kv: kv ? createKVAdapter(kv) : undefined,
+        kv: undefined,
       },
       log: {
         debug: (...args: any[]) => console.debug(...args),
@@ -26,15 +26,12 @@ export function createContextBuilder(kv?: Deno.Kv) {
         warn: (...args: any[]) => console.warn(...args),
         error: (...args: any[]) => console.error(...args),
       },
-      // Deno Deploy Cache API is standard Web Cache API
       cache: {
         match: async (req: Request | string) => caches.open('v1').then(c => c.match(req)),
         put: async (req: Request | string, res: Response) => caches.open('v1').then(c => c.put(req, res)),
         delete: async (req: Request | string) => caches.open('v1').then(c => c.delete(req)),
       },
       waitUntil: (promise: Promise<any>) => {
-        // Deno Deploy doesn't strictly require waitUntil for background tasks
-        // but we can just not await it here.
         promise.catch(console.error);
       },
     };

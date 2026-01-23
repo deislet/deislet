@@ -67,3 +67,11 @@ pub struct HandlerInfo {
     pub used_services: Vec<String>,
     pub imports: Vec<String>,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct AdapterArtifacts {
+    pub router_code: String,
+    pub context_builder_code: String,
+    pub kv_adapter_code: Option<String>,
+    pub config_files: Vec<(String, String)>,
+}
