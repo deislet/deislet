@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "start": "deno run -A router.ts",
+    "dev": "deno run --watch -A router.ts"
+  },
+  "imports": {
+    "std/": "https://deno.land/std@0.208.0/",
+    "uuid": "npm:uuid@^9.0.0"
+  }
+}

@@ -70,6 +70,8 @@ pub struct VendorsConfig {
     pub deno: Option<VendorConfig>,
     #[serde(default)]
     pub tencent: Option<VendorConfig>,
+    #[serde(default)]
+    pub denix: Option<VendorConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

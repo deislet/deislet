@@ -23,7 +23,7 @@ pub async fn execute(vendors: Vec<String>, _watch: bool, minify: bool) -> Result
 
     println!("{}", "Building...".dimmed());
 
-    let result = compiler.compile(&project_dir, vendors.clone(), minify)?;
+    let result = compiler.compile(&project_dir, vendors.clone(), minify).await?;
 
     if result.success {
         println!("\n{}", "Build completed".green().bold());

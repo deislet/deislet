@@ -11,8 +11,15 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
     if src_dir.exists() {
         for entry in WalkDir::new(&src_dir) {
             let entry = entry?;
+            let path = entry.path();
+            let filename = path.file_name().unwrap().to_string_lossy();
+
+            // Skip generated entry points
+            if filename == "index.ts" || filename == "index.js" || filename == "wrangler.toml" {
+                continue;
+            }
+
             if entry.file_type().is_file() {
-                let path = entry.path();
                 if let Some(ext) = path.extension() {
                     if ext == "ts" || ext == "js" {
                         let relative = path.strip_prefix(&src_dir).unwrap();
@@ -295,7 +302,7 @@ function matchRoute(pathname: string, route: string): boolean {{
 "#
     );
 
-    fs::write(output_dir.join("index.ts"), router)?;
+    fs::write(output_dir.join("router.ts"), router)?;
 
     Ok(())
 }

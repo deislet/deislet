@@ -12,6 +12,17 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
         let entry = entry?;
         if entry.file_type().is_file() {
             let path = entry.path();
+            let filename = path.file_name().unwrap().to_string_lossy();
+
+            // Skip generated entry points and bundles
+            if filename == "main.ts"
+                || filename == "router.ts"
+                || filename.ends_with(".bundle.js")
+                || filename == "deno.json"
+            {
+                continue;
+            }
+
             if let Some(ext) = path.extension() {
                 if ext == "ts" || ext == "js" {
                     // Skip adapters directory
@@ -21,14 +32,7 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
 
                     let relative = path.strip_prefix(src_dir).unwrap();
                     let route = filename_to_route(relative.to_string_lossy().as_ref());
-                    let import_path = format!(
-                        "./{}",
-                        relative
-                            .to_string_lossy()
-                            .to_string()
-                            .trim_end_matches(".ts")
-                            .trim_end_matches(".js")
-                    );
+                    let import_path = format!("./{}", relative.to_string_lossy());
                     routes.push((route, import_path));
                 }
             }
@@ -71,8 +75,8 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
     // Generate deno.json
     let deno_json = serde_json::json!({
         "tasks": {
-            "start": "deno run -A main.bundle.js",
-            "dev": "deno run --watch -A main.bundle.js"
+            "start": "deno run -A router.ts",
+            "dev": "deno run --watch -A router.ts"
         },
         "imports": imports
     });
@@ -120,7 +124,7 @@ export function createKVAdapter(kv: Deno.Kv) {
     },
 
     async list(options?: any) {
-      const entries = kv.list(options?.prefix ? { prefix: [options.prefix] } : {});
+      const entries = kv.list(options?.prefix ? { prefix: [options.prefix] } : { prefix: [] });
       const keys: any[] = [];
 
       for await (const entry of entries) {
@@ -311,7 +315,7 @@ console.log('🚀 Deno Deploy server running...');
 "#
     );
 
-    fs::write(output_dir.join("main.ts"), router)?;
+    fs::write(output_dir.join("router.ts"), router)?;
 
     Ok(())
 }

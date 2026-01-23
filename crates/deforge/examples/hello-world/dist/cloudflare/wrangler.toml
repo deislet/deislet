@@ -1,0 +1,11 @@
+name = "hello-world"
+main = "index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[env.staging]
+route = "staging.hello-world.workers.dev"
+
+[env.production]
+route = "hello-world.workers.dev"
+

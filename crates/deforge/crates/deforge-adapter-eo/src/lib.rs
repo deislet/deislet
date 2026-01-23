@@ -10,8 +10,15 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
 
     for entry in WalkDir::new(src_dir) {
         let entry = entry?;
+        let path = entry.path();
+        let filename = path.file_name().unwrap().to_string_lossy();
+
+        // Skip generated entry points
+        if filename == "index.ts" || filename == "index.js" || filename == "edgeone.toml" {
+            continue;
+        }
+
         if entry.file_type().is_file() {
-            let path = entry.path();
             if let Some(ext) = path.extension() {
                 if ext == "ts" || ext == "js" {
                     // Skip adapters directory
@@ -114,71 +121,94 @@ export function createKVAdapter(kvNamespace: any) {
     }
 
     // Generate Context Builder
-    let context_builder = r#"/**
+    let kv_import = if config
+        .services
+        .as_ref()
+        .and_then(|s| s.kv.as_ref())
+        .map(|kv| kv.enabled)
+        .unwrap_or(false)
+    {
+        "import { createKVAdapter } from './kv-adapter';\n"
+    } else {
+        ""
+    };
+
+    let kv_usage = if config
+        .services
+        .as_ref()
+        .and_then(|s| s.kv.as_ref())
+        .map(|kv| kv.enabled)
+        .unwrap_or(false)
+    {
+        "// Extract KV if present\n    const kv = typeof globalThis.EdgeKV !== 'undefined' ? createKVAdapter(globalThis.EdgeKV) : undefined;"
+    } else {
+        "const kv = undefined;"
+    };
+
+    let context_builder = format!(
+        r#"/**
  * EdgeOne Context Builder
  */
-import { createKVAdapter } from './kv-adapter';
-
-export function createContextBuilder(event: any) {
-  return function buildContext(request: Request, route: string = '/') {
+{kv_import}
+export function createContextBuilder(event: any) {{
+  return function buildContext(request: Request, route: string = '/') {{
     const url = new URL(request.url);
     
-    // Extract KV if present (EdgeOne typically exposes it globally or via env)
-    // Adjust based on specific EdgeOne runtime environment
-    const kv = typeof globalThis.EdgeKV !== 'undefined' ? createKVAdapter(globalThis.EdgeKV) : undefined;
+    {kv_usage}
 
-    return {
+    return {{
       request,
-      env: {}, // EdgeOne env vars usually injected globally
+      env: {{}}, // EdgeOne env vars usually injected globally
       params: extractParams(url.pathname, route),
       path: url.pathname,
       method: request.method,
       query: Object.fromEntries(url.searchParams),
       headers: request.headers,
       cookies: parseCookies(request),
-      services: {
+      services: {{
         kv,
-      },
+      }},
       log: console,
       waitUntil: (promise: Promise<any>) => event.waitUntil(promise),
-    };
-  };
-}
+    }};
+  }};
+}}
 
-function extractParams(pathname: string, route: string): Record<string, string> {
-  const params: Record<string, string> = {};
+function extractParams(pathname: string, route: string): Record<string, string> {{
+  const params: Record<string, string> = {{}};
   const routeParts = route.split('/');
   const pathParts = pathname.split('/');
 
-  routeParts.forEach((part, i) => {
-    if (part.startsWith(':')) {
+  routeParts.forEach((part, i) => {{
+    if (part.startsWith(':')) {{
       const paramName = part.slice(1);
       params[paramName] = pathParts[i] || '';
-    }
-  });
+    }}
+  }});
 
   return params;
-}
+}}
 
-function parseCookies(request: Request): any {
-  const cookies: Record<string, string> = {};
+function parseCookies(request: Request): any {{
+  const cookies: Record<string, string> = {{}};
   const cookieHeader = request.headers.get('Cookie');
 
-  if (cookieHeader) {
-    cookieHeader.split(';').forEach(cookie => {
+  if (cookieHeader) {{
+    cookieHeader.split(';').forEach(cookie => {{
       const [name, ...rest] = cookie.split('=');
       cookies[name.trim()] = rest.join('=').trim();
-    });
-  }
+    }});
+  }}
 
-  return {
-    get(name: string) { return cookies[name]; },
-    set(name: string, value: string) { cookies[name] = value; },
-    delete(name: string) { delete cookies[name]; },
-    getAll() { return { ...cookies }; }
-  };
-}
-"#;
+  return {{
+    get(name: string) {{ return cookies[name]; }},
+    set(name: string, value: string) {{ cookies[name] = value; }},
+    delete(name: string) {{ delete cookies[name]; }},
+    getAll() {{ return {{ ...cookies }}; }}
+  }};
+}}
+"#
+    );
     fs::write(adapters_dir.join("context-builder.ts"), context_builder)?;
 
     Ok(())
@@ -239,7 +269,7 @@ function matchRoute(pathname: string, route: string): boolean {{
 "#
     );
 
-    fs::write(output_dir.join("index.ts"), router)?;
+    fs::write(output_dir.join("router.ts"), router)?;
 
     Ok(())
 }

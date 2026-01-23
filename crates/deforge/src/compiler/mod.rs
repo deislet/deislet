@@ -37,6 +37,11 @@ impl Compiler {
         let mut result = ValidationResult::new();
 
         for handler_path in handlers {
+            // Skip binary files
+            if handler_path.ends_with(".wasm") {
+                continue;
+            }
+
             let code = fs::read_to_string(&handler_path)?;
 
             // Parse handler
@@ -73,16 +78,18 @@ impl Compiler {
 
             // Iron Forge: Perform Rolldown Bundling
             let (platform, entry_file) = match vendor.as_str() {
-                "cloudflare" => (TargetPlatform::Cloudflare, "index.ts"),
-                "deno" => (TargetPlatform::Deno, "main.ts"),
-                "tencent" => (TargetPlatform::EdgeOne, "index.ts"),
-                _ => (TargetPlatform::Cloudflare, "index.ts"),
+                "cloudflare" => (TargetPlatform::Cloudflare, "router.ts"),
+                "deno" => (TargetPlatform::Deno, "router.ts"),
+                "tencent" => (TargetPlatform::EdgeOne, "router.ts"),
+                "denix" => (TargetPlatform::Cloudflare, "src/index.ts"),
+                _ => (TargetPlatform::Cloudflare, "router.ts"),
             };
 
             let output_dir = Path::new(&build.output_path);
             let entry_path = output_dir.join(entry_file);
 
-            if entry_path.exists() {
+            // Skip bundling for Deno as it supports native TS/URL imports and bundling caused issues
+            if entry_path.exists() && vendor != "deno" {
                 println!("{}", format!("  ⚡ Bundling for {}...", vendor).dimmed());
                 
                 // For EdgeOne, bundling is mandatory. For others, it's an optimization.
@@ -158,7 +165,7 @@ impl Compiler {
                 // Check for deno
                 if Command::new("deno").arg("--version").output().is_ok() {
                     println!("{}", "  Create smoke test (deno check)...".dimmed());
-                    let entry_point = output_dir.join("main.ts");
+                    let entry_point = output_dir.join("router.ts");
                     if entry_point.exists() {
                         let status = Command::new("deno")
                             .args(&["check", entry_point.to_str().unwrap()])
@@ -172,6 +179,9 @@ impl Compiler {
                 } else {
                     println!("{}", "  ⚠ Skipping verification: 'deno' not found".dimmed());
                 }
+            }
+            "denix" => {
+                // Denix verification logic (e.g. denictl validate)
             }
             _ => {}
         }
@@ -198,7 +208,7 @@ impl Compiler {
             if entry.file_type().is_file() {
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
-                    if ext == "ts" || ext == "js" {
+                    if ext == "ts" || ext == "js" || ext == "wasm" {
                         handlers.push(path.to_string_lossy().to_string());
                     }
                 }
@@ -225,6 +235,11 @@ impl Compiler {
             if let Some(ref tencent) = vendor_config.tencent {
                 if tencent.enabled {
                     vendors.push("tencent".to_string());
+                }
+            }
+            if let Some(ref denix) = vendor_config.denix {
+                if denix.enabled {
+                    vendors.push("denix".to_string());
                 }
             }
         }
@@ -258,6 +273,25 @@ impl Compiler {
         let mut total_size = 0;
 
         for handler_path in handlers {
+            // Handle binary files (WASM) directly without transformation
+            if handler_path.ends_with(".wasm") {
+                let relative_path = Path::new(&handler_path)
+                    .strip_prefix(project_dir.join(&config.function_root))
+                    .unwrap_or(Path::new(&handler_path));
+                
+                let output_path = output_dir.join(relative_path);
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                
+                fs::copy(&handler_path, &output_path)?;
+                files.push(handler_path.clone());
+                if let Ok(metadata) = fs::metadata(&output_path) {
+                    total_size += metadata.len() as usize;
+                }
+                continue;
+            }
+
             let code = fs::read_to_string(&handler_path)?;
 
             // Transform for vendor
@@ -287,6 +321,11 @@ impl Compiler {
             "cloudflare" => deforge_adapter_cf::generate(&output_dir, config)?,
             "deno" => deforge_adapter_dc::generate(&output_dir, config)?,
             "tencent" => deforge_adapter_eo::generate(&output_dir, config)?,
+            "denix" => {
+                // Denix supports Edge Canon natively, so no adapter generation needed.
+                // We just rely on the source files and subsequent bundling.
+                // We might want to generate a manifest or config if Denix requires it.
+            },
             _ => return Err(anyhow::anyhow!("Unknown vendor: {vendor}")),
         }
 
