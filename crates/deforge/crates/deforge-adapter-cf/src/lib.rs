@@ -50,7 +50,7 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
 
     let wrangler_toml = format!(
         r#"name = "{}"
-main = "index.ts"
+main = "index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 

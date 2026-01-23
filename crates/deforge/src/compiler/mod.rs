@@ -102,15 +102,6 @@ impl Compiler {
                         fs::write(&output_file, bundled_code)?;
                         
                         println!("{}", format!("  ✓ Bundled to {}", output_filename).green());
-                        
-                        // Update config files to point to bundled file if necessary
-                        if vendor == "cloudflare" {
-                            // Update wrangler.toml main = "index.js"
-                            self.update_wrangler_toml(output_dir, "index.js")?;
-                        } else if vendor == "deno" {
-                            // Update deno.json task to run bundle
-                            self.update_deno_json(output_dir, "main.bundle.js")?;
-                        }
                     },
                     Err(e) => {
                         println!("{}", format!("  ⚠ Bundling failed: {}", e).yellow());
@@ -135,26 +126,6 @@ impl Compiler {
             builds,
             errors: Vec::new(),
         })
-    }
-
-    fn update_wrangler_toml(&self, dir: &Path, new_main: &str) -> anyhow::Result<()> {
-        let path = dir.join("wrangler.toml");
-        if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            let new_content = content.replace("main = \"index.ts\"", &format!("main = \"{}\"", new_main));
-            fs::write(path, new_content)?;
-        }
-        Ok(())
-    }
-
-    fn update_deno_json(&self, dir: &Path, new_main: &str) -> anyhow::Result<()> {
-        let path = dir.join("deno.json");
-        if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            let new_content = content.replace("main.ts", new_main);
-            fs::write(path, new_content)?;
-        }
-        Ok(())
     }
 
     fn verify_artifacts(&self, vendor: &str, output_dir: &Path) -> anyhow::Result<()> {

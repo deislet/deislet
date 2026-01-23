@@ -38,44 +38,23 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
     // Generate main router
     generate_router(output_dir, &routes)?;
 
-    // Generate package.json for bundling
-    let package_json = serde_json::json!({
-        "name": format!("{}-edgeone", config.name),
-        "private": true,
-        "scripts": {
-            "build": "esbuild index.ts --bundle --outfile=dist/worker.js --format=esm --platform=neutral --target=es2020"
-        },
-        "devDependencies": {
-            "esbuild": "^0.19.0",
-            "typescript": "^5.0.0"
-        }
-    });
+    // Generate edgeone.toml
+    let edgeone_toml = format!(
+        r#"name = "{}"
+language = "typescript"
+runtime = "edge-functions"
+entry_point = "index.js"
 
-    fs::write(
-        output_dir.join("package.json"),
-        serde_json::to_string_pretty(&package_json)?,
-    )?;
+[environments.staging]
+url = "staging.{}.edgeone.ai"
 
-    // Generate build script
-    let build_script = r#"#!/bin/bash
-if ! command -v esbuild &> /dev/null; then
-    echo "esbuild not found. Installing dependencies..."
-    npm install
-fi
+[environments.production]
+url = "{}.edgeone.ai"
+"#,
+        config.name, config.name, config.name
+    );
 
-echo "Bundling for Tencent EdgeOne..."
-npm run build
-echo "Done! Output: dist/worker.js"
-"#;
-
-    fs::write(output_dir.join("build.sh"), build_script)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(output_dir.join("build.sh"))?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(output_dir.join("build.sh"), perms)?;
-    }
+    fs::write(output_dir.join("edgeone.toml"), edgeone_toml)?;
 
     // Create adapters directory
     let adapters_dir = output_dir.join("adapters");

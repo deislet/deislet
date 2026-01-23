@@ -71,8 +71,8 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
     // Generate deno.json
     let deno_json = serde_json::json!({
         "tasks": {
-            "start": "deno run -A main.ts",
-            "dev": "deno run --watch -A main.ts"
+            "start": "deno run -A main.bundle.js",
+            "dev": "deno run --watch -A main.bundle.js"
         },
         "imports": imports
     });
