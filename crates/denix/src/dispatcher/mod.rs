@@ -80,8 +80,8 @@ pub async fn start_server(
         }
     });
 
-    // Build HTTP routes - 所有请求通过 x-deis-app-id header 路由
-    // 添加通配符路由来处理所有 HTTP 请求
+    // Build HTTP routes - all requests are routed via x-deis-app-id header
+    // Add wildcard routes to handle all HTTP requests
     let http_router = Router::new()
         .route("/*path", axum::routing::any(handlers::handle_request))
         .route("/", axum::routing::any(handlers::handle_request))
@@ -89,14 +89,14 @@ pub async fn start_server(
         .layer(TraceLayer::new_for_http());
 
     // Merge HTTP and gRPC services
-    // HTTP 路由优先，gRPC 作为 fallback（但实际上 HTTP 会处理所有非 gRPC 的请求）
+    // HTTP routes prioritized, gRPC as fallback
     let app = http_router.fallback_service(grpc_service);
 
     // Bind address
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // 预加载系统管理应用
+    // Preload system management application
     let system_app_code = include_str!("system_app.js");
     match app_manager
         .load_app(
@@ -107,14 +107,14 @@ pub async fn start_server(
         )
         .await
     {
-        Ok(_) => info!("✅ 系统管理应用已加载 (app_id: _system)"),
+        Ok(_) => info!("✅ System management app loaded (app_id: _system)"),
         Err(e) => {
-            tracing::error!("❌ 加载系统管理应用失败: {}", e);
+            tracing::error!("❌ Failed to load system management app: {}", e);
             anyhow::bail!("Failed to load system app: {}", e);
         }
     }
 
-    // 预加载测试应用（可选）
+    // Preload test application (optional)
     let test_app_code = r#"
  export default function handler(context) {
    return new Response("Hello from x-deis-app-id: hello! Path: " + context.request.url);
@@ -129,8 +129,8 @@ pub async fn start_server(
         )
         .await
     {
-        Ok(_) => info!("✅ 测试应用已加载 (app_id: hello)"),
-        Err(e) => tracing::warn!("⚠️ 加载测试应用失败: {}", e),
+        Ok(_) => info!("✅ Test application loaded (app_id: hello)"),
+        Err(e) => tracing::warn!("⚠️ Failed to load test application: {}", e),
     }
 
     info!("====================================");

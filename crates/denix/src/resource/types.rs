@@ -1,8 +1,8 @@
-// 资源类型定义
+// Resource type definitions
 
 use serde::{Deserialize, Serialize};
 
-/// 资源类型
+/// Resource type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resource {
     pub name: String,

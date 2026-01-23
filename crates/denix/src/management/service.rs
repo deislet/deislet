@@ -9,7 +9,7 @@ use crate::config_store::{ConfigEntry, ConfigStore};
 use super::proto::denix_management_server::DenixManagement;
 use super::proto::*;
 
-/// Denix 管理服务实现
+/// Denix management service implementation
 pub struct DenixManagementService {
     app_manager: Arc<ApplicationManager>,
     config_store: Arc<ConfigStore>,
@@ -106,7 +106,7 @@ impl DenixManagement for DenixManagementService {
             req.config_type, req.version, req.force
         );
 
-        // 转换配置类型
+        // Convert configuration type
         let config_type = match super::proto::ConfigType::try_from(req.config_type) {
             Ok(super::proto::ConfigType::Global) => crate::config_store::ConfigType::Global,
             Ok(super::proto::ConfigType::App) => crate::config_store::ConfigType::App,
@@ -120,15 +120,15 @@ impl DenixManagement for DenixManagementService {
             }
         };
 
-        // 创建配置条目
+        // Create configuration entry
         let entry = ConfigEntry::new(
-            "global".to_string(), // TODO: 根据 config_type 确定 ID
+            "global".to_string(), // TODO: Determine ID based on config_type
             config_type,
             req.version,
             req.config_json,
         );
 
-        // 保存配置
+        // Save configuration
         match self.config_store.save_config(entry).await {
             Ok(_) => {
                 info!("Config saved successfully, version: {}", req.version);
@@ -155,7 +155,7 @@ impl DenixManagement for DenixManagementService {
     ) -> Result<Response<DeployAppResponse>, Status> {
         let req = request.into_inner();
         info!(
-            "部署应用: {} (包大小: {} 字节)",
+            "Deploying app: {} (package size: {} bytes)",
             req.app_id,
             req.package_data.len()
         );
@@ -167,10 +167,10 @@ impl DenixManagement for DenixManagementService {
         {
             Ok(pkg) => pkg,
             Err(e) => {
-                error!("安装应用包失败: {}", e);
+                error!("Failed to install app package: {}", e);
                 return Ok(Response::new(DeployAppResponse {
                     success: false,
-                    message: format!("安装应用包失败: {}", e),
+                    message: format!("Failed to install app package: {}", e),
                     app_id: req.app_id,
                 }));
             }
@@ -181,27 +181,27 @@ impl DenixManagement for DenixManagementService {
             Ok(Some(bytes)) => match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("入口文件不是有效的 UTF-8: {}", e);
+                    error!("Entry file is not valid UTF-8: {}", e);
                     return Ok(Response::new(DeployAppResponse {
                         success: false,
-                        message: format!("入口文件不是有效的 UTF-8: {}", e),
+                        message: format!("Entry file is not valid UTF-8: {}", e),
                         app_id: req.app_id,
                     }));
                 }
             },
             Ok(None) => {
-                error!("入口文件不存在: {}", entry_point);
+                error!("Entry file does not exist: {}", entry_point);
                 return Ok(Response::new(DeployAppResponse {
                     success: false,
-                    message: format!("入口文件不存在: {}", entry_point),
+                    message: format!("Entry file does not exist: {}", entry_point),
                     app_id: req.app_id,
                 }));
             }
             Err(e) => {
-                error!("读取入口文件失败: {}", e);
+                error!("Failed to read entry file: {}", e);
                 return Ok(Response::new(DeployAppResponse {
                     success: false,
-                    message: format!("读取入口文件失败: {}", e),
+                    message: format!("Failed to read entry file: {}", e),
                     app_id: req.app_id,
                 }));
             }
@@ -220,26 +220,26 @@ impl DenixManagement for DenixManagementService {
             .await
         {
             Ok(_) => {
-                info!("应用 {} 部署成功", req.app_id);
+                info!("App {} deployed successfully", req.app_id);
                 let _ = self
                     .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Deployed)
                     .await;
                 Ok(Response::new(DeployAppResponse {
                     success: true,
-                    message: "应用部署成功".to_string(),
+                    message: "App deployed successfully".to_string(),
                     app_id: req.app_id,
                 }))
             }
             Err(e) => {
-                error!("应用 {} 部署失败: {}", req.app_id, e);
+                error!("App {} deployment failed: {}", req.app_id, e);
                 let _ = self
                     .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Failed)
                     .await;
                 Ok(Response::new(DeployAppResponse {
                     success: false,
-                    message: format!("部署应用失败: {}", e),
+                    message: format!("App deployment failed: {}", e),
                     app_id: req.app_id,
                 }))
             }
@@ -251,25 +251,20 @@ impl DenixManagement for DenixManagementService {
         request: Request<UnloadAppRequest>,
     ) -> Result<Response<UnloadAppResponse>, Status> {
         let req = request.into_inner();
-        info!("卸载应用: {}", req.app_id);
-
+        info!("Uninstalling app: {}", req.app_id);
         match self.app_manager.unload_app(&req.app_id).await {
             Ok(_) => {
-                info!("应用 {} 卸载成功", req.app_id);
-                let _ = self
-                    .app_repo
-                    .update_status(&req.app_id, AppPackageStatus::Stopped)
-                    .await;
+                info!("App {} uninstalled successfully", req.app_id);
                 Ok(Response::new(UnloadAppResponse {
                     success: true,
-                    message: "应用卸载成功".to_string(),
+                    message: "App uninstalled successfully".to_string(),
                 }))
             }
             Err(e) => {
-                warn!("应用 {} 卸载失败: {}", req.app_id, e);
+                warn!("App {} uninstallation failed: {}", req.app_id, e);
                 Ok(Response::new(UnloadAppResponse {
                     success: false,
-                    message: format!("卸载应用失败: {}", e),
+                    message: format!("App uninstallation failed: {}", e),
                 }))
             }
         }
@@ -281,7 +276,7 @@ impl DenixManagement for DenixManagementService {
     ) -> Result<Response<UpdateAppResponse>, Status> {
         let req = request.into_inner();
         info!(
-            "更新应用: {} (包大小: {} 字节)",
+            "Updating app: {} (package size: {} bytes)",
             req.app_id,
             req.package_data.len()
         );
@@ -293,10 +288,10 @@ impl DenixManagement for DenixManagementService {
         {
             Ok(pkg) => pkg,
             Err(e) => {
-                error!("安装应用包失败: {}", e);
+                error!("Failed to install app package: {}", e);
                 return Ok(Response::new(UpdateAppResponse {
                     success: false,
-                    message: format!("安装应用包失败: {}", e),
+                    message: format!("Failed to install app package: {}", e),
                 }));
             }
         };
@@ -306,56 +301,61 @@ impl DenixManagement for DenixManagementService {
             Ok(Some(bytes)) => match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("入口文件不是有效的 UTF-8: {}", e);
+                    error!("Entry file is not valid UTF-8: {}", e);
                     return Ok(Response::new(UpdateAppResponse {
                         success: false,
-                        message: format!("入口文件不是有效的 UTF-8: {}", e),
+                        message: format!("Entry file is not valid UTF-8: {}", e),
                     }));
                 }
             },
             Ok(None) => {
-                error!("入口文件不存在: {}", entry_point);
+                error!("Entry file does not exist: {}", entry_point);
                 return Ok(Response::new(UpdateAppResponse {
                     success: false,
-                    message: format!("入口文件不存在: {}", entry_point),
+                    message: format!("Entry file does not exist: {}", entry_point),
                 }));
             }
             Err(e) => {
-                error!("读取入口文件失败: {}", e);
+                error!("Failed to read entry file: {}", e);
                 return Ok(Response::new(UpdateAppResponse {
                     success: false,
-                    message: format!("读取入口文件失败: {}", e),
+                    message: format!("Failed to read entry file: {}", e),
                 }));
             }
         };
 
-        let config = req.config.map(|config| map_proto_config(Some(config)));
+        let config = map_proto_config(req.config);
 
         match self
             .app_manager
-            .update_app(&req.app_id, entry_code, config, Some(entry_point.clone()))
+            .update_app(
+                &req.app_id,
+                entry_code,
+                Some(config),
+                Some(entry_point.clone()),
+            )
             .await
         {
             Ok(_) => {
-                info!("应用 {} 更新成功", req.app_id);
+                info!("App {} updated successfully", req.app_id);
                 let _ = self
                     .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Deployed)
                     .await;
                 Ok(Response::new(UpdateAppResponse {
                     success: true,
-                    message: "应用更新成功".to_string(),
+                    message: "App updated successfully".to_string(),
                 }))
             }
             Err(e) => {
-                error!("应用 {} 更新失败: {}", req.app_id, e);
+                error!("App {} update failed: {}", req.app_id, e);
                 let _ = self
                     .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Failed)
                     .await;
                 Ok(Response::new(UpdateAppResponse {
                     success: false,
-                    message: format!("更新应用失败: {}", e),
+                    message: format!("App update failed: {}", e),
                 }))
             }
         }
@@ -368,18 +368,18 @@ impl DenixManagement for DenixManagementService {
         let req = request.into_inner();
         info!("Status query received, include_apps: {}", req.include_apps);
 
-        // Worker 基本信息
+        // Basic Worker information
         let worker_info = Some(WorkerInfo {
             worker_id: self.worker_id.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime_seconds: 0, // TODO: 计算实际 uptime
+            uptime_seconds: 0, // TODO: Calculate actual uptime
             hostname: hostname::get()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string(),
         });
 
-        // 应用列表
+        // Application list
         let apps = if req.include_apps {
             self.app_manager
                 .list_apps()
@@ -392,8 +392,8 @@ impl DenixManagement for DenixManagementService {
                         crate::app::AppState::Stopped => AppState::Stopped as i32,
                         crate::app::AppState::Error => AppState::Error as i32,
                     },
-                    request_count: 0, // TODO: 实际统计
-                    error_count: 0,   // TODO: 实际统计
+                    request_count: 0, // TODO: Real-world statistics
+                    error_count: 0,   // TODO: Real-world statistics
                     error_message: app.error.unwrap_or_default(),
                 })
                 .collect()
@@ -415,11 +415,11 @@ impl DenixManagement for DenixManagementService {
             })
             .collect::<Vec<_>>();
 
-        // 资源使用情况（简化版）
+        // Resource usage (simplified version)
         let resource_usage = Some(ResourceUsage {
-            cpu_percent: 0.0, // TODO: 实际 CPU 使用率
-            memory_bytes: 0,  // TODO: 实际内存使用
-            goroutines: 0,    // Rust 没有 goroutines，可以返回线程数
+            cpu_percent: 0.0, // TODO: Actual CPU usage
+            memory_bytes: 0,  // TODO: Actual memory usage
+            goroutines: 0,    // Rust doesn't have goroutines, can return thread count instead
         });
 
         Ok(Response::new(GetStatusResponse {
@@ -440,7 +440,7 @@ impl DenixManagement for DenixManagementService {
             req.command
         );
 
-        // TODO: 实现命令执行逻辑
+        // TODO: Implement command execution logic
         Ok(Response::new(ExecuteCommandResponse {
             success: false,
             output: String::new(),

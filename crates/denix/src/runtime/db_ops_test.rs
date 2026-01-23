@@ -1,4 +1,4 @@
-// Database Ops 单元测试
+// Database Ops unit tests
 
 #[cfg(test)]
 mod tests {
@@ -15,7 +15,7 @@ mod tests {
             ..Default::default()
         });
 
-        // 注入必要的 Store（测试中不注入 DbClient，测试错误处理）
+        // Inject necessary Stores (DbClient not injected in tests to test error handling)
         let op_state = runtime.op_state();
         let mut state = op_state.borrow_mut();
         let response_store: ResponseStore = Rc::new(RefCell::new(None));
@@ -28,7 +28,7 @@ mod tests {
     async fn test_db_execute_without_client() {
         let mut runtime = setup_test_runtime();
 
-        // 测试在没有 DbClient 时的错误处理
+        // Test error handling without DbClient
         let code = r#"
             (async () => {
                 try {
@@ -47,9 +47,9 @@ mod tests {
             .await
             .unwrap();
 
-        // 验证返回的是错误信息（通过 runtime 内部机制）
-        // 因为没有配置 DbClient，应该抛出 "Database client not configured" 错误
-        // 实际测试通过验证代码执行不会崩溃即可
+        // Verify that error information is returned (via runtime internal mechanism)
+        // Should throw "Database client not configured" error since DbClient is not configured
+        // Actual test verifies that the code execution does not crash
         drop(resolved);
     }
 
@@ -124,7 +124,7 @@ mod tests {
             .unwrap();
     }
 
-    // 注意：完整的集成测试需要实际的 denira server
-    // 这些测试只验证 ops 的基本结构和错误处理
-    // 真实的 Database 操作测试在 db_client.rs 中，标记为 #[ignore]
+    // Note: Complete integration tests require a real denira server
+    // These tests only verify the basic structure and error handling of ops
+    // Real Database operation tests are in db_client.rs, marked as #[ignore]
 }

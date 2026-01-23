@@ -1,4 +1,4 @@
-// WebSocket Server Ops 单元测试
+// WebSocket Server Ops unit tests
 
 #[cfg(test)]
 mod tests {
@@ -15,7 +15,7 @@ mod tests {
             ..Default::default()
         });
 
-        // 注入必要的 Store
+        // Inject necessary Stores
         let op_state = runtime.op_state();
         let mut state = op_state.borrow_mut();
         let response_store: ResponseStore = Rc::new(RefCell::new(None));
@@ -94,7 +94,7 @@ mod tests {
     fn test_ws_server_api_availability() {
         let mut runtime = setup_test_runtime();
 
-        // 测试 WebSocketServer 和 WebSocketPair 类是否可用
+        // Test whether WebSocketServer and WebSocketPair classes are available
         let code = r#"
             if (typeof WebSocketServer === "undefined") {
                 throw new Error("WebSocketServer not available");
@@ -105,7 +105,7 @@ mod tests {
             "ok";
         "#;
 
-        // 先加载 runtime.js
+        // Load runtime.js first
         runtime
             .execute_script("<runtime>", include_str!("js/runtime.js"))
             .unwrap();

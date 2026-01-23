@@ -1,5 +1,5 @@
-// Database Ops 定义
-// 提供 SQL 数据库操作功能
+// Database Ops definitions
+// Provides SQL database operation functionality
 
 use super::db_client::DbClient;
 use deno_core::{extension, op2, OpState};
@@ -7,16 +7,16 @@ use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Database Execute 操作
+/// Database Execute operation
 ///
-/// 执行 SQL 语句（INSERT, UPDATE, DELETE 等）
+/// Executes SQL statements (INSERT, UPDATE, DELETE, etc.)
 ///
-/// # 参数
-/// - sql: SQL 语句
-/// - params: 可选的参数（JSON 编码的数组字符串）
+/// # Parameters
+/// - sql: SQL statement
+/// - params: Optional parameters (JSON-encoded array string)
 ///
-/// # 返回
-/// - JSON 对象: { rows_affected: number, last_insert_id?: number }
+/// # Returns
+/// - JSON object: { rows_affected: number, last_insert_id?: number }
 #[op2(async)]
 #[serde]
 async fn op_db_execute(
@@ -24,7 +24,7 @@ async fn op_db_execute(
     #[string] sql: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
-    // 获取 DbClient
+    // Get DbClient
     let client = {
         let state_borrow = state.borrow();
         match state_borrow.try_borrow::<DbClient>() {
@@ -37,7 +37,7 @@ async fn op_db_execute(
         }
     };
 
-    // 执行 SQL
+    // Execute SQL
     match client.execute(sql, params).await {
         Ok((rows_affected, last_insert_id)) => {
             let mut result = serde_json::json!({
@@ -58,16 +58,16 @@ async fn op_db_execute(
     }
 }
 
-/// Database Query 操作
+/// Database Query operation
 ///
-/// 查询 SQL（SELECT）
+/// Queries SQL (SELECT)
 ///
-/// # 参数
-/// - sql: SQL 查询语句
-/// - params: 可选的参数（JSON 编码的数组字符串）
+/// # Parameters
+/// - sql: SQL query statement
+/// - params: Optional parameters (JSON-encoded array string)
 ///
-/// # 返回
-/// - JSON 对象: { rows: Array<Object>, columns: Array<string> }
+/// # Returns
+/// - JSON object: { rows: Array<Object>, columns: Array<string> }
 #[op2(async)]
 #[serde]
 async fn op_db_query(
@@ -75,7 +75,7 @@ async fn op_db_query(
     #[string] sql: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
-    // 获取 DbClient
+    // Get DbClient
     let client = {
         let state_borrow = state.borrow();
         match state_borrow.try_borrow::<DbClient>() {
@@ -88,10 +88,10 @@ async fn op_db_query(
         }
     };
 
-    // 查询 SQL
+    // Query SQL
     match client.query(sql, params).await {
         Ok((rows_json, columns)) => {
-            // 解析行数据
+            // Parse row data
             let rows: JsonValue =
                 serde_json::from_str(&rows_json).unwrap_or_else(|_| JsonValue::Array(vec![]));
 
@@ -108,19 +108,19 @@ async fn op_db_query(
     }
 }
 
-/// Database Batch 操作
+/// Database Batch operation
 ///
-/// 批量执行多条 SQL
+/// Executes multiple SQL statements in a batch
 ///
-/// # 参数
-/// - statements: JSON 编码的语句数组，每个元素包含 sql 和可选的 params
+/// # Parameters
+/// - statements: JSON-encoded array of statements, each element contains sql and optional params
 ///
-/// # 返回
-/// - JSON 数组: [{ rows_affected: number, last_insert_id?: number }, ...]
+/// # Returns
+/// - JSON array: [{ rows_affected: number, last_insert_id?: number }, ...]
 #[op2(async)]
 #[serde]
 async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: String) -> JsonValue {
-    // 获取 DbClient
+    // Get DbClient
     let client = {
         let state_borrow = state.borrow();
         match state_borrow.try_borrow::<DbClient>() {
@@ -133,7 +133,7 @@ async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: Str
         }
     };
 
-    // 解析语句列表
+    // Parse statement list
     let statements_value: JsonValue = match serde_json::from_str(&statements_json) {
         Ok(v) => v,
         Err(e) => {
@@ -166,7 +166,7 @@ async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: Str
         statements.push((sql, params));
     }
 
-    // 批量执行
+    // Execute batch
     match client.batch(statements).await {
         Ok(results) => {
             let results_json: Vec<JsonValue> = results
@@ -192,19 +192,19 @@ async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: Str
     }
 }
 
-/// Database Prepare 操作
+/// Database Prepare operation
 ///
-/// 预处理 SQL 语句
+/// Prepares an SQL statement
 ///
-/// # 参数
-/// - sql: SQL 语句
+/// # Parameters
+/// - sql: SQL statement
 ///
-/// # 返回
-/// - statement_id: 预处理语句 ID
+/// # Returns
+/// - statement_id: Prepared statement ID
 #[op2(async)]
 #[string]
 async fn op_db_prepare(state: Rc<RefCell<OpState>>, #[string] sql: String) -> String {
-    // 获取 DbClient
+    // Get DbClient
     let client = {
         let state_borrow = state.borrow();
         match state_borrow.try_borrow::<DbClient>() {
@@ -216,7 +216,7 @@ async fn op_db_prepare(state: Rc<RefCell<OpState>>, #[string] sql: String) -> St
         }
     };
 
-    // 预处理
+    // Prepare
     match client.prepare(sql).await {
         Ok(statement_id) => statement_id,
         Err(e) => {
@@ -226,16 +226,16 @@ async fn op_db_prepare(state: Rc<RefCell<OpState>>, #[string] sql: String) -> St
     }
 }
 
-/// Database Execute Prepared 操作
+/// Database Execute Prepared operation
 ///
-/// 执行预处理语句
+/// Executes a prepared statement
 ///
-/// # 参数
-/// - statement_id: 预处理语句 ID
-/// - params: 可选的参数（JSON 编码的数组字符串）
+/// # Parameters
+/// - statement_id: Prepared statement ID
+/// - params: Optional parameters (JSON-encoded array string)
 ///
-/// # 返回
-/// - JSON 对象: { rows_affected: number, last_insert_id?: number }
+/// # Returns
+/// - JSON object: { rows_affected: number, last_insert_id?: number }
 #[op2(async)]
 #[serde]
 async fn op_db_execute_prepared(
@@ -243,7 +243,7 @@ async fn op_db_execute_prepared(
     #[string] statement_id: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
-    // 获取 DbClient
+    // Get DbClient
     let client = {
         let state_borrow = state.borrow();
         match state_borrow.try_borrow::<DbClient>() {
@@ -256,7 +256,7 @@ async fn op_db_execute_prepared(
         }
     };
 
-    // 执行预处理语句
+    // Execute prepared statement
     match client.execute_prepared(statement_id, params).await {
         Ok((rows_affected, last_insert_id)) => {
             let mut result = serde_json::json!({
@@ -277,16 +277,16 @@ async fn op_db_execute_prepared(
     }
 }
 
-/// Database Query Prepared 操作
+/// Database Query Prepared operation
 ///
-/// 查询预处理语句
+/// Queries a prepared statement
 ///
-/// # 参数
-/// - statement_id: 预处理语句 ID
-/// - params: 可选的参数（JSON 编码的数组字符串）
+/// # Parameters
+/// - statement_id: Prepared statement ID
+/// - params: Optional parameters (JSON-encoded array string)
 ///
-/// # 返回
-/// - JSON 对象: { rows: Array<Object>, columns: Array<string> }
+/// # Returns
+/// - JSON object: { rows: Array<Object>, columns: Array<string> }
 #[op2(async)]
 #[serde]
 async fn op_db_query_prepared(
@@ -294,7 +294,7 @@ async fn op_db_query_prepared(
     #[string] statement_id: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
-    // 获取 DbClient
+    // Get DbClient
     let client = {
         let state_borrow = state.borrow();
         match state_borrow.try_borrow::<DbClient>() {
@@ -307,10 +307,10 @@ async fn op_db_query_prepared(
         }
     };
 
-    // 查询预处理语句
+    // Query prepared statement
     match client.query_prepared(statement_id, params).await {
         Ok((rows_json, columns)) => {
-            // 解析行数据
+            // Parse row data
             let rows: JsonValue =
                 serde_json::from_str(&rows_json).unwrap_or_else(|_| JsonValue::Array(vec![]));
 
@@ -327,7 +327,7 @@ async fn op_db_query_prepared(
     }
 }
 
-// 定义 db extension
+// Define db extension
 extension!(
     denix_db_ops,
     ops = [
@@ -340,7 +340,7 @@ extension!(
     ],
 );
 
-/// 初始化 db ops extension
+/// Initialize db ops extension
 pub fn init_db_extension() -> deno_core::Extension {
     denix_db_ops::init()
 }

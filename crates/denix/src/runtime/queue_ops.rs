@@ -3,7 +3,7 @@ use deno_core::{extension, op2, OpState};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-// 内存队列 (作为 fallback)
+// In-memory queue (as fallback)
 pub type MemoryQueue = Rc<RefCell<Vec<(String, String)>>>;
 
 #[op2(async)]

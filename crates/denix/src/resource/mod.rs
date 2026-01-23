@@ -1,4 +1,4 @@
-// 资源管理模块
-// 目前资源通过 ops 直接提供，未来可扩展更复杂的资源管理
+// Resource management module
+// Currently resources are provided directly through ops, can be extended for more complex management in the future
 
 pub mod types;

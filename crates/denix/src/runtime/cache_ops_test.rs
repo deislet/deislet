@@ -1,4 +1,4 @@
-// Cache Ops 单元测试
+// Cache Ops unit tests
 
 #[cfg(test)]
 mod tests {
@@ -11,10 +11,10 @@ mod tests {
             ..Default::default()
         });
 
-        // 注入 CacheStore
+        // Inject CacheStore
         let op_state = runtime.op_state();
         let mut state = op_state.borrow_mut();
-        let cache_store: CacheStore = create_cache_store(100, 0); // 100 条目，无 TTL
+        let cache_store: CacheStore = create_cache_store(100, 0); // 100 entries, no TTL
         state.put(cache_store);
 
         runtime
@@ -38,7 +38,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 通过直接访问 CacheStore 验证
+        // Verify by directly accessing CacheStore
         let cache = {
             let op_state = runtime.op_state();
             let state = op_state.borrow();

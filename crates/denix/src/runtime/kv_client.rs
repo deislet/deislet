@@ -1,37 +1,37 @@
-// KV Store gRPC 客户端封装
+// KV Store gRPC client wrapper
 //
-// 提供连接到远程 KV Store 服务的功能
-// 这是 denix runtime 与 denira server 之间的通信层
+// Provides functionality to connect to remote KV Store service
+// This is the communication layer between denix runtime and denira server
 
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
-// 引入生成的 proto 代码
+// Import generated proto code
 pub mod proto {
     tonic::include_proto!("denix.storage");
 }
 
 use proto::{kv_store_client::KvStoreClient, *};
 
-/// KV Store 客户端封装
+/// KV Store client wrapper
 ///
-/// 使用 Arc<Mutex> 包装以支持跨 async 操作共享和内部可变性
+/// Wrapped in Arc<Mutex> to support sharing and internal mutability across async operations
 #[derive(Clone)]
 pub struct KvClient {
     client: Arc<Mutex<KvStoreClient<Channel>>>,
 }
 
 impl KvClient {
-    /// 连接到远程 KV Store 服务
+    /// Connect to remote KV Store service
     ///
-    /// # 参数
-    /// - endpoint: gRPC 服务地址 (如 "http://127.0.0.1:50051")
+    /// # Parameters
+    /// - endpoint: gRPC service address (e.g., "http://127.0.0.1:50051")
     ///
-    /// # 返回
-    /// - Ok(KvClient): 连接成功
-    /// - Err: 连接失败
+    /// # Returns
+    /// - Ok(KvClient): Connection successful
+    /// - Err: Connection failed
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
         tracing::info!("Connecting to KV Store at {}", endpoint);
@@ -44,14 +44,14 @@ impl KvClient {
         })
     }
 
-    /// 获取值
+    /// Get value
     ///
-    /// # 参数
-    /// - key: 键
+    /// # Parameters
+    /// - key: Key
     ///
-    /// # 返回
-    /// - Some(value): 找到值
-    /// - None: 键不存在
+    /// # Returns
+    /// - Some(value): Value found
+    /// - None: Key does not exist
     pub async fn get(&self, key: String) -> Result<Option<String>> {
         let request = tonic::Request::new(GetRequest { key: key.clone() });
 
@@ -64,11 +64,11 @@ impl KvClient {
         Ok(get_response.value)
     }
 
-    /// 设置值
+    /// Set value
     ///
-    /// # 参数
-    /// - key: 键
-    /// - value: 值
+    /// # Parameters
+    /// - key: Key
+    /// - value: Value
     pub async fn set(&self, key: String, value: String) -> Result<()> {
         let request = tonic::Request::new(SetRequest {
             key: key.clone(),
@@ -88,10 +88,10 @@ impl KvClient {
         Ok(())
     }
 
-    /// 删除键
+    /// Delete key
     ///
-    /// # 参数
-    /// - key: 键
+    /// # Parameters
+    /// - key: Key
     pub async fn delete(&self, key: String) -> Result<()> {
         let request = tonic::Request::new(DeleteRequest { key: key.clone() });
 
@@ -108,14 +108,14 @@ impl KvClient {
         Ok(())
     }
 
-    /// 列出前缀匹配的键
+    /// List keys with matching prefix
     ///
-    /// # 参数
-    /// - prefix: 前缀
-    /// - limit: 可选的数量限制
+    /// # Parameters
+    /// - prefix: Prefix
+    /// - limit: Optional quantity limit
     ///
-    /// # 返回
-    /// - (keys, next_cursor): 键列表和下一页游标
+    /// # Returns
+    /// - (keys, next_cursor): Key list and next page cursor
     pub async fn list(
         &self,
         prefix: String,
@@ -136,14 +136,14 @@ impl KvClient {
         Ok((list_response.keys, list_response.next_cursor))
     }
 
-    /// 检查键是否存在
+    /// Check if key exists
     ///
-    /// # 参数
-    /// - key: 键
+    /// # Parameters
+    /// - key: Key
     ///
-    /// # 返回
-    /// - true: 存在
-    /// - false: 不存在
+    /// # Returns
+    /// - true: Exists
+    /// - false: Does not exist
     pub async fn has(&self, key: String) -> Result<bool> {
         let request = tonic::Request::new(HasRequest { key: key.clone() });
 
@@ -161,21 +161,21 @@ impl KvClient {
 mod tests {
     use super::*;
 
-    /// 注意：这些测试需要运行 denira server
-    /// 暂时标记为 #[ignore]，在集成测试环境中启用
+    /// Note: These tests require running a denira server
+    /// Temporarily marked as #[ignore], to be enabled in integration testing environments
     #[tokio::test]
     #[ignore]
     async fn test_kv_client_connect() {
         let result = KvClient::connect("http://127.0.0.1:50051").await;
-        // 如果服务未运行，应该返回连接错误
-        // 这里只测试客户端代码编译和基本逻辑
+        // Should return connection error if service is not running
+        // Only testing client code compilation and basic logic here
         assert!(result.is_err() || result.is_ok());
     }
 
     #[tokio::test]
     #[ignore]
     async fn test_kv_client_operations() {
-        // 此测试需要真实的 denira server
+        // This test requires a real denira server
         let client = KvClient::connect("http://127.0.0.1:50051")
             .await
             .expect("Failed to connect");

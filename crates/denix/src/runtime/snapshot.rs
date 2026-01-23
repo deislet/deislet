@@ -45,8 +45,8 @@ fn load_snapshot(path: &PathBuf) -> Result<&'static [u8]> {
 }
 
 fn create_startup_snapshot() -> Result<&'static [u8]> {
-    // 在单独的线程中创建快照，以避免 tokio runtime 嵌套问题
-    // (create_snapshot 内部可能会调用 block_on)
+    // Create snapshot in a separate thread to avoid nested tokio runtime issues
+    // (create_snapshot may call block_on internally)
     std::thread::spawn(|| {
         let extensions = build_runtime_extensions();
         let output = create_snapshot(
@@ -61,12 +61,12 @@ fn create_startup_snapshot() -> Result<&'static [u8]> {
                         panic!("Failed to init lazy extensions for snapshot: {}", err);
                     }
 
-                    // 执行 bootstrap.js 以初始化 Web API 全局对象
+                    // Execute bootstrap.js to initialize Web API global objects
                     let bootstrap_specifier =
                         ModuleSpecifier::parse("ext:denix_bootstrap/src/runtime/js/bootstrap.js")
                             .expect("Failed to parse bootstrap specifier");
 
-                    // 创建临时的 tokio runtime 来执行 async 模块加载
+                    // Create temporary tokio runtime to execute async module loading
                     let tokio_rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()

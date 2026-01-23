@@ -9,25 +9,25 @@ use tracing::{debug, info};
 
 use super::types::{ConfigEntry, ConfigType};
 
-/// 配置存储
+/// Configuration store
 pub struct ConfigStore {
-    /// SQLite 连接（同步，使用 tokio::task::spawn_blocking）
+    /// SQLite connection (synchronous, uses tokio::task::spawn_blocking)
     db_path: String,
 
-    /// 内存缓存（零拷贝读取）
+    /// In-memory cache (zero-copy reads)
     cache: Arc<ArcSwap<HashMap<String, ConfigEntry>>>,
 
-    /// 写锁（保证写操作串行）
+    /// Write lock (ensures sequential write operations)
     write_lock: Arc<RwLock<()>>,
 }
 
 impl ConfigStore {
-    /// 创建新的配置存储
+    /// Create a new configuration store
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let db_path = db_path.as_ref().to_string_lossy().to_string();
         let db_path_clone = db_path.clone();
 
-        // 初始化数据库（在 blocking 任务中）
+        // Initialize database (in blocking task)
         tokio::task::spawn_blocking(move || Self::init_db(&db_path_clone))
             .await
             .context("Failed to spawn blocking task")?
@@ -39,14 +39,14 @@ impl ConfigStore {
             write_lock: Arc::new(RwLock::new(())),
         };
 
-        // 从数据库加载配置到缓存
+        // Load configurations from database into cache
         store.load_cache_from_db().await?;
 
         info!("ConfigStore initialized with database: {}", db_path);
         Ok(store)
     }
 
-    /// 初始化数据库表（同步函数）
+    /// Initialize database tables (synchronous function)
     fn init_db(db_path: &str) -> Result<()> {
         let conn = rusqlite::Connection::open(db_path).context("Failed to open database")?;
 
@@ -66,7 +66,7 @@ impl ConfigStore {
         )
         .context("Failed to create configs table")?;
 
-        // 创建索引
+        // Create index
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_config_type ON configs(config_type)",
             [],
@@ -76,7 +76,7 @@ impl ConfigStore {
         Ok(())
     }
 
-    /// 从数据库加载所有配置到缓存
+    /// Load all configurations from database into cache
     async fn load_cache_from_db(&self) -> Result<()> {
         let db_path = self.db_path.clone();
 
@@ -117,7 +117,7 @@ impl ConfigStore {
         .await
         .context("Failed to spawn blocking task")??;
 
-        // 构建缓存 map
+        // Build cache map
         let mut cache_map = HashMap::new();
         for entry in entries {
             let key = Self::make_cache_key(&entry.id, entry.config_type);
@@ -126,21 +126,21 @@ impl ConfigStore {
 
         let count = cache_map.len();
 
-        // 更新缓存（零拷贝）
+        // Update cache (zero-copy)
         self.cache.store(Arc::new(cache_map));
 
         debug!("Loaded {} configs from database", count);
         Ok(())
     }
 
-    /// 保存配置
+    /// Save configuration
     pub async fn save_config(&self, entry: ConfigEntry) -> Result<()> {
         let _lock = self.write_lock.write().await;
 
         let db_path = self.db_path.clone();
         let entry_clone = entry.clone();
 
-        // 保存到数据库
+        // Save to database
         tokio::task::spawn_blocking(move || {
             let conn = rusqlite::Connection::open(&db_path)?;
 
@@ -177,20 +177,20 @@ impl ConfigStore {
         .await
         .context("Failed to spawn blocking task")??;
 
-        // 更新缓存
+        // Update cache
         self.update_cache(entry);
 
         Ok(())
     }
 
-    /// 获取配置（零拷贝）
+    /// Get configuration (zero-copy)
     pub fn get_config(&self, id: &str, config_type: ConfigType) -> Option<ConfigEntry> {
         let cache = self.cache.load();
         let key = Self::make_cache_key(id, config_type);
         cache.get(&key).cloned()
     }
 
-    /// 获取所有配置（按类型）
+    /// Get all configurations (by type)
     pub fn get_configs_by_type(&self, config_type: ConfigType) -> Vec<ConfigEntry> {
         let cache = self.cache.load();
         cache
@@ -200,7 +200,7 @@ impl ConfigStore {
             .collect()
     }
 
-    /// 删除配置
+    /// Delete configuration
     pub async fn delete_config(&self, id: &str, config_type: ConfigType) -> Result<bool> {
         let _lock = self.write_lock.write().await;
 
@@ -209,7 +209,7 @@ impl ConfigStore {
         let id_for_cache = id.to_string();
         let config_type_str = config_type.as_str().to_string();
 
-        // 从数据库删除
+        // Delete from database
         let deleted = tokio::task::spawn_blocking(move || {
             let conn = rusqlite::Connection::open(&db_path)?;
             let affected = conn.execute(
@@ -222,14 +222,14 @@ impl ConfigStore {
         .context("Failed to spawn blocking task")??;
 
         if deleted {
-            // 更新缓存
+            // Update cache
             self.remove_from_cache(&id_for_cache, config_type);
         }
 
         Ok(deleted)
     }
 
-    /// 更新缓存
+    /// Update cache
     fn update_cache(&self, entry: ConfigEntry) {
         let key = Self::make_cache_key(&entry.id, entry.config_type);
         let entry_clone = entry.clone();
@@ -240,7 +240,7 @@ impl ConfigStore {
         });
     }
 
-    /// 从缓存删除
+    /// Remove from cache
     fn remove_from_cache(&self, id: &str, config_type: ConfigType) {
         let key = Self::make_cache_key(id, config_type);
         let key_clone = key.clone();
@@ -251,12 +251,12 @@ impl ConfigStore {
         });
     }
 
-    /// 生成缓存键
+    /// Generate cache key
     fn make_cache_key(id: &str, config_type: ConfigType) -> String {
         format!("{}:{}", config_type.as_str(), id)
     }
 
-    /// 获取配置数量
+    /// Get configuration count
     pub fn count(&self) -> usize {
         self.cache.load().len()
     }
@@ -274,7 +274,7 @@ mod tests {
 
         let store = ConfigStore::new(&db_path).await?;
 
-        // 保存配置
+        // Save configuration
         let entry = ConfigEntry::new(
             "app1".to_string(),
             ConfigType::App,
@@ -284,12 +284,12 @@ mod tests {
 
         store.save_config(entry.clone()).await?;
 
-        // 读取配置
+        // Read configuration
         let loaded = store.get_config("app1", ConfigType::App);
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().content, r#"{"key":"value"}"#);
 
-        // 删除配置
+        // Delete configuration
         let deleted = store.delete_config("app1", ConfigType::App).await?;
         assert!(deleted);
 

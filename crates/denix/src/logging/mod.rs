@@ -1,4 +1,4 @@
-// 日志缓冲和推送模块
+// Log buffering and shipping module
 
 mod buffer;
 mod layer;

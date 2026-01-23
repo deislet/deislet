@@ -1,4 +1,4 @@
-// Runtime 线程池 - 多核支持
+// Runtime thread pool - multi-core support
 
 use super::isolate::AppRuntime;
 use crate::app_repo::AppRepo;
@@ -10,12 +10,12 @@ use std::sync::{Arc, Once};
 use std::thread;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-/// 确保 V8 平台只初始化一次
+/// Ensure V8 platform is initialized only once
 static V8_INIT: Once = Once::new();
 
 type FetchResult = (u16, HashMap<String, String>, Option<String>);
 
-/// 初始化 V8 平台（每个进程只能调用一次）
+/// Initialize V8 platform (can only be called once per process)
 fn init_v8_platform() {
     V8_INIT.call_once(|| {
         JsRuntime::init_platform(None, false);
@@ -23,9 +23,9 @@ fn init_v8_platform() {
     });
 }
 
-/// Runtime 消息类型
+/// Runtime message type
 pub enum RuntimeMessage {
-    /// 加载应用
+    /// Load application
     LoadApp {
         app_id: String,
         code: String,
@@ -37,12 +37,12 @@ pub enum RuntimeMessage {
         resource_table_max: Option<usize>,
         response: oneshot::Sender<Result<()>>,
     },
-    /// 卸载应用
+    /// Unload application
     UnloadApp {
         app_id: String,
         response: oneshot::Sender<Result<()>>,
     },
-    /// 执行请求
+    /// Execute request
     ExecuteRequest {
         app_id: String,
         url: String,
@@ -51,38 +51,38 @@ pub enum RuntimeMessage {
         body: Option<String>,
         response: oneshot::Sender<Result<FetchResult>>,
     },
-    /// 获取应用列表
+    /// Get application list
     #[allow(dead_code)]
     ListApps {
         response: oneshot::Sender<Vec<String>>,
     },
-    /// 注册 WebSocket 连接
+    /// Register WebSocket connection
     RegisterWsConnection {
         app_id: String,
         ws_id: String,
-        /// JavaScript 发送消息到客户端的通道
+        /// Channel for JavaScript to send messages to the client
         js_to_client_tx: mpsc::UnboundedSender<super::WsServerMessage>,
         response: oneshot::Sender<Result<()>>,
     },
-    /// 发送 WebSocket 消息 (从 Gateway 到 JavaScript)
+    /// Send WebSocket message (from Gateway to JavaScript)
     SendWsMessage {
         app_id: String,
         ws_id: String,
         message: String,
         response: oneshot::Sender<Result<()>>,
     },
-    /// 注销 WebSocket 连接
+    /// Unregister WebSocket connection
     UnregisterWsConnection {
         app_id: String,
         ws_id: String,
         response: oneshot::Sender<Result<()>>,
     },
-    /// 获取 OpMetrics 汇总
+    /// Get OpMetrics summary
     GetOpMetrics {
         app_id: String,
         response: oneshot::Sender<Result<OpMetricsSummary>>,
     },
-    /// 连接调试器
+    /// Connect debugger
     ConnectInspector {
         app_id: String,
         response: oneshot::Sender<
@@ -92,11 +92,11 @@ pub enum RuntimeMessage {
             )>,
         >,
     },
-    /// 关闭线程
+    /// Close thread
     Shutdown,
 }
 
-/// Runtime 线程
+/// Runtime thread
 struct RuntimeThread {
     #[allow(dead_code)]
     thread_id: usize,
@@ -105,14 +105,14 @@ struct RuntimeThread {
 }
 
 impl RuntimeThread {
-    /// 创建新的 runtime 线程
+    /// Create new runtime thread
     fn new(thread_id: usize) -> Self {
-        // 设置通道容量为 100，超过将触发背压（拒绝请求）
+        // Set channel capacity to 100, exceeding will trigger backpressure (reject requests)
         let (tx, rx) = mpsc::channel(100);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
         let handle = thread::spawn(move || {
-            // 创建 current_thread 的 tokio runtime
+            // Create current_thread tokio runtime
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -123,7 +123,7 @@ impl RuntimeThread {
             });
         });
 
-        // 等待线程准备就绪
+        // Wait for thread to be ready
         let _ = ready_rx.recv();
 
         Self {
@@ -133,7 +133,7 @@ impl RuntimeThread {
         }
     }
 
-    /// 运行事件循环
+    /// Run event loop
     async fn run_event_loop(
         thread_id: usize,
         mut rx: mpsc::Receiver<RuntimeMessage>,
@@ -141,10 +141,10 @@ impl RuntimeThread {
     ) {
         tracing::info!("Runtime thread {} started", thread_id);
 
-        // 通知主线程此线程已完成初始化
+        // Notify main thread that this thread has finished initialization
         let _ = ready_tx.send(());
 
-        // 该线程管理的所有应用 runtimes
+        // All application runtimes managed by this thread
         let mut runtimes: HashMap<String, AppRuntime> = HashMap::new();
 
         while let Some(msg) = rx.recv().await {
@@ -237,7 +237,7 @@ impl RuntimeThread {
 
                     let result = match runtimes.get_mut(&app_id) {
                         Some(runtime) => {
-                            // 注册 sender 到 WsServerManager，这样 JavaScript 可以发送消息到客户端
+                            // Register sender to WsServerManager, so JavaScript can send messages to the client
                             runtime
                                 .register_ws_connection(ws_id.clone(), js_to_client_tx)
                                 .await
@@ -316,7 +316,7 @@ impl RuntimeThread {
             }
         }
 
-        // 显式清理所有 runtimes，确保在正确的上下文中 drop
+        // Explicitly cleanup all runtimes to ensure they are dropped in the correct context
         tracing::debug!(
             "Cleaning up {} runtimes in thread {}",
             runtimes.len(),
@@ -327,7 +327,7 @@ impl RuntimeThread {
         tracing::info!("Runtime thread {} stopped", thread_id);
     }
 
-    /// 发送消息
+    /// Send message
     fn send(&self, msg: RuntimeMessage) -> Result<()> {
         self.sender.try_send(msg).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
@@ -347,7 +347,7 @@ impl Drop for RuntimeThread {
     }
 }
 
-/// Runtime 线程池
+/// Runtime thread pool
 pub struct RuntimePool {
     threads: Vec<RuntimeThread>,
     app_assignments: Arc<RwLock<HashMap<String, usize>>>, // app_id -> thread_id
@@ -355,13 +355,13 @@ pub struct RuntimePool {
 }
 
 impl RuntimePool {
-    /// 创建新的线程池
+    /// Create new thread pool
     pub fn new(num_threads: Option<usize>) -> Self {
         Self::new_with_repo(num_threads, None)
     }
 
     pub fn new_with_repo(num_threads: Option<usize>, app_repo: Option<Arc<AppRepo>>) -> Self {
-        // 确保 V8 平台已初始化（每个进程只初始化一次）
+        // Ensure V8 platform is initialized (only once per process)
         init_v8_platform();
 
         let num_threads = num_threads.unwrap_or_else(num_cpus::get);
@@ -376,17 +376,17 @@ impl RuntimePool {
         }
     }
 
-    /// 选择一个线程（负载均衡）
+    /// Select a thread (load balancing)
     async fn select_thread_for_new_app(&self) -> usize {
         let assignments = self.app_assignments.read().await;
 
-        // 统计每个线程的应用数量
+        // Count number of applications in each thread
         let mut counts = vec![0; self.threads.len()];
         for thread_id in assignments.values() {
             counts[*thread_id] += 1;
         }
 
-        // 选择应用数最少的线程
+        // Select thread with the minimum number of applications
         counts
             .iter()
             .enumerate()
@@ -395,12 +395,12 @@ impl RuntimePool {
             .unwrap_or(0)
     }
 
-    /// 获取应用所在的线程 ID
+    /// Get the thread ID where the application is located
     async fn get_thread_id(&self, app_id: &str) -> Option<usize> {
         self.app_assignments.read().await.get(app_id).copied()
     }
 
-    /// 加载应用
+    /// Load application
     #[allow(clippy::too_many_arguments)]
     pub async fn load_app(
         &self,
@@ -412,16 +412,16 @@ impl RuntimePool {
         memory_limit_mb: Option<usize>,
         resource_table_max: Option<usize>,
     ) -> Result<()> {
-        // 检查是否已存在
+        // Check if already exists
         if self.get_thread_id(&app_id).await.is_some() {
             return Err(anyhow::anyhow!("App already exists"));
         }
 
-        // 选择线程
+        // Select thread
         let thread_id = self.select_thread_for_new_app().await;
         tracing::info!("Assigning app {} to thread {}", app_id, thread_id);
 
-        // 发送加载消息
+        // Send load message
         let (tx, rx) = oneshot::channel();
         self.threads[thread_id].send(RuntimeMessage::LoadApp {
             app_id: app_id.clone(),
@@ -435,12 +435,12 @@ impl RuntimePool {
             response: tx,
         })?;
 
-        // 等待结果
+        // Wait for result
         let result = rx
             .await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?;
 
-        // 如果成功，记录分配
+        // Record assignment if successful
         if result.is_ok() {
             self.app_assignments.write().await.insert(app_id, thread_id);
         }
@@ -448,27 +448,27 @@ impl RuntimePool {
         result
     }
 
-    /// 卸载应用
+    /// Unload application
     pub async fn unload_app(&self, app_id: &str) -> Result<()> {
-        // 获取线程 ID
+        // Get thread ID
         let thread_id = self
             .get_thread_id(app_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("App not found"))?;
 
-        // 发送卸载消息
+        // Send unload message
         let (tx, rx) = oneshot::channel();
         self.threads[thread_id].send(RuntimeMessage::UnloadApp {
             app_id: app_id.to_string(),
             response: tx,
         })?;
 
-        // 等待结果
+        // Wait for result
         let result = rx
             .await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?;
 
-        // 如果成功，移除分配记录
+        // Remove assignment record if successful
         if result.is_ok() {
             self.app_assignments.write().await.remove(app_id);
         }
@@ -476,7 +476,7 @@ impl RuntimePool {
         result
     }
 
-    /// 执行请求
+    /// Execute request
     pub async fn execute_request(
         &self,
         app_id: &str,
@@ -485,13 +485,13 @@ impl RuntimePool {
         headers: HashMap<String, String>,
         body: Option<String>,
     ) -> Result<(u16, HashMap<String, String>, Option<String>)> {
-        // 获取线程 ID
+        // Get thread ID
         let thread_id = self
             .get_thread_id(app_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("App not found"))?;
 
-        // 发送执行消息
+        // Send execution message
         let (tx, rx) = oneshot::channel();
         self.threads[thread_id].send(RuntimeMessage::ExecuteRequest {
             app_id: app_id.to_string(),
@@ -502,25 +502,25 @@ impl RuntimePool {
             response: tx,
         })?;
 
-        // 等待结果
+        // Wait for result
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
-    /// 列出所有应用
+    /// List all applications
     #[cfg(test)]
     pub async fn list_apps(&self) -> Vec<String> {
         let assignments = self.app_assignments.read().await;
         assignments.keys().cloned().collect()
     }
 
-    /// 获取线程数
+    /// Get thread count
     #[cfg(test)]
     pub fn thread_count(&self) -> usize {
         self.threads.len()
     }
 
-    /// 获取统计信息
+    /// Get statistics
     pub async fn get_stats(&self) -> HashMap<String, usize> {
         let assignments = self.app_assignments.read().await;
 
@@ -536,16 +536,16 @@ impl RuntimePool {
         thread_apps
     }
 
-    /// 注册 WebSocket 连接
+    /// Register WebSocket connection
     ///
-    /// # 参数
-    /// - app_id: 应用 ID
-    /// - ws_id: WebSocket 连接 ID
-    /// - js_to_client_tx: JavaScript 发送消息到客户端的通道
+    /// # Parameters
+    /// - app_id: Application ID
+    /// - ws_id: WebSocket connection ID
+    /// - js_to_client_tx: Channel for JavaScript to send messages to the client
     ///
-    /// # 返回
-    /// - Ok(()) 成功
-    /// - Err(...) 应用不存在或注册失败
+    /// # Returns
+    /// - Ok(()) Success
+    /// - Err(...) Application not found or registration failed
     pub async fn register_ws_connection(
         &self,
         app_id: &str,
@@ -569,16 +569,16 @@ impl RuntimePool {
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
-    /// 发送 WebSocket 消息到 JavaScript
+    /// Send WebSocket message to JavaScript
     ///
-    /// # 参数
-    /// - app_id: 应用 ID
-    /// - ws_id: WebSocket 连接 ID
-    /// - message: 消息内容
+    /// # Parameters
+    /// - app_id: Application ID
+    /// - ws_id: WebSocket connection ID
+    /// - message: Message content
     ///
-    /// # 返回
-    /// - Ok(()) 成功
-    /// - Err(...) 应用不存在或发送失败
+    /// # Returns
+    /// - Ok(()) Success
+    /// - Err(...) Application not found or send failed
     pub async fn send_ws_message(
         &self,
         app_id: &str,
@@ -602,15 +602,15 @@ impl RuntimePool {
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
-    /// 注销 WebSocket 连接
+    /// Unregister WebSocket connection
     ///
-    /// # 参数
-    /// - app_id: 应用 ID
-    /// - ws_id: WebSocket 连接 ID
+    /// # Parameters
+    /// - app_id: Application ID
+    /// - ws_id: WebSocket connection ID
     ///
-    /// # 返回
-    /// - Ok(()) 成功
-    /// - Err(...) 应用不存在或注销失败
+    /// # Returns
+    /// - Ok(()) Success
+    /// - Err(...) Application not found or unregistration failed
     pub async fn unregister_ws_connection(&self, app_id: &str, ws_id: String) -> Result<()> {
         let thread_id = self
             .get_thread_id(app_id)
@@ -628,7 +628,7 @@ impl RuntimePool {
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
-    /// 获取应用 OpMetrics 汇总
+    /// Get aggregate application OpMetrics
     pub async fn get_op_metrics(&self, app_id: &str) -> Result<OpMetricsSummary> {
         let thread_id = self
             .get_thread_id(app_id)
@@ -645,7 +645,7 @@ impl RuntimePool {
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
-    /// 连接调试器
+    /// Connect debugger
     pub async fn connect_inspector(
         &self,
         app_id: &str,
@@ -676,7 +676,7 @@ mod tests {
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
 
-    // 使用全局的 RuntimePool 避免多次创建/销毁导致的 V8 问题
+    // Use global RuntimePool to avoid V8 issues from multiple creation/destruction
     static TEST_POOL: Lazy<Mutex<RuntimePool>> =
         Lazy::new(|| Mutex::new(RuntimePool::new(Some(4))));
 
@@ -696,7 +696,7 @@ mod tests {
             }
         "#;
 
-        // 加载应用
+        // Load application
         let result = pool
             .load_app(
                 "test_load_exec_app".to_string(),
@@ -710,7 +710,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        // 执行请求
+        // Execute request
         let result = pool
             .execute_request(
                 "test_load_exec_app",
@@ -726,7 +726,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, Some("Hello from pool!".to_string()));
 
-        // 清理
+        // Cleanup
         let _ = pool.unload_app("test_load_exec_app").await;
     }
 
@@ -734,7 +734,7 @@ mod tests {
     async fn test_load_balancing() {
         let pool = TEST_POOL.lock().unwrap();
 
-        // 加载多个应用
+        // Load multiple applications
         for i in 0..4 {
             let code = r#"export default function handler(context) { return new Response("ok"); }"#;
             pool.load_app(
@@ -750,12 +750,12 @@ mod tests {
             .unwrap();
         }
 
-        // 检查应用分配
+        // Check application assignments
         let stats = pool.get_stats().await;
         assert!(stats.get("total_apps").unwrap() >= &4);
         assert_eq!(stats.get("total_threads"), Some(&4));
 
-        // 清理
+        // Cleanup
         for i in 0..4 {
             let _ = pool.unload_app(&format!("lb_app{}", i)).await;
         }
@@ -778,11 +778,11 @@ mod tests {
         .await
         .unwrap();
 
-        // 卸载应用
+        // Unload application
         let result = pool.unload_app("unload_test_app").await;
         assert!(result.is_ok());
 
-        // 验证应用已删除
+        // Verify application deleted
         let apps = pool.list_apps().await;
         assert!(!apps.contains(&"unload_test_app".to_string()));
     }

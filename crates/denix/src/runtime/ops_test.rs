@@ -1,4 +1,4 @@
-// Runtime Ops 单元测试
+// Runtime Ops unit tests
 
 #[cfg(test)]
 mod tests {
@@ -14,7 +14,7 @@ mod tests {
             ..Default::default()
         });
 
-        // 注入 Response Store 和 Env Store
+        // Inject Response Store and Env Store
         let op_state = runtime.op_state();
         let mut state = op_state.borrow_mut();
         let response_store: ResponseStore = Rc::new(RefCell::new(None));

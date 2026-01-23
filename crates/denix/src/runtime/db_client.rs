@@ -1,37 +1,37 @@
-// Database gRPC 客户端封装
+// Database gRPC client wrapper
 //
-// 提供连接到远程 Database 服务的功能
-// 类似 Cloudflare D1 / Deno Deploy SQL
+// Provides functionality to connect to remote Database service
+// Similar to Cloudflare D1 / Deno Deploy SQL
 
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
-// 引入生成的 proto 代码
+// Import generated proto code
 pub mod proto {
     tonic::include_proto!("denix.storage");
 }
 
 use proto::{database_client::DatabaseClient, *};
 
-/// Database 客户端封装
+/// Database client wrapper
 ///
-/// 使用 Arc<Mutex> 包装以支持跨 async 操作共享和内部可变性
+/// Wrapped in Arc<Mutex> to support sharing and internal mutability across async operations
 #[derive(Clone)]
 pub struct DbClient {
     client: Arc<Mutex<DatabaseClient<Channel>>>,
 }
 
 impl DbClient {
-    /// 连接到远程 Database 服务
+    /// Connect to remote Database service
     ///
-    /// # 参数
-    /// - endpoint: gRPC 服务地址 (如 "http://127.0.0.1:50051")
+    /// # Parameters
+    /// - endpoint: gRPC service address (e.g., "http://127.0.0.1:50051")
     ///
-    /// # 返回
-    /// - Ok(DbClient): 连接成功
-    /// - Err: 连接失败
+    /// # Returns
+    /// - Ok(DbClient): Connection successful
+    /// - Err: Connection failed
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
         tracing::info!("Connecting to Database at {}", endpoint);
@@ -44,14 +44,14 @@ impl DbClient {
         })
     }
 
-    /// 执行 SQL 语句（INSERT, UPDATE, DELETE 等）
+    /// Executes SQL statements (INSERT, UPDATE, DELETE, etc.)
     ///
-    /// # 参数
-    /// - sql: SQL 语句
-    /// - params: 可选的参数（JSON 编码的数组）
+    /// # Parameters
+    /// - sql: SQL statement
+    /// - params: Optional parameters (JSON encoded array)
     ///
-    /// # 返回
-    /// - (rows_affected, last_insert_id): 影响行数和插入 ID
+    /// # Returns
+    /// - (rows_affected, last_insert_id): Number of rows affected and last insert ID
     pub async fn execute(&self, sql: String, params: Option<String>) -> Result<(i64, Option<i64>)> {
         let request = tonic::Request::new(ExecuteRequest {
             sql: sql.clone(),
@@ -74,14 +74,14 @@ impl DbClient {
         Ok((exec_response.rows_affected, exec_response.last_insert_id))
     }
 
-    /// 查询 SQL（SELECT）
+    /// Queries SQL (SELECT)
     ///
-    /// # 参数
-    /// - sql: SQL 查询语句
-    /// - params: 可选的参数（JSON 编码的数组）
+    /// # Parameters
+    /// - sql: SQL query statement
+    /// - params: Optional parameters (JSON encoded array)
     ///
-    /// # 返回
-    /// - (rows, columns): 结果行（JSON 编码）和列名
+    /// # Returns
+    /// - (rows, columns): Result rows (JSON-encoded) and column names
     pub async fn query(
         &self,
         sql: String,
@@ -108,13 +108,13 @@ impl DbClient {
         Ok((query_response.rows, query_response.columns))
     }
 
-    /// 批量执行多条 SQL
+    /// Executes multiple SQL statements in a batch
     ///
-    /// # 参数
-    /// - statements: SQL 语句列表，每个包含 sql 和可选的 params
+    /// # Parameters
+    /// - statements: List of SQL statements, each containing sql and optional params
     ///
-    /// # 返回
-    /// - results: 每条语句的执行结果
+    /// # Returns
+    /// - results: Execution results for each statement
     pub async fn batch(
         &self,
         statements: Vec<(String, Option<String>)>,
@@ -153,13 +153,13 @@ impl DbClient {
         Ok(results)
     }
 
-    /// 预处理 SQL 语句
+    /// Prepares an SQL statement
     ///
-    /// # 参数
-    /// - sql: SQL 语句
+    /// # Parameters
+    /// - sql: SQL statement
     ///
-    /// # 返回
-    /// - statement_id: 预处理语句 ID
+    /// # Returns
+    /// - statement_id: Prepared statement ID
     pub async fn prepare(&self, sql: String) -> Result<String> {
         let request = tonic::Request::new(PrepareRequest { sql: sql.clone() });
 
@@ -179,14 +179,14 @@ impl DbClient {
         Ok(prepare_response.statement_id)
     }
 
-    /// 执行预处理语句
+    /// Executes a prepared statement
     ///
-    /// # 参数
-    /// - statement_id: 预处理语句 ID
-    /// - params: 可选的参数（JSON 编码的数组）
+    /// # Parameters
+    /// - statement_id: Prepared statement ID
+    /// - params: Optional parameters (JSON encoded array)
     ///
-    /// # 返回
-    /// - (rows_affected, last_insert_id): 影响行数和插入 ID
+    /// # Returns
+    /// - (rows_affected, last_insert_id): Number of rows affected and last insert ID
     pub async fn execute_prepared(
         &self,
         statement_id: String,
@@ -213,14 +213,14 @@ impl DbClient {
         Ok((exec_response.rows_affected, exec_response.last_insert_id))
     }
 
-    /// 查询预处理语句
+    /// Queries a prepared statement
     ///
-    /// # 参数
-    /// - statement_id: 预处理语句 ID
-    /// - params: 可选的参数（JSON 编码的数组）
+    /// # Parameters
+    /// - statement_id: Prepared statement ID
+    /// - params: Optional parameters (JSON encoded array)
     ///
-    /// # 返回
-    /// - (rows, columns): 结果行（JSON 编码）和列名
+    /// # Returns
+    /// - (rows, columns): Result rows (JSON-encoded) and column names
     pub async fn query_prepared(
         &self,
         statement_id: String,
@@ -252,21 +252,21 @@ impl DbClient {
 mod tests {
     use super::*;
 
-    /// 注意：这些测试需要运行 denira server
-    /// 暂时标记为 #[ignore]，在集成测试环境中启用
+    /// Note: These tests require running a denira server
+    /// Temporarily marked as #[ignore], to be enabled in integration testing environments
     #[tokio::test]
     #[ignore]
     async fn test_db_client_connect() {
         let result = DbClient::connect("http://127.0.0.1:50051").await;
-        // 如果服务未运行，应该返回连接错误
-        // 这里只测试客户端代码编译和基本逻辑
+        // Should return connection error if service is not running
+        // Only testing client code compilation and basic logic here
         assert!(result.is_err() || result.is_ok());
     }
 
     #[tokio::test]
     #[ignore]
     async fn test_db_client_operations() {
-        // 此测试需要真实的 denira server
+        // This test requires a real denira server
         let client = DbClient::connect("http://127.0.0.1:50051")
             .await
             .expect("Failed to connect");

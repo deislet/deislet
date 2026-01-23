@@ -1,15 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
-/// 配置类型
+/// Configuration type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigType {
-    /// 全局配置
+    /// Global configuration
     Global,
-    /// 应用配置
+    /// Application configuration
     App,
-    /// 资源配置
+    /// Resource configuration
     Resource,
 }
 
@@ -32,25 +32,25 @@ impl ConfigType {
     }
 }
 
-/// 配置条目
+/// Configuration entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigEntry {
-    /// 配置 ID（如 app_id 或 "global"）
+    /// Configuration ID (e.g., app_id or "global")
     pub id: String,
 
-    /// 配置类型
+    /// Configuration type
     pub config_type: ConfigType,
 
-    /// 配置版本
+    /// Configuration version
     pub version: i64,
 
-    /// 配置内容（JSON 字符串）
+    /// Configuration content (JSON string)
     pub content: String,
 
-    /// 创建时间
+    /// Creation time
     pub created_at: SystemTime,
 
-    /// 更新时间
+    /// Update time
     pub updated_at: SystemTime,
 }
 

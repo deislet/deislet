@@ -10,7 +10,7 @@ use super::service::DenixManagementService;
 pub struct ManagementServer;
 
 impl ManagementServer {
-    /// 创建 gRPC 服务路由（用于嵌入到 axum）
+    /// Create gRPC service routing (for embedding into axum)
     pub fn create_service(
         app_manager: Arc<ApplicationManager>,
         config_store: Arc<ConfigStore>,

@@ -1,5 +1,5 @@
-// Runtime Ops 定义
-// 提供 JavaScript 调用 Rust 的接口
+// Runtime Ops definitions
+// Provides interfaces for JavaScript to call Rust
 
 use super::kv_client::KvClient;
 use deno_core::{extension, op2, OpState};
@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// KV Get 操作
+/// KV Get operation
 #[op2(async)]
 #[string]
 async fn op_kv_get(
@@ -29,7 +29,7 @@ async fn op_kv_get(
     ))
 }
 
-/// KV Set 操作
+/// KV Set operation
 #[op2(async)]
 async fn op_kv_set(
     state: Rc<RefCell<OpState>>,
@@ -51,7 +51,7 @@ async fn op_kv_set(
     ))
 }
 
-/// KV Delete 操作
+/// KV Delete operation
 #[op2(async)]
 async fn op_kv_delete(
     state: Rc<RefCell<OpState>>,
@@ -72,7 +72,7 @@ async fn op_kv_delete(
     ))
 }
 
-/// KV List 操作
+/// KV List operation
 #[op2(async)]
 #[serde]
 async fn op_kv_list(
@@ -98,7 +98,7 @@ async fn op_kv_list(
     ))
 }
 
-/// 日志操作
+/// Log operation
 #[op2(fast)]
 fn op_log(#[string] level: String, #[string] message: String) {
     match level.as_str() {
@@ -109,20 +109,20 @@ fn op_log(#[string] level: String, #[string] message: String) {
     }
 }
 
-// 响应存储（用于临时存储应用的响应）
+// Response store (used for temporary storage of application responses)
 pub type ResponseStore = Rc<RefCell<Option<String>>>;
 
-/// 内部 op：设置响应
+/// Internal op: set response
 #[op2(fast)]
 fn op_set_response(state: &mut OpState, #[string] response_json: String) {
     let store = state.borrow::<ResponseStore>().clone();
     *store.borrow_mut() = Some(response_json);
 }
 
-// 环境变量存储
+// Environment variables store
 pub type EnvStore = Rc<RefCell<HashMap<String, String>>>;
 
-/// 内部 op：获取环境变量
+/// Internal op: get environment variables
 #[op2]
 #[serde]
 fn op_get_env(state: &mut OpState) -> HashMap<String, String> {
@@ -131,7 +131,7 @@ fn op_get_env(state: &mut OpState) -> HashMap<String, String> {
     map
 }
 
-// 定义 extension
+// Define extension
 extension!(
     denix_ops,
     ops = [
@@ -145,7 +145,7 @@ extension!(
     ],
 );
 
-/// 初始化 ops extension
+/// Initialize ops extension
 pub fn init_ops_extension() -> deno_core::Extension {
     denix_ops::init()
 }

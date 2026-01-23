@@ -7,22 +7,22 @@ use tracing::{debug, error, info, warn};
 use super::buffer::LogBuffer;
 use super::types::LogEntry;
 
-/// 日志推送器配置
+/// Log shipper configuration
 #[derive(Debug, Clone)]
 pub struct ShipperConfig {
-    /// 日志服务端点（可选）
+    /// Log service endpoint (optional)
     pub endpoint: Option<String>,
 
-    /// 刷新间隔（秒）
+    /// Flush interval (seconds)
     pub flush_interval: u64,
 
-    /// 每批次最大日志数
+    /// Maximum logs per batch
     pub batch_size: usize,
 
-    /// 最大重试次数
+    /// Maximum retry attempts
     pub max_retries: u32,
 
-    /// 是否启用
+    /// Whether enabled
     pub enabled: bool,
 }
 
@@ -38,7 +38,7 @@ impl Default for ShipperConfig {
     }
 }
 
-/// 日志推送器
+/// Log shipper
 pub struct LogShipper {
     buffer: Arc<LogBuffer>,
     config: ShipperConfig,
@@ -46,7 +46,7 @@ pub struct LogShipper {
 }
 
 impl LogShipper {
-    /// 创建新的日志推送器
+    /// Create new log shipper
     pub fn new(buffer: Arc<LogBuffer>, config: ShipperConfig) -> Self {
         Self {
             buffer,
@@ -55,7 +55,7 @@ impl LogShipper {
         }
     }
 
-    /// 启动日志推送任务（后台运行）
+    /// Start log shipping task (runs in background)
     pub async fn start(&self) {
         if !self.config.enabled {
             info!("Log shipper is disabled");
@@ -89,14 +89,14 @@ impl LogShipper {
         );
     }
 
-    /// 停止日志推送任务
+    /// Stop log shipping task
     pub async fn stop(&self) {
         let mut running = self.running.write().await;
         *running = false;
         info!("Log shipper stopped");
     }
 
-    /// 日志推送循环
+    /// Log shipping loop
     async fn run_shipper_loop(
         buffer: Arc<LogBuffer>,
         config: ShipperConfig,
@@ -107,17 +107,17 @@ impl LogShipper {
         loop {
             interval.tick().await;
 
-            // 检查是否应该停止
+            // Check if should stop
             if !*running.read().await {
                 break;
             }
 
-            // 检查缓冲区是否有日志
+            // Check if buffer has logs
             if buffer.is_empty() {
                 continue;
             }
 
-            // 取出一批日志
+            // Take a batch of logs
             let entries = buffer.drain(config.batch_size);
             if entries.is_empty() {
                 continue;
@@ -125,17 +125,17 @@ impl LogShipper {
 
             debug!("Shipping {} log entries", entries.len());
 
-            // 推送日志（带重试）
+            // Ship logs (with retries)
             if let Err(e) = Self::ship_with_retry(&entries, &config).await {
                 error!("Failed to ship logs after retries: {}", e);
-                // 注意：失败的日志已经从缓冲区移除，考虑是否需要重新入队或持久化到磁盘
+                // Note: failed logs are removed from buffer, consider re-queuing or persisting to disk
             }
         }
 
         info!("Log shipper loop exited");
     }
 
-    /// 带重试的日志推送
+    /// Ship logs with retry
     async fn ship_with_retry(entries: &[LogEntry], config: &ShipperConfig) -> Result<()> {
         let mut attempts = 0;
 
@@ -153,7 +153,7 @@ impl LogShipper {
                     );
 
                     if attempts < config.max_retries {
-                        // 指数退避
+                        // Exponential backoff
                         let backoff = Duration::from_secs(2u64.pow(attempts));
                         sleep(backoff).await;
                     }
@@ -167,15 +167,15 @@ impl LogShipper {
         ))
     }
 
-    /// 实际推送日志（gRPC 调用）
+    /// Actual log shipping (gRPC call)
     async fn ship_logs(_entries: &[LogEntry], config: &ShipperConfig) -> Result<()> {
-        // TODO: 实现实际的 gRPC 推送逻辑
-        // 目前只是模拟成功
+        // TODO: Implement actual gRPC shipping logic
+        // Currently just simulates success
 
         if let Some(endpoint) = &config.endpoint {
             debug!("Would ship logs to: {}", endpoint);
 
-            // 这里未来会调用 gRPC client:
+            // Will call gRPC client here in the future:
             // let mut client = LogServiceClient::connect(endpoint.clone()).await?;
             // let request = tonic::Request::new(PushLogsRequest {
             //     entries: entries.iter().map(|e| convert_to_proto(e)).collect(),
@@ -186,7 +186,7 @@ impl LogShipper {
 
             Ok(())
         } else {
-            // 没有配置端点，dry-run 模式
+            // No endpoint configured, dry-run mode
             debug!("Dry-run: would have shipped {} logs", _entries.len());
             Ok(())
         }
@@ -209,7 +209,7 @@ mod tests {
             ..Default::default()
         };
 
-        // 添加一些日志
+        // Add some logs
         for i in 0..15 {
             buffer.push(LogEntry::new(
                 "test".to_string(),
@@ -218,17 +218,17 @@ mod tests {
             ));
         }
 
-        // 启动 shipper
+        // Start shipper
         let shipper = LogShipper::new(buffer.clone(), config);
         shipper.start().await;
 
-        // 等待推送
+        // Wait for shipping
         sleep(Duration::from_secs(2)).await;
 
-        // 停止 shipper
+        // Stop shipper
         shipper.stop().await;
 
-        // 验证日志被推送（缓冲区应该被清空或减少）
+        // Verify logs are shipped (buffer should be empty or reduced)
         let remaining = buffer.len();
         assert!(remaining < 15);
     }

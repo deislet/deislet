@@ -1,39 +1,39 @@
-# Denix - 自治型边缘运行时
+# Denix - Autonomous Edge Runtime
 
-基于 **Rust + deno_core** 的高性能、多租户、自治型 JavaScript/TypeScript/Wasm 运行时平台，专为边缘计算场景设计。
+A high-performance, multi-tenant, autonomous JavaScript/TypeScript/Wasm runtime platform built with **Rust + deno_core**, designed for edge computing scenarios.
 
-## 🎯 核心特性
+## 🎯 Core Features
 
-- 🦀 **Rust 核心**: 极致性能与内存安全。
-- 📦 **多语言支持**: 原生支持 JavaScript, TypeScript (自动转译), WebAssembly。
-- 🔒 **多租户隔离**: 每个应用独享 V8 Isolate，毫秒级冷启动。
-- 🛡️ **资源治理**: 
-  - **硬限制**: 30s CPU 时间，128MB 内存 (OOM 自动终止)。
-  - **流控**: 1000 IOPS 速率限制，请求背压保护。
-- 🐛 **远程调试**: 支持 Chrome DevTools Protocol (Inspector)，无需暴露额外端口。
-- ⚡ **极速启动**: Level 1 快照技术，预热 Web API，冷启动 < 10ms。
-- 📦 **标准兼容**: 
-  - WinterCG 兼容 (Fetch, URL, Streams, Crypto)。
-  - Wasm 原生导入支持 (`import mod from "./file.wasm"`).
-- 🔌 **自治架构**: 本地 SQLite 配置存储，不强依赖外部控制面，内置 gRPC 管理接口。
+- 🦀 **Rust Core**: Ultimate performance and memory safety.
+- 📦 **Multi-Language Support**: Native support for JavaScript, TypeScript (auto-transpiled), and WebAssembly.
+- 🔒 **Multi-Tenant Isolation**: Each app has its own V8 Isolate, millisecond-level cold start.
+- 🛡️ **Resource Governance**:
+  - **Hard Limits**: 30s CPU time, 128MB memory (auto OOM termination).
+  - **Flow Control**: 1000 IOPS rate limiting, request backpressure protection.
+- 🐛 **Remote Debugging**: Chrome DevTools Protocol (Inspector) support, no extra port needed.
+- ⚡ **Fast Startup**: Level 1 snapshot technology, preheated Web API, cold start < 10ms.
+- 📦 **Standard Compatibility**:
+  - WinterCG compatible (Fetch, URL, Streams, Crypto).
+  - Wasm native import support (`import mod from "./file.wasm"`).
+- 🔌 **Autonomous Architecture**: Local SQLite config storage, no strong dependency on external control plane, built-in gRPC management interface.
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 1. 编译与运行
+### 1. Build and Run
 
 ```bash
-# 开发模式
+# Development mode
 cargo run
 
-# 生产模式 (推荐)
+# Production mode (recommended)
 cargo run --release
 ```
 
-首次运行会自动在 `/tmp` 生成启动快照以加速后续启动。
+First run will automatically generate startup snapshot in `/tmp` to accelerate subsequent starts.
 
-### 2. 部署应用
+### 2. Deploy Applications
 
-Denix 提供 gRPC 管理接口 (`proto/management.proto`)。可以使用 `grpcurl` 或编写客户端进行交互。
+Denix provides gRPC management interface (`proto/management.proto`). Use `grpcurl` or write a client for interaction.
 
 **Hello World (JavaScript):**
 
@@ -43,60 +43,60 @@ export default async function handler(ctx) {
 }
 ```
 
-### 3. 远程调试
+### 3. Remote Debugging
 
-支持通过 WebSocket 复用端口进行调试：
+Supports debugging through WebSocket on reused port:
 - URL: `ws://localhost:8000/`
 - Headers: `x-deis-app-id: _inspect:<app_id>`, `x-denix-inspect-token: <token>`
 
-详细文档参见 [docs/TESTING.md](docs/TESTING.md)。
+See [docs/TESTING.md](docs/TESTING.md) for details.
 
-## 📚 运行时 API
+## 📚 Runtime API
 
-Denix 遵循 **Edge Canon** 规范，提供以下 API：
+Denix follows **Edge Canon** specification, providing the following APIs:
 
-### Web 标准 (全局)
+### Web Standards (Global)
 - `fetch`, `Request`, `Response`
 - `URL`, `URLSearchParams`
 - `console.*`
-- `caches` (本地缓存)
+- `caches` (local cache)
 - `setTimeout`, `setInterval`
 - `crypto`, `TextEncoder`, `TextDecoder`
 - `WebSocket`, `WebSocketPair`
 
-### 资源绑定 (通过 `ctx.env`)
+### Resource Bindings (via `ctx.env`)
 - **KV**: `ctx.env.KV.get(key)`, `put(key, val)`
 - **Database**: `ctx.env.DB.query(sql)` (SQL over gRPC)
 - **Blob**: `ctx.env.BUCKET.get(key)`
 - **Queue**: `ctx.env.QUEUE.send(msg)`
 
-## 📖 文档导航
+## 📖 Documentation
 
-- [**架构设计**](ARCHITECTURE.md): 系统分层与核心流程。
-- [**测试指南**](docs/TESTING.md): 单元测试与集成测试说明。
-- [**管理协议**](proto/management.proto): 控制面 gRPC 接口定义。
-- [**重构笔记**](docs/REFACTORING_2026.md): (已归档) 架构演进记录。
+- [**Architecture**](ARCHITECTURE.md): System layers and core flows.
+- [**Testing Guide**](docs/TESTING.md): Unit and integration test documentation.
+- [**Management Protocol**](proto/management.proto): Control plane gRPC interface definition.
+- [**Refactoring Notes**](docs/REFACTORING_2026.md): (Archived) Architecture evolution records.
 
-## 🛠️ 项目结构
+## 🛠️ Project Structure
 
 ```
 denix/
 ├── src/
-│   ├── runtime/       # V8 Runtime 核心 (Isolate, Ops, Loader)
-│   │   ├── js/        # 内置 JS (Bootstrap, Polyfills)
-│   ├── app/           # 应用生命周期管理
-│   ├── management/    # gRPC 管理服务
-│   ├── dispatcher/    # HTTP/WS 流量分发
-│   └── config_store/  # 本地配置存储 (SQLite)
-├── proto/             # gRPC 协议定义
-├── tests/             # 集成测试
-├── docs/              # 详细文档
-└── examples/          # 示例代码
+│   ├── runtime/       # V8 Runtime core (Isolate, Ops, Loader)
+│   │   ├── js/        # Built-in JS (Bootstrap, Polyfills)
+│   ├── app/           # Application lifecycle management
+│   ├── management/    # gRPC management service
+│   ├── dispatcher/    # HTTP/WS traffic routing
+│   └── config_store/  # Local config storage (SQLite)
+├── proto/             # gRPC protocol definitions
+├── tests/             # Integration tests
+├── docs/              # Detailed documentation
+└── examples/          # Example code
 ```
 
-## 🤝 贡献
+## 🤝 Contributing
 
-欢迎提交 PR！请确保通过所有测试：
+PRs welcome! Ensure all tests pass:
 
 ```bash
 cargo test

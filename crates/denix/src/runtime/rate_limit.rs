@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-/// 简单的令牌桶速率限制器
+/// Simple token bucket rate limiter
 pub struct RateLimiter {
     tokens: f64,
     last_refill: Instant,
@@ -22,7 +22,7 @@ impl RateLimiter {
         self.check_at(Instant::now())
     }
 
-    /// 内部方法：指定时间检查，方便测试
+    /// Internal method: Check at specific time, for testing
     pub fn check_at(&mut self, now: Instant) -> bool {
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
 
@@ -49,12 +49,12 @@ mod tests {
         let mut limiter = RateLimiter::new(10.0); // 10 ops/sec
         let start = Instant::now();
 
-        // 初始应该有 10 个 token
+        // Should initially have 10 tokens
         for _ in 0..10 {
             assert!(limiter.check_at(start));
         }
 
-        // 第 11 个应该失败
+        // The 11th should fail
         assert!(!limiter.check_at(start));
     }
 
@@ -63,17 +63,17 @@ mod tests {
         let mut limiter = RateLimiter::new(10.0);
         let start = Instant::now();
 
-        // 消耗完
+        // Consume all
         for _ in 0..10 {
             limiter.check_at(start);
         }
         assert!(!limiter.check_at(start));
 
-        // 经过 0.1 秒，应该恢复 1 个 token (10 * 0.1 = 1)
+        // After 0.1 seconds, should refill 1 token (10 * 0.1 = 1)
         let later = start + Duration::from_millis(100);
         assert!(limiter.check_at(later));
 
-        // 再次耗尽
+        // Exhaust again
         assert!(!limiter.check_at(later));
     }
 
@@ -82,10 +82,10 @@ mod tests {
         let mut limiter = RateLimiter::new(10.0);
         let start = Instant::now();
 
-        // 经过很久，token 不应超过 max_tokens (10)
+        // After a long time, tokens should not exceed max_tokens (10)
         let later = start + Duration::from_secs(100);
 
-        // 只能消耗 10 次
+        // Can only consume 10 times
         for _ in 0..10 {
             assert!(limiter.check_at(later));
         }

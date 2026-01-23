@@ -1,4 +1,4 @@
-// Application Manager 单元测试
+// Application Manager unit tests
 
 #[cfg(test)]
 mod tests {
@@ -10,7 +10,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    // 使用全局单例 ApplicationManager 避免多次创建 RuntimePool
+    // Use global singleton ApplicationManager to avoid multiple RuntimePool creations
     static TEST_MANAGER: Lazy<Mutex<ApplicationManager>> =
         Lazy::new(|| Mutex::new(ApplicationManager::with_threads(Some(2))));
 
@@ -42,7 +42,7 @@ mod tests {
         assert_eq!(app.id, "test1");
         assert_eq!(app.state, AppState::Running);
 
-        // 清理
+        // Cleanup
         let _ = manager.unload_app("test1").await;
     }
 
@@ -78,7 +78,7 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
 
-        // 清理
+        // Cleanup
         let _ = manager.unload_app("dup").await;
     }
 
@@ -144,7 +144,7 @@ mod tests {
         let app = manager.get_app("test3").unwrap();
         assert_eq!(app.state, AppState::Running);
 
-        // 清理
+        // Cleanup
         let _ = manager.unload_app("test3").await;
     }
 
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.unwrap().contains("/test/path"));
 
-        // 清理
+        // Cleanup
         let _ = manager.unload_app("test4").await;
     }
 
@@ -226,7 +226,7 @@ mod tests {
         assert!(ids.contains(&"app1".to_string()));
         assert!(ids.contains(&"app2".to_string()));
 
-        // 清理
+        // Cleanup
         let _ = manager.unload_app("app1").await;
         let _ = manager.unload_app("app2").await;
     }
@@ -265,7 +265,7 @@ mod tests {
         assert!(stats["total"].as_u64().unwrap() >= 2);
         assert!(stats["running"].as_u64().unwrap() >= 2);
 
-        // 清理
+        // Cleanup
         let _ = manager.unload_app("s1").await;
         let _ = manager.unload_app("s2").await;
     }
@@ -329,7 +329,7 @@ mod tests {
 
         assert_eq!(body, Some("42".to_string()));
 
-        // 清理
+        // Cleanup
         let _ = manager.unload_app("kvtest").await;
     }
 }

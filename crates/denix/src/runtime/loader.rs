@@ -105,7 +105,7 @@ impl ModuleLoader for MemoryModuleLoader {
                 || media_type == MediaType::Tsx
                 || media_type == MediaType::Jsx
             {
-                // Transpile requires string
+                // Transpilation requires string
                 let text =
                     String::from_utf8(bytes).map_err(|e| JsErrorBox::generic(e.to_string()))?;
 
@@ -185,7 +185,7 @@ impl ModuleLoader for DbModuleLoader {
                     .ok_or_else(|| {
                         JsErrorBox::generic(format!("Module not found: {}", module_specifier))
                     })?;
-                // 不再强制转换为 String，保留二进制数据
+                // No longer forcing conversion to String, keeping binary data
                 modules
                     .write()
                     .await

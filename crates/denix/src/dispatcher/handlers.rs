@@ -13,7 +13,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 
-/// 统一请求处理器 - 通过 x-deis-app-id header 路由到对应应用
+/// Unified request handler - routes to applications via x-deis-app-id header
 pub async fn handle_request(
     State(state): State<AppState>,
     method: Method,
@@ -22,11 +22,11 @@ pub async fn handle_request(
     ws: Option<WebSocketUpgrade>,
     body: String,
 ) -> impl IntoResponse {
-    // 从 header 中获取 app_id
+    // Get app_id from header
     let app_id = match headers.get("x-deis-app-id").and_then(|v| v.to_str().ok()) {
         Some(id) => id.to_string(),
         None => {
-            tracing::warn!("请求缺少 x-deis-app-id header: {} {}", method, uri);
+            tracing::warn!("Request missing x-deis-app-id header: {} {}", method, uri);
             return (
                 StatusCode::BAD_REQUEST,
                 "Missing x-deis-app-id header".to_string(),
@@ -35,7 +35,7 @@ pub async fn handle_request(
         }
     };
 
-    // 检查是否是调试请求
+    // Check if it's a debug request
     if let Some(target_app_id) = app_id.strip_prefix("_inspect:") {
         let token = headers
             .get("x-denix-inspect-token")
@@ -66,17 +66,17 @@ pub async fn handle_request(
         }
     }
 
-    // 使用完整的 URI（包含 path 和 query）
+    // Use full URI (including path and query)
     let url = format!("http://localhost{}", uri);
 
     tracing::debug!(
-        "路由请求: app_id={}, method={}, url={}",
+        "Routing request: app_id={}, method={}, url={}",
         app_id,
         method,
         url
     );
 
-    // 转换 headers
+    // Convert headers
     let mut header_map = std::collections::HashMap::new();
     for (key, value) in headers.iter() {
         if let Ok(value_str) = value.to_str() {
@@ -84,24 +84,24 @@ pub async fn handle_request(
         }
     }
 
-    // 添加 WebSocket 升级标志
+    // Add WebSocket upgrade flag
     if ws.is_some() {
         header_map.insert("Upgrade".to_string(), "websocket".to_string());
     }
 
     let body_opt = if body.is_empty() { None } else { Some(body) };
 
-    // 执行应用
+    // Execute application
     match state
         .app_manager
         .execute_app(&app_id, url, method.to_string(), header_map, body_opt)
         .await
     {
         Ok((status, resp_headers, resp_body)) => {
-            // 检查是否是 WebSocket 升级响应
+            // Check if it's a WebSocket upgrade response
             if status == 101 {
                 if let Some(ws_upgrade) = ws {
-                    // 提取 WebSocket ID
+                    // Extract WebSocket ID
                     if let Some(ws_id) = resp_headers.get("X-Denix-WebSocket-ID") {
                         let ws_id = ws_id.clone();
                         let app_id_clone = app_id.clone();
@@ -113,7 +113,7 @@ pub async fn handle_request(
                             ws_id
                         );
 
-                        // 执行 WebSocket 升级并启动消息桥接
+                        // Execute WebSocket upgrade and start message bridging
                         return ws_upgrade
                             .on_upgrade(move |socket| {
                                 handle_websocket_bridged(socket, app_id_clone, ws_id, app_manager)
@@ -128,7 +128,7 @@ pub async fn handle_request(
                 }
             }
 
-            // 普通 HTTP 响应
+            // Normal HTTP response
             let mut response = Response::builder().status(status);
 
             for (key, value) in resp_headers {
@@ -141,15 +141,15 @@ pub async fn handle_request(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("应用 {} 执行失败: {}", app_id, e);
+            tracing::error!("Application {} execution failed: {}", app_id, e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
 }
 
-/// 处理 WebSocket 连接（桥接模式）
+/// Handle WebSocket connection (bridge mode)
 ///
-/// 实现客户端 WebSocket ↔ JavaScript WebSocketServer 的完整双向消息桥接
+/// Implements full bidirectional message bridging between client WebSocket and JavaScript WebSocketServer
 async fn handle_websocket_bridged(
     socket: WebSocket,
     app_id: String,
@@ -164,12 +164,12 @@ async fn handle_websocket_bridged(
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // 创建双向通道
-    // js_to_client: JavaScript 消息 -> 客户端 (注册到 WsServerManager)
+    // Create bidirectional channels
+    // js_to_client: JavaScript message -> client (registered in WsServerManager)
     let (js_to_client_tx, mut js_to_client_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // 注册 WebSocket 连接到 RuntimePool
-    // 注意：我们只需要注册 js_to_client_tx，因为客户端消息通过 dispatch_ws_message 直接发送
+    // Register WebSocket connection in RuntimePool
+    // Note: we only need to register js_to_client_tx, as client messages are sent directly via dispatch_ws_message
     if let Err(e) = app_manager
         .register_ws_connection(&app_id, ws_id.clone(), js_to_client_tx)
         .await
@@ -186,7 +186,7 @@ async fn handle_websocket_bridged(
 
     tracing::debug!("WebSocket connection {} registered successfully", ws_id);
 
-    // 任务 A: 从客户端接收消息 -> 发送到 JavaScript
+    // Task A: Receive message from client -> send to JavaScript
     let app_id_clone = app_id.clone();
     let ws_id_clone = ws_id.clone();
     let app_manager_clone = app_manager.clone();
@@ -209,7 +209,7 @@ async fn handle_websocket_bridged(
                         data.len(),
                         ws_id_clone
                     );
-                    // 将二进制数据转换为 base64 字符串
+                    // Convert binary data to base64 string
                     let base64_data =
                         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
                     let json_message = format!(r#"{{"type":"binary","data":"{}"}}"#, base64_data);
@@ -223,7 +223,7 @@ async fn handle_websocket_bridged(
                 }
                 Ok(Message::Ping(data)) => {
                     tracing::trace!("Received ping (ws_id: {})", ws_id_clone);
-                    // Axum 会自动处理 Pong 响应
+                    // Axum handles Pong responses automatically
                     drop(data);
                 }
                 Ok(Message::Pong(_)) => {
@@ -247,7 +247,7 @@ async fn handle_websocket_bridged(
         tracing::debug!("Client -> JS task ended (ws_id: {})", ws_id_clone);
     });
 
-    // 任务 B: 从 JavaScript 接收消息 -> 发送到客户端
+    // Task B: Receive message from JavaScript -> send to client
     let ws_id_clone = ws_id.clone();
     let js_to_client_task = tokio::spawn(async move {
         use crate::runtime::WsServerMessage;
@@ -293,7 +293,7 @@ async fn handle_websocket_bridged(
         tracing::debug!("JS -> Client task ended (ws_id: {})", ws_id_clone);
     });
 
-    // 等待任一任务完成（表示连接已关闭）
+    // Wait for either task to complete (indicates connection closed)
     tokio::select! {
         _ = client_to_js_task => {
             tracing::debug!("Client task completed first for ws_id: {}", ws_id);
@@ -303,7 +303,7 @@ async fn handle_websocket_bridged(
         }
     }
 
-    // 清理：注销 WebSocket 连接
+    // Cleanup: unregister WebSocket connection
     if let Err(e) = app_manager
         .unregister_ws_connection(&app_id, ws_id.clone())
         .await
@@ -318,7 +318,7 @@ async fn handle_websocket_bridged(
     );
 }
 
-/// 处理调试器会话
+/// Handle debugger session
 async fn handle_inspector_session(
     socket: WebSocket,
     app_id: String,

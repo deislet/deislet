@@ -1,5 +1,5 @@
-// Cache Ops 定义
-// 提供高性能本地缓存功能，基于 moka
+// Cache Ops definitions
+// Provides high-performance local caching based on moka
 
 use deno_core::{extension, op2, OpState};
 use moka::future::Cache;
@@ -8,20 +8,20 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Cache 存储类型
-/// 使用 Arc 包装，支持跨线程共享和异步访问
+/// Cache storage type
+/// Wrapped in Arc to support cross-thread sharing and async access
 pub type CacheStore = Arc<Cache<String, String>>;
 
-/// Cache Get 操作
+/// Cache Get operation
 ///
-/// 从缓存中获取值
+/// Get value from cache
 ///
-/// # 参数
-/// - key: 缓存键
+/// # Parameters
+/// - key: Cache key
 ///
-/// # 返回
-/// - Some(value): 缓存命中
-/// - None: 缓存未命中或已过期
+/// # Returns
+/// - Some(value): Cache hit
+/// - None: Cache miss or expired
 #[op2(async)]
 #[string]
 async fn op_cache_get(state: Rc<RefCell<OpState>>, #[string] key: String) -> Option<String> {
@@ -32,18 +32,18 @@ async fn op_cache_get(state: Rc<RefCell<OpState>>, #[string] key: String) -> Opt
     cache.get(&key).await
 }
 
-/// Cache Set 操作
+/// Cache Set operation
 ///
-/// 设置缓存值
+/// Set cache value
 ///
-/// # 参数
-/// - key: 缓存键
-/// - value: 缓存值
-/// - ttl: 过期时间（秒），目前使用全局 TTL 配置，此参数预留
+/// # Parameters
+/// - key: Cache key
+/// - value: Cache value
+/// - ttl: TTL in seconds, currently uses global TTL config, this parameter is reserved
 ///
-/// # 注意
-/// 当前版本使用创建 Cache 时的全局 TTL 设置
-/// 未来版本将支持 per-entry TTL
+/// # Note
+/// Current version uses global TTL setting from Cache creation
+/// Future versions will support per-entry TTL
 #[op2(async)]
 async fn op_cache_set(
     state: Rc<RefCell<OpState>>,
@@ -59,12 +59,12 @@ async fn op_cache_set(
     cache.insert(key, value).await;
 }
 
-/// Cache Delete 操作
+/// Cache Delete operation
 ///
-/// 删除缓存项
+/// Delete cache item
 ///
-/// # 参数
-/// - key: 缓存键
+/// # Parameters
+/// - key: Cache key
 #[op2(async)]
 async fn op_cache_delete(state: Rc<RefCell<OpState>>, #[string] key: String) {
     let cache = {
@@ -74,16 +74,16 @@ async fn op_cache_delete(state: Rc<RefCell<OpState>>, #[string] key: String) {
     cache.invalidate(&key).await;
 }
 
-/// Cache Has 操作
+/// Cache Has operation
 ///
-/// 检查缓存键是否存在
+/// Check if cache key exists
 ///
-/// # 参数
-/// - key: 缓存键
+/// # Parameters
+/// - key: Cache key
 ///
-/// # 返回
-/// - true: 存在且未过期
-/// - false: 不存在或已过期
+/// # Returns
+/// - true: Exists and not expired
+/// - false: Does not exist or expired
 #[op2(async)]
 async fn op_cache_has(state: Rc<RefCell<OpState>>, #[string] key: String) -> bool {
     let cache = {
@@ -93,9 +93,9 @@ async fn op_cache_has(state: Rc<RefCell<OpState>>, #[string] key: String) -> boo
     cache.contains_key(&key)
 }
 
-/// Cache Clear 操作
+/// Cache Clear operation
 ///
-/// 清空所有缓存
+/// Clear all caches
 #[op2(async)]
 async fn op_cache_clear(state: Rc<RefCell<OpState>>) {
     let cache = {
@@ -103,18 +103,18 @@ async fn op_cache_clear(state: Rc<RefCell<OpState>>) {
         state_borrow.borrow::<CacheStore>().clone()
     };
     cache.invalidate_all();
-    // 等待清理完成
+    // Wait for cleanup completion
     cache.run_pending_tasks().await;
 }
 
-/// Cache 统计信息
+/// Cache statistics
 ///
-/// 返回缓存的统计数据
+/// Returns cache statistics
 ///
-/// # 返回
-/// JSON 对象包含：
-/// - entry_count: 当前条目数
-/// - weighted_size: 加权大小
+/// # Returns
+/// JSON object containing:
+/// - entry_count: Current number of entries
+/// - weighted_size: Weighted size
 #[op2(async)]
 #[serde]
 async fn op_cache_stats(state: Rc<RefCell<OpState>>) -> serde_json::Value {
@@ -123,7 +123,7 @@ async fn op_cache_stats(state: Rc<RefCell<OpState>>) -> serde_json::Value {
         state_borrow.borrow::<CacheStore>().clone()
     };
 
-    // 确保 pending tasks 完成以获取准确统计
+    // Ensure pending tasks complete to get accurate statistics
     cache.run_pending_tasks().await;
 
     serde_json::json!({
@@ -132,7 +132,7 @@ async fn op_cache_stats(state: Rc<RefCell<OpState>>) -> serde_json::Value {
     })
 }
 
-// 定义 cache extension
+// Define cache extension
 extension!(
     denix_cache_ops,
     ops = [
@@ -145,19 +145,19 @@ extension!(
     ],
 );
 
-/// 初始化 cache ops extension
+/// Initialize cache ops extension
 pub fn init_cache_extension() -> deno_core::Extension {
     denix_cache_ops::init()
 }
 
-/// 创建 CacheStore 实例
+/// Create CacheStore instance
 ///
-/// # 参数
-/// - max_capacity: 最大容量（条目数）
-/// - tti: 空闲过期时间（秒），0 表示不设置
+/// # Parameters
+/// - max_capacity: Maximum capacity (number of entries)
+/// - tti: Time-to-idle (seconds), 0 for none
 ///
-/// # 返回
-/// CacheStore 实例
+/// # Returns
+/// CacheStore instance
 pub fn create_cache_store(max_capacity: u64, tti: u64) -> CacheStore {
     let mut builder = Cache::builder().max_capacity(max_capacity);
 

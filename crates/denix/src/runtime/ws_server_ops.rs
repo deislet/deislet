@@ -1,5 +1,5 @@
-// WebSocket Server Ops 定义
-// 提供服务端 WebSocket 功能，允许 JavaScript 应用接收客户端 WebSocket 连接
+// WebSocket Server Ops definitions
+// Provides server-side WebSocket functionality, allowing JavaScript apps to receive client connections
 
 use deno_core::{extension, op2, OpState};
 use serde::{Deserialize, Serialize};
@@ -10,60 +10,60 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
-/// WebSocket 服务端连接 ID
+/// WebSocket server connection ID
 pub type WsConnectionId = String;
 
-/// WebSocket 服务端消息
+/// WebSocket server message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WsServerMessage {
-    /// 文本消息
+    /// Text message
     Text(String),
-    /// 二进制消息
+    /// Binary message
     Binary(Vec<u8>),
-    /// 关闭连接
+    /// Close connection
     Close { code: u16, reason: String },
 }
 
-/// WebSocket 服务端连接管理器
-/// 存储每个连接的发送通道
+/// WebSocket server connection manager
+/// Stores send channels for each connection
 pub type WsServerManager =
     Arc<RwLock<HashMap<WsConnectionId, mpsc::UnboundedSender<WsServerMessage>>>>;
 
-/// 创建 WebSocket 服务端管理器
+/// Create WebSocket server manager
 pub fn create_ws_server_manager() -> WsServerManager {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-/// WebSocket 服务端接受连接
+/// WebSocket server accept connection
 ///
-/// 标记 WebSocket 连接已被接受
+/// Mark WebSocket connection as accepted
 ///
-/// # 参数
-/// - ws_id: WebSocket 连接 ID
+/// # Parameters
+/// - ws_id: WebSocket connection ID
 ///
-/// # 返回
-/// - JSON 对象: { success: bool, error?: string }
+/// # Returns
+/// - JSON object: { success: bool, error?: string }
 #[op2]
 #[serde]
 fn op_ws_server_accept(_state: Rc<RefCell<OpState>>, #[string] ws_id: String) -> JsonValue {
     tracing::debug!("WebSocket server accept: {}", ws_id);
 
-    // 简单标记接受（实际的接受逻辑在 gateway 层）
+    // Simply mark as accepted (actual accept logic is in the gateway layer)
     serde_json::json!({
         "success": true
     })
 }
 
-/// WebSocket 服务端发送消息
+/// WebSocket server send message
 ///
-/// 向客户端发送消息
+/// Send message to client
 ///
-/// # 参数
-/// - ws_id: WebSocket 连接 ID
-/// - message: 要发送的消息
+/// # Parameters
+/// - ws_id: WebSocket connection ID
+/// - message: Message to send
 ///
-/// # 返回
-/// - JSON 对象: { success: bool, error?: string }
+/// # Returns
+/// - JSON object: { success: bool, error?: string }
 #[op2(async)]
 #[serde]
 async fn op_ws_server_send(
@@ -71,7 +71,7 @@ async fn op_ws_server_send(
     #[string] ws_id: String,
     #[string] message: String,
 ) -> JsonValue {
-    // 获取 WebSocket 服务端管理器
+    // Get WebSocket server manager
     let ws_manager = {
         let state_borrow = state.borrow();
         match state_borrow.try_borrow::<WsServerManager>() {
@@ -85,7 +85,7 @@ async fn op_ws_server_send(
         }
     };
 
-    // 查找连接
+    // Find connection
     let manager = ws_manager.read().await;
     match manager.get(&ws_id) {
         Some(tx) => {
@@ -106,7 +106,7 @@ async fn op_ws_server_send(
     }
 }
 
-/// WebSocket 关闭请求
+/// WebSocket close request
 #[derive(Debug, Deserialize)]
 struct WsCloseRequest {
     ws_id: String,
@@ -114,22 +114,22 @@ struct WsCloseRequest {
     reason: String,
 }
 
-/// WebSocket 服务端关闭连接
+/// WebSocket server close connection
 ///
-/// 关闭客户端连接
+/// Close client connection
 ///
-/// # 参数
-/// - request_json: 关闭请求的 JSON 字符串
+/// # Parameters
+/// - request_json: JSON string of the close request
 ///
-/// # 返回
-/// - JSON 对象: { success: bool, error?: string }
+/// # Returns
+/// - JSON object: { success: bool, error?: string }
 #[op2(async)]
 #[serde]
 async fn op_ws_server_close(
     state: Rc<RefCell<OpState>>,
     #[string] request_json: String,
 ) -> JsonValue {
-    // 解析请求
+    // Parse request
     let request: WsCloseRequest = match serde_json::from_str(&request_json) {
         Ok(req) => req,
         Err(e) => {
@@ -140,7 +140,7 @@ async fn op_ws_server_close(
         }
     };
 
-    // 获取 WebSocket 服务端管理器
+    // Get WebSocket server manager
     let ws_manager = {
         let state_borrow = state.borrow();
         match state_borrow.try_borrow::<WsServerManager>() {
@@ -159,7 +159,7 @@ async fn op_ws_server_close(
         reason: request.reason,
     };
 
-    // 查找连接并发送关闭消息
+    // Find connection and send close message
     let manager = ws_manager.read().await;
     match manager.get(&request.ws_id) {
         Some(tx) => {
@@ -175,13 +175,13 @@ async fn op_ws_server_close(
     }
 }
 
-// 定义 ws_server extension
+// Define ws_server extension
 extension!(
     denix_ws_server_ops,
     ops = [op_ws_server_accept, op_ws_server_send, op_ws_server_close],
 );
 
-/// 初始化 ws_server ops extension
+/// Initialize ws_server ops extension
 pub fn init_ws_server_extension() -> deno_core::Extension {
     denix_ws_server_ops::init()
 }

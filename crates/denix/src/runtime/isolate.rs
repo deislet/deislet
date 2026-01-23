@@ -1,4 +1,4 @@
-// V8 Runtime Isolate 封装
+// V8 Runtime Isolate wrapper
 
 use super::cache_ops::{create_cache_store, CacheStore};
 use super::loader::DbModuleLoader;
@@ -94,8 +94,8 @@ impl AppRuntime {
         let op_metrics = Rc::new(OpMetricsSummaryTracker::default());
         let op_metrics_tracker = op_metrics.clone();
 
-        // 速率限制器 (默认 1000 ops/sec)
-        // TODO: 从配置中读取
+        // Rate limiter (default 1000 ops/sec)
+        // TODO: Read from configuration
         let limiter = Arc::new(Mutex::new(RateLimiter::new(1000.0)));
         let isolate_handle_cell = Arc::new(OnceCell::<deno_core::v8::IsolateHandle>::new());
         let isolate_handle_cell_clone = isolate_handle_cell.clone();
@@ -115,12 +115,12 @@ impl AppRuntime {
             let callback = move |ctx: &_,
                                  event: deno_core::OpMetricsEvent,
                                  source: deno_core::OpMetricsSource| {
-                // 先调用原始 tracker
+                // Call the original tracker first
                 if let Some(ref f) = tracker_fn {
                     f(ctx, event, source);
                 }
 
-                // 只检查 Dispatched 事件
+                // Only check Dispatched events
                 if event == deno_core::OpMetricsEvent::Dispatched {
                     let mut limiter = limiter.lock().unwrap();
                     if !limiter.check() {
@@ -146,7 +146,7 @@ impl AppRuntime {
             ..Default::default()
         });
 
-        // 初始化 Handle
+        // Initialize Handle
         let _ = isolate_handle_cell.set(runtime.v8_isolate().thread_safe_handle());
 
         {
@@ -213,7 +213,7 @@ impl AppRuntime {
             );
         }
 
-        // 配置 OOM 处理：当堆内存接近上限时，终止执行而不是直接 panic
+        // Configure OOM handling: terminate execution when heap memory is near limit instead of panicking
         if memory_limit_mb.is_some() {
             let handle = runtime.v8_isolate().thread_safe_handle();
             let app_id_clone = app_id.clone();
@@ -227,10 +227,10 @@ impl AppRuntime {
                     initial
                 );
 
-                // 终止执行
+                // Terminate execution
                 handle.terminate_execution();
 
-                // 返回当前值+10MB，给 V8 一点喘息空间以便完成终止流程，避免立即 Crash
+                // Return current value + 10MB to give V8 space to complete termination and avoid immediate crash
                 current + 10 * 1024 * 1024
             });
         }
@@ -251,10 +251,11 @@ impl AppRuntime {
             return Ok(());
         }
 
-        // 如果快照已加载，则跳过 bootstrap 加载（因为已经包含在快照中）
+        // Skip bootstrap load if snapshot is already loaded
         if !self.snapshot_loaded {
-            let bootstrap_specifier =
-                deno_core::ModuleSpecifier::parse("ext:denix_bootstrap/src/runtime/js/bootstrap.js")?;
+            let bootstrap_specifier = deno_core::ModuleSpecifier::parse(
+                "ext:denix_bootstrap/src/runtime/js/bootstrap.js",
+            )?;
             let bootstrap_id = self
                 .runtime
                 .load_side_es_module(&bootstrap_specifier)
@@ -308,7 +309,7 @@ impl AppRuntime {
         Ok(())
     }
 
-    /// 连接调试器
+    /// Connect debugger
     pub fn connect_inspector(
         &mut self,
     ) -> Result<(
@@ -379,12 +380,12 @@ impl AppRuntime {
 
         let promise = self.runtime.execute_script("<fetch>", code)?;
 
-        // 设置执行超时 (默认 30秒)
-        // TODO: 从配置中读取超时时间
+        // Set execution timeout (default 30 seconds)
+        // TODO: Read timeout from configuration
         let timeout_ms = 30_000;
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
 
-        // 启动超时监控任务
+        // Start timeout monitoring task
         let timeout_task = tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
             tracing::warn!(
@@ -400,10 +401,10 @@ impl AppRuntime {
             .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
             .await;
 
-        // 取消超时任务
+        // Cancel timeout task
         timeout_task.abort();
 
-        // 检查结果
+        // Check results
         result?;
 
         let json_str = {

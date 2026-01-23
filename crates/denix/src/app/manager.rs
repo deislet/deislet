@@ -1,4 +1,4 @@
-// 应用管理器
+// Application manager
 
 use super::types::{App, AppConfig, AppState};
 use crate::app_repo::AppRepo;
@@ -9,16 +9,16 @@ use deno_core::OpMetricsSummary;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// 应用管理器
+/// Application manager
 pub struct ApplicationManager {
     apps: DashMap<String, App>,
     runtime_pool: Arc<RuntimePool>,
-    // 调试会话: app_id -> (token, expires_at)
+    // Debug sessions: app_id -> (token, expires_at)
     inspect_sessions: DashMap<String, (String, SystemTime)>,
 }
 
 impl ApplicationManager {
-    /// 创建新的应用管理器
+    /// Create a new application manager
     pub fn new() -> Self {
         Self::with_threads(None)
     }
@@ -27,7 +27,7 @@ impl ApplicationManager {
         Self::with_threads_and_repo(None, app_repo)
     }
 
-    /// 创建新的应用管理器（指定线程数）
+    /// Create a new application manager (with specified thread count)
     pub fn with_threads(num_threads: Option<usize>) -> Self {
         Self {
             apps: DashMap::new(),
@@ -44,7 +44,7 @@ impl ApplicationManager {
         }
     }
 
-    /// 加载应用
+    /// Load application
     pub async fn load_app(
         &self,
         id: String,
@@ -52,14 +52,14 @@ impl ApplicationManager {
         config: AppConfig,
         entry_point: Option<String>,
     ) -> Result<()> {
-        // 检查应用是否已存在
+        // Check if application already exists
         if self.apps.contains_key(&id) {
             return Err(anyhow!("App {} already exists", id));
         }
 
         tracing::info!("Loading app: {}", id);
 
-        // 创建应用信息
+        // Create application information
         let now = SystemTime::now();
         let mut app_info = App {
             id: id.clone(),
@@ -70,7 +70,7 @@ impl ApplicationManager {
             error: None,
         };
 
-        // 在 runtime pool 中加载应用
+        // Load application in runtime pool
         let memory_limit = config.limits.as_ref().map(|l| l.memory_mb);
         let resource_table_max = config.limits.as_ref().and_then(|l| l.resource_table_max);
         match self
@@ -103,20 +103,20 @@ impl ApplicationManager {
         }
     }
 
-    /// 开启调试会话
+    /// Start debug session
     pub fn start_inspect(&self, app_id: String, ttl_seconds: u64) -> Result<(String, String)> {
-        // 检查应用是否已存在
+        // Check if application exists
         if !self.apps.contains_key(&app_id) {
             return Err(anyhow!("App {} not found", app_id));
         }
 
-        // 生成 Token
+        // Generate token
         let token = uuid::Uuid::new_v4().to_string();
         let expires_at = SystemTime::now() + std::time::Duration::from_secs(ttl_seconds);
 
         let inspect_app_id = format!("_inspect:{}", app_id);
 
-        // 存储会话
+        // Store session
         self.inspect_sessions
             .insert(app_id.clone(), (token.clone(), expires_at));
 
@@ -130,7 +130,7 @@ impl ApplicationManager {
         Ok((inspect_app_id, token))
     }
 
-    /// 验证调试 Token
+    /// Validate debug token
     pub fn validate_inspect_token(&self, app_id: &str, token: &str) -> bool {
         if let Some(entry) = self.inspect_sessions.get(app_id) {
             let (stored_token, expires_at) = entry.value();
@@ -141,7 +141,7 @@ impl ApplicationManager {
         false
     }
 
-    /// 连接调试器
+    /// Connect debugger
     pub async fn connect_inspector(
         &self,
         app_id: &str,
@@ -152,14 +152,14 @@ impl ApplicationManager {
         self.runtime_pool.connect_inspector(app_id).await
     }
 
-    /// 卸载应用
+    /// Unload application
     pub async fn unload_app(&self, id: &str) -> Result<()> {
         tracing::info!("Unloading app: {}", id);
 
-        // 从 runtime pool 中卸载
+        // Unload from runtime pool
         self.runtime_pool.unload_app(id).await?;
 
-        // 移除应用信息
+        // Remove application information
         match self.apps.remove(id) {
             Some(_) => {
                 tracing::info!("App {} unloaded successfully", id);
@@ -169,7 +169,7 @@ impl ApplicationManager {
         }
     }
 
-    /// 更新应用
+    /// Update application
     pub async fn update_app(
         &self,
         id: &str,
@@ -184,14 +184,14 @@ impl ApplicationManager {
             .get(id)
             .ok_or_else(|| anyhow!("App {} not found", id))?;
 
-        // 获取当前配置
+        // Get current configuration
         let current_config = config.unwrap_or_else(|| entry.config.clone());
         drop(entry);
 
-        // 在 runtime pool 中卸载旧版本
+        // Unload old version from runtime pool
         self.runtime_pool.unload_app(id).await?;
 
-        // 加载新版本
+        // Load new version
         let memory_limit = current_config.limits.as_ref().map(|l| l.memory_mb);
         let resource_table_max = current_config
             .limits
@@ -209,7 +209,7 @@ impl ApplicationManager {
             )
             .await?;
 
-        // 更新应用信息
+        // Update application information
         if let Some(mut entry) = self.apps.get_mut(id) {
             entry.state = AppState::Running;
             entry.config = current_config;
@@ -221,7 +221,7 @@ impl ApplicationManager {
         Ok(())
     }
 
-    /// 执行应用
+    /// Execute application
     pub async fn execute_app(
         &self,
         id: &str,
@@ -249,24 +249,24 @@ impl ApplicationManager {
 
         drop(entry);
 
-        // 通过 runtime pool 执行请求
+        // Execute request via runtime pool
         self.runtime_pool
             .execute_request(id, url, method, headers, body)
             .await
     }
 
-    /// 获取应用信息
+    /// Get application information
     #[allow(dead_code)]
     pub fn get_app(&self, id: &str) -> Option<App> {
         self.apps.get(id).map(|entry| entry.clone())
     }
 
-    /// 列出所有应用
+    /// List all applications
     pub fn list_apps(&self) -> Vec<App> {
         self.apps.iter().map(|entry| entry.clone()).collect()
     }
 
-    /// 获取统计信息
+    /// Get statistics
     #[allow(dead_code)]
     pub async fn get_stats(&self) -> serde_json::Value {
         let apps: Vec<App> = self.apps.iter().map(|entry| entry.clone()).collect();
@@ -280,7 +280,7 @@ impl ApplicationManager {
             "loading": apps.iter().filter(|a| a.state == AppState::Loading).count(),
         });
 
-        // 添加线程池统计
+        // Add thread pool statistics
         if let Some(obj) = stats.as_object_mut() {
             obj.insert(
                 "pool".to_string(),
@@ -291,7 +291,7 @@ impl ApplicationManager {
         stats
     }
 
-    /// 获取各应用的 OpMetrics 汇总
+    /// Get aggregate OpMetrics for each application
     pub async fn get_op_metrics(&self) -> Vec<(String, OpMetricsSummary)> {
         let app_ids: Vec<String> = self.apps.iter().map(|entry| entry.key().clone()).collect();
         let mut results = Vec::new();
@@ -314,14 +314,14 @@ impl ApplicationManager {
         results
     }
 
-    /// 注册 WebSocket 连接
+    /// Register WebSocket connection
     ///
-    /// 建立 Gateway 和 JavaScript WebSocketServer 之间的双向消息通道
+    /// Establish bidirectional message channel between Gateway and JavaScript WebSocketServer
     ///
-    /// # 参数
-    /// - app_id: 应用 ID
-    /// - ws_id: WebSocket 连接 ID
-    /// - js_to_client_tx: JavaScript 发送消息到客户端的通道
+    /// # Parameters
+    /// - app_id: Application ID
+    /// - ws_id: WebSocket connection ID
+    /// - js_to_client_tx: Channel for JavaScript to send messages to the client
     pub async fn register_ws_connection(
         &self,
         app_id: &str,
@@ -333,12 +333,12 @@ impl ApplicationManager {
             .await
     }
 
-    /// 发送 WebSocket 消息到 JavaScript
+    /// Send WebSocket message to JavaScript
     ///
-    /// # 参数
-    /// - app_id: 应用 ID
-    /// - ws_id: WebSocket 连接 ID
-    /// - message: 消息内容
+    /// # Parameters
+    /// - app_id: Application ID
+    /// - ws_id: WebSocket connection ID
+    /// - message: Message content
     pub async fn send_ws_message(
         &self,
         app_id: &str,
@@ -350,11 +350,11 @@ impl ApplicationManager {
             .await
     }
 
-    /// 注销 WebSocket 连接
+    /// Unregister WebSocket connection
     ///
-    /// # 参数
-    /// - app_id: 应用 ID
-    /// - ws_id: WebSocket 连接 ID
+    /// # Parameters
+    /// - app_id: Application ID
+    /// - ws_id: WebSocket connection ID
     pub async fn unregister_ws_connection(&self, app_id: &str, ws_id: String) -> Result<()> {
         self.runtime_pool
             .unregister_ws_connection(app_id, ws_id)
