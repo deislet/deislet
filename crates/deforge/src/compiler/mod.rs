@@ -50,7 +50,7 @@ impl Compiler {
         Ok(result)
     }
 
-    pub fn compile(
+    pub async fn compile(
         &self,
         project_dir: &Path,
         vendors: Vec<String>,
@@ -69,14 +69,62 @@ impl Compiler {
         let mut builds = HashMap::new();
 
         for vendor in target_vendors {
-            let build = self.build_for_vendor(project_dir, &vendor, &config, minify)?;
+            let mut build = self.build_for_vendor(project_dir, &vendor, &config, minify)?;
+
+            // Iron Forge: Perform Rolldown Bundling
+            let (platform, entry_file) = match vendor.as_str() {
+                "cloudflare" => (TargetPlatform::Cloudflare, "index.ts"),
+                "deno" => (TargetPlatform::Deno, "main.ts"),
+                "tencent" => (TargetPlatform::EdgeOne, "index.ts"),
+                _ => (TargetPlatform::Cloudflare, "index.ts"),
+            };
+
+            let output_dir = Path::new(&build.output_path);
+            let entry_path = output_dir.join(entry_file);
+
+            if entry_path.exists() {
+                println!("{}", format!("  ⚡ Bundling for {}...", vendor).dimmed());
+                
+                // For EdgeOne, bundling is mandatory. For others, it's an optimization.
+                // We bundle for everyone to ensure self-contained artifacts.
+                let bundler = DeforgeBundler::new(&entry_path, platform);
+                
+                match bundler.bundle().await {
+                    Ok(bundled_code) => {
+                        // Output bundled file as .js
+                        // For Deno, we keep main.ts but maybe main.bundle.js is better?
+                        // But Deno Deploy config points to main.ts. 
+                        // Actually Deno runs TS directly, so bundling is optional but good for performance.
+                        // Let's stick to .js for bundled output.
+                        let output_filename = if vendor == "deno" { "main.bundle.js" } else { "index.js" };
+                        let output_file = output_dir.join(output_filename);
+                        
+                        fs::write(&output_file, bundled_code)?;
+                        
+                        println!("{}", format!("  ✓ Bundled to {}", output_filename).green());
+                        
+                        // Update config files to point to bundled file if necessary
+                        if vendor == "cloudflare" {
+                            // Update wrangler.toml main = "index.js"
+                            self.update_wrangler_toml(output_dir, "index.js")?;
+                        } else if vendor == "deno" {
+                            // Update deno.json task to run bundle
+                            self.update_deno_json(output_dir, "main.bundle.js")?;
+                        }
+                    },
+                    Err(e) => {
+                        println!("{}", format!("  ⚠ Bundling failed: {}", e).yellow());
+                        // For EdgeOne, this is critical error
+                        if vendor == "tencent" {
+                            return Err(anyhow::anyhow!("EdgeOne bundling failed: {}", e));
+                        }
+                    }
+                }
+            }
 
             // Verify artifacts (Smoke Test)
-            if let Err(e) = self.verify_artifacts(&vendor, Path::new(&build.output_path)) {
-                println!(
-                    "{}",
-                    format!("  ⚠ Verification failed for {}: {}", vendor, e).yellow()
-                );
+            if let Err(e) = self.verify_artifacts(&vendor, output_dir) {
+                println!("{}", format!("  ⚠ Verification failed for {}: {}", vendor, e).yellow());
             }
 
             builds.insert(vendor, build);
@@ -87,6 +135,26 @@ impl Compiler {
             builds,
             errors: Vec::new(),
         })
+    }
+
+    fn update_wrangler_toml(&self, dir: &Path, new_main: &str) -> anyhow::Result<()> {
+        let path = dir.join("wrangler.toml");
+        if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            let new_content = content.replace("main = \"index.ts\"", &format!("main = \"{}\"", new_main));
+            fs::write(path, new_content)?;
+        }
+        Ok(())
+    }
+
+    fn update_deno_json(&self, dir: &Path, new_main: &str) -> anyhow::Result<()> {
+        let path = dir.join("deno.json");
+        if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            let new_content = content.replace("main.ts", new_main);
+            fs::write(path, new_content)?;
+        }
+        Ok(())
     }
 
     fn verify_artifacts(&self, vendor: &str, output_dir: &Path) -> anyhow::Result<()> {

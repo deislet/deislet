@@ -92,6 +92,10 @@ tracing-subscriber = "0.3"
 # Utilities
 chrono = "0.4"
 
+# Bundler
+rolldown = { path = "/ext/deislet/resource/rolldown/crates/rolldown", features = ["experimental"] }
+rolldown_common = { path = "/ext/deislet/resource/rolldown/crates/rolldown_common" }
+
 [profile.release]
 opt-level = 3
 lto = true
