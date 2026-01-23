@@ -261,7 +261,7 @@ impl Compiler {
             
             // Add to routes
             if !handler_path.ends_with(".wasm") {
-                let route = crate::compiler::transformer::Transformer::filename_to_route(relative_path.to_str().unwrap(), "");
+                let route = Transformer::filename_to_route(relative_path.to_str().unwrap(), "");
                 // Use relative path for import (from _deforge_internal/router.ts to src/...)
                 let import_path = format!("../src/{}", relative_path.to_string_lossy());
                 // Fix Windows paths for JS import
@@ -341,6 +341,33 @@ impl Compiler {
         } else {
             // For Deno, we rely on the written files in _deforge_internal/
             // deno.json points to _deforge_internal/router.ts
+        }
+
+        // Cleanup for Bundled targets (CF, EO, Denix)
+        if vendor != "deno" {
+            // Delete _deforge_internal
+            let system_dir = output_dir.join("_deforge_internal");
+            if system_dir.exists() {
+                fs::remove_dir_all(system_dir)?;
+            }
+            
+            // Cleanup source files in src/ but keep assets
+            let src_dir = output_dir.join("src");
+            if src_dir.exists() {
+                for entry in WalkDir::new(&src_dir).contents_first(true) {
+                    let entry = entry?;
+                    if entry.file_type().is_file() {
+                        if let Some(ext) = entry.path().extension() {
+                            if ext == "ts" || ext == "js" {
+                                fs::remove_file(entry.path())?;
+                            }
+                        }
+                    } else if entry.file_type().is_dir() {
+                        // Try to remove dir (succeeds only if empty)
+                        let _ = fs::remove_dir(entry.path());
+                    }
+                }
+            }
         }
 
         Ok(VendorBuild {
