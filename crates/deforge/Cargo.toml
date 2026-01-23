@@ -64,14 +64,14 @@ anyhow = "1.0"
 thiserror = "1.0"
 
 # Parser and compiler
-swc_core = "0.90"
-swc_common = "0.33"
-swc_ecma_ast = "0.110"
-swc_ecma_parser = "0.141"
-swc_ecma_visit = "0.96"
+swc_core = "0.100"
+swc_common = "18.0"
+swc_ecma_ast = "20.0"
+swc_ecma_parser = "33.0"
+swc_ecma_visit = "20.0"
 
 # Serialization
-serde = { version = "=1.0.188", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 

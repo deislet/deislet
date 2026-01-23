@@ -1,7 +1,7 @@
 use deforge_core::HandlerInfo;
 use swc_common::{sync::Lrc, FileName, SourceMap};
 use swc_ecma_ast::*;
-use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsConfig};
+use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
 pub struct TypeScriptParser {
@@ -18,14 +18,10 @@ impl TypeScriptParser {
     pub fn parse(&self, code: &str, filename: &str) -> anyhow::Result<HandlerInfo> {
         let source_file = self
             .source_map
-            .new_source_file(FileName::Custom(filename.to_string()), code.to_string());
+            .new_source_file(FileName::Custom(filename.to_string()).into(), code.to_string());
 
         let lexer = Lexer::new(
-            Syntax::Typescript(TsConfig {
-                tsx: false,
-                decorators: false,
-                ..Default::default()
-            }),
+            Syntax::Typescript(Default::default()),
             EsVersion::Es2022,
             StringInput::from(&*source_file),
             None,
@@ -148,7 +144,7 @@ impl Visit for HandlerVisitor {
     }
 
     fn visit_import_decl(&mut self, n: &ImportDecl) {
-        self.imports.push(n.src.value.to_string());
+        self.imports.push(n.src.value.to_string_lossy().to_string());
     }
 
     fn visit_expr(&mut self, n: &Expr) {
