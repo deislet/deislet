@@ -1,6 +1,8 @@
-# DeniCTL Architecture
+# Deforge Architecture
 
-本文档详细描述 DeniCTL 的技术架构和实现细节。
+本文档详细描述 Deforge 的技术架构和实现细节。
+
+> **注**: Deforge 是一个专注的代码编译器，将标准代码翻译为平台特定代码。
 
 ## 整体架构
 
@@ -14,12 +16,13 @@
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    DeniCTL Compiler                         │
+│                    Deforge Compiler                         │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │   Parser     │→ │  Validator   │→ │ Transformer  │     │
+│  │  Rolldown    │→ │  Validator   │→ │   Adapters   │     │
+│  │   Bundler    │  │  (Optional)  │  │  (spec.mdc)  │     │
 │  └──────────────┘  └──────────────┘  └──────────────┘     │
 │         ↓                  ↓                  ↓             │
-│  Parse AST        Check Rules        Generate Code         │
+│  Bundle Code      Check Rules      Platform Code           │
 └─────────────────────────────────────────────────────────────┘
                            │
            ┌───────────────┼───────────────┐

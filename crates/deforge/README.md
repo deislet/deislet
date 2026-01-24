@@ -26,12 +26,16 @@
 ```
 deforge/
 ├── crates/
-│   ├── deforge/           # CLI 可执行文件 (validate + build)
-│   ├── deforge-core/      # 核心类型定义
-│   ├── deforge-parser/    # TypeScript/JavaScript 解析器 (SWC)
-│   ├── deforge-compiler/  # 代码验证和转换
-│   └── deforge-adapters/  # 平台适配器代码生成
+│   ├── deforge/              # CLI 可执行文件 (validate + build)
+│   ├── deforge-core/         # 核心类型定义
+│   ├── deforge-compiler/     # 编译器和打包器 (Rolldown)
+│   ├── deforge-adapter-cf/   # Cloudflare Workers 适配器 (spec.mdc)
+│   ├── deforge-adapter-dc/   # Deno Deploy 适配器 (spec.mdc)
+│   └── deforge-adapter-eo/   # EdgeOne Pages 适配器 (spec.mdc)
+└── crates/ADAPTER_SPECS.md   # 平台规范文档
 ```
+
+每个适配器都有对应的 `spec.mdc` 文件，详细定义了平台的入口格式、API、限制和最佳实践。
 
 ## 🚀 快速开始
 
@@ -99,9 +103,10 @@ dist/
 │   ├── deno.json             # Deno 配置
 │   └── src/                  # 转换后的代码
 └── tencent/
-    ├── index.ts              # EdgeOne 路由器
-    ├── edgeone.toml          # EdgeOne 配置
-    └── src/                  # 转换后的代码
+    ├── edge-functions/
+    │   └── index.js          # EdgeOne Pages 入口点
+    ├── edgeone.json          # EdgeOne 配置
+    └── src/                  # 转换后的代码和静态资源
 ```
 
 ## 📝 输入格式
@@ -307,6 +312,27 @@ zone_id = "your-zone-id"
 - **构建速度**: ~5s (100 个handlers)
 - **二进制大小**: ~15MB (release)
 - **内存占用**: ~30MB
+
+## 📚 平台规范文档
+
+每个平台适配器都有详细的规范文档 (`spec.mdc`)，确保生成的代码完全符合平台要求：
+
+- **Cloudflare Workers** (`crates/deforge-adapter-cf/spec.mdc`)
+  - 基于 https://developers.cloudflare.com/workers/llms-full.txt
+  - Modules syntax: `export default { fetch(request, env, ctx) }`
+  - 支持 KV, D1, R2, Durable Objects
+
+- **Deno Deploy** (`crates/deforge-adapter-dc/spec.mdc`)
+  - 基于 https://docs.deno.com/llms-full.txt
+  - Entry format: `Deno.serve(async (req: Request) => Response)`
+  - 支持 Deno KV, Node.js 兼容层
+
+- **EdgeOne Pages** (`crates/deforge-adapter-eo/spec.mdc`)
+  - 基于 EdgeOne Pages 官方文档
+  - Entry format: `export function onRequest(context)`
+  - 支持 Edge Functions + Node Functions
+
+详细对比和使用指南请参阅 [`crates/ADAPTER_SPECS.md`](./crates/ADAPTER_SPECS.md)
 
 ## 🤝 贡献
 
