@@ -205,6 +205,81 @@ impl Compiler {
         vendors
     }
 
+    /// 从项目配置中检测使用的特性
+    fn detect_required_features(&self, config: &ProjectConfig) -> Vec<Feature> {
+        let mut features = Vec::new();
+
+        // 检测服务配置
+        if let Some(ref services) = config.services {
+            if let Some(ref kv) = services.kv {
+                if kv.enabled {
+                    features.push(Feature::KVStorage);
+                }
+            }
+            if let Some(ref db) = services.database {
+                if db.enabled {
+                    features.push(Feature::SQLDatabase);
+                }
+            }
+        }
+
+        // 检测运行时特性
+        if config.runtime.contains("node") {
+            features.push(Feature::NodeRuntime);
+        }
+
+        // TODO: 未来可以从代码分析中检测更多特性使用
+        // - SSR: 检测是否使用了渲染框架
+        // - ISR: 检测是否配置了增量静态再生
+        // - CronJobs: 检测是否有定时任务定义
+        // - WebSockets: 检测代码中是否使用了 WebSocket API
+        // - 等等
+
+        features
+    }
+
+    /// 验证平台是否支持所需特性
+    fn validate_platform_capabilities(
+        &self,
+        vendor: &str,
+        features: &[Feature],
+    ) -> anyhow::Result<()> {
+        let platform = match vendor {
+            "cloudflare" => Platform::Cloudflare,
+            "deno" => Platform::Deno,
+            "tencent" => Platform::Tencent,
+            _ => {
+                // 未知平台，跳过验证
+                return Ok(());
+            }
+        };
+
+        let caps = PlatformCapabilities::new(platform);
+
+        // 检查所有特性
+        match caps.check_features(features) {
+            Ok(_) => Ok(()),
+            Err(errors) => {
+                // 显示详细的错误信息
+                eprintln!("\n{}", "✗ Platform capability validation failed".red().bold());
+                eprintln!(
+                    "{} cannot be deployed to {} due to unsupported features:\n",
+                    "Project".yellow(),
+                    platform.display_name().cyan()
+                );
+
+                for (i, error) in errors.iter().enumerate() {
+                    eprintln!("{}. {}\n", i + 1, error.detailed_message());
+                }
+
+                Err(anyhow::anyhow!(
+                    "Platform {} does not support required features",
+                    platform.display_name()
+                ))
+            }
+        }
+    }
+
     async fn build_for_vendor(
         &self,
         project_dir: &Path,
@@ -212,6 +287,10 @@ impl Compiler {
         config: &ProjectConfig,
         _minify: bool,
     ) -> anyhow::Result<VendorBuild> {
+        // 验证平台能力
+        let required_features = self.detect_required_features(config);
+        self.validate_platform_capabilities(vendor, &required_features)?;
+
         let output_dir = project_dir
             .join(
                 config

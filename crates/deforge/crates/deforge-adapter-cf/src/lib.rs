@@ -109,7 +109,7 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
         ));
     }
 
-    let kv_import = if has_kv {
+    let _kv_import = if has_kv {
         "import { createKVAdapter } from './adapters/kv-adapter';\n"
     } else {
         ""

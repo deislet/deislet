@@ -1,8 +1,6 @@
 use anyhow::Result;
 use rolldown::{Bundler, BundlerOptions, InputItem, Platform, OutputFormat};
 use rolldown_common::Output;
-use std::path::Path;
-use std::sync::Arc;
 
 pub enum TargetPlatform {
     Cloudflare,
