@@ -188,8 +188,10 @@ function parseCookies(request: Request): any {{
 
   if (cookieHeader) {{
     cookieHeader.split(';').forEach(cookie => {{
-      const [name, ...rest] = cookie.split('=');
-      cookies[name.trim()] = rest.join('=').trim();
+      const parts = cookie.split('=');
+      const name = parts[0];
+      const value = parts.slice(1).join('=');
+      cookies[name.trim()] = value.trim();
     }});
   }}
 
@@ -197,7 +199,15 @@ function parseCookies(request: Request): any {{
     get(name: string) {{ return cookies[name]; }},
     set(name: string, value: string) {{ cookies[name] = value; }},
     delete(name: string) {{ delete cookies[name]; }},
-    getAll() {{ return {{ ...cookies }}; }}
+    getAll() {{
+      const result: Record<string, string> = {{}};
+      for (const key in cookies) {{
+        if (cookies.hasOwnProperty(key)) {{
+          result[key] = cookies[key];
+        }}
+      }}
+      return result;
+    }}
   }};
 }}
 "#
