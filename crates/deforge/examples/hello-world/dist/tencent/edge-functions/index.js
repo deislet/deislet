@@ -1,23 +1,24 @@
 //#region dist/tencent/_deforge_internal/adapters/context-builder.ts
 /**
-* EdgeOne Context Builder
+* EdgeOne Context Enhancer
+* Enhances the EdgeOne context with additional utilities
 */
-function createContextBuilder(event) {
-	return function buildContext(request, route = "/") {
-		const url = new URL(request.url);
-		return {
-			request,
-			env: {},
-			params: extractParams(url.pathname, route),
-			path: url.pathname,
-			method: request.method,
-			query: Object.fromEntries(url.searchParams),
-			headers: request.headers,
-			cookies: parseCookies(request),
-			services: { kv: void 0 },
-			log: console,
-			waitUntil: (promise) => event.waitUntil(promise)
-		};
+function enhanceContext(context, route = "/") {
+	const { request, env } = context;
+	const url = new URL(request.url);
+	const kv = void 0;
+	return {
+		...context,
+		params: extractParams(url.pathname, route),
+		path: url.pathname,
+		method: request.method,
+		query: Object.fromEntries(url.searchParams),
+		cookies: parseCookies(request),
+		services: { kv },
+		log: console,
+		waitUntil: (promise) => {
+			if (typeof context.waitUntil === "function") context.waitUntil(promise);
+		}
 	};
 }
 function extractParams(pathname, route) {
@@ -114,12 +115,20 @@ async function handler(context) {
 * Tencent EdgeOne Main Entry
 * Auto-generated router
 */
-var router_default = { async fetch(request, event) {
-	const buildContext = createContextBuilder(event);
-	const pathname = new URL(request.url).pathname;
-	if (matchRoute(pathname, "/")) return handler(buildContext(request, "/"));
-	return new Response("Not Found", { status: 404 });
-} };
+async function onRequest(context) {
+	try {
+		const { request } = context;
+		const pathname = new URL(request.url).pathname;
+		if (matchRoute(pathname, "/")) return await handler(enhanceContext(context, "/"));
+		return new Response("Not Found", { status: 404 });
+	} catch (error) {
+		console.error("EdgeOne Function Error:", error);
+		return new Response(`Internal Error: ${error.message || String(error)}`, {
+			status: 500,
+			headers: { "content-type": "text/plain" }
+		});
+	}
+}
 function matchRoute(pathname, route) {
 	if (pathname === route) return true;
 	const routeParts = route.split("/");
@@ -132,4 +141,4 @@ function matchRoute(pathname, route) {
 }
 
 //#endregion
-export { router_default as default };
+export { onRequest };

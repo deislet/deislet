@@ -56,7 +56,7 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(pathname, '{route}')) {{
     const enhancedContext = enhanceContext(context, '{route}');
-    return handler{i}(enhancedContext);
+    return await handler{i}(enhancedContext);
   }}
 "#
         ));
@@ -77,14 +77,22 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
 import {{ enhanceContext }} from './adapters/context-builder';
 {imports}
 
-export function onRequest(context) {{
-  const {{ request }} = context;
-  const url = new URL(request.url);
-  const pathname = url.pathname;
+export async function onRequest(context) {{
+  try {{
+    const {{ request }} = context;
+    const url = new URL(request.url);
+    const pathname = url.pathname;
 
 {route_handlers}
-  // 404 Not Found
-  return new Response('Not Found', {{ status: 404 }});
+    // 404 Not Found
+    return new Response('Not Found', {{ status: 404 }});
+  }} catch (error) {{
+    console.error('EdgeOne Function Error:', error);
+    return new Response(`Internal Error: ${{error.message || String(error)}}`, {{
+      status: 500,
+      headers: {{ 'content-type': 'text/plain' }}
+    }});
+  }}
 }}
 
 function matchRoute(pathname: string, route: string): boolean {{
