@@ -44,6 +44,9 @@ pub enum Feature {
     SQLDatabase,
     ObjectStorage,
 
+    // Caching
+    Cache,
+
     // Runtime
     NodeRuntime,
     SSR,
@@ -68,6 +71,7 @@ impl Feature {
             Feature::KVStorage => "KV Storage",
             Feature::SQLDatabase => "SQL Database",
             Feature::ObjectStorage => "Object Storage",
+            Feature::Cache => "Cache API",
             Feature::NodeRuntime => "Node.js Runtime",
             Feature::SSR => "Server-Side Rendering",
             Feature::ISR => "Incremental Static Regeneration",
@@ -85,6 +89,7 @@ impl Feature {
             Feature::KVStorage => "Low-latency key-value storage",
             Feature::SQLDatabase => "SQL database for relational data",
             Feature::ObjectStorage => "S3-compatible object storage for large files",
+            Feature::Cache => "HTTP response caching at the edge",
             Feature::NodeRuntime => "Node.js built-in modules and npm packages",
             Feature::SSR => "Server-side rendering for dynamic content",
             Feature::ISR => "Incremental static regeneration with revalidation",
@@ -111,6 +116,10 @@ impl Feature {
             (Feature::ObjectStorage, Platform::Cloudflare) => Some("R2 Buckets"),
             (Feature::ObjectStorage, Platform::Deno) => None,
             (Feature::ObjectStorage, Platform::Tencent) => None,
+
+            (Feature::Cache, Platform::Cloudflare) => Some("Cache API"),
+            (Feature::Cache, Platform::Deno) => Some("Cache API"),
+            (Feature::Cache, Platform::Tencent) => Some("Cache API"),
 
             (Feature::NodeRuntime, Platform::Cloudflare) => None,
             (Feature::NodeRuntime, Platform::Deno) => Some("Node.js compatibility layer"),
@@ -355,6 +364,7 @@ const ALL_FEATURES: &[Feature] = &[
     Feature::KVStorage,
     Feature::SQLDatabase,
     Feature::ObjectStorage,
+    Feature::Cache,
     Feature::NodeRuntime,
     Feature::SSR,
     Feature::ISR,
@@ -377,6 +387,7 @@ mod tests {
         assert!(caps.supports(Feature::KVStorage));
         assert!(caps.supports(Feature::SQLDatabase));
         assert!(caps.supports(Feature::ObjectStorage));
+        assert!(caps.supports(Feature::Cache));
         assert!(caps.supports(Feature::CronJobs));
         assert!(caps.supports(Feature::WebSockets));
         assert!(caps.supports(Feature::DurableObjects));
@@ -392,6 +403,7 @@ mod tests {
 
         assert!(caps.supports(Feature::KVStorage));
         assert!(caps.supports(Feature::SQLDatabase));
+        assert!(caps.supports(Feature::Cache));
         assert!(caps.supports(Feature::NodeRuntime));
         assert!(caps.supports(Feature::SSR));
         assert!(caps.supports(Feature::ISR));
@@ -408,6 +420,7 @@ mod tests {
         let caps = PlatformCapabilities::new(Platform::Tencent);
 
         assert!(caps.supports(Feature::KVStorage));
+        assert!(caps.supports(Feature::Cache));
         assert!(caps.supports(Feature::NodeRuntime));
         assert!(caps.supports(Feature::SSR));
         assert!(caps.supports(Feature::ISR));
