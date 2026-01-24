@@ -331,8 +331,18 @@ impl Compiler {
             
             match bundler.bundle().await {
                 Ok(bundled_code) => {
-                    fs::write(output_dir.join("index.js"), bundled_code)?;
-                    println!("{}", "  ✓ Bundled to index.js".green());
+                    let output_file = if vendor == "tencent" {
+                        let ef_dir = output_dir.join("edge-functions");
+                        if !ef_dir.exists() { 
+                            let _ = fs::create_dir_all(&ef_dir); 
+                        }
+                        ef_dir.join("index.js")
+                    } else {
+                        output_dir.join("index.js")
+                    };
+
+                    fs::write(&output_file, bundled_code)?;
+                    println!("{}", format!("  ✓ Bundled to {}", output_file.file_name().unwrap().to_string_lossy()).green());
                 },
                 Err(e) => {
                     return Err(anyhow::anyhow!("Bundling failed: {}", e));

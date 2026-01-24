@@ -27,21 +27,16 @@ pub fn generate(
     // 4. Generate Config Files
     let mut config_files = Vec::new();
 
-    let edgeone_toml = format!(
-        r#"name = "{}"
-language = "typescript"
-runtime = "edge-functions"
-entry_point = "index.js"
+    // Minimal configuration based on user example
+    let edgeone_json = serde_json::json!({
+        "name": config.name,
+        // "entry": "edge-functions/index.js", // Use convention
+    });
 
-[environments.staging]
-url = "staging.{}.edgeone.ai"
-
-[environments.production]
-url = "{}.edgeone.ai"
-"#,
-        config.name, config.name, config.name
-    );
-    config_files.push(("edgeone.toml".to_string(), edgeone_toml));
+    config_files.push((
+        "edgeone.json".to_string(),
+        serde_json::to_string_pretty(&edgeone_json).unwrap(),
+    ));
 
     Ok(AdapterArtifacts {
         router_code,
@@ -60,8 +55,8 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
 
         route_handlers.push_str(&format!(
             r#"  if (matchRoute(pathname, '{route}')) {{
-    const context = buildContext(request, '{route}');
-    return handler{i}(context);
+    const enhancedContext = enhanceContext(context, '{route}');
+    return handler{i}(enhancedContext);
   }}
 "#
         ));
@@ -79,20 +74,18 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
  * Auto-generated router
  */
 
-import {{ createContextBuilder }} from './adapters/context-builder';
+import {{ enhanceContext }} from './adapters/context-builder';
 {imports}
 
-export default {{
-  async fetch(request, event) {{
-    const buildContext = createContextBuilder(event);
-    const url = new URL(request.url);
-    const pathname = url.pathname;
+export function onRequest(context) {{
+  const {{ request }} = context;
+  const url = new URL(request.url);
+  const pathname = url.pathname;
 
 {route_handlers}
-    // 404 Not Found
-    return new Response('Not Found', {{ status: 404 }});
-  }}
-}};
+  // 404 Not Found
+  return new Response('Not Found', {{ status: 404 }});
+}}
 
 function matchRoute(pathname: string, route: string): boolean {{
   // Exact match
@@ -121,37 +114,40 @@ fn generate_context_builder_code(has_kv: bool) -> String {
     };
 
     let kv_usage = if has_kv {
-        "// Extract KV if present\n    const kv = typeof globalThis.EdgeKV !== 'undefined' ? createKVAdapter(globalThis.EdgeKV) : undefined;"
+        "// Extract KV if present\n  const kv = typeof globalThis.EdgeKV !== 'undefined' ? createKVAdapter(globalThis.EdgeKV) : undefined;"
     } else {
         "const kv = undefined;"
     };
 
     format!(
         r#"/**
- * EdgeOne Context Builder
+ * EdgeOne Context Enhancer
+ * Enhances the EdgeOne context with additional utilities
  */
 {kv_import}
-export function createContextBuilder(event: any) {{
-  return function buildContext(request: Request, route: string = '/') {{
-    const url = new URL(request.url);
-    
-    {kv_usage}
+export function enhanceContext(context: any, route: string = '/') {{
+  const {{ request, env }} = context;
+  const url = new URL(request.url);
 
-    return {{
-      request,
-      env: {{}}, // EdgeOne env vars usually injected globally
-      params: extractParams(url.pathname, route),
-      path: url.pathname,
-      method: request.method,
-      query: Object.fromEntries(url.searchParams),
-      headers: request.headers,
-      cookies: parseCookies(request),
-      services: {{
-        kv,
-      }},
-      log: console,
-      waitUntil: (promise: Promise<any>) => event.waitUntil(promise),
-    }};
+  {kv_usage}
+
+  return {{
+    ...context,
+    params: extractParams(url.pathname, route),
+    path: url.pathname,
+    method: request.method,
+    query: Object.fromEntries(url.searchParams),
+    cookies: parseCookies(request),
+    services: {{
+      kv,
+    }},
+    log: console,
+    waitUntil: (promise: Promise<any>) => {{
+      // EdgeOne may not support waitUntil, provide no-op fallback
+      if (typeof context.waitUntil === 'function') {{
+        context.waitUntil(promise);
+      }}
+    }},
   }};
 }}
 
