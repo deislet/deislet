@@ -139,12 +139,20 @@ export function enhanceContext(context: any, route: string = '/') {{
 
   {kv_usage}
 
+  // Convert URLSearchParams to plain object (without Object.fromEntries for compatibility)
+  const query = {{}};
+  url.searchParams.forEach((value, key) => {{
+    query[key] = value;
+  }});
+
   return {{
-    ...context,
+    request: context.request,
+    env: context.env || {{}},
     params: extractParams(url.pathname, route),
     path: url.pathname,
     method: request.method,
-    query: Object.fromEntries(url.searchParams),
+    query: query,
+    headers: request.headers,
     cookies: parseCookies(request),
     services: {{
       kv,
