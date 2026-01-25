@@ -16,9 +16,10 @@ impl TypeScriptParser {
     }
 
     pub fn parse(&self, code: &str, filename: &str) -> anyhow::Result<HandlerInfo> {
-        let source_file = self
-            .source_map
-            .new_source_file(FileName::Custom(filename.to_string()).into(), code.to_string());
+        let source_file = self.source_map.new_source_file(
+            FileName::Custom(filename.to_string()).into(),
+            code.to_string(),
+        );
 
         let lexer = Lexer::new(
             Syntax::Typescript(Default::default()),

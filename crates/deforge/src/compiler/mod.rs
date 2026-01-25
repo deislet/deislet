@@ -3,8 +3,8 @@ mod validator;
 
 use crate::parser::TypeScriptParser;
 use colored::Colorize;
-use deforge_core::*;
 use deforge_core::bundler::{DeforgeBundler, TargetPlatform};
+use deforge_core::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -75,12 +75,17 @@ impl Compiler {
         let mut builds = HashMap::new();
 
         for vendor in target_vendors {
-            let build = self.build_for_vendor(project_dir, &vendor, &config, minify).await?;
+            let build = self
+                .build_for_vendor(project_dir, &vendor, &config, minify)
+                .await?;
             let output_dir = Path::new(&build.output_path);
 
             // Verify artifacts (Smoke Test)
             if let Err(e) = self.verify_artifacts(&vendor, output_dir) {
-                println!("{}", format!("  ⚠ Verification failed for {}: {}", vendor, e).yellow());
+                println!(
+                    "{}",
+                    format!("  ⚠ Verification failed for {}: {}", vendor, e).yellow()
+                );
             }
 
             builds.insert(vendor, build);
@@ -263,7 +268,10 @@ impl Compiler {
             Ok(_) => Ok(()),
             Err(errors) => {
                 // 显示详细的错误信息
-                eprintln!("\n{}", "✗ Platform capability validation failed".red().bold());
+                eprintln!(
+                    "\n{}",
+                    "✗ Platform capability validation failed".red().bold()
+                );
                 eprintln!(
                     "{} cannot be deployed to {} due to unsupported features:\n",
                     "Project".yellow(),
@@ -320,13 +328,13 @@ impl Compiler {
             let relative_path = Path::new(&handler_path)
                 .strip_prefix(project_dir.join(&config.function_root))
                 .unwrap_or(Path::new(&handler_path));
-            
+
             // Output to dist/vendor/src/... (to avoid conflict with generated files)
             let output_path = output_dir.join("src").join(relative_path);
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            
+
             if handler_path.ends_with(".wasm") {
                 fs::copy(&handler_path, &output_path)?;
                 files.push(handler_path.clone());
@@ -334,19 +342,21 @@ impl Compiler {
             }
 
             let code = fs::read_to_string(&handler_path)?;
-            let transformed = self.transformer.transform(&code, &handler_path, vendor, config)?;
+            let transformed = self
+                .transformer
+                .transform(&code, &handler_path, vendor, config)?;
             fs::write(&output_path, &transformed)?;
-            
+
             files.push(handler_path.clone());
             total_size += transformed.len();
-            
+
             // Add to routes
             if !handler_path.ends_with(".wasm") {
                 let route = Transformer::filename_to_route(relative_path.to_str().unwrap(), "");
                 // Use relative path for import (from _deforge_internal/router.ts to src/...)
                 let import_path = format!("../src/{}", relative_path.to_string_lossy());
                 // Fix Windows paths for JS import
-                let import_path = import_path.replace("\\", "/"); 
+                let import_path = import_path.replace("\\", "/");
                 routes.push((route, import_path));
             }
         }
@@ -365,12 +375,15 @@ impl Compiler {
                     "".to_string()
                 };
                 AdapterArtifacts {
-                    router_code: format!("import handler from '{}'; export default handler;", entry_import),
+                    router_code: format!(
+                        "import handler from '{}'; export default handler;",
+                        entry_import
+                    ),
                     context_builder_code: "".to_string(),
                     kv_adapter_code: None,
                     config_files: vec![],
                 }
-            },
+            }
             _ => return Err(anyhow::anyhow!("Unknown vendor: {vendor}")),
         };
 
@@ -390,11 +403,14 @@ impl Compiler {
 
         // Write System Code
         fs::write(system_dir.join("router.ts"), artifacts.router_code)?;
-        
+
         let adapters_dir = system_dir.join("adapters");
         fs::create_dir_all(&adapters_dir)?;
-        fs::write(adapters_dir.join("context-builder.ts"), artifacts.context_builder_code)?;
-        
+        fs::write(
+            adapters_dir.join("context-builder.ts"),
+            artifacts.context_builder_code,
+        )?;
+
         if let Some(kv) = artifacts.kv_adapter_code {
             fs::write(adapters_dir.join("kv-adapter.ts"), kv)?;
         }
@@ -406,16 +422,17 @@ impl Compiler {
                 "tencent" => TargetPlatform::EdgeOne,
                 _ => TargetPlatform::Cloudflare,
             };
-            
+
             println!("{}", format!("  ⚡ Bundling for {}...", vendor).dimmed());
-            let bundler = DeforgeBundler::new(system_dir.join("router.ts").to_str().unwrap(), platform);
-            
+            let bundler =
+                DeforgeBundler::new(system_dir.join("router.ts").to_str().unwrap(), platform);
+
             match bundler.bundle().await {
                 Ok(bundled_code) => {
                     let output_file = if vendor == "tencent" {
                         let ef_dir = output_dir.join("edge-functions");
-                        if !ef_dir.exists() { 
-                            let _ = fs::create_dir_all(&ef_dir); 
+                        if !ef_dir.exists() {
+                            let _ = fs::create_dir_all(&ef_dir);
                         }
                         ef_dir.join("index.js")
                     } else {
@@ -423,8 +440,15 @@ impl Compiler {
                     };
 
                     fs::write(&output_file, bundled_code)?;
-                    println!("{}", format!("  ✓ Bundled to {}", output_file.file_name().unwrap().to_string_lossy()).green());
-                },
+                    println!(
+                        "{}",
+                        format!(
+                            "  ✓ Bundled to {}",
+                            output_file.file_name().unwrap().to_string_lossy()
+                        )
+                        .green()
+                    );
+                }
                 Err(e) => {
                     return Err(anyhow::anyhow!("Bundling failed: {}", e));
                 }
@@ -441,7 +465,7 @@ impl Compiler {
             if system_dir.exists() {
                 fs::remove_dir_all(system_dir)?;
             }
-            
+
             // Cleanup source files in src/ but keep assets
             let src_dir = output_dir.join("src");
             if src_dir.exists() {

@@ -4,7 +4,6 @@
  * These tests verify that the generated code complies with
  * deforge-adapter-cf/spec.mdc requirements.
  */
-
 use deforge_adapter_cf::generate;
 use deforge_core::ProjectConfig;
 
@@ -20,7 +19,9 @@ fn test_entry_point_format() {
 
     // Verify modules syntax entry point (per spec.mdc)
     assert!(result.router_code.contains("export default"));
-    assert!(result.router_code.contains("async fetch(request, env, ctx)"));
+    assert!(result
+        .router_code
+        .contains("async fetch(request, env, ctx)"));
 
     // Should NOT use service worker syntax
     assert!(!result.router_code.contains("addEventListener"));

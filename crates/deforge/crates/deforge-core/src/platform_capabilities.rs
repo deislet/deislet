@@ -5,7 +5,6 @@
  * Used for compile-time validation to prevent generating
  * incompatible code.
  */
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -161,7 +160,7 @@ impl Feature {
             (Feature::SQLDatabase, Platform::Tencent) => vec![
                 "Use external database service (Postgres, MySQL)",
                 "Use EdgeKV for simple key-value data",
-                "Deploy to Cloudflare Workers (D1) or Deno Deploy (Postgres)"
+                "Deploy to Cloudflare Workers (D1) or Deno Deploy (Postgres)",
             ],
 
             (Feature::ObjectStorage, Platform::Deno) => vec![

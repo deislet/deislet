@@ -4,7 +4,6 @@
  * These tests verify that the generated code complies with
  * deforge-adapter-eo/spec.mdc (pages-llms.mdc) requirements.
  */
-
 use deforge_adapter_eo::generate;
 use deforge_core::ProjectConfig;
 
@@ -93,7 +92,9 @@ fn test_context_structure() {
     let result = generate(&routes, &config).unwrap();
 
     // Verify EdgeOne context structure (per spec.mdc line 819-822)
-    assert!(result.context_builder_code.contains("request: context.request"));
+    assert!(result
+        .context_builder_code
+        .contains("request: context.request"));
     assert!(result.context_builder_code.contains("env: context.env"));
     assert!(result.context_builder_code.contains("params:"));
 }
@@ -169,8 +170,13 @@ fn test_spec_reference_in_comments() {
     let result = generate(&routes, &config).unwrap();
 
     // Verify spec compliance is documented (references pages-llms.mdc)
-    assert!(result.router_code.contains("pages-llms.mdc") || result.router_code.contains("spec.mdc"));
-    assert!(result.context_builder_code.contains("pages-llms.mdc") || result.context_builder_code.contains("spec.mdc"));
+    assert!(
+        result.router_code.contains("pages-llms.mdc") || result.router_code.contains("spec.mdc")
+    );
+    assert!(
+        result.context_builder_code.contains("pages-llms.mdc")
+            || result.context_builder_code.contains("spec.mdc")
+    );
 }
 
 #[test]

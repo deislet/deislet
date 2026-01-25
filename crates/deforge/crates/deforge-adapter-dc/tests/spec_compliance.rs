@@ -4,7 +4,6 @@
  * These tests verify that the generated code complies with
  * deforge-adapter-dc/spec.mdc requirements.
  */
-
 use deforge_adapter_dc::generate;
 use deforge_core::ProjectConfig;
 
@@ -79,7 +78,7 @@ fn test_kv_adapter_when_enabled() {
     assert!(kv_code.contains("async getJSON"));
     assert!(kv_code.contains("async put"));
     assert!(kv_code.contains("async delete"));
-    assert!(kv_code.contains("kv.get([key])"));  // Deno KV uses array keys
+    assert!(kv_code.contains("kv.get([key])")); // Deno KV uses array keys
     assert!(kv_code.contains("kv.set([key]"));
 }
 
