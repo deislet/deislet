@@ -14,26 +14,25 @@ pub struct DeforgeBundler {
 
 impl DeforgeBundler {
     pub fn new(entry: &str, platform: TargetPlatform) -> Self {
-        let mut options = BundlerOptions::default();
-
-        // Input config
-        options.input = Some(vec![InputItem {
-            name: Some("index".to_string()),
-            import: entry.to_string(),
-        }]);
-
-        // Platform config
-        match platform {
+        let (platform_opt, format) = match platform {
             TargetPlatform::Cloudflare | TargetPlatform::EdgeOne => {
-                options.platform = Some(Platform::Browser);
-                options.format = Some(OutputFormat::Esm);
+                (Some(Platform::Browser), Some(OutputFormat::Esm))
             }
             TargetPlatform::Deno => {
                 // Deno supports Node-style resolution but runs in a browser-like environment
-                options.platform = Some(Platform::Node);
-                options.format = Some(OutputFormat::Esm);
+                (Some(Platform::Node), Some(OutputFormat::Esm))
             }
-        }
+        };
+
+        let options = BundlerOptions {
+            input: Some(vec![InputItem {
+                name: Some("index".to_string()),
+                import: entry.to_string(),
+            }]),
+            platform: platform_opt,
+            format,
+            ..Default::default()
+        };
 
         Self { options }
     }

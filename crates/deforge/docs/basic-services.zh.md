@@ -172,4 +172,4 @@ Alternatives:
 
 - [Edge Canon 基础规范](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_BASIC.md)
 - [Edge Canon 平台支持矩阵](https://github.com/deislet/edge-canon/blob/main/PLATFORM_MATRIX.md)
-- [deforge 平台能力系统](./crates/deforge-core/src/platform_capabilities.rs)
+- [deforge 平台能力系统](../crates/deforge-core/src/platform_capabilities.rs)

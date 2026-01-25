@@ -2,6 +2,12 @@ use deforge_core::ProjectConfig;
 
 pub struct Transformer {}
 
+impl Default for Transformer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Transformer {
     pub fn new() -> Self {
         Self {}

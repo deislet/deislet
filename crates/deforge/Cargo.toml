@@ -9,6 +9,13 @@ repository = "https://github.com/deislet/deforge"
 homepage = "https://github.com/deislet/deforge"
 keywords = ["edge", "serverless", "compiler", "cloudflare", "deno"]
 categories = ["command-line-utilities", "development-tools", "web-programming"]
+readme = "README.md"
+documentation = "https://docs.rs/deforge"
+
+[lib]
+name = "deforge"
+path = "src/lib.rs"
+crate-type = ["lib"]
 
 [[bin]]
 name = "deforge"
