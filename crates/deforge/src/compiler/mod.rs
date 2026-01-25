@@ -209,18 +209,20 @@ impl Compiler {
     fn detect_required_features(&self, config: &ProjectConfig) -> Vec<Feature> {
         let mut features = Vec::new();
 
-        // 检测服务配置
+        // 注意：KV Storage 和 Cache API 是基础服务，所有平台都必须支持，
+        // 因此不需要检测或验证这些特性
+
+        // 检测扩展服务配置
         if let Some(ref services) = config.services {
-            if let Some(ref kv) = services.kv {
-                if kv.enabled {
-                    features.push(Feature::KVStorage);
-                }
-            }
             if let Some(ref db) = services.database {
                 if db.enabled {
                     features.push(Feature::SQLDatabase);
                 }
             }
+            // 未来可以添加更多扩展服务检测
+            // - ObjectStorage
+            // - Queues
+            // - 等等
         }
 
         // 检测运行时特性

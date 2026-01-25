@@ -36,16 +36,15 @@ impl Platform {
     }
 }
 
-/// Feature that might not be supported on all platforms
+/// Extended features that might not be supported on all platforms
+///
+/// Note: KV Storage and Cache API are NOT included here as they are
+/// Basic Features that all Edge Canon compliant platforms must support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Feature {
     // Storage
-    KVStorage,
     SQLDatabase,
     ObjectStorage,
-
-    // Caching
-    Cache,
 
     // Runtime
     NodeRuntime,
@@ -68,10 +67,8 @@ pub enum Feature {
 impl Feature {
     pub fn name(&self) -> &'static str {
         match self {
-            Feature::KVStorage => "KV Storage",
             Feature::SQLDatabase => "SQL Database",
             Feature::ObjectStorage => "Object Storage",
-            Feature::Cache => "Cache API",
             Feature::NodeRuntime => "Node.js Runtime",
             Feature::SSR => "Server-Side Rendering",
             Feature::ISR => "Incremental Static Regeneration",
@@ -86,10 +83,8 @@ impl Feature {
 
     pub fn description(&self) -> &'static str {
         match self {
-            Feature::KVStorage => "Low-latency key-value storage",
             Feature::SQLDatabase => "SQL database for relational data",
             Feature::ObjectStorage => "S3-compatible object storage for large files",
-            Feature::Cache => "HTTP response caching at the edge",
             Feature::NodeRuntime => "Node.js built-in modules and npm packages",
             Feature::SSR => "Server-side rendering for dynamic content",
             Feature::ISR => "Incremental static regeneration with revalidation",
@@ -105,10 +100,6 @@ impl Feature {
     /// Get the platform-specific implementation name
     pub fn platform_name(&self, platform: Platform) -> Option<&'static str> {
         match (self, platform) {
-            (Feature::KVStorage, Platform::Cloudflare) => Some("KV Namespaces"),
-            (Feature::KVStorage, Platform::Deno) => Some("Deno KV"),
-            (Feature::KVStorage, Platform::Tencent) => Some("EdgeKV"),
-
             (Feature::SQLDatabase, Platform::Cloudflare) => Some("D1 Database"),
             (Feature::SQLDatabase, Platform::Deno) => Some("Postgres (via integration)"),
             (Feature::SQLDatabase, Platform::Tencent) => None,
@@ -116,10 +107,6 @@ impl Feature {
             (Feature::ObjectStorage, Platform::Cloudflare) => Some("R2 Buckets"),
             (Feature::ObjectStorage, Platform::Deno) => None,
             (Feature::ObjectStorage, Platform::Tencent) => None,
-
-            (Feature::Cache, Platform::Cloudflare) => Some("Cache API"),
-            (Feature::Cache, Platform::Deno) => Some("Cache API"),
-            (Feature::Cache, Platform::Tencent) => Some("Cache API"),
 
             (Feature::NodeRuntime, Platform::Cloudflare) => None,
             (Feature::NodeRuntime, Platform::Deno) => Some("Node.js compatibility layer"),
@@ -359,12 +346,13 @@ impl std::fmt::Display for UnsupportedFeatureError {
 
 impl std::error::Error for UnsupportedFeatureError {}
 
-/// All features across all platforms
+/// All extended features across all platforms
+///
+/// Note: This only includes extended features. Basic features (KV Storage, Cache API)
+/// are not listed here as they are guaranteed to be available on all platforms.
 const ALL_FEATURES: &[Feature] = &[
-    Feature::KVStorage,
     Feature::SQLDatabase,
     Feature::ObjectStorage,
-    Feature::Cache,
     Feature::NodeRuntime,
     Feature::SSR,
     Feature::ISR,
@@ -384,13 +372,14 @@ mod tests {
     fn test_cloudflare_capabilities() {
         let caps = PlatformCapabilities::new(Platform::Cloudflare);
 
-        assert!(caps.supports(Feature::KVStorage));
+        // Extended features
         assert!(caps.supports(Feature::SQLDatabase));
         assert!(caps.supports(Feature::ObjectStorage));
-        assert!(caps.supports(Feature::Cache));
         assert!(caps.supports(Feature::CronJobs));
         assert!(caps.supports(Feature::WebSockets));
         assert!(caps.supports(Feature::DurableObjects));
+        assert!(caps.supports(Feature::Queues));
+        assert!(caps.supports(Feature::WorkersAI));
 
         assert!(!caps.supports(Feature::NodeRuntime));
         assert!(!caps.supports(Feature::SSR));
@@ -401,9 +390,8 @@ mod tests {
     fn test_deno_capabilities() {
         let caps = PlatformCapabilities::new(Platform::Deno);
 
-        assert!(caps.supports(Feature::KVStorage));
+        // Extended features
         assert!(caps.supports(Feature::SQLDatabase));
-        assert!(caps.supports(Feature::Cache));
         assert!(caps.supports(Feature::NodeRuntime));
         assert!(caps.supports(Feature::SSR));
         assert!(caps.supports(Feature::ISR));
@@ -413,14 +401,14 @@ mod tests {
 
         assert!(!caps.supports(Feature::ObjectStorage));
         assert!(!caps.supports(Feature::DurableObjects));
+        assert!(!caps.supports(Feature::Queues));
     }
 
     #[test]
     fn test_tencent_capabilities() {
         let caps = PlatformCapabilities::new(Platform::Tencent);
 
-        assert!(caps.supports(Feature::KVStorage));
-        assert!(caps.supports(Feature::Cache));
+        // Extended features
         assert!(caps.supports(Feature::NodeRuntime));
         assert!(caps.supports(Feature::SSR));
         assert!(caps.supports(Feature::ISR));
@@ -429,6 +417,7 @@ mod tests {
         assert!(!caps.supports(Feature::ObjectStorage));
         assert!(!caps.supports(Feature::CronJobs));
         assert!(!caps.supports(Feature::WebSockets));
+        assert!(!caps.supports(Feature::Queues));
     }
 
     #[test]
@@ -448,12 +437,13 @@ mod tests {
     fn test_check_features() {
         let caps = PlatformCapabilities::new(Platform::Tencent);
 
-        let features = vec![Feature::KVStorage, Feature::SQLDatabase, Feature::WebSockets];
+        // Test with features that Tencent doesn't support
+        let features = vec![Feature::SQLDatabase, Feature::WebSockets, Feature::CronJobs];
 
         let result = caps.check_features(&features);
         assert!(result.is_err());
 
         let errors = result.unwrap_err();
-        assert_eq!(errors.len(), 2); // SQL and WebSockets not supported
+        assert_eq!(errors.len(), 3); // SQL, WebSockets, and CronJobs not supported on Tencent
     }
 }
