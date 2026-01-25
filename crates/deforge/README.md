@@ -2,22 +2,23 @@
 
 > 标准代码到平台代码的纯粹翻译器 | Pure Translator from Standard to Platform-Specific Code
 
-**Deforge** 是一个专注的代码编译器，将符合 [deislet/spec](https://github.com/deislet/spec) 标准的 Edge Function 代码翻译为特定平台的可部署代码。
+**Deforge** 是一个专注的代码编译器，将符合 [Edge Canon](https://github.com/deislet/edge-canon) 标准的 Edge Function 代码翻译为特定平台的可部署代码。
 
 ## 🎯 核心定位
 
 **Deforge 只做一件事：翻译代码**
 
 ```
-输入：符合 deislet/spec 标准的代码库
-输出：特定平台（Cloudflare/Deno/Tencent）的可部署代码
+输入：符合 Edge Canon 标准的代码库
+输出：特定平台（Cloudflare/Deno/Tencent/Deislet）的可部署代码
 ```
 
 ## ✨ 特性
 
 - **纯粹翻译器**: 专注于代码转换，不涉及项目管理、开发服务器或部署
-- **多平台支持**: 一次编写，翻译到 Cloudflare Workers、Deno Deploy、Tencent EdgeOne
-- **标准验证**: 确保输入代码符合规范，检测平台特定代码
+- **多平台支持**: 一次编写，翻译到 Cloudflare Workers、Deno Deploy、Tencent EdgeOne、Deislet
+- **标准验证**: 确保输入代码符合 Edge Canon 规范，检测平台特定代码
+- **平台能力验证**: 编译时检查目标平台是否支持使用的扩展特性
 - **自动适配**: 自动生成路由器、适配器和配置文件
 - **类型安全**: 基于 Rust + SWC，保证转换的正确性
 
@@ -25,17 +26,24 @@
 
 ```
 deforge/
+├── src/
+│   ├── main.rs              # CLI 入口 (validate + build)
+│   ├── compiler/            # 编译器逻辑
+│   ├── parser/              # TypeScript/JavaScript 解析器
+│   └── commands/            # CLI 命令实现
 ├── crates/
-│   ├── deforge/              # CLI 可执行文件 (validate + build)
-│   ├── deforge-core/         # 核心类型定义
-│   ├── deforge-compiler/     # 编译器和打包器 (Rolldown)
-│   ├── deforge-adapter-cf/   # Cloudflare Workers 适配器 (spec.mdc)
-│   ├── deforge-adapter-dc/   # Deno Deploy 适配器 (spec.mdc)
-│   └── deforge-adapter-eo/   # EdgeOne Pages 适配器 (spec.mdc)
-└── crates/ADAPTER_SPECS.md   # 平台规范文档
+│   ├── deforge-core/        # 核心类型、配置、平台能力系统
+│   ├── deforge-adapter-cf/  # Cloudflare Workers 适配器
+│   ├── deforge-adapter-dc/  # Deno Deploy 适配器
+│   └── deforge-adapter-eo/  # EdgeOne Pages 适配器
+└── BASIC_SERVICES.md        # 基础服务文档
 ```
 
-每个适配器都有对应的 `spec.mdc` 文件，详细定义了平台的入口格式、API、限制和最佳实践。
+### 关键组件
+
+- **平台能力系统** (`platform_capabilities.rs`): 编译时验证平台特性支持
+- **适配器系统**: 为每个平台生成符合其规范的代码
+- **验证器**: 检测平台特定代码和规范违规
 
 ## 🚀 快速开始
 
@@ -124,7 +132,7 @@ your-project/
 │   │   └── [id].ts        # /api/:id （动态路由）
 │   └── admin/
 │       └── index.ts       # /admin
-└── denictl.toml           # 可选：项目配置
+└── .config.json           # 必须：项目配置
 ```
 
 ### Handler 格式
@@ -156,19 +164,27 @@ export default async function handler(context: Context): Promise<Response> {
 
 ```typescript
 interface Context {
-  request: Request;          // 原始 Request 对象
-  env: Record<string, string>; // 环境变量
-  params: Record<string, string>; // 路由参数
-  query: URLSearchParams;    // 查询参数
-  services: {                // 统一服务接口
-    kv: KVStore;
-    database?: Database;
-    cache?: Cache;
+  request: Request;                // 原始 Request 对象
+  env: Record<string, string>;     // 环境变量
+  params: Record<string, string>;  // 路由参数
+
+  // 基础服务（所有平台必须支持）
+  services: {
+    kv: KVStore;                   // 键值存储（无需配置）
+    cache: Cache;                  // HTTP 缓存（无需配置）
+
+    // 扩展服务（需要配置，平台可选支持）
+    database?: Database;           // SQL 数据库
+    blob?: BlobStore;              // 对象存储
+    queue?: Queue;                 // 消息队列
   };
-  log: Logger;               // 结构化日志
+
+  log: Logger;                     // 结构化日志
   waitUntil: (promise: Promise<any>) => void;
 }
 ```
+
+> **注意**: KV Storage 和 Cache API 是基础服务，无需在配置中启用。详见 [BASIC_SERVICES.md](./BASIC_SERVICES.md)
 
 ## 🔍 验证规则
 
@@ -271,27 +287,39 @@ npx wrangler deploy
 
 ## 🔧 配置文件
 
-可选的 `denictl.toml` 配置文件：
+必需的 `.config.json` 配置文件（Edge Canon 标准）：
 
-```toml
-[project]
-name = "my-edge-app"
-version = "1.0.0"
+```json
+{
+  "version": "0.1.0",
+  "name": "my-edge-app",
+  "runtime": "standard-v1",
+  "language": "typescript",
+  "functionRoot": "./functions",
 
-[build]
-minify = true
-source_map = false
+  "services": {
+    // 扩展服务（需要显式启用）
+    "database": {
+      "enabled": true,
+      "binding": "DB"
+    }
+  },
 
-[cloudflare]
-account_id = "your-account-id"
-kv_namespaces = ["KV_STORE"]
+  "vendors": {
+    "cloudflare": { "enabled": true },
+    "deno": { "enabled": true },
+    "tencent": { "enabled": true }
+  },
 
-[deno]
-import_map = "import_map.json"
-
-[tencent]
-zone_id = "your-zone-id"
+  "build": {
+    "outDir": "./dist",
+    "minify": true,
+    "sourceMap": false
+  }
+}
 ```
+
+> **注意**: KV 和 Cache 无需配置，详见 [BASIC_SERVICES.md](./BASIC_SERVICES.md)
 
 ## 🏗️ 与其他工具的关系
 
@@ -313,26 +341,23 @@ zone_id = "your-zone-id"
 - **二进制大小**: ~15MB (release)
 - **内存占用**: ~30MB
 
-## 📚 平台规范文档
+## 📚 相关文档
 
-每个平台适配器都有详细的规范文档 (`spec.mdc`)，确保生成的代码完全符合平台要求：
+### Edge Canon 规范
+- [基础规范 (Basic)](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_BASIC.md) - 所有平台必须支持的能力
+- [扩展规范 (Extended)](https://github.com/deislet/edge-canon/blob/main/SPECIFICATION_EXT.md) - 平台可选支持的特性
+- [平台支持矩阵](https://github.com/deislet/edge-canon/blob/main/PLATFORM_MATRIX.md) - 详细兼容性信息
 
+### Deforge 文档
+- [BASIC_SERVICES.md](./BASIC_SERVICES.md) - KV 和 Cache 基础服务说明
+- [ARCHITECTURE.md](./ARCHITECTURE.md) - 架构设计文档
+- [ERROR_SYSTEM.md](./crates/deforge-core/ERROR_SYSTEM.md) - 错误分类系统
+
+### 平台适配器
+每个平台适配器都有详细的规范文档 (`spec.mdc`)：
 - **Cloudflare Workers** (`crates/deforge-adapter-cf/spec.mdc`)
-  - 基于 https://developers.cloudflare.com/workers/llms-full.txt
-  - Modules syntax: `export default { fetch(request, env, ctx) }`
-  - 支持 KV, D1, R2, Durable Objects
-
 - **Deno Deploy** (`crates/deforge-adapter-dc/spec.mdc`)
-  - 基于 https://docs.deno.com/llms-full.txt
-  - Entry format: `Deno.serve(async (req: Request) => Response)`
-  - 支持 Deno KV, Node.js 兼容层
-
 - **EdgeOne Pages** (`crates/deforge-adapter-eo/spec.mdc`)
-  - 基于 EdgeOne Pages 官方文档
-  - Entry format: `export function onRequest(context)`
-  - 支持 Edge Functions + Node Functions
-
-详细对比和使用指南请参阅 [`crates/ADAPTER_SPECS.md`](./crates/ADAPTER_SPECS.md)
 
 ## 🤝 贡献
 
