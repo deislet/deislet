@@ -20,6 +20,11 @@ deno_runtime = { git = "https://github.com/kookyleo/deno", branch = "bump-fqdn-0
 # Deno Core (for op2 macro compatibility)
 deno_core = "0.380"
 
+# 兼容性钉版本:temporal_rs 0.1.2 (经 v8→temporal_capi 间接引入) 是针对
+# icu_calendar 2.1.x 编写的;2.2.x 对 cal/types 模块做了破坏性改动,会导致
+# temporal_rs 编译失败。这里约束 icu_calendar 停留在 2.1.x。
+icu_calendar = "~2.1"
+
 # System Traits (for permissions)
 sys_traits = "0.1.22"
 
