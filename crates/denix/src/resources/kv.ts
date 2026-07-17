@@ -1,10 +1,10 @@
-// KV 存储资源实现
-// 提供简单的内存 KV 存储
+// KV storage resource implementation
+// Provides a simple in-memory KV store
 
 import type { ResourceProvider, KVStore } from "./types.ts";
 
 /**
- * 内存 KV 存储实现
+ * In-memory KV store implementation
  */
 class MemoryKVStore implements KVStore {
   private store = new Map<string, { value: string; expiresAt?: number }>();
@@ -26,7 +26,7 @@ class MemoryKVStore implements KVStore {
       return null;
     }
 
-    // 检查是否过期
+    // Check for expiration
     if (item.expiresAt && item.expiresAt < Date.now()) {
       this.store.delete(fullKey);
       return null;
@@ -59,13 +59,13 @@ class MemoryKVStore implements KVStore {
 
     for (const [key, item] of this.store.entries()) {
       if (key.startsWith(fullPrefix)) {
-        // 检查是否过期
+        // Check for expiration
         if (item.expiresAt && item.expiresAt < Date.now()) {
           this.store.delete(key);
           continue;
         }
 
-        // 移除前缀返回原始 key
+        // Strip the prefix and return the original key
         keys.push(key.substring(this.prefix.length));
       }
     }
@@ -74,7 +74,7 @@ class MemoryKVStore implements KVStore {
   }
 
   /**
-   * 清理过期的键
+   * Remove expired keys
    */
   cleanup(): void {
     const now = Date.now();
@@ -87,7 +87,7 @@ class MemoryKVStore implements KVStore {
 }
 
 /**
- * KV 资源提供者
+ * KV resource provider
  */
 export class KVResourceProvider implements ResourceProvider {
   type = "kv";
@@ -99,15 +99,15 @@ export class KVResourceProvider implements ResourceProvider {
     const namespace = config.namespace || "default";
     const store = new MemoryKVStore(appId, namespace);
 
-    // 定期清理过期键
+    // Periodically clean up expired keys
     setInterval(() => {
       store.cleanup();
-    }, 60000); // 每分钟清理一次
+    }, 60000); // Clean up once per minute
 
     return store;
   }
 
   async destroy(_instance: KVStore): Promise<void> {
-    // 内存存储不需要特殊清理
+    // In-memory store requires no special cleanup
   }
 }

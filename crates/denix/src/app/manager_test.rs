@@ -1,6 +1,11 @@
 // Application Manager unit tests
 
 #[cfg(test)]
+// Holding the std MutexGuard across await points is intentional here: the global
+// TEST_MANAGER mutex exists precisely to serialize these tests against a shared
+// singleton ApplicationManager. Tests are independent tokio runtimes, so there is
+// no lock-order inversion, and dropping the guard early would defeat the purpose.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use crate::app::{
         types::{AppConfig, AppState},

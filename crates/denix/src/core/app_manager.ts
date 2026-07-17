@@ -1,12 +1,12 @@
-// 应用管理器实现
+// Application manager implementation
 
 import type { App, AppConfig, AppState } from "./types.ts";
 import { RuntimeIsolate } from "./isolate.ts";
 import { ResourceManager } from "./resource_manager.ts";
 
 /**
- * ApplicationManager 类
- * 管理应用的完整生命周期
+ * ApplicationManager class
+ * Manages the full lifecycle of applications
  */
 export class ApplicationManager {
   private apps = new Map<string, App>();
@@ -18,19 +18,19 @@ export class ApplicationManager {
   }
 
   /**
-   * 加载应用
+   * Load an application
    */
   async loadApp(
     id: string,
     code: string,
     config: AppConfig = {},
   ): Promise<void> {
-    // 检查应用是否已存在
+    // Check whether the app already exists
     if (this.apps.has(id)) {
       throw new Error(`App ${id} already exists`);
     }
 
-    // 创建应用记录
+    // Create the app record
     const app: App = {
       id,
       code,
@@ -43,16 +43,16 @@ export class ApplicationManager {
     this.apps.set(id, app);
 
     try {
-      // 创建资源
+      // Create resources
       await this.createAppResources(id, config);
 
-      // 创建并初始化 Runtime Isolate
+      // Create and initialize the runtime isolate
       const isolate = new RuntimeIsolate(id, code, config);
       await isolate.initialize();
 
       this.isolates.set(id, isolate);
 
-      // 更新应用状态
+      // Update the app state
       app.state = "running";
       app.updatedAt = new Date();
 
@@ -68,7 +68,7 @@ export class ApplicationManager {
   }
 
   /**
-   * 创建应用所需的资源
+   * Create the resources required by an application
    */
   private async createAppResources(
     appId: string,
@@ -77,7 +77,7 @@ export class ApplicationManager {
     const resources = config.resources || [];
 
     for (const resourceSpec of resources) {
-      // resourceSpec 格式: "type:name" 或 "type:name:config"
+      // resourceSpec format: "type:name" or "type:name:config"
       const parts = resourceSpec.split(":");
       const type = parts[0];
       const name = parts[1] || type;
@@ -88,7 +88,7 @@ export class ApplicationManager {
         try {
           resourceConfig = JSON.parse(configStr);
         } catch {
-          // 忽略配置解析错误
+          // Ignore config parsing errors
         }
       }
 
@@ -100,14 +100,14 @@ export class ApplicationManager {
       );
     }
 
-    // 如果没有指定资源，默认创建一个 KV 存储
+    // If no resources are specified, create a KV store by default
     if (resources.length === 0) {
       await this.resourceManager.createResource(appId, "kv", "kv", {});
     }
   }
 
   /**
-   * 卸载应用
+   * Unload an application
    */
   async unloadApp(id: string): Promise<void> {
     const app = this.apps.get(id);
@@ -116,21 +116,21 @@ export class ApplicationManager {
     }
 
     try {
-      // 更新状态
+      // Update the state
       app.state = "stopped";
       app.updatedAt = new Date();
 
-      // 终止 Isolate
+      // Terminate the isolate
       const isolate = this.isolates.get(id);
       if (isolate) {
         isolate.terminate();
         this.isolates.delete(id);
       }
 
-      // 销毁资源
+      // Destroy resources
       await this.resourceManager.destroyAppResources(id);
 
-      // 删除应用记录
+      // Remove the app record
       this.apps.delete(id);
 
       console.log(`[AppManager] App ${id} unloaded successfully`);
@@ -145,7 +145,7 @@ export class ApplicationManager {
   }
 
   /**
-   * 更新应用 (热更新)
+   * Update an application (hot update)
    */
   async updateApp(id: string, code: string, config?: AppConfig): Promise<void> {
     const app = this.apps.get(id);
@@ -154,28 +154,28 @@ export class ApplicationManager {
     }
 
     try {
-      // 保存旧的 isolate
+      // Keep a reference to the old isolate
       const oldIsolate = this.isolates.get(id);
 
-      // 更新配置
+      // Update the configuration
       if (config) {
         app.config = config;
       }
 
-      // 创建新的 isolate
+      // Create a new isolate
       const newIsolate = new RuntimeIsolate(id, code, app.config);
       await newIsolate.initialize();
 
-      // 更新应用记录
+      // Update the app record
       app.code = code;
       app.state = "running";
       app.updatedAt = new Date();
       delete app.error;
 
-      // 替换 isolate
+      // Swap in the new isolate
       this.isolates.set(id, newIsolate);
 
-      // 终止旧的 isolate
+      // Terminate the old isolate
       if (oldIsolate) {
         oldIsolate.terminate();
       }
@@ -192,7 +192,7 @@ export class ApplicationManager {
   }
 
   /**
-   * 执行应用
+   * Execute an application
    */
   async executeApp(id: string, request: Request): Promise<Response> {
     const app = this.apps.get(id);
@@ -210,10 +210,10 @@ export class ApplicationManager {
     }
 
     try {
-      // 获取应用环境
+      // Get the app environment
       const env = this.resourceManager.getAppEnv(id);
 
-      // 执行请求
+      // Execute the request
       const response = await isolate.execute(request, env);
       return response;
     } catch (error) {
@@ -226,21 +226,21 @@ export class ApplicationManager {
   }
 
   /**
-   * 获取应用信息
+   * Get application info
    */
   getApp(id: string): App | undefined {
     return this.apps.get(id);
   }
 
   /**
-   * 列出所有应用
+   * List all applications
    */
   listApps(): App[] {
     return Array.from(this.apps.values());
   }
 
   /**
-   * 获取应用统计信息
+   * Get application statistics
    */
   getStats() {
     const apps = Array.from(this.apps.values());
@@ -256,7 +256,7 @@ export class ApplicationManager {
   }
 
   /**
-   * 获取资源管理器
+   * Get the resource manager
    */
   getResourceManager(): ResourceManager {
     return this.resourceManager;

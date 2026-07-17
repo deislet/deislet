@@ -1,23 +1,23 @@
-// Denix 平台入口文件
+// Denix platform entry point
 
 import { ApplicationManager } from "./core/app_manager.ts";
 import { HTTPGateway } from "./core/gateway.ts";
 
 /**
- * 主函数
+ * Main function
  */
 async function main() {
   console.log("🚀 Starting Denix Platform...");
   console.log("=====================================");
 
-  // 创建应用管理器
+  // Create the application manager
   const appManager = new ApplicationManager();
 
-  // 创建 HTTP 网关
+  // Create the HTTP gateway
   const port = parseInt(Deno.env.get("PORT") || "8000");
   const gateway = new HTTPGateway(appManager, port);
 
-  // 启动网关
+  // Start the gateway
   await gateway.start();
 
   console.log("=====================================");
@@ -27,14 +27,14 @@ async function main() {
   console.log(`📚 API Docs: http://localhost:${port}/`);
   console.log("=====================================");
 
-  // 处理优雅退出
+  // Handle graceful shutdown
   const handleShutdown = async () => {
     console.log("\n🛑 Shutting down Denix Platform...");
 
-    // 停止网关
+    // Stop the gateway
     await gateway.stop();
 
-    // 卸载所有应用
+    // Unload all applications
     const apps = appManager.listApps();
     for (const app of apps) {
       try {
@@ -48,12 +48,12 @@ async function main() {
     Deno.exit(0);
   };
 
-  // 监听退出信号
+  // Listen for exit signals
   Deno.addSignalListener("SIGINT", handleShutdown);
   Deno.addSignalListener("SIGTERM", handleShutdown);
 }
 
-// 运行主函数
+// Run the main function
 if (import.meta.main) {
   main().catch((error) => {
     console.error("❌ Fatal error:", error);

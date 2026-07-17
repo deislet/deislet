@@ -1,12 +1,12 @@
-// HTTP Gateway 实现
-// 接收 HTTP 请求并路由到对应的应用
+// HTTP gateway implementation
+// Receives HTTP requests and routes them to the corresponding application
 
 import { ApplicationManager } from "./app_manager.ts";
 import type { AppConfig } from "./types.ts";
 
 /**
- * HTTPGateway 类
- * HTTP 网关和 API 服务器
+ * HTTPGateway class
+ * HTTP gateway and API server
  */
 export class HTTPGateway {
   private appManager: ApplicationManager;
@@ -19,7 +19,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 启动网关服务器
+   * Start the gateway server
    */
   async start(): Promise<void> {
     console.log(`[Gateway] Starting HTTP server on port ${this.port}...`);
@@ -33,29 +33,29 @@ export class HTTPGateway {
   }
 
   /**
-   * 处理 HTTP 请求
+   * Handle an HTTP request
    */
   private async handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
     try {
-      // 健康检查
+      // Health check
       if (path === "/health") {
         return this.handleHealthCheck();
       }
 
-      // 管理 API
+      // Management API
       if (path.startsWith("/api/")) {
         return await this.handleAdminAPI(request);
       }
 
-      // 应用路由
+      // Application routes
       if (path.startsWith("/apps/")) {
         return await this.handleAppRequest(request);
       }
 
-      // 根路径
+      // Root path
       if (path === "/") {
         return this.handleRoot();
       }
@@ -71,7 +71,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 处理健康检查
+   * Handle health check
    */
   private handleHealthCheck(): Response {
     const stats = this.appManager.getStats();
@@ -89,7 +89,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 处理根路径
+   * Handle the root path
    */
   private handleRoot(): Response {
     const stats = this.appManager.getStats();
@@ -240,36 +240,36 @@ export class HTTPGateway {
   }
 
   /**
-   * 处理管理 API 请求
+   * Handle management API requests
    */
   private async handleAdminAPI(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
 
-    // POST /api/apps - 创建应用
+    // POST /api/apps - create an app
     if (path === "/api/apps" && method === "POST") {
       return await this.handleCreateApp(request);
     }
 
-    // GET /api/apps - 列出应用
+    // GET /api/apps - list apps
     if (path === "/api/apps" && method === "GET") {
       return this.handleListApps();
     }
 
-    // GET /api/apps/:id - 获取应用信息
+    // GET /api/apps/:id - get app info
     if (path.match(/^\/api\/apps\/[^/]+$/) && method === "GET") {
       const appId = path.split("/")[3];
       return this.handleGetApp(appId);
     }
 
-    // PUT /api/apps/:id - 更新应用
+    // PUT /api/apps/:id - update an app
     if (path.match(/^\/api\/apps\/[^/]+$/) && method === "PUT") {
       const appId = path.split("/")[3];
       return await this.handleUpdateApp(appId, request);
     }
 
-    // DELETE /api/apps/:id - 删除应用
+    // DELETE /api/apps/:id - delete an app
     if (path.match(/^\/api\/apps\/[^/]+$/) && method === "DELETE") {
       const appId = path.split("/")[3];
       return await this.handleDeleteApp(appId);
@@ -279,7 +279,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 创建应用
+   * Create an application
    */
   private async handleCreateApp(request: Request): Promise<Response> {
     try {
@@ -310,7 +310,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 列出应用
+   * List applications
    */
   private handleListApps(): Response {
     const apps = this.appManager.listApps().map((app) => ({
@@ -328,7 +328,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 获取应用信息
+   * Get application info
    */
   private handleGetApp(appId: string): Response {
     const app = this.appManager.getApp(appId);
@@ -356,7 +356,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 更新应用
+   * Update an application
    */
   private async handleUpdateApp(
     appId: string,
@@ -390,7 +390,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 删除应用
+   * Delete an application
    */
   private async handleDeleteApp(appId: string): Promise<Response> {
     try {
@@ -411,7 +411,7 @@ export class HTTPGateway {
   }
 
   /**
-   * 处理应用请求
+   * Handle an application request
    */
   private async handleAppRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -427,23 +427,23 @@ export class HTTPGateway {
       return new Response("Missing app ID", { status: 400 });
     }
 
-    // 构建应用内部的路径
+    // Build the app-internal path
     const appPath = "/" + pathParts.slice(3).join("/");
     const appUrl = new URL(appPath + url.search, url.origin);
 
-    // 创建新的请求对象
+    // Create a new request object
     const appRequest = new Request(appUrl, {
       method: request.method,
       headers: request.headers,
       body: request.body,
     });
 
-    // 执行应用
+    // Execute the application
     return await this.appManager.executeApp(appId, appRequest);
   }
 
   /**
-   * 停止网关服务器
+   * Stop the gateway server
    */
   async stop(): Promise<void> {
     if (this.server) {

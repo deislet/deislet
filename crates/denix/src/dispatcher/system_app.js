@@ -1,5 +1,5 @@
-// 系统管理应用 - 提供平台管理 API
-// 通过 x-deis-app-id: _system 访问
+// System management app - provides platform management APIs
+// Accessible via x-deis-app-id: _system
 
 export default async function handler(context) {
   const request = context.request;
@@ -7,7 +7,7 @@ export default async function handler(context) {
   const path = url.pathname;
   const method = request.method;
 
-    // 健康检查
+    // Health check
     if (path === "/health" && method === "GET") {
       return new Response(
         JSON.stringify({
@@ -21,7 +21,7 @@ export default async function handler(context) {
       );
     }
 
-    // 根路径 - 欢迎页面
+    // Root path - welcome page
     if (path === "/" && method === "GET") {
       return new Response(
         "<html><body><h1>Denix Platform</h1><p>Use x-deis-app-id header to route requests</p></body></html>",

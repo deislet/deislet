@@ -130,8 +130,8 @@ mod tests {
         let has_exists = cache.contains_key("exists_key");
         let has_not_exists = cache.contains_key("not_exists_key");
 
-        assert_eq!(has_exists, true);
-        assert_eq!(has_not_exists, false);
+        assert!(has_exists);
+        assert!(!has_not_exists);
     }
 
     #[tokio::test]

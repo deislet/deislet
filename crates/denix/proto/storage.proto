@@ -3,174 +3,174 @@ syntax = "proto3";
 package denix.storage;
 
 // KV Store Service
-// 提供简单的键值存储功能
+// Provides simple key-value storage
 service KvStore {
-  // 获取值
+  // Get a value
   rpc Get(GetRequest) returns (GetResponse);
 
-  // 设置值
+  // Set a value
   rpc Set(SetRequest) returns (SetResponse);
 
-  // 删除键
+  // Delete a key
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 
-  // 列出前缀匹配的键
+  // List keys matching a prefix
   rpc List(ListRequest) returns (ListResponse);
 
-  // 检查键是否存在
+  // Check whether a key exists
   rpc Has(HasRequest) returns (HasResponse);
 }
 
-// Get 请求
+// Get request
 message GetRequest {
   string key = 1;
 }
 
-// Get 响应
+// Get response
 message GetResponse {
-  // 如果找到，value 非空；否则为空
+  // If found, value is present; otherwise it is absent
   optional string value = 1;
 }
 
-// Set 请求
+// Set request
 message SetRequest {
   string key = 1;
   string value = 2;
 }
 
-// Set 响应
+// Set response
 message SetResponse {
   bool success = 1;
 }
 
-// Delete 请求
+// Delete request
 message DeleteRequest {
   string key = 1;
 }
 
-// Delete 响应
+// Delete response
 message DeleteResponse {
   bool success = 1;
 }
 
-// List 请求
+// List request
 message ListRequest {
   string prefix = 1;
-  // 可选的分页参数
+  // Optional pagination parameters
   optional int32 limit = 2;
   optional string cursor = 3;
 }
 
-// List 响应
+// List response
 message ListResponse {
   repeated string keys = 1;
-  // 下一页游标（如果有）
+  // Cursor for the next page (if any)
   optional string next_cursor = 2;
 }
 
-// Has 请求
+// Has request
 message HasRequest {
   string key = 1;
 }
 
-// Has 响应
+// Has response
 message HasResponse {
   bool exists = 1;
 }
 
 // Database Service
-// 提供类似 Cloudflare D1 的 SQL 数据库功能
+// Provides SQL database functionality similar to Cloudflare D1
 service Database {
-  // 执行 SQL 语句（INSERT, UPDATE, DELETE 等）
+  // Execute a SQL statement (INSERT, UPDATE, DELETE, etc.)
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
 
-  // 查询 SQL（SELECT）
+  // Run a SQL query (SELECT)
   rpc Query(QueryRequest) returns (QueryResponse);
 
-  // 批量执行多条 SQL
+  // Execute multiple SQL statements in a batch
   rpc Batch(BatchRequest) returns (BatchResponse);
 
-  // 预处理语句
+  // Prepare a statement
   rpc Prepare(PrepareRequest) returns (PrepareResponse);
 
-  // 执行预处理语句
+  // Execute a prepared statement
   rpc ExecutePrepared(ExecutePreparedRequest) returns (ExecuteResponse);
 
-  // 查询预处理语句
+  // Query with a prepared statement
   rpc QueryPrepared(QueryPreparedRequest) returns (QueryResponse);
 }
 
-// Execute 请求
+// Execute request
 message ExecuteRequest {
   string sql = 1;
-  // JSON 编码的参数数组
+  // JSON-encoded parameter array
   optional string params = 2;
 }
 
-// Execute 响应
+// Execute response
 message ExecuteResponse {
   bool success = 1;
-  // 影响的行数
+  // Number of affected rows
   int64 rows_affected = 2;
-  // 最后插入的 ID
+  // Last inserted row ID
   optional int64 last_insert_id = 3;
-  // 错误信息（如果有）
+  // Error message (if any)
   optional string error = 4;
 }
 
-// Query 请求
+// Query request
 message QueryRequest {
   string sql = 1;
-  // JSON 编码的参数数组
+  // JSON-encoded parameter array
   optional string params = 2;
 }
 
-// Query 响应
+// Query response
 message QueryResponse {
   bool success = 1;
-  // JSON 编码的结果行数组
+  // JSON-encoded array of result rows
   string rows = 2;
-  // 列名
+  // Column names
   repeated string columns = 3;
-  // 错误信息（如果有）
+  // Error message (if any)
   optional string error = 4;
 }
 
-// Batch 请求
+// Batch request
 message BatchRequest {
   repeated ExecuteRequest statements = 1;
 }
 
-// Batch 响应
+// Batch response
 message BatchResponse {
   bool success = 1;
   repeated ExecuteResponse results = 2;
   optional string error = 3;
 }
 
-// Prepare 请求
+// Prepare request
 message PrepareRequest {
   string sql = 1;
 }
 
-// Prepare 响应
+// Prepare response
 message PrepareResponse {
   bool success = 1;
-  // 预处理语句 ID
+  // Prepared statement ID
   string statement_id = 2;
   optional string error = 3;
 }
 
-// ExecutePrepared 请求
+// ExecutePrepared request
 message ExecutePreparedRequest {
   string statement_id = 1;
-  // JSON 编码的参数数组
+  // JSON-encoded parameter array
   optional string params = 2;
 }
 
-// QueryPrepared 请求
+// QueryPrepared request
 message QueryPreparedRequest {
   string statement_id = 1;
-  // JSON 编码的参数数组
+  // JSON-encoded parameter array
   optional string params = 2;
 }

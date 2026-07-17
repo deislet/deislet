@@ -1,7 +1,7 @@
-// 资源类型定义
+// Resource type definitions
 
 /**
- * 资源提供者接口
+ * Resource provider interface
  */
 export interface ResourceProvider {
   type: string;
@@ -10,7 +10,7 @@ export interface ResourceProvider {
 }
 
 /**
- * KV 存储接口
+ * KV store interface
  */
 export interface KVStore {
   get(key: string): Promise<string | null>;

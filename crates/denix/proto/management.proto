@@ -2,193 +2,193 @@ syntax = "proto3";
 
 package denix.management;
 
-// Denix 管理服务 - 接收 supervisor 的控制指令
+// Denix management service - receives control commands from the supervisor
 service DenixManagement {
-    // Supervisor 推送配置
+    // Supervisor pushes configuration
     rpc PushConfig(PushConfigRequest) returns (PushConfigResponse);
 
-    // Supervisor 部署应用
+    // Supervisor deploys an app
     rpc DeployApp(DeployAppRequest) returns (DeployAppResponse);
 
-    // Supervisor 卸载应用
+    // Supervisor unloads an app
     rpc UnloadApp(UnloadAppRequest) returns (UnloadAppResponse);
 
-    // Supervisor 更新应用
+    // Supervisor updates an app
     rpc UpdateApp(UpdateAppRequest) returns (UpdateAppResponse);
 
-    // Supervisor 查询状态
+    // Supervisor queries status
     rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 
-    // Supervisor 执行命令
+    // Supervisor executes a command
     rpc ExecuteCommand(ExecuteCommandRequest) returns (ExecuteCommandResponse);
 
-    // 健康检查
+    // Health check
     rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
-    // 开启调试
+    // Start an inspect (debug) session
     rpc StartInspect(StartInspectRequest) returns (StartInspectResponse);
 }
 
-// ============ 调试管理 ============
+// ============ Inspect management ============
 
 message StartInspectRequest {
     string app_id = 1;
-    // 调试会话有效期（秒），默认 300秒
+    // Inspect session TTL (seconds), defaults to 300 seconds
     int32 ttl_seconds = 2;
 }
 
 message StartInspectResponse {
-    // 调试用 App ID (例如: _inspect:<app_id>)
+    // Inspect app ID (e.g. _inspect:<app_id>)
     string inspect_app_id = 1;
-    // 调试 Token (需放入 x-denix-inspect-token header)
+    // Inspect token (must be sent in the x-denix-inspect-token header)
     string token = 2;
 }
 
-// ============ 配置管理 ============
+// ============ Configuration management ============
 
-// 推送配置请求
+// Push configuration request
 message PushConfigRequest {
-    // 配置版本号
+    // Configuration version number
     int64 version = 1;
 
-    // 配置内容（JSON 格式）
+    // Configuration content (JSON format)
     string config_json = 2;
 
-    // 配置类型
+    // Configuration type
     ConfigType config_type = 3;
 
-    // 是否强制更新
+    // Whether to force the update
     bool force = 4;
 }
 
-// 配置类型
+// Configuration type
 enum ConfigType {
     CONFIG_TYPE_UNSPECIFIED = 0;
-    GLOBAL = 1;      // 全局配置
-    APP = 2;         // 应用配置
-    RESOURCE = 3;    // 资源配置
+    GLOBAL = 1;      // Global configuration
+    APP = 2;         // Application configuration
+    RESOURCE = 3;    // Resource configuration
 }
 
-// 推送配置响应
+// Push configuration response
 message PushConfigResponse {
     bool success = 1;
     string message = 2;
     int64 applied_version = 3;
 }
 
-// ============ 应用管理 ============
+// ============ Application management ============
 
-// 部署应用请求
+// Deploy app request
 message DeployAppRequest {
-    // 应用 ID
+    // Application ID
     string app_id = 1;
 
-    // 应用 ZIP 包数据
+    // Application ZIP package data
     bytes package_data = 2;
 
-    // 应用配置（可选，会覆盖 manifest 中的配置）
+    // Application config (optional; overrides the config in the manifest)
     AppConfig config = 3;
 }
 
-// 应用配置
+// Application configuration
 message AppConfig {
-    // 环境变量
+    // Environment variables
     map<string, string> env = 1;
 
-    // 资源限制
+    // Resource limits
     ResourceLimits limits = 2;
 
-    // 路由规则
+    // Routing rules
     repeated RouteRule routes = 3;
 }
 
-// 资源限制
+// Resource limits
 message ResourceLimits {
-    // 内存限制（MB）
+    // Memory limit (MB)
     int32 memory_mb = 1;
 
-    // CPU 限制（毫核）
+    // CPU limit (millicores)
     int32 cpu_milli = 2;
 
-    // 最大请求并发数
+    // Maximum concurrent requests
     int32 max_concurrency = 3;
 
-    // ResourceTable 最大数量
+    // Maximum number of ResourceTable entries
     int32 resource_table_max = 4;
 }
 
-// 路由规则
+// Routing rule
 message RouteRule {
-    // 匹配路径（支持通配符）
+    // Path to match (wildcards supported)
     string path = 1;
 
-    // 匹配方法
+    // Methods to match
     repeated string methods = 2;
 }
 
-// 部署应用响应
+// Deploy app response
 message DeployAppResponse {
     bool success = 1;
     string message = 2;
     string app_id = 3;
 }
 
-// 卸载应用请求
+// Unload app request
 message UnloadAppRequest {
     string app_id = 1;
 }
 
-// 卸载应用响应
+// Unload app response
 message UnloadAppResponse {
     bool success = 1;
     string message = 2;
 }
 
-// 更新应用请求
+// Update app request
 message UpdateAppRequest {
     string app_id = 1;
-    // 应用 ZIP 包数据
+    // Application ZIP package data
     bytes package_data = 2;
-    // 应用配置（可选，会覆盖 manifest 中的配置）
+    // Application config (optional; overrides the config in the manifest)
     AppConfig config = 3;
 }
 
-// 更新应用响应
+// Update app response
 message UpdateAppResponse {
     bool success = 1;
     string message = 2;
 }
 
-// ============ 状态查询 ============
+// ============ Status queries ============
 
-// 查询状态请求
+// Get status request
 message GetStatusRequest {
-    // 是否包含应用详情
+    // Whether to include app details
     bool include_apps = 1;
 }
 
-// 查询状态响应
+// Get status response
 message GetStatusResponse {
-    // Worker 基本信息
+    // Basic worker info
     WorkerInfo worker_info = 1;
 
-    // 应用列表
+    // Application list
     repeated AppStatus apps = 2;
 
-    // 系统资源使用情况
+    // System resource usage
     ResourceUsage resource_usage = 3;
 
-    // 应用 OpMetrics 汇总
+    // Per-app OpMetrics summary
     repeated AppOpMetrics op_metrics = 4;
 }
 
-// 应用 OpMetrics 汇总
+// Per-app OpMetrics summary
 message AppOpMetrics {
     string app_id = 1;
     OpMetricsSummary summary = 2;
 }
 
-// OpMetrics 汇总
+// OpMetrics summary
 message OpMetricsSummary {
     uint64 ops_dispatched_sync = 1;
     uint64 ops_dispatched_async = 2;
@@ -196,7 +196,7 @@ message OpMetricsSummary {
     uint64 ops_completed_async = 4;
 }
 
-// Worker 信息
+// Worker info
 message WorkerInfo {
     string worker_id = 1;
     string version = 2;
@@ -204,7 +204,7 @@ message WorkerInfo {
     string hostname = 4;
 }
 
-// 应用状态
+// Application status
 message AppStatus {
     string app_id = 1;
     AppState state = 2;
@@ -213,7 +213,7 @@ message AppStatus {
     string error_message = 5;
 }
 
-// 应用状态枚举
+// Application state enum
 enum AppState {
     APP_STATE_UNSPECIFIED = 0;
     LOADING = 1;
@@ -222,35 +222,35 @@ enum AppState {
     ERROR = 4;
 }
 
-// 资源使用情况
+// Resource usage
 message ResourceUsage {
     double cpu_percent = 1;
     int64 memory_bytes = 2;
     int64 goroutines = 3;
 }
 
-// ============ 命令执行 ============
+// ============ Command execution ============
 
-// 执行命令请求
+// Execute command request
 message ExecuteCommandRequest {
     string command = 1;
     repeated string args = 2;
     map<string, string> options = 3;
 }
 
-// 执行命令响应
+// Execute command response
 message ExecuteCommandResponse {
     bool success = 1;
     string output = 2;
     string error = 3;
 }
 
-// ============ 健康检查 ============
+// ============ Health check ============
 
-// 健康检查请求
+// Health check request
 message HealthCheckRequest {}
 
-// 健康检查响应
+// Health check response
 message HealthCheckResponse {
     bool healthy = 1;
     string version = 2;

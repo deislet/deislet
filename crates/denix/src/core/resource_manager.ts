@@ -1,30 +1,30 @@
-// 资源管理器实现
+// Resource manager implementation
 
 import type { ResourceProvider } from "../resources/types.ts";
 import { KVResourceProvider } from "../resources/kv.ts";
 
 /**
- * ResourceManager 类
- * 管理应用可访问的外部资源
+ * ResourceManager class
+ * Manages external resources accessible to applications
  */
 export class ResourceManager {
   private providers = new Map<string, ResourceProvider>();
   private appResources = new Map<string, Map<string, any>>();
 
   constructor() {
-    // 注册默认资源提供者
+    // Register default resource providers
     this.registerProvider(new KVResourceProvider());
   }
 
   /**
-   * 注册资源提供者
+   * Register a resource provider
    */
   registerProvider(provider: ResourceProvider): void {
     this.providers.set(provider.type, provider);
   }
 
   /**
-   * 为应用创建资源
+   * Create a resource for an application
    */
   async createResource(
     appId: string,
@@ -39,7 +39,7 @@ export class ResourceManager {
 
     const instance = await provider.create(appId, config);
 
-    // 存储资源实例
+    // Store the resource instance
     if (!this.appResources.has(appId)) {
       this.appResources.set(appId, new Map());
     }
@@ -53,8 +53,8 @@ export class ResourceManager {
   }
 
   /**
-   * 获取应用的环境对象
-   * 包含所有已创建的资源
+   * Get the environment object for an application,
+   * containing all created resources
    */
   getAppEnv(appId: string): Record<string, any> {
     const resources = this.appResources.get(appId);
@@ -71,7 +71,7 @@ export class ResourceManager {
   }
 
   /**
-   * 销毁应用的所有资源
+   * Destroy all resources of an application
    */
   async destroyAppResources(appId: string): Promise<void> {
     const resources = this.appResources.get(appId);
@@ -90,14 +90,14 @@ export class ResourceManager {
   }
 
   /**
-   * 列出已注册的资源类型
+   * List registered resource types
    */
   listProviders(): string[] {
     return Array.from(this.providers.keys());
   }
 
   /**
-   * 获取应用的资源列表
+   * Get the resource list of an application
    */
   listAppResources(appId: string): Array<{ name: string; type: string }> {
     const resources = this.appResources.get(appId);

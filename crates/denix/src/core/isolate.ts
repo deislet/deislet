@@ -1,5 +1,5 @@
-// Runtime Isolate 实现
-// 使用 Deno Worker 为每个应用提供独立的运行时环境
+// Runtime isolate implementation
+// Uses Deno Workers to give each application an isolated runtime environment
 
 import type {
   AppConfig,
@@ -9,7 +9,7 @@ import type {
 } from "./types.ts";
 
 /**
- * 将 Request 对象序列化为可传输的格式
+ * Serialize a Request object into a transferable format
  */
 async function serializeRequest(request: Request) {
   const body = request.body ? await request.text() : undefined;
@@ -27,7 +27,7 @@ async function serializeRequest(request: Request) {
 }
 
 /**
- * 反序列化 Response 数据
+ * Deserialize Response data
  */
 function deserializeResponse(data: any): Response {
   const { status, statusText, headers, body } = data;
@@ -39,8 +39,8 @@ function deserializeResponse(data: any): Response {
 }
 
 /**
- * RuntimeIsolate 类
- * 封装单个应用的 Deno Worker 实例
+ * RuntimeIsolate class
+ * Wraps the Deno Worker instance of a single application
  */
 export class RuntimeIsolate {
   private worker: Worker | null = null;
@@ -57,13 +57,13 @@ export class RuntimeIsolate {
   ) {}
 
   /**
-   * 初始化 Worker
+   * Initialize the Worker
    */
   async initialize(): Promise<void> {
-    // 构建 Worker 代码
+    // Build the Worker code
     const workerCode = this.buildWorkerCode();
 
-    // 创建 Worker
+    // Create the Worker
     const permissions = this.buildPermissions(this.config.permissions);
 
     this.worker = new Worker(
@@ -76,15 +76,15 @@ export class RuntimeIsolate {
       },
     );
 
-    // 监听 Worker 消息
+    // Listen for Worker messages
     this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       this.handleWorkerMessage(event.data);
     };
 
-    // 监听 Worker 错误
+    // Listen for Worker errors
     this.worker.onerror = (error) => {
       console.error(`[${this.appId}] Worker error:`, error);
-      // 拒绝所有待处理的请求
+      // Reject all pending requests
       for (const [requestId, pending] of this.pendingRequests.entries()) {
         clearTimeout(pending.timer);
         pending.reject(new Error("Worker crashed"));
@@ -92,27 +92,27 @@ export class RuntimeIsolate {
       }
     };
 
-    // 等待 Worker 初始化完成
+    // Wait for the Worker to finish initializing
     await this.ping();
   }
 
   /**
-   * 构建 Worker 代码
+   * Build the Worker code
    */
   private buildWorkerCode(): string {
-    // 注入应用代码
+    // Inject the application code
     const appCode = this.code;
 
-    // Worker 运行时代码
+    // Worker runtime code
     return `
-      // 注入应用代码到全局
+      // Inject the application code into the global scope
       self.__APP_CODE__ = ${JSON.stringify(appCode)};
 
-      // Worker 全局状态
+      // Worker global state
       let appHandler = null;
       let isReady = false;
 
-      // 初始化应用
+      // Initialize the application
       async function initializeApp() {
         try {
           const appModule = await import("data:text/javascript," + encodeURIComponent(self.__APP_CODE__));
@@ -129,13 +129,13 @@ export class RuntimeIsolate {
         }
       }
 
-      // 反序列化 Request
+      // Deserialize a Request
       function deserializeRequest(data) {
         const { url, method, headers, body } = data;
         return new Request(url, { method, headers, body });
       }
 
-      // 序列化 Response
+      // Serialize a Response
       async function serializeResponse(response) {
         const body = await response.text();
         const headers = {};
@@ -151,7 +151,7 @@ export class RuntimeIsolate {
         };
       }
 
-      // 处理消息
+      // Handle messages
       self.onmessage = async (event) => {
         const message = event.data;
 
@@ -196,7 +196,7 @@ export class RuntimeIsolate {
   }
 
   /**
-   * 构建权限配置
+   * Build the permission configuration
    */
   private buildPermissions(permissions?: Permissions): Deno.PermissionOptions {
     return {
@@ -209,7 +209,7 @@ export class RuntimeIsolate {
   }
 
   /**
-   * Ping Worker 检查是否就绪
+   * Ping the Worker to check readiness
    */
   private async ping(): Promise<void> {
     const initMessage: WorkerRequest = {
@@ -227,7 +227,7 @@ export class RuntimeIsolate {
           clearTimeout(timer);
           this.worker?.removeEventListener("message", handler);
 
-          // 发送初始化消息
+          // Send the initialization message
           const initMsg: WorkerRequest = {
             type: "ping",
             requestId: "init2",
@@ -250,7 +250,7 @@ export class RuntimeIsolate {
   }
 
   /**
-   * 执行请求
+   * Execute a request
    */
   async execute(
     request: Request,
@@ -284,7 +284,7 @@ export class RuntimeIsolate {
   }
 
   /**
-   * 处理 Worker 消息
+   * Handle a Worker message
    */
   private handleWorkerMessage(message: WorkerResponse) {
     const pending = this.pendingRequests.get(message.requestId);
@@ -304,7 +304,7 @@ export class RuntimeIsolate {
   }
 
   /**
-   * 终止 Worker
+   * Terminate the Worker
    */
   terminate(): void {
     if (this.worker) {
@@ -312,7 +312,7 @@ export class RuntimeIsolate {
       this.worker = null;
     }
 
-    // 拒绝所有待处理的请求
+    // Reject all pending requests
     for (const [requestId, pending] of this.pendingRequests.entries()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Worker terminated"));
@@ -321,7 +321,7 @@ export class RuntimeIsolate {
   }
 
   /**
-   * 获取应用 ID
+   * Get the application ID
    */
   getAppId(): string {
     return this.appId;

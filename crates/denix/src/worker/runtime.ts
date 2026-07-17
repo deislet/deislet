@@ -1,14 +1,14 @@
-// Worker 运行时代码
-// 这段代码运行在独立的 Worker 线程中
+// Worker runtime code
+// This code runs in a dedicated Worker thread
 
 import type { WorkerRequest, WorkerResponse } from "../core/types.ts";
 
-// Worker 全局状态
+// Worker global state
 let appHandler: any = null;
 let isReady = false;
 
 /**
- * 序列化 Request 对象为可传输的格式
+ * Serialize a Request object into a transferable format
  */
 async function serializeRequest(request: Request) {
   const body = request.body ? await request.text() : undefined;
@@ -26,7 +26,7 @@ async function serializeRequest(request: Request) {
 }
 
 /**
- * 反序列化 Request 对象
+ * Deserialize a Request object
  */
 function deserializeRequest(data: any): Request {
   const { url, method, headers, body } = data;
@@ -38,7 +38,7 @@ function deserializeRequest(data: any): Request {
 }
 
 /**
- * 序列化 Response 对象为可传输的格式
+ * Serialize a Response object into a transferable format
  */
 async function serializeResponse(response: Response) {
   const body = await response.text();
@@ -56,14 +56,14 @@ async function serializeResponse(response: Response) {
 }
 
 /**
- * 处理来自主线程的消息
+ * Handle messages from the main thread
  */
 self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const message = event.data;
 
   try {
     if (message.type === "ping") {
-      // 健康检查
+      // Health check
       const response: WorkerResponse = {
         type: "pong",
         requestId: message.requestId,
@@ -73,7 +73,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (message.type === "execute") {
-      // 执行应用代码
+      // Execute the application code
       if (!isReady || !appHandler) {
         throw new Error("App handler not initialized");
       }
@@ -82,16 +82,16 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         throw new Error("Request data is missing");
       }
 
-      // 反序列化请求
+      // Deserialize the request
       const request = deserializeRequest(message.request);
 
-      // 准备环境对象
+      // Prepare the environment object
       const env = message.env || {};
 
-      // 执行应用的 fetch 函数
+      // Invoke the app's fetch function
       const response = await appHandler.fetch(request, env);
 
-      // 序列化响应
+      // Serialize the response
       const serializedResponse = await serializeResponse(response);
 
       const responseMessage: WorkerResponse = {
@@ -103,7 +103,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       self.postMessage(responseMessage);
     }
   } catch (error) {
-    // 发送错误响应
+    // Send an error response
     const errorMessage: WorkerResponse = {
       type: "error",
       requestId: message.requestId,
@@ -114,15 +114,15 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 };
 
 /**
- * 初始化应用
- * 这个函数会在 Worker 启动时立即执行
+ * Initialize the application
+ * This function runs immediately when the Worker starts
  */
 async function initializeApp() {
   try {
-    // 应用代码会通过特殊的方式注入
-    // 在实际运行时，__APP_CODE__ 会被替换为真实的应用代码
+    // The application code is injected externally;
+    // at runtime, __APP_CODE__ is replaced with the real application code
     const appModule = await import("data:text/javascript," + encodeURIComponent(
-      // @ts-ignore - __APP_CODE__ 会在运行时注入
+      // @ts-ignore - __APP_CODE__ is injected at runtime
       self.__APP_CODE__,
     ));
 
@@ -141,6 +141,6 @@ async function initializeApp() {
   }
 }
 
-// 暴露全局初始化函数
+// Expose the global initialization function
 // @ts-ignore
 self.initializeApp = initializeApp;

@@ -670,6 +670,12 @@ impl RuntimePool {
 }
 
 #[cfg(test)]
+// Holding the std MutexGuard across await points is intentional here: the global
+// TEST_POOL mutex exists precisely to serialize these tests against a shared
+// singleton RuntimePool (V8 cannot be created/destroyed repeatedly). Each test is
+// an independent tokio runtime, so no deadlock is possible, and dropping the guard
+// early would defeat the purpose.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::app::types::AppPermissions;

@@ -1,57 +1,57 @@
-// 核心类型定义
+// Core type definitions
 
 /**
- * 应用状态
+ * Application state
  */
 export type AppState = "loading" | "running" | "stopped" | "error";
 
 /**
- * 权限配置
+ * Permission configuration
  */
 export interface Permissions {
-  net?: boolean | string[]; // 网络访问
-  read?: boolean | string[]; // 文件读取
-  write?: boolean | string[]; // 文件写入
-  env?: boolean | string[]; // 环境变量
-  run?: boolean | string[]; // 子进程
+  net?: boolean | string[]; // Network access
+  read?: boolean | string[]; // File read
+  write?: boolean | string[]; // File write
+  env?: boolean | string[]; // Environment variables
+  run?: boolean | string[]; // Subprocesses
 }
 
 /**
- * 资源限制
+ * Resource limits
  */
 export interface ResourceLimits {
-  maxMemoryMB?: number; // 最大内存 (MB)
-  maxCpuTimeMS?: number; // 最大 CPU 时间 (毫秒)
-  maxConcurrent?: number; // 最大并发请求
-  requestTimeoutMS?: number; // 请求超时 (毫秒)
+  maxMemoryMB?: number; // Maximum memory (MB)
+  maxCpuTimeMS?: number; // Maximum CPU time (milliseconds)
+  maxConcurrent?: number; // Maximum concurrent requests
+  requestTimeoutMS?: number; // Request timeout (milliseconds)
 }
 
 /**
- * 应用配置
+ * Application configuration
  */
 export interface AppConfig {
-  routes?: string[]; // 路由路径
-  permissions?: Permissions; // 权限配置
-  limits?: ResourceLimits; // 资源限制
-  resources?: string[]; // 所需资源列表
-  env?: Record<string, string>; // 环境变量
+  routes?: string[]; // Route paths
+  permissions?: Permissions; // Permission configuration
+  limits?: ResourceLimits; // Resource limits
+  resources?: string[]; // List of required resources
+  env?: Record<string, string>; // Environment variables
 }
 
 /**
- * 应用定义
+ * Application definition
  */
 export interface App {
-  id: string; // 应用 ID
-  code: string; // 应用代码
-  state: AppState; // 应用状态
-  config: AppConfig; // 应用配置
-  createdAt: Date; // 创建时间
-  updatedAt: Date; // 更新时间
-  error?: string; // 错误信息
+  id: string; // Application ID
+  code: string; // Application code
+  state: AppState; // Application state
+  config: AppConfig; // Application configuration
+  createdAt: Date; // Creation time
+  updatedAt: Date; // Last update time
+  error?: string; // Error message
 }
 
 /**
- * Worker 请求消息
+ * Worker request message
  */
 export interface WorkerRequest {
   type: "execute" | "ping";
@@ -66,7 +66,7 @@ export interface WorkerRequest {
 }
 
 /**
- * Worker 响应消息
+ * Worker response message
  */
 export interface WorkerResponse {
   type: "response" | "error" | "pong";
@@ -81,32 +81,32 @@ export interface WorkerResponse {
 }
 
 /**
- * 资源接口
+ * Resource interface
  */
 export interface Resource {
-  type: string; // 资源类型
-  name: string; // 资源名称
-  config: Record<string, any>; // 资源配置
+  type: string; // Resource type
+  name: string; // Resource name
+  config: Record<string, any>; // Resource configuration
 }
 
 /**
- * 资源提供者接口
+ * Resource provider interface
  */
 export interface ResourceProvider {
-  type: string; // 资源类型
-  create(appId: string, config: Record<string, any>): Promise<any>; // 创建资源实例
-  destroy(instance: any): Promise<void>; // 销毁资源实例
+  type: string; // Resource type
+  create(appId: string, config: Record<string, any>): Promise<any>; // Create a resource instance
+  destroy(instance: any): Promise<void>; // Destroy a resource instance
 }
 
 /**
- * 应用处理函数接口
+ * Application handler interface
  */
 export interface AppHandler {
   fetch(request: Request, env?: Record<string, any>): Promise<Response>;
 }
 
 /**
- * 路由配置
+ * Route configuration
  */
 export interface RouteConfig {
   appId: string;
