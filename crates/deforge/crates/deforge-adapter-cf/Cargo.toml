@@ -1,18 +1,18 @@
 [package]
 name = "deforge-adapter-cf"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
+version = "0.1.0"
+edition = "2021"
+authors = ["kookyleo <kookyleo@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/deislet/deforge"
+homepage = "https://github.com/deislet/deforge"
 description = "Cloudflare Workers adapter for deforge"
 
 [dependencies]
 deforge-core = { version = "0.1.0", path = "../deforge-core" }
 
-handlebars.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-anyhow.workspace = true
-walkdir.workspace = true
+handlebars = "5.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+walkdir = "2.4"

@@ -4,10 +4,9 @@ members = [
     "crates/workit",
     "crates/deflux",
     "crates/denix",
-]
-exclude = [
-    "crates/denictl",
     "crates/deforge",
+    "crates/deforge/crates/*",
+    "crates/denictl/crates/*",
 ]
 resolver = "2"
 

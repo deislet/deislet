@@ -1,22 +1,21 @@
 [package]
 name = "denictl-compiler"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+authors = ["Deislet Team"]
+license = "MIT"
 
 [dependencies]
 denictl-core = { path = "../denictl-core" }
 denictl-parser = { path = "../denictl-parser" }
 denictl-adapters = { path = "../denictl-adapters" }
 
-serde.workspace = true
-serde_json.workspace = true
-walkdir.workspace = true
-anyhow.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.4"
+anyhow = "1.0"
 
-swc_core.workspace = true
-swc_common.workspace = true
-swc_ecma_ast.workspace = true
-swc_ecma_parser.workspace = true
-swc_ecma_visit.workspace = true
+swc_common = "18.0"
+swc_ecma_ast = "20.0"
+swc_ecma_parser = "33.0"
+swc_ecma_visit = "20.0"
