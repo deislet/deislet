@@ -1772,6 +1772,7 @@ dependencies = [
  "hostname",
  "http-body-util",
  "hyper 1.8.1",
+ "icu_calendar",
  "moka",
  "num_cpus",
  "once_cell",
@@ -4601,6 +4602,7 @@ dependencies = [
  "icu_locale",
  "icu_locale_core",
  "icu_provider",
+ "ixdtf",
  "tinystr",
  "zerovec",
 ]

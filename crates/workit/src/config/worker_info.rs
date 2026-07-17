@@ -45,7 +45,7 @@ impl WorkerInfo {
     /// # Examples
     ///
     /// ```rust
-    /// use workit::{WorkerInfo, WorkerType};
+    /// use denira_workit::{WorkerInfo, WorkerType};
     ///
     /// let worker_info = WorkerInfo::new(
     ///     WorkerType::Denix("1.0.0".to_string()),
@@ -72,7 +72,7 @@ impl WorkerInfo {
     /// # Examples
     ///
     /// ```rust
-    /// use workit::{WorkerInfo, WorkerType};
+    /// use denira_workit::{WorkerInfo, WorkerType};
     ///
     /// let worker_info = WorkerInfo::new_single_port(
     ///     WorkerType::Denix("1.0.0".to_string()),
@@ -111,7 +111,7 @@ impl WorkerInfo {
     /// # Examples
     ///
     /// ```rust
-    /// use workit::{WorkerInfo, WorkerType};
+    /// use denira_workit::{WorkerInfo, WorkerType};
     ///
     /// let worker_info = WorkerInfo::new_single_port(
     ///     WorkerType::Deflux("1.2.0".to_string()),
