@@ -1,0 +1,22 @@
+# Denira Test Configuration with TLS
+
+bind_addr = "0.0.0.0"
+port = 8082
+heartbeat_interval = 30
+heartbeat_timeout = 90
+
+# Worker authentication
+worker_preshared_keys = [
+    "test-worker-key-12345"
+]
+
+# API authentication
+api_auth_enabled = false
+api_keys = []
+
+# TLS Configuration
+[tls]
+api_enabled = true
+ws_enabled = false
+cert_path = "cert.pem"
+key_path = "key.pem"
