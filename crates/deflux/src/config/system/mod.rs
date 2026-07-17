@@ -4,7 +4,6 @@ pub mod compression;
 pub mod log;
 pub mod mime;
 pub mod https;
-pub mod process;
 pub mod upstream;
 pub mod tokio;
 
@@ -18,37 +17,11 @@ pub use log::*;
 use serde::{Deserialize, Serialize};
 pub(crate) use upstream::*;
 pub(crate) use tokio::*;
-use workit::SupervisorConfig;
+use denira_workit::SupervisorConfig;
 
 use crate::config::{ConfigError, Validatable};
+use crate::process::DaemonConfig;
 
-/// Runtime configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RuntimeConfig {
-    /// Number of worker threads, default is number of CPU cores * 2
-    #[serde(default)]
-    pub worker_threads_factor: Option<usize>,
-    /// Maximum number of blocking threads
-    #[serde(default)]
-    pub max_blocking_threads: Option<usize>,
-    /// Event interval in milliseconds
-    #[serde(default)]
-    pub event_interval: Option<u32>,
-    /// Global queue interval in milliseconds
-    #[serde(default)]
-    pub global_queue_interval: Option<u32>,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            worker_threads_factor: Some(2),
-            max_blocking_threads: Some(128),
-            event_interval: Some(30),
-            global_queue_interval: Some(15),
-        }
-    }
-}
 
 /// System configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,6 +31,9 @@ pub struct SystemConfig {
     // user and group
     pub user: Option<String>,
     pub group: Option<String>,
+    // daemon configuration
+    #[serde(default)]
+    pub daemon_config: DaemonConfig,
     // tokio runtime
     pub tokio_runtime: Option<TokioConfig>,
     // listen address
@@ -76,13 +52,13 @@ pub struct SystemConfig {
     pub compression: Option<CompressionConfig>,
     // supervisor
     pub supervisor: Option<SupervisorConfig>,
-    /// Runtime configuration
-    #[serde(default)]
-    pub runtime: RuntimeConfig,
 }
 
 impl Validatable for SystemConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        // validate daemon config
+        self.daemon_config.validate()?;
+        
         // validate the upstreams
         if let Some(upstreams) = &self.upstreams {
             for upstream in upstreams {
@@ -121,7 +97,8 @@ impl Default for SystemConfig {
         Self {
             daemon: Some(true),
             user: Some("nobody".to_string()),
-            group: Some("nobody".to_string()),
+            group: Some("nogroup".to_string()),
+            daemon_config: DaemonConfig::default(),
             tokio_runtime: Some(TokioConfig::default()),
             listen_addr: Some(vec!["0.0.0.0".to_string()]),
             listen_ports: Some(vec![80, 443]),
@@ -132,7 +109,6 @@ impl Default for SystemConfig {
             log: Some(LoggingConfig::default()),
             compression: Some(CompressionConfig::default()),
             supervisor: None,
-            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -143,6 +119,7 @@ impl From<&SystemConfig> for SystemConfig {
             daemon: other.daemon.clone(),
             user: other.user.clone(),
             group: other.group.clone(),
+            daemon_config: other.daemon_config.clone(),
             tokio_runtime: other.tokio_runtime.clone(),
             listen_addr: other.listen_addr.clone(),
             listen_ports: other.listen_ports.clone(),
@@ -153,7 +130,6 @@ impl From<&SystemConfig> for SystemConfig {
             log: other.log.clone(),
             compression: other.compression.clone(),
             supervisor: other.supervisor.clone(),
-            runtime: other.runtime.clone(),
         }
     }
 }
@@ -180,6 +156,8 @@ impl Add<SystemConfig> for SystemConfig {
             } else {
                 self.daemon
             },
+            // daemon config (always prefer other's config if provided, otherwise keep self)
+            daemon_config: other.daemon_config,
             // tokio runtime
             tokio_runtime: if other.tokio_runtime.is_some() {
                 other.tokio_runtime
@@ -239,8 +217,6 @@ impl Add<SystemConfig> for SystemConfig {
             } else {
                 self.supervisor
             },
-            // runtime configuration
-            runtime: other.runtime,
         }
     }
 }

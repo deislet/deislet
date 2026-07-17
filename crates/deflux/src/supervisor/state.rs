@@ -1,36 +1,36 @@
 //! Deflux instance lifecycle state management
 //!
-//! 基于 workit 库的 InstanceStatus 实现 deflux 实例的生命周期管理
+//! Implementation of deflux instance lifecycle management based on InstanceStatus from the workit library
 //!
-//! 状态流转：Pending -> Active -> Sunsetting -> Terminated
-//! 支持重启循环：Terminated -> Pending
+//! State Transitions: Pending -> Active -> Sunsetting -> Terminated
+//! Supports restart cycle: Terminated -> Pending
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-// 直接使用 workit 库的状态定义
-pub use workit::models::instance::InstanceStatus as State;
+// Directly use state definitions from the workit library
+pub use denira_workit::models::instance::InstanceStatus as State;
 
-/// Deflux 实例状态管理器
+/// Deflux instance state manager
 ///
-/// 使用 workit 库的 InstanceStatus 管理 deflux 实例的完整生命周期
+/// Manages the full lifecycle of a deflux instance using InstanceStatus from the workit library
 ///
-/// 状态流转：
-/// - Pending: 实例启动，等待注册和配置下发
-/// - Active: 实例就绪，正常处理请求
-/// - Sunsetting: 实例准备关闭，不接受新连接
-/// - Terminated: 实例已完全关闭
+/// State Transitions:
+/// - Pending: Instance starting, waiting for registration and configuration delivery
+/// - Active: Instance ready, processing requests normally
+/// - Sunsetting: Instance preparing to close, no longer accepting new connections
+/// - Terminated: Instance fully closed
 pub struct DefluxStateManager {
-    /// 当前状态
+    /// Current state
     current_state: Arc<RwLock<State>>,
-    /// 状态转换历史
+    /// State transition history
     transition_history: Arc<RwLock<Vec<StateTransition>>>,
-    /// 实例 ID
+    /// Instance ID
     instance_id: String,
 }
 
-/// 状态转换记录
+/// State transition record
 #[derive(Debug, Clone)]
 pub struct StateTransition {
     pub from: State,
@@ -40,7 +40,7 @@ pub struct StateTransition {
 }
 
 impl DefluxStateManager {
-    /// 创建新的状态管理器
+    /// Create a new state manager
     pub fn new(instance_id: String) -> Self {
         info!("Creating state manager for instance: {}", instance_id);
 
@@ -51,12 +51,12 @@ impl DefluxStateManager {
         }
     }
 
-    /// 内部状态转换方法
+    /// Internal state transition method
     async fn transition_to(&self, new_state: State, event: &str) -> Result<State, String> {
         let mut current = self.current_state.write().await;
         let old_state = current.clone();
 
-        // 验证状态转换是否有效
+        // Validate if the state transition is valid
         if !self.is_valid_transition(&old_state, &new_state) {
             let error_msg = format!(
                 "Invalid state transition from {:?} to {:?} via event '{}'",
@@ -66,10 +66,10 @@ impl DefluxStateManager {
             return Err(error_msg);
         }
 
-        // 执行状态转换
+        // Execute state transition
         *current = new_state.clone();
 
-        // 记录转换历史
+        // Record transition history
         let transition = StateTransition {
             from: old_state.clone(),
             to: new_state.clone(),
@@ -88,69 +88,69 @@ impl DefluxStateManager {
         Ok(new_state)
     }
 
-    /// 验证状态转换是否有效
+    /// Validate if the state transition is valid
     fn is_valid_transition(&self, from: &State, to: &State) -> bool {
         use State::*;
 
         match (from, to) {
-            // 正常生命周期
-            (Pending, Active) => true,        // 注册完成
-            (Active, Active) => true,         // 心跳保持
-            (Active, Sunsetting) => true,     // 开始关闭
-            (Sunsetting, Sunsetting) => true, // 关闭中心跳
-            (Sunsetting, Terminated) => true, // 完全关闭
+            // Normal lifecycle
+            (Pending, Active) => true,        // Registration completed
+            (Active, Active) => true,         // Heartbeat maintained
+            (Active, Sunsetting) => true,     // Shutdown started
+            (Sunsetting, Sunsetting) => true, // Heartbeat during sunsetting
+            (Sunsetting, Terminated) => true, // Fully closed
 
-            // 重启循环
-            (Terminated, Pending) => true, // 重启
+            // Restart cycle
+            (Terminated, Pending) => true, // Restart
 
-            // 其他转换都是无效的
+            // Other transitions are invalid
             _ => false,
         }
     }
 
-    /// 获取当前状态
+    /// Get current state
     pub async fn current_state(&self) -> State {
         self.current_state.read().await.clone()
     }
 
-    /// 检查实例是否处于活跃状态
+    /// Check if the instance is in active state
     pub async fn is_active(&self) -> bool {
         matches!(self.current_state().await, State::Active)
     }
 
-    /// 检查实例是否已终止
+    /// Check if the instance is terminated
     pub async fn is_terminated(&self) -> bool {
         matches!(self.current_state().await, State::Terminated)
     }
 
-    /// 检查实例是否在关闭中
+    /// Check if the instance is sunsetting
     pub async fn is_sunsetting(&self) -> bool {
         matches!(self.current_state().await, State::Sunsetting)
     }
 
-    /// 检查实例是否在等待状态
+    /// Check if the instance is pending
     pub async fn is_pending(&self) -> bool {
         matches!(self.current_state().await, State::Pending)
     }
 
-    /// 获取状态转换历史数量
+    /// Get number of state transitions in history
     pub async fn history_count(&self) -> usize {
         self.transition_history.read().await.len()
     }
 
-    /// 获取状态转换历史
+    /// Get state transition history
     pub async fn get_history(&self) -> Vec<StateTransition> {
         self.transition_history.read().await.clone()
     }
 
-    /// 获取实例 ID
+    /// Get instance ID
     pub fn instance_id(&self) -> &str {
         &self.instance_id
     }
 
-    /// 处理注册完成事件
+    /// Handle registration complete event
     ///
-    /// 从 Pending 状态转换到 Active 状态
+    /// Transition from Pending to Active state
     pub async fn handle_registration_complete(&self) -> Result<State, String> {
         info!(
             "Instance {} registration completed, transitioning to Active",
@@ -160,18 +160,18 @@ impl DefluxStateManager {
             .await
     }
 
-    /// 处理心跳事件
+    /// Handle heartbeat event
     ///
-    /// 在 Active 或 Sunsetting 状态保持活跃
+    /// Maintain activity in Active or Sunsetting state
     pub async fn handle_heartbeat(&self) -> Result<State, String> {
         let current = self.current_state().await;
         match current {
             State::Active => {
-                // 在 Active 状态，心跳保持状态不变
+                // In Active state, heartbeat keeps the state unchanged
                 self.transition_to(State::Active, "heartbeat").await
             }
             State::Sunsetting => {
-                // 在 Sunsetting 状态，心跳也保持状态不变
+                // In Sunsetting state, heartbeat also keeps the state unchanged
                 self.transition_to(State::Sunsetting, "heartbeat").await
             }
             _ => {
@@ -182,9 +182,9 @@ impl DefluxStateManager {
         }
     }
 
-    /// 处理关闭事件
+    /// Handle shutdown event
     ///
-    /// 从 Active 状态转换到 Sunsetting 状态
+    /// Transition from Active to Sunsetting state
     pub async fn handle_shutdown(&self) -> Result<State, String> {
         info!(
             "Instance {} received shutdown signal, transitioning to Sunsetting",
@@ -193,9 +193,9 @@ impl DefluxStateManager {
         self.transition_to(State::Sunsetting, "shutdown").await
     }
 
-    /// 处理静默事件（所有连接关闭）
+    /// Handle silenced event (all connections closed)
     ///
-    /// 从 Sunsetting 状态转换到 Terminated 状态
+    /// Transition from Sunsetting to Terminated state
     pub async fn handle_silenced(&self) -> Result<State, String> {
         info!(
             "Instance {} all connections closed, transitioning to Terminated",
@@ -204,9 +204,9 @@ impl DefluxStateManager {
         self.transition_to(State::Terminated, "silenced").await
     }
 
-    /// 处理重启事件
+    /// Handle restart event
     ///
-    /// 从 Terminated 状态转换到 Pending 状态
+    /// Transition from Terminated to Pending state
     pub async fn handle_startup(&self) -> Result<State, String> {
         info!(
             "Instance {} restarting, transitioning to Pending",
@@ -215,9 +215,9 @@ impl DefluxStateManager {
         self.transition_to(State::Pending, "startup").await
     }
 
-    /// 处理非受控终止（如进程被 kill）
+    /// Handle uncontrolled termination (e.g., process killed)
     ///
-    /// 尝试上报状态并记录
+    /// Attempt to report status and record it
     pub async fn handle_uncontrolled_termination(&self) -> Result<(), String> {
         let current_state = self.current_state().await;
         error!(
@@ -225,19 +225,19 @@ impl DefluxStateManager {
             self.instance_id, current_state
         );
 
-        // 记录状态变更历史
+        // Record state change history
         let history_count = self.history_count().await;
         error!(
             "Instance {} had {} state transitions before termination",
             self.instance_id, history_count
         );
 
-        // TODO: 实现状态上报逻辑
+        // TODO: Implement status reporting logic
 
         Ok(())
     }
 
-    /// 强制设置状态（仅用于紧急情况）
+    /// Force set state (emergency use only)
     pub async fn force_set_state(&self, new_state: State, reason: &str) -> State {
         let mut current = self.current_state.write().await;
         let old_state = current.clone();
@@ -248,7 +248,7 @@ impl DefluxStateManager {
             self.instance_id, old_state, new_state, reason
         );
 
-        // 记录强制转换
+        // Record forced transition
         let transition = StateTransition {
             from: old_state,
             to: new_state.clone(),
@@ -262,7 +262,7 @@ impl DefluxStateManager {
         new_state
     }
 
-    /// 检查是否可以执行特定操作
+    /// Check if a specific operation can be performed
     pub async fn can_handle_shutdown(&self) -> bool {
         matches!(self.current_state().await, State::Active)
     }
@@ -286,7 +286,7 @@ impl DefluxStateManager {
         matches!(self.current_state().await, State::Terminated)
     }
 
-    /// 重置状态机（仅用于测试）
+    /// Reset state machine (for testing only)
     #[cfg(test)]
     pub async fn reset(&self) {
         let mut current = self.current_state.write().await;
@@ -316,33 +316,33 @@ mod tests {
     async fn test_normal_lifecycle() {
         let manager = DefluxStateManager::new("test-instance".to_string());
 
-        // 初始状态应该是 Pending
+        // Initial state should be Pending
         assert_eq!(manager.current_state().await, State::Pending);
         assert!(manager.is_pending().await);
 
-        // 注册完成，进入 Active
+        // Registration completed, enter Active
         let result = manager.handle_registration_complete().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), State::Active);
         assert!(manager.is_active().await);
 
-        // 发送心跳，保持 Active
+        // Send heartbeat, maintain Active
         let result = manager.handle_heartbeat().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), State::Active);
 
-        // 开始关闭
+        // Start shutdown
         let result = manager.handle_shutdown().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), State::Sunsetting);
         assert!(manager.is_sunsetting().await);
 
-        // 心跳在 Sunsetting 状态仍然有效
+        // Heartbeat is still valid in Sunsetting state
         let result = manager.handle_heartbeat().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), State::Sunsetting);
 
-        // 所有连接关闭，进入 Terminated
+        // All connections closed, enter Terminated
         let result = manager.handle_silenced().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), State::Terminated);
@@ -353,13 +353,13 @@ mod tests {
     async fn test_restart_cycle() {
         let manager = DefluxStateManager::new("test-instance".to_string());
 
-        // 完整生命周期
+        // Complete lifecycle
         manager.handle_registration_complete().await.unwrap();
         manager.handle_shutdown().await.unwrap();
         manager.handle_silenced().await.unwrap();
         assert!(manager.is_terminated().await);
 
-        // 重启
+        // Restart
         let result = manager.handle_startup().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), State::Pending);
@@ -370,14 +370,14 @@ mod tests {
     async fn test_invalid_transitions() {
         let manager = DefluxStateManager::new("test-instance".to_string());
 
-        // 尝试从 Pending 状态直接关闭（无效转换）
+        // Attempt to shutdown directly from Pending state (invalid transition)
         let result = manager.handle_shutdown().await;
         assert!(result.is_err());
 
-        // 状态应该保持不变
+        // State should remain unchanged
         assert_eq!(manager.current_state().await, State::Pending);
 
-        // 尝试从 Pending 状态直接静默（无效转换）
+        // Attempt to silence directly from Pending state (invalid transition)
         let result = manager.handle_silenced().await;
         assert!(result.is_err());
         assert_eq!(manager.current_state().await, State::Pending);
@@ -387,24 +387,24 @@ mod tests {
     async fn test_capability_checks() {
         let manager = DefluxStateManager::new("test-instance".to_string());
 
-        // Pending 状态的能力
+        // Capabilities in Pending state
         assert!(manager.can_handle_registration().await);
         assert!(!manager.can_handle_shutdown().await);
         assert!(!manager.can_handle_heartbeat().await);
 
-        // 转换到 Active 状态
+        // Transition to Active state
         manager.handle_registration_complete().await.unwrap();
 
-        // Active 状态的能力
+        // Capabilities in Active state
         assert!(!manager.can_handle_registration().await);
         assert!(manager.can_handle_shutdown().await);
         assert!(manager.can_handle_heartbeat().await);
         assert!(!manager.can_handle_silenced().await);
 
-        // 转换到 Sunsetting 状态
+        // Transition to Sunsetting state
         manager.handle_shutdown().await.unwrap();
 
-        // Sunsetting 状态的能力
+        // Capabilities in Sunsetting state
         assert!(!manager.can_handle_shutdown().await);
         assert!(manager.can_handle_heartbeat().await);
         assert!(manager.can_handle_silenced().await);
@@ -416,7 +416,7 @@ mod tests {
 
         assert_eq!(manager.history_count().await, 0);
 
-        // 执行一些状态转换
+        // Perform some state transitions
         manager.handle_registration_complete().await.unwrap();
         assert_eq!(manager.history_count().await, 1);
 
@@ -426,7 +426,7 @@ mod tests {
         manager.handle_shutdown().await.unwrap();
         assert_eq!(manager.history_count().await, 3);
 
-        // 检查历史记录
+        // Check history records
         let history = manager.get_history().await;
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].from, State::Pending);
@@ -438,14 +438,14 @@ mod tests {
     async fn test_force_set_state() {
         let manager = DefluxStateManager::new("test-instance".to_string());
 
-        // 强制设置状态
+        // Force set state
         let new_state = manager
             .force_set_state(State::Terminated, "emergency shutdown")
             .await;
         assert_eq!(new_state, State::Terminated);
         assert!(manager.is_terminated().await);
 
-        // 检查历史记录包含强制转换
+        // Check that history records include the forced transition
         let history = manager.get_history().await;
         assert_eq!(history.len(), 1);
         assert!(history[0].event.contains("force_set"));
@@ -455,14 +455,14 @@ mod tests {
     async fn test_uncontrolled_termination() {
         let manager = DefluxStateManager::new("test-instance".to_string());
 
-        // 进入 Active 状态
+        // Enter Active state
         manager.handle_registration_complete().await.unwrap();
 
-        // 模拟非受控终止
+        // Simulate uncontrolled termination
         let result = manager.handle_uncontrolled_termination().await;
         assert!(result.is_ok());
 
-        // 状态应该保持不变（因为没有实际的状态转换）
+        // State should remain unchanged (since there was no actual state transition)
         assert_eq!(manager.current_state().await, State::Active);
     }
 }

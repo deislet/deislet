@@ -84,7 +84,7 @@ algorithms = ["gzip", "br", "deflate"]
 [system.supervisor]
 associated_id = "test-deflux-instance"
 secret = "test-secret-key-for-deflux-testing"
-addr = "ws://127.0.0.1:9001"
+addr = "http://127.0.0.1:9001"
 heartbeat_interval = 30
 request_timeout = 10
 retry_count = 3

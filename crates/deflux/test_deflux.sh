@@ -79,10 +79,10 @@ check_dependencies() {
 
 # Build the project
 build_project() {
-    echo -e "${BLUE}Building Deflux...${NC}"
+    echo -e "${BLUE}Building Deflux and Mock Supervisor...${NC}"
     
-    if ! cargo build --release; then
-        echo -e "${RED}Error: Failed to build Deflux${NC}"
+    if ! cargo build --release --bin deflux --bin mock_superv; then
+        echo -e "${RED}Error: Failed to build binaries${NC}"
         exit 1
     fi
     
@@ -91,13 +91,19 @@ build_project() {
 
 # Start fake supervisor
 start_fake_supervisor() {
-    echo -e "${BLUE}Starting fake supervisor on port $SUPERVISOR_PORT...${NC}"
+    echo -e "${BLUE}Starting mock supervisor (gRPC) on port $SUPERVISOR_PORT...${NC}"
     
-    cd fake_superv
-    cargo run -- "127.0.0.1:$SUPERVISOR_PORT" &
+    # Assume we are in crates/deflux, target is at workspace root
+    TARGET_DIR="../../target/release"
+    
+    if [[ ! -f "$TARGET_DIR/mock_superv" ]]; then
+        echo -e "${RED}Error: mock_superv binary not found at $TARGET_DIR/mock_superv${NC}"
+        exit 1
+    fi
+
+    "$TARGET_DIR/mock_superv" "127.0.0.1:$SUPERVISOR_PORT" &
     local pid=$!
     PIDS+=($pid)
-    cd ..
     
     # Wait for supervisor to start
     echo "Waiting for supervisor to start..."
@@ -105,11 +111,11 @@ start_fake_supervisor() {
     
     # Check if supervisor is running
     if ! kill -0 $pid 2>/dev/null; then
-        echo -e "${RED}Error: Failed to start fake supervisor${NC}"
+        echo -e "${RED}Error: Failed to start mock supervisor${NC}"
         exit 1
     fi
     
-    echo -e "${GREEN}Fake supervisor started (PID: $pid)${NC}"
+    echo -e "${GREEN}Mock supervisor started (PID: $pid)${NC}"
 }
 
 # Start test backends

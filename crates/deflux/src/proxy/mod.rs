@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod balancer;
+pub mod handler;
 pub mod service;
 
 use anyhow::Result;

@@ -1,0 +1,302 @@
+digraph RustProject {
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  edge [color=gray];
+
+  subgraph cluster_process {
+    label="process";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    process_DaemonConfig [label="DaemonConfig\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_crate_main {
+    label="crate::main";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+  }
+
+  subgraph cluster_cli {
+    label="cli";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    cli_CliConfig [label="CliConfig\n[struct]", fillcolor="#E3F2FD"];
+    cli_CliAction [label="CliAction\n[enum]", fillcolor="#FFF3E0"];
+    cli_SignalType [label="SignalType\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_crate {
+    label="crate";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+  }
+
+  subgraph cluster_supervisor_state {
+    label="supervisor::state";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    supervisor_state_DefluxStateManager [label="DefluxStateManager\n[struct]", fillcolor="#E3F2FD"];
+    supervisor_state_StateTransition [label="StateTransition\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_supervisor_client {
+    label="supervisor::client";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    supervisor_client_DefluxSupervisorClient [label="DefluxSupervisorClient\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_supervisor {
+    label="supervisor";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+  }
+
+  subgraph cluster_proxy_admin {
+    label="proxy::admin";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    proxy_admin_AdminInterface [label="AdminInterface\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_proxy_service {
+    label="proxy::service";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    proxy_service_ProxyService [label="ProxyService\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_proxy_balancer {
+    label="proxy::balancer";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    proxy_balancer_BalancerHelper [label="BalancerHelper\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_proxy {
+    label="proxy";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    proxy_DefluxServer [label="DefluxServer\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config_util {
+    label="config::util";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_util_SizeValue [label="SizeValue\n[struct]", fillcolor="#E3F2FD"];
+    config_util_CacheKeys [label="CacheKeys\n[struct]", fillcolor="#E3F2FD"];
+    config_util_CacheK [label="CacheK\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_config_error {
+    label="config::error";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_error_ConfigError [label="ConfigError\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_config_superv {
+    label="config::superv";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_superv_SupervisorSystemConfig [label="SupervisorSystemConfig\n[struct]", fillcolor="#E3F2FD"];
+    config_superv_SupervisorAppsConfig [label="SupervisorAppsConfig\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config {
+    label="config";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_Validatable [label="Validatable\n[trait]", fillcolor="#F3E5F5"];
+  }
+
+  subgraph cluster_config_local {
+    label="config::local";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+  }
+
+  subgraph cluster_config_system_https {
+    label="config::system::https";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_https_HttpsConfig [label="HttpsConfig\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config_system_compression {
+    label="config::system::compression";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_compression_MinSize [label="MinSize\n[struct]", fillcolor="#E3F2FD"];
+    config_system_compression_CompressionConfig [label="CompressionConfig\n[struct]", fillcolor="#E3F2FD"];
+    config_system_compression_CompressionAlgo [label="CompressionAlgo\n[enum]", fillcolor="#FFF3E0"];
+    config_system_compression_CompressionLevel [label="CompressionLevel\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_config_system_upstream {
+    label="config::system::upstream";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_upstream_UpstreamServer [label="UpstreamServer\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config_system_cache {
+    label="config::system::cache";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_cache_CacheConfig [label="CacheConfig\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config_system_mime {
+    label="config::system::mime";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_mime_MIMETypes [label="MIMETypes\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_config_system_balancing {
+    label="config::system::balancing";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_balancing_BalancingStrategy [label="BalancingStrategy\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_config_system {
+    label="config::system";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_SystemConfig [label="SystemConfig\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config_system_log {
+    label="config::system::log";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_log_PidConfig [label="PidConfig\n[struct]", fillcolor="#E3F2FD"];
+    config_system_log_ErrorLogConfig [label="ErrorLogConfig\n[struct]", fillcolor="#E3F2FD"];
+    config_system_log_AccessLogConfig [label="AccessLogConfig\n[struct]", fillcolor="#E3F2FD"];
+    config_system_log_LoggingConfig [label="LoggingConfig\n[struct]", fillcolor="#E3F2FD"];
+    config_system_log_AccessLogKeys [label="AccessLogKeys\n[struct]", fillcolor="#E3F2FD"];
+    config_system_log_LogLevel [label="LogLevel\n[enum]", fillcolor="#FFF3E0"];
+    config_system_log_AccessLogK [label="AccessLogK\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_config_system_tokio {
+    label="config::system::tokio";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_system_tokio_TokioConfig [label="TokioConfig\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config_manager_database {
+    label="config::manager::database";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_manager_database_AppConfigEntry [label="AppConfigEntry\n[struct]", fillcolor="#E3F2FD"];
+    config_manager_database_DatabaseStats [label="DatabaseStats\n[struct]", fillcolor="#E3F2FD"];
+    config_manager_database_ConfigDatabase [label="ConfigDatabase\n[struct]", fillcolor="#E3F2FD"];
+    config_manager_database_DatabaseError [label="DatabaseError\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_config_manager {
+    label="config::manager";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_manager_ConfigManager [label="ConfigManager\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config_apps_cache {
+    label="config::apps::cache";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_apps_cache_CacheConfigEntry [label="CacheConfigEntry\n[struct]", fillcolor="#E3F2FD"];
+    config_apps_cache_CacheConfig [label="CacheConfig\n[struct]", fillcolor="#E3F2FD"];
+    config_apps_cache_Condition [label="Condition\n[enum]", fillcolor="#FFF3E0"];
+  }
+
+  subgraph cluster_config_apps {
+    label="config::apps";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_apps_AppConfig [label="AppConfig\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  subgraph cluster_config_apps_certificate {
+    label="config::apps::certificate";
+    style=filled;
+    color=lightgrey;
+    node [style=filled];
+    config_apps_certificate_CertificateConfig [label="CertificateConfig\n[struct]", fillcolor="#E3F2FD"];
+  }
+
+  supervisor_mod [label="mod", shape=ellipse];
+  supervisor_mod -> supervisor_client_mod [style=dashed];
+  supervisor_mod [label="mod", shape=ellipse];
+  supervisor_mod -> supervisor_state_mod [style=dashed];
+  proxy_mod [label="mod", shape=ellipse];
+  proxy_mod -> proxy_admin_mod [style=dashed];
+  proxy_mod [label="mod", shape=ellipse];
+  proxy_mod -> proxy_balancer_mod [style=dashed];
+  proxy_mod [label="mod", shape=ellipse];
+  proxy_mod -> proxy_service_mod [style=dashed];
+  config_mod [label="mod", shape=ellipse];
+  config_mod -> config_manager_mod [style=dashed];
+  config_mod [label="mod", shape=ellipse];
+  config_mod -> config_system_mod [style=dashed];
+  config_mod [label="mod", shape=ellipse];
+  config_mod -> config_superv_mod [style=dashed];
+  config_mod [label="mod", shape=ellipse];
+  config_mod -> config_error_mod [style=dashed];
+  config_system_mod [label="mod", shape=ellipse];
+  config_system_mod -> config_system_balancing_mod [style=dashed];
+  config_system_mod [label="mod", shape=ellipse];
+  config_system_mod -> config_system_cache_mod [style=dashed];
+  config_system_mod [label="mod", shape=ellipse];
+  config_system_mod -> config_system_compression_mod [style=dashed];
+  config_system_mod [label="mod", shape=ellipse];
+  config_system_mod -> config_system_log_mod [style=dashed];
+  config_system_mod [label="mod", shape=ellipse];
+  config_system_mod -> config_system_mime_mod [style=dashed];
+  config_system_mod [label="mod", shape=ellipse];
+  config_system_mod -> config_system_https_mod [style=dashed];
+  config_system_mod [label="mod", shape=ellipse];
+  config_system_mod -> config_system_upstream_mod [style=dashed];
+  config_system_mod [label="mod", shape=ellipse];
+  config_system_mod -> config_system_tokio_mod [style=dashed];
+  config_manager_mod [label="mod", shape=ellipse];
+  config_manager_mod -> config_manager_database_mod [style=dashed];
+  config_apps_mod [label="mod", shape=ellipse];
+  config_apps_mod -> config_apps_certificate_mod [style=dashed];
+  config_apps_mod [label="mod", shape=ellipse];
+  config_apps_mod -> config_apps_cache_mod [style=dashed];
+}

@@ -4,8 +4,21 @@
 # 其他运行时配置（如上游、负载均衡、缓存等）将通过 supervisor 动态下发
 
 # 监听地址和端口
-listen_addr = ["127.0.0.1", "::1"]  # 同时支持 IPv4 和 IPv6
-listen_ports = [80, 443]  # 在每个地址上监听多个端口
+listen_addr = ["127.0.0.1"]  # 同时支持 IPv4 和 IPv6
+listen_ports = [8080, 8443]  # 在每个地址上监听多个端口
+
+# 守护进程配置
+user = "nobody"
+group = "nogroup"
+
+# 守护进程详细配置
+[daemon_config]
+pid_file = "/tmp/deflux.pid"
+stdout_file = "/tmp/deflux.out"
+stderr_file = "/tmp/deflux.err"
+work_dir = "/d/deislet/deflux"
+umask = 0o022
+chown_pid = false
 
 # 日志配置
 [log.error_log]

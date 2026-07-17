@@ -10,33 +10,21 @@ use tokio::net::TcpStream;
 use anyhow::Result;
 
 use crate::config::ConfigManager;
+use super::handler::ProxyHandler;
 
-/// Proxy service for handling requests with configuration management
 pub struct ProxyService {
     config_manager: Arc<ConfigManager>,
+    handler: ProxyHandler,
 }
 
 impl ProxyService {
-    /// Create a new proxy service instance
     pub fn new(config_manager: Arc<ConfigManager>) -> Self {
-        Self { config_manager }
+        let handler = ProxyHandler::new(Arc::clone(&config_manager));
+        Self { config_manager, handler }
     }
 
-    /// Handle a new TCP connection
     pub async fn handle_connection(&self, stream: TcpStream) -> Result<()> {
-        // TODO: Implement actual proxy logic using Pingora
-        // For now, just echo back a simple response
-        let mut buf = [0; 1024];
-        let stream = stream;
-        
-        // Read the request
-        stream.try_read(&mut buf)?;
-        
-        // Send a simple response
-        let response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!\r\n";
-        stream.try_write(response.as_bytes())?;
-        
-        Ok(())
+        self.handler.handle_connection(stream).await
     }
 
     /// Get configuration for a specific app using ArcSwap (lock-free)

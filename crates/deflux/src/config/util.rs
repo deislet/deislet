@@ -222,7 +222,7 @@ mod tests {
     /// Demonstration of parse_cache_key functionality
     #[test]
     fn test_parse_cache_key_demo() {
-        println!("\n🎯 Cache Key Parsing 演示:");
+        println!("\n🎯 Cache Key Parsing Demo:");
         
         let examples = vec![
             "$scheme$host$request_uri",
@@ -234,12 +234,12 @@ mod tests {
         for example in examples {
             match CacheKeys::from_str(example) {
                 Ok(keys) => {
-                    println!("✅ 输入: {}", example);
-                    println!("   解析结果: {:?}", keys);
+                    println!("✅ Input: {}", example);
+                    println!("   Parse Result: {:?}", keys);
                 },
                 Err(e) => {
-                    println!("❌ 输入: {}", example);
-                    println!("   错误: {}", e);
+                    println!("❌ Input: {}", example);
+                    println!("   Error: {}", e);
                 }
             }
             println!();

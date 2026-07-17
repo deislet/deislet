@@ -1,73 +1,90 @@
 //! Supervisor client implementation
 //!
-//! 集成 yasm 状态机的 supervisor 客户端，
-//! 通过事件驱动管理 deflux 实例生命周期
+//! Supervisor client integrated with yasm state machine,
+//! managing deflux instance lifecycle through events
 
 use crate::supervisor::state::{DefluxStateManager, State};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tokio::time::{Duration, interval};
 use tracing::{debug, error, info, warn};
 
-use workit::SupervisorConfig;
-use workit::{MessageBuilder, SdkResult, WorkerCommand, WorkerInfo, WorkerType, WorkitClient, WorkitError, deflux::PipelineData};
+use denira_workit::SupervisorConfig;
+use denira_workit::{MessageBuilder, SdkResult, WorkerCommand, WorkerInfo, WorkerType, WorkitClient, WorkitError, deflux::PipelineData};
+
+/// Restart signal type
+#[derive(Debug, Clone)]
+pub enum RestartSignal {
+    /// Graceful restart
+    Graceful,
+    /// Hard restart (stop then start)
+    Hard,
+}
 
 /// Deflux supervisor client
 ///
-/// 集成状态机的 supervisor 客户端，负责：
-/// - 与 supervisor 的 WebSocket 连接
-/// - deflux 实例生命周期管理
-/// - 配置下发和命令处理
-/// - 状态上报和监控
+/// Supervisor client with integrated state machine, responsible for:
+/// - WebSocket connection with supervisor
+/// - deflux instance lifecycle management
+/// - Configuration delivery and command processing
+/// - Status reporting and monitoring
 #[derive(Debug)]
 pub struct DefluxSupervisorClient {
-    /// WorkIt WebSocket 客户端
+    /// WorkIt WebSocket client
     workit_client: Arc<Mutex<WorkitClient>>,
-    /// 状态管理器
+    /// State manager
     state_manager: Arc<DefluxStateManager>,
-    /// 配置
+    /// Configuration
     config: SupervisorConfig,
+    /// Restart signal sender (optional)
+    restart_tx: Option<broadcast::Sender<RestartSignal>>,
 }
 
 impl DefluxSupervisorClient {
-    /// 创建新的 supervisor 客户端
+    /// Create a new supervisor client
     pub fn new(config: SupervisorConfig) -> SdkResult<Self> {
-        // 验证配置
+        // Validate configuration
         config.validate().map_err(WorkitError::ConfigurationError)?;
 
-        // 创建 workit supervisor 配置
+        // Create workit supervisor configuration
         let supervisor_config = SupervisorConfig::new(
             config.associated_id.clone(),
             config.secret.clone(),
             config.addr.clone(),
         );
 
-        // 验证 workit 配置
+        // Validate workit configuration
         supervisor_config
             .validate()
             .map_err(WorkitError::ConfigurationError)?;
 
-        // 创建 worker 信息
+        // Create worker info
         let worker_info = WorkerInfo::new(
             WorkerType::Deflux(env!("CARGO_PKG_VERSION").to_string()),
             "0.0.0.0".to_string(),
             vec![80, 443],
         );
 
-        // 创建 workit 客户端
+        // Create workit client
         let workit_client = WorkitClient::new(supervisor_config, worker_info);
 
-        // 创建状态管理器
+        // Create state manager
         let state_manager = Arc::new(DefluxStateManager::new(config.associated_id.clone()));
 
         Ok(Self {
             workit_client: Arc::new(Mutex::new(workit_client)),
             state_manager,
             config,
+            restart_tx: None,
         })
     }
 
-    /// 连接到 supervisor
+    /// Set restart signal sender
+    pub fn set_restart_channel(&mut self, restart_tx: broadcast::Sender<RestartSignal>) {
+        self.restart_tx = Some(restart_tx);
+    }
+
+    /// Connect to supervisor
     pub async fn connect(&mut self) -> SdkResult<()> {
         let mut client = self.workit_client.lock().await;
         info!(
@@ -79,7 +96,7 @@ impl DefluxSupervisorClient {
         Ok(())
     }
 
-    /// 进行身份认证
+    /// Perform authentication
     pub async fn authenticate(&mut self) -> SdkResult<()> {
         let mut client = self.workit_client.lock().await;
         info!("Authenticating with supervisor");
@@ -88,7 +105,7 @@ impl DefluxSupervisorClient {
         Ok(())
     }
 
-    /// 注册实例
+    /// Register instance
     pub async fn register(&mut self) -> SdkResult<()> {
         let mut client = self.workit_client.lock().await;
         info!("Registering with supervisor");
@@ -97,7 +114,7 @@ impl DefluxSupervisorClient {
         Ok(())
     }
 
-    /// 处理注册完成，转换到 Active 状态
+    /// Handle registration complete, transition to Active state
     pub async fn handle_registration_complete(&mut self) -> SdkResult<()> {
         self.state_manager
             .handle_registration_complete()
@@ -109,21 +126,21 @@ impl DefluxSupervisorClient {
         Ok(())
     }
 
-    /// 运行客户端主循环
+    /// Run client main loop
     pub async fn run(&mut self) -> SdkResult<()> {
         info!(
             "Starting deflux supervisor client main loop for instance: {}",
             self.config.associated_id
         );
 
-        // 启动后台任务
+        // Start background tasks
         self.start_background_tasks().await;
 
-        // 主循环 - 等待命令和处理事件
+        // Main loop - waiting for commands and processing events
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            // 检查连接状态
+            // Check connection status
             if !self.is_ready().await {
                 warn!("Supervisor connection lost, attempting to reconnect...");
                 match self.reconnect_with_backoff().await {
@@ -143,27 +160,27 @@ impl DefluxSupervisorClient {
         Ok(())
     }
 
-    /// 启动客户端并完成完整的连接流程
+    /// Start client and complete the full connection flow
     pub async fn start(&mut self) -> SdkResult<()> {
         info!(
             "Starting deflux supervisor client for instance: {}",
             self.config.associated_id
         );
 
-        // 注册状态机回调
+        // Register state machine callbacks
         self.setup_state_callbacks().await;
 
-        // 连接和注册
+        // Connect and register
         self.connect_and_register().await?;
 
-        // 启动后台任务
+        // Start background tasks
         self.start_background_tasks().await;
 
         info!("Deflux supervisor client started successfully");
         Ok(())
     }
 
-    /// 连接到 supervisor 并完成认证注册流程
+    /// Connect to supervisor and complete authentication and registration flow
     async fn connect_and_register(&mut self) -> SdkResult<()> {
         let mut client = self.workit_client.lock().await;
 
@@ -172,19 +189,19 @@ impl DefluxSupervisorClient {
             self.config.addr
         );
 
-        // 连接
+        // Connect
         client.connect().await?;
         info!("Connected to supervisor");
 
-        // 认证
+        // Authenticate
         client.authenticate().await?;
         info!("Authentication successful");
 
-        // 注册
+        // Register
         client.register().await?;
         info!("Registration successful");
 
-        // 状态机：转换到 Active 状态
+        // State machine: transition to Active state
         self.state_manager
             .handle_registration_complete()
             .await
@@ -193,26 +210,26 @@ impl DefluxSupervisorClient {
         Ok(())
     }
 
-    /// 设置状态机回调
+    /// Set state machine callbacks
     async fn setup_state_callbacks(&self) {
-        // 简化的状态管理器不需要复杂的回调设置
-        // 状态变更会自动记录日志
+        // Simplified state manager does not require complex callback setup
+        // State changes are automatically logged
         info!(
             "State manager initialized for instance: {}",
             self.config.associated_id
         );
     }
 
-    /// 启动后台任务
+    /// Start background tasks
     async fn start_background_tasks(&self) {
-        // 启动心跳任务
+        // Start heartbeat task
         self.start_heartbeat_task();
 
-        // 启动命令处理任务
+        // Start command handling task
         self.start_command_handler();
     }
 
-    /// 启动心跳任务
+    /// Start heartbeat task
     fn start_heartbeat_task(&self) -> tokio::task::JoinHandle<()> {
         let client = Arc::clone(&self.workit_client);
         let heartbeat_interval = self.config.heartbeat_duration();
@@ -238,7 +255,7 @@ impl DefluxSupervisorClient {
         })
     }
 
-    /// 启动命令处理任务
+    /// Start command handling task
     fn start_command_handler(&self) -> tokio::task::JoinHandle<()> {
         let _client = Arc::clone(&self.workit_client);
         let _state_manager = Arc::clone(&self.state_manager);
@@ -247,16 +264,16 @@ impl DefluxSupervisorClient {
         tokio::spawn(async move {
             info!("Starting command handler for {}", instance_id);
 
-            // TODO: 实现实际的命令接收和处理逻辑
-            // 这需要 WorkitClient 提供命令接收接口
+            // TODO: Implement actual command reception and handling logic
+            // This requires WorkitClient to provide a command reception interface
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                // 占位符：等待 workit 库提供命令接收API
+                // Placeholder: waiting for workit library to provide command reception API
             }
         })
     }
 
-    /// 发送状态更新到 supervisor（内部方法）
+    /// Send state update to supervisor (internal method)
     #[allow(dead_code)]
     async fn send_state_update_internal(
         _client: Arc<Mutex<WorkitClient>>,
@@ -277,13 +294,13 @@ impl DefluxSupervisorClient {
 
         let _status_message = MessageBuilder::status_update(to.to_string(), Some(status_data));
 
-        // TODO: 等待 WorkitClient 提供通用消息发送API
+        // TODO: Wait for WorkitClient to provide general message sending API
         info!("Would send state update: {} -> {}", from, to);
 
         Ok(())
     }
 
-    /// 发送状态更新到 supervisor
+    /// Send status update to supervisor
     pub async fn send_status_update(
         &self,
         status: &str,
@@ -292,11 +309,11 @@ impl DefluxSupervisorClient {
         let _status_message = MessageBuilder::status_update(status.to_string(), details);
 
         info!("Sending status update: {}", status);
-        // TODO: 实现实际发送
+        // TODO: Implement actual sending
         Ok(())
     }
 
-    /// 发送管道消息到 supervisor
+    /// Send pipeline message to supervisor
     pub async fn send_pipeline_message(&self, pipeline_data: PipelineData) -> SdkResult<()> {
         let _pipeline_message = MessageBuilder::deflux_pipeline(
             pipeline_data.pipeline_id.clone(),
@@ -308,11 +325,11 @@ impl DefluxSupervisorClient {
             "Sending pipeline message for: {}",
             pipeline_data.pipeline_id
         );
-        // TODO: 实现实际发送
+        // TODO: Implement actual sending
         Ok(())
     }
 
-    /// 处理来自 supervisor 的命令
+    /// Handle command from supervisor
     pub async fn handle_command(&self, command: WorkerCommand) -> SdkResult<serde_json::Value> {
         info!("Handling command: {:?}", command);
 
@@ -326,14 +343,14 @@ impl DefluxSupervisorClient {
                     timeout_seconds, reason
                 );
 
-                // 状态机：转换到 Sunsetting 状态
+                // State machine: transition to Sunsetting state
                 match self.state_manager.handle_shutdown().await {
                     Ok(_) => {
-                        // 执行实际的关闭逻辑
+                        // Execute actual shutdown logic
                         self.execute_shutdown(timeout_seconds.map(|t| t as u32))
                             .await;
 
-                        // 状态机：转换到 Terminated 状态
+                        // State machine: transition to Terminated state
                         let _ = self.state_manager.handle_silenced().await;
 
                         Ok(serde_json::json!({
@@ -360,11 +377,11 @@ impl DefluxSupervisorClient {
                     timeout_seconds, preserve_state
                 );
 
-                // 状态机：先关闭再重启
+                // State machine: sunset then restart
                 let _ = self.state_manager.handle_shutdown().await;
                 let _ = self.state_manager.handle_silenced().await;
 
-                // 执行重启逻辑
+                // Execute restart logic
                 self.execute_restart(preserve_state).await;
 
                 Ok(serde_json::json!({
@@ -376,7 +393,7 @@ impl DefluxSupervisorClient {
             WorkerCommand::Reload => {
                 info!("Received reload command");
 
-                // 实现重载逻辑（重新加载配置、路由规则等）
+                // Implement reload logic (reload config, routing rules, etc.)
                 Ok(serde_json::json!({
                     "success": true,
                     "message": "Reload completed"
@@ -386,7 +403,7 @@ impl DefluxSupervisorClient {
             WorkerCommand::UpdateConfig { config } => {
                 info!("Received config update: {:?}", config);
 
-                // 实现配置更新逻辑
+                // Implement configuration update logic
                 match self.apply_config_update(config).await {
                     Ok(_) => Ok(serde_json::json!({
                         "success": true,
@@ -412,7 +429,7 @@ impl DefluxSupervisorClient {
                     "is_active": self.state_manager.is_active().await,
                     "is_terminated": self.state_manager.is_terminated().await,
                     "transition_count": history_count,
-                    "uptime": "placeholder", // TODO: 实现实际的运行时间计算
+                    "uptime": "placeholder", // TODO: Implement actual uptime calculation
                 }))
             }
 
@@ -429,52 +446,86 @@ impl DefluxSupervisorClient {
             }
 
             WorkerCommand::Custom { command, args } => {
-                warn!(
-                    "Received unknown custom command: {} with args: {:?}",
+                info!(
+                    "Received custom command: {} with args: {:?}",
                     command, args
                 );
-                Ok(serde_json::json!({
-                    "success": false,
-                    "error": format!("Unknown command: {}", command)
-                }))
+
+                match command.as_str() {
+                    "graceful_restart" => {
+                        info!("Initiating graceful restart via supervisor command");
+
+                        if let Some(restart_tx) = &self.restart_tx {
+                            match restart_tx.send(RestartSignal::Graceful) {
+                                Ok(_) => {
+                                    info!("Graceful restart signal sent successfully");
+                                    Ok(serde_json::json!({
+                                        "success": true,
+                                        "message": "Graceful restart initiated"
+                                    }))
+                                }
+                                Err(e) => {
+                                    error!("Failed to send graceful restart signal: {}", e);
+                                    Ok(serde_json::json!({
+                                        "success": false,
+                                        "error": format!("Failed to send restart signal: {}", e)
+                                    }))
+                                }
+                            }
+                        } else {
+                            warn!("Restart channel not configured");
+                            Ok(serde_json::json!({
+                                "success": false,
+                                "error": "Restart channel not configured"
+                            }))
+                        }
+                    }
+                    _ => {
+                        warn!("Unknown custom command: {}", command);
+                        Ok(serde_json::json!({
+                            "success": false,
+                            "error": format!("Unknown command: {}", command)
+                        }))
+                    }
+                }
             }
         }
     }
 
-    /// 执行关闭逻辑
+    /// Execute shutdown logic
     async fn execute_shutdown(&self, timeout_seconds: Option<u32>) {
         let timeout = timeout_seconds.unwrap_or(30);
         info!("Executing graceful shutdown with timeout: {}s", timeout);
 
-        // TODO: 实现实际的关闭逻辑
-        // 1. 停止接受新连接
-        // 2. 等待现有连接完成
-        // 3. 关闭所有资源
+        // TODO: Implement actual shutdown logic
+        // 1. Stop accepting new connections
+        // 2. Wait for existing connections to complete
+        // 3. Close all resources
     }
 
-    /// 执行重启逻辑
+    /// Execute restart logic
     async fn execute_restart(&self, preserve_state: bool) {
         info!("Executing restart, preserve_state: {}", preserve_state);
 
-        // TODO: 实现实际的重启逻辑
-        // 1. 保存状态（如果需要）
-        // 2. 重新加载配置
-        // 3. 重新启动服务
+        // TODO: Implement actual restart logic
+        // 1. Save state (if needed)
+        // 2. Reload configuration
+        // 3. Restart service
     }
 
-    /// 应用配置更新
+    /// Apply configuration update
     async fn apply_config_update(&self, _config: serde_json::Value) -> Result<(), String> {
         info!("Applying configuration update");
 
-        // TODO: 实现配置更新逻辑
-        // 1. 验证配置
-        // 2. 应用配置
-        // 3. 重新加载相关组件
+        // TODO: Implement configuration update logic
+        // 1. Validate configuration
+        // 2. Apply configuration
+        // 3. Reload related components
 
         Ok(())
     }
 
-    /// 检查客户端是否就绪
+    /// Check if client is ready
     pub async fn is_ready(&self) -> bool {
         let client = self.workit_client.lock().await;
         client.is_connected()
@@ -483,17 +534,17 @@ impl DefluxSupervisorClient {
             && self.state_manager.is_active().await
     }
 
-    /// 优雅断开连接
+    /// Gracefully disconnect
     pub async fn disconnect(&mut self) -> SdkResult<()> {
         info!("Disconnecting from supervisor");
 
-        // 状态机：转换到关闭状态
+        // State machine: transition to closed state
         if self.state_manager.is_active().await {
             let _ = self.state_manager.handle_shutdown().await;
         }
         let _ = self.state_manager.handle_silenced().await;
 
-        // 断开连接
+        // Disconnect
         let mut client = self.workit_client.lock().await;
         client.disconnect().await?;
 
@@ -501,7 +552,7 @@ impl DefluxSupervisorClient {
         Ok(())
     }
 
-    /// 获取当前状态
+    /// Get current state
     pub async fn current_state(&self) -> State {
         self.state_manager.current_state().await
     }
@@ -559,7 +610,7 @@ impl DefluxSupervisorClient {
         self.reconnect_with_backoff().await
     }
 
-    /// 获取状态管理器（用于测试）
+    /// Get state manager (for testing)
     #[cfg(test)]
     pub fn state_manager(&self) -> &Arc<DefluxStateManager> {
         &self.state_manager
@@ -574,7 +625,7 @@ mod tests {
         SupervisorConfig {
             associated_id: "test-worker".to_string(),
             secret: "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
-            addr: "ws://localhost:8080".to_string(),
+            addr: "http://localhost:8080".to_string(),
             heartbeat_interval: 30,
             request_timeout: 10,
             retry_count: 3,
@@ -602,10 +653,10 @@ mod tests {
         let config = create_test_config();
         let client = DefluxSupervisorClient::new(config).unwrap();
 
-        // 初始状态应该是 Pending
+        // Initial state should be Pending
         assert_eq!(client.current_state().await, State::Pending);
 
-        // 检查状态管理器集成
+        // Check state manager integration
         let state_manager = client.state_manager();
         assert_eq!(state_manager.instance_id(), "test-worker");
     }
@@ -615,7 +666,7 @@ mod tests {
         let config = create_test_config();
         let client = DefluxSupervisorClient::new(config).unwrap();
 
-        // 测试状态查询命令
+        // Test status query command
         let result = client.handle_command(WorkerCommand::GetStatus).await;
         assert!(result.is_ok());
 

@@ -3,10 +3,10 @@ use crate::config::{ConfigError, Validatable};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokioConfig {
-    worker_threads: Option<usize>,
-    max_blocking_threads: Option<usize>,
-    event_interval: Option<u64>,
-    global_queue_interval: Option<u64>,
+    pub worker_threads: Option<usize>,
+    pub max_blocking_threads: Option<usize>,
+    pub event_interval: Option<u64>,
+    pub global_queue_interval: Option<u64>,
 }
 
 impl Default for TokioConfig {
