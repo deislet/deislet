@@ -1,0 +1,39 @@
+# deflux 配置文件
+#
+# 本配置包含系统运行所需的基础配置
+# 其他运行时配置（如上游、负载均衡、缓存等）将通过 supervisor 动态下发
+
+# 监听地址和端口
+listen_addr = ["127.0.0.1"]  # 同时支持 IPv4 和 IPv6
+listen_ports = [8080, 8443]  # 在每个地址上监听多个端口
+
+# 守护进程配置
+user = "nobody"
+group = "nogroup"
+
+# 守护进程详细配置
+[daemon_config]
+pid_file = "/tmp/deflux.pid"
+stdout_file = "/tmp/deflux.out"
+stderr_file = "/tmp/deflux.err"
+work_dir = "/d/deislet/deflux"
+umask = 0o022
+chown_pid = false
+
+# 日志配置
+[log.error_log]
+level = "debug"  # 可选值: error, warn, info, debug, trace
+path = "./error.log"
+
+# Runtime 配置
+[runtime]
+worker_threads_factor = 2  # CPU 核心数的倍数
+max_blocking_threads = 128
+event_interval = 30  # 毫秒
+global_queue_interval = 15  # 毫秒
+
+# Supervisor 配置
+[supervisor]
+addr = "ws://127.0.0.1:9001"
+associated_id = "deflux-worker-001"
+secret = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678"

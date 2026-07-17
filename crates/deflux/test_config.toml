@@ -1,0 +1,90 @@
+# Test configuration for Deflux load balancer
+# This configuration is designed for testing with fake_superv and test backends
+
+[system]
+daemon = false
+user = "nobody"
+group = "nobody"
+
+# Listen on multiple ports for load balancing
+listen_addr = ["127.0.0.1"]
+listen_ports = [8080, 8443]
+
+# Tokio runtime configuration
+[system.runtime]
+worker_threads_factor = 2
+max_blocking_threads = 64
+event_interval = 30
+global_queue_interval = 15
+
+# HTTPS configuration
+[system.https]
+enabled = true
+http2_enabled = true
+cert_file = "certs/server.crt"
+key_file = "certs/server.key"
+# For testing, we'll use self-signed certificates
+verify_hostname = false
+
+# Upstream backend servers (test backends)
+[[system.upstreams]]
+name = "backend-1"
+host = "127.0.0.1"
+port = 8001
+weight = 100
+health_check = { enabled = true, interval = 10, timeout = 5, path = "/health" }
+
+[[system.upstreams]]
+name = "backend-2" 
+host = "127.0.0.1"
+port = 8002
+weight = 100
+health_check = { enabled = true, interval = 10, timeout = 5, path = "/health" }
+
+[[system.upstreams]]
+name = "backend-3"
+host = "127.0.0.1"
+port = 8003
+weight = 50
+health_check = { enabled = true, interval = 10, timeout = 5, path = "/health" }
+
+# Load balancing strategy
+[system.balancing_strategy]
+algorithm = "round_robin"
+# algorithm = "least_connections"
+# algorithm = "weighted_round_robin"
+# algorithm = "max_power_reserve"
+
+# Caching configuration
+[system.cache]
+enabled = true
+max_size = "100MB"
+ttl = 300  # 5 minutes
+cache_control_respect = true
+
+# Logging configuration
+[system.log]
+[system.log.access_log]
+enabled = true
+path = "/tmp/deflux_access.log"
+format = "combined"
+
+[system.log.error_log]
+enabled = true
+path = "/tmp/deflux_error.log"
+level = "info"
+
+# Compression configuration
+[system.compression]
+enabled = true
+min_size = 1024
+algorithms = ["gzip", "br", "deflate"]
+
+# Supervisor configuration for testing with fake_superv
+[system.supervisor]
+associated_id = "test-deflux-instance"
+secret = "test-secret-key-for-deflux-testing"
+addr = "http://127.0.0.1:9001"
+heartbeat_interval = 30
+request_timeout = 10
+retry_count = 3
