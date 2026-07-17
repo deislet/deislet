@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.worker", "deno.ns"],
+    "allowJs": true
+  },
+  "tasks": {
+    "dev": "deno run --allow-all --watch src/main.ts",
+    "start": "deno run --allow-all src/main.ts",
+    "test": "deno test --allow-all"
+  },
+  "fmt": {
+    "semiColons": true,
+    "singleQuote": false
+  },
+  "imports": {
+    "@std/": "https://deno.land/std@0.208.0/"
+  }
+}

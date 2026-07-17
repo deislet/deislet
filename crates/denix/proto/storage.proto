@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package denix.storage;
+
+// KV Store Service
+// 提供简单的键值存储功能
+service KvStore {
+  // 获取值
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // 设置值
+  rpc Set(SetRequest) returns (SetResponse);
+
+  // 删除键
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // 列出前缀匹配的键
+  rpc List(ListRequest) returns (ListResponse);
+
+  // 检查键是否存在
+  rpc Has(HasRequest) returns (HasResponse);
+}
+
+// Get 请求
+message GetRequest {
+  string key = 1;
+}
+
+// Get 响应
+message GetResponse {
+  // 如果找到，value 非空；否则为空
+  optional string value = 1;
+}
+
+// Set 请求
+message SetRequest {
+  string key = 1;
+  string value = 2;
+}
+
+// Set 响应
+message SetResponse {
+  bool success = 1;
+}
+
+// Delete 请求
+message DeleteRequest {
+  string key = 1;
+}
+
+// Delete 响应
+message DeleteResponse {
+  bool success = 1;
+}
+
+// List 请求
+message ListRequest {
+  string prefix = 1;
+  // 可选的分页参数
+  optional int32 limit = 2;
+  optional string cursor = 3;
+}
+
+// List 响应
+message ListResponse {
+  repeated string keys = 1;
+  // 下一页游标（如果有）
+  optional string next_cursor = 2;
+}
+
+// Has 请求
+message HasRequest {
+  string key = 1;
+}
+
+// Has 响应
+message HasResponse {
+  bool exists = 1;
+}
+
+// Database Service
+// 提供类似 Cloudflare D1 的 SQL 数据库功能
+service Database {
+  // 执行 SQL 语句（INSERT, UPDATE, DELETE 等）
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // 查询 SQL（SELECT）
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // 批量执行多条 SQL
+  rpc Batch(BatchRequest) returns (BatchResponse);
+
+  // 预处理语句
+  rpc Prepare(PrepareRequest) returns (PrepareResponse);
+
+  // 执行预处理语句
+  rpc ExecutePrepared(ExecutePreparedRequest) returns (ExecuteResponse);
+
+  // 查询预处理语句
+  rpc QueryPrepared(QueryPreparedRequest) returns (QueryResponse);
+}
+
+// Execute 请求
+message ExecuteRequest {
+  string sql = 1;
+  // JSON 编码的参数数组
+  optional string params = 2;
+}
+
+// Execute 响应
+message ExecuteResponse {
+  bool success = 1;
+  // 影响的行数
+  int64 rows_affected = 2;
+  // 最后插入的 ID
+  optional int64 last_insert_id = 3;
+  // 错误信息（如果有）
+  optional string error = 4;
+}
+
+// Query 请求
+message QueryRequest {
+  string sql = 1;
+  // JSON 编码的参数数组
+  optional string params = 2;
+}
+
+// Query 响应
+message QueryResponse {
+  bool success = 1;
+  // JSON 编码的结果行数组
+  string rows = 2;
+  // 列名
+  repeated string columns = 3;
+  // 错误信息（如果有）
+  optional string error = 4;
+}
+
+// Batch 请求
+message BatchRequest {
+  repeated ExecuteRequest statements = 1;
+}
+
+// Batch 响应
+message BatchResponse {
+  bool success = 1;
+  repeated ExecuteResponse results = 2;
+  optional string error = 3;
+}
+
+// Prepare 请求
+message PrepareRequest {
+  string sql = 1;
+}
+
+// Prepare 响应
+message PrepareResponse {
+  bool success = 1;
+  // 预处理语句 ID
+  string statement_id = 2;
+  optional string error = 3;
+}
+
+// ExecutePrepared 请求
+message ExecutePreparedRequest {
+  string statement_id = 1;
+  // JSON 编码的参数数组
+  optional string params = 2;
+}
+
+// QueryPrepared 请求
+message QueryPreparedRequest {
+  string statement_id = 1;
+  // JSON 编码的参数数组
+  optional string params = 2;
+}

@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package denix.logging;
+
+// 日志服务 - 接收 denix 推送的日志
+service LogService {
+    // 推送日志（批量）
+    rpc PushLogs(PushLogsRequest) returns (PushLogsResponse);
+
+    // 健康检查
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// 日志级别
+enum LogLevel {
+    LOG_LEVEL_UNSPECIFIED = 0;
+    TRACE = 1;
+    DEBUG = 2;
+    INFO = 3;
+    WARN = 4;
+    ERROR = 5;
+    FATAL = 6;
+}
+
+// 单条日志记录
+message LogEntry {
+    // 时间戳（微秒）
+    int64 timestamp_us = 1;
+
+    // 日志级别
+    LogLevel level = 2;
+
+    // 日志来源（worker ID）
+    string source = 3;
+
+    // 应用 ID（可选）
+    string app_id = 4;
+
+    // 日志消息
+    string message = 5;
+
+    // 结构化字段
+    map<string, string> fields = 6;
+
+    // 跟踪 ID（用于分布式追踪）
+    string trace_id = 7;
+
+    // Span ID
+    string span_id = 8;
+}
+
+// 推送日志请求
+message PushLogsRequest {
+    // 批量日志
+    repeated LogEntry entries = 1;
+
+    // 请求元数据
+    map<string, string> metadata = 2;
+}
+
+// 推送日志响应
+message PushLogsResponse {
+    // 成功接收的日志条数
+    int32 accepted_count = 1;
+
+    // 拒绝的日志条数
+    int32 rejected_count = 2;
+
+    // 错误信息（如果有）
+    string error_message = 3;
+}
+
+// 健康检查请求
+message HealthCheckRequest {}
+
+// 健康检查响应
+message HealthCheckResponse {
+    // 服务状态
+    bool healthy = 1;
+
+    // 版本信息
+    string version = 2;
+}

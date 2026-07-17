@@ -1,0 +1,37 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Data
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Applications (managed by supervisor)
+/apps/
+/examples/
+*.zip
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Coverage
+coverage/
+*.xml
+
+# Snapshots
+*.snapshot
+
+# OS
+.DS_Store
+Thumbs.db
