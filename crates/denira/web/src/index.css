@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+@theme {
+  /* 柔和浅色主题 - 降低对比度 */
+  --color-background: #f8f9fa;
+  --color-foreground: #2d3748;
+  --color-card: #ffffff;
+  --color-card-foreground: #2d3748;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #2d3748;
+  --color-primary: #4a5568;
+  --color-primary-foreground: #f7fafc;
+  --color-secondary: #edf2f7;
+  --color-secondary-foreground: #2d3748;
+  --color-muted: #e2e8f0;
+  --color-muted-foreground: #718096;
+  --color-accent: #edf2f7;
+  --color-accent-foreground: #2d3748;
+  --color-destructive: #e53e3e;
+  --color-destructive-foreground: #fff5f5;
+  --color-border: #e2e8f0;
+  --color-input: #e2e8f0;
+  --color-ring: #cbd5e0;
+  --color-sidebar-background: #ffffff;
+  --color-sidebar-foreground: #4a5568;
+  --color-sidebar-primary: #3182ce;
+  --color-sidebar-primary-foreground: #f7fafc;
+  --color-sidebar-accent: #edf2f7;
+  --color-sidebar-accent-foreground: #2d3748;
+  --color-sidebar-border: #e2e8f0;
+  --color-sidebar-ring: #cbd5e0;
+  --color-success: #38a169;
+  --color-warning: #d69e2e;
+  --radius: 0.5rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* 柔和深色主题 */
+    --color-background: #1a202c;
+    --color-foreground: #e2e8f0;
+    --color-card: #2d3748;
+    --color-card-foreground: #e2e8f0;
+    --color-popover: #2d3748;
+    --color-popover-foreground: #e2e8f0;
+    --color-primary: #63b3ed;
+    --color-primary-foreground: #1a202c;
+    --color-secondary: #2d3748;
+    --color-secondary-foreground: #e2e8f0;
+    --color-muted: #2d3748;
+    --color-muted-foreground: #a0aec0;
+    --color-accent: #2d3748;
+    --color-accent-foreground: #e2e8f0;
+    --color-destructive: #fc8181;
+    --color-destructive-foreground: #1a202c;
+    --color-border: #4a5568;
+    --color-input: #4a5568;
+    --color-ring: #63b3ed;
+    --color-sidebar-background: #2d3748;
+    --color-sidebar-foreground: #cbd5e0;
+    --color-sidebar-primary: #63b3ed;
+    --color-sidebar-primary-foreground: #1a202c;
+    --color-sidebar-accent: #4a5568;
+    --color-sidebar-accent-foreground: #e2e8f0;
+    --color-sidebar-border: #4a5568;
+    --color-sidebar-ring: #63b3ed;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}

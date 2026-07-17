@@ -1,0 +1,327 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value as JsonValue};
+use std::collections::HashMap;
+use std::sync::Arc;
+use chrono::{DateTime, Utc};
+
+use crate::config_manager::ConfigManager;
+use crate::database::Database;
+use super::error::ApiError;
+
+#[derive(Clone)]
+pub struct ConfigsState {
+    pub config_manager: Arc<ConfigManager>,
+    pub database: Arc<Database>,
+}
+
+/// List configurations of all workers
+pub async fn list_all_configs(
+    State(state): State<ConfigsState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let configs = state.config_manager.get_all_configs();
+
+    Ok(Json(json!({
+        "success": true,
+        "data": configs,
+        "count": configs.len()
+    })))
+}
+
+/// Get configurations of a specific worker
+pub async fn get_worker_configs(
+    State(state): State<ConfigsState>,
+    Path(worker_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    match state.config_manager.get_worker_config(&worker_id) {
+        Some(configs) => Ok(Json(json!({
+            "success": true,
+            "worker_id": worker_id,
+            "data": configs,
+            "count": configs.len()
+        }))),
+        None => Err(ApiError::NotFound(format!(
+            "No configs found for worker: {}",
+            worker_id
+        ))),
+    }
+}
+
+/// Get value of a specific configuration item
+pub async fn get_config_value(
+    State(state): State<ConfigsState>,
+    Path((worker_id, config_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    match state.config_manager.get_config_value(&worker_id, &config_key) {
+        Some(value) => Ok(Json(json!({
+            "success": true,
+            "worker_id": worker_id,
+            "config_key": config_key,
+            "value": value
+        }))),
+        None => Err(ApiError::NotFound(format!(
+            "Config {}:{} not found",
+            worker_id, config_key
+        ))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateConfigRequest {
+    pub configs: HashMap<String, JsonValue>,
+}
+
+/// Update worker configurations
+pub async fn update_worker_configs(
+    State(state): State<ConfigsState>,
+    Path(worker_id): Path<String>,
+    Json(request): Json<UpdateConfigRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let version = state
+        .config_manager
+        .update_config(&worker_id, request.configs.clone())
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "worker_id": worker_id,
+            "version_timestamp": version,
+            "updated_keys": request.configs.keys().collect::<Vec<_>>(),
+            "message": "Configs updated successfully"
+        })),
+    ))
+}
+
+/// Delete a specific configuration item
+pub async fn delete_config(
+    State(state): State<ConfigsState>,
+    Path((worker_id, config_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    state
+        .config_manager
+        .delete_config_key(&worker_id, &config_key)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "worker_id": worker_id,
+        "config_key": config_key,
+        "message": "Config deleted successfully"
+    })))
+}
+
+/// Delete all configurations of a worker
+pub async fn delete_worker_configs(
+    State(state): State<ConfigsState>,
+    Path(worker_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    state
+        .config_manager
+        .delete_worker_config(&worker_id)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "worker_id": worker_id,
+        "message": "All configs deleted successfully"
+    })))
+}
+
+/// Push a single configuration to worker
+pub async fn push_config(
+    State(state): State<ConfigsState>,
+    Path((worker_id, config_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    state
+        .config_manager
+        .push_config_to_worker(&worker_id, &config_key)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "worker_id": worker_id,
+        "config_key": config_key,
+        "message": "Config pushed successfully"
+    })))
+}
+
+/// Push all configurations to worker
+pub async fn push_all_configs(
+    State(state): State<ConfigsState>,
+    Path(worker_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let count = state
+        .config_manager
+        .push_all_configs_to_worker(&worker_id)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "worker_id": worker_id,
+        "pushed_count": count,
+        "message": format!("Pushed {} configs successfully", count)
+    })))
+}
+
+/// Get configuration statistics
+pub async fn get_config_stats(
+    State(state): State<ConfigsState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let stats = state.config_manager.get_stats().await;
+
+    Ok(Json(json!({
+        "success": true,
+        "worker_count": stats.worker_count,
+        "total_configs": stats.total_configs
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+fn default_limit() -> usize {
+    100
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConfigHistoryItem {
+    pub id: i64,
+    pub config_key: String,
+    pub config_value: JsonValue,
+    pub version_timestamp: DateTime<Utc>,
+    pub operation: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Get configuration history for a worker
+///
+/// Returns all configuration change history for a specified worker
+pub async fn get_config_history(
+    State(state): State<ConfigsState>,
+    Path(worker_id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let history = state
+        .database
+        .get_config_history(&worker_id, query.limit)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    let items: Vec<ConfigHistoryItem> = history
+        .into_iter()
+        .map(|entry| ConfigHistoryItem {
+            id: entry.id,
+            config_key: entry.config_key,
+            config_value: entry.config_value,
+            version_timestamp: entry.version_timestamp,
+            operation: entry.operation,
+            created_at: entry.created_at,
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "success": true,
+        "worker_id": worker_id,
+        "history": items,
+        "count": items.len()
+    })))
+}
+
+/// Get history for a specific configuration key
+///
+/// Returns all change history for a specific configuration key of a specified worker
+pub async fn get_config_key_history(
+    State(state): State<ConfigsState>,
+    Path((worker_id, config_key)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let history = state
+        .database
+        .get_config_key_history(&worker_id, &config_key, query.limit)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    let items: Vec<ConfigHistoryItem> = history
+        .into_iter()
+        .map(|entry| ConfigHistoryItem {
+            id: entry.id,
+            config_key: entry.config_key.clone(),
+            config_value: entry.config_value,
+            version_timestamp: entry.version_timestamp,
+            operation: entry.operation,
+            created_at: entry.created_at,
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "success": true,
+        "worker_id": worker_id,
+        "config_key": config_key,
+        "history": items,
+        "count": items.len()
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RollbackRequest {
+    pub version_timestamp: DateTime<Utc>,
+}
+
+/// Rollback configuration key to specified version
+///
+/// Restores specified configuration key to a historical version
+pub async fn rollback_config_key(
+    State(state): State<ConfigsState>,
+    Path((worker_id, config_key)): Path<(String, String)>,
+    Json(request): Json<RollbackRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Get configuration value of specified version from history
+    let config_value = state
+        .database
+        .get_config_at_version(&worker_id, &config_key, request.version_timestamp)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "No config value found for {}:{} at version {}",
+                worker_id,
+                config_key,
+                request.version_timestamp
+            ))
+        })?;
+
+    // Update configuration (update only this key)
+    let mut configs = HashMap::new();
+    configs.insert(config_key.clone(), config_value.clone());
+
+    let version = state
+        .config_manager
+        .update_config(&worker_id, configs)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "worker_id": worker_id,
+        "config_key": config_key,
+        "rolled_back_to": request.version_timestamp,
+        "new_version": version,
+        "value": config_value,
+        "message": "Config rolled back successfully"
+    })))
+}
