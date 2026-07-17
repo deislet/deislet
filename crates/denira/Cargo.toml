@@ -28,7 +28,7 @@ prost = "0.13"
 tokio-stream = "0.1"
 
 # Database
-rusqlite = { version = "0.36", features = ["bundled"] }
+rusqlite = { workspace = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
