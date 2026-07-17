@@ -1,7 +1,7 @@
 use denictl_core::*;
 use swc_common::{sync::Lrc, FileName, SourceMap};
 use swc_ecma_ast::*;
-use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsConfig};
+use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
 pub struct Validator {
@@ -41,12 +41,12 @@ impl Validator {
 
         // Parse for deeper validation
         let source_file = self.source_map.new_source_file(
-            FileName::Custom(handler_info.path.clone()),
+            FileName::Custom(handler_info.path.clone()).into(),
             code.to_string(),
         );
 
         let lexer = Lexer::new(
-            Syntax::Typescript(TsConfig {
+            Syntax::Typescript(TsSyntax {
                 tsx: false,
                 decorators: false,
                 ..Default::default()
