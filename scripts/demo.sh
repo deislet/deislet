@@ -273,12 +273,16 @@ EOF
 
   if command -v jq >/dev/null 2>&1; then
     echo "🚀 部署示例应用"
-    (
-      cd "$ROOT_DIR/crates/denix"
-      DENIX_URL="http://127.0.0.1:${DENIX_PORT}" \
-        bash "${ROOT_DIR}/crates/denix/scripts/deploy_rust_examples.sh" \
-        > "${LOG_DIR}/denix_deploy.log" 2>&1
-    ) || echo "⚠️  示例应用部署失败，请查看 ${LOG_DIR}/denix_deploy.log"
+    if [ -x "${ROOT_DIR}/crates/denix/scripts/deploy_rust_examples.sh" ]; then
+      (
+        cd "$ROOT_DIR/crates/denix"
+        DENIX_URL="http://127.0.0.1:${DENIX_PORT}" \
+          bash "${ROOT_DIR}/crates/denix/scripts/deploy_rust_examples.sh" \
+          > "${LOG_DIR}/denix_deploy.log" 2>&1
+      ) || echo "WARN: example app deployment failed, see ${LOG_DIR}/denix_deploy.log"
+    else
+      echo "INFO: skipping example app deployment; denix now uses a gRPC management plane and a deploy client is TODO"
+    fi
   else
     echo "⚠️  未检测到 jq，跳过示例应用部署"
   fi
