@@ -3,7 +3,8 @@ use colored::Colorize;
 use std::fs;
 use std::path::Path;
 
-pub async fn execute(name: String, template: String) -> Result<()> {
+// TODO: template selection is not implemented yet; only the default template is generated
+pub async fn execute(name: String, _template: String) -> Result<()> {
     println!("{}", "Creating project...".green().bold());
 
     let project_dir = Path::new(&name);

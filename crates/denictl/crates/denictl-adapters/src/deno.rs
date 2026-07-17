@@ -8,7 +8,7 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
     let mut routes = Vec::new();
     let src_dir = output_dir;
 
-    for entry in WalkDir::new(&src_dir) {
+    for entry in WalkDir::new(src_dir) {
         let entry = entry?;
         if entry.file_type().is_file() {
             let path = entry.path();
@@ -19,7 +19,7 @@ pub fn generate(output_dir: &Path, config: &ProjectConfig) -> anyhow::Result<()>
                         continue;
                     }
 
-                    let relative = path.strip_prefix(&src_dir).unwrap();
+                    let relative = path.strip_prefix(src_dir).unwrap();
                     let route = filename_to_route(relative.to_string_lossy().as_ref());
                     let import_path = format!("./{}", relative.to_string_lossy().to_string()
                         .trim_end_matches(".ts")

@@ -1,7 +1,5 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use colored::Colorize;
-use tracing_subscriber;
 
 mod commands;
 mod dev;

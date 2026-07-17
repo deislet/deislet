@@ -3,7 +3,7 @@ use super::watcher::{RouteInfo, discover_routes, start_file_watcher};
 use anyhow::Result;
 use axum::{
     Router,
-    routing::{get, post, delete as axum_delete},
+    routing::{get, post},
     extract::{Request, State, Path as AxumPath, Query},
     response::{Response, IntoResponse, Json},
     http::{StatusCode, HeaderMap},
@@ -18,6 +18,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 struct AppState {
+    // TODO: will be read once actual handler execution is implemented
+    #[allow(dead_code)]
     config: ProjectConfig,
     routes: Arc<RwLock<Vec<RouteInfo>>>,
     kv_store: MockKVStore,
@@ -265,14 +267,16 @@ async fn build_mock_context(
         serde_json::json!({})
     };
 
-    let kv_count = kv_store.count().await;
+    // Touch the store so behavior stays identical; availability is always
+    // reported as true in dev mode since the mock store is always present.
+    let _kv_count = kv_store.count().await;
 
     MockContext {
         path: path.to_string(),
         method: method.to_string(),
         params: serde_json::json!(params),
         query,
-        kv_available: kv_count > 0 || true, // Always show as available in dev mode
+        kv_available: true,
     }
 }
 

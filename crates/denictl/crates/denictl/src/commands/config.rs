@@ -1,7 +1,8 @@
 use anyhow::Result;
 use colored::Colorize;
 
-pub async fn set(key: String, value: String) -> Result<()> {
+// TODO: persisting the value is not implemented yet
+pub async fn set(key: String, _value: String) -> Result<()> {
     println!("{}", format!("✓ Configuration saved: {}", key).green());
     println!("{}", "  (Config management implementation coming soon)".dimmed());
     Ok(())

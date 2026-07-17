@@ -1,57 +1,57 @@
 /// Deforge Error Classification System
 ///
-/// 设计原则：
-/// 1. 层次清晰：按错误类型分层（解析、验证、平台、编译、配置）
-/// 2. 类型安全：使用枚举而非字符串代码
-/// 3. 信息丰富：提供详细错误信息、位置、建议
-/// 4. 可扩展：易于添加新的错误类型
+/// Design principles:
+/// 1. Clear hierarchy: layered by error kind (parse, validation, platform, compilation, configuration)
+/// 2. Type safety: use enums instead of string codes
+/// 3. Rich information: provide detailed messages, locations, and suggestions
+/// 4. Extensibility: easy to add new error kinds
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 
 // ============================================================================
-// 顶层错误类型
+// Top-level error type
 // ============================================================================
 
 #[derive(Error, Debug)]
 pub enum DeforgeError {
-    /// 解析错误 - 代码结构、语法问题
+    /// Parse error - code structure and syntax issues
     #[error("Parse error: {0}")]
     Parse(#[from] ParseError),
 
-    /// 验证错误 - 规范合规性检查
+    /// Validation error - spec compliance checks
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
 
-    /// 平台错误 - 平台能力、兼容性问题
+    /// Platform error - platform capability and compatibility issues
     #[error("Platform error: {0}")]
     Platform(#[from] PlatformError),
 
-    /// 编译错误 - 转换、打包、适配器问题
+    /// Compilation error - transform, bundling, and adapter issues
     #[error("Compilation error: {0}")]
     Compilation(#[from] CompilationError),
 
-    /// 配置错误 - 项目配置问题
+    /// Configuration error - project configuration issues
     #[error("Configuration error: {0}")]
     Configuration(#[from] ConfigurationError),
 
-    /// IO 错误
+    /// IO error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// JSON 序列化错误
+    /// JSON serialization error
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
 
 // ============================================================================
-// 1. 解析错误 (Parse Errors)
+// 1. Parse Errors
 // ============================================================================
 
 #[derive(Error, Debug, Clone)]
 pub enum ParseError {
-    /// TypeScript/JavaScript 语法错误
+    /// TypeScript/JavaScript syntax error
     #[error("Syntax error at {location}: {message}")]
     Syntax {
         location: SourceLocation,
@@ -59,14 +59,14 @@ pub enum ParseError {
         snippet: Option<String>,
     },
 
-    /// 无效的文件结构
+    /// Invalid file structure
     #[error("Invalid file structure in {file}: {message}")]
     InvalidStructure {
         file: String,
         message: String,
     },
 
-    /// 不支持的语法特性
+    /// Unsupported syntax feature
     #[error("Unsupported syntax at {location}: {feature}")]
     UnsupportedSyntax {
         location: SourceLocation,
@@ -76,24 +76,24 @@ pub enum ParseError {
 }
 
 // ============================================================================
-// 2. 验证错误 (Validation Errors)
+// 2. Validation Errors
 // ============================================================================
 
 #[derive(Error, Debug, Clone)]
 pub enum ValidationError {
-    /// 规范合规性错误
+    /// Spec compliance error
     #[error("{0}")]
     SpecCompliance(#[from] SpecComplianceError),
 
-    /// 代码质量警告
+    /// Code quality warning
     #[error("{0}")]
     CodeQuality(#[from] CodeQualityWarning),
 }
 
-/// 规范合规性错误 - 违反 deislet/spec 标准
+/// Spec compliance errors - violations of the deislet/spec standard
 #[derive(Error, Debug, Clone)]
 pub enum SpecComplianceError {
-    /// 缺少必需的导出
+    /// Missing required export
     #[error("Missing required export in {file}")]
     MissingExport {
         file: String,
@@ -102,7 +102,7 @@ pub enum SpecComplianceError {
         suggestion: String,
     },
 
-    /// 平台检测代码（禁止 typeof Deno 等）
+    /// Platform detection code (typeof Deno etc. is forbidden)
     #[error("Platform detection code at {location}")]
     PlatformDetection {
         location: SourceLocation,
@@ -110,7 +110,7 @@ pub enum SpecComplianceError {
         suggestion: String,
     },
 
-    /// 访问 context.raw（禁止）
+    /// Access to context.raw (forbidden)
     #[error("Direct access to context.raw at {location}")]
     RawAccess {
         location: SourceLocation,
@@ -118,7 +118,7 @@ pub enum SpecComplianceError {
         suggestion: String,
     },
 
-    /// 平台特定 API 使用（禁止 Deno.env, process.env 等）
+    /// Platform-specific API usage (Deno.env, process.env etc. are forbidden)
     #[error("Platform-specific API usage at {location}")]
     PlatformApi {
         location: SourceLocation,
@@ -127,7 +127,7 @@ pub enum SpecComplianceError {
         suggestion: String,
     },
 
-    /// 条件导入（禁止基于平台的动态导入）
+    /// Conditional import (platform-based dynamic imports are forbidden)
     #[error("Conditional import at {location}")]
     ConditionalImport {
         location: SourceLocation,
@@ -135,7 +135,7 @@ pub enum SpecComplianceError {
         suggestion: String,
     },
 
-    /// 无效的 Handler 签名
+    /// Invalid handler signature
     #[error("Invalid handler signature at {location}")]
     InvalidHandlerSignature {
         location: SourceLocation,
@@ -144,10 +144,10 @@ pub enum SpecComplianceError {
     },
 }
 
-/// 代码质量警告 - 不阻止编译但建议改进
+/// Code quality warnings - do not block compilation but improvements are recommended
 #[derive(Error, Debug, Clone)]
 pub enum CodeQualityWarning {
-    /// 性能警告
+    /// Performance warning
     #[error("Performance concern at {location}: {message}")]
     Performance {
         location: SourceLocation,
@@ -155,7 +155,7 @@ pub enum CodeQualityWarning {
         suggestion: Option<String>,
     },
 
-    /// 安全警告
+    /// Security warning
     #[error("Security concern at {location}: {message}")]
     Security {
         location: SourceLocation,
@@ -163,7 +163,7 @@ pub enum CodeQualityWarning {
         severity: SecuritySeverity,
     },
 
-    /// 弃用警告
+    /// Deprecation warning
     #[error("Deprecated usage at {location}: {message}")]
     Deprecated {
         location: SourceLocation,
@@ -173,16 +173,16 @@ pub enum CodeQualityWarning {
 }
 
 // ============================================================================
-// 3. 平台错误 (Platform Errors)
+// 3. Platform Errors
 // ============================================================================
 
 #[derive(Error, Debug, Clone)]
 pub enum PlatformError {
-    /// 不支持的特性（已有的 UnsupportedFeatureError）
+    /// Unsupported feature (the existing UnsupportedFeatureError)
     #[error("{0}")]
     UnsupportedFeature(#[from] crate::platform_capabilities::UnsupportedFeatureError),
 
-    /// 不兼容的运行时
+    /// Incompatible runtime
     #[error("Incompatible runtime for {platform}")]
     IncompatibleRuntime {
         platform: String,
@@ -191,7 +191,7 @@ pub enum PlatformError {
         suggestion: String,
     },
 
-    /// 平台限制超出
+    /// Platform limit exceeded
     #[error("Platform limit exceeded for {platform}")]
     LimitExceeded {
         platform: String,
@@ -200,7 +200,7 @@ pub enum PlatformError {
         actual_value: usize,
     },
 
-    /// 平台不可用
+    /// Platform unavailable
     #[error("Platform {platform} is not available")]
     PlatformUnavailable {
         platform: String,
@@ -209,12 +209,12 @@ pub enum PlatformError {
 }
 
 // ============================================================================
-// 4. 编译错误 (Compilation Errors)
+// 4. Compilation Errors
 // ============================================================================
 
 #[derive(Error, Debug, Clone)]
 pub enum CompilationError {
-    /// 打包器错误
+    /// Bundler error
     #[error("Bundler error: {message}")]
     Bundler {
         message: String,
@@ -222,7 +222,7 @@ pub enum CompilationError {
         cause: Option<String>,
     },
 
-    /// 适配器错误
+    /// Adapter error
     #[error("Adapter error for {vendor}: {message}")]
     Adapter {
         vendor: String,
@@ -230,7 +230,7 @@ pub enum CompilationError {
         suggestion: Option<String>,
     },
 
-    /// 代码转换错误
+    /// Code transform error
     #[error("Transform error at {location}: {message}")]
     Transform {
         location: SourceLocation,
@@ -238,14 +238,14 @@ pub enum CompilationError {
         transform_stage: TransformStage,
     },
 
-    /// 路由生成错误
+    /// Route generation error
     #[error("Router generation error: {message}")]
     RouterGeneration {
         message: String,
         routes: Vec<String>,
     },
 
-    /// 依赖解析错误
+    /// Dependency resolution error
     #[error("Dependency resolution error: {message}")]
     DependencyResolution {
         message: String,
@@ -255,12 +255,12 @@ pub enum CompilationError {
 }
 
 // ============================================================================
-// 5. 配置错误 (Configuration Errors)
+// 5. Configuration Errors
 // ============================================================================
 
 #[derive(Error, Debug, Clone)]
 pub enum ConfigurationError {
-    /// 无效的配置文件
+    /// Invalid configuration file
     #[error("Invalid configuration in {file}: {message}")]
     InvalidConfig {
         file: String,
@@ -268,21 +268,21 @@ pub enum ConfigurationError {
         field: Option<String>,
     },
 
-    /// 缺少必需配置
+    /// Missing required configuration
     #[error("Missing required configuration: {field}")]
     MissingConfig {
         field: String,
         suggestion: String,
     },
 
-    /// 配置冲突
+    /// Conflicting configuration
     #[error("Configuration conflict: {message}")]
     Conflict {
         message: String,
         conflicting_fields: Vec<String>,
     },
 
-    /// 无效的平台配置
+    /// Invalid platform configuration
     #[error("Invalid platform configuration for {platform}: {message}")]
     InvalidPlatformConfig {
         platform: String,
@@ -291,10 +291,10 @@ pub enum ConfigurationError {
 }
 
 // ============================================================================
-// 辅助类型
+// Helper types
 // ============================================================================
 
-/// 源码位置信息
+/// Source location information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceLocation {
     pub file: String,
@@ -308,7 +308,7 @@ impl fmt::Display for SourceLocation {
     }
 }
 
-/// 导出要求
+/// Export requirement
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExportRequirement {
     DefaultExport,
@@ -326,7 +326,7 @@ impl fmt::Display for ExportRequirement {
     }
 }
 
-/// 安全严重程度
+/// Security severity
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecuritySeverity {
     Low,
@@ -335,7 +335,7 @@ pub enum SecuritySeverity {
     Critical,
 }
 
-/// 平台限制类型
+/// Platform limit type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlatformLimitType {
     ScriptSize,
@@ -359,7 +359,7 @@ impl fmt::Display for PlatformLimitType {
     }
 }
 
-/// 转换阶段
+/// Transform stage
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransformStage {
     Parse,
@@ -382,11 +382,11 @@ impl fmt::Display for TransformStage {
 }
 
 // ============================================================================
-// 错误代码映射（向后兼容）
+// Error code mapping (backward compatibility)
 // ============================================================================
 
 impl SpecComplianceError {
-    /// 获取错误代码（用于向后兼容旧的字符串代码系统）
+    /// Get the error code (for backward compatibility with the old string-code system)
     pub fn error_code(&self) -> &'static str {
         match self {
             SpecComplianceError::MissingExport { .. } => "SPEC_MISSING_EXPORT",
@@ -433,7 +433,7 @@ impl CompilationError {
 }
 
 // ============================================================================
-// 测试
+// Tests
 // ============================================================================
 
 #[cfg(test)]

@@ -17,6 +17,12 @@ pub struct Compiler {
     transformer: Transformer,
 }
 
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Compiler {
     pub fn new() -> Self {
         Self {
@@ -134,7 +140,8 @@ impl Compiler {
         project_dir: &Path,
         vendor: &str,
         config: &ProjectConfig,
-        minify: bool,
+        // TODO: minification is not implemented yet; wire this up once a minifier is integrated
+        _minify: bool,
     ) -> anyhow::Result<VendorBuild> {
         let output_dir = project_dir
             .join(config.build.as_ref().map(|b| b.out_dir.as_str()).unwrap_or("./dist"))

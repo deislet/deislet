@@ -1,18 +1,18 @@
 //! Deforge - Universal Edge Function Compiler
 //!
-//! Deforge 是一个专注的代码编译器，将符合 Edge Canon 标准的 Edge Function
-//! 代码翻译为特定平台的可部署代码。
+//! Deforge is a focused code compiler that translates Edge Function code
+//! conforming to the Edge Canon standard into platform-specific deployable code.
 //!
-//! # 使用方式
+//! # Usage
 //!
-//! ## 作为 CLI
+//! ## As a CLI
 //!
 //! ```bash
 //! cargo install deforge
 //! deforge build --vendor cloudflare
 //! ```
 //!
-//! ## 作为库
+//! ## As a library
 //!
 //! ```toml
 //! [dependencies]
@@ -38,30 +38,30 @@
 //! }
 //! ```
 //!
-//! # 模块
+//! # Modules
 //!
-//! - `compiler`: 编译器核心逻辑
-//! - `parser`: TypeScript/JavaScript 解析器
-//! - `commands`: CLI 命令实现
+//! - `compiler`: core compiler logic
+//! - `parser`: TypeScript/JavaScript parser
+//! - `commands`: CLI command implementations
 //!
-//! # 重导出
+//! # Re-exports
 //!
-//! 常用类型从 `deforge-core` 重导出，方便使用：
+//! Commonly used types are re-exported from `deforge-core` for convenience:
 //!
 //! ```rust
 //! use deforge::{ProjectConfig, Platform, Feature};
 //! ```
 
-// 编译器核心模块
+// Core compiler module
 pub mod compiler;
 
-// 解析器模块
+// Parser module
 pub mod parser;
 
-// CLI 命令模块（作为库使用时可选）
+// CLI command module (optional when used as a library)
 pub mod commands;
 
-// 重导出核心类型，方便外部使用
+// Re-export core types for external use
 pub use deforge_core::{
     config::{ProjectConfig, ServicesConfig, VendorsConfig},
     error::{DeniError, Result},
@@ -72,24 +72,24 @@ pub use deforge_core::{
     },
 };
 
-// 重导出适配器
+// Re-export adapters
 pub use deforge_adapter_cf as adapter_cf;
 pub use deforge_adapter_dc as adapter_dc;
 pub use deforge_adapter_eo as adapter_eo;
 
-// 导出编译器主要接口
+// Export the main compiler interface
 pub use compiler::{Compiler, CompilerOptions};
 
-/// 库版本
+/// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 检查项目配置文件是否存在
+/// Check whether the project configuration file exists
 pub fn check_config_exists(project_dir: &str) -> bool {
     use std::path::Path;
     Path::new(project_dir).join(".config.json").exists()
 }
 
-/// 加载项目配置
+/// Load the project configuration
 pub fn load_project_config(project_dir: &str) -> Result<ProjectConfig> {
     use std::fs;
     use std::path::Path;
@@ -122,13 +122,13 @@ mod tests {
 
     #[test]
     fn test_check_config_exists() {
-        // 测试不存在的路径
+        // Test a nonexistent path
         assert!(!check_config_exists("/nonexistent/path"));
     }
 
     #[test]
     fn test_compiler_options_creation() {
-        // 测试 CompilerOptions 的创建和字段访问
+        // Test creating CompilerOptions and accessing its fields
         let options = CompilerOptions {
             project_dir: "./test".to_string(),
             minify: true,
@@ -138,7 +138,7 @@ mod tests {
             output_mode: OutputMode::Memory,
         };
 
-        // 验证字段可以被访问
+        // Verify the fields are accessible
         assert_eq!(options.project_dir, "./test");
         assert!(options.minify);
         assert!(!options.source_map);
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_compiler_with_options() {
-        // 测试 Compiler::with_options
+        // Test Compiler::with_options
         let options = CompilerOptions {
             project_dir: "./test".to_string(),
             target_vendor: Some("cloudflare".to_string()),
@@ -158,7 +158,7 @@ mod tests {
 
         let compiler = Compiler::with_options(options);
 
-        // 测试 options() 方法
+        // Test the options() method
         let retrieved_options = compiler.options();
         assert_eq!(retrieved_options.project_dir, "./test");
         assert_eq!(
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn test_compiler_default() {
-        // 测试 Compiler::new() 使用默认选项
+        // Test that Compiler::new() uses default options
         let compiler = Compiler::new();
         let options = compiler.options();
 

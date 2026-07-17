@@ -5,7 +5,8 @@ pub async fn execute(
     vendors: Vec<String>,
     env: String,
     tag: Option<String>,
-    promote: bool,
+    // TODO: promote flow is not implemented yet
+    _promote: bool,
 ) -> Result<()> {
     println!("\n{}", "🚀 Deploying Edge Function...\n".bold());
 
@@ -19,10 +20,7 @@ pub async fn execute(
     println!("{}", format!("Deploying to {}...", env).yellow());
 
     for (i, vendor) in vendors.iter().enumerate() {
-        println!(
-            "{}",
-            format!("[{}/{}] Deploying to {}...", i + 1, vendors.len(), vendor)
-        );
+        println!("[{}/{}] Deploying to {}...", i + 1, vendors.len(), vendor);
 
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 

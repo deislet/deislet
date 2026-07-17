@@ -13,30 +13,30 @@ use walkdir::WalkDir;
 pub use transformer::Transformer;
 pub use validator::Validator;
 
-/// 编译器配置选项
+/// Compiler configuration options
 #[derive(Debug, Clone)]
 pub struct CompilerOptions {
-    /// 项目目录路径
+    /// Project directory path
     #[allow(dead_code)]
     pub project_dir: String,
-    /// 是否压缩输出
+    /// Whether to minify the output
     #[allow(dead_code)]
     pub minify: bool,
-    /// 是否生成 source map
+    /// Whether to generate source maps
     #[allow(dead_code)]
     pub source_map: bool,
-    /// 目标平台（None 表示构建所有启用的平台）
+    /// Target platform (None means build all enabled platforms)
     #[allow(dead_code)]
     pub target_vendor: Option<String>,
-    /// 是否启用严格验证
+    /// Whether to enable strict validation
     #[allow(dead_code)]
     pub strict_validation: bool,
-    /// 输出模式（Files/Memory/Both）
+    /// Output mode (Files/Memory/Both)
     #[allow(dead_code)]
     pub output_mode: OutputMode,
 }
 
-// 重导出 OutputMode
+// Re-export OutputMode
 pub use deforge_core::types::OutputMode;
 
 impl Default for CompilerOptions {
@@ -66,12 +66,12 @@ impl Default for Compiler {
 }
 
 impl Compiler {
-    /// 创建新的编译器实例（使用默认选项）
+    /// Create a new compiler instance (with default options)
     pub fn new() -> Self {
         Self::with_options(CompilerOptions::default())
     }
 
-    /// 使用指定选项创建编译器实例
+    /// Create a compiler instance with the given options
     pub fn with_options(options: CompilerOptions) -> Self {
         Self {
             parser: TypeScriptParser::new(),
@@ -81,7 +81,7 @@ impl Compiler {
         }
     }
 
-    /// 获取编译器选项的引用
+    /// Get a reference to the compiler options
     #[allow(dead_code)]
     pub fn options(&self) -> &CompilerOptions {
         &self.options
@@ -286,42 +286,42 @@ impl Compiler {
         vendors
     }
 
-    /// 从项目配置中检测使用的特性
+    /// Detect used features from the project configuration
     fn detect_required_features(&self, config: &ProjectConfig) -> Vec<Feature> {
         let mut features = Vec::new();
 
-        // 注意：KV Storage 和 Cache API 是基础服务，所有平台都必须支持，
-        // 因此不需要检测或验证这些特性
+        // Note: KV Storage and Cache API are base services that every platform
+        // must support, so there is no need to detect or validate them
 
-        // 检测扩展服务配置
+        // Detect extended service configuration
         if let Some(ref services) = config.services {
             if let Some(ref db) = services.database {
                 if db.enabled {
                     features.push(Feature::SQLDatabase);
                 }
             }
-            // 未来可以添加更多扩展服务检测
+            // More extended service detection can be added in the future
             // - ObjectStorage
             // - Queues
-            // - 等等
+            // - etc.
         }
 
-        // 检测运行时特性
+        // Detect runtime features
         if config.runtime.contains("node") {
             features.push(Feature::NodeRuntime);
         }
 
-        // TODO: 未来可以从代码分析中检测更多特性使用
-        // - SSR: 检测是否使用了渲染框架
-        // - ISR: 检测是否配置了增量静态再生
-        // - CronJobs: 检测是否有定时任务定义
-        // - WebSockets: 检测代码中是否使用了 WebSocket API
-        // - 等等
+        // TODO: More feature usage could be detected via code analysis in the future
+        // - SSR: detect whether a rendering framework is used
+        // - ISR: detect whether incremental static regeneration is configured
+        // - CronJobs: detect whether scheduled task definitions exist
+        // - WebSockets: detect whether the WebSocket API is used in the code
+        // - etc.
 
         features
     }
 
-    /// 验证平台是否支持所需特性
+    /// Validate that the platform supports the required features
     fn validate_platform_capabilities(
         &self,
         vendor: &str,
@@ -332,18 +332,18 @@ impl Compiler {
             "deno" => Platform::Deno,
             "tencent" => Platform::Tencent,
             _ => {
-                // 未知平台，跳过验证
+                // Unknown platform, skip validation
                 return Ok(());
             }
         };
 
         let caps = PlatformCapabilities::new(platform);
 
-        // 检查所有特性
+        // Check all features
         match caps.check_features(features) {
             Ok(_) => Ok(()),
             Err(errors) => {
-                // 显示详细的错误信息
+                // Show detailed error information
                 eprintln!(
                     "\n{}",
                     "✗ Platform capability validation failed".red().bold()
@@ -375,7 +375,7 @@ impl Compiler {
     ) -> anyhow::Result<VendorBuild> {
         use deforge_core::types::BuildArtifacts;
 
-        // 验证平台能力
+        // Validate platform capabilities
         let required_features = self.detect_required_features(config);
         self.validate_platform_capabilities(vendor, &required_features)?;
 
@@ -401,7 +401,7 @@ impl Compiler {
             fs::create_dir_all(&output_dir)?;
         }
 
-        // 内存模式：收集所有生成的内容
+        // Memory mode: collect all generated content
         let mut memory_config_files = HashMap::new();
         let mut memory_source_files = HashMap::new();
         let mut memory_system_files = HashMap::new();
@@ -437,7 +437,7 @@ impl Compiler {
                 .transformer
                 .transform(&code, &handler_path, vendor, config)?;
 
-            // 写入文件（Files/Both 模式）
+            // Write files (Files/Both modes)
             if should_write_files {
                 if let Some(parent) = output_path.parent() {
                     fs::create_dir_all(parent)?;
@@ -445,7 +445,7 @@ impl Compiler {
                 fs::write(&output_path, &transformed)?;
             }
 
-            // 收集到内存（Memory/Both 模式）
+            // Collect into memory (Memory/Both modes)
             if should_collect_memory {
                 let source_key = format!("src/{}", relative_path.to_string_lossy());
                 memory_source_files.insert(source_key, transformed.clone());
@@ -499,12 +499,12 @@ impl Compiler {
                 content = content.replace("router.ts", "_deforge_internal/router.ts");
             }
 
-            // 写入文件（Files/Both 模式）
+            // Write files (Files/Both modes)
             if should_write_files {
                 fs::write(output_dir.join(&name), &content)?;
             }
 
-            // 收集到内存（Memory/Both 模式）
+            // Collect into memory (Memory/Both modes)
             if should_collect_memory {
                 memory_config_files.insert(name, content);
             }
@@ -562,12 +562,12 @@ impl Compiler {
                 _ => TargetPlatform::Cloudflare,
             };
 
-            // 对于内存模式，我们需要临时写入文件以便 bundler 可以处理
-            // TODO: 未来可以改进 bundler 支持直接从内存输入
+            // For memory mode, we need to temporarily write files so the bundler can process them
+            // TODO: The bundler could be improved to accept in-memory input directly
             let temp_router_path = if should_write_files {
                 system_dir.join("router.ts")
             } else {
-                // 内存模式：创建临时目录
+                // Memory mode: create a temporary directory
                 let temp_dir = std::env::temp_dir().join(format!("deforge-{}", vendor));
                 fs::create_dir_all(&temp_dir)?;
                 let temp_system = temp_dir.join("_deforge_internal");
@@ -609,7 +609,7 @@ impl Compiler {
                         );
                     }
 
-                    // 内存模式：清理临时文件
+                    // Memory mode: clean up temporary files
                     if !should_write_files {
                         let temp_dir = std::env::temp_dir().join(format!("deforge-{}", vendor));
                         if temp_dir.exists() {
@@ -659,7 +659,7 @@ impl Compiler {
             }
         }
 
-        // 构建 BuildArtifacts（Memory/Both 模式）
+        // Build BuildArtifacts (Memory/Both modes)
         let build_artifacts = if should_collect_memory {
             Some(BuildArtifacts {
                 entry_code,

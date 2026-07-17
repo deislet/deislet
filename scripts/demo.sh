@@ -13,24 +13,24 @@ DEFAULT_DEFLUX_PORT=8087
 
 usage() {
   cat <<'EOF'
-用法:
+Usage:
   demo.sh [start|stop|status] [options]
 
-选项:
-  --denira-port <port>       HTTP/gRPC 端口 (默认 8085)
-  --denix-port <port>        Denix HTTP 端口 (默认 8086)
-  --deflux-port <port>       Deflux HTTP 端口 (默认 8087)
-  --secret <hex>             Supervisor 共享密钥 (64 位 hex)
-  --demo-dir <path>          运行目录 (默认 .demo)
-  --log-dir <path>           日志目录 (默认 .demo/logs)
-  --help                     显示帮助
+Options:
+  --denira-port <port>       Denira HTTP/gRPC port (default 8085)
+  --denix-port <port>        Denix HTTP port (default 8086)
+  --deflux-port <port>       Deflux HTTP port (default 8087)
+  --secret <hex>             Supervisor shared secret (64-char hex)
+  --demo-dir <path>          Runtime directory (default .demo)
+  --log-dir <path>           Log directory (default .demo/logs)
+  --help                     Show this help
 EOF
 }
 
 require_command() {
   local name=$1
   if ! command -v "$name" >/dev/null 2>&1; then
-    echo "❌ 缺少依赖: $name"
+    echo "❌ Missing dependency: $name"
     exit 1
   fi
 }
@@ -54,7 +54,7 @@ port_in_use() {
   elif command -v nc >/dev/null 2>&1; then
     nc -z 127.0.0.1 "$port" >/dev/null 2>&1 || nc -z ::1 "$port" >/dev/null 2>&1
   else
-    echo "❌ 缺少端口检测工具，请安装 ss/lsof/nc" >&2
+    echo "❌ No port probing tool found, please install ss/lsof/nc" >&2
     exit 1
   fi
 }
@@ -127,7 +127,7 @@ EOF
 
 load_state() {
   if [ ! -f "$STATE_FILE" ]; then
-    echo "⚠️  未找到运行状态: $STATE_FILE"
+    echo "⚠️  Run state not found: $STATE_FILE"
     exit 1
   fi
   # shellcheck disable=SC1090
@@ -142,7 +142,7 @@ start_demo() {
   if ! command -v lsof >/dev/null 2>&1 \
     && ! command -v ss >/dev/null 2>&1 \
     && ! command -v nc >/dev/null 2>&1; then
-    echo "❌ 缺少端口检测工具，请安装 ss/lsof/nc" >&2
+    echo "❌ No port probing tool found, please install ss/lsof/nc" >&2
     exit 1
   fi
 
@@ -157,7 +157,7 @@ start_demo() {
     # shellcheck disable=SC1090
     source "$STATE_FILE"
     if pid_running "$DENIRA_PID" || pid_running "$DENIX_PID" || pid_running "$DEFLUX_PID"; then
-      echo "⚠️  检测到已有运行实例，请先执行 stop"
+      echo "⚠️  An existing instance is running, please run stop first"
       exit 1
     fi
   fi
@@ -229,7 +229,7 @@ associated_id = "deflux-demo-01"
 secret = "${SECRET}"
 EOF
 
-    echo "🚀 启动 Denira (HTTP/gRPC: ${DENIRA_PORT})"
+    echo "🚀 Starting Denira (HTTP/gRPC: ${DENIRA_PORT})"
     (
       cd "$ROOT_DIR"
       cargo run -p denira -- \
@@ -246,22 +246,22 @@ EOF
     fi
 
     if grep -q "Address already in use" "${LOG_DIR}/denira.log"; then
-      echo "⚠️  端口 ${DENIRA_PORT} 已被占用，尝试下一端口"
+      echo "⚠️  Port ${DENIRA_PORT} is already in use, trying the next port"
       kill "$DENIRA_PID" || true
       attempt=$((attempt + 1))
       continue
     fi
 
-    echo "❌ Denira API 未就绪，请检查日志: ${LOG_DIR}/denira.log"
+    echo "❌ Denira API is not ready, please check the log: ${LOG_DIR}/denira.log"
     exit 1
   done
 
   if [ $denira_ready -ne 1 ]; then
-    echo "❌ 无法找到可用端口启动 Denira"
+    echo "❌ Could not find an available port to start Denira"
     exit 1
   fi
 
-  echo "🚀 启动 Denix (HTTP: ${DENIX_PORT})"
+  echo "🚀 Starting Denix (HTTP: ${DENIX_PORT})"
   (
     cd "$ROOT_DIR"
     DENIX_CONFIG="$DENIX_CONFIG" \
@@ -272,10 +272,10 @@ EOF
   DENIX_PID=$!
 
   if ! wait_for_http_any "http://127.0.0.1:${DENIX_PORT}/health" 60; then
-    echo "⚠️  Denix 健康检查未通过，请检查日志: ${LOG_DIR}/denix.log"
+    echo "⚠️  Denix health check failed, please check the log: ${LOG_DIR}/denix.log"
   fi
 
-  echo "🚀 启动 Deflux (HTTP: ${DEFLUX_PORT})"
+  echo "🚀 Starting Deflux (HTTP: ${DEFLUX_PORT})"
   (
     cd "$ROOT_DIR"
     cargo run -p deflux --bin deflux -- -c "$DEFLUX_CONFIG" \
@@ -284,7 +284,7 @@ EOF
   DEFLUX_PID=$!
 
   if command -v jq >/dev/null 2>&1; then
-    echo "🚀 部署示例应用"
+    echo "🚀 Deploying example app"
     # Package the example app and deploy it through denira, which relays
     # to the denix gRPC management plane.
     APP_ZIP="${DEMO_DIR}/example-app.zip"
@@ -308,12 +308,12 @@ with zipfile.ZipFile('${APP_ZIP}', 'w') as zf:
       echo "WARN: failed to package example app, see ${LOG_DIR}/denix_deploy.log"
     fi
   else
-    echo "⚠️  未检测到 jq，跳过示例应用部署"
+    echo "⚠️  jq not found, skipping example app deployment"
   fi
 
   write_state
 
-  echo "✅ 演示环境已启动"
+  echo "✅ Demo environment started"
   echo "- Denira API: http://127.0.0.1:${DENIRA_PORT}"
   echo "- Denix: http://127.0.0.1:${DENIX_PORT}"
   echo "- Deflux: http://127.0.0.1:${DEFLUX_PORT}"
@@ -323,27 +323,27 @@ stop_demo() {
   load_state
 
   if pid_running "$DENIX_PID"; then
-    echo "🛑 停止 Denix (PID: $DENIX_PID)"
+    echo "🛑 Stopping Denix (PID: $DENIX_PID)"
     kill "$DENIX_PID" || true
   fi
 
   if pid_running "$DEFLUX_PID"; then
-    echo "🛑 停止 Deflux (PID: $DEFLUX_PID)"
+    echo "🛑 Stopping Deflux (PID: $DEFLUX_PID)"
     kill "$DEFLUX_PID" || true
   fi
 
   if pid_running "$DENIRA_PID"; then
-    echo "🛑 停止 Denira (PID: $DENIRA_PID)"
+    echo "🛑 Stopping Denira (PID: $DENIRA_PID)"
     kill "$DENIRA_PID" || true
   fi
 
-  echo "✅ 已发送停止信号，如需强制退出请手动处理"
+  echo "✅ Stop signals sent; force-kill manually if needed"
 }
 
 status_demo() {
   load_state
 
-  echo "状态信息"
+  echo "Status"
   echo "- Denira PID: ${DENIRA_PID}"
   echo "- Denix PID: ${DENIX_PID}"
   echo "- Deflux PID: ${DEFLUX_PID}"
@@ -391,7 +391,7 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     *)
-      echo "未知参数: $1"
+      echo "Unknown argument: $1"
       usage
       exit 1
       ;;

@@ -1,30 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// 编译器输出模式
+/// Compiler output mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputMode {
-    /// 只写入文件到磁盘（默认，用于 CLI）
+    /// Write files to disk only (default, used by the CLI)
     #[default]
     Files,
-    /// 只返回内存中的内容，不写文件（用于库集成）
+    /// Return in-memory content only, without writing files (for library integration)
     Memory,
-    /// 既写文件又返回内存内容（用于需要两者的场景）
+    /// Both write files and return in-memory content (for scenarios that need both)
     Both,
 }
 
-/// 构建产物内容（内存模式）
+/// Build artifact contents (memory mode)
 #[derive(Debug, Clone)]
 pub struct BuildArtifacts {
-    /// 主入口代码（如 index.js 或 router.ts）
+    /// Main entry code (e.g. index.js or router.ts)
     pub entry_code: String,
-    /// 入口文件名
+    /// Entry file name
     pub entry_filename: String,
-    /// 配置文件（文件名 -> 内容）
+    /// Configuration files (file name -> content)
     pub config_files: HashMap<String, String>,
-    /// 转换后的源文件（相对路径 -> 内容）
+    /// Transformed source files (relative path -> content)
     pub source_files: HashMap<String, String>,
-    /// 系统生成的文件（如 adapters/context-builder.ts）
+    /// System-generated files (e.g. adapters/context-builder.ts)
     pub system_files: HashMap<String, String>,
 }
 
@@ -80,13 +80,13 @@ pub struct CompilationResult {
 #[derive(Debug, Clone)]
 pub struct VendorBuild {
     pub vendor: String,
-    /// 输出目录路径（Files/Both 模式有值）
+    /// Output directory path (set in Files/Both modes)
     pub output_path: String,
-    /// 文件路径列表（Files/Both 模式有值）
+    /// List of file paths (set in Files/Both modes)
     pub files: Vec<String>,
     pub size: usize,
     pub warnings: Vec<String>,
-    /// 构建产物内容（Memory/Both 模式有值）
+    /// Build artifact contents (set in Memory/Both modes)
     pub artifacts: Option<BuildArtifacts>,
 }
 

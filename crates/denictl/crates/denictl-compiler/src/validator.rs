@@ -8,6 +8,12 @@ pub struct Validator {
     source_map: Lrc<SourceMap>,
 }
 
+impl Default for Validator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Validator {
     pub fn new() -> Self {
         Self {

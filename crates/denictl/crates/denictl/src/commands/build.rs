@@ -4,7 +4,8 @@ use denictl_compiler::Compiler;
 use std::env;
 use std::time::Instant;
 
-pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<()> {
+// TODO: watch mode is not implemented yet
+pub async fn execute(vendors: Vec<String>, _watch: bool, minify: bool) -> Result<()> {
     println!("{}", "Building project...".yellow());
 
     let start = Instant::now();

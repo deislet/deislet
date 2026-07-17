@@ -8,6 +8,12 @@ pub struct TypeScriptParser {
     source_map: Lrc<SourceMap>,
 }
 
+impl Default for TypeScriptParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeScriptParser {
     pub fn new() -> Self {
         Self {
@@ -177,7 +183,7 @@ export default async function handler(context) {
         assert!(result.is_ok());
 
         let info = result.unwrap();
-        assert_eq!(info.has_default_export, true);
+        assert!(info.has_default_export);
         assert_eq!(info.route, "/api/hello");
         assert_eq!(info.named_exports.len(), 0);
     }
@@ -195,7 +201,7 @@ export function middleware() { return null; }
         assert!(result.is_ok());
 
         let info = result.unwrap();
-        assert_eq!(info.has_default_export, false);
+        assert!(!info.has_default_export);
         assert!(info.named_exports.contains(&"config".to_string()));
         assert!(info.named_exports.contains(&"handler".to_string()));
         assert!(info.named_exports.contains(&"middleware".to_string()));
@@ -215,7 +221,7 @@ export default async (context) => {
         assert!(result.is_ok());
 
         let info = result.unwrap();
-        assert_eq!(info.has_default_export, true);
+        assert!(info.has_default_export);
         assert_eq!(info.route, "/");
     }
 
@@ -301,7 +307,7 @@ export default async function handler(context: Context): Promise<Response> {
         assert!(result.is_ok());
 
         let info = result.unwrap();
-        assert_eq!(info.has_default_export, true);
+        assert!(info.has_default_export);
     }
 
     #[test]
@@ -321,7 +327,7 @@ export const metadata = { version: '1.0.0' };
         assert!(result.is_ok());
 
         let info = result.unwrap();
-        assert_eq!(info.has_default_export, true);
+        assert!(info.has_default_export);
         assert!(info.named_exports.contains(&"config".to_string()));
         assert!(info.named_exports.contains(&"metadata".to_string()));
     }
@@ -341,7 +347,7 @@ const data = { key: "value" };
         assert!(result.is_ok());
 
         let info = result.unwrap();
-        assert_eq!(info.has_default_export, false);
+        assert!(!info.has_default_export);
         assert_eq!(info.named_exports.len(), 0);
     }
 
@@ -375,6 +381,6 @@ export default async function handler(context) {
         assert!(result.is_ok());
 
         let info = result.unwrap();
-        assert_eq!(info.has_default_export, true);
+        assert!(info.has_default_export);
     }
 }
