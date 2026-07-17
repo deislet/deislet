@@ -1,0 +1,17 @@
+[package]
+name = "deforge-adapter-dc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Deno Cloud adapter for deforge"
+
+[dependencies]
+deforge-core = { version = "0.1.0", path = "../deforge-core" }
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+walkdir.workspace = true

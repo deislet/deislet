@@ -1,0 +1,20 @@
+name = "hello-world-cf-db"
+main = "index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[env.staging]
+route = "staging.hello-world-cf-db.workers.dev"
+
+[env.production]
+route = "hello-world-cf-db.workers.dev"
+
+[[kv_namespaces]]
+binding = "KV"
+id = ""  # Add your KV namespace ID
+
+[[d1_databases]]
+binding = "DB"
+database_name = ""  # Add your D1 database name
+database_id = ""    # Add your D1 database ID
+

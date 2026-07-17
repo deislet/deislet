@@ -1,0 +1,18 @@
+[package]
+name = "deforge-adapter-cf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Cloudflare Workers adapter for deforge"
+
+[dependencies]
+deforge-core = { version = "0.1.0", path = "../deforge-core" }
+
+handlebars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+walkdir.workspace = true

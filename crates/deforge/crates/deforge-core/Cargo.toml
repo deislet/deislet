@@ -1,0 +1,17 @@
+[package]
+name = "deforge-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core types and traits for deforge - Universal Edge Function Compiler"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rolldown.workspace = true
+rolldown_common.workspace = true

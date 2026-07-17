@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "name": "hello-world",
+  "runtime": "denix",
+  "language": "typescript",
+  "functionRoot": "src",
+  "entry_point": "src/index.ts",
+  "vendors": {
+    "cloudflare": { "enabled": true },
+    "deno": { "enabled": true },
+    "tencent": { "enabled": true },
+    "denix": { "enabled": true }
+  },
+  "build": {
+    "outDir": "dist"
+  }
+}
