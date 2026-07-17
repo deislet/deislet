@@ -1,0 +1,36 @@
+[package]
+name = "denictl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "denictl"
+path = "src/main.rs"
+
+[dependencies]
+denictl-core = { path = "../denictl-core" }
+denictl-parser = { path = "../denictl-parser" }
+denictl-compiler = { path = "../denictl-compiler" }
+denictl-adapters = { path = "../denictl-adapters" }
+
+clap.workspace = true
+colored.workspace = true
+indicatif.workspace = true
+dialoguer.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+notify.workspace = true
+walkdir.workspace = true
+url.workspace = true
