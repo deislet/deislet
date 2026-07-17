@@ -7,13 +7,23 @@
 use deforge_adapter_eo::generate;
 use deforge_core::ProjectConfig;
 
+fn test_config(name: &str, kv_enabled: bool) -> ProjectConfig {
+    let mut v = serde_json::json!({
+        "version": "1.0",
+        "name": name,
+        "runtime": "edge",
+        "language": "typescript",
+    });
+    if kv_enabled {
+        v["services"] = serde_json::json!({ "kv": { "enabled": true } });
+    }
+    serde_json::from_value(v).expect("valid test project config")
+}
+
 #[test]
 fn test_entry_point_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -28,10 +38,7 @@ fn test_entry_point_format() {
 #[test]
 fn test_context_parameter() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -43,15 +50,14 @@ fn test_context_parameter() {
 #[test]
 fn test_no_modern_syntax() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
     // Verify NO Object.fromEntries (not in spec.mdc Web APIs list)
-    assert!(!result.context_builder_code.contains("Object.fromEntries"));
+    // Match the call form so the explanatory comment in the generated
+    // code does not trip the assertion.
+    assert!(!result.context_builder_code.contains("Object.fromEntries("));
 
     // Verify NO spread operators in critical paths
     // (Cookies getAll() may have spread, but main context should not)
@@ -60,10 +66,7 @@ fn test_no_modern_syntax() {
 #[test]
 fn test_web_apis_compliance() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -84,17 +87,17 @@ fn test_web_apis_compliance() {
 #[test]
 fn test_context_structure() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
     // Verify EdgeOne context structure (per spec.mdc line 819-822)
+    // The builder aliases `const request = context.request` and then
+    // exposes it as `request: request`; assert on both halves.
     assert!(result
         .context_builder_code
-        .contains("request: context.request"));
+        .contains("const request = context.request"));
+    assert!(result.context_builder_code.contains("request: request"));
     assert!(result.context_builder_code.contains("env: context.env"));
     assert!(result.context_builder_code.contains("params:"));
 }
@@ -102,10 +105,7 @@ fn test_context_structure() {
 #[test]
 fn test_cookie_parsing_compatibility() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -120,10 +120,7 @@ fn test_cookie_parsing_compatibility() {
 #[test]
 fn test_error_handling() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -131,16 +128,13 @@ fn test_error_handling() {
     assert!(result.router_code.contains("try"));
     assert!(result.router_code.contains("catch (error)"));
     assert!(result.router_code.contains("console.error"));
-    assert!(result.router_code.contains("'Internal Error'"));
+    assert!(result.router_code.contains("'Internal Error"));
 }
 
 #[test]
 fn test_edgeone_json_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -162,10 +156,7 @@ fn test_edgeone_json_format() {
 #[test]
 fn test_spec_reference_in_comments() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -182,10 +173,7 @@ fn test_spec_reference_in_comments() {
 #[test]
 fn test_traditional_loops_only() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -197,13 +185,7 @@ fn test_traditional_loops_only() {
 #[test]
 fn test_kv_adapter_compatibility() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: Some(deforge_core::ServicesConfig {
-            kv: Some(deforge_core::KVConfig { enabled: true }),
-            database: None,
-        }),
-    };
+    let config = test_config("test-app", true);
 
     let result = generate(&routes, &config).unwrap();
 

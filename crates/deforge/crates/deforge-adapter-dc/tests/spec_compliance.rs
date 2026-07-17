@@ -7,13 +7,23 @@
 use deforge_adapter_dc::generate;
 use deforge_core::ProjectConfig;
 
+fn test_config(name: &str, kv_enabled: bool) -> ProjectConfig {
+    let mut v = serde_json::json!({
+        "version": "1.0",
+        "name": name,
+        "runtime": "edge",
+        "language": "typescript",
+    });
+    if kv_enabled {
+        v["services"] = serde_json::json!({ "kv": { "enabled": true } });
+    }
+    serde_json::from_value(v).expect("valid test project config")
+}
+
 #[test]
 fn test_entry_point_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -27,13 +37,7 @@ fn test_entry_point_format() {
 #[test]
 fn test_deno_kv_usage() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: Some(deforge_core::ServicesConfig {
-            kv: Some(deforge_core::KVConfig { enabled: true }),
-            database: None,
-        }),
-    };
+    let config = test_config("test-app", true);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -44,10 +48,7 @@ fn test_deno_kv_usage() {
 #[test]
 fn test_env_access() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -58,13 +59,7 @@ fn test_env_access() {
 #[test]
 fn test_kv_adapter_when_enabled() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: Some(deforge_core::ServicesConfig {
-            kv: Some(deforge_core::KVConfig { enabled: true }),
-            database: None,
-        }),
-    };
+    let config = test_config("test-app", true);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -85,10 +80,7 @@ fn test_kv_adapter_when_enabled() {
 #[test]
 fn test_deno_json_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -111,10 +103,7 @@ fn test_deno_json_format() {
 #[test]
 fn test_error_handling_present() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -127,10 +116,7 @@ fn test_error_handling_present() {
 #[test]
 fn test_spec_reference_in_comments() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -142,10 +128,7 @@ fn test_spec_reference_in_comments() {
 #[test]
 fn test_cache_api_wrapper() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -157,10 +140,7 @@ fn test_cache_api_wrapper() {
 #[test]
 fn test_wait_until_polyfill() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-app".to_string(),
-        services: None,
-    };
+    let config = test_config("test-app", false);
 
     let result = generate(&routes, &config).unwrap();
 

@@ -7,13 +7,23 @@
 use deforge_adapter_cf::generate;
 use deforge_core::ProjectConfig;
 
+fn test_config(name: &str, kv_enabled: bool) -> ProjectConfig {
+    let mut v = serde_json::json!({
+        "version": "1.0",
+        "name": name,
+        "runtime": "edge",
+        "language": "typescript",
+    });
+    if kv_enabled {
+        v["services"] = serde_json::json!({ "kv": { "enabled": true } });
+    }
+    serde_json::from_value(v).expect("valid test project config")
+}
+
 #[test]
 fn test_entry_point_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: None,
-    };
+    let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -30,10 +40,7 @@ fn test_entry_point_format() {
 #[test]
 fn test_handler_parameters() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: None,
-    };
+    let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -46,10 +53,7 @@ fn test_handler_parameters() {
 #[test]
 fn test_context_includes_env_bindings() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: None,
-    };
+    let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -61,10 +65,7 @@ fn test_context_includes_env_bindings() {
 #[test]
 fn test_context_includes_cf_property() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: None,
-    };
+    let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -75,10 +76,7 @@ fn test_context_includes_cf_property() {
 #[test]
 fn test_context_execution_methods() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: None,
-    };
+    let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -94,13 +92,7 @@ fn test_context_execution_methods() {
 #[test]
 fn test_kv_adapter_when_enabled() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: Some(deforge_core::ServicesConfig {
-            kv: Some(deforge_core::KVConfig { enabled: true }),
-            database: None,
-        }),
-    };
+    let config = test_config("test-worker", true);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -120,10 +112,7 @@ fn test_kv_adapter_when_enabled() {
 #[test]
 fn test_wrangler_toml_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: None,
-    };
+    let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -147,10 +136,7 @@ fn test_wrangler_toml_format() {
 #[test]
 fn test_error_handling_present() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: None,
-    };
+    let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config).unwrap();
 
@@ -163,10 +149,7 @@ fn test_error_handling_present() {
 #[test]
 fn test_spec_reference_in_comments() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = ProjectConfig {
-        name: "test-worker".to_string(),
-        services: None,
-    };
+    let config = test_config("test-worker", false);
 
     let result = generate(&routes, &config).unwrap();
 
