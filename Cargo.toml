@@ -1,9 +1,13 @@
 [workspace]
 members = [
     "crates/denira",
-    "crates/denira-workit",
+    "crates/workit",
     "crates/deflux",
     "crates/denix",
+]
+exclude = [
+    "crates/denictl",
+    "crates/deforge",
 ]
 resolver = "2"
 
@@ -21,4 +25,4 @@ serde_json = "1.0"
 tracing = "0.1"
 anyhow = "1.0"
 rusqlite = { version = "0.36", features = ["bundled"] }
-denira-workit = { path = "crates/denira-workit" }
+denira-workit = { path = "crates/workit" }
