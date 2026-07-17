@@ -80,17 +80,20 @@ pub async fn start_server(
         }
     });
 
-    // Build HTTP routes - all requests are routed via x-deis-app-id header
-    // Add wildcard routes to handle all HTTP requests
-    let http_router = Router::new()
+    // Build HTTP routes - all requests are routed via x-deis-app-id header.
+    // gRPC services must be mounted on their explicit path prefixes BEFORE
+    // the wildcard, otherwise `/*path` swallows every gRPC call and the
+    // management plane is unreachable.
+    let app = Router::new()
+        .route_service(
+            "/denix.management.DenixManagement/*rpc",
+            grpc_service.clone(),
+        )
+        .route_service("/denix.trigger.Trigger/*rpc", grpc_service)
         .route("/*path", axum::routing::any(handlers::handle_request))
         .route("/", axum::routing::any(handlers::handle_request))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
-
-    // Merge HTTP and gRPC services
-    // HTTP routes prioritized, gRPC as fallback
-    let app = http_router.fallback_service(grpc_service);
 
     // Bind address
     let addr = format!("0.0.0.0:{}", port);
