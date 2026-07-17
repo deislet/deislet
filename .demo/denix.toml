@@ -1,8 +1,0 @@
-http_port = 8093
-
-[supervisor]
-enabled = true
-addr = "http://127.0.0.1:8085"
-associated_id = "denix-demo-01"
-secret = "016d425102bea4abcdf34deb656c0f8820a56903d45cbc66d5e4c0ddc8cf4299"
-reconnect_interval = 5
