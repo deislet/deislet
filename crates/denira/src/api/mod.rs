@@ -51,6 +51,7 @@ pub fn build_api_router(
     config_manager: Arc<ConfigManager>,
     command_executor: Arc<CommandExecutor>,
     metrics_collector: Arc<MetricsCollector>,
+    denix_manager: Arc<crate::denix_client::DenixNodeManager>,
     config: Arc<SupervisorConfig>,
 ) -> ApiRouter {
     let app_state = AppState {
@@ -77,8 +78,7 @@ pub fn build_api_router(
     };
 
     let apps_state = apps::AppsState {
-        sessions: Arc::clone(&sessions),
-        http_client: reqwest::Client::new(),
+        denix: Arc::clone(&denix_manager),
     };
 
     let auth_config = middleware::AuthConfig::from_supervisor_config(&config);
@@ -113,11 +113,10 @@ pub fn build_api_router(
         .route("/api/metrics", get(metrics::export_prometheus))
         .route("/api/metrics/summary", get(metrics::get_metrics_summary))
         .with_state(metrics_state)
-        .route("/api/apps", get(apps::list_apps))
-        .route("/api/apps", post(apps::create_app))
-        .route("/api/apps/:id", get(apps::get_app))
-        .route("/api/apps/:id", delete(apps::delete_app))
-        .route("/api/apps/:id/domains", put(apps::update_app_domains))
+        .route("/api/denix", get(apps::list_nodes))
+        .route("/api/denix/:node/status", get(apps::node_status))
+        .route("/api/denix/:node/apps/:app_id", put(apps::deploy_app))
+        .route("/api/denix/:node/apps/:app_id", delete(apps::unload_app))
         .with_state(apps_state)
         .layer(axum_middleware::from_fn_with_state(
             auth_config.clone(),
@@ -177,6 +176,11 @@ pub async fn start_api_server(
     port: u16,
 ) -> anyhow::Result<()> {
     let tls_config = config.tls.clone();
+    let denix_manager = Arc::new(crate::denix_client::DenixNodeManager::new(
+        config.denix_nodes.clone(),
+        config.denix_poll_interval,
+    ));
+    tokio::spawn(Arc::clone(&denix_manager).poll_loop());
     let api = build_api_router(
         sessions,
         database,
@@ -184,6 +188,7 @@ pub async fn start_api_server(
         config_manager,
         command_executor,
         metrics_collector,
+        denix_manager,
         config,
     );
 

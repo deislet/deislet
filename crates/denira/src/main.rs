@@ -109,6 +109,12 @@ async fn main() -> Result<(), anyhow::Error> {
     Arc::clone(&scheduler).start().await;
     info!("Cron scheduler started");
 
+    let denix_manager = Arc::new(denira::DenixNodeManager::new(
+        api_config.denix_nodes.clone(),
+        api_config.denix_poll_interval,
+    ));
+    tokio::spawn(Arc::clone(&denix_manager).poll_loop());
+
     let api = denira::api::build_api_router(
         sessions,
         db,
@@ -116,6 +122,7 @@ async fn main() -> Result<(), anyhow::Error> {
         config_manager,
         command_executor,
         metrics_collector,
+        Arc::clone(&denix_manager),
         Arc::clone(&api_config),
     );
 

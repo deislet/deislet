@@ -16,11 +16,13 @@ pub mod broadcast;
 pub mod api;
 pub mod config_manager;
 pub mod command;
+pub mod denix_client;
 pub mod metrics;
 pub mod scheduler;
 pub mod tls;
 
-pub use config::{SupervisorConfig, TlsConfig};
+pub use config::{DenixNodeConfig, SupervisorConfig, TlsConfig};
+pub use denix_client::DenixNodeManager;
 pub use message::{WorkerType, WorkerInfo, AuthData, AuthResponse, RegisterRequest, RegisterResponse, HeartbeatRequest, HeartbeatAck, Message, MessageType, ConfigUpdateMessage, ConfigUpdateAck};
 pub use session::{SessionManager, WorkerSession, WorkerState, SendError};
 pub use handler::MessageHandler;
@@ -58,9 +60,7 @@ mod tests {
             heartbeat_interval: 60,
             heartbeat_timeout: 180,
             worker_preshared_keys: vec!["key1".to_string()],
-            api_keys: Vec::new(),
-            api_auth_enabled: false,
-            tls: None,
+            ..Default::default()
         };
         assert_eq!(config.bind_addr, "127.0.0.1");
         assert_eq!(config.port, 9000);

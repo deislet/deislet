@@ -58,10 +58,13 @@ sha2 = "0.10"
 rust-embed = "8"
 mime_guess = "2"
 
-reqwest = { version = "0.11", features = ["json"] }
 
 # Denira WorkIt SDK
 denira-workit = { path = "../workit" }
 
+[build-dependencies]
+tonic-build = "0.12"
+
 [dev-dependencies]
 tempfile = "3"
+reqwest = { version = "0.12", features = ["json"] }

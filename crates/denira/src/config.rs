@@ -17,6 +17,27 @@ pub struct SupervisorConfig {
     /// TLS configuration (optional)
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Denix nodes managed through their gRPC management plane.
+    ///
+    /// Denix instances are autonomous and do not register themselves;
+    /// the supervisor reaches out to the endpoints listed here instead.
+    #[serde(default)]
+    pub denix_nodes: Vec<DenixNodeConfig>,
+    /// Interval in seconds between denix node health polls (default: 15)
+    #[serde(default = "default_denix_poll_interval")]
+    pub denix_poll_interval: u64,
+}
+
+fn default_denix_poll_interval() -> u64 {
+    15
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DenixNodeConfig {
+    /// Stable identifier used in API paths and logs
+    pub id: String,
+    /// gRPC endpoint of the denix management plane, e.g. "http://127.0.0.1:8086"
+    pub addr: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +65,8 @@ impl Default for SupervisorConfig {
             api_keys: Vec::new(),
             api_auth_enabled: false,
             tls: None,
+            denix_nodes: Vec::new(),
+            denix_poll_interval: default_denix_poll_interval(),
         }
     }
 }

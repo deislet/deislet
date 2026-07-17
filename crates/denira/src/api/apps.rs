@@ -1,330 +1,167 @@
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tracing::{error, warn};
+//! REST endpoints for managing denix nodes through their gRPC management
+//! plane. Replaces the former proxy onto the retired denix HTTP API.
 
-use crate::message::WorkerType;
-use crate::session::SessionManager;
+use axum::{
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Json},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::Arc;
+use tracing::warn;
+
+use crate::denix_client::{DenixNodeManager, NodeError};
+
+/// Hard cap for uploaded app packages. Keeps a misbehaving client from
+/// buffering arbitrary amounts of memory in the supervisor.
+const MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppsState {
-    pub sessions: Arc<SessionManager>,
-    pub http_client: Client,
+    pub denix: Arc<DenixNodeManager>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct AppsResponse {
-    pub apps: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
-}
-
-fn find_denix_worker(sessions: &SessionManager) -> Option<String> {
-    for entry in sessions.iter() {
-        let session = entry.value();
-        if matches!(session.worker_type, WorkerType::Denix(_)) {
-            if let Some(port) = session.ports.first() {
-                let host = if session.host == "0.0.0.0" {
-                    "127.0.0.1"
-                } else {
-                    &session.host
-                };
-                return Some(format!("http://{}:{}", host, port));
-            }
-        }
-    }
-    None
-}
-
-pub async fn list_apps(
-    State(state): State<AppsState>,
-) -> impl IntoResponse {
-    let Some(denix_url) = find_denix_worker(&state.sessions) else {
-        warn!("No Denix worker available for apps proxy");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "No Denix worker available".to_string(),
-            }),
-        )
-            .into_response();
+fn node_error_response(e: &NodeError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match e {
+        NodeError::UnknownNode => StatusCode::NOT_FOUND,
+        NodeError::Transport(_) => StatusCode::BAD_GATEWAY,
+        NodeError::Rpc(_) => StatusCode::BAD_GATEWAY,
     };
+    (status, Json(json!({ "error": e.to_string() })))
+}
 
-    let url = format!("{}/api/apps", denix_url);
-    match state.http_client.get(&url).send().await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-                    Err(e) => {
-                        error!("Failed to parse apps response: {}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("Failed to parse response: {}", e),
-                            }),
-                        )
-                            .into_response()
+/// GET /api/denix — all configured nodes with cached health.
+pub async fn list_nodes(State(state): State<AppsState>) -> impl IntoResponse {
+    Json(json!({ "nodes": state.denix.list() }))
+}
+
+#[derive(Deserialize)]
+pub struct StatusParams {
+    /// Include per-app details (default true).
+    #[serde(default = "default_true")]
+    pub apps: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct AppStatusView {
+    app_id: String,
+    state: String,
+    request_count: i64,
+    error_count: i64,
+    error_message: String,
+}
+
+/// GET /api/denix/:node/status — live status straight from the node.
+pub async fn node_status(
+    State(state): State<AppsState>,
+    Path(node): Path<String>,
+    Query(params): Query<StatusParams>,
+) -> impl IntoResponse {
+    match state.denix.get_status(&node, params.apps).await {
+        Ok(status) => {
+            let apps: Vec<AppStatusView> = status
+                .apps
+                .iter()
+                .map(|a| AppStatusView {
+                    app_id: a.app_id.clone(),
+                    state: match a.state {
+                        1 => "loading",
+                        2 => "running",
+                        3 => "stopped",
+                        4 => "error",
+                        _ => "unknown",
                     }
-                }
-            } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                (
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    Json(ErrorResponse { error: body }),
-                )
-                    .into_response()
-            }
+                    .to_string(),
+                    request_count: a.request_count,
+                    error_count: a.error_count,
+                    error_message: a.error_message.clone(),
+                })
+                .collect();
+            let worker = status.worker_info.as_ref();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "node": node,
+                    "worker": {
+                        "worker_id": worker.map(|w| w.worker_id.clone()),
+                        "version": worker.map(|w| w.version.clone()),
+                        "uptime_seconds": worker.map(|w| w.uptime_seconds),
+                        "hostname": worker.map(|w| w.hostname.clone()),
+                    },
+                    "apps": apps,
+                    "resource_usage": status.resource_usage.as_ref().map(|r| json!({
+                        "cpu_percent": r.cpu_percent,
+                        "memory_bytes": r.memory_bytes,
+                    })),
+                })),
+            )
         }
         Err(e) => {
-            error!("Failed to proxy apps request: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("Proxy error: {}", e),
-                }),
-            )
-                .into_response()
+            warn!(node = %node, error = %e, "Status query failed");
+            node_error_response(&e)
         }
     }
 }
 
-pub async fn get_app(
+/// PUT /api/denix/:node/apps/:app_id — deploy a ZIP package (raw body).
+pub async fn deploy_app(
     State(state): State<AppsState>,
-    Path(id): Path<String>,
+    Path((node, app_id)): Path<(String, String)>,
+    body: Bytes,
 ) -> impl IntoResponse {
-    let Some(denix_url) = find_denix_worker(&state.sessions) else {
+    if body.is_empty() {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "No Denix worker available".to_string(),
-            }),
-        )
-            .into_response();
-    };
-
-    let url = format!("{}/api/apps/{}", denix_url, id);
-    match state.http_client.get(&url).send().await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-                    Err(e) => {
-                        error!("Failed to parse app response: {}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("Failed to parse response: {}", e),
-                            }),
-                        )
-                            .into_response()
-                    }
-                }
-            } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                (
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    Json(ErrorResponse { error: body }),
-                )
-                    .into_response()
-            }
-        }
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "empty package body; expected a ZIP archive" })),
+        );
+    }
+    if body.len() > MAX_PACKAGE_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": format!("package exceeds {} byte limit", MAX_PACKAGE_BYTES)
+            })),
+        );
+    }
+    match state.denix.deploy_app(&node, &app_id, body.to_vec()).await {
+        Ok(resp) if resp.success => (
+            StatusCode::OK,
+            Json(json!({ "success": true, "app_id": resp.app_id, "message": resp.message })),
+        ),
+        Ok(resp) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "success": false, "message": resp.message })),
+        ),
         Err(e) => {
-            error!("Failed to proxy get app request: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("Proxy error: {}", e),
-                }),
-            )
-                .into_response()
+            warn!(node = %node, app_id = %app_id, error = %e, "Deploy failed");
+            node_error_response(&e)
         }
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CreateAppRequest {
-    pub id: String,
-    pub code: String,
-    #[serde(default)]
-    pub subdomain: Option<String>,
-}
-
-pub async fn create_app(
+/// DELETE /api/denix/:node/apps/:app_id — unload an app.
+pub async fn unload_app(
     State(state): State<AppsState>,
-    Json(payload): Json<CreateAppRequest>,
+    Path((node, app_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let Some(denix_url) = find_denix_worker(&state.sessions) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "No Denix worker available".to_string(),
-            }),
-        )
-            .into_response();
-    };
-
-    let url = format!("{}/api/apps", denix_url);
-    match state
-        .http_client
-        .post(&url)
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(data) => (StatusCode::CREATED, Json(data)).into_response(),
-                    Err(e) => {
-                        error!("Failed to parse create app response: {}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("Failed to parse response: {}", e),
-                            }),
-                        )
-                            .into_response()
-                    }
-                }
-            } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                (
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    Json(ErrorResponse { error: body }),
-                )
-                    .into_response()
-            }
-        }
+    match state.denix.unload_app(&node, &app_id).await {
+        Ok(resp) if resp.success => (
+            StatusCode::OK,
+            Json(json!({ "success": true, "message": resp.message })),
+        ),
+        Ok(resp) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "success": false, "message": resp.message })),
+        ),
         Err(e) => {
-            error!("Failed to proxy create app request: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("Proxy error: {}", e),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-pub async fn delete_app(
-    State(state): State<AppsState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let Some(denix_url) = find_denix_worker(&state.sessions) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "No Denix worker available".to_string(),
-            }),
-        )
-            .into_response();
-    };
-
-    let url = format!("{}/api/apps/{}", denix_url, id);
-    match state.http_client.delete(&url).send().await {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
-            } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                (
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    Json(ErrorResponse { error: body }),
-                )
-                    .into_response()
-            }
-        }
-        Err(e) => {
-            error!("Failed to proxy delete app request: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("Proxy error: {}", e),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct UpdateDomainsRequest {
-    pub custom_domains: Vec<String>,
-}
-
-pub async fn update_app_domains(
-    State(state): State<AppsState>,
-    Path(id): Path<String>,
-    Json(payload): Json<UpdateDomainsRequest>,
-) -> impl IntoResponse {
-    let Some(denix_url) = find_denix_worker(&state.sessions) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "No Denix worker available".to_string(),
-            }),
-        )
-            .into_response();
-    };
-
-    let url = format!("{}/api/apps/{}/domains", denix_url, id);
-    match state
-        .http_client
-        .put(&url)
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-                    Err(e) => {
-                        error!("Failed to parse update domains response: {}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("Failed to parse response: {}", e),
-                            }),
-                        )
-                            .into_response()
-                    }
-                }
-            } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                (
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    Json(ErrorResponse { error: body }),
-                )
-                    .into_response()
-            }
-        }
-        Err(e) => {
-            error!("Failed to proxy update domains request: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("Proxy error: {}", e),
-                }),
-            )
-                .into_response()
+            warn!(node = %node, app_id = %app_id, error = %e, "Unload failed");
+            node_error_response(&e)
         }
     }
 }
