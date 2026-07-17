@@ -71,16 +71,16 @@ impl SupervisorConfig {
             return Err("addr cannot be empty".to_string());
         }
 
-        if !self.addr.starts_with("ws://") && !self.addr.starts_with("wss://") {
-            return Err("addr must start with ws:// or wss://".to_string());
+        if !self.addr.starts_with("http://") && !self.addr.starts_with("https://") {
+            return Err("addr must start with http:// or https://".to_string());
         }
 
         Ok(())
     }
 
-    /// Build WebSocket connection URL
-    pub fn websocket_url(&self) -> String {
-        format!("{}/ws", self.addr.trim_end_matches('/'))
+    /// Build gRPC endpoint URL
+    pub fn grpc_endpoint(&self) -> String {
+        self.addr.clone()
     }
 }
 
@@ -131,20 +131,20 @@ mod tests {
     }
 
     #[test]
-    fn test_websocket_url_building() {
+    fn test_grpc_endpoint_building() {
         let ws_config = SupervisorConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
-            "ws://localhost:8080".to_string(),
+            "http://localhost:8080".to_string(),
         );
-        assert_eq!(ws_config.websocket_url(), "ws://localhost:8080/ws");
+        assert_eq!(ws_config.grpc_endpoint(), "http://localhost:8080");
 
         let wss_config = SupervisorConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
-            "wss://example.com:8443".to_string(),
+            "https://example.com:8443".to_string(),
         );
-        assert_eq!(wss_config.websocket_url(), "wss://example.com:8443/ws");
+        assert_eq!(wss_config.grpc_endpoint(), "https://example.com:8443");
     }
 
     #[test]
@@ -152,10 +152,23 @@ mod tests {
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
-            "ws://localhost:8080".to_string(),
+            "http://localhost:8080".to_string(),
         );
 
         assert!(config.validate().is_ok());
+    }
+// ...
+    #[test]
+    fn test_validation_invalid_addr_scheme() {
+        let config = SupervisorConfig::new(
+            "test-id".to_string(),
+            VALID_SECRET.to_string(),
+            "ws://example.com".to_string(),
+        );
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "addr must start with http:// or https://");
     }
 
     #[test]
@@ -163,7 +176,7 @@ mod tests {
         let config = SupervisorConfig::new(
             "".to_string(),
             VALID_SECRET.to_string(),
-            "ws://localhost:8080".to_string(),
+            "http://localhost:8080".to_string(),
         );
 
         let result = config.validate();
@@ -176,7 +189,7 @@ mod tests {
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             "".to_string(),
-            "ws://localhost:8080".to_string(),
+            "http://localhost:8080".to_string(),
         );
 
         let result = config.validate();
@@ -189,7 +202,7 @@ mod tests {
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             "short".to_string(),
-            "ws://localhost:8080".to_string(),
+            "http://localhost:8080".to_string(),
         );
 
         let result = config.validate();
@@ -208,7 +221,7 @@ mod tests {
         let config = SupervisorConfig::new(
             "test-id".to_string(),
             invalid_secret.to_string(),
-            "ws://localhost:8080".to_string(),
+            "http://localhost:8080".to_string(),
         );
 
         let result = config.validate();
@@ -230,19 +243,6 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "addr cannot be empty");
-    }
-
-    #[test]
-    fn test_validation_invalid_addr_scheme() {
-        let config = SupervisorConfig::new(
-            "test-id".to_string(),
-            VALID_SECRET.to_string(),
-            "http://example.com".to_string(),
-        );
-
-        let result = config.validate();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "addr must start with ws:// or wss://");
     }
 
     #[test]

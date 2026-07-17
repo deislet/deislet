@@ -11,7 +11,7 @@ pub use register::{RegisterRequest, RegisterResponse};
 
 pub use messages::{
     AuthMessage, AuthResponseMessage, CommandData, CommandMessage, CommandResponseMessage,
-    HeartbeatAckMessage, HeartbeatMessage, Message, MessageBuilder, RegisterMessage,
-    RegisterResponseMessage, StatusUpdateMessage, WorkerCommand, WorkitMessage, deflux, denix,
-    supervisor,
+    ConfigPushAckMessage, ConfigPushData, ConfigPushMessage, HeartbeatAckMessage,
+    HeartbeatMessage, Message, MessageBuilder, RegisterMessage, RegisterResponseMessage,
+    StatusUpdateMessage, WorkerCommand, WorkitMessage, deflux, denix, supervisor,
 };

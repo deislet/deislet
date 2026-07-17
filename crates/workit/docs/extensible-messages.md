@@ -1,76 +1,76 @@
-# 统一可扩展消息系统
+# Unified Extensible Message System
 
-WorkIt 框架采用基于关联类型的统一消息系统，提供类型安全、可扩展性和高性能的消息处理能力。
+The WorkIt framework adopts a unified message system based on associated types, providing type safety, extensibility, and high-performance message processing capabilities.
 
-## 设计原则
+## Design Principles
 
-### 核心理念
+### Core Concepts
 
-1. **类型安全**：编译时检查消息类型和数据结构
-2. **可扩展性**：新系统可以定义自己的消息类型而无需修改核心库
-3. **统一性**：所有消息类型使用相同的基础结构
-4. **性能**：零成本抽象，无运行时开销
-5. **简洁性**：保持库的简单性，避免复杂的向后兼容层
+1. **Type Safety**: Compile-time checks for message types and data structures
+2. **Extensibility**: New systems can define their own message types without modifying the core library
+3. **Uniformity**: All message types use the same base structure
+4. **Performance**: Zero-cost abstractions, no runtime overhead
+5. **Simplicity**: Maintain library simplicity and avoid complex backward compatibility layers
 
-### 架构概述
+### Architecture Overview
 
-所有消息都基于以下核心组件：
+All messages are based on the following core components:
 
-- **`Message` Trait**：定义消息类型的公共接口
-- **`WorkitMessage<M>`**：通用消息包装器
-- **`MessageBuilder`**：统一的消息构建器
-- **扩展模块**：特定系统的消息类型定义
+- **`Message` Trait**: Defines the public interface for message types
+- **`WorkitMessage<M>`**: A generic message wrapper
+- **`MessageBuilder`**: A unified message builder
+- **Extension Modules**: Message type definitions for specific systems
 
-## 核心组件
+## Core Components
 
 ### Message Trait
 
 ```rust
 pub trait Message: Debug + Clone + Serialize + DeserializeOwned + Send + Sync + 'static {
-    /// 消息类型标识符
+    /// Message type identifier
     const MESSAGE_TYPE: &'static str;
     
-    /// 关联类型：消息特定数据
+    /// Associated type: Message-specific data
     type Data: Debug + Clone + Serialize + DeserializeOwned + Send + Sync;
     
-    /// 获取消息数据
+    /// Get message data
     fn data(&self) -> &Self::Data;
     
-    /// 获取可选的消息 ID
+    /// Get optional message ID
     fn message_id(&self) -> Option<Uuid>;
     
-    /// 检查此消息是否需要认证
+    /// Check if this message requires authentication
     fn requires_auth(&self) -> bool;
     
-    /// 从数据创建新消息
+    /// Create a new message from data
     fn new(data: Self::Data) -> Self;
     
-    /// 使用显式 ID 创建新消息
+    /// Create a new message with an explicit ID
     fn with_id(data: Self::Data, message_id: Uuid) -> Self;
 }
 ```
 
-### WorkitMessage 包装器
+### WorkitMessage Wrapper
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkitMessage<M: Message> {
-    /// 消息类型标识符
+    /// Message type identifier
     pub message_type: String,
-    /// 可选的消息 ID，用于请求-响应追踪
+    /// Optional message ID for request-response tracking
     pub message_id: Option<Uuid>,
-    /// 消息创建时间戳
+    /// Message creation timestamp
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// 消息数据
+    /// Message data
     pub data: M::Data,
-    /// 可选的关联 ID，用于响应匹配请求
+    /// Optional correlation ID for matching responses to requests
     pub correlation_id: Option<Uuid>,
 }
 ```
 
-## 核心消息类型
+## Core Message Types
 
-### 认证消息
+### Authentication Message
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,11 +82,11 @@ pub struct AuthMessage {
 impl Message for AuthMessage {
     const MESSAGE_TYPE: &'static str = "authenticate";
     type Data = AuthData;
-    // ... 其他实现
+    // ... other implementations
 }
 ```
 
-### 注册消息
+### Registration Message
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,11 +98,11 @@ pub struct RegisterMessage {
 impl Message for RegisterMessage {
     const MESSAGE_TYPE: &'static str = "register";
     type Data = RegisterRequest;
-    // ... 其他实现
+    // ... other implementations
 }
 ```
 
-### 心跳消息
+### Heartbeat Message
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,13 +114,13 @@ pub struct HeartbeatMessage {
 impl Message for HeartbeatMessage {
     const MESSAGE_TYPE: &'static str = "heartbeat";
     type Data = HeartbeatRequest;
-    // ... 其他实现
+    // ... other implementations
 }
 ```
 
-## 扩展消息类型
+## Extended Message Types
 
-### Supervisor 系统
+### Supervisor System
 
 ```rust
 pub mod supervisor {
@@ -143,12 +143,12 @@ pub mod supervisor {
     impl Message for SupervisorMessage {
         const MESSAGE_TYPE: &'static str = "supervisor_operation";
         type Data = BatchOperationData;
-        // ... 实现细节
+        // ... implementation details
     }
 }
 ```
 
-### Denix 系统
+### Denix System
 
 ```rust
 pub mod denix {
@@ -171,12 +171,12 @@ pub mod denix {
     impl Message for DenixMessage {
         const MESSAGE_TYPE: &'static str = "denix_deployment";
         type Data = DeploymentData;
-        // ... 实现细节
+        // ... implementation details
     }
 }
 ```
 
-### Deflux 系统
+### Deflux System
 
 ```rust
 pub mod deflux {
@@ -198,33 +198,33 @@ pub mod deflux {
     impl Message for DefluxMessage {
         const MESSAGE_TYPE: &'static str = "deflux_pipeline";
         type Data = PipelineData;
-        // ... 实现细节
+        // ... implementation details
     }
 }
 ```
 
-## 使用方法
+## Usage
 
-### 创建消息
+### Creating Messages
 
-使用 `MessageBuilder` 创建各种类型的消息：
+Use `MessageBuilder` to create various types of messages:
 
 ```rust
 use workit::models::messages::{MessageBuilder, WorkitMessage};
 use workit::models::{AuthData, RegisterRequest, HeartbeatRequest};
 
-// 创建认证消息
+// Create authentication message
 let auth_data = AuthData::new("worker_001".to_string(), b"secret_key")?;
 let auth_message = MessageBuilder::auth(auth_data);
 
-// 创建注册消息
+// Create registration message
 let register_data = RegisterRequest {
     id: "worker_001".to_string(),
     info: worker_info,
 };
 let register_message = MessageBuilder::register(register_data);
 
-// 创建心跳消息
+// Create heartbeat message
 let heartbeat_data = HeartbeatRequest {
     id: "worker_001".to_string(),
     power_reserve: 85,
@@ -232,12 +232,12 @@ let heartbeat_data = HeartbeatRequest {
 let heartbeat_message = MessageBuilder::heartbeat(heartbeat_data);
 ```
 
-### 创建扩展消息
+### Creating Extended Messages
 
 ```rust
 use serde_json::json;
 
-// Supervisor 批量操作
+// Supervisor batch operation
 let supervisor_message = MessageBuilder::supervisor_operation(
     "batch_deploy".to_string(),
     vec!["worker1".to_string(), "worker2".to_string()],
@@ -246,10 +246,10 @@ let supervisor_message = MessageBuilder::supervisor_operation(
         "replicas": 3,
         "strategy": "rolling_update"
     }),
-    Some(2), // 并行限制
+    Some(2), // Parallel limit
 );
 
-// Denix 容器部署
+// Denix container deployment
 let denix_message = MessageBuilder::denix_deployment(
     "nginx:1.21".to_string(),
     3,                      // replicas
@@ -258,10 +258,10 @@ let denix_message = MessageBuilder::denix_deployment(
     "1Gi".to_string(),      // Memory
 );
 
-// Deflux 数据管道
+// Deflux data pipeline
 let deflux_message = MessageBuilder::deflux_pipeline(
     "analytics_pipeline".to_string(),
-    "实时数据分析管道".to_string(),
+    "Real-time data analysis pipeline".to_string(),
     vec![
         PipelineStage {
             name: "extract".to_string(),
@@ -271,51 +271,51 @@ let deflux_message = MessageBuilder::deflux_pipeline(
                 "connection": "postgresql://localhost:5432/data"
             }),
         },
-        // ... 更多阶段
+        // ... more stages
     ],
 );
 ```
 
-### 请求-响应模式
+### Request-Response Pattern
 
 ```rust
 use uuid::Uuid;
 
-// 创建请求
+// Create request
 let request_id = Uuid::new_v4();
 let auth_data = AuthData::new("worker_001".to_string(), b"secret_key")?;
 let auth_msg = AuthMessage::with_id(auth_data, request_id);
 let request = WorkitMessage::new(auth_msg);
 
-// 创建响应
+// Create response
 let response_data = AuthResponseData {
     authenticated: true,
-    message: "认证成功".to_string(),
+    message: "Authentication successful".to_string(),
     error: None,
 };
 let auth_response = AuthResponseMessage::new(response_data);
 let response = WorkitMessage::response_to(auth_response, &request);
 
-// 验证关联
+// Verify correlation
 assert_eq!(response.correlation_id, Some(request_id));
 ```
 
-### 序列化和反序列化
+### Serialization and Deserialization
 
 ```rust
-// 序列化
+// Serialization
 let json_string = serde_json::to_string(&message)?;
 
-// 反序列化
+// Deserialization
 let deserialized: WorkitMessage<AuthMessage> = serde_json::from_str(&json_string)?;
 ```
 
-## 自定义消息类型
+## Custom Message Types
 
-创建自定义消息类型非常简单：
+Creating custom message types is very simple:
 
 ```rust
-// 定义数据结构
+// Define data structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitoringData {
     pub metric_name: String,
@@ -323,14 +323,14 @@ pub struct MonitoringData {
     pub tags: std::collections::HashMap<String, String>,
 }
 
-// 定义消息类型
+// Define message type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitoringMessage {
     pub monitoring_data: MonitoringData,
     pub message_id: Option<Uuid>,
 }
 
-// 实现 Message trait
+// Implement Message trait
 impl Message for MonitoringMessage {
     const MESSAGE_TYPE: &'static str = "monitoring_metric";
     type Data = MonitoringData;
@@ -359,56 +359,56 @@ impl Message for MonitoringMessage {
 }
 ```
 
-## 最佳实践
+## Best Practices
 
-### 1. 消息类型命名
+### 1. Message Type Naming
 
-- 使用清晰、描述性的名称
-- 遵循 `snake_case` 命名约定
-- 包含系统前缀（如 `supervisor_`, `denix_`, `deflux_`）
+- Use clear, descriptive names
+- Follow `snake_case` naming conventions
+- Include system prefixes (e.g., `supervisor_`, `denix_`, `deflux_`)
 
-### 2. 数据结构设计
+### 2. Data Structure Design
 
-- 保持数据结构简单和可序列化
-- 使用适当的类型（如 `String` 而不是 `&str`）
-- 为可选字段使用 `Option<T>`
+- Keep data structures simple and serializable
+- Use appropriate types (e.g., `String` instead of `&str`)
+- Use `Option<T>` for optional fields
 
-### 3. 错误处理
+### 3. Error Handling
 
-- 总是处理序列化/反序列化错误
-- 提供有意义的错误消息
-- 使用 `Result<T, E>` 进行错误传播
+- Always handle serialization/deserialization errors
+- Provide meaningful error messages
+- Use `Result<T, E>` for error propagation
 
-### 4. 性能考虑
+### 4. Performance Considerations
 
-- 避免不必要的克隆
-- 使用引用当可能时
-- 考虑使用 `Arc<T>` 共享数据
+- Avoid unnecessary clones
+- Use references when possible
+- Consider using `Arc<T>` to share data
 
-## 示例代码
+## Example Code
 
-完整的示例代码可以在 `examples/extensible_messages.rs` 中找到，展示了：
+Complete example code can be found in `examples/extensible_messages.rs`, demonstrating:
 
-- 核心消息类型的使用
-- 扩展消息类型的创建
-- 序列化和反序列化
-- 请求-响应模式
-- 自定义消息类型的实现
+- Usage of core message types
+- Creation of extended message types
+- Serialization and deserialization
+- Request-Response pattern
+- Implementation of custom message types
 
-## 迁移指南
+## Migration Guide
 
-如果你之前使用了基于枚举的消息系统，迁移到新的统一系统很简单：
+If you previously used an enum-based message system, migrating to the new unified system is straightforward:
 
-### 旧方式（已移除）
+### Old Way (Removed)
 ```rust
-// 这种方式不再支持
+// This method is no longer supported
 let msg = ClientMessage::authenticate(auth_data);
 ```
 
-### 新方式
+### New Way
 ```rust
-// 使用统一的消息构建器
+// Use the unified message builder
 let msg = MessageBuilder::auth(auth_data);
 ```
 
-新系统提供了更好的类型安全性、更清晰的代码结构和更好的可扩展性。 
+The new system provides better type safety, a clearer code structure, and superior extensibility.

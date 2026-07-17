@@ -1,7 +1,9 @@
 [package]
-name = "workit"
+name = "denira-workit"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+authors = ["kookyleo <kookyleo@gmail.com>"]
 description = "Worker communication toolkit for Denira supervisor integration"
 
 [dependencies]
@@ -19,13 +21,19 @@ tokio-tungstenite = { version = "0.24.0", features = ["native-tls"] }
 tracing = "0.1.41"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
 yasm = { version = "0.4.0", features = ["serde"] }
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [dev-dependencies]
 tracing-subscriber = "0.3.18"
 
-[[example]]
-name = "extensible_messages"
-path = "examples/extensible_messages.rs"
+# [[example]]
+# name = "extensible_messages"
+# path = "examples/extensible_messages.rs"
 
 # [[example]]
 # name = "basic_usage"

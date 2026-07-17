@@ -7,6 +7,10 @@ pub mod config;
 pub mod error;
 pub mod models;
 
+pub mod pb {
+    tonic::include_proto!("deflux.supervisor");
+}
+
 // Re-export core types
 pub use client::WorkitClient;
 pub use config::{SupervisorConfig, WorkerInfo, WorkerType};

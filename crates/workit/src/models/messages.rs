@@ -446,6 +446,102 @@ pub enum WorkerCommand {
     },
 }
 
+/// Configuration push data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPushData {
+    /// Worker ID to push config to
+    pub worker_id: String,
+    /// Configuration key (e.g., "app.runtime", "gateway.cors")
+    pub config_key: String,
+    /// Configuration value as JSON
+    pub config_value: serde_json::Value,
+    /// Version timestamp for config tracking
+    pub version_timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPushMessage {
+    pub push_data: ConfigPushData,
+    pub message_id: Option<Uuid>,
+}
+
+impl Message for ConfigPushMessage {
+    const MESSAGE_TYPE: &'static str = "config_push";
+    type Data = ConfigPushData;
+
+    fn data(&self) -> &Self::Data {
+        &self.push_data
+    }
+
+    fn message_id(&self) -> Option<Uuid> {
+        self.message_id
+    }
+
+    fn requires_auth(&self) -> bool {
+        true // Config push requires authentication
+    }
+
+    fn new(data: Self::Data) -> Self {
+        Self {
+            push_data: data,
+            message_id: Some(Uuid::new_v4()),
+        }
+    }
+
+    fn with_id(data: Self::Data, message_id: Uuid) -> Self {
+        Self {
+            push_data: data,
+            message_id: Some(message_id),
+        }
+    }
+}
+
+/// Configuration push acknowledgment data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPushAckData {
+    pub success: bool,
+    pub message: String,
+    pub config_key: String,
+    pub applied_version: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPushAckMessage {
+    pub ack_data: ConfigPushAckData,
+    pub message_id: Option<Uuid>,
+}
+
+impl Message for ConfigPushAckMessage {
+    const MESSAGE_TYPE: &'static str = "config_push_ack";
+    type Data = ConfigPushAckData;
+
+    fn data(&self) -> &Self::Data {
+        &self.ack_data
+    }
+
+    fn message_id(&self) -> Option<Uuid> {
+        self.message_id
+    }
+
+    fn requires_auth(&self) -> bool {
+        false // Response messages don't require auth
+    }
+
+    fn new(data: Self::Data) -> Self {
+        Self {
+            ack_data: data,
+            message_id: Some(Uuid::new_v4()),
+        }
+    }
+
+    fn with_id(data: Self::Data, message_id: Uuid) -> Self {
+        Self {
+            ack_data: data,
+            message_id: Some(message_id),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandData {
     pub command_id: Uuid,
@@ -789,6 +885,38 @@ impl MessageBuilder {
             command,
         };
         WorkitMessage::new(CommandMessage::new(command_data))
+    }
+
+    /// Create config push message
+    pub fn config_push(
+        worker_id: String,
+        config_key: String,
+        config_value: serde_json::Value,
+        version_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> WorkitMessage<ConfigPushMessage> {
+        let push_data = ConfigPushData {
+            worker_id,
+            config_key,
+            config_value,
+            version_timestamp,
+        };
+        WorkitMessage::new(ConfigPushMessage::new(push_data))
+    }
+
+    /// Create config push acknowledgment message
+    pub fn config_push_ack(
+        success: bool,
+        message: String,
+        config_key: String,
+        applied_version: chrono::DateTime<chrono::Utc>,
+    ) -> WorkitMessage<ConfigPushAckMessage> {
+        let ack_data = ConfigPushAckData {
+            success,
+            message,
+            config_key,
+            applied_version,
+        };
+        WorkitMessage::new(ConfigPushAckMessage::new(ack_data))
     }
 }
 

@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 /// Worker Type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerType {
-    Denix(String), // Javascript Runtime Worker, The inner string is the version of the worker
-    Deflux(String), // LB / HttpProxy Worker, The inner string is the version of the worker
+    #[serde(rename = "denix")]
+    Denix(String),
+    #[serde(rename = "deflux")]
+    Deflux(String),
 }
 
 impl WorkerType {

@@ -1,25 +1,19 @@
-//! WorkIt client implementation
+//! WorkIt client implementation (gRPC)
 //!
-//! Async client based on unified message system
+//! Async client based on gRPC unified message system
 
 use crate::config::{SupervisorConfig, WorkerInfo};
 use crate::error::WorkitError;
-use crate::models::{
-    AuthData, HeartbeatRequest, RegisterRequest,
-    messages::{
-        AuthResponseMessage, HeartbeatAckMessage, Message, MessageBuilder, RegisterResponseMessage,
-        WorkitMessage,
-    },
+use crate::pb::supervisor_service_client::SupervisorServiceClient;
+use crate::pb::{
+    supervisor_message::Payload, AuthenticateRequest, Heartbeat, RegisterRequest, SupervisorMessage,
 };
 
-use futures_util::{SinkExt, StreamExt};
 use serde_json;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
-};
+use tokio::sync::{mpsc, Mutex};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Channel;
+use tonic::{Request, Streaming};
 
 /// WorkIt client
 #[derive(Debug)]
@@ -28,12 +22,10 @@ pub struct WorkitClient {
     config: SupervisorConfig,
     /// Worker information
     worker_info: WorkerInfo,
-    /// WebSocket connection
-    ws_stream: Option<Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
-    /// Message sending channel
-    message_sender: Option<mpsc::UnboundedSender<WsMessage>>,
-    /// Message receiving channel
-    message_receiver: Option<mpsc::UnboundedReceiver<String>>,
+    /// gRPC request sender
+    request_tx: Option<mpsc::Sender<SupervisorMessage>>,
+    /// gRPC response receiver
+    response_rx: Option<Mutex<Streaming<SupervisorMessage>>>,
     /// Authentication status
     authenticated: bool,
     /// Registration status
@@ -46,9 +38,8 @@ impl WorkitClient {
         Self {
             config,
             worker_info,
-            ws_stream: None,
-            message_sender: None,
-            message_receiver: None,
+            request_tx: None,
+            response_rx: None,
             authenticated: false,
             registered: false,
         }
@@ -56,69 +47,39 @@ impl WorkitClient {
 
     /// Connect to supervisor
     pub async fn connect(&mut self) -> Result<(), WorkitError> {
-        let url = self.config.websocket_url();
+        let url = self.config.grpc_endpoint();
 
-        let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
-            WorkitError::ConnectionError(format!("Failed to connect to {url}: {e}"))
-        })?;
+        let channel = Channel::from_shared(url.clone())
+            .map_err(|e| WorkitError::ConfigurationError(format!("Invalid URL: {e}")))?
+            .connect()
+            .await
+            .map_err(|e| {
+                WorkitError::ConnectionError(format!("Failed to connect to {url}: {e}"))
+            })?;
 
-        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let mut client = SupervisorServiceClient::new(channel);
+        let (tx, rx) = mpsc::channel(128);
+        let in_stream = ReceiverStream::new(rx);
 
-        // Start message sending task
-        let send_task = tokio::spawn(async move {
-            let mut msg_rx = msg_rx;
-            while let Some(message) = msg_rx.recv().await {
-                if let Err(e) = ws_sender.send(message).await {
-                    eprintln!("Failed to send message: {e}");
-                    break;
-                }
-            }
-        });
+        let response = client
+            .establish_channel(Request::new(in_stream))
+            .await
+            .map_err(|e| WorkitError::ConnectionError(format!("Failed to establish channel: {e}")))?;
 
-        // Start message receiving task
-        let recv_task = tokio::spawn(async move {
-            while let Some(message) = ws_receiver.next().await {
-                match message {
-                    Ok(WsMessage::Text(text)) => {
-                        if let Err(e) = response_tx.send(text) {
-                            eprintln!("Failed to forward message: {e}");
-                            break;
-                        }
-                    }
-                    Ok(WsMessage::Close(_)) => {
-                        println!("WebSocket connection closed");
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("WebSocket error: {e}");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        self.message_sender = Some(msg_tx);
-        self.message_receiver = Some(response_rx);
-
-        // Store task handles (in a real application you might want to store these)
-        tokio::spawn(async move {
-            let _ = tokio::join!(send_task, recv_task);
-        });
+        self.request_tx = Some(tx);
+        self.response_rx = Some(Mutex::new(response.into_inner()));
 
         Ok(())
     }
 
     /// Send message
-    async fn send_message<M: Message>(&self, message: WorkitMessage<M>) -> Result<(), WorkitError> {
-        if let Some(sender) = &self.message_sender {
-            let json_str = serde_json::to_string(&message).map_err(|e| {
-                WorkitError::SerializationError(format!("Failed to serialize message: {e}"))
-            })?;
-
-            sender.send(WsMessage::Text(json_str)).map_err(|e| {
+    pub async fn send_message(&self, payload: Payload) -> Result<(), WorkitError> {
+        if let Some(sender) = &self.request_tx {
+            let message = SupervisorMessage {
+                payload: Some(payload),
+            };
+            
+            sender.send(message).await.map_err(|e| {
                 WorkitError::ConnectionError(format!("Failed to send message: {e}"))
             })?;
 
@@ -129,12 +90,13 @@ impl WorkitClient {
     }
 
     /// Receive message
-    async fn receive_message(&mut self) -> Result<String, WorkitError> {
-        if let Some(receiver) = &mut self.message_receiver {
-            receiver
-                .recv()
-                .await
-                .ok_or_else(|| WorkitError::ConnectionError("Connection closed".to_string()))
+    pub async fn receive_message(&mut self) -> Result<Option<Payload>, WorkitError> {
+        if let Some(receiver) = &mut self.response_rx {
+            match receiver.lock().await.message().await {
+                Ok(Some(msg)) => Ok(msg.payload),
+                Ok(None) => Err(WorkitError::ConnectionError("Stream closed by server".to_string())),
+                Err(e) => Err(WorkitError::ConnectionError(format!("gRPC error: {e}"))),
+            }
         } else {
             Err(WorkitError::ConnectionError("Not connected".to_string()))
         }
@@ -142,36 +104,26 @@ impl WorkitClient {
 
     /// Authenticate
     pub async fn authenticate(&mut self) -> Result<(), WorkitError> {
-        let auth_data = AuthData::new(
-            self.config.associated_id.clone(),
-            self.config.secret.as_bytes(),
-        )?;
+        let req = AuthenticateRequest {
+            instance_id: self.config.associated_id.clone(),
+            secret: self.config.secret.clone(),
+        };
 
-        let auth_message = MessageBuilder::auth(auth_data);
-        self.send_message(auth_message).await?;
+        self.send_message(Payload::Authenticate(req)).await?;
 
         // Wait for authentication response
-        let response_json = self.receive_message().await?;
-
-        // Try to parse as authentication response
-        match serde_json::from_str::<WorkitMessage<AuthResponseMessage>>(&response_json) {
-            Ok(response) => {
-                if response.data.authenticated {
+        match self.receive_message().await? {
+            Some(Payload::AuthResponse(resp)) => {
+                if resp.success {
                     self.authenticated = true;
-                    println!("Authentication successful: {}", response.data.message);
+                    println!("Authentication successful: {}", resp.message);
                     Ok(())
                 } else {
-                    Err(WorkitError::AuthenticationError(
-                        response
-                            .data
-                            .error
-                            .unwrap_or("Authentication failed".to_string()),
-                    ))
+                    Err(WorkitError::AuthenticationError(resp.message))
                 }
             }
-            Err(_) => Err(WorkitError::AuthenticationError(
-                "Invalid authentication response".to_string(),
-            )),
+            Some(_) => Err(WorkitError::AuthenticationError("Unexpected response type".to_string())),
+            None => Err(WorkitError::AuthenticationError("No payload in response".to_string())),
         }
     }
 
@@ -183,31 +135,29 @@ impl WorkitClient {
             ));
         }
 
-        let register_request = RegisterRequest {
-            id: self.config.associated_id.clone(),
-            info: self.worker_info.clone(),
+        let worker_info_json = serde_json::to_string(&self.worker_info).map_err(|e| {
+            WorkitError::SerializationError(format!("Failed to serialize worker info: {e}"))
+        })?;
+
+        let req = RegisterRequest {
+            worker_info_json,
         };
 
-        let register_message = MessageBuilder::register(register_request);
-        self.send_message(register_message).await?;
+        self.send_message(Payload::Register(req)).await?;
 
         // Wait for registration response
-        let response_json = self.receive_message().await?;
-
-        let response: WorkitMessage<RegisterResponseMessage> = serde_json::from_str(&response_json)
-            .map_err(|_| {
-                WorkitError::RegistrationError("Invalid registration response".to_string())
-            })?;
-
-        if response.data.success {
-            self.registered = true;
-            println!("Registration successful: {}", response.data.message);
-            if let Some(instance_id) = &response.data.instance_id {
-                println!("Assigned instance ID: {instance_id}");
+        match self.receive_message().await? {
+            Some(Payload::RegisterResponse(resp)) => {
+                if resp.success {
+                    self.registered = true;
+                    println!("Registration successful: {}", resp.message);
+                    Ok(())
+                } else {
+                    Err(WorkitError::RegistrationError(resp.message))
+                }
             }
-            Ok(())
-        } else {
-            Err(WorkitError::RegistrationError(response.data.message))
+            Some(_) => Err(WorkitError::RegistrationError("Unexpected response type".to_string())),
+            None => Err(WorkitError::RegistrationError("No payload in response".to_string())),
         }
     }
 
@@ -219,34 +169,12 @@ impl WorkitClient {
             ));
         }
 
-        let heartbeat_request = HeartbeatRequest {
-            id: self.config.associated_id.clone(),
-            power_reserve: 85, // Example power level
+        let req = Heartbeat {
+            status: "active".to_string(),
         };
 
-        let heartbeat_message = MessageBuilder::heartbeat(heartbeat_request);
-        self.send_message(heartbeat_message).await?;
-
-        // Wait for heartbeat acknowledgment
-        let response_json = self.receive_message().await?;
-
-        let response: WorkitMessage<HeartbeatAckMessage> = serde_json::from_str(&response_json)
-            .map_err(|_| {
-                WorkitError::CommunicationError("Invalid heartbeat response".to_string())
-            })?;
-
-        if response.data.success {
-            println!("Heartbeat acknowledged: {}", response.data.message);
-            if let Some(interval) = response.data.next_heartbeat_interval {
-                println!("Next heartbeat interval: {interval}s");
-            }
-            Ok(())
-        } else {
-            Err(WorkitError::CommunicationError(format!(
-                "Heartbeat failed: {}",
-                response.data.message
-            )))
-        }
+        self.send_message(Payload::Heartbeat(req)).await?;
+        Ok(())
     }
 
     /// Start basic client loop
@@ -267,7 +195,6 @@ impl WorkitClient {
                 _ = heartbeat_timer.tick() => {
                     if let Err(e) = self.send_heartbeat().await {
                         eprintln!("Heartbeat failed: {e}");
-                        // Could choose to reconnect or exit
                         break;
                     }
                 }
@@ -275,9 +202,11 @@ impl WorkitClient {
                 // Handle received messages
                 message_result = self.receive_message() => {
                     match message_result {
-                        Ok(message_json) => {
-                            // Simple print of received message
-                            println!("Received message: {message_json}");
+                        Ok(Some(payload)) => {
+                            println!("Received payload: {:?}", payload);
+                        }
+                        Ok(None) => {
+                            eprintln!("Received empty payload");
                         }
                         Err(e) => {
                             eprintln!("Failed to receive message: {e}");
@@ -293,22 +222,16 @@ impl WorkitClient {
 
     /// Disconnect
     pub async fn disconnect(&mut self) -> Result<(), WorkitError> {
-        if let Some(sender) = &self.message_sender {
-            let _ = sender.send(WsMessage::Close(None));
-        }
-
-        self.ws_stream = None;
-        self.message_sender = None;
-        self.message_receiver = None;
+        self.request_tx = None;
+        self.response_rx = None;
         self.authenticated = false;
         self.registered = false;
-
         Ok(())
     }
 
     /// Check connection status
     pub fn is_connected(&self) -> bool {
-        self.message_sender.is_some()
+        self.request_tx.is_some()
     }
 
     /// Check authentication status
@@ -320,6 +243,26 @@ impl WorkitClient {
     pub fn is_registered(&self) -> bool {
         self.registered
     }
+
+    /// Clone the sender for independent message sending (e.g., heartbeat task)
+    pub fn clone_sender(&self) -> Option<mpsc::Sender<SupervisorMessage>> {
+        self.request_tx.clone()
+    }
+
+    /// Send heartbeat using a cloned sender (doesn't require &mut self)
+    pub async fn send_heartbeat_with_sender(
+        sender: &mpsc::Sender<SupervisorMessage>,
+    ) -> Result<(), WorkitError> {
+        let req = Heartbeat {
+            status: "active".to_string(),
+        };
+        let message = SupervisorMessage {
+            payload: Some(Payload::Heartbeat(req)),
+        };
+        sender.send(message).await.map_err(|e| {
+            WorkitError::ConnectionError(format!("Failed to send heartbeat: {e}"))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -330,7 +273,7 @@ mod tests {
         SupervisorConfig::new(
             "test_worker".to_string(),
             "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
-            "ws://localhost:8080".to_string(),
+            "http://localhost:8080".to_string(),
         )
     }
 
@@ -351,16 +294,5 @@ mod tests {
         assert!(!client.is_connected());
         assert!(!client.is_authenticated());
         assert!(!client.is_registered());
-    }
-
-    #[tokio::test]
-    async fn test_message_serialization() {
-        let auth_data = AuthData::new("test_worker".to_string(), b"test_key").unwrap();
-        let auth_message = MessageBuilder::auth(auth_data);
-
-        let json_str = serde_json::to_string(&auth_message).unwrap();
-        // Simple check that serialization succeeded, no need to deserialize to specific type
-        assert!(!json_str.is_empty());
-        assert!(json_str.contains("authenticate"));
     }
 }
