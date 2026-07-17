@@ -1,0 +1,14 @@
+# Rust 编译产物
+target/
+Cargo.lock
+
+# 临时数据库文件
+*.db
+*.db-shm
+*.db-wal
+
+# 日志文件
+*.log
+
+# 临时配置文件
+*_test.toml

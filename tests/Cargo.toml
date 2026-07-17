@@ -1,0 +1,17 @@
+[package]
+name = "deislet-integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "integration_workit_denira"
+path = "integration_workit_denira.rs"
+
+[[bin]]
+name = "integration_denix_supervisor"
+path = "integration_denix_supervisor.rs"
+
+[dependencies]
+workit = { path = "../../_superv_workit" }
+denix = { path = "../../denix" }
+tokio = { version = "1", features = ["full"] }

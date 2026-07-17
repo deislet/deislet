@@ -24,3 +24,8 @@ __pycache__/
 # Examples directory (third-party reference projects)
 examples/*
 !examples/README.md
+
+# Local demo runtime artifacts
+.demo/
+*.db
+*.log
