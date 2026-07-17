@@ -44,6 +44,9 @@ pub struct ApiRouter {
     pub tls_enabled: bool,
 }
 
+// Each argument is a distinct shared component; bundling them into a struct
+// would only move the same list into a builder without simplifying call sites.
+#[allow(clippy::too_many_arguments)]
 pub fn build_api_router(
     sessions: Arc<SessionManager>,
     database: Arc<Database>,
@@ -165,6 +168,9 @@ pub fn log_api_ready(port: u16, tls_enabled: bool, auth_config: &middleware::Aut
 }
 
 /// Start HTTP API server
+// Each argument is a distinct shared component; bundling them into a struct
+// would only move the same list into a builder without simplifying call sites.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_api_server(
     sessions: Arc<SessionManager>,
     database: Arc<Database>,

@@ -147,7 +147,7 @@ impl ConfigDatabase {
         let mut stmt = conn.prepare("SELECT MAX(version_timestamp) FROM app_configs")?;
 
         let timestamp_str: Option<String> = stmt
-            .query_row([], |row| Ok(row.get::<_, Option<String>>(0)?))?;
+            .query_row([], |row| row.get::<_, Option<String>>(0))?;
 
         match timestamp_str {
             Some(ts) => {
@@ -161,8 +161,7 @@ impl ConfigDatabase {
                 Ok(DateTime::from_timestamp(0, 0)
                     .ok_or_else(|| DatabaseError::ParseError {
                         message: "Failed to create Unix epoch timestamp".to_string(),
-                    })?
-                    .into())
+                    })?)
             }
         }
     }
@@ -348,16 +347,21 @@ impl ConfigDatabase {
     /// # Returns
     /// Database statistics including counts of stored data
     pub async fn get_stats(&self) -> Result<DatabaseStats, DatabaseError> {
-        let conn = self.connection.lock().map_err(|_| {
-            DatabaseError::ConnectionError {
-                message: "Database connection mutex poisoned during stats query".to_string(),
-            }
-        })?;
-        let apps_count: u32 = conn.query_row(
-            "SELECT COUNT(*) FROM app_configs",
-            [],
-            |row| row.get(0),
-        )?;
+        // Scope the connection guard so it is released before the await below:
+        // `get_latest_version_timestamp` locks the same mutex, so holding the
+        // guard across that call would deadlock (and trip `await_holding_lock`).
+        let apps_count: u32 = {
+            let conn = self.connection.lock().map_err(|_| {
+                DatabaseError::ConnectionError {
+                    message: "Database connection mutex poisoned during stats query".to_string(),
+                }
+            })?;
+            conn.query_row(
+                "SELECT COUNT(*) FROM app_configs",
+                [],
+                |row| row.get(0),
+            )?
+        };
 
         let latest_version = self.get_latest_version_timestamp().await?;
 

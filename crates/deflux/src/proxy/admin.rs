@@ -16,6 +16,12 @@ pub struct AdminInterface {
     // Placeholder for admin functionality
 }
 
+impl Default for AdminInterface {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AdminInterface {
     /// Create a new admin interface
     pub fn new() -> Self {

@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn test_helper_creation() {
         let _helper = BalancerHelper::new();
-        let _helper2 = BalancerHelper::default();
+        let _helper2 = BalancerHelper;
 
         // Both should be created successfully
         // (No specific assertions needed as creation itself is the test)

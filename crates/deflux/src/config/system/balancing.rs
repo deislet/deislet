@@ -29,14 +29,14 @@ impl FromStr for BalancingStrategy {
                 let re = Regex::new(r"^header_hash\s*?\(([^)]+)\)$")
                     .map_err(|_| "Invalid regex pattern".to_string())?;
                 
-                if let Some(captures) = re.captures(s) {
-                    if let Some(header_name) = captures.get(1) {
-                        let header_name = header_name.as_str().trim();
-                        if header_name.is_empty() {
-                            return Err("Header name cannot be empty".to_string());
-                        }
-                        return Ok(BalancingStrategy::HeaderHash(header_name.to_string()));
+                if let Some(captures) = re.captures(s)
+                    && let Some(header_name) = captures.get(1)
+                {
+                    let header_name = header_name.as_str().trim();
+                    if header_name.is_empty() {
+                        return Err("Header name cannot be empty".to_string());
                     }
+                    return Ok(BalancingStrategy::HeaderHash(header_name.to_string()));
                 }
                 
                 // if the string is not a valid balancing strategy, return an error
@@ -59,10 +59,10 @@ impl Display for BalancingStrategy {
 
 impl Validatable for BalancingStrategy {
     fn validate(&self) -> Result<(), ConfigError> {
-        if let BalancingStrategy::HeaderHash(header_name) = self {
-            if header_name.is_empty() {
-                return Err(ConfigError::ValidationError { message: "header name is empty".to_string() });
-            }
+        if let BalancingStrategy::HeaderHash(header_name) = self
+            && header_name.is_empty()
+        {
+            return Err(ConfigError::ValidationError { message: "header name is empty".to_string() });
         }
         Ok(())
     }

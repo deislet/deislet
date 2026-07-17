@@ -39,10 +39,10 @@ impl ProxyService {
         for (app_id, config) in configs.iter() {
             if let Some(domains) = config.get("domains").and_then(|d| d.as_array()) {
                 for domain_value in domains {
-                    if let Some(config_domain) = domain_value.as_str() {
-                        if config_domain == domain {
-                            return Some((app_id.clone(), config.clone()));
-                        }
+                    if let Some(config_domain) = domain_value.as_str()
+                        && config_domain == domain
+                    {
+                        return Some((app_id.clone(), config.clone()));
                     }
                 }
             }

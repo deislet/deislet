@@ -87,7 +87,7 @@ pub async fn export_prometheus(
             worker_type, count
         ));
     }
-    output.push_str("\n");
+    output.push('\n');
 
     // System metrics
     output.push_str(&format!(

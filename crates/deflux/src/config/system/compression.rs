@@ -49,7 +49,7 @@ impl CompressionLevel {
             1 => Ok(CompressionLevel::FastestSpeed),
             2 => Ok(CompressionLevel::FastSpeed),
             3 => Ok(CompressionLevel::Balancing),
-            4 | 5 | 6 | 7 => Ok(CompressionLevel::HighCompression),
+            4..=7 => Ok(CompressionLevel::HighCompression),
             8 | 9 => Ok(CompressionLevel::UltraCompression),
             _ => Err(format!("Invalid compression level: {level}, must be 1-9")),
         }

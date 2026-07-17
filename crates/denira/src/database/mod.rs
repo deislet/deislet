@@ -306,7 +306,7 @@ impl Database {
                 cmd.sent_at.map(|t| t.to_rfc3339()),
                 cmd.completed_at.map(|t| t.to_rfc3339()),
                 cmd.timeout_at.map(|t| t.to_rfc3339()),
-                cmd.response_data.as_ref().map(|d| serde_json::to_string(d)).transpose()?,
+                cmd.response_data.as_ref().map(serde_json::to_string).transpose()?,
                 &cmd.error_message,
             ],
         )?;
@@ -339,7 +339,7 @@ impl Database {
             params![
                 status.as_str(),
                 completed_at,
-                response_data.as_ref().map(|d| serde_json::to_string(d)).transpose()?,
+                response_data.as_ref().map(serde_json::to_string).transpose()?,
                 error_message,
                 command_id,
             ],
@@ -362,7 +362,7 @@ impl Database {
                 &event.worker_id,
                 event.severity.as_str(),
                 &event.message,
-                event.metadata.as_ref().map(|m| serde_json::to_string(m)).transpose()?,
+                event.metadata.as_ref().map(serde_json::to_string).transpose()?,
                 Utc::now().to_rfc3339(),
             ],
         )?;
@@ -977,6 +977,9 @@ impl Database {
     // Cron Tasks methods
 
     /// Save or update cron task
+    // The argument list mirrors the cron_tasks table columns; grouping them
+    // into a struct would not simplify the single call site.
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_cron_task(
         &self,
         id: &str,
@@ -1073,14 +1076,11 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::Mutex as AsyncMutex;
 
     #[tokio::test]
     async fn test_database_init() {
-        let db = Database::init(":memory:").await.unwrap();
         // Database should be created successfully
-        assert!(true);
+        let _db = Database::init(":memory:").await.unwrap();
     }
 
     #[tokio::test]

@@ -1,18 +1,18 @@
+//! Cache System is used to cache the response of the upstream server.
+//! It is only available in http GET and HEAD requests.
+//! It will strictly follow the cache policy of the upstream server.
+//! The following headers are added to the response:
+//!   X-Cache-Status    HIT        Cache hit
+//!   X-Cache-Status    MISS       Cache miss
+//!   X-Cache-Status    EXPIRED    Cache expired
+//!   X-Cache-Status    BYPASS     Cache bypassed
+//!
+//! Attention: "stale-while-revalidate" is supported as a Application-Level Cache-Control directive.
+
 use std::str::FromStr;
 
 use crate::config::{util::{CacheKeys, SizeValue}, ConfigError, Validatable};
 use serde::{Deserialize, Serialize};
-
-/// Cache System is used to cache the response of the upstream server.
-/// It is only available in http GET and HEAD requests.
-/// It will strictly follow the cache policy of the upstream server.
-/// The following headers are added to the response:
-///   X-Cache-Status	HIT	    Cache hit
-///   X-Cache-Status	MISS	Cache miss
-///   X-Cache-Status	EXPIRED	Cache expired
-///   X-Cache-Status	BYPASS	Cache bypassed
-/// 
-/// Attention: "stale-while-revalidate" is supported as a Application-Level Cache-Control directive.
 
 /// Cache configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

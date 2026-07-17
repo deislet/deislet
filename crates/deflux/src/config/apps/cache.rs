@@ -124,7 +124,7 @@ impl CacheConfigEntry {
     #[allow(dead_code)]
     fn from_str_pair(c: &str, k: &str) -> Result<Self, ConfigError> {
         let condition = Condition::from_str(c)?;
-        let cache_key = CacheKeys::from_str(k).map_err(|e| ConfigError::CacheKeyParseError(e))?;
+        let cache_key = CacheKeys::from_str(k).map_err(ConfigError::CacheKeyParseError)?;
         Ok(Self(condition, cache_key))
     }
 }

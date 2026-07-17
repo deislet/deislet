@@ -1,14 +1,33 @@
 use denira::*;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
+
+/// Poll the given TCP port until the API server accepts connections,
+/// so tests do not rely on fixed delays for startup synchronization.
+/// Panics if the server is not ready within the attempt limit.
+async fn wait_for_server_ready(port: u16) {
+    const MAX_ATTEMPTS: u32 = 100;
+    let mut ticker = tokio::time::interval(Duration::from_millis(50));
+    // The first tick completes immediately, so the first probe has no delay.
+    for _ in 0..MAX_ATTEMPTS {
+        ticker.tick().await;
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    panic!("API server on port {port} did not become ready in time");
+}
 
 #[tokio::test]
 async fn test_api_server_health() {
-    // 创建测试配置
+    // Create test configuration
     let config = SupervisorConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
 
-    // 创建服务器组件
+    // Create server components
     let sessions = Arc::new(SessionManager::new());
     let broadcaster = Arc::new(EventBroadcaster::new());
     let config_manager = Arc::new(ConfigManager::new(
@@ -21,7 +40,7 @@ async fn test_api_server_health() {
     ));
     let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
 
-    // 在后台启动 API 服务器
+    // Start the API server in the background
     let api_config = Arc::new(config.clone());
     tokio::spawn(async move {
         let _ = denira::api::start_api_server(
@@ -37,10 +56,10 @@ async fn test_api_server_health() {
         .await;
     });
 
-    // 等待服务器启动
-    sleep(Duration::from_secs(1)).await;
+    // Wait until the server is ready
+    wait_for_server_ready(18081).await;
 
-    // 测试 health 端点
+    // Test the health endpoint
     let client = reqwest::Client::new();
     let response = client
         .get("http://localhost:18081/health")
@@ -84,9 +103,9 @@ async fn test_api_workers_endpoint() {
         .await;
     });
 
-    sleep(Duration::from_secs(1)).await;
+    wait_for_server_ready(18082).await;
 
-    // 测试 workers 端点
+    // Test the workers endpoint
     let client = reqwest::Client::new();
     let response = client
         .get("http://localhost:18082/api/workers")
@@ -132,9 +151,9 @@ async fn test_api_metrics_endpoint() {
         .await;
     });
 
-    sleep(Duration::from_secs(1)).await;
+    wait_for_server_ready(18083).await;
 
-    // 测试 metrics 端点
+    // Test the metrics endpoint
     let client = reqwest::Client::new();
     let response = client
         .get("http://localhost:18083/api/metrics/summary")
@@ -181,9 +200,9 @@ async fn test_api_events_endpoint() {
         .await;
     });
 
-    sleep(Duration::from_secs(1)).await;
+    wait_for_server_ready(18084).await;
 
-    // 测试 events 端点
+    // Test the events endpoint
     let client = reqwest::Client::new();
     let response = client
         .get("http://localhost:18084/api/events")

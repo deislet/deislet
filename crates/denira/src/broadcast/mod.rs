@@ -75,6 +75,12 @@ pub struct EventBroadcaster {
     clients: Arc<DashMap<Uuid, mpsc::UnboundedSender<String>>>,
 }
 
+impl Default for EventBroadcaster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EventBroadcaster {
     pub fn new() -> Self {
         Self {
@@ -110,7 +116,7 @@ impl EventBroadcaster {
             let client_id = *entry.key();
             let sender = entry.value();
 
-            if let Err(_) = sender.send(json.clone()) {
+            if sender.send(json.clone()).is_err() {
                 tracing::warn!("Failed to send to client {}, marking for removal", client_id);
                 disconnected.push(client_id);
             }

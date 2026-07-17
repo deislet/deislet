@@ -47,31 +47,30 @@ pub async fn api_key_auth(
     }
 
     // Check Authorization header
-    if let Some(auth_header) = headers.get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            // Support two formats:
-            // 1. "Bearer <api_key>"
-            // 2. "<api_key>" (direct)
-            let api_key = if let Some(key) = auth_str.strip_prefix("Bearer ") {
-                key
-            } else {
-                auth_str
-            };
+    if let Some(auth_header) = headers.get("Authorization")
+        && let Ok(auth_str) = auth_header.to_str()
+    {
+        // Support two formats:
+        // 1. "Bearer <api_key>"
+        // 2. "<api_key>" (direct)
+        let api_key = if let Some(key) = auth_str.strip_prefix("Bearer ") {
+            key
+        } else {
+            auth_str
+        };
 
-            // Verify API Key
-            if auth_config.api_keys.contains(&api_key.to_string()) {
-                return next.run(request).await;
-            }
+        // Verify API Key
+        if auth_config.api_keys.contains(&api_key.to_string()) {
+            return next.run(request).await;
         }
     }
 
     // Check X-API-Key header (fallback)
-    if let Some(api_key_header) = headers.get("X-API-Key") {
-        if let Ok(api_key) = api_key_header.to_str() {
-            if auth_config.api_keys.contains(&api_key.to_string()) {
-                return next.run(request).await;
-            }
-        }
+    if let Some(api_key_header) = headers.get("X-API-Key")
+        && let Ok(api_key) = api_key_header.to_str()
+        && auth_config.api_keys.contains(&api_key.to_string())
+    {
+        return next.run(request).await;
     }
 
     // Authentication failed
@@ -93,9 +92,11 @@ mod tests {
 
     #[test]
     fn test_auth_config_from_supervisor_config() {
-        let mut config = crate::config::SupervisorConfig::default();
-        config.api_auth_enabled = true;
-        config.api_keys = vec!["test-key-123".to_string()];
+        let config = crate::config::SupervisorConfig {
+            api_auth_enabled: true,
+            api_keys: vec!["test-key-123".to_string()],
+            ..Default::default()
+        };
 
         let auth_config = AuthConfig::from_supervisor_config(&config);
         assert!(auth_config.enabled);

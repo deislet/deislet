@@ -75,6 +75,9 @@ impl FromStr for CacheKeys {
 
         let parts: Vec<&str> = s.split('$').filter(|part| !part.is_empty()).collect();
         let mut result = Vec::new();
+        // Compile the regex once outside the loop to avoid repeated compilation
+        let header_re = Regex::new(r"^header\s*\(([^)]+)\)$")
+            .map_err(|_| "Invalid header regex pattern".to_string())?;
         for part in parts {
             match part {
                 "scheme" => result.push(CacheK::Scheme),
@@ -85,18 +88,15 @@ impl FromStr for CacheKeys {
                 "protocol" => result.push(CacheK::Protocol),
                 _ => {
                     // Use regex to parse header(header_name) and cookie(cookie_name)
-                    let header_re = Regex::new(r"^header\s*\(([^)]+)\)$")
-                        .map_err(|_| "Invalid header regex pattern".to_string())?;
-                    
-                    if let Some(captures) = header_re.captures(part) {
-                        if let Some(header_name) = captures.get(1) {
-                            let header_name = header_name.as_str().trim();
-                            if header_name.is_empty() {
-                                return Err("Header name cannot be empty".to_string());
-                            }
-                            result.push(CacheK::Header(header_name.to_string()));
-                            continue;
+                    if let Some(captures) = header_re.captures(part)
+                        && let Some(header_name) = captures.get(1)
+                    {
+                        let header_name = header_name.as_str().trim();
+                        if header_name.is_empty() {
+                            return Err("Header name cannot be empty".to_string());
                         }
+                        result.push(CacheK::Header(header_name.to_string()));
+                        continue;
                     }
 
                     // If no regex matches, it's an invalid cache key part

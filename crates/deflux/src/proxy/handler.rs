@@ -96,7 +96,7 @@ impl ProxyHandler {
             .await
             .context("Failed to read request line")?;
 
-        let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 3 {
             anyhow::bail!("Invalid request line: {}", request_line.trim());
         }

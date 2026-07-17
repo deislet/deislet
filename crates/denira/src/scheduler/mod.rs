@@ -98,7 +98,7 @@ impl CronScheduler {
         // Add to memory
         self.tasks
             .entry(worker_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(task.clone());
 
         // Persist to database
@@ -169,40 +169,39 @@ impl CronScheduler {
                     continue;
                 }
 
-                if let Some(next_run) = task.next_run {
-                    if next_run <= now {
-                        info!(
-                            "Triggering cron task {} for worker {} (cron: {})",
-                            task.id, worker_id, task.cron_expr
+                if let Some(next_run) = task.next_run
+                    && next_run <= now
+                {
+                    info!(
+                        "Triggering cron task {} for worker {} (cron: {})",
+                        task.id, worker_id, task.cron_expr
+                    );
+
+                    // Trigger task
+                    if let Err(e) = self.trigger_task(&worker_id, task).await {
+                        error!(
+                            "Failed to trigger cron task {} for worker {}: {}",
+                            task.id, worker_id, e
                         );
+                    }
 
-                        // Trigger task
-                        if let Err(e) = self.trigger_task(&worker_id, task).await {
-                            error!(
-                                "Failed to trigger cron task {} for worker {}: {}",
-                                task.id, worker_id, e
-                            );
+                    // Update time
+                    task.last_run = Some(now);
+                    task.next_run = match self.calculate_next_run(&task.cron_expr) {
+                        Ok(next) => next,
+                        Err(e) => {
+                            error!("Failed to calculate next run for task {}: {}", task.id, e);
+                            None
                         }
+                    };
 
-                        // Update time
-                        task.last_run = Some(now);
-                        task.next_run = match self.calculate_next_run(&task.cron_expr) {
-                            Ok(next) => next,
-                            Err(e) => {
-                                error!("Failed to calculate next run for task {}: {}", task.id, e);
-                                None
-                            }
-                        };
-
-                        // Persist update
-                        if let Some(db) = &self.database {
-                            if let Err(e) = db
-                                .update_cron_task_times(&task.id, task.last_run, task.next_run)
-                                .await
-                            {
-                                error!("Failed to update task {} in database: {}", task.id, e);
-                            }
-                        }
+                    // Persist update
+                    if let Some(db) = &self.database
+                        && let Err(e) = db
+                            .update_cron_task_times(&task.id, task.last_run, task.next_run)
+                            .await
+                    {
+                        error!("Failed to update task {} in database: {}", task.id, e);
                     }
                 }
             }
@@ -291,7 +290,7 @@ impl CronScheduler {
 
                 self.tasks
                     .entry(worker_id)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(task);
             }
 

@@ -1,63 +1,63 @@
-# Denira Supervisor 配置示例
+# Denira Supervisor example configuration
 
-# 绑定地址
+# Bind address
 bind_addr = "0.0.0.0"
 
-# HTTP API 和 gRPC 端口
+# HTTP API and gRPC port
 port = 8080
 
-# 心跳配置（秒）
+# Heartbeat configuration (seconds)
 heartbeat_interval = 30
 heartbeat_timeout = 90
 
-# Worker 预共享密钥（用于 gRPC 认证）
+# Worker pre-shared keys (used for gRPC authentication)
 worker_preshared_keys = [
     "your-worker-psk-here-change-this-in-production"
 ]
 
 # ========================================
-# API 认证配置
+# API authentication configuration
 # ========================================
 
-# 启用 HTTP API 认证（默认：false）
-# 设置为 true 后，所有 API 端点（除了 /health 和 /api/metrics）都需要 API Key
+# Enable HTTP API authentication (default: false)
+# When set to true, all API endpoints (except /health and /api/metrics) require an API Key
 api_auth_enabled = true
 
-# API Keys 列表
-# 客户端可以通过以下两种方式提供 API Key：
+# API Keys list
+# Clients can provide the API Key in either of the following ways:
 # 1. Authorization: Bearer <api_key>
 # 2. X-API-Key: <api_key>
 api_keys = [
-    "denira-admin-key-1234567890abcdef",      # 管理员密钥
-    "denira-readonly-key-fedcba0987654321",   # 只读密钥（未来扩展）
+    "denira-admin-key-1234567890abcdef",      # Admin key
+    "denira-readonly-key-fedcba0987654321",   # Read-only key (reserved for future use)
 ]
 
 # ========================================
-# TLS 配置（可选）
+# TLS configuration (optional)
 # ========================================
 
 [tls]
-# 为 HTTP API 启用 TLS
+# Enable TLS for the HTTP API
 api_enabled = false
 
-# TLS 证书路径
+# TLS certificate paths
 # cert_path = "/path/to/cert.pem"
 # key_path = "/path/to/key.pem"
 
 # ========================================
-# 使用说明
+# Usage
 # ========================================
 
-# 1. 复制此文件为 denira.toml
-# 2. 修改 worker_preshared_keys 和 api_keys 为安全的随机字符串
-# 3. 如果需要启用认证，设置 api_auth_enabled = true
-# 4. 启动 Denira: ./denira --config denira.toml
+# 1. Copy this file to denira.toml
+# 2. Change worker_preshared_keys and api_keys to secure random strings
+# 3. To enable authentication, set api_auth_enabled = true
+# 4. Start Denira: ./denira --config denira.toml
 
-# 示例 API 请求（启用认证时）：
+# Example API requests (with authentication enabled):
 # curl -H "X-API-Key: denira-admin-key-1234567890abcdef" http://localhost:8080/api/workers
-# 或
+# or
 # curl -H "Authorization: Bearer denira-admin-key-1234567890abcdef" http://localhost:8080/api/workers
 
-# 不需要认证的端点：
-# - /health - 健康检查
+# Endpoints that do not require authentication:
+# - /health - Health check
 # - /api/metrics - Prometheus Metrics

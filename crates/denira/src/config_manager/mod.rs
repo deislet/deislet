@@ -65,7 +65,7 @@ impl ConfigManager {
         for config in configs {
             let worker_configs_map = worker_configs
                 .entry(config.worker_id.clone())
-                .or_insert_with(HashMap::new);
+                .or_default();
 
             worker_configs_map.insert(config.config_key, config.config_value);
 
@@ -320,8 +320,6 @@ pub enum PushError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::WorkerSession;
-    use crate::message::{WorkerInfo, WorkerType};
 
     #[tokio::test]
     async fn test_config_manager_creation() {
@@ -409,7 +407,7 @@ mod tests {
         // Verify: key1 is deleted, key2 and key3 still exist
         let worker_configs = manager.get_worker_config("worker-1").unwrap();
         assert_eq!(worker_configs.len(), 2, "Worker should have 2 configs remaining");
-        assert!(worker_configs.get("key1").is_none(), "key1 should be deleted");
+        assert!(!worker_configs.contains_key("key1"), "key1 should be deleted");
         assert_eq!(worker_configs.get("key2"), Some(&serde_json::json!("value2")), "key2 should still exist");
         assert_eq!(worker_configs.get("key3"), Some(&serde_json::json!({"nested": "object"})), "key3 should still exist");
 
@@ -445,6 +443,6 @@ mod tests {
         // Verify: key1 still exists
         let worker_configs = manager.get_worker_config("worker-1").unwrap();
         assert_eq!(worker_configs.len(), 1);
-        assert!(worker_configs.get("key1").is_some());
+        assert!(worker_configs.contains_key("key1"));
     }
 }

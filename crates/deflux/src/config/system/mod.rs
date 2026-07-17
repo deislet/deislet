@@ -116,7 +116,7 @@ impl Default for SystemConfig {
 impl From<&SystemConfig> for SystemConfig {
     fn from(other: &SystemConfig) -> Self {
         Self {
-            daemon: other.daemon.clone(),
+            daemon: other.daemon,
             user: other.user.clone(),
             group: other.group.clone(),
             daemon_config: other.daemon_config.clone(),

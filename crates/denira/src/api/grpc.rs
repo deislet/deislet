@@ -8,13 +8,13 @@ use uuid::Uuid;
 
 use denira_workit::pb::supervisor_service_server::SupervisorService;
 use denira_workit::pb::{
-    supervisor_message::Payload, AuthenticateRequest, Heartbeat, RegisterRequest, SupervisorMessage,
-    AuthResponse, RegisterResponse, SystemConfig, AppConfigs
+    supervisor_message::Payload, Heartbeat, SupervisorMessage,
+    AuthResponse, RegisterResponse,
 };
 
 use crate::config::SupervisorConfig;
-use crate::session::{SessionManager, WorkerSession, WorkerState};
-use crate::message::{AuthData, RegisterRequest as InternalRegisterRequest, WorkerInfo};
+use crate::session::{SessionManager, WorkerSession};
+use crate::message::{RegisterRequest as InternalRegisterRequest, WorkerInfo};
 use crate::handler::MessageHandler;
 use crate::database::Database;
 use crate::broadcast::EventBroadcaster;
@@ -130,7 +130,7 @@ impl SupervisorService for GrpcSupervisorService {
 async fn handle_payload(
     payload: Payload,
     tx: &mpsc::Sender<Result<SupervisorMessage, Status>>,
-    sessions: &Arc<SessionManager>,
+    _sessions: &Arc<SessionManager>,
     handler: &MessageHandler,
     current_session: &mut Option<Arc<WorkerSession>>,
     authenticated: &mut bool,
@@ -205,7 +205,7 @@ async fn handle_payload(
             });
             send_payload(tx, reply).await;
         }
-        Payload::Heartbeat(req) => {
+        Payload::Heartbeat(_req) => {
             if let Some(session) = current_session {
                 // Map proto heartbeat to internal struct
                 // Proto: status (string)

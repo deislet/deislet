@@ -10,7 +10,6 @@ use tokio::time::timeout;
 
 use crate::database::{Database, CommandStatus, CommandEntry};
 use crate::session::SessionManager;
-use crate::message::{Message, MessageType};
 use crate::broadcast::{EventBroadcaster, BroadcastEvent};
 use denira_workit::pb::{SupervisorMessage, CommandRequest as ProtoCommandRequest, supervisor_message::Payload};
 
@@ -600,7 +599,7 @@ mod tests {
 
         // Verify: response sent via oneshot channel
         let received_response = rx.await.unwrap();
-        assert_eq!(received_response.success, true);
+        assert!(received_response.success);
         assert_eq!(received_response.message, "Status OK");
 
         // Verify: tracker removed from pending_commands
@@ -641,7 +640,7 @@ mod tests {
 
         // Verify: response sent
         let received_response = rx.await.unwrap();
-        assert_eq!(received_response.success, false);
+        assert!(!received_response.success);
         assert!(received_response.message.contains("Restart failed"));
 
         // Verify: tracker removed

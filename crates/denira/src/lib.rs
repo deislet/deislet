@@ -1,11 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::redundant_closure)]
-#![allow(clippy::single_char_add_str)]
-#![allow(clippy::unwrap_or_default)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::redundant_pattern_matching)]
-#![allow(clippy::new_without_default)]
-
 pub mod config;
 pub mod message;
 pub mod session;
@@ -40,7 +32,7 @@ pub const VERSION: &str = "0.1.0";
 mod tests {
     use crate::config::SupervisorConfig;
     use crate::session::{SessionManager, WorkerSession, WorkerState};
-    use crate::message::{WorkerType, WorkerInfo, AuthData, AuthResponse, RegisterRequest, RegisterResponse, HeartbeatRequest, HeartbeatAck};
+    use crate::message::{WorkerType, WorkerInfo, AuthData, RegisterRequest, HeartbeatRequest};
     use crate::handler::MessageHandler;
 
     #[test]
@@ -155,14 +147,16 @@ mod tests {
         use sha2::{Sha256, Digest};
 
         let secret = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
-        let mut config = SupervisorConfig::default();
-        config.worker_preshared_keys = vec![secret.to_string()];
+        let config = SupervisorConfig {
+            worker_preshared_keys: vec![secret.to_string()],
+            ..Default::default()
+        };
         let sessions = SessionManager::new();
         let handler = MessageHandler::new(
             std::sync::Arc::new(config),
             std::sync::Arc::new(sessions),
         );
-        
+
         let associated_id = "test-worker".to_string();
         let timestamp = chrono::Utc::now().timestamp() as u64;
         
@@ -185,8 +179,10 @@ mod tests {
     #[tokio::test]
     async fn test_message_handler_auth_with_invalid_signature() {
         let secret = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
-        let mut config = SupervisorConfig::default();
-        config.worker_preshared_keys = vec![secret.to_string()];
+        let config = SupervisorConfig {
+            worker_preshared_keys: vec![secret.to_string()],
+            ..Default::default()
+        };
         let sessions = SessionManager::new();
         let handler = MessageHandler::new(
             std::sync::Arc::new(config),
@@ -237,8 +233,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_handler_heartbeat() {
-        let mut config = SupervisorConfig::default();
-        config.heartbeat_interval = 45;
+        let config = SupervisorConfig {
+            heartbeat_interval: 45,
+            ..Default::default()
+        };
         let sessions = SessionManager::new();
         let handler = MessageHandler::new(
             std::sync::Arc::new(config),
