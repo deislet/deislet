@@ -80,19 +80,26 @@ generate_secret() {
   fi
 }
 
+# Wait until the URL answers with 2xx. curl paces the retries itself
+# (1s apart), so there is no busy loop and no shell-level sleeping.
 wait_for_http() {
   local url=$1
   local attempts=$2
-  local count=0
+  curl -sf -o /dev/null -m 2 \
+    --retry "$attempts" --retry-delay 1 --retry-max-time $((attempts * 2)) \
+    --retry-connrefused --retry-all-errors \
+    "$url" >/dev/null 2>&1
+}
 
-  while [ "$count" -lt "$attempts" ]; do
-    if curl -sf "$url" >/dev/null 2>&1; then
-      return 0
-    fi
-    count=$((count + 1))
-  done
-
-  return 1
+# Wait until the URL answers with any HTTP status at all (services like
+# denix reject unrouted requests with 4xx while being perfectly healthy).
+wait_for_http_any() {
+  local url=$1
+  local attempts=$2
+  curl -s -o /dev/null -m 2 \
+    --retry "$attempts" --retry-delay 1 --retry-max-time $((attempts * 2)) \
+    --retry-connrefused \
+    "$url" >/dev/null 2>&1
 }
 
 pid_running() {
@@ -186,6 +193,11 @@ port = ${DENIRA_PORT}
 heartbeat_interval = 30
 heartbeat_timeout = 90
 worker_preshared_keys = ["${SECRET}"]
+denix_poll_interval = 5
+
+[[denix_nodes]]
+id = "denix-demo-01"
+addr = "http://127.0.0.1:${DENIX_PORT}"
 EOF
 
     cat > "$DENIX_CONFIG" <<EOF
@@ -259,7 +271,7 @@ EOF
   ) &
   DENIX_PID=$!
 
-  if ! wait_for_http "http://127.0.0.1:${DENIX_PORT}/health" 400; then
+  if ! wait_for_http_any "http://127.0.0.1:${DENIX_PORT}/health" 60; then
     echo "⚠️  Denix 健康检查未通过，请检查日志: ${LOG_DIR}/denix.log"
   fi
 
@@ -273,15 +285,27 @@ EOF
 
   if command -v jq >/dev/null 2>&1; then
     echo "🚀 部署示例应用"
-    if [ -x "${ROOT_DIR}/crates/denix/scripts/deploy_rust_examples.sh" ]; then
-      (
-        cd "$ROOT_DIR/crates/denix"
-        DENIX_URL="http://127.0.0.1:${DENIX_PORT}" \
-          bash "${ROOT_DIR}/crates/denix/scripts/deploy_rust_examples.sh" \
-          > "${LOG_DIR}/denix_deploy.log" 2>&1
-      ) || echo "WARN: example app deployment failed, see ${LOG_DIR}/denix_deploy.log"
+    # Package the example app and deploy it through denira, which relays
+    # to the denix gRPC management plane.
+    APP_ZIP="${DEMO_DIR}/example-app.zip"
+    if python3 -c "
+import zipfile, pathlib, sys
+src = pathlib.Path('${ROOT_DIR}/scripts/demo-assets/example-app')
+with zipfile.ZipFile('${APP_ZIP}', 'w') as zf:
+    for f in sorted(src.iterdir()):
+        zf.write(f, f.name)
+" 2> "${LOG_DIR}/denix_deploy.log"; then
+      http_code=$(curl -s -o "${LOG_DIR}/denix_deploy.log" -w '%{http_code}' \
+        -X PUT --data-binary "@${APP_ZIP}" \
+        -H 'content-type: application/zip' \
+        "http://127.0.0.1:${DENIRA_PORT}/api/denix/denix-demo-01/apps/demo" || echo 000)
+      if [ "$http_code" = "200" ]; then
+        echo "Example app deployed: send requests with header 'x-deis-app-id: demo'"
+      else
+        echo "WARN: example app deployment failed (HTTP ${http_code}), see ${LOG_DIR}/denix_deploy.log"
+      fi
     else
-      echo "INFO: skipping example app deployment; denix now uses a gRPC management plane and a deploy client is TODO"
+      echo "WARN: failed to package example app, see ${LOG_DIR}/denix_deploy.log"
     fi
   else
     echo "⚠️  未检测到 jq，跳过示例应用部署"

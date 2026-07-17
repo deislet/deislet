@@ -1,0 +1,7 @@
+{
+  "id": "demo",
+  "name": "Demo App",
+  "version": "0.1.0",
+  "description": "Minimal example app used by scripts/demo.sh",
+  "entry_point": "index.js"
+}
