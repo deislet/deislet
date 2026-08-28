@@ -21,6 +21,7 @@
 | 8 | **节点主动拉** | denix 启动时向 denira 拉取「我该跑哪些应用的哪个版本」，拉完才报健康 |
 | 9 | **队列轮询消费** | denix 定期向 depot 拉自己该消费的消息，靠租约避免重复。depot 保持无状态 |
 | 10 | **环境维度** | 每个应用有 production 与任意多个预览环境，各自独立的版本指针、绑定与密钥 |
+| 11 | **观测独立** | 日志汇聚与指标提取由独立组件 delog 承担，不放进控制面。存活判断走直连健康检查，质量判断才查 delog |
 
 ---
 
@@ -55,6 +56,8 @@ flowchart TB
         资产优先命中 → 未命中起 V8 Isolate"]
         depot["<b>depot</b> · 存储
         KV / DB / Blob / Queue 四套 gRPC 服务"]
+        delog["<b>delog</b> · 日志与指标
+        接收全组件日志 · 提取指标 · 供查询"]
     end
 
     denira["<b>denira</b> · 控制面
@@ -76,8 +79,13 @@ flowchart TB
     denix --"轮询拉队列消息"--> depot
     deflux <-->|"workit gRPC"| denira
     denira --"部署版本 / 查状态 / cron 触发"--> denix
-    denix --"启动拉配置 · 日志回流"--> denira
+    denix --"启动拉配置"--> denira
     denira --"建 namespace / 授权"--> depot
+    deflux --日志--> delog
+    denix --日志--> delog
+    depot --日志--> delog
+    denira --日志--> delog
+    denira --"查聚合指标"--> delog
 
     coraza -.待接入.-> deflux
     capkit -.待接入.-> denira
@@ -86,7 +94,7 @@ flowchart TB
     classDef new fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#01579b
     classDef gap fill:#fff3e0,stroke:#e65100,stroke-width:2px,stroke-dasharray:4 3,color:#e65100
     class deflux,denix,denira,deforge done
-    class depot new
+    class depot,delog new
     class coraza,capkit,denictl gap
 ```
 
@@ -95,7 +103,7 @@ flowchart TB
 原先 denix 是纯被动的自治节点：不主动连任何人，等 denira 调它的管理面。现在**多了两条它主动发起的连接**：
 
 - 启动时向 denira 拉应用清单（原则 8）
-- 日志批量回流给 denira
+- 日志批量投递给 delog
 
 自治性本身没变——拉完之后本地 SQLite 就能撑住，denira 挂了照常服务。但「denix 从不外连」这条不再成立，配置里需要有 denira 的地址。
 
@@ -281,6 +289,7 @@ sequenceDiagram
     participant R as denira
     participant X as denix
     participant D as depot
+    participant L as delog
 
     rect rgb(232, 245, 233)
     Note over F,R: ① deflux 主动连 denira —— 不变
@@ -318,10 +327,14 @@ sequenceDiagram
     end
 
     rect rgb(243, 229, 245)
-    Note over X,R: ⑤ 日志回流 —— 补断链
-    X-)R: LogService.PushLogs（批量、背压、丢弃最旧）
-    R->>R: 从结构化日志提取指标
-    R->>R: 落 SQLite + 喂 Prometheus + 推面板
+    Note over X,L: ⑤ 日志汇聚 —— 目标是 delog，不是 denira
+    X-)L: LogService.PushLogs（批量、背压、丢弃最旧）
+    F-)L: 访问日志（请求量与耗时的主要来源）
+    D-)L: 存储服务日志
+    R-)L: 控制面自己的日志
+    L->>L: 提取指标，落分表 SQLite，暴露 Prometheus
+    R->>L: 查聚合指标（错误率、耗时退化）
+    Note over R: 据此做质量决策；<br/>存活判断另走 ③ 的直连健康检查
     end
 
     rect rgb(255, 235, 238)
@@ -368,7 +381,88 @@ sequenceDiagram
 
 ---
 
-## 7. 绑定与密钥
+## 7. delog：日志汇聚与指标
+
+### 为什么必须独立成一个组件
+
+本设计早前的版本把日志汇聚安在 denira 上，那是错的。denira 一旦既接收全部日志、又依据日志做调度决策，就形成了闭环：
+
+```mermaid
+flowchart LR
+    subgraph bad["错误的形状：denira 既当记分员又当裁判"]
+        direction TB
+        c1["deflux / denix / depot"] -->|"写日志"| r1["<b>denira</b>
+        接收日志 · 提取指标 · 依据指标决策 · 下发调度"]
+        r1 -->|"调度"| c1
+        r1 -.->|"自己的日志给自己"| r1
+    end
+
+    subgraph good["拆开后：delog 对谁都不依赖"]
+        direction TB
+        c2["deflux / denix / depot / denira"] -->|"写日志"| d2["<b>delog</b>
+        接收 · 存储 · 提取指标 · 供查询"]
+        r2["<b>denira</b>
+        查询聚合指标 · 决策 · 下发调度"] -->|"查询"| d2
+        r2 -->|"调度"| c2
+    end
+
+    classDef bad fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#b71c1c
+    classDef good fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
+    class c1,r1 bad
+    class c2,d2,r2 good
+```
+
+具体是三个问题，不只是形状难看：
+
+1. **数据性质冲突**。日志是高频追加的时序数据，控制元数据是低频可变的关系数据。挤在同一个 SQLite 里会写竞争，一次日志洪峰能把部署操作拖慢甚至阻塞。
+2. **自我观测盲区**。denira 自己出故障时，本该记录这次故障的东西正是出故障的东西。控制面是最需要事后追查的部分，却恰恰没有记录。
+3. **故障放大**。日志处理的一个 bug 能拖垮控制面；反过来，重启 denira 做版本升级会中断整条日志管道。两件事的可用性要求完全不同——丢日志可以接受，丢部署元数据不行。
+
+拆开之后 delog **对任何组件都不依赖**，denira 退回成它的一个查询方。这不是把环改成大环，是真的断开。
+
+### 保持解耦的关键：delog 必须是「哑」的
+
+delog 只做：接收带标签的日志条目、存储、按规则聚合、供查询。**它不认识应用模型**——不知道什么是版本、环境、部署指针，也不做任何判断。所有解释工作在 denira。
+
+一旦 delog 开始理解应用语义（比如"这个应用错误率高，通知 denira 回滚"），依赖就又长回去了。
+
+### 职责边界
+
+| 能力 | 说明 |
+|---|---|
+| **接收** | `LogService.PushLogs`，批量、幂等。来源包括 denix、deflux、depot，以及 denira 自己 |
+| **存储与保留** | 按天分表的 SQLite，按时间与总量双重上限淘汰。日志可丢，不做备份 |
+| **指标提取** | 落实 edge-canon 定的 Log-based Metrics：从结构化字段里按规则提取计数、耗时分布、错误率 |
+| **查询 API** | 供 denira 决策与 Web 面板展示。**denira 查的是聚合指标，不是原始日志流** |
+| **Prometheus** | 由 delog 暴露应用与请求维度的指标 |
+| **实时 tail** | 流式订阅，供开发者看某个应用的实时日志（类似 `wrangler tail`） |
+
+delog 自己的日志只写 stderr，不自摄入，避免递归。
+
+### 硬约束：两条观测路径必须分开
+
+这是把日志用于决策时最容易踩的坑，写死在设计里：
+
+- **存活判断走直连**：denira → denix / deflux 的健康检查，不经过 delog。这条路必须快且可靠。
+- **质量判断走 delog**：错误率、耗时退化、自动回滚这类统计性决策，查 delog 的聚合指标。这条路慢、可降级。
+
+如果存活判断依赖 delog，那 delog 一挂，整个集群会被误判成全部死亡，然后触发一轮灾难性的调度。
+
+### 与现有代码的关系
+
+这不是重构，是把已有的东西接到正确的地方：
+
+- `crates/denix/proto/logging.proto` **本来就是按独立服务设计的**——`source` 是通用来源标识，带 `app_id`、`trace_id`、`span_id`，还自带 `HealthCheck`。它从一开始就不是 denira 的一部分。
+- denix 的 `logging/shipper.rs` 已经是「配一个 endpoint、批量投递、指数退避」的形态，`ShipperConfig.endpoint` 指向 delog 即可，投递逻辑本身要补的只是真正的 gRPC 调用。
+- denix 的 `LogBuffer` 是固定容量环形缓冲、丢最旧，delog 不可达时应用照常服务。deflux 和 depot 需要各自加一个同样的缓冲与投递。
+
+### 可选的中间路线
+
+如果不想多一个进程，可以让 delog 和 depot 跑在同一个二进制里，作为两个独立服务、两套独立存储。代码与数据仍然分离，以后能平滑拆开。代价是失去故障隔离——日志洪峰会影响用户数据服务的响应。**建议还是分开**：delog 是全系统吞吐最高的数据通道，把它和用户数据放一起，等于让平台自身的可观测性去和业务抢资源。
+
+---
+
+## 8. 绑定与密钥
 
 **Bindings**：把 `AppManifest.resources: Vec<String>` 这个未定义字段改成结构化声明：
 
@@ -393,7 +487,7 @@ sequenceDiagram
 
 ---
 
-## 8. 限额
+## 9. 限额
 
 现状全部写死在代码里（30 秒超时、1000 ops/s、堆上限），改成三层：平台默认（denix 配置）→ 应用覆盖（denira 下发）→ 硬上限（应用覆盖不能突破）。
 
@@ -404,7 +498,7 @@ sequenceDiagram
 
 ---
 
-## 9. 落地顺序
+## 10. 落地顺序
 
 | 阶段 | 内容 | 说明 |
 |---|---|---|
@@ -412,19 +506,19 @@ sequenceDiagram
 | **一 · B** | deforge 增加 `Platform::Deislet` 与 adapter：产出含函数入口、路由表、资产清单的应用包；`ctx.params` 随之成立 | 与 A 并行。它是路由参数、静态资产、版本包结构的共同前提，晚做会拖住阶段二和三 |
 | **二** | 版本、环境与部署模型：数据表、流式传包、DeployVersion / ActivateVersion、节点自举拉取、denictl deploy/promote/rollback | 依赖一·B 定下的包结构 |
 | **三** | 静态资产：包内带资产、denix 资产优先命中、deflux 路径级路由与缓存、自动子域 | 依赖阶段二的版本包结构 |
-| **四** | 可观测：真实状态上报、日志回流、指标提取、面板展示 | 前三阶段跑通后才有真数据 |
+| **四** | 可观测：delog 组件（接收、保留、指标提取、查询与 Prometheus）；denix / deflux / depot 三侧投递；denix 真实状态上报；面板展示 | 前三阶段跑通后才有真数据可看。delog 本身不依赖任何组件，也可提前起手 |
 | **五** | cron 修正、secrets、限额三层化、出网控制 | 收尾的正确性与安全项 |
 
 ---
 
-## 10. 尚未决定
+## 11. 尚未决定
 
 **边做边定**
 
 - 证书自动签发（ACME）。自动子域需要泛域名证书，届时一并考虑。`examples/pingap` 有现成模块可参考。
 - `denictl dev` 怎么执行用户代码。现在返回假响应。三条路：起本地 denix、调 deno CLI、把 deno_core 嵌进 denictl。
-- 日志保留时长，以及从结构化日志里提取哪些字段成为指标。
-- 实时日志流（类似 `wrangler tail`）要不要。
+- delog 的日志保留时长与总量上限，以及从结构化日志里提取哪些字段成为指标。
+- delog 与 depot 是否合并为同一个二进制（设计倾向分开，见 §7）。
 - 出网控制用黑名单还是白名单。
 - depot 的备份周期与保留策略。
 
@@ -440,7 +534,7 @@ sequenceDiagram
 
 ---
 
-## 11. 能力矩阵对账
+## 12. 能力矩阵对账
 
 `edge-canon/PLATFORM_MATRIX.md` 里 Deislet 一列写的是**目标**，不是现状。下表是 2026-08-29 按代码逐项核对的结果，用来指导补齐，也用来修正那张公开的表。
 
@@ -455,7 +549,7 @@ sequenceDiagram
 | KV 存储 | ✅ | **不成立** | op 齐全，但需要 OpState 里有 `KvClient`；无服务端时运行时返回 "KV service not available" |
 | Cache API | ✅ | 成立 | moka 进程内缓存，`globalThis.caches` 已挂。语义上是单节点缓存，与 CF 的 per-colo 缓存接近 |
 | 生命周期 `waitUntil` | ✅ | 成立 | `runtime.js` 中已实现 |
-| 结构化日志 | ✅ | 部分成立 | 本地 `op_log` → 环形缓冲正常；回流上报是空壳 |
+| 结构化日志 | ✅ | 部分成立 | 本地 `op_log` → 环形缓冲正常；投递是空壳，且接收端（delog）尚不存在 |
 | Web 标准 | ✅ | 成立 | deno_web / fetch / crypto / net / websocket / tls 均已注册 |
 
 ### 扩展特性
