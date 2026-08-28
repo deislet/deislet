@@ -1923,6 +1923,7 @@ dependencies = [
 name = "deis-control"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arc-swap",
  "axum",
@@ -1935,6 +1936,7 @@ dependencies = [
  "hex",
  "mime_guess",
  "prost",
+ "rand 0.8.5",
  "reqwest",
  "rusqlite",
  "rust-embed",
@@ -1949,6 +1951,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tonic",
  "tonic-build",
@@ -1957,6 +1960,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -2017,6 +2021,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dashmap 5.5.3",
+ "deis-store",
  "deno_ast",
  "deno_core",
  "deno_error",
@@ -2062,7 +2067,10 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tonic-build",
@@ -2077,12 +2085,16 @@ name = "deis-telemetry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "chrono",
  "clap 4.5.54",
  "prost",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tonic-build",
@@ -10826,6 +10838,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

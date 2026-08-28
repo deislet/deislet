@@ -92,6 +92,10 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 # Test dependencies
+# The blob client speaks a streaming contract owned by deis-store. Running it
+# against the real server in tests is what catches a change on that side; unit
+# tests on either half alone cannot.
+deis-store = { path = "../deis-store" }
 hyper = "1.7"
 tower = "0.5"
 tempfile = "3"

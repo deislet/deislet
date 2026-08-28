@@ -54,6 +54,9 @@ async fn test_websocket_direct_bridging() {
         deis_runtime::app::types::AppPermissions::default(),
         None,
         None,
+        Vec::new(),
+        30_000,
+        1000.0,
     )
     .expect("Failed to create runtime");
 

@@ -42,6 +42,16 @@ pub struct ResourceLimits {
     pub cpu_milli: u32,
     #[serde(default)]
     pub resource_table_max: Option<usize>,
+
+    /// Per-app override of the platform default execution timeout (ms).
+    /// `None` means "use the platform default" (see `crate::config::RuntimeLimits`).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+
+    /// Per-app override of the platform default JS-op rate limit (ops/sec).
+    /// `None` means "use the platform default" (see `crate::config::RuntimeLimits`).
+    #[serde(default)]
+    pub rate_limit_ops_per_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

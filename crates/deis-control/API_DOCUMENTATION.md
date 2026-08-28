@@ -9,6 +9,7 @@
 
 - [Authentication](#authentication)
 - [Nodes API](#nodes-api)
+- [Product Model API](#product-model-api)
 - [Configs API](#configs-api)
 - [Commands API](#commands-api)
 - [Events API](#events-api)
@@ -144,6 +145,249 @@ GET /api/nodes/:id/heartbeats?limit=10
   "count": 1
 }
 ```
+
+---
+
+## Product Model API
+
+Apps, versions, environments, deployments, routes and secrets. Two rules
+shape this surface:
+
+- **A version is immutable.** Uploading a bundle creates a version and
+  nothing ever changes it afterwards. There is no update or delete
+  endpoint for a single version.
+- **A deployment is a pointer.** The current version of an environment is
+  the newest deployment row for it. Deploying and rolling back both insert
+  a row, so the history is complete and a rollback costs the same as a
+  deploy.
+
+### Create App
+
+```http
+POST /api/apps
+Content-Type: application/json
+
+{ "id": "my-app" }
+```
+
+`201 Created` with the app; `409 Conflict` if the name is taken. The id may
+contain lowercase letters, digits, `-` and `_`, and must start with a
+letter or digit.
+
+### List / Get / Delete App
+
+```http
+GET    /api/apps
+GET    /api/apps/{app_id}
+DELETE /api/apps/{app_id}
+```
+
+Deleting an app removes its versions, environments, deployment history,
+routes and secrets, and drops the bundle files those versions referenced.
+The response reports how much was removed:
+
+```json
+{
+  "app_id": "my-app",
+  "removed": { "versions": 2, "environments": 1, "deployments": 3, "routes": 1, "secrets": 2 },
+  "bundle_files_removed": 2
+}
+```
+
+Nodes keep serving what they already loaded until their next assignment
+refresh.
+
+### Upload a Bundle (create a version)
+
+```http
+POST /api/apps/{app_id}/versions?sha256=<hex>
+Content-Type: application/zip
+
+<raw zip body>
+```
+
+The optional `sha256` query parameter is the digest the client computed. It
+is compared against the bytes actually received, which is how a truncated
+upload is caught before it can become a version.
+
+The upload is rejected with `400 Bad Request`, and nothing is written, when:
+
+- the digest does not match what was received,
+- the archive has no readable `manifest.json`, or the manifest does not
+  parse, or its `schema` is not 1,
+- the manifest names an app other than `{app_id}`,
+- the manifest `entry` is not present inside the archive.
+
+`201 Created` on success. A byte-identical bundle that was already uploaded
+returns `200 OK` with `"created": false` and the existing version: the same
+content is the same version.
+
+```json
+{
+  "version": {
+    "id": "8d0a9822-...",
+    "app_id": "my-app",
+    "number": 1,
+    "bundle_sha": "0026d534...",
+    "created_at": 1787955616,
+    "manifest": { "schema": 1, "app": "my-app", "entry": "worker/index.js" }
+  },
+  "created": true,
+  "bundle_url": "http://localhost:8080/api/apps/my-app/versions/8d0a9822-.../bundle"
+}
+```
+
+Maximum upload size is 64 MB.
+
+### List / Get Versions
+
+```http
+GET /api/apps/{app_id}/versions
+GET /api/apps/{app_id}/versions/{version_id}
+```
+
+Newest first. The bundle's location on the control plane is never part of a
+response.
+
+### Download a Bundle
+
+```http
+GET /api/apps/{app_id}/versions/{version_id}/bundle
+```
+
+Streams the zip with `Content-Type: application/zip` and an `ETag` holding
+the bundle digest. This is the address that appears in every assignment;
+nodes download bundles here rather than receiving them inside a gRPC
+message.
+
+### Create / List Environments
+
+```http
+POST /api/apps/{app_id}/environments
+{ "name": "production" }
+
+GET  /api/apps/{app_id}/environments
+GET  /api/apps/{app_id}/environments/{env}
+```
+
+`production` or any preview name. Deployment pointers, routes and secrets
+all hang off an environment, never off the bare app.
+
+### Deploy
+
+```http
+POST /api/apps/{app_id}/environments/{env}/deployments
+{ "version_id": "8d0a9822-...", "note": "first deploy" }
+```
+
+Name the target with either `version_id` or `version_number` (the "v3" a
+human says). `201 Created` returns the new pointer row together with the
+version it points at.
+
+### Current Deployment and History
+
+```http
+GET /api/apps/{app_id}/environments/{env}/deployment
+GET /api/apps/{app_id}/environments/{env}/deployments?limit=50
+```
+
+The first returns what the environment runs now, or `404` if it has never
+been deployed. The second returns the history, newest first.
+
+### Rollback
+
+```http
+POST /api/apps/{app_id}/environments/{env}/rollback
+{ }
+```
+
+With no body, rolls back to the previous distinct version this environment
+ran; `409 Conflict` when there is none. A body may name a target with
+`version_id` or `version_number`, and may carry a `note`. The rollback is
+appended as a new deployment row - nothing is mutated, so the rollback is
+itself reversible.
+
+### Routes
+
+```http
+GET    /api/routes
+GET    /api/apps/{app_id}/environments/{env}/routes
+POST   /api/apps/{app_id}/environments/{env}/routes
+PUT    /api/apps/{app_id}/environments/{env}/routes/{route_id}
+DELETE /api/apps/{app_id}/environments/{env}/routes/{route_id}
+```
+
+Body for create and update:
+
+```json
+{ "host": "example.com", "path_prefix": "/api", "priority": 10 }
+```
+
+`host` may be omitted or null to match any domain, and may start with `*.`
+for a wildcard. `path_prefix` must be absolute. Higher `priority` wins when
+several routes match; `GET /api/routes` returns the whole table in that
+order.
+
+`PUT` replaces every field, so an omitted `host` clears it back to "any
+domain".
+
+### Secrets
+
+```http
+PUT    /api/apps/{app_id}/environments/{env}/secrets/{name}
+{ "value": "s3cr3t" }
+
+GET    /api/apps/{app_id}/environments/{env}/secrets
+DELETE /api/apps/{app_id}/environments/{env}/secrets/{name}
+```
+
+Values are encrypted with AES-256-GCM before they touch the database, using
+the 32-byte master key from the `secret_key_file` config option. **There is
+no endpoint that returns a secret value**: the list returns names and
+timestamps only.
+
+When the master key is missing or unreadable every secret endpoint answers
+`503 Service Unavailable` and stores nothing, rather than falling back to
+plaintext:
+
+```json
+{ "error": "secret storage is unavailable: secret_key_file is not set in the control plane config" }
+```
+
+Secret names follow environment variable rules: a letter or `_` first, then
+letters, digits and `_`.
+
+Changing a secret does not create a version; it takes effect on the next
+deployment push.
+
+### Node Assignments
+
+```http
+GET /api/nodes/{node_id}/assignments
+```
+
+What that node should be running: one entry per environment that has a
+deployment. Nodes pull this on startup, fetch each bundle over HTTP, verify
+the digest, load it, and only then report healthy.
+
+```json
+[
+  {
+    "app_id": "my-app",
+    "version_id": "8d0a9822-...",
+    "environment": "production",
+    "bundle_url": "http://localhost:8080/api/apps/my-app/versions/8d0a9822-.../bundle",
+    "bundle_sha": "0026d534..."
+  }
+]
+```
+
+Every runtime node runs every app, so the list is currently identical for
+all nodes. The `bundle_url` host comes from `public_base_url` when it is
+configured, otherwise from the `Host` header of the request.
+
+With `api_auth_enabled = true`, this endpoint and the bundle download are
+authenticated like any other, so nodes must be given an API key.
 
 ---
 
@@ -643,11 +887,15 @@ All API errors use a unified format:
 
 **HTTP Status Codes**:
 - `200 OK` - Request successful
+- `201 Created` - Resource created (app, version, environment, deployment, route)
 - `202 Accepted` - Request accepted (Asynchronous operation)
-- `400 Bad Request` - Request format error
+- `400 Bad Request` - Request format error, or a bundle that failed verification
 - `401 Unauthorized` - Authentication failed (Valid API key required)
 - `404 Not Found` - Resource does not exist
+- `409 Conflict` - Clashes with existing state (duplicate name, nothing to roll back to)
+- `413 Payload Too Large` - Bundle exceeds the 64 MB upload limit
 - `500 Internal Server Error` - Internal server error
+- `503 Service Unavailable` - A dependency is not configured, for instance the secret master key
 
 ---
 
@@ -685,6 +933,12 @@ curl http://localhost:8080/api/metrics
 ---
 
 ## Changelog
+
+### Unreleased
+- Product model API: apps, versions, environments, deployments, routes and secrets
+- Bundle upload with sha256 and manifest verification, plus streamed bundle download
+- Per-node assignment list at `GET /api/nodes/{node_id}/assignments`
+- Secrets encrypted with AES-256-GCM; values are never returned by any endpoint
 
 ### v0.1.0 (2026-01-11)
 - Initial release

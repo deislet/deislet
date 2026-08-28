@@ -5,6 +5,7 @@ use super::loader::DbModuleLoader;
 use super::ops::{EnvStore, ResponseStore};
 use super::queue_ops::MemoryQueue;
 use super::rate_limit::RateLimiter;
+use super::route_match::{match_routes, path_from_url};
 use super::runtime_init::{build_runtime_extensions, init_lazy_extensions};
 use super::snapshot::load_or_create_startup_snapshot;
 use super::ws_server_ops::{create_ws_server_manager, WsServerManager};
@@ -31,6 +32,10 @@ struct JsRequest {
     method: String,
     headers: HashMap<String, String>,
     body: Option<String>,
+    /// Route placeholder values (e.g. `:id` in "/users/:id"), resolved against
+    /// the app's configured route patterns. Empty when no pattern matches, or
+    /// when the app has no route patterns configured yet.
+    params: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +54,18 @@ pub struct AppRuntime {
     resource_table_max: Option<usize>,
     op_metrics: Rc<OpMetricsSummaryTracker>,
     snapshot_loaded: bool,
+    /// Route patterns (e.g. "/users/:id") from the app's manifest, used to
+    /// populate `context.params` on each request. See `super::route_match`.
+    route_patterns: Vec<String>,
+    /// Maximum wall-clock time (ms) a single `execute_fetch` may run before
+    /// this isolate is terminated and the request fails.
+    timeout_ms: u64,
+    /// Configured JS-op dispatch rate limit (ops/sec) for this isolate.
+    /// Kept alongside the live `RateLimiter` (captured in the op-metrics
+    /// closure) purely so tests can assert the configured value reached
+    /// this isolate; not read outside of `#[cfg(test)]`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    rate_limit_ops_per_sec: f64,
 }
 
 impl AppRuntime {
@@ -62,6 +79,9 @@ impl AppRuntime {
         permissions_config: super::super::app::types::AppPermissions,
         memory_limit_mb: Option<usize>,
         resource_table_max: Option<usize>,
+        route_patterns: Vec<String>,
+        timeout_ms: u64,
+        rate_limit_ops_per_sec: f64,
     ) -> Result<Self> {
         let mut create_params = deno_core::v8::CreateParams::default();
         if let Some(mb) = memory_limit_mb {
@@ -94,9 +114,8 @@ impl AppRuntime {
         let op_metrics = Rc::new(OpMetricsSummaryTracker::default());
         let op_metrics_tracker = op_metrics.clone();
 
-        // Rate limiter (default 1000 ops/sec)
-        // TODO: Read from configuration
-        let limiter = Arc::new(Mutex::new(RateLimiter::new(1000.0)));
+        // Rate limiter: platform default, or this app's configured override.
+        let limiter = Arc::new(Mutex::new(RateLimiter::new(rate_limit_ops_per_sec)));
         let isolate_handle_cell = Arc::new(OnceCell::<deno_core::v8::IsolateHandle>::new());
         let isolate_handle_cell_clone = isolate_handle_cell.clone();
         let app_id_clone = app_id.clone();
@@ -124,7 +143,12 @@ impl AppRuntime {
                 if event == deno_core::OpMetricsEvent::Dispatched {
                     let mut limiter = limiter.lock().unwrap();
                     if !limiter.check() {
-                        tracing::error!(target: "app", "Rate limit exceeded for app {}, op: {}. Terminating.", app_id, op_name);
+                        tracing::warn!(
+                            target: "app",
+                            "Rate limit exceeded for app {}, op: {}. Terminating isolate execution; the in-flight request will fail.",
+                            app_id,
+                            op_name
+                        );
                         if let Some(handle) = handle_cell.get() {
                             handle.terminate_execution();
                         }
@@ -243,6 +267,9 @@ impl AppRuntime {
             resource_table_max,
             op_metrics,
             snapshot_loaded,
+            route_patterns,
+            timeout_ms,
+            rate_limit_ops_per_sec,
         })
     }
 
@@ -358,11 +385,31 @@ impl AppRuntime {
             }
         }
 
+        let pathname = path_from_url(&url);
+        let params = match_routes(&self.route_patterns, &pathname);
+        if !params.is_empty() {
+            tracing::debug!(
+                target: "app",
+                "Matched route params for app {}: path={}, params={:?}",
+                self.app_id,
+                pathname,
+                params
+            );
+        } else if !self.route_patterns.is_empty() {
+            tracing::trace!(
+                target: "app",
+                "No configured route pattern matched: app={}, path={}",
+                self.app_id,
+                pathname
+            );
+        }
+
         let request = JsRequest {
             url,
             method,
             headers,
             body,
+            params,
         };
 
         let request_json = serde_json::to_string(&request)?;
@@ -380,16 +427,18 @@ impl AppRuntime {
 
         let promise = self.runtime.execute_script("<fetch>", code)?;
 
-        // Set execution timeout (default 30 seconds)
-        // TODO: Read timeout from configuration
-        let timeout_ms = 30_000;
+        // Set execution timeout: platform default, or this app's configured override.
+        let timeout_ms = self.timeout_ms;
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let app_id_for_timeout = self.app_id.clone();
 
         // Start timeout monitoring task
         let timeout_task = tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
             tracing::warn!(
-                "App execution timed out after {}ms, terminating...",
+                target: "app",
+                "App {} execution timed out after {}ms. Terminating isolate execution; the request will fail.",
+                app_id_for_timeout,
                 timeout_ms
             );
             isolate_handle.terminate_execution();
@@ -559,6 +608,28 @@ impl AppRuntime {
     #[cfg(test)]
     pub fn app_id(&self) -> &str {
         &self.app_id
+    }
+
+    /// Exposes the effective execution timeout for this isolate. Behavioral
+    /// termination tests are unreliable here: `execute_fetch`'s timeout is
+    /// enforced by a `tokio::spawn`ed sleep-and-terminate task, which on the
+    /// `current_thread` runtime this isolate runs on only gets scheduled once
+    /// the polling task yields -- something a JS handler that never performs
+    /// a genuine async Rust op (only synchronous work or microtasks) may
+    /// never do, no matter how long it runs. That is a pre-existing
+    /// characteristic of the timeout mechanism itself, not something this
+    /// accessor works around; it exists so tests can assert the *value*
+    /// reached the isolate without depending on that timing.
+    #[cfg(test)]
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    /// Exposes the effective JS-op rate limit for this isolate, for the same
+    /// reason as `timeout_ms` above.
+    #[cfg(test)]
+    pub fn rate_limit_ops_per_sec(&self) -> f64 {
+        self.rate_limit_ops_per_sec
     }
 
     pub fn op_metrics_summary(&self) -> OpMetricsSummary {

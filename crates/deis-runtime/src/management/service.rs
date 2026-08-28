@@ -41,10 +41,33 @@ fn map_proto_limits(
             None
         };
 
+        let timeout_ms = if limits.timeout_ms < 0 {
+            warn!("ResourceLimits.timeout_ms is negative: {}", limits.timeout_ms);
+            None
+        } else if limits.timeout_ms > 0 {
+            Some(limits.timeout_ms as u64)
+        } else {
+            None
+        };
+
+        let rate_limit_ops_per_sec = if limits.rate_limit_ops_per_sec < 0.0 {
+            warn!(
+                "ResourceLimits.rate_limit_ops_per_sec is negative: {}",
+                limits.rate_limit_ops_per_sec
+            );
+            None
+        } else if limits.rate_limit_ops_per_sec > 0.0 {
+            Some(limits.rate_limit_ops_per_sec)
+        } else {
+            None
+        };
+
         crate::app::types::ResourceLimits {
             memory_mb,
             cpu_milli,
             resource_table_max,
+            timeout_ms,
+            rate_limit_ops_per_sec,
         }
     })
 }
@@ -482,5 +505,47 @@ impl RuntimeManagement for RuntimeManagementService {
             version: env!("CARGO_PKG_VERSION").to_string(),
             details: Default::default(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proto_limits(timeout_ms: i64, rate_limit_ops_per_sec: f64) -> ResourceLimits {
+        ResourceLimits {
+            memory_mb: 0,
+            cpu_milli: 0,
+            max_concurrency: 0,
+            resource_table_max: 0,
+            timeout_ms,
+            rate_limit_ops_per_sec,
+        }
+    }
+
+    #[test]
+    fn test_map_proto_limits_none_stays_none() {
+        assert!(map_proto_limits(None).is_none());
+    }
+
+    #[test]
+    fn test_map_proto_limits_zero_means_no_override() {
+        let mapped = map_proto_limits(Some(proto_limits(0, 0.0))).unwrap();
+        assert_eq!(mapped.timeout_ms, None);
+        assert_eq!(mapped.rate_limit_ops_per_sec, None);
+    }
+
+    #[test]
+    fn test_map_proto_limits_positive_values_carry_through() {
+        let mapped = map_proto_limits(Some(proto_limits(5000, 250.0))).unwrap();
+        assert_eq!(mapped.timeout_ms, Some(5000));
+        assert_eq!(mapped.rate_limit_ops_per_sec, Some(250.0));
+    }
+
+    #[test]
+    fn test_map_proto_limits_negative_values_are_dropped() {
+        let mapped = map_proto_limits(Some(proto_limits(-1, -1.0))).unwrap();
+        assert_eq!(mapped.timeout_ms, None);
+        assert_eq!(mapped.rate_limit_ops_per_sec, None);
     }
 }

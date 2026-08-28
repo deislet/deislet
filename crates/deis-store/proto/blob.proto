@@ -2,14 +2,30 @@ syntax = "proto3";
 
 package deis.blob;
 
+// Object storage.
+//
+// Bodies are streamed in both directions: a stored object can be far larger
+// than a single gRPC message, so neither side may assume the whole body fits
+// in memory or in one frame. Both sides chunk at 1 MiB (see CHUNK_BYTES in the
+// server implementation); the receiver must accept any chunk size up to the
+// service message ceiling and must not rely on chunk boundaries carrying
+// meaning.
+//
+// The tenant is carried out of band, in the `x-deis-app-id` gRPC metadata
+// header, exactly like the HTTP data path. The service knows nothing beyond
+// that id: no versions, no environments, no deployments.
 service BlobStore {
-  // Get object
-  rpc Get(GetRequest) returns (GetResponse);
-  
-  // Put object
-  rpc Put(PutRequest) returns (PutResponse);
-  
-  // Delete object
+  // Stream an object body out. The first response carries `info`, every
+  // response after it carries one `chunk`, in order. An unknown key fails
+  // with NOT_FOUND before any message is produced.
+  rpc Get(GetRequest) returns (stream GetResponse);
+
+  // Stream an object body in. The first request must carry `header`, every
+  // request after it carries one `chunk`, in order. An empty body (header and
+  // nothing else) stores a zero-length object.
+  rpc Put(stream PutRequest) returns (PutResponse);
+
+  // Delete an object. Deleting a key that is already absent succeeds.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 }
 
@@ -18,18 +34,46 @@ message GetRequest {
 }
 
 message GetResponse {
-  optional bytes data = 1;
-  optional string error = 2;
+  oneof payload {
+    // Always the first message of the stream.
+    BlobInfo info = 1;
+    // One ordered slice of the body. Concatenating every chunk in arrival
+    // order reproduces the object byte for byte.
+    bytes chunk = 2;
+  }
+}
+
+// What the store knows about one object.
+message BlobInfo {
+  string key = 1;
+  // Lowercase hex sha256 of the body; also the content address on disk.
+  string sha256 = 2;
+  uint64 size = 3;
+  optional string content_type = 4;
+  // Unix seconds at which this key was last written.
+  int64 created_at = 5;
 }
 
 message PutRequest {
+  oneof payload {
+    // Always the first message of the stream.
+    PutHeader header = 1;
+    // One ordered slice of the body.
+    bytes chunk = 2;
+  }
+}
+
+message PutHeader {
   string key = 1;
-  bytes data = 2;
+  optional string content_type = 2;
 }
 
 message PutResponse {
   bool success = 1;
   optional string error = 2;
+  // Lowercase hex sha256 of what was stored.
+  string sha256 = 3;
+  uint64 size = 4;
 }
 
 message DeleteRequest {

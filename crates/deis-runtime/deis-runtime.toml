@@ -8,6 +8,20 @@ http_port = 8000
 # Can be overridden via the DEIS_RUNTIME_DATA_DIR environment variable
 # data_dir = "./data"
 
+# Platform-wide default execution limits for app isolates. An individual app
+# may override either value via its own ResourceLimits config; these are only
+# the fallback used when it does not.
+[limits]
+# Maximum wall-clock time (ms) a single fetch invocation may run before the
+# isolate is terminated and the request fails.
+# Can be overridden via the DEIS_RUNTIME_DEFAULT_TIMEOUT_MS environment variable
+timeout_ms = 30000
+
+# Maximum rate (ops/sec) of JS-op dispatch before the isolate is terminated
+# and the in-flight request fails.
+# Can be overridden via the DEIS_RUNTIME_DEFAULT_RATE_LIMIT_OPS_PER_SEC environment variable
+rate_limit_ops_per_sec = 1000.0
+
 # Logging configuration (optional)
 [logging]
 # Whether log shipping is enabled

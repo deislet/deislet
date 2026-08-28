@@ -8,24 +8,95 @@ pub struct Config {
     /// Address the gRPC server binds to.
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Address the Prometheus text endpoint binds to. It is a separate port
+    /// from `listen` so a scraper can be pointed at it without being given
+    /// access to the ingest and query RPCs.
+    #[serde(default = "default_metrics_listen")]
+    pub metrics_listen: String,
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// How many days of logs to keep. Logs live in one table per UTC day;
+    /// the sweeper drops whole tables older than this.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    /// How many days of metric samples to keep.
+    #[serde(default = "default_metric_retention_days")]
+    pub metric_retention_days: u32,
+    /// Seconds between retention sweeps. A sweep also runs once at startup.
+    #[serde(default = "default_retention_sweep_interval_secs")]
+    pub retention_sweep_interval_secs: u64,
+    /// How many entries the live fan-out buffer holds. A Tail consumer that
+    /// falls this far behind loses entries (only for that consumer - writers
+    /// are never blocked and storage is unaffected).
+    #[serde(default = "default_tail_capacity")]
+    pub tail_capacity: usize,
+    /// Page size used when a query does not ask for one.
+    #[serde(default = "default_query_default_limit")]
+    pub query_default_limit: u32,
+    /// Hard ceiling on the page size a caller may ask for.
+    #[serde(default = "default_query_max_limit")]
+    pub query_max_limit: u32,
+    /// How far back `/metrics` looks for the latest sample of each series.
+    /// A series with no sample newer than this is left out of the export
+    /// rather than exported with a stale value.
+    #[serde(default = "default_metrics_export_window_secs")]
+    pub metrics_export_window_secs: u64,
 }
 
 fn default_listen() -> String {
     "127.0.0.1:8092".to_string()
 }
 
+fn default_metrics_listen() -> String {
+    "127.0.0.1:8093".to_string()
+}
+
 fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
+}
+
+fn default_log_retention_days() -> u32 {
+    7
+}
+
+fn default_metric_retention_days() -> u32 {
+    30
+}
+
+fn default_retention_sweep_interval_secs() -> u64 {
+    3600
+}
+
+fn default_tail_capacity() -> usize {
+    1024
+}
+
+fn default_query_default_limit() -> u32 {
+    100
+}
+
+fn default_query_max_limit() -> u32 {
+    1000
+}
+
+fn default_metrics_export_window_secs() -> u64 {
+    300
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
+            metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
+            log_retention_days: default_log_retention_days(),
+            metric_retention_days: default_metric_retention_days(),
+            retention_sweep_interval_secs: default_retention_sweep_interval_secs(),
+            tail_capacity: default_tail_capacity(),
+            query_default_limit: default_query_default_limit(),
+            query_max_limit: default_query_max_limit(),
+            metrics_export_window_secs: default_metrics_export_window_secs(),
         }
     }
 }
@@ -34,13 +105,116 @@ impl Config {
     /// Load from `path`. A missing file is not an error: the service is
     /// expected to run with defaults during development.
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
+        let config = match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str::<Self>(&text)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!(path = %path.display(), "config file not found, using defaults");
-                Ok(Self::default())
+                Self::default()
             }
-            Err(e) => Err(e.into()),
+            Err(e) => return Err(e.into()),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Reject values that would make the service behave in a way nobody
+    /// intended - a zero retention would delete today's logs on the first
+    /// sweep, a zero page size would return empty pages forever.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.log_retention_days == 0 {
+            anyhow::bail!("log_retention_days must be at least 1");
         }
+        if self.metric_retention_days == 0 {
+            anyhow::bail!("metric_retention_days must be at least 1");
+        }
+        if self.retention_sweep_interval_secs == 0 {
+            anyhow::bail!("retention_sweep_interval_secs must be at least 1");
+        }
+        if self.tail_capacity == 0 {
+            anyhow::bail!("tail_capacity must be at least 1");
+        }
+        if self.query_default_limit == 0 || self.query_max_limit == 0 {
+            anyhow::bail!("query_default_limit and query_max_limit must be at least 1");
+        }
+        if self.query_default_limit > self.query_max_limit {
+            anyhow::bail!(
+                "query_default_limit ({}) must not exceed query_max_limit ({})",
+                self.query_default_limit,
+                self.query_max_limit
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_document_yields_defaults() {
+        let config: Config = toml::from_str("").expect("empty config must parse");
+        assert_eq!(config.listen, "127.0.0.1:8092");
+        assert_eq!(config.metrics_listen, "127.0.0.1:8093");
+        assert_eq!(config.log_retention_days, 7);
+        config.validate().expect("defaults must be valid");
+    }
+
+    #[test]
+    fn fields_override_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+            listen = "0.0.0.0:9000"
+            metrics_listen = "0.0.0.0:9001"
+            data_dir = "/var/lib/deis-telemetry"
+            log_retention_days = 3
+            tail_capacity = 16
+        "#,
+        )
+        .expect("config must parse");
+        assert_eq!(config.listen, "0.0.0.0:9000");
+        assert_eq!(config.metrics_listen, "0.0.0.0:9001");
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/deis-telemetry"));
+        assert_eq!(config.log_retention_days, 3);
+        assert_eq!(config.tail_capacity, 16);
+        // Untouched fields keep their defaults.
+        assert_eq!(config.query_default_limit, 100);
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        let err = toml::from_str::<Config>("retention_days = 5").unwrap_err();
+        assert!(
+            err.to_string().contains("retention_days"),
+            "error should name the unknown key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_retention_is_rejected() {
+        let config = Config {
+            log_retention_days: 0,
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn default_limit_above_max_is_rejected() {
+        let config = Config {
+            query_default_limit: 10_000,
+            query_max_limit: 1_000,
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn missing_file_falls_back_to_defaults() {
+        let config = Config::load(std::path::Path::new(
+            "/nonexistent/deis-telemetry-missing.toml",
+        ))
+        .expect("missing file must fall back to defaults");
+        assert_eq!(config.listen, default_listen());
     }
 }

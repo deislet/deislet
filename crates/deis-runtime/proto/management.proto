@@ -115,6 +115,14 @@ message ResourceLimits {
 
     // Maximum number of ResourceTable entries
     int32 resource_table_max = 4;
+
+    // Per-app override of the platform default execution timeout (ms).
+    // 0 means "use the platform default".
+    int64 timeout_ms = 5;
+
+    // Per-app override of the platform default JS-op rate limit (ops/sec).
+    // 0 means "use the platform default".
+    double rate_limit_ops_per_sec = 6;
 }
 
 // Routing rule

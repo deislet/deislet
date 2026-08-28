@@ -33,6 +33,29 @@ api_keys = [
 ]
 
 # ========================================
+# Product model: bundles and secrets
+# ========================================
+
+# Directory holding uploaded application bundles: one sub-directory per
+# app, one content-addressed zip per version. This is the only copy of a
+# version's code the platform keeps, so put it on persistent storage.
+bundle_dir = "data/bundles"
+
+# Absolute base URL nodes use to reach this control plane. It ends up in
+# the bundle download links handed out with each assignment. Leave it unset
+# and the URL is derived from the request's Host header, which is right for
+# direct connections and wrong behind a proxy that rewrites it.
+# public_base_url = "https://control.internal:8080"
+
+# File holding the 32-byte master key that encrypts environment secrets
+# (AES-256-GCM, nonce prefixed). Either 32 raw bytes or 64 hex characters:
+#   openssl rand -hex 32 > /etc/deis/secret.key && chmod 600 /etc/deis/secret.key
+# The key never enters the database and is never logged. Without it the
+# control plane still runs, but every secret endpoint answers 503 rather
+# than storing a value in the clear.
+# secret_key_file = "/etc/deis/secret.key"
+
+# ========================================
 # TLS configuration (optional)
 # ========================================
 

@@ -71,7 +71,11 @@ impl ControlServer {
             grpc_service = grpc_service.with_command_executor(executor.clone());
         }
 
+        // Nodes and the control plane exchange manifests and batched
+        // commands; the tonic default of 4 MB is too tight for those.
         ControlServiceServer::new(grpc_service)
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
     }
 
     pub async fn start(&self) -> Result<(), anyhow::Error> {

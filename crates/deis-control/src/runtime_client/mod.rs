@@ -29,6 +29,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Raise both message limits from the tonic default of 4 MB.
+///
+/// Deployment metadata and status responses grow with the number of
+/// applications a node runs, and a truncated response would look like a
+/// dead node rather than an oversized message.
+fn with_message_limits(
+    client: RuntimeManagementClient<Channel>,
+) -> RuntimeManagementClient<Channel> {
+    client
+        .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+}
+
 /// Last observed health of one deis-runtime node.
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeHealth {
@@ -110,7 +123,7 @@ impl RuntimeNodeManager {
             .connect()
             .await
             .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))?;
-        Ok(RuntimeManagementClient::new(channel))
+        Ok(with_message_limits(RuntimeManagementClient::new(channel)))
     }
 
     /// One health probe; updates the cache and returns the fresh state.
@@ -174,7 +187,7 @@ impl RuntimeNodeManager {
             .connect()
             .await
             .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))?;
-        let mut client = RuntimeManagementClient::new(channel);
+        let mut client = with_message_limits(RuntimeManagementClient::new(channel));
 
         info!(
             node = id,

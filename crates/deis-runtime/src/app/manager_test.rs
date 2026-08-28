@@ -8,7 +8,7 @@
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use crate::app::{
-        types::{AppConfig, AppState},
+        types::{AppConfig, AppState, ResourceLimits},
         ApplicationManager,
     };
     use once_cell::sync::Lazy;
@@ -336,5 +336,84 @@ mod tests {
 
         // Cleanup
         let _ = manager.unload_app("kvtest").await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_app_populates_route_params_end_to_end() {
+        let manager = TEST_MANAGER.lock().unwrap();
+
+        let code = r#"
+            export default function handler(context) {
+                return new Response(JSON.stringify(context.params));
+            }
+        "#;
+
+        let config = AppConfig {
+            routes: vec!["/users/:id".to_string()],
+            ..Default::default()
+        };
+
+        manager
+            .load_app("params_app".to_string(), code.to_string(), config, None)
+            .await
+            .unwrap();
+
+        let result = manager
+            .execute_app(
+                "params_app",
+                "http://localhost/users/42".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let (status, _headers, body) = result.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, Some(r#"{"id":"42"}"#.to_string()));
+
+        // Cleanup
+        let _ = manager.unload_app("params_app").await;
+    }
+
+    #[test]
+    fn test_effective_limits_uses_platform_default_when_app_has_none() {
+        let manager = ApplicationManager::with_threads(Some(1));
+        let (timeout_ms, rate_limit) = manager.effective_limits("app_a", None);
+        assert_eq!(timeout_ms, manager.default_limits.timeout_ms);
+        assert_eq!(rate_limit, manager.default_limits.rate_limit_ops_per_sec);
+    }
+
+    #[test]
+    fn test_effective_limits_applies_per_app_override() {
+        let manager = ApplicationManager::with_threads(Some(1));
+        let limits = ResourceLimits {
+            memory_mb: 0,
+            cpu_milli: 0,
+            resource_table_max: None,
+            timeout_ms: Some(5_000),
+            rate_limit_ops_per_sec: Some(10.0),
+        };
+        let (timeout_ms, rate_limit) = manager.effective_limits("app_b", Some(&limits));
+        assert_eq!(timeout_ms, 5_000);
+        assert_eq!(rate_limit, 10.0);
+    }
+
+    #[test]
+    fn test_effective_limits_falls_back_per_field() {
+        // An app may override only one of the two limits; the other should
+        // still fall back to the platform default rather than, say, zero.
+        let manager = ApplicationManager::with_threads(Some(1));
+        let limits = ResourceLimits {
+            memory_mb: 0,
+            cpu_milli: 0,
+            resource_table_max: None,
+            timeout_ms: Some(5_000),
+            rate_limit_ops_per_sec: None,
+        };
+        let (timeout_ms, rate_limit) = manager.effective_limits("app_c", Some(&limits));
+        assert_eq!(timeout_ms, 5_000);
+        assert_eq!(rate_limit, manager.default_limits.rate_limit_ops_per_sec);
     }
 }

@@ -1,9 +1,13 @@
-// Database gRPC client wrapper
-//
-// Provides functionality to connect to remote Database service
-// Similar to Cloudflare D1 / Deno Deploy SQL
+//! SQL client backing `ctx.db`, the equivalent of Cloudflare D1.
+//!
+//! Talks to deis-store, which gives each application its own SQLite file: the
+//! tenant travels in the `x-deis-app-id` metadata header (see [`Tenant`]), not
+//! in the proto messages, so one client speaks for exactly one application.
+//! Prepared-statement handles are owned by the application that created them
+//! and the store refuses them across tenants.
 
-use anyhow::Result;
+use super::tenant::Tenant;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
@@ -21,6 +25,7 @@ use proto::{database_client::DatabaseClient, *};
 #[derive(Clone)]
 pub struct DbClient {
     client: Arc<Mutex<DatabaseClient<Channel>>>,
+    tenant: Tenant,
 }
 
 impl DbClient {
@@ -28,20 +33,32 @@ impl DbClient {
     ///
     /// # Parameters
     /// - endpoint: gRPC service address (e.g., "http://127.0.0.1:50051")
+    /// - app_id: the tenant every call of this client is charged to
     ///
     /// # Returns
     /// - Ok(DbClient): Connection successful
     /// - Err: Connection failed
-    pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
+    pub async fn connect(endpoint: impl Into<String>, app_id: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        tracing::info!("Connecting to Database at {}", endpoint);
+        let tenant = Tenant::new(app_id)?;
+        tracing::info!(%endpoint, app_id = tenant.app_id(), "connecting to database");
 
-        let client = DatabaseClient::connect(endpoint).await?;
+        let client = DatabaseClient::connect(endpoint.clone())
+            .await
+            .with_context(|| format!("connecting to database at {endpoint}"))?
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE);
 
-        tracing::info!("Database client connected successfully");
+        tracing::info!(%endpoint, app_id = tenant.app_id(), "database client connected");
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
+            tenant,
         })
+    }
+
+    /// The application every call of this client is charged to.
+    pub fn app_id(&self) -> &str {
+        self.tenant.app_id()
     }
 
     /// Executes SQL statements (INSERT, UPDATE, DELETE, etc.)
@@ -53,7 +70,7 @@ impl DbClient {
     /// # Returns
     /// - (rows_affected, last_insert_id): Number of rows affected and last insert ID
     pub async fn execute(&self, sql: String, params: Option<String>) -> Result<(i64, Option<i64>)> {
-        let request = tonic::Request::new(ExecuteRequest {
+        let request = self.tenant.stamp(ExecuteRequest {
             sql: sql.clone(),
             params,
         });
@@ -87,7 +104,7 @@ impl DbClient {
         sql: String,
         params: Option<String>,
     ) -> Result<(String, Vec<String>)> {
-        let request = tonic::Request::new(QueryRequest {
+        let request = self.tenant.stamp(QueryRequest {
             sql: sql.clone(),
             params,
         });
@@ -124,7 +141,7 @@ impl DbClient {
             .map(|(sql, params)| ExecuteRequest { sql, params })
             .collect();
 
-        let request = tonic::Request::new(BatchRequest {
+        let request = self.tenant.stamp(BatchRequest {
             statements: execute_requests,
         });
 
@@ -161,7 +178,7 @@ impl DbClient {
     /// # Returns
     /// - statement_id: Prepared statement ID
     pub async fn prepare(&self, sql: String) -> Result<String> {
-        let request = tonic::Request::new(PrepareRequest { sql: sql.clone() });
+        let request = self.tenant.stamp(PrepareRequest { sql: sql.clone() });
 
         tracing::debug!("DB Prepare: {}", sql);
 
@@ -192,7 +209,7 @@ impl DbClient {
         statement_id: String,
         params: Option<String>,
     ) -> Result<(i64, Option<i64>)> {
-        let request = tonic::Request::new(ExecutePreparedRequest {
+        let request = self.tenant.stamp(ExecutePreparedRequest {
             statement_id,
             params,
         });
@@ -226,7 +243,7 @@ impl DbClient {
         statement_id: String,
         params: Option<String>,
     ) -> Result<(String, Vec<String>)> {
-        let request = tonic::Request::new(QueryPreparedRequest {
+        let request = self.tenant.stamp(QueryPreparedRequest {
             statement_id,
             params,
         });
@@ -257,7 +274,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_db_client_connect() {
-        let result = DbClient::connect("http://127.0.0.1:50051").await;
+        let result = DbClient::connect("http://127.0.0.1:50051", "test_app").await;
         // Should return connection error if service is not running
         // Only testing client code compilation and basic logic here
         assert!(result.is_err() || result.is_ok());
@@ -267,7 +284,7 @@ mod tests {
     #[ignore]
     async fn test_db_client_operations() {
         // This test requires a real deis-control server
-        let client = DbClient::connect("http://127.0.0.1:50051")
+        let client = DbClient::connect("http://127.0.0.1:50051", "test_app")
             .await
             .expect("Failed to connect");
 

@@ -26,10 +26,39 @@ pub struct ControlConfig {
     /// Interval in seconds between deis-runtime node health polls (default: 15)
     #[serde(default = "default_deis_runtime_poll_interval")]
     pub deis_runtime_poll_interval: u64,
+    /// Directory holding uploaded application bundles, one sub-directory
+    /// per app and one content-addressed zip per version.
+    ///
+    /// This is the only copy of a version's code the platform keeps, so it
+    /// belongs on persistent storage that survives a restart.
+    #[serde(default = "default_bundle_dir")]
+    pub bundle_dir: PathBuf,
+    /// Absolute base URL nodes use to reach this control plane, for
+    /// instance "https://control.internal:8080".
+    ///
+    /// It ends up in the bundle download links handed to nodes. Leave it
+    /// unset and the URL is derived from the Host header of the request,
+    /// which is right when nodes talk to the control plane directly and
+    /// wrong behind a proxy that rewrites it.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    /// File holding the 32-byte master key that encrypts environment
+    /// secrets (AES-256-GCM). Either 32 raw bytes or 64 hex characters,
+    /// for instance from `openssl rand -hex 32`.
+    ///
+    /// The key never enters the database and is never logged. Without it
+    /// the control plane still runs, but every secret endpoint answers
+    /// 503 instead of storing anything in the clear.
+    #[serde(default)]
+    pub secret_key_file: Option<PathBuf>,
 }
 
 fn default_deis_runtime_poll_interval() -> u64 {
     15
+}
+
+fn default_bundle_dir() -> PathBuf {
+    PathBuf::from("data/bundles")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +96,9 @@ impl Default for ControlConfig {
             tls: None,
             deis_runtime_nodes: Vec::new(),
             deis_runtime_poll_interval: default_deis_runtime_poll_interval(),
+            bundle_dir: default_bundle_dir(),
+            public_base_url: None,
+            secret_key_file: None,
         }
     }
 }

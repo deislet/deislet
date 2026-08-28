@@ -25,6 +25,9 @@ mod tests {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         );
         assert!(
             result.is_ok(),
@@ -49,6 +52,9 @@ mod tests {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         );
         assert!(
             result.is_ok(),
@@ -78,6 +84,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         );
         assert!(
             result.is_ok(),
@@ -108,6 +117,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         );
         assert!(
             result.is_ok(),
@@ -133,6 +145,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         );
         assert!(result.is_ok());
     }
@@ -149,6 +164,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         );
         assert!(result.is_err());
     }
@@ -170,6 +188,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         );
         assert!(result.is_ok());
 
@@ -197,6 +218,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         )
         .unwrap();
 
@@ -244,6 +268,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         )
         .unwrap();
 
@@ -284,6 +311,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         )
         .unwrap();
 
@@ -331,6 +361,9 @@ export default function handler(context: any): Response {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         )
         .unwrap();
 
@@ -356,5 +389,153 @@ export default function handler(context: any): Response {
         let (status, _headers, body) = result_data;
         assert_eq!(status, 200);
         assert_eq!(body, Some("/test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_execute_fetch_populates_route_params() {
+        let code = r#"
+            export default function handler(context) {
+                return new Response(JSON.stringify(context.params), {
+                    status: 200,
+                    headers: { "content-type": "application/json" }
+                });
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "test_params_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+            vec!["/users/:id".to_string()],
+            30_000,
+            1000.0,
+        )
+        .unwrap();
+
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        let result = runtime
+            .execute_fetch(
+                "http://localhost/users/123".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await;
+
+        assert!(result.is_ok());
+
+        let result_data = rx.await.unwrap().unwrap();
+        let (status, _headers, body) = result_data;
+        assert_eq!(status, 200);
+        assert_eq!(body, Some(r#"{"id":"123"}"#.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_execute_fetch_without_matching_route_gives_empty_params() {
+        let code = r#"
+            export default function handler(context) {
+                return new Response(JSON.stringify(context.params));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "test_no_params_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+            vec!["/users/:id".to_string()],
+            30_000,
+            1000.0,
+        )
+        .unwrap();
+
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        let result = runtime
+            .execute_fetch(
+                "http://localhost/posts/1".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await;
+
+        assert!(result.is_ok());
+
+        let result_data = rx.await.unwrap().unwrap();
+        let (_status, _headers, body) = result_data;
+        assert_eq!(body, Some("{}".to_string()));
+    }
+
+    #[test]
+    fn test_new_stores_configured_timeout_and_rate_limit_overrides() {
+        let code = r#"
+            export default function handler() {
+                return new Response("ok");
+            }
+        "#;
+
+        let runtime = AppRuntime::new(
+            "test_limits_override_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+            Vec::new(),
+            5_000,
+            42.5,
+        )
+        .unwrap();
+
+        // Both values differ from the platform defaults (30_000ms /
+        // 1000.0 ops/sec) used elsewhere in this file, so this only passes
+        // if the values actually threaded through `AppRuntime::new` rather
+        // than falling back to a hard-coded default.
+        assert_eq!(runtime.timeout_ms(), 5_000);
+        assert_eq!(runtime.rate_limit_ops_per_sec(), 42.5);
+    }
+
+    #[test]
+    fn test_new_stores_platform_default_limits_when_not_overridden() {
+        let code = r#"
+            export default function handler() {
+                return new Response("ok");
+            }
+        "#;
+
+        let runtime = AppRuntime::new(
+            "test_default_limits_app".to_string(),
+            code.to_string(),
+            None,
+            None,
+            HashMap::new(),
+            AppPermissions::default(),
+            None,
+            None,
+            Vec::new(),
+            30_000,
+            1000.0,
+        )
+        .unwrap();
+
+        assert_eq!(runtime.timeout_ms(), 30_000);
+        assert_eq!(runtime.rate_limit_ops_per_sec(), 1000.0);
     }
 }

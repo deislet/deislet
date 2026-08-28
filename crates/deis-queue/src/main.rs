@@ -9,9 +9,10 @@ mod config;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
 use tonic_health::pb::health_server::HealthServer;
-use tracing::info;
+use tracing::{error, info};
 
 /// gRPC payload ceiling. The 4 MB tonic default is too tight for batched
 /// messages and manifests, so every Deislet service agrees on 16 MB.
@@ -29,8 +30,7 @@ struct Cli {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -52,10 +52,57 @@ async fn main() -> Result<()> {
 
     // Domain services are registered alongside health once implemented.
     Server::builder()
-        .add_service(health_service)
-        .serve(addr)
+        .add_service(
+            health_service
+                .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+        )
+        .serve_with_shutdown(addr, shutdown_signal())
         .await
         .context("gRPC server terminated")?;
 
+    info!("deis-queue stopped");
     Ok(())
+}
+
+/// Resolve when the process is asked to stop.
+///
+/// Both signals are honoured, because both are used: an operator pressing
+/// Ctrl-C sends SIGINT, while systemd, Docker and Kubernetes stop a container
+/// with SIGTERM. Without this the server would run until the process was
+/// killed outright, so in-flight requests would be cut mid-response instead
+/// of being allowed to finish.
+async fn shutdown_signal() {
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            error!(
+                error = %e,
+                "cannot listen for SIGTERM; a supervisor stopping this service will kill it \
+                 outright and in-flight requests will be cut mid-response"
+            );
+            None
+        }
+    };
+
+    match terminate.as_mut() {
+        Some(terminate) => {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => report_interrupt(result),
+                _ = terminate.recv() => info!("SIGTERM received, draining in-flight requests"),
+            }
+        }
+        None => report_interrupt(tokio::signal::ctrl_c().await),
+    }
+}
+
+fn report_interrupt(result: std::io::Result<()>) {
+    match result {
+        Ok(()) => info!("interrupt received, draining in-flight requests"),
+        Err(e) => error!(
+            error = %e,
+            "cannot listen for the interrupt signal; the process will only stop when killed, \
+             which cuts in-flight requests"
+        ),
+    }
 }

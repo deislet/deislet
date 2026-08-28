@@ -6,6 +6,7 @@ pub mod events;
 pub mod grpc;
 pub mod metrics;
 pub mod middleware;
+pub mod product;
 pub mod static_files;
 pub mod nodes;
 
@@ -19,7 +20,7 @@ use tower_http::{
     cors::CorsLayer,
     trace::TraceLayer,
 };
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{
     broadcast::EventBroadcaster,
@@ -28,6 +29,7 @@ use crate::{
     config_manager::ConfigManager,
     database::Database,
     metrics::MetricsCollector,
+    product::{BundleStore, ProductStore, SecretsBackend},
     session::SessionManager,
 };
 
@@ -84,6 +86,8 @@ pub fn build_api_router(
         deis_runtime: Arc::clone(&deis_runtime_manager),
     };
 
+    let product_state = build_product_state(Arc::clone(&database), &config);
+
     let auth_config = middleware::AuthConfig::from_control_config(&config);
 
     let protected_routes = Router::new()
@@ -121,6 +125,9 @@ pub fn build_api_router(
         .route("/api/runtime/:node/apps/:app_id", put(apps::deploy_app))
         .route("/api/runtime/:node/apps/:app_id", delete(apps::unload_app))
         .with_state(apps_state)
+        // The product model brings its own state, so it is merged as a
+        // finished router rather than threaded through the chain above.
+        .merge(product::router(product_state))
         .layer(axum_middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::api_key_auth,
@@ -141,6 +148,48 @@ pub fn build_api_router(
         router: app,
         auth_config,
         tls_enabled,
+    }
+}
+
+/// Assemble the state every product endpoint shares.
+///
+/// Both fallible pieces - the bundle directory and the secret master key -
+/// are resolved once here so a misconfiguration shows up in the startup
+/// log instead of on a request hours later.
+fn build_product_state(database: Arc<Database>, config: &ControlConfig) -> product::ProductState {
+    let bundles = BundleStore::new(config.bundle_dir.clone());
+    match bundles.ensure_root() {
+        Ok(()) => info!(
+            bundle_dir = %config.bundle_dir.display(),
+            "Bundle directory ready; uploaded versions are stored here and served to nodes from here"
+        ),
+        Err(e) => error!(
+            bundle_dir = %config.bundle_dir.display(),
+            error = %e,
+            "Bundle directory is not usable; every bundle upload will fail and nodes cannot fetch any version until this path is writable"
+        ),
+    }
+
+    let secrets = SecretsBackend::load(config.secret_key_file.as_deref());
+
+    let tls_enabled = config.tls.as_ref().map(|tls| tls.api_enabled).unwrap_or(false);
+    let scheme = if tls_enabled { "https" } else { "http" };
+    let host = if config.bind_addr == "0.0.0.0" || config.bind_addr == "::" {
+        "127.0.0.1"
+    } else {
+        config.bind_addr.as_str()
+    };
+    let address = product::PublicAddress {
+        configured: config.public_base_url.clone(),
+        scheme,
+        fallback: format!("{}://{}:{}", scheme, host, config.port),
+    };
+
+    product::ProductState {
+        store: Arc::new(ProductStore::new(database)),
+        bundles: Arc::new(bundles),
+        secrets: Arc::new(secrets),
+        address: Arc::new(address),
     }
 }
 

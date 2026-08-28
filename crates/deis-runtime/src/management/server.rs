@@ -19,5 +19,7 @@ impl ManagementServer {
     ) -> ProtoServer<RuntimeManagementService> {
         let service = RuntimeManagementService::new(app_manager, config_store, app_repo, node_id);
         ProtoServer::new(service)
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
     }
 }

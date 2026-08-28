@@ -2,10 +2,28 @@ syntax = "proto3";
 
 package deis.telemetry;
 
-// Log service - receives logs shipped by deis-runtime
+// Log service - receives logs shipped by every Deislet component, stores them,
+// and serves them back for querying and live following.
+//
+// This service is deliberately "dumb": it stores and returns what it was given.
+// It never evaluates health, never raises alerts and never calls back into any
+// other component. Liveness of a component is judged by a direct health check
+// against that component, never through this service.
 service LogService {
     // Push logs (batched)
     rpc PushLogs(PushLogsRequest) returns (PushLogsResponse);
+
+    // Query stored logs, newest first, paginated
+    rpc Query(QueryRequest) returns (QueryResponse);
+
+    // Follow logs as they arrive (backs "deis tail")
+    rpc Tail(TailRequest) returns (stream LogEntry);
+
+    // Push numeric metric samples (batched)
+    rpc PushMetrics(PushMetricsRequest) returns (PushMetricsResponse);
+
+    // Query stored metric samples, newest first, paginated
+    rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 
     // Health check
     rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
@@ -68,6 +86,139 @@ message PushLogsResponse {
 
     // Error message (if any)
     string error_message = 3;
+}
+
+// Query stored logs. Every filter is optional; an unset filter matches
+// everything. Filters combine with AND.
+message QueryRequest {
+    // Only this application; empty matches every application
+    string app_id = 1;
+
+    // Inclusive lower bound on timestamp_us; 0 means unbounded
+    int64 start_us = 2;
+
+    // Exclusive upper bound on timestamp_us; 0 means unbounded
+    int64 end_us = 3;
+
+    // Minimum severity, comparing the LogLevel ordinal;
+    // LOG_LEVEL_UNSPECIFIED means no floor
+    LogLevel min_level = 4;
+
+    // Exact trace ID; empty matches every trace
+    string trace_id = 5;
+
+    // Case-insensitive substring of the message; empty matches every message
+    string contains = 6;
+
+    // Page size. 0 selects the server default, values above the server
+    // maximum are clamped down to it.
+    int32 limit = 7;
+
+    // Opaque continuation token taken from a previous QueryResponse.
+    // Empty starts at the newest matching entry.
+    string cursor = 8;
+}
+
+// Query result page, newest entry first
+message QueryResponse {
+    // Matching entries, ordered newest first
+    repeated LogEntry entries = 1;
+
+    // Token to pass back as QueryRequest.cursor for the next, older page.
+    // Empty when this page is the last one.
+    string next_cursor = 2;
+
+    // True when at least one older matching entry exists
+    bool has_more = 3;
+}
+
+// Follow logs as they are ingested. Only entries that arrive after the call
+// are streamed; use Query for anything already stored.
+message TailRequest {
+    // Only this application; empty follows every application
+    string app_id = 1;
+
+    // Minimum severity; LOG_LEVEL_UNSPECIFIED means no floor
+    LogLevel min_level = 2;
+}
+
+// One numeric sample of one metric at one point in time
+message MetricSample {
+    // Metric name, for example "deis_runtime_requests_total"
+    string name = 1;
+
+    // Application ID the sample belongs to; empty for component-level metrics
+    string app_id = 2;
+
+    // Additional dimensions
+    map<string, string> labels = 3;
+
+    // Sample value
+    double value = 4;
+
+    // Timestamp (microseconds)
+    int64 timestamp_us = 5;
+}
+
+// Push metric samples request
+message PushMetricsRequest {
+    // Batched samples
+    repeated MetricSample samples = 1;
+
+    // Request metadata
+    map<string, string> metadata = 2;
+}
+
+// Push metric samples response
+message PushMetricsResponse {
+    // Number of samples successfully accepted
+    int32 accepted_count = 1;
+
+    // Number of samples rejected
+    int32 rejected_count = 2;
+
+    // Error message (if any)
+    string error_message = 3;
+}
+
+// Query stored metric samples. Every filter is optional; filters combine
+// with AND.
+message QueryMetricsRequest {
+    // Exact metric name; empty matches every metric
+    string name = 1;
+
+    // Only this application; empty matches every application
+    string app_id = 2;
+
+    // Every entry must be present on the sample with the same value;
+    // the sample may carry additional labels
+    map<string, string> label_selector = 3;
+
+    // Inclusive lower bound on timestamp_us; 0 means unbounded
+    int64 start_us = 4;
+
+    // Exclusive upper bound on timestamp_us; 0 means unbounded
+    int64 end_us = 5;
+
+    // Page size. 0 selects the server default, values above the server
+    // maximum are clamped down to it.
+    int32 limit = 6;
+
+    // Opaque continuation token taken from a previous QueryMetricsResponse
+    string cursor = 7;
+}
+
+// Metric query result page, newest sample first
+message QueryMetricsResponse {
+    // Matching samples, ordered newest first
+    repeated MetricSample samples = 1;
+
+    // Token to pass back as QueryMetricsRequest.cursor for the next,
+    // older page. Empty when this page is the last one.
+    string next_cursor = 2;
+
+    // True when at least one older matching sample exists
+    bool has_more = 3;
 }
 
 // Health check request

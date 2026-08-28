@@ -35,6 +35,9 @@ pub enum RuntimeMessage {
         permissions: super::super::app::types::AppPermissions,
         memory_limit_mb: Option<usize>,
         resource_table_max: Option<usize>,
+        route_patterns: Vec<String>,
+        timeout_ms: u64,
+        rate_limit_ops_per_sec: f64,
         response: oneshot::Sender<Result<()>>,
     },
     /// Unload application
@@ -158,6 +161,9 @@ impl RuntimeThread {
                     permissions,
                     memory_limit_mb,
                     resource_table_max,
+                    route_patterns,
+                    timeout_ms,
+                    rate_limit_ops_per_sec,
                     response,
                 } => {
                     tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
@@ -170,6 +176,9 @@ impl RuntimeThread {
                         permissions,
                         memory_limit_mb,
                         resource_table_max,
+                        route_patterns,
+                        timeout_ms,
+                        rate_limit_ops_per_sec,
                     ) {
                         Ok(mut runtime) => match runtime.init_module().await {
                             Ok(()) => {
@@ -411,6 +420,9 @@ impl RuntimePool {
         permissions: super::super::app::types::AppPermissions,
         memory_limit_mb: Option<usize>,
         resource_table_max: Option<usize>,
+        route_patterns: Vec<String>,
+        timeout_ms: u64,
+        rate_limit_ops_per_sec: f64,
     ) -> Result<()> {
         // Check if already exists
         if self.get_thread_id(&app_id).await.is_some() {
@@ -432,6 +444,9 @@ impl RuntimePool {
             permissions,
             memory_limit_mb,
             resource_table_max,
+            route_patterns,
+            timeout_ms,
+            rate_limit_ops_per_sec,
             response: tx,
         })?;
 
@@ -712,6 +727,9 @@ mod tests {
                 AppPermissions::default(),
                 None,
                 None,
+                Vec::new(),
+                30_000,
+                1000.0,
             )
             .await;
         assert!(result.is_ok());
@@ -751,6 +769,9 @@ mod tests {
                 AppPermissions::default(),
                 None,
                 None,
+                Vec::new(),
+                30_000,
+                1000.0,
             )
             .await
             .unwrap();
@@ -780,6 +801,9 @@ mod tests {
             AppPermissions::default(),
             None,
             None,
+            Vec::new(),
+            30_000,
+            1000.0,
         )
         .await
         .unwrap();

@@ -65,8 +65,13 @@ async fn main() -> Result<()> {
     info!("Log shipper started (dry-run mode)");
 
     // Create application manager
-    let app_manager = Arc::new(ApplicationManager::new_with_repo(app_repo.clone()));
-    info!("Application manager initialized");
+    let app_manager = Arc::new(
+        ApplicationManager::new_with_repo(app_repo.clone()).with_limits(config.limits.clone()),
+    );
+    info!(
+        "Application manager initialized (default timeout={}ms, default rate limit={} ops/sec)",
+        config.limits.timeout_ms, config.limits.rate_limit_ops_per_sec
+    );
 
     info!("====================================");
     info!("✅ Runtime Platform ready to serve!");

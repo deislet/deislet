@@ -188,6 +188,22 @@ impl Database {
         Ok(db)
     }
 
+    /// Run `f` with the shared SQLite connection held.
+    ///
+    /// The connection is a single `Mutex<Connection>` for the whole
+    /// process, so callers must keep the closure short and must not block
+    /// on anything else inside it. Feature-specific storage layers (for
+    /// instance `crate::product::ProductStore`) build on this instead of
+    /// opening a second connection, which would fight the first one for
+    /// the write lock and defeat the `PRAGMA foreign_keys` set at init.
+    pub async fn with_connection<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&Connection) -> Result<T, E>,
+    {
+        let conn = self.connection.lock().await;
+        f(&conn)
+    }
+
     /// Save or update node information
     pub async fn save_node(&self, session: &NodeSession) -> Result<(), DatabaseError> {
         let conn = self.connection.lock().await;

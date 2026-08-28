@@ -6,10 +6,17 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DEMO_DIR="${DEMO_DIR:-${ROOT_DIR}/.demo}"
 LOG_DIR="${LOG_DIR:-${DEMO_DIR}/logs}"
 STATE_FILE="${STATE_FILE:-${DEMO_DIR}/state.env}"
+# Where `cargo build` leaves the demo binaries. CARGO_TARGET_DIR is honoured
+# because this repo is often built with a shared target directory.
+BIN_DIR="${CARGO_TARGET_DIR:-${ROOT_DIR}/target}/debug"
 
 DEFAULT_DEIS_CONTROL_PORT=8085
 DEFAULT_DEIS_RUNTIME_PORT=8086
 DEFAULT_DEIS_PROXY_PORT=8087
+DEFAULT_DEIS_STORE_PORT=8090
+DEFAULT_DEIS_QUEUE_PORT=8091
+DEFAULT_DEIS_TELEMETRY_PORT=8092
+DEFAULT_DEIS_TELEMETRY_METRICS_PORT=8093
 
 usage() {
   cat <<'EOF'
@@ -17,13 +24,17 @@ Usage:
   demo.sh [start|stop|status] [options]
 
 Options:
-  --deis-control-port <port>       Control HTTP/gRPC port (default 8085)
-  --deis-runtime-port <port>        Runtime HTTP port (default 8086)
-  --deis-proxy-port <port>       Proxy HTTP port (default 8087)
-  --secret <hex>             Control shared secret (64-char hex)
-  --demo-dir <path>          Runtime directory (default .demo)
-  --log-dir <path>           Log directory (default .demo/logs)
-  --help                     Show this help
+  --deis-control-port <port>            Control HTTP/gRPC port (default 8085)
+  --deis-runtime-port <port>            Runtime HTTP port (default 8086)
+  --deis-proxy-port <port>              Proxy HTTP port (default 8087)
+  --deis-store-port <port>              Store gRPC port, KV/DB/Blob (default 8090)
+  --deis-queue-port <port>              Queue gRPC port (default 8091)
+  --deis-telemetry-port <port>          Telemetry gRPC port (default 8092)
+  --deis-telemetry-metrics-port <port>  Telemetry Prometheus port (default 8093)
+  --secret <hex>                        Control shared secret (64-char hex)
+  --demo-dir <path>                     Runtime directory (default .demo)
+  --log-dir <path>                      Log directory (default .demo/logs)
+  --help                                Show this help
 EOF
 }
 
@@ -39,18 +50,16 @@ ensure_dirs() {
   mkdir -p "$LOG_DIR"
 }
 
+# `ss` is asked first on purpose: it lists every listening socket on the host,
+# while `lsof` without root only sees this user's own processes. Trusting lsof
+# first makes a port owned by another user look free, and the service that is
+# then handed that port dies on bind.
 port_in_use() {
   local port=$1
-  if command -v lsof >/dev/null 2>&1; then
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt | grep -qE "[:.]${port}([[:space:]]|$)"
+  elif command -v lsof >/dev/null 2>&1; then
     lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
-  elif command -v ss >/dev/null 2>&1; then
-    if ss -lnt | grep -qE "[:.]${port}([[:space:]]|$)"; then
-      return 0
-    fi
-    if command -v sudo >/dev/null 2>&1 && sudo -n ss -lntp 2>/dev/null | grep -qE "[:.]${port}([[:space:]]|$)"; then
-      return 0
-    fi
-    return 1
   elif command -v nc >/dev/null 2>&1; then
     nc -z 127.0.0.1 "$port" >/dev/null 2>&1 || nc -z ::1 "$port" >/dev/null 2>&1
   else
@@ -59,12 +68,29 @@ port_in_use() {
   fi
 }
 
-find_available_port() {
-  local port=$1
-  while port_in_use "$port"; do
+# Ports already handed out during this start, which nothing is listening on
+# yet. Without this record two services asked for a port in the same second
+# would both be given the same free one, and the second to bind would die.
+CLAIMED_PORTS=""
+
+port_claimed() {
+  case " ${CLAIMED_PORTS} " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Pick the first free port at or above $2 and store it in the variable named
+# by $1. It assigns rather than echoes because a command substitution runs in
+# a subshell, which would throw away the record of what was already claimed.
+claim_port() {
+  local var=$1
+  local port=$2
+  while port_in_use "$port" || port_claimed "$port"; do
     port=$((port + 1))
   done
-  echo "$port"
+  CLAIMED_PORTS="${CLAIMED_PORTS} ${port}"
+  printf -v "$var" '%s' "$port"
 }
 
 generate_secret() {
@@ -102,6 +128,79 @@ wait_for_http_any() {
     "$url" >/dev/null 2>&1
 }
 
+# Wait until a gRPC listener accepts TCP connections. gRPC speaks h2c, so a
+# plain curl request gets no usable HTTP reply; what proves readiness is that
+# the connection was established at all. curl exits 7 only when it never
+# managed to connect, so that one code is the not-ready signal and anything
+# else means the socket answered. curl paces its own retries (1s apart), so
+# there is no busy loop and no shell-level sleeping.
+wait_for_tcp() {
+  local port=$1
+  local attempts=$2
+  local rc=0
+  curl -s -o /dev/null -m 2 \
+    --retry "$attempts" --retry-delay 1 --retry-max-time $((attempts * 2)) \
+    --retry-connrefused \
+    "http://127.0.0.1:${port}/" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 7 ]
+}
+
+# Wait for one service to start serving, giving up early if it dies.
+#
+# Each round hands the pacing to curl, which spaces its own retries a second
+# apart, and then re-checks the process; there is no shell-level sleeping. The
+# process check matters twice over: a service killed by a port clash dies in
+# milliseconds, and -- because a port held by an unrelated process answers the
+# probe perfectly well -- a socket that responds is only proof of readiness if
+# our own process is the one still running.
+#
+# Returns 0 when ready, 1 when it never became ready, 2 when it exited.
+wait_for_service() {
+  local probe=$1
+  local target=$2
+  local pid=$3
+  local rounds=$4
+  local round=0
+
+  while [ "$round" -lt "$rounds" ]; do
+    if ! pid_running "$pid"; then
+      return 2
+    fi
+    if "$probe" "$target" 2; then
+      if pid_running "$pid"; then
+        return 0
+      fi
+      return 2
+    fi
+    round=$((round + 1))
+  done
+  return 1
+}
+
+# Say what a readiness outcome means for the demo. A service that died left
+# its reason in its own log, and the usual reason is a port clash, so the last
+# few lines are shown inline rather than left to be hunted down.
+report_service() {
+  local name=$1
+  local rc=$2
+  local log=$3
+  local consequence=$4
+
+  case "$rc" in
+    0)
+      echo "   ✓ ${name} is serving"
+      ;;
+    2)
+      echo "❌ ${name} exited during startup; ${consequence}"
+      tail -n 5 "$log" 2>/dev/null | sed 's/^/     /'
+      ;;
+    *)
+      echo "⚠️  ${name} never became ready; ${consequence}"
+      echo "     See ${log}"
+      ;;
+  esac
+}
+
 pid_running() {
   local pid=$1
   if [ -z "$pid" ]; then
@@ -115,12 +214,22 @@ write_state() {
 DEIS_CONTROL_PORT=$DEIS_CONTROL_PORT
 DEIS_RUNTIME_PORT=$DEIS_RUNTIME_PORT
 DEIS_PROXY_PORT=$DEIS_PROXY_PORT
+DEIS_STORE_PORT=$DEIS_STORE_PORT
+DEIS_QUEUE_PORT=$DEIS_QUEUE_PORT
+DEIS_TELEMETRY_PORT=$DEIS_TELEMETRY_PORT
+DEIS_TELEMETRY_METRICS_PORT=$DEIS_TELEMETRY_METRICS_PORT
 DEIS_CONTROL_PID=$DEIS_CONTROL_PID
 DEIS_RUNTIME_PID=$DEIS_RUNTIME_PID
 DEIS_PROXY_PID=$DEIS_PROXY_PID
+DEIS_STORE_PID=$DEIS_STORE_PID
+DEIS_QUEUE_PID=$DEIS_QUEUE_PID
+DEIS_TELEMETRY_PID=$DEIS_TELEMETRY_PID
 DEIS_CONTROL_CONFIG=$DEIS_CONTROL_CONFIG
 DEIS_RUNTIME_CONFIG=$DEIS_RUNTIME_CONFIG
 DEIS_PROXY_CONFIG=$DEIS_PROXY_CONFIG
+DEIS_STORE_CONFIG=$DEIS_STORE_CONFIG
+DEIS_QUEUE_CONFIG=$DEIS_QUEUE_CONFIG
+DEIS_TELEMETRY_CONFIG=$DEIS_TELEMETRY_CONFIG
 SECRET=$SECRET
 EOF
 }
@@ -132,6 +241,88 @@ load_state() {
   fi
   # shellcheck disable=SC1090
   source "$STATE_FILE"
+}
+
+# Bring up the three services the platform stores things in or reports to:
+# deis-store (KV/DB/Blob), deis-queue and deis-telemetry. They are started
+# before the control plane on purpose: none of them depends on it, while
+# every other component ships logs at deis-telemetry, so it should already be
+# listening when the rest come up.
+#
+# Each one is a gRPC service. deis-telemetry additionally exposes a plain
+# HTTP scrape endpoint, which is a real answer and so a stronger readiness
+# signal; the other two can only be probed at the TCP level.
+# Build every demo binary once, up front.
+#
+# The services are then launched as binaries rather than through `cargo run`,
+# for two reasons. Six concurrent `cargo run` invocations queue up on the
+# build-directory lock, so the ones at the back look hung. More importantly,
+# `cargo run` makes the service a grandchild: `$!` is cargo's pid, and killing
+# it on `stop` leaves the real process running and its port occupied.
+build_binaries() {
+  echo "🔨 Building demo binaries"
+  if ! (
+    cd "$ROOT_DIR"
+    cargo build \
+      -p deis-control -p deis-runtime -p deis-proxy \
+      -p deis-store -p deis-queue -p deis-telemetry
+  ) > "${LOG_DIR}/build.log" 2>&1; then
+    echo "❌ Build failed, nothing was started. See ${LOG_DIR}/build.log"
+    tail -n 20 "${LOG_DIR}/build.log" | sed 's/^/     /'
+    exit 1
+  fi
+}
+
+start_data_plane() {
+  cat > "$DEIS_TELEMETRY_CONFIG" <<EOF
+listen = "127.0.0.1:${DEIS_TELEMETRY_PORT}"
+metrics_listen = "127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}"
+data_dir = "${DEMO_DIR}/deis-telemetry-data"
+EOF
+
+  cat > "$DEIS_STORE_CONFIG" <<EOF
+listen = "127.0.0.1:${DEIS_STORE_PORT}"
+data_dir = "${DEMO_DIR}/deis-store-data"
+EOF
+
+  cat > "$DEIS_QUEUE_CONFIG" <<EOF
+listen = "127.0.0.1:${DEIS_QUEUE_PORT}"
+data_dir = "${DEMO_DIR}/deis-queue-data"
+EOF
+
+  echo "🚀 Starting Telemetry (gRPC: ${DEIS_TELEMETRY_PORT}, metrics: ${DEIS_TELEMETRY_METRICS_PORT})"
+  "${BIN_DIR}/deis-telemetry" --config "$DEIS_TELEMETRY_CONFIG" \
+    > "${LOG_DIR}/deis-telemetry.log" 2>&1 &
+  DEIS_TELEMETRY_PID=$!
+
+  echo "🚀 Starting Store (gRPC: ${DEIS_STORE_PORT})"
+  "${BIN_DIR}/deis-store" --config "$DEIS_STORE_CONFIG" \
+    > "${LOG_DIR}/deis-store.log" 2>&1 &
+  DEIS_STORE_PID=$!
+
+  echo "🚀 Starting Queue (gRPC: ${DEIS_QUEUE_PORT})"
+  "${BIN_DIR}/deis-queue" --config "$DEIS_QUEUE_CONFIG" \
+    > "${LOG_DIR}/deis-queue.log" 2>&1 &
+  DEIS_QUEUE_PID=$!
+
+  # All three are launched before any is probed, so they come up in parallel.
+  local rc
+
+  rc=0
+  wait_for_service wait_for_http \
+    "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" "$DEIS_TELEMETRY_PID" 60 || rc=$?
+  report_service "Telemetry" "$rc" "${LOG_DIR}/deis-telemetry.log" \
+    "logs and metrics pushed at it are dropped"
+
+  rc=0
+  wait_for_service wait_for_tcp "$DEIS_STORE_PORT" "$DEIS_STORE_PID" 60 || rc=$?
+  report_service "Store" "$rc" "${LOG_DIR}/deis-store.log" \
+    "ctx.kv / ctx.db / ctx.blob calls will fail"
+
+  rc=0
+  wait_for_service wait_for_tcp "$DEIS_QUEUE_PORT" "$DEIS_QUEUE_PID" 60 || rc=$?
+  report_service "Queue" "$rc" "${LOG_DIR}/deis-queue.log" \
+    "ctx.queue calls will fail"
 }
 
 start_demo() {
@@ -149,14 +340,24 @@ start_demo() {
   local user_deis_control_port
   local user_deis_runtime_port
   local user_deis_proxy_port
+  local user_deis_store_port
+  local user_deis_queue_port
+  local user_deis_telemetry_port
+  local user_deis_telemetry_metrics_port
   user_deis_control_port=${DEIS_CONTROL_PORT:-}
   user_deis_runtime_port=${DEIS_RUNTIME_PORT:-}
   user_deis_proxy_port=${DEIS_PROXY_PORT:-}
+  user_deis_store_port=${DEIS_STORE_PORT:-}
+  user_deis_queue_port=${DEIS_QUEUE_PORT:-}
+  user_deis_telemetry_port=${DEIS_TELEMETRY_PORT:-}
+  user_deis_telemetry_metrics_port=${DEIS_TELEMETRY_METRICS_PORT:-}
 
   if [ -f "$STATE_FILE" ]; then
     # shellcheck disable=SC1090
     source "$STATE_FILE"
-    if pid_running "${DEIS_CONTROL_PID:-}" || pid_running "${DEIS_RUNTIME_PID:-}" || pid_running "${DEIS_PROXY_PID:-}"; then
+    if pid_running "${DEIS_CONTROL_PID:-}" || pid_running "${DEIS_RUNTIME_PID:-}" \
+      || pid_running "${DEIS_PROXY_PID:-}" || pid_running "${DEIS_STORE_PID:-}" \
+      || pid_running "${DEIS_QUEUE_PID:-}" || pid_running "${DEIS_TELEMETRY_PID:-}"; then
       echo "⚠️  An existing instance is running, please run stop first"
       exit 1
     fi
@@ -165,15 +366,30 @@ start_demo() {
   DEIS_CONTROL_PORT=$user_deis_control_port
   DEIS_RUNTIME_PORT=$user_deis_runtime_port
   DEIS_PROXY_PORT=$user_deis_proxy_port
+  DEIS_STORE_PORT=$user_deis_store_port
+  DEIS_QUEUE_PORT=$user_deis_queue_port
+  DEIS_TELEMETRY_PORT=$user_deis_telemetry_port
+  DEIS_TELEMETRY_METRICS_PORT=$user_deis_telemetry_metrics_port
 
-  DEIS_RUNTIME_PORT=$(find_available_port "${DEIS_RUNTIME_PORT:-$DEFAULT_DEIS_RUNTIME_PORT}")
-  DEIS_PROXY_PORT=$(find_available_port "${DEIS_PROXY_PORT:-$DEFAULT_DEIS_PROXY_PORT}")
+  claim_port DEIS_RUNTIME_PORT "${DEIS_RUNTIME_PORT:-$DEFAULT_DEIS_RUNTIME_PORT}"
+  claim_port DEIS_PROXY_PORT "${DEIS_PROXY_PORT:-$DEFAULT_DEIS_PROXY_PORT}"
+  claim_port DEIS_STORE_PORT "${DEIS_STORE_PORT:-$DEFAULT_DEIS_STORE_PORT}"
+  claim_port DEIS_QUEUE_PORT "${DEIS_QUEUE_PORT:-$DEFAULT_DEIS_QUEUE_PORT}"
+  claim_port DEIS_TELEMETRY_PORT "${DEIS_TELEMETRY_PORT:-$DEFAULT_DEIS_TELEMETRY_PORT}"
+  claim_port DEIS_TELEMETRY_METRICS_PORT \
+    "${DEIS_TELEMETRY_METRICS_PORT:-$DEFAULT_DEIS_TELEMETRY_METRICS_PORT}"
 
   SECRET=${SECRET:-$(generate_secret)}
 
   DEIS_CONTROL_CONFIG="${DEMO_DIR}/deis-control.toml"
   DEIS_RUNTIME_CONFIG="${DEMO_DIR}/deis-runtime.toml"
   DEIS_PROXY_CONFIG="${DEMO_DIR}/deis-proxy.toml"
+  DEIS_STORE_CONFIG="${DEMO_DIR}/deis-store.toml"
+  DEIS_QUEUE_CONFIG="${DEMO_DIR}/deis-queue.toml"
+  DEIS_TELEMETRY_CONFIG="${DEMO_DIR}/deis-telemetry.toml"
+
+  build_binaries
+  start_data_plane
 
   local start_port
   start_port=${DEIS_CONTROL_PORT:-$DEFAULT_DEIS_CONTROL_PORT}
@@ -233,14 +449,11 @@ secret = "${SECRET}"
 EOF
 
     echo "🚀 Starting Control (HTTP/gRPC: ${DEIS_CONTROL_PORT})"
-    (
-      cd "$ROOT_DIR"
-      cargo run -p deis-control -- \
-        --config "$DEIS_CONTROL_CONFIG" \
-        --port "$DEIS_CONTROL_PORT" \
-        --database "${DEMO_DIR}/deis-control.db" \
-        > "${LOG_DIR}/deis-control.log" 2>&1
-    ) &
+    "${BIN_DIR}/deis-control" \
+      --config "$DEIS_CONTROL_CONFIG" \
+      --port "$DEIS_CONTROL_PORT" \
+      --database "${DEMO_DIR}/deis-control.db" \
+      > "${LOG_DIR}/deis-control.log" 2>&1 &
     DEIS_CONTROL_PID=$!
 
     if wait_for_http "http://127.0.0.1:${DEIS_CONTROL_PORT}/health" 200; then
@@ -265,26 +478,30 @@ EOF
   fi
 
   echo "🚀 Starting Runtime (HTTP: ${DEIS_RUNTIME_PORT})"
-  (
-    cd "$ROOT_DIR"
-    DEIS_RUNTIME_CONFIG="$DEIS_RUNTIME_CONFIG" \
-      DEIS_RUNTIME_HTTP_PORT="$DEIS_RUNTIME_PORT" \
-      cargo run -p deis-runtime \
-      > "${LOG_DIR}/deis-runtime.log" 2>&1
-  ) &
+  DEIS_RUNTIME_CONFIG="$DEIS_RUNTIME_CONFIG" \
+    DEIS_RUNTIME_HTTP_PORT="$DEIS_RUNTIME_PORT" \
+    "${BIN_DIR}/deis-runtime" \
+    > "${LOG_DIR}/deis-runtime.log" 2>&1 &
   DEIS_RUNTIME_PID=$!
 
-  if ! wait_for_http_any "http://127.0.0.1:${DEIS_RUNTIME_PORT}/health" 60; then
-    echo "⚠️  Runtime health check failed, please check the log: ${LOG_DIR}/deis-runtime.log"
-  fi
+  local runtime_rc
+  runtime_rc=0
+  wait_for_service wait_for_http_any "http://127.0.0.1:${DEIS_RUNTIME_PORT}/health" \
+    "$DEIS_RUNTIME_PID" 60 || runtime_rc=$?
+  report_service "Runtime" "$runtime_rc" "${LOG_DIR}/deis-runtime.log" \
+    "no application can serve a request"
 
   echo "🚀 Starting Proxy (HTTP: ${DEIS_PROXY_PORT})"
-  (
-    cd "$ROOT_DIR"
-    cargo run -p deis-proxy --bin deis-proxy -- -c "$DEIS_PROXY_CONFIG" \
-      > "${LOG_DIR}/deis-proxy.log" 2>&1
-  ) &
+  "${BIN_DIR}/deis-proxy" -c "$DEIS_PROXY_CONFIG" \
+    > "${LOG_DIR}/deis-proxy.log" 2>&1 &
   DEIS_PROXY_PID=$!
+
+  local proxy_rc
+  proxy_rc=0
+  wait_for_service wait_for_http_any "http://127.0.0.1:${DEIS_PROXY_PORT}/" \
+    "$DEIS_PROXY_PID" 60 || proxy_rc=$?
+  report_service "Proxy" "$proxy_rc" "${LOG_DIR}/deis-proxy.log" \
+    "the demo entry point is unreachable"
 
   if command -v jq >/dev/null 2>&1; then
     echo "🚀 Deploying example app"
@@ -320,8 +537,20 @@ with zipfile.ZipFile('${APP_ZIP}', 'w') as zf:
   echo "- Control API: http://127.0.0.1:${DEIS_CONTROL_PORT}"
   echo "- Runtime: http://127.0.0.1:${DEIS_RUNTIME_PORT}"
   echo "- Proxy: http://127.0.0.1:${DEIS_PROXY_PORT}"
+  echo "- Store (gRPC): 127.0.0.1:${DEIS_STORE_PORT}"
+  echo "- Queue (gRPC): 127.0.0.1:${DEIS_QUEUE_PORT}"
+  echo "- Telemetry (gRPC): 127.0.0.1:${DEIS_TELEMETRY_PORT}"
+  echo "- Telemetry metrics: http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics"
 }
 
+# SIGTERM, not SIGINT. Bash sets SIGINT to "ignored" for every command it
+# starts asynchronously, and that disposition survives exec, so a service that
+# does not install its own SIGINT handler never sees the signal at all and
+# keeps running with its port held. SIGTERM is not ignored, and deis-store,
+# deis-queue, deis-telemetry and deis-proxy all drain on it.
+#
+# deis-control and deis-runtime have no shutdown handler yet, so for them the
+# default action applies: they stop immediately, without draining.
 stop_demo() {
   load_state
 
@@ -340,6 +569,23 @@ stop_demo() {
     kill "$DEIS_CONTROL_PID" || true
   fi
 
+  # The data plane goes last: the components above may still be flushing logs
+  # to deis-telemetry or finishing storage calls while they shut down.
+  if pid_running "${DEIS_QUEUE_PID:-}"; then
+    echo "🛑 Stopping Queue (PID: $DEIS_QUEUE_PID)"
+    kill "$DEIS_QUEUE_PID" || true
+  fi
+
+  if pid_running "${DEIS_STORE_PID:-}"; then
+    echo "🛑 Stopping Store (PID: $DEIS_STORE_PID)"
+    kill "$DEIS_STORE_PID" || true
+  fi
+
+  if pid_running "${DEIS_TELEMETRY_PID:-}"; then
+    echo "🛑 Stopping Telemetry (PID: $DEIS_TELEMETRY_PID)"
+    kill "$DEIS_TELEMETRY_PID" || true
+  fi
+
   echo "✅ Stop signals sent; force-kill manually if needed"
 }
 
@@ -350,9 +596,16 @@ status_demo() {
   echo "- Control PID: ${DEIS_CONTROL_PID}"
   echo "- Runtime PID: ${DEIS_RUNTIME_PID}"
   echo "- Proxy PID: ${DEIS_PROXY_PID}"
+  echo "- Store PID: ${DEIS_STORE_PID:-unknown}"
+  echo "- Queue PID: ${DEIS_QUEUE_PID:-unknown}"
+  echo "- Telemetry PID: ${DEIS_TELEMETRY_PID:-unknown}"
   echo "- Control API: http://127.0.0.1:${DEIS_CONTROL_PORT}"
   echo "- Runtime: http://127.0.0.1:${DEIS_RUNTIME_PORT}"
   echo "- Proxy: http://127.0.0.1:${DEIS_PROXY_PORT}"
+  echo "- Store (gRPC): 127.0.0.1:${DEIS_STORE_PORT:-unknown}"
+  echo "- Queue (gRPC): 127.0.0.1:${DEIS_QUEUE_PORT:-unknown}"
+  echo "- Telemetry (gRPC): 127.0.0.1:${DEIS_TELEMETRY_PORT:-unknown}"
+  echo "- Telemetry metrics: http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT:-unknown}/metrics"
 }
 
 action="start"
@@ -373,6 +626,22 @@ while [ $# -gt 0 ]; do
       ;;
     --deis-proxy-port)
       DEIS_PROXY_PORT=$2
+      shift 2
+      ;;
+    --deis-store-port)
+      DEIS_STORE_PORT=$2
+      shift 2
+      ;;
+    --deis-queue-port)
+      DEIS_QUEUE_PORT=$2
+      shift 2
+      ;;
+    --deis-telemetry-port)
+      DEIS_TELEMETRY_PORT=$2
+      shift 2
+      ;;
+    --deis-telemetry-metrics-port)
+      DEIS_TELEMETRY_METRICS_PORT=$2
       shift 2
       ;;
     --secret)
