@@ -175,7 +175,7 @@ export function onRequest(context: EventContext): Response | Promise<Response> {
 
 ### 文档 (85%)
 - ✅ README.md (项目概览)
-- ✅ ARCHITECTURE.md (架构设计)
+- ✅ 架构设计（已并入仓库根 `docs/architecture.zh.md`）
 - ✅ TODO.md (开发清单)
 - ✅ QUICKSTART.md ⭐ (快速开始指南)
 - ✅ CONTRIBUTING.md (贡献指南)
@@ -404,7 +404,7 @@ function matchRoute(pathname: string, route: string): boolean {
 ## 🎓 学习资源
 
 - [快速开始](./QUICKSTART.md) - 5 分钟上手
-- [架构设计](./ARCHITECTURE.md) - 技术细节
+- [架构设计](../../docs/architecture.zh.md) - 平台整体设计
 - [开发清单](./TODO.md) - 开发路线图
 - [贡献指南](./CONTRIBUTING.md) - 参与开发
 

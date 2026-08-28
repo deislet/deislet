@@ -1,5 +1,13 @@
 # Denix Architecture (2026 Edition)
 
+> This document covers denix internals only. For the platform-wide design —
+> data model, deployment and versioning, static asset handling, and the depot
+> storage component denix will depend on — see
+> [`docs/architecture.zh.md`](../../docs/architecture.zh.md).
+>
+> Note: the Log Service shown below is designed but not yet implemented on
+> either side.
+
 ## 🎯 Design Goals
 
 Transform Denix from a **Dependent Agent** to an **Autonomous Edge Runtime**. It is designed to be robust, self-sufficient, and compliant with the **Edge Canon** specification.

@@ -1,7 +1,11 @@
 # Denira Architecture Documentation
 
 **Version**: v0.1.0
-**Last Updated**: 2026-01-11
+**Last Updated**: 2026-08-29
+
+> This document covers denira internals only. For the platform-wide design —
+> data model, deployment and versioning, request path — see
+> [`docs/architecture.zh.md`](../../docs/architecture.zh.md).
 
 ---
 
@@ -15,8 +19,8 @@ Denira is a distributed cluster management supervisor used to manage and monitor
 ┌─────────────────────────────────────────────────────────────┐
 │                        Denira Supervisor                      │
 ├───────────────────┬─────────────────┬──────────────────────────┤
-│  WebSocket Server │   HTTP API      │   Web UI                 │
-│  (Worker Connections)│ (Management Interface)│ (Frontend Interface)│
+│  gRPC Server      │   HTTP API      │   Web UI + WS            │
+│ (Worker Connections)│ (Management Interface)│ (Console + Events)  │
 └──────┬────────────┴─────┬───────────┴────┬─────────────────────┘
        │                  │                │
        ▼                  ▼                ▼
@@ -49,12 +53,16 @@ Denira is a distributed cluster management supervisor used to manage and monitor
 
 ## 🏗️ Module Architecture
 
-### 1. **WebSocket Server** (`src/server.rs`)
+### 1. **gRPC Server** (`src/server.rs`)
 
-Responsible for persistent connections and communication with worker nodes.
+Responsible for persistent connections and communication with worker nodes,
+over a Tonic bidirectional stream defined by the `workit` SDK.
+
+> WebSocket is *not* used for workers. The `/api/ws` endpoint exists only to push
+> events to the browser console; see `src/broadcast/`.
 
 **Responsibilities**:
-- Accept worker WebSocket connections
+- Accept worker gRPC streams
 - Handle authentication (PSK + HMAC-SHA256)
 - Manage session lifecycle
 - Receive heartbeats and status updates
@@ -62,8 +70,8 @@ Responsible for persistent connections and communication with worker nodes.
 
 **Message Flow**:
 ```
-Worker → WebSocket → Server → Handler → SessionManager/Database
-Worker ← WebSocket ← Server ← CommandExecutor
+Worker → gRPC stream → Server → Handler → SessionManager/Database
+Worker ← gRPC stream ← Server ← CommandExecutor
 ```
 
 **Key Types**:
