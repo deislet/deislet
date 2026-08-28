@@ -436,3 +436,63 @@ sequenceDiagram
 **明确推迟**
 
 百分比灰度、Durable Objects、depot 多副本高可用、计费与配额。
+
+---
+
+## 11. 能力矩阵对账
+
+`edge-canon/PLATFORM_MATRIX.md` 里 Deislet 一列写的是**目标**，不是现状。下表是 2026-08-29 按代码逐项核对的结果，用来指导补齐，也用来修正那张公开的表。
+
+### 基础特性（规范要求全平台必须支持）
+
+| 特性 | 表里 | 实况 | 缺什么 |
+|---|---|---|---|
+| HTTP Handler | ✅ | 成立 | — |
+| Request / Response | ✅ | 部分成立 | `JsRequest` 只有 url / method / headers / body，且 body 是 `String`。二进制请求体与响应体不支持，需要改成字节 |
+| 环境变量 | ✅ | 成立 | manifest 的 env 经 `EnvStore` 注入，`ctx.env` 可读 |
+| 路由参数 | ✅ | **不成立** | `JsRequest` 结构体里没有 params 字段，`ctx.params` 恒为空对象。根因见下方「工具链缺口」 |
+| KV 存储 | ✅ | **不成立** | op 齐全，但需要 OpState 里有 `KvClient`；无服务端时运行时返回 "KV service not available" |
+| Cache API | ✅ | 成立 | moka 进程内缓存，`globalThis.caches` 已挂。语义上是单节点缓存，与 CF 的 per-colo 缓存接近 |
+| 生命周期 `waitUntil` | ✅ | 成立 | `runtime.js` 中已实现 |
+| 结构化日志 | ✅ | 部分成立 | 本地 `op_log` → 环形缓冲正常；回流上报是空壳 |
+| Web 标准 | ✅ | 成立 | deno_web / fetch / crypto / net / websocket / tls 均已注册 |
+
+### 扩展特性
+
+| 特性 | 表里 | 实况 | 缺什么 |
+|---|---|---|---|
+| SQL 数据库 | ✅ Remote gRPC | **不成立** | 只有客户端，无服务端 |
+| 对象存储 | ✅ Remote gRPC | **不成立** | 只有客户端，无服务端；proto 无流式接口 |
+| Node.js 运行时 | ✅ Native | **不成立** | `build_runtime_extensions()` 中**没有注册 `deno_node`**，仅从中借用了一个 TLS op。`require`、`Buffer`、`node:` 模块均不可用 |
+| 服务端渲染 | ✅ Native | **不成立** | 依赖 Node 兼容、npm 包解析、静态资产三者，均不具备 |
+| 增量静态再生 | ⚠️ Planned | 与表一致 | — |
+| WebAssembly | ✅ Native | 成立 | V8 自带 |
+| 定时任务 | ✅ Native | **不成立** | 链路三段错位，见 §5 |
+| 消息队列 | ✅ Native (Memory) | **不成立** | 运行时只有 `op_queue_send`，无消费 op；无服务端 |
+| Durable Objects | ⚠️ Planned | 与表一致 | — |
+| WebSocket | ✅ Native | 未验证 | denix 有 `ws_server_ops`；deflux 侧 pingora 内置 upgrade 隧道支持，但两端从未端到端验证；HTTP/2 下还需 extended CONNECT |
+| BroadcastChannel | ✅ Native | 成立（单进程） | `InMemoryBroadcastChannel`，跨节点不通。全量复制下同一应用在多节点各有一份，广播不互通 |
+| Workers AI | ❌ | 与表一致 | — |
+
+### 矩阵没体现的缺口：工具链没有自家平台目标
+
+`deforge` 的 `Platform` 枚举只有 `Cloudflare` / `Deno` / `Tencent`，**没有 Deislet**。编译器不能为自家平台产出代码。
+
+后果：
+
+- 「两条线并重」目前只有线 B 有工具链。线 A 的应用只能手写单文件——demo 里那个应用就是 `demo.sh` 用 Python 手工打的 zip。
+- edge-canon §5 的自动路由（文件路径映射到 URL 路径）在自家平台上编译不出来。**这也是 `ctx.params` 恒为空的根因**：文件路由的参数本该由编译器生成的分发代码填充，而自家平台没有编译目标，所以没人填。
+- 静态资产（§4）要求包里带资产清单，同样需要编译器产出。
+
+**补齐路径**：`deforge` 增加 `Platform::Deislet` 与对应 adapter，产出包含函数入口、路由表、资产清单的应用包，`denictl deploy` 直接上传该包。这项应排进落地顺序的阶段二，它是版本包结构的前提。
+
+### 补齐工作量分组
+
+| 组 | 项目 | 说明 |
+|---|---|---|
+| **随阶段一自然补齐** | KV、SQL 数据库、对象存储、消息队列 | 客户端和 proto 都在，缺的就是 depot |
+| **随阶段二、三自然补齐** | 路由参数、静态资产、SSR 的前置条件 | 需要 deforge 的 Deislet 目标与版本包结构 |
+| **独立小项** | 二进制请求体、WebSocket 端到端验证、cron 接线 | 各自一两天，互不依赖 |
+| **真正的硬骨头** | Node.js 运行时、服务端渲染 | 见下 |
+
+**Node.js 兼容与 SSR 需要单独决策。** 注册 `deno_node` 扩展只是第一步，真正的成本在 npm 包解析、`node_modules` 布局、CJS/ESM 互操作，以及这些如何进入不可变版本包。Cloudflare 自己也只做到 `nodejs_compat` 的有限支持，我们在表里标 `Native` 比 CF 承诺得还满，不现实。建议要么降级为「有限支持」并明确列出可用的 `node:` 模块，要么从矩阵移除。
