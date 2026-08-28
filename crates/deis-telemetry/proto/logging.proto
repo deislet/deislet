@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package deis.logging;
+package deis.telemetry;
 
 // Log service - receives logs shipped by deis-runtime
 service LogService {

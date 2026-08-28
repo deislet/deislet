@@ -1,0 +1,25 @@
+[package]
+name = "deis-queue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deislet message queue with lease-based consumption"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+rusqlite = { workspace = true }
+tonic = "0.12"
+tonic-health = "0.12"
+prost = "0.13"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+toml = "0.8"
+uuid = { version = "1.12", features = ["v4"] }
+
+[build-dependencies]
+tonic-build = "0.12"
