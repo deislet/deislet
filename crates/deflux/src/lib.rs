@@ -1,16 +1,18 @@
-//! Deflux: Managed Multi-site Load Balancer
+//! Deflux: managed multi-site reverse proxy and load balancer.
 //!
-//! Deflux is a high-performance HTTP/HTTPS load balancer based on Pingora, supporting dynamic configuration management.
+//! The data plane is Pingora: HTTP/1.1 and HTTP/2 termination, TLS with
+//! per-application certificates selected by SNI, upstream load balancing with
+//! health checks, and zero-downtime binary upgrades. Deflux adds domain based
+//! application routing, configuration layering (defaults + local file +
+//! supervisor), and the supervisor client that registers the instance with
+//! denira.
 
 pub mod cli;
 pub mod config;
-pub mod graceful_restart;
-pub mod process;
 pub mod proxy;
+pub mod restart;
 pub mod supervisor;
+pub mod tls;
 
-// Re-export commonly used types for convenience
-pub use config::AppConfig;
-pub use graceful_restart::{GracefulRestartConfig, RestartCoordinator};
-pub use proxy::DefluxServer;
+pub use config::{AppConfig, ConfigManager, SystemConfig};
 pub use supervisor::DefluxSupervisorClient;

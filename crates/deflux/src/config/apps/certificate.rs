@@ -2,8 +2,8 @@
 //!
 //! The certificate is used to secure the HTTPS connection.
 
-use serde::{Deserialize, Serialize};
 use crate::config::{ConfigError, Validatable};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CertificateConfig {

@@ -1,213 +1,204 @@
-#!/bin/bash
-# Deflux graceful restart integration test script
+#!/usr/bin/env bash
+# Zero-downtime upgrade check for deflux.
+#
+# Starts a backend and a deflux instance, then performs the same handover that
+# `deflux -s reload` does: spawn a replacement with --upgrade and send SIGQUIT
+# to the old process. Requests keep flowing throughout; any failure during the
+# handover fails the test. Every wait is on a real event (HTTP readiness via
+# curl's own retry, process exit via tail --pid), never a fixed delay.
+#
+# A second case runs deflux as a daemon started with a relative `-c` path and
+# the default (relative) database from its own directory, then reloads it with
+# `deflux -s reload`; this is the path on which the replacement used to resolve
+# every relative path against `/` and die.
+set -euo pipefail
 
-set -e
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+WORK_DIR="$(mktemp -d)"
+BACKEND_PORT=${BACKEND_PORT:-18081}
+PROXY_PORT=${PROXY_PORT:-18080}
+PIDS=()
 
-# Color definitions
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
-# Test configuration
-TEST_PORT=18080
-TEST_CONFIG="/tmp/deflux-test-config.toml"
-TEST_DB="/tmp/deflux-test.db"
-DEFLUX_BIN="./target/debug/deflux"
-LOG_FILE="/tmp/deflux-test.log"
-
-# Cleanup function
 cleanup() {
-    echo -e "${YELLOW}Cleaning up test environment...${NC}"
-    pkill -f "deflux.*${TEST_CONFIG}" || true
-    rm -f "$TEST_CONFIG" "$TEST_DB" "$LOG_FILE"
-    rm -f /tmp/deflux-restart.sock
+  touch "$WORK_DIR/stop"
+  for pid in "${PIDS[@]}"; do
+    kill -9 "$pid" 2>/dev/null || true
+    # Reap it here so bash does not print a "Killed" job notice on exit.
+    wait "$pid" 2>/dev/null || true
+  done
+  # Daemons are not children; find them through the pid files they wrote.
+  for pidfile in "$WORK_DIR"/daemon/deflux.pid "$WORK_DIR"/daemon/deflux.pid.old; do
+    [ -f "$pidfile" ] && kill -9 "$(cat "$pidfile")" 2>/dev/null || true
+  done
+  rm -rf "$WORK_DIR"
 }
-
-# Register cleanup trap
 trap cleanup EXIT
 
-# Check the binary
-check_binary() {
-    if [ ! -f "$DEFLUX_BIN" ]; then
-        echo -e "${RED}Error: Deflux binary not found${NC}"
-        echo "Build it first: cargo build -p deflux"
-        exit 1
-    fi
+wait_http() {
+  curl -sf -o /dev/null -m 2 --retry 30 --retry-delay 1 --retry-all-errors --retry-connrefused "$1"
 }
 
-# Create test configuration
-create_test_config() {
-    echo -e "${GREEN}Creating test configuration...${NC}"
-    cat > "$TEST_CONFIG" <<EOF
-[system]
+for tool in curl python3 tail timeout; do
+  command -v "$tool" >/dev/null || { echo "missing tool: $tool"; exit 2; }
+done
+
+echo "building deflux"
+(cd "$ROOT_DIR" && cargo build -q -p deflux)
+# Respect a redirected target directory (CARGO_TARGET_DIR or .cargo/config).
+TARGET_DIR="$(cd "$ROOT_DIR" && cargo metadata --format-version 1 --no-deps \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+DEFLUX="$TARGET_DIR/debug/deflux"
+[ -x "$DEFLUX" ] || { echo "binary not found: $DEFLUX"; exit 2; }
+
+echo "starting backend on 127.0.0.1:$BACKEND_PORT"
+echo ok > "$WORK_DIR/index.html"
+python3 -m http.server "$BACKEND_PORT" --bind 127.0.0.1 --directory "$WORK_DIR" >/dev/null 2>&1 &
+PIDS+=($!)
+wait_http "http://127.0.0.1:$BACKEND_PORT/"
+
+cat > "$WORK_DIR/deflux.toml" <<EOF
 listen_addr = ["127.0.0.1"]
-listen_ports = [$TEST_PORT]
+listen_ports = [$PROXY_PORT]
+upgrade_sock = "$WORK_DIR/upgrade.sock"
+pid_file = "$WORK_DIR/deflux.pid"
+database = "$WORK_DIR/sites.db"
 
-[system.log]
-[system.log.error_log]
-level = "Debug"
+[[upstreams]]
+host = "127.0.0.1"
+port = $BACKEND_PORT
 
-[system.tokio_runtime]
-worker_threads = 2
+[log.error_log]
+level = "info"
 EOF
-}
 
-# Start Deflux
-start_deflux() {
-    echo -e "${GREEN}Starting Deflux (port: $TEST_PORT)...${NC}"
-    RUST_LOG=deflux=debug "$DEFLUX_BIN" -c "$TEST_CONFIG" > "$LOG_FILE" 2>&1 &
-    DEFLUX_PID=$!
+echo "starting deflux on 127.0.0.1:$PROXY_PORT"
+"$DEFLUX" -c "$WORK_DIR/deflux.toml" > "$WORK_DIR/old.log" 2>&1 &
+OLD_PID=$!
+PIDS+=($OLD_PID)
+wait_http "http://127.0.0.1:$PROXY_PORT/"
+echo "old process $OLD_PID is serving"
 
-    # Wait for startup
-    sleep 2
+# Keep requests flowing during the handover and count failures.
+FAILURES="$WORK_DIR/failures"
+: > "$FAILURES"
+(
+  while [ ! -e "$WORK_DIR/stop" ]; do
+    curl -sf -o /dev/null -m 2 "http://127.0.0.1:$PROXY_PORT/" || echo fail >> "$FAILURES"
+  done
+) &
+LOAD_PID=$!
+PIDS+=($LOAD_PID)
 
-    if ! kill -0 $DEFLUX_PID 2>/dev/null; then
-        echo -e "${RED}Error: Deflux failed to start${NC}"
-        cat "$LOG_FILE"
-        exit 1
-    fi
+echo "spawning replacement and handing over the listening sockets"
+"$DEFLUX" -c "$WORK_DIR/deflux.toml" --upgrade > "$WORK_DIR/new.log" 2>&1 &
+NEW_PID=$!
+PIDS+=($NEW_PID)
+kill -QUIT "$OLD_PID"
 
-    echo -e "${GREEN}Deflux started (PID: $DEFLUX_PID)${NC}"
-}
+if ! timeout 60 tail --pid="$OLD_PID" -f /dev/null; then
+  echo "FAIL: old process $OLD_PID did not exit"
+  echo "--- old process log"; tail -40 "$WORK_DIR/old.log"
+  echo "--- replacement log"; tail -40 "$WORK_DIR/new.log"
+  exit 1
+fi
+echo "old process $OLD_PID exited"
 
-# Test connectivity
-test_connection() {
-    local expected_pid=$1
-    echo -e "${YELLOW}Testing connection to 127.0.0.1:$TEST_PORT...${NC}"
+if ! kill -0 "$NEW_PID" 2>/dev/null; then
+  echo "FAIL: replacement process died"
+  cat "$WORK_DIR/new.log"
+  exit 1
+fi
+wait_http "http://127.0.0.1:$PROXY_PORT/"
+echo "replacement process $NEW_PID is serving"
 
-    # Test with netcat or curl
-    if command -v nc &> /dev/null; then
-        timeout 2 bash -c "echo 'GET / HTTP/1.0\r\n\r\n' | nc 127.0.0.1 $TEST_PORT" > /dev/null 2>&1 || true
-    elif command -v curl &> /dev/null; then
-        curl -s --max-time 2 "http://127.0.0.1:$TEST_PORT/" > /dev/null 2>&1 || true
-    else
-        echo -e "${YELLOW}Warning: neither nc nor curl is available, skipping connection test${NC}"
-        return 0
-    fi
+touch "$WORK_DIR/stop"
+wait "$LOAD_PID" || true
 
-    echo -e "${GREEN}Connection test passed${NC}"
-}
+FAILED=$(wc -l < "$FAILURES")
+echo "requests failed during handover: $FAILED"
+if ! grep -q "listener sockets sent" "$WORK_DIR/old.log"; then
+  echo "warning: old process log does not mention the socket transfer"
+  tail -20 "$WORK_DIR/old.log"
+fi
+if [ "$FAILED" -ne 0 ]; then
+  echo "FAIL"
+  exit 1
+fi
+echo "PASS: foreground handover"
 
-# Trigger graceful restart
-trigger_graceful_restart() {
-    echo -e "${GREEN}Triggering graceful restart (sending SIGUSR1)...${NC}"
-    kill -USR1 $DEFLUX_PID
+# Wait for the replacement to finish so the proxy port is free again.
+kill "$NEW_PID"
+timeout 60 tail --pid="$NEW_PID" -f /dev/null || true
 
-    # Wait briefly for the new process to start
-    sleep 3
+# --- Daemon mode with relative paths -------------------------------------
+# Everything relative, resolved against the directory deflux is started from:
+# the config path, the default database (sites.db), the pid file, the upgrade
+# socket and the error log. `user`/`group` stay unset so no root is needed.
+DAEMON_DIR="$WORK_DIR/daemon"
+mkdir -p "$DAEMON_DIR"
+cat > "$DAEMON_DIR/deflux.toml" <<EOF
+listen_addr = ["127.0.0.1"]
+listen_ports = [$PROXY_PORT]
+upgrade_sock = "upgrade.sock"
+pid_file = "deflux.pid"
+grace_period_secs = 2
 
-    # Find the new process
-    NEW_PID=$(pgrep -f "deflux.*${TEST_CONFIG}" | grep -v "^${DEFLUX_PID}$" | head -1 || true)
+[[upstreams]]
+host = "127.0.0.1"
+port = $BACKEND_PORT
 
-    if [ -z "$NEW_PID" ]; then
-        echo -e "${RED}Error: new process not found${NC}"
-        echo -e "${YELLOW}Old process PID: $DEFLUX_PID${NC}"
-        echo -e "${YELLOW}Log contents:${NC}"
-        tail -50 "$LOG_FILE"
-        exit 1
-    fi
+[log.error_log]
+level = "info"
+path = "daemon.log"
+EOF
 
-    echo -e "${GREEN}New process started (PID: $NEW_PID)${NC}"
-    echo -e "${YELLOW}Old process PID: $DEFLUX_PID, new process PID: $NEW_PID${NC}"
+echo "starting deflux as a daemon from $DAEMON_DIR with relative paths"
+(cd "$DAEMON_DIR" && "$DEFLUX" -c deflux.toml -d)
+wait_http "http://127.0.0.1:$PROXY_PORT/"
+DAEMON_PID=$(cat "$DAEMON_DIR/deflux.pid")
+[ -f "$DAEMON_DIR/sites.db" ] || { echo "FAIL: database not created next to the config"; exit 1; }
+echo "daemon $DAEMON_PID is serving"
 
-    # Wait for the old process to exit
-    local wait_count=0
-    while kill -0 $DEFLUX_PID 2>/dev/null; do
-        sleep 1
-        wait_count=$((wait_count + 1))
-        if [ $wait_count -gt 10 ]; then
-            echo -e "${YELLOW}Warning: old process still alive after 10 seconds${NC}"
-            break
-        fi
-    done
+: > "$FAILURES"
+(
+  while [ ! -e "$WORK_DIR/stop" ]; do
+    curl -sf -o /dev/null -m 2 "http://127.0.0.1:$PROXY_PORT/" || echo fail >> "$FAILURES"
+  done
+) &
+LOAD_PID=$!
+PIDS+=($LOAD_PID)
 
-    if kill -0 $DEFLUX_PID 2>/dev/null; then
-        echo -e "${YELLOW}Old process is still running, possibly waiting for connections to close${NC}"
-    else
-        echo -e "${GREEN}Old process exited${NC}"
-    fi
+echo "reloading the daemon with -s reload"
+(cd "$DAEMON_DIR" && "$DEFLUX" -c deflux.toml -s reload)
 
-    # Update PID to the new process
-    DEFLUX_PID=$NEW_PID
-}
+if ! timeout 60 tail --pid="$DAEMON_PID" -f /dev/null; then
+  echo "FAIL: old daemon $DAEMON_PID did not exit"
+  tail -40 "$DAEMON_DIR/daemon.log"
+  exit 1
+fi
+echo "old daemon $DAEMON_PID exited"
 
-# Verify logs
-verify_logs() {
-    echo -e "${YELLOW}Verifying logs...${NC}"
+NEW_DAEMON_PID=$(cat "$DAEMON_DIR/deflux.pid")
+if [ "$NEW_DAEMON_PID" = "$DAEMON_PID" ] || ! kill -0 "$NEW_DAEMON_PID" 2>/dev/null; then
+  echo "FAIL: no replacement daemon (pid file says $NEW_DAEMON_PID)"
+  tail -40 "$DAEMON_DIR/daemon.log"
+  exit 1
+fi
+wait_http "http://127.0.0.1:$PROXY_PORT/"
+echo "replacement daemon $NEW_DAEMON_PID is serving"
 
-    local expected_logs=(
-        "Received SIGUSR1, initiating graceful restart"
-        "Extracted.*FDs for transfer"
-        "Spawned new process with PID"
-        "Detected graceful restart, receiving listeners from parent"
-        "Child process: received.*FDs"
-        "successfully rebuilt.*listeners"
-    )
+touch "$WORK_DIR/stop"
+wait "$LOAD_PID" || true
+rm -f "$WORK_DIR/stop"
 
-    local missing_logs=0
-    for log_pattern in "${expected_logs[@]}"; do
-        if ! grep -q "$log_pattern" "$LOG_FILE"; then
-            echo -e "${RED}  ✗ Missing log: $log_pattern${NC}"
-            missing_logs=$((missing_logs + 1))
-        else
-            echo -e "${GREEN}  ✓ Found log: $log_pattern${NC}"
-        fi
-    done
-
-    if [ $missing_logs -gt 0 ]; then
-        echo -e "${RED}Warning: $missing_logs expected log entries not found${NC}"
-        echo -e "${YELLOW}Full log:${NC}"
-        cat "$LOG_FILE"
-        return 1
-    fi
-
-    echo -e "${GREEN}Log verification passed${NC}"
-}
-
-# Main test flow
-main() {
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}Deflux Graceful Restart Integration Test${NC}"
-    echo -e "${GREEN}========================================${NC}"
-
-    # Step 1: check and prepare
-    check_binary
-    cleanup
-    create_test_config
-
-    # Step 2: start the initial process
-    start_deflux
-    OLD_PID=$DEFLUX_PID
-
-    # Step 3: test initial connectivity
-    test_connection $OLD_PID
-
-    # Step 4: trigger graceful restart
-    trigger_graceful_restart
-
-    # Step 5: test connectivity after restart
-    sleep 2
-    test_connection $DEFLUX_PID
-
-    # Step 6: verify logs
-    if verify_logs; then
-        echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}✓ All tests passed!${NC}"
-        echo -e "${GREEN}========================================${NC}"
-    else
-        echo -e "${YELLOW}========================================${NC}"
-        echo -e "${YELLOW}⚠ Tests finished with warnings${NC}"
-        echo -e "${YELLOW}========================================${NC}"
-    fi
-
-    # Step 7: cleanup
-    echo -e "${YELLOW}Stopping Deflux...${NC}"
-    kill -TERM $DEFLUX_PID 2>/dev/null || true
-    sleep 2
-
-    echo -e "${GREEN}Test finished${NC}"
-}
-
-# Run the main test
-main
+FAILED=$(wc -l < "$FAILURES")
+echo "requests failed during daemon reload: $FAILED"
+if ! grep -q "replacement process is ready" "$DAEMON_DIR/daemon.log"; then
+  echo "warning: daemon log does not mention the readiness handshake"
+  tail -20 "$DAEMON_DIR/daemon.log"
+fi
+if [ "$FAILED" -ne 0 ]; then
+  echo "FAIL"
+  exit 1
+fi
+echo "PASS: daemon reload with relative paths"

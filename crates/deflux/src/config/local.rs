@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::{system::SystemConfig, ConfigError, Validatable};
+use crate::config::{ConfigError, Validatable, system::SystemConfig};
 
 pub(crate) struct LocalConfig(SystemConfig);
 

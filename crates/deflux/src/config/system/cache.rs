@@ -11,7 +11,10 @@
 
 use std::str::FromStr;
 
-use crate::config::{util::{CacheKeys, SizeValue}, ConfigError, Validatable};
+use crate::config::{
+    ConfigError, Validatable,
+    util::{CacheKeys, SizeValue},
+};
 use serde::{Deserialize, Serialize};
 
 /// Cache configuration
@@ -33,10 +36,14 @@ impl Default for CacheConfig {
 impl Validatable for CacheConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.default_cache_key.0.is_empty() {
-            return Err(ConfigError::ValidationError { message: "proxy cache key is empty".to_string() });
+            return Err(ConfigError::ValidationError {
+                message: "proxy cache key is empty".to_string(),
+            });
         }
         if self.max_cache_size.as_bytes() == 0 {
-            return Err(ConfigError::ValidationError { message: "max cache size is empty".to_string() });
+            return Err(ConfigError::ValidationError {
+                message: "max cache size is empty".to_string(),
+            });
         }
         Ok(())
     }

@@ -1,49 +1,51 @@
-//! Command Line Interface for Deflux
-//!
-//! This module handles all command line argument parsing and related operations.
+//! Command line interface.
 
-use anyhow::{anyhow, Context, Result};
 use std::env;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::process;
 
-/// CLI configuration structure
+use anyhow::{Context, Result, anyhow};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+
+use crate::config::{ConfigManager, SystemConfig};
+
 #[derive(Debug, Clone)]
 pub struct CliConfig {
-    /// Configuration file path
+    /// Configuration file path, made absolute at parse time so that log
+    /// lines and relaunches never depend on the working directory.
     pub config_file: PathBuf,
-    /// Whether to run as a daemon
+    /// Detach and run in the background.
     pub daemon: bool,
-    /// Action to perform
+    /// Take over the listening sockets of a running instance.
+    pub upgrade: bool,
+    /// Inherited pipe to write one byte to once startup has succeeded and
+    /// the upgrade socket is about to be opened. Set by the process that
+    /// spawned this one for an upgrade; see [`crate::restart`].
+    pub ready_fd: Option<RawFd>,
     pub action: CliAction,
 }
 
-/// Available CLI actions
 #[derive(Debug, Clone)]
 pub enum CliAction {
-    /// Start the server normally
     Start,
-    /// Print help information
     Help,
-    /// Print version information
     Version,
-    /// Test configuration file syntax
+    /// Parse the configuration file and exit.
     TestConfig,
-    /// Send signal to main process
+    /// Signal the running instance named by the configuration's PID file.
     Signal(SignalType),
 }
 
-/// Signal types for process control
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalType {
-    /// Fast shutdown - immediately terminate all processes
+    /// Exit immediately, dropping in-flight requests.
     Stop,
-    /// Graceful shutdown - wait for requests to complete
+    /// Stop accepting connections, exit once in-flight requests finish.
     Quit,
-    /// Hot reload configuration - start new process, graceful switch
+    /// Start a replacement process and hand the listening sockets to it.
     Reload,
-    /// Reopen log files - for log rotation
-    Reopen,
 }
 
 impl Default for CliConfig {
@@ -51,20 +53,27 @@ impl Default for CliConfig {
         Self {
             config_file: PathBuf::from("config.toml"),
             daemon: false,
+            upgrade: false,
+            ready_fd: None,
             action: CliAction::Start,
         }
     }
 }
 
 impl CliConfig {
-    /// Parse command line arguments
     pub fn parse() -> Result<Self> {
-        let args: Vec<String> = env::args().collect();
+        Self::parse_from(env::args().skip(1))
+    }
+
+    pub fn parse_from<I, S>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let mut config = Self::default();
-        
-        let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_ref() {
                 "-?" | "-h" | "--help" => {
                     config.action = CliAction::Help;
                     return Ok(config);
@@ -73,85 +82,127 @@ impl CliConfig {
                     config.action = CliAction::Version;
                     return Ok(config);
                 }
-                "-t" | "--test" => {
-                    config.action = CliAction::TestConfig;
-                }
-                "-d" | "--daemon" => {
-                    config.daemon = true;
-                }
+                "-t" | "--test" => config.action = CliAction::TestConfig,
+                "-d" | "--daemon" => config.daemon = true,
+                "-u" | "--upgrade" => config.upgrade = true,
                 "-c" | "--config" => {
-                    i += 1;
-                    if i >= args.len() {
-                        return Err(anyhow!("Option -c requires a configuration file path"));
-                    }
-                    config.config_file = PathBuf::from(&args[i]);
+                    let path = args
+                        .next()
+                        .ok_or_else(|| anyhow!("option -c requires a configuration file path"))?;
+                    config.config_file = PathBuf::from(path.as_ref());
                 }
                 "-s" | "--signal" => {
-                    i += 1;
-                    if i >= args.len() {
-                        return Err(anyhow!("Option -s requires a signal name"));
-                    }
-                    let signal = Self::parse_signal(&args[i])?;
-                    config.action = CliAction::Signal(signal);
-                    return Ok(config);
+                    let name = args
+                        .next()
+                        .ok_or_else(|| anyhow!("option -s requires a signal name"))?;
+                    config.action = CliAction::Signal(Self::parse_signal(name.as_ref())?);
                 }
-                arg if arg.starts_with('-') => {
-                    return Err(anyhow!("Unknown option: {}", arg));
+                "--ready-fd" => {
+                    let fd = args
+                        .next()
+                        .ok_or_else(|| anyhow!("option --ready-fd requires a descriptor"))?;
+                    let fd: RawFd = fd
+                        .as_ref()
+                        .parse()
+                        .map_err(|_| anyhow!("invalid --ready-fd value: {}", fd.as_ref()))?;
+                    config.ready_fd = Some(fd);
                 }
-                // Reject any positional arguments
-                positional_arg => {
-                    return Err(anyhow!("Unexpected argument: {}. Use -c to specify config file.", positional_arg));
+                other if other.starts_with('-') => return Err(anyhow!("unknown option: {other}")),
+                other => {
+                    return Err(anyhow!(
+                        "unexpected argument: {other}; use -c to specify the config file"
+                    ));
                 }
             }
-            i += 1;
         }
-
+        // Absolute, but without resolving symlinks: a deployment that
+        // re-points a config.toml link must see the new target on reload.
+        config.config_file = std::path::absolute(&config.config_file).with_context(|| {
+            format!(
+                "resolving configuration file path {}",
+                config.config_file.display()
+            )
+        })?;
         Ok(config)
     }
 
-    /// Parse signal type from string
-    fn parse_signal(signal: &str) -> Result<SignalType> {
-        match signal.to_lowercase().as_str() {
-            "stop" => Ok(SignalType::Stop), // SIGTERM stop, kill -15, will exit immediately
-            "quit" => Ok(SignalType::Quit), // SIGQUIT quit, kill -3, will wait for requests to complete
-            "reload" => Ok(SignalType::Reload), // SIGUSR1 reload, kill -10, will reload configuration
-            "reopen" => Ok(SignalType::Reopen), // SIGUSR2 reopen, kill -12, will reopen log files
+    fn parse_signal(name: &str) -> Result<SignalType> {
+        match name.to_lowercase().as_str() {
+            "stop" => Ok(SignalType::Stop),
+            "quit" => Ok(SignalType::Quit),
+            "reload" => Ok(SignalType::Reload),
             _ => Err(anyhow!(
-                "Invalid signal '{}'. Valid signals: stop, quit, reload, reopen",
-                signal
+                "invalid signal '{name}'; valid signals: stop, quit, reload"
             )),
         }
     }
 
-    /// Execute the CLI action
-    pub async fn execute(&self) -> Result<()> {
+    /// Carry out any action other than starting the server, then exit.
+    pub fn execute(&self) -> Result<()> {
         match &self.action {
             CliAction::Help => {
                 Self::print_help();
                 process::exit(0);
             }
             CliAction::Version => {
-                Self::print_version();
+                println!("Deflux v{}", env!("CARGO_PKG_VERSION"));
                 process::exit(0);
             }
             CliAction::TestConfig => {
-                self.test_config().await?;
+                self.load_config()?;
+                println!("Configuration file syntax is OK");
                 process::exit(0);
             }
             CliAction::Signal(signal) => {
-                self.send_signal(signal).await?;
+                self.send_signal(*signal)?;
                 process::exit(0);
             }
-            CliAction::Start => {
-                // Normal startup - no action needed here
-                Ok(())
-            }
+            CliAction::Start => Ok(()),
         }
     }
 
-    /// Print help information
+    fn load_config(&self) -> Result<SystemConfig> {
+        if !self.config_file.exists() {
+            return Err(anyhow!(
+                "configuration file does not exist: {}",
+                self.config_file.display()
+            ));
+        }
+        ConfigManager::load_system_config(&self.config_file).with_context(|| {
+            format!(
+                "failed to parse configuration file {}",
+                self.config_file.display()
+            )
+        })
+    }
+
+    fn send_signal(&self, signal: SignalType) -> Result<()> {
+        let config = self.load_config()?;
+        let pid_file = config.pid_file();
+        let pid_text = std::fs::read_to_string(pid_file).with_context(|| {
+            format!("reading PID file {pid_file}; is deflux running as a daemon?")
+        })?;
+        let pid: i32 = pid_text
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid PID in {pid_file}: {}", pid_text.trim()))?;
+
+        let unix_signal = match signal {
+            SignalType::Stop => Signal::SIGINT,
+            SignalType::Quit => Signal::SIGTERM,
+            SignalType::Reload => Signal::SIGUSR1,
+        };
+        println!("Sending {unix_signal} to process {pid}");
+        kill(Pid::from_raw(pid), unix_signal)
+            .with_context(|| format!("sending {unix_signal} to process {pid}"))?;
+        Ok(())
+    }
+
     fn print_help() {
-        println!("Deflux - Managed Load Balancer Server v{}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "Deflux - managed multi-site reverse proxy v{}",
+            env!("CARGO_PKG_VERSION")
+        );
         println!();
         println!("USAGE:");
         println!("    deflux [OPTIONS]");
@@ -159,132 +210,25 @@ impl CliConfig {
         println!("OPTIONS:");
         println!("    -?, -h, --help         Print this help message");
         println!("    -v, --version          Print version information");
-        println!("    -d, --daemon           Run as a daemon (in the background)");
-        println!("    -c, --config <FILE>    Specify configuration file (default: config.toml)");
-        println!("    -t, --test             Test configuration file syntax and exit");
-        println!("    -s, --signal <SIGNAL>  Send signal to main process");
+        println!("    -c, --config <FILE>    Configuration file (default: config.toml)");
+        println!("    -d, --daemon           Run in the background");
+        println!(
+            "    -u, --upgrade          Take over the listening sockets of a running instance"
+        );
+        println!("    -t, --test             Check the configuration file and exit");
+        println!(
+            "    -s, --signal <SIGNAL>  Signal the running daemon (uses pid_file from the config)"
+        );
         println!();
         println!("SIGNALS:");
-        println!("    stop      Fast shutdown - immediately terminate all processes");
-        println!("    quit      Graceful shutdown - wait for requests to complete");
-        println!("    reload    Hot reload configuration - start new process, graceful switch");
-        println!("    reopen    Reopen log files - for log rotation");
+        println!("    stop      Exit immediately");
+        println!("    quit      Stop accepting connections, exit when in-flight requests finish");
+        println!("    reload    Start a replacement process and hand the listening sockets to it");
         println!();
         println!("EXAMPLES:");
-        println!("    deflux");
         println!("    deflux -c /etc/deflux/config.toml");
-        println!("    deflux -t -c /etc/deflux/config.toml");
-        println!("    deflux -s reload");
-        println!("    deflux -s quit");
-    }
-
-    /// Print version information
-    fn print_version() {
-        println!("Deflux v{}", env!("CARGO_PKG_VERSION"));
-        // Note: RUSTC_VERSION and TARGET are not always available at compile time
-        #[cfg(debug_assertions)]
-        println!("Debug build");
-        #[cfg(not(debug_assertions))]
-        println!("Release build");
-    }
-
-    /// Test configuration file syntax
-    async fn test_config(&self) -> Result<()> {
-        use crate::config::LocalConfig;
-        
-        println!("Testing configuration file: {}", self.config_file.display());
-        
-        // Test if file exists
-        if !self.config_file.exists() {
-            return Err(anyhow!(
-                "Configuration file does not exist: {}",
-                self.config_file.display()
-            ));
-        }
-
-        // Try to parse the configuration file
-        let _config = LocalConfig::from_toml(self.config_file.clone())
-            .with_context(|| {
-                format!(
-                    "Failed to parse configuration file: {}",
-                    self.config_file.display()
-                )
-            })?;
-
-        println!("Configuration file syntax is OK");
-        Ok(())
-    }
-
-    /// Send signal to main process
-    async fn send_signal(&self, signal: &SignalType) -> Result<()> {
-        use std::fs;
-
-        // Try to read PID file (common convention)
-        let pid_file = if PathBuf::from("/var/run/deflux.pid").exists() {
-            PathBuf::from("/var/run/deflux.pid")
-        } else {
-            PathBuf::from("deflux.pid")
-        };
-
-        if !pid_file.exists() {
-            return Err(anyhow!(
-                "PID file not found: {}. Is Deflux running?",
-                pid_file.display()
-            ));
-        }
-
-        let pid_str = fs::read_to_string(&pid_file)
-            .with_context(|| format!("Failed to read PID file: {}", pid_file.display()))?;
-
-        let pid: u32 = pid_str.trim().parse()
-            .with_context(|| format!("Invalid PID in file: {}", pid_str.trim()))?;
-
-        println!("Sending {} signal to process {}", Self::signal_name(signal), pid);
-
-        // On Unix systems, we would use the signal syscall
-        // For now, this is a placeholder implementation
-        #[cfg(unix)]
-        {
-            self.send_unix_signal(pid, signal).await?;
-        }
-
-        #[cfg(not(unix))]
-        {
-            return Err(anyhow!("Signal sending is only supported on Unix systems"));
-        }
-
-        println!("Signal sent successfully");
-        Ok(())
-    }
-
-    /// Send Unix signal to process
-    #[cfg(unix)]
-    async fn send_unix_signal(&self, pid: u32, signal: &SignalType) -> Result<()> {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-
-        let unix_signal = match signal {
-            SignalType::Stop => Signal::SIGTERM,
-            SignalType::Quit => Signal::SIGQUIT,
-            SignalType::Reload => Signal::SIGUSR1, // Common convention for reload
-            SignalType::Reopen => Signal::SIGUSR2, // Common convention for reopen
-        };
-
-        let pid = Pid::from_raw(pid as i32);
-        signal::kill(pid, unix_signal)
-            .with_context(|| format!("Failed to send signal to process {}", pid))?;
-
-        Ok(())
-    }
-
-    /// Get human-readable signal name
-    fn signal_name(signal: &SignalType) -> &'static str {
-        match signal {
-            SignalType::Stop => "STOP",
-            SignalType::Quit => "QUIT",
-            SignalType::Reload => "RELOAD",
-            SignalType::Reopen => "REOPEN",
-        }
+        println!("    deflux -c /etc/deflux/config.toml -d");
+        println!("    deflux -c /etc/deflux/config.toml -s reload");
     }
 }
 
@@ -293,31 +237,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_signal_parsing() {
-        assert!(matches!(
-            CliConfig::parse_signal("stop").unwrap(),
-            SignalType::Stop
-        ));
-        assert!(matches!(
-            CliConfig::parse_signal("QUIT").unwrap(),
-            SignalType::Quit
-        ));
-        assert!(matches!(
+    fn parses_signals() {
+        assert_eq!(CliConfig::parse_signal("stop").unwrap(), SignalType::Stop);
+        assert_eq!(CliConfig::parse_signal("QUIT").unwrap(), SignalType::Quit);
+        assert_eq!(
             CliConfig::parse_signal("reload").unwrap(),
             SignalType::Reload
-        ));
-        assert!(matches!(
-            CliConfig::parse_signal("reopen").unwrap(),
-            SignalType::Reopen
-        ));
-        
-        assert!(CliConfig::parse_signal("invalid").is_err());
+        );
+        assert!(CliConfig::parse_signal("reopen").is_err());
     }
 
     #[test]
-    fn test_default_config() {
+    fn parses_flags() {
+        let config = CliConfig::parse_from(["-c", "/tmp/x.toml", "--upgrade", "-d"]).unwrap();
+        assert_eq!(config.config_file, PathBuf::from("/tmp/x.toml"));
+        assert!(config.upgrade);
+        assert!(config.daemon);
+        assert!(config.ready_fd.is_none());
+        assert!(matches!(config.action, CliAction::Start));
+    }
+
+    #[test]
+    fn parses_ready_fd() {
+        let config = CliConfig::parse_from(["--ready-fd", "7"]).unwrap();
+        assert_eq!(config.ready_fd, Some(7));
+        assert!(CliConfig::parse_from(["--ready-fd", "seven"]).is_err());
+        assert!(CliConfig::parse_from(["--ready-fd"]).is_err());
+    }
+
+    #[test]
+    fn makes_relative_config_paths_absolute() {
+        let config = CliConfig::parse_from(["-c", "etc/deflux.toml"]).unwrap();
+        assert!(config.config_file.is_absolute());
+        assert!(config.config_file.ends_with("etc/deflux.toml"));
+
+        let config = CliConfig::parse_from(Vec::<&str>::new()).unwrap();
+        assert!(config.config_file.is_absolute());
+        assert!(config.config_file.ends_with("config.toml"));
+    }
+
+    #[test]
+    fn rejects_positional_and_unknown() {
+        assert!(CliConfig::parse_from(["config.toml"]).is_err());
+        assert!(CliConfig::parse_from(["--bogus"]).is_err());
+        assert!(CliConfig::parse_from(["-c"]).is_err());
+    }
+
+    #[test]
+    fn default_config() {
         let config = CliConfig::default();
         assert_eq!(config.config_file, PathBuf::from("config.toml"));
         assert!(matches!(config.action, CliAction::Start));
     }
-} 
+}

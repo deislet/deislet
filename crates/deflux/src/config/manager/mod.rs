@@ -1,184 +1,224 @@
 pub mod database;
 
-use crate::config::{LocalConfig, SystemConfig, error::ConfigError};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 
-pub use database::{ConfigDatabase, DatabaseError, AppConfigEntry};
+use crate::config::{
+    AppConfig, ConfigError, LocalConfig, RouteTable, SupervisorSystemConfig, SystemConfig,
+    Validatable,
+};
 
+pub use database::{AppConfigEntry, ConfigDatabase, DatabaseError};
 
-/// Configuration manager that handles the complete configuration lifecycle
+/// Configuration manager that owns the complete configuration lifecycle.
 ///
-/// Manages:
-/// - System config layering: default + local + supervisor
-/// - App config storage using ArcSwap<HashMap<AppId, JsonValue>>
-/// - Database persistence and incremental updates from supervisor
+/// - System config: baseline + local file (+ supervisor overlay), swapped
+///   atomically so readers never block.
+/// - App configs: persisted in the database, mirrored in memory, and
+///   compiled into a [`RouteTable`] whenever they change.
 pub struct ConfigManager {
-    /// System configuration, finally, it is the default config + local config + supervisor config
-    system_config: Arc<RwLock<SystemConfig>>,
-    /// App configurations using ArcSwap for atomic updates
-    /// Key: app_id, Value: app configuration as JSON
+    system_config: ArcSwap<SystemConfig>,
+    /// Raw app configurations keyed by app id, as pushed by the supervisor.
     app_configs: Arc<ArcSwap<HashMap<String, JsonValue>>>,
-    /// Last known app config version timestamp
-    app_configs_ver: Arc<RwLock<DateTime<Utc>>>,
-    /// Database handle for persistence
-    local_database: Arc<RwLock<ConfigDatabase>>,
+    /// Lookup structures derived from `app_configs`.
+    routes: ArcSwap<RouteTable>,
+    /// Version timestamp of the newest app config applied.
+    app_configs_ver: RwLock<DateTime<Utc>>,
+    local_database: RwLock<ConfigDatabase>,
 }
 
 impl ConfigManager {
-    /// Initialize the config manager by loading the local config and database
-    /// 
-    /// # Arguments
-    /// * `local_config_path` - Path to local config.toml file
-    /// * `local_database` - Database handle for persistence
-    /// 
-    /// # Returns
-    pub async fn new(
-        local_config_path: PathBuf,
-        local_database: ConfigDatabase,
-    ) -> Result<Self, ConfigError> {
-        // Load local config
-        let local_config = LocalConfig::from_toml(local_config_path)?;
-        // System config = the default config + local config
-        let system_config = SystemConfig::default() + local_config.get_system_config();
+    /// Load the local configuration file, open the database it names, and
+    /// build the initial route table.
+    pub async fn new(local_config_path: PathBuf) -> Result<Self, ConfigError> {
+        let system_config = Self::load_system_config(&local_config_path)?;
+        Self::with_system_config(system_config).await
+    }
 
-        // Load init app configs from database
-        let local_database = Arc::new(RwLock::new(local_database));
-        let app_configs: HashMap<String, JsonValue> = local_database
-            .read()
-            .await
-            .load_all_app_configs()
-            .await?;
-        let latest_app_configs_version = local_database
-            .read()
-            .await
-            .get_latest_version_timestamp()
-            .await?;
+    /// Layer the local configuration file onto the baseline, with every
+    /// relative path resolved against the current working directory. This is
+    /// the only step that touches the file, so callers can initialize logging
+    /// from the result before [`Self::with_system_config`] opens the database
+    /// and loads certificates.
+    pub fn load_system_config(local_config_path: &Path) -> Result<SystemConfig, ConfigError> {
+        let local_config = LocalConfig::from_toml(local_config_path.to_path_buf())?;
+        let mut system_config = SystemConfig::baseline() + local_config.get_system_config();
+        system_config.resolve_paths(&std::env::current_dir()?);
+        // The file was validated on its own; the merge can still combine a
+        // local value with a baseline one into something invalid (a port in
+        // both listen_ports and tls.ports, say), so validate the result too.
+        system_config.validate()?;
+        Ok(system_config)
+    }
+
+    /// Open the database named by an already loaded system configuration and
+    /// build the initial route table.
+    pub async fn with_system_config(system_config: SystemConfig) -> Result<Self, ConfigError> {
+        let local_database = ConfigDatabase::init(system_config.database()).await?;
+        let app_configs = local_database.load_all_app_configs().await?;
+        let latest_version = local_database.get_latest_version_timestamp().await?;
+        info!(
+            database = system_config.database(),
+            apps = app_configs.len(),
+            "app configurations loaded"
+        );
+
+        let routes = RouteTable::build(
+            &app_configs,
+            system_config
+                .tls
+                .as_ref()
+                .and_then(|t| t.default_certificate.as_ref()),
+        );
 
         Ok(Self {
-            system_config: Arc::new(RwLock::new(system_config)),
+            system_config: ArcSwap::from_pointee(system_config),
             app_configs: Arc::new(ArcSwap::from_pointee(app_configs)),
-            app_configs_ver: Arc::new(RwLock::new(latest_app_configs_version)),
-            local_database
+            routes: ArcSwap::from_pointee(routes),
+            app_configs_ver: RwLock::new(latest_version),
+            local_database: RwLock::new(local_database),
         })
     }
 
-    /// Update the app configurations by applying the incremental updates from supervisor
-    /// 
-    /// # Arguments
-    /// * `updates` - The incremental updates from supervisor
-    /// 
-    /// # Returns
-    /// * `DateTime<Utc>` - The latest version timestamp
-    pub async fn update_app_configs(&self, updates: Vec<AppConfigEntry>) -> Result<DateTime<Utc>, ConfigError> {
+    /// Apply incremental app config updates from the supervisor, persist
+    /// them, and rebuild the route table.
+    pub async fn update_app_configs(
+        &self,
+        updates: Vec<AppConfigEntry>,
+    ) -> Result<DateTime<Utc>, ConfigError> {
         if updates.is_empty() {
-            return Err(ConfigError::ValidationError { 
-                message: "No updates provided".to_string() 
+            return Err(ConfigError::ValidationError {
+                message: "No updates provided".to_string(),
             });
         }
 
-        // Clone the Arc references for use in closure
-        let app_configs_arc = Arc::clone(&self.app_configs);
-        let app_configs_ver_arc = Arc::clone(&self.app_configs_ver);
-        
-        // Get the latest version timestamp from updates
-        let latest_version_timestamp = updates.iter()
+        let latest_version = updates
+            .iter()
             .map(|update| update.version_timestamp)
             .max()
             .ok_or_else(|| ConfigError::ValidationError {
                 message: "No updates provided to apply".to_string(),
             })?;
 
+        let app_configs = Arc::clone(&self.app_configs);
         let result_timestamp = {
             let mut db = self.local_database.write().await;
-            db.apply_incremental_updates(updates, |app_configs| {
-                // Update ArcSwap cache (app_configs)
-                app_configs_arc.store(Arc::new(app_configs.clone()));
+            db.apply_incremental_updates(updates, |configs| {
+                app_configs.store(Arc::new(configs.clone()));
                 Ok::<(), DatabaseError>(())
-            }).await?
+            })
+            .await?
         };
 
-        // Update app configs version
-        {
-            let mut app_configs_ver = app_configs_ver_arc.write().await;
-            *app_configs_ver = latest_version_timestamp;
-        }
-
+        *self.app_configs_ver.write().await = latest_version;
+        self.rebuild_routes();
         Ok(result_timestamp)
     }
 
-    /// Get the current system configuration
-    /// 
-    /// # Returns
-    /// * `SystemConfig` - The current system configuration
-    pub async fn get_system_config(&self) -> SystemConfig {
-        let system_config = self.system_config.read().await;
-        system_config.clone()
+    /// Replace the whole application list, persist it, and rebuild the route
+    /// table. Apps missing from `apps` are removed.
+    pub async fn replace_app_configs(
+        &self,
+        apps: Vec<AppConfig>,
+        version: DateTime<Utc>,
+    ) -> Result<(), ConfigError> {
+        let mut configs = HashMap::with_capacity(apps.len());
+        for app in apps {
+            app.validate()?;
+            let id = app.id.clone();
+            configs.insert(id, serde_json::to_value(app)?);
+        }
+
+        {
+            let mut db = self.local_database.write().await;
+            db.save_all_app_configs(&configs, version).await?;
+        }
+        let count = configs.len();
+        self.app_configs.store(Arc::new(configs));
+        *self.app_configs_ver.write().await = version;
+        info!(apps = count, %version, "app configurations replaced");
+        self.rebuild_routes();
+        Ok(())
     }
 
-    /// Get the current app configurations as a snapshot
+    /// Layer a supervisor overlay onto the running system configuration.
     ///
-    /// # Returns
-    /// * `HashMap<String, JsonValue>` - The current app configurations
+    /// Only traffic policy can change this way; the overlay type already
+    /// strips everything else. The balancing strategy is fixed per process,
+    /// so a change there is recorded but only takes effect after a restart.
+    pub fn apply_system_overlay(&self, overlay: SupervisorSystemConfig) -> Result<(), ConfigError> {
+        let current = self.system_config.load_full();
+        let merged = (*current).clone() + overlay.get_system_config();
+        merged.validate()?;
+        if merged.balancing_strategy() != current.balancing_strategy() {
+            warn!(
+                active = %current.balancing_strategy(),
+                requested = %merged.balancing_strategy(),
+                "balancing strategy changed by supervisor; restart to apply"
+            );
+        }
+        self.system_config.store(Arc::new(merged));
+        info!("system configuration overlay applied");
+        self.rebuild_routes();
+        Ok(())
+    }
+
+    /// Recompile the route table from the current app configurations.
+    pub fn rebuild_routes(&self) {
+        let system = self.system_config.load();
+        let apps = self.app_configs.load();
+        let routes = RouteTable::build(
+            &apps,
+            system
+                .tls
+                .as_ref()
+                .and_then(|t| t.default_certificate.as_ref()),
+        );
+        info!(apps = routes.len(), "route table rebuilt");
+        self.routes.store(Arc::new(routes));
+    }
+
+    /// Current system configuration snapshot.
+    pub fn get_system_config(&self) -> Arc<SystemConfig> {
+        self.system_config.load_full()
+    }
+
+    /// Current route table snapshot.
+    pub fn routes(&self) -> Arc<RouteTable> {
+        self.routes.load_full()
+    }
+
     pub fn get_app_configs(&self) -> HashMap<String, JsonValue> {
         (**self.app_configs.load()).clone()
     }
 
-    /// Get a specific app configuration
-    ///
-    /// # Arguments
-    /// * `app_id` - The app ID to get configuration for
-    ///
-    /// # Returns
-    /// * `Option<JsonValue>` - The app configuration if found
     pub fn get_app_config(&self, app_id: &str) -> Option<JsonValue> {
         self.app_configs.load().get(app_id).cloned()
     }
 
-    /// Check if an app exists
-    ///
-    /// # Arguments
-    /// * `app_id` - The app ID to check
-    ///
-    /// # Returns
-    /// * `bool` - True if the app exists
     pub fn has_app(&self, app_id: &str) -> bool {
         self.app_configs.load().contains_key(app_id)
     }
 
-    /// Get the number of configured apps
-    ///
-    /// # Returns
-    /// * `usize` - Number of apps
     pub fn get_app_count(&self) -> usize {
         self.app_configs.load().len()
     }
 
-    /// Get all app IDs
-    ///
-    /// # Returns
-    /// * `Vec<String>` - List of all app IDs
     pub fn get_app_ids(&self) -> Vec<String> {
         self.app_configs.load().keys().cloned().collect()
     }
 
-    /// Get the ArcSwap reference for direct access by business logic
-    ///
-    /// # Returns
-    /// * `&Arc<ArcSwap<HashMap<String, JsonValue>>>` - Direct reference to ArcSwap
     pub fn get_app_configs_arc(&self) -> &Arc<ArcSwap<HashMap<String, JsonValue>>> {
         &self.app_configs
     }
 
-    /// Get the latest app configurations version timestamp
-    /// 
-    /// # Returns
-    /// * `DateTime<Utc>` - The latest app configurations version timestamp
     pub async fn get_app_configs_ver(&self) -> DateTime<Utc> {
         *self.app_configs_ver.read().await
     }

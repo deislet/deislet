@@ -1,15 +1,16 @@
-//! Superv configuration structures pushed from supervisor
-//!
-//! This module defines the supervisor configuration that is pushed from
-//! the supervisor service and stored in the database.
+//! Configuration layers pushed by the supervisor.
 
 use serde::{Deserialize, Serialize};
 
-use crate::{config::{system::SystemConfig, ConfigError, Validatable}};
-
 use crate::config::apps::AppConfig;
+use crate::config::{ConfigError, Validatable, system::SystemConfig};
 
-/// Supervisor configuration managed by supervisor
+/// System configuration overlay received from the supervisor.
+///
+/// Only traffic policy may be overridden remotely. Anything that binds the
+/// process to its host (listeners, daemon settings, database, logging, the
+/// supervisor connection itself) is cleared so a remote push cannot detach
+/// the instance from its operator.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorSystemConfig(SystemConfig);
 
@@ -17,15 +18,24 @@ impl SupervisorSystemConfig {
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
         let mut config: SystemConfig = serde_json::from_str::<SystemConfig>(json)?;
 
-        // filter out the parts that are not supported by supervisor.
-        // It's important to filter out the parts that are not supported by supervisor
-        // because the supervisor will not be able to process them.
-        config.tokio_runtime = None;
+        config.daemon = None;
+        config.user = None;
+        config.group = None;
+        config.pid_file = None;
+        config.upgrade_sock = None;
+        config.worker_threads = None;
+        config.database = None;
+        config.grace_period_secs = None;
+        config.graceful_shutdown_timeout_secs = None;
+        // The balancer's schedule is fixed when the process starts; an
+        // overlay value would be stored but never applied.
+        config.health_check_interval_secs = None;
         config.listen_addr = None;
         config.listen_ports = None;
-        config.supervisor = None;
+        config.tls = None;
         config.log = None;
         config.cache = None;
+        config.supervisor = None;
 
         config.validate()?;
         Ok(Self(config))
@@ -36,38 +46,51 @@ impl SupervisorSystemConfig {
     }
 }
 
+/// Application list received from the supervisor.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorAppsConfig(Vec<AppConfig>);
 
 impl SupervisorAppsConfig {
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
-        let config: Vec<AppConfig> = serde_json::from_str::<Vec<AppConfig>>(json)?;
-        config.iter().map(|app| app.validate()).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self(config))
+        let apps: Vec<AppConfig> = serde_json::from_str(json)?;
+        Self::from_apps(apps)
     }
 
-    /// Get the list of app configurations
-    pub fn get_apps(&self) -> Vec<AppConfig> {
-        self.0.clone()
-    }
-
-    /// Create from a vector of app configs
     pub fn from_apps(apps: Vec<AppConfig>) -> Result<Self, ConfigError> {
-        // Validate all apps first
         for app in &apps {
             app.validate()?;
         }
         Ok(Self(apps))
     }
 
-    /// Get the number of apps
+    pub fn get_apps(&self) -> Vec<AppConfig> {
+        self.0.clone()
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Check if there are no apps
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_overlay_cannot_rebind_listeners() {
+        let overlay = SupervisorSystemConfig::from_json(
+            r#"{"listen_ports": [1], "balancing_strategy": "random", "supervisor": null}"#,
+        )
+        .unwrap()
+        .get_system_config();
+        assert!(overlay.listen_ports.is_none());
+        assert_eq!(
+            overlay.balancing_strategy,
+            Some(crate::config::system::BalancingStrategy::Random)
+        );
+    }
+}
