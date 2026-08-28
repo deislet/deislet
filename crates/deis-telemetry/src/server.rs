@@ -24,7 +24,7 @@ use crate::service::{QueryLimits, TelemetryService};
 use crate::stats::ServiceStats;
 use crate::store::Store;
 use crate::tail::TailHub;
-use crate::{MAX_MESSAGE_SIZE, now_us};
+use crate::{MAX_GRPC_MESSAGE_BYTES, now_us};
 
 /// A started service: both listeners are already bound, so `grpc_addr` and
 /// `metrics_addr` are the real addresses even when the configuration asked
@@ -159,8 +159,8 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         // Log batches are the reason this ceiling exists: a runtime shipping
         // a few thousand lines at once must not be cut off at tonic's 4 MB
         // default.
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
 
     let grpc_shutdown = subscribe(&shutdown);
     let grpc = tokio::spawn(async move {

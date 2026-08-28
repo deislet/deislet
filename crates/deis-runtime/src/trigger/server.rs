@@ -10,7 +10,7 @@ impl TriggerServer {
     ) -> super::proto::trigger_server::TriggerServer<TriggerServiceImpl> {
         let service = TriggerServiceImpl::new(app_manager);
         super::proto::trigger_server::TriggerServer::new(service)
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
     }
 }

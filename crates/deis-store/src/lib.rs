@@ -17,6 +17,10 @@
 //! blob/<app_id>/<aa>/<bb>/<sha256>   object content, addressed by digest
 //! ```
 
+// Re-exported so every component in the platform spells these the same
+// way; see deis_wire::conventions for why they live in one place.
+pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
+
 pub mod blob;
 pub mod config;
 pub mod database;
@@ -27,9 +31,6 @@ pub mod server;
 pub mod sqlite;
 pub mod tenant;
 
-/// gRPC payload ceiling. The 4 MB tonic default is too tight for batched
-/// messages and manifests, so every Deislet service agrees on 16 MB.
-pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Seconds since the unix epoch, the one time representation used in every
 /// table here.
@@ -54,6 +55,7 @@ pub fn unix_seconds() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]

@@ -29,7 +29,7 @@ use proto::{
 /// Size of one uploaded body slice, matching `deis_store::blob::CHUNK_BYTES`.
 ///
 /// Chunk boundaries carry no meaning on the wire, so this only has to stay
-/// comfortably below [`crate::MAX_GRPC_MESSAGE_SIZE`]; 1 MiB is also what the
+/// comfortably below [`crate::MAX_GRPC_MESSAGE_BYTES`]; 1 MiB is also what the
 /// store sends back on `Get`.
 const CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -64,8 +64,8 @@ impl BlobClient {
         let client = GrpcBlobClient::connect(endpoint.clone())
             .await
             .with_context(|| format!("connecting to blob store at {endpoint}"))?
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE);
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::info!(%endpoint, app_id = tenant.app_id(), "blob store client connected");
 
         Ok(Self { client, tenant })

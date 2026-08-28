@@ -4,6 +4,10 @@
 //! dimension, and knows nothing about versions, environments or deployments.
 //! Those concepts live in deis-control and deis-runtime.
 
+// Re-exported so every component in the platform spells these the same
+// way; see deis_wire::conventions for why they live in one place.
+pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
+
 mod config;
 
 use anyhow::{Context, Result};
@@ -14,9 +18,6 @@ use tonic::transport::Server;
 use tonic_health::pb::health_server::HealthServer;
 use tracing::{error, info};
 
-/// gRPC payload ceiling. The 4 MB tonic default is too tight for batched
-/// messages and manifests, so every Deislet service agrees on 16 MB.
-pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "deis-queue", about = "Deislet message queue")]
@@ -54,8 +55,8 @@ async fn main() -> Result<()> {
     Server::builder()
         .add_service(
             health_service
-                .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
         )
         .serve_with_shutdown(addr, shutdown_signal())
         .await

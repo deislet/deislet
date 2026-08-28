@@ -46,8 +46,8 @@ impl DbClient {
         let client = DatabaseClient::connect(endpoint.clone())
             .await
             .with_context(|| format!("connecting to database at {endpoint}"))?
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE);
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
         tracing::info!(%endpoint, app_id = tenant.app_id(), "database client connected");
         Ok(Self {

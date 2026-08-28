@@ -14,8 +14,8 @@ use deis_store::proto::storage::{
     PrepareRequest, QueryPreparedRequest, QueryRequest, SetRequest,
     database_client::DatabaseClient, kv_store_client::KvStoreClient,
 };
-use deis_store::tenant::APP_ID_METADATA_KEY;
-use deis_store::{MAX_MESSAGE_SIZE, server};
+use deis_store::tenant::APP_ID_HEADER;
+use deis_store::{MAX_GRPC_MESSAGE_BYTES, server};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::Request;
@@ -68,20 +68,20 @@ impl Harness {
 
     async fn kv(&self) -> KvStoreClient<Channel> {
         KvStoreClient::new(self.channel().await)
-            .max_decoding_message_size(MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
 
     async fn database(&self) -> DatabaseClient<Channel> {
         DatabaseClient::new(self.channel().await)
-            .max_decoding_message_size(MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
 
     async fn blob(&self) -> BlobStoreClient<Channel> {
         BlobStoreClient::new(self.channel().await)
-            .max_decoding_message_size(MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
 }
 
@@ -98,7 +98,7 @@ fn as_app<T>(app: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
-        .insert(APP_ID_METADATA_KEY, app.parse().unwrap());
+        .insert(APP_ID_HEADER, app.parse().unwrap());
     request
 }
 

@@ -1,8 +1,12 @@
-//! Wire - Rust work distribution framework
+//! The wire between the Deislet control plane and its nodes: the gRPC
+//! protocol, the shared message models, and the client side of the link.
 //!
-//! Async work distribution framework based on unified message system
+//! It also holds [`conventions`], the handful of constants every component in
+//! the platform must spell identically - including the storage services, which
+//! depend on this crate for that module alone.
 
 pub mod client;
+pub mod conventions;
 pub mod config;
 pub mod error;
 pub mod models;
@@ -15,6 +19,9 @@ pub mod pb {
 pub use client::WireClient;
 pub use config::{ControlConfig, NodeInfo, NodeRole};
 pub use error::{SdkResult, WireError};
+
+// Re-export the cross-component conventions
+pub use conventions::{APP_ID_HEADER, MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES};
 
 // Re-export models
 pub use models::{AuthData, HeartbeatRequest, InstanceDetails, InstanceStatus, RegisterRequest};

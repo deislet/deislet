@@ -1,7 +1,7 @@
 //! Process wiring: open the three stores, register them on one gRPC server,
 //! and keep the KV sweeper running alongside.
 
-use crate::MAX_MESSAGE_SIZE;
+use crate::MAX_GRPC_MESSAGE_BYTES;
 use crate::blob::BlobService;
 use crate::config::Config;
 use crate::database::DatabaseService;
@@ -160,18 +160,18 @@ pub async fn serve(
         .add_service(health_service)
         .add_service(
             KvStoreServer::new(stores.kv)
-                .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
         )
         .add_service(
             DatabaseServer::new(stores.database)
-                .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
         )
         .add_service(
             BlobStoreServer::new(stores.blob)
-                .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
         )
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await;
@@ -200,7 +200,7 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
     tracing::info!(
         %addr,
         data_dir = %config.data_dir.display(),
-        max_message_size = MAX_MESSAGE_SIZE,
+        max_message_size = MAX_GRPC_MESSAGE_BYTES,
         max_object_bytes = config.max_object_bytes,
         kv_sweep_interval_secs = config.kv_sweep_interval_secs,
         "deis-store serving KvStore, Database and BlobStore"

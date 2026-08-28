@@ -20,6 +20,10 @@
 //! - [`stats`]   this process's own counters
 //! - [`server`]  wiring: listeners, retention sweeper, shutdown
 
+// Re-exported so every component in the platform spells these the same
+// way; see deis_wire::conventions for why they live in one place.
+pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
+
 pub mod config;
 pub mod http;
 pub mod prom;
@@ -31,12 +35,10 @@ pub mod tail;
 
 /// Generated types and stubs for `deis.telemetry`.
 pub mod proto {
+
     tonic::include_proto!("deis.telemetry");
 }
 
-/// gRPC payload ceiling. The 4 MB tonic default is too tight for batched
-/// messages and manifests, so every Deislet service agrees on 16 MB.
-pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Current wall-clock time in microseconds since the Unix epoch.
 ///

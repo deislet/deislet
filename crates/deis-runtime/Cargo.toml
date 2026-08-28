@@ -6,6 +6,7 @@ license = "Apache-2.0"
 authors = ["kookyleo <kookyleo@gmail.com>"]
 
 [dependencies]
+deis-wire = { workspace = true }
 # Async runtime
 tokio = { version = "1.48", features = ["full"] }
 

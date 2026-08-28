@@ -8,12 +8,14 @@
 //! `blob/<app_id>/...`), so it is validated hard rather than sanitised: an id
 //! that could escape the data directory is refused outright.
 
+// Re-exported so every component in the platform spells these the same
+// way; see deis_wire::conventions for why they live in one place.
+pub use deis_wire::conventions::APP_ID_HEADER;
+
 use crate::error::StoreError;
 use std::fmt;
 use tonic::Request;
 
-/// Metadata key carrying the tenant, matching `deis_proxy::proxy::APP_ID_HEADER`.
-pub const APP_ID_METADATA_KEY: &str = "x-deis-app-id";
 
 /// Longest accepted tenant id. Well under any filesystem name limit even
 /// after the `.sqlite` suffix.
@@ -75,22 +77,22 @@ impl fmt::Display for AppId {
 pub fn app_id_of<T>(request: &Request<T>) -> Result<AppId, StoreError> {
     let raw = request
         .metadata()
-        .get(APP_ID_METADATA_KEY)
+        .get(APP_ID_HEADER)
         .ok_or_else(|| {
             tracing::warn!(
-                header = APP_ID_METADATA_KEY,
+                header = APP_ID_HEADER,
                 "request has no tenant header, refusing it; the caller must stamp the app id or it \
                  would be reading another app's data"
             );
-            StoreError::Tenant(format!("missing {APP_ID_METADATA_KEY} header"))
+            StoreError::Tenant(format!("missing {APP_ID_HEADER} header"))
         })?
         .to_str()
         .map_err(|_| {
             tracing::warn!(
-                header = APP_ID_METADATA_KEY,
+                header = APP_ID_HEADER,
                 "tenant header is not printable ASCII, refusing the request"
             );
-            StoreError::Tenant(format!("{APP_ID_METADATA_KEY} is not valid ASCII"))
+            StoreError::Tenant(format!("{APP_ID_HEADER} is not valid ASCII"))
         })?;
 
     AppId::parse(raw).inspect_err(|e| {
@@ -104,6 +106,7 @@ pub fn app_id_of<T>(request: &Request<T>) -> Result<AppId, StoreError> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -139,7 +142,7 @@ mod tests {
     fn reads_the_tenant_from_metadata() {
         let mut req = Request::new(());
         req.metadata_mut()
-            .insert(APP_ID_METADATA_KEY, "my-app".parse().unwrap());
+            .insert(APP_ID_HEADER, "my-app".parse().unwrap());
         assert_eq!(app_id_of(&req).unwrap().as_str(), "my-app");
     }
 
@@ -154,7 +157,7 @@ mod tests {
     fn traversal_attempt_in_metadata_is_refused() {
         let mut req = Request::new(());
         req.metadata_mut()
-            .insert(APP_ID_METADATA_KEY, "../../etc".parse().unwrap());
+            .insert(APP_ID_HEADER, "../../etc".parse().unwrap());
         assert!(matches!(app_id_of(&req), Err(StoreError::Tenant(_))));
     }
 }

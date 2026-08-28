@@ -44,8 +44,8 @@ impl KvClient {
         let client = KvStoreClient::connect(endpoint.clone())
             .await
             .with_context(|| format!("connecting to KV store at {endpoint}"))?
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE);
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
         tracing::info!(%endpoint, app_id = tenant.app_id(), "KV store client connected");
         Ok(Self {

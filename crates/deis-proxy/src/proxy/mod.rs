@@ -16,6 +16,10 @@
 //!    replacing whatever the client sent, so deis-runtime only ever sees an id that
 //!    passed the checks above.
 
+// Re-exported so every component in the platform spells these the same
+// way; see deis_wire::conventions for why they live in one place.
+pub use deis_wire::conventions::APP_ID_HEADER;
+
 pub mod access_log;
 pub mod balancer;
 pub mod service;
@@ -42,8 +46,6 @@ pub use access_log::AccessLog;
 pub use balancer::Balancer;
 pub use service::ExitOnPanic;
 
-/// Header naming the application a request is for. Forwarded to deis-runtime.
-pub const APP_ID_HEADER: &str = "x-deis-app-id";
 
 pub struct DeisProxy {
     config: Arc<ConfigManager>,
@@ -352,6 +354,7 @@ impl ProxyHttp for DeisProxy {
 
 #[cfg(test)]
 mod tests {
+
     use std::collections::HashMap;
 
     use serde_json::json;

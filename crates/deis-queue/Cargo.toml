@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
+deis-wire = { workspace = true }
 tonic = "0.12"
 tonic-health = "0.12"
 prost = "0.13"

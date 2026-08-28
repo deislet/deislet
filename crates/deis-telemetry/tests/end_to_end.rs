@@ -12,7 +12,7 @@ use deis_telemetry::proto::{
     QueryMetricsRequest, QueryRequest, TailRequest,
 };
 use deis_telemetry::server::{self, RunningServer};
-use deis_telemetry::{MAX_MESSAGE_SIZE, now_us};
+use deis_telemetry::{MAX_GRPC_MESSAGE_BYTES, now_us};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tonic::transport::Channel;
@@ -38,8 +38,8 @@ async fn connect(server: &RunningServer) -> LogServiceClient<Channel> {
         .await
         .expect("the gRPC listener must accept the connection");
     LogServiceClient::new(channel)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
 }
 
 fn entry(app_id: &str, level: i32, message: &str, timestamp_us: i64) -> LogEntry {

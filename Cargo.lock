@@ -1997,6 +1997,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.5.54",
+ "deis-wire",
  "prost",
  "rusqlite",
  "serde",
@@ -2022,6 +2023,7 @@ dependencies = [
  "chrono",
  "dashmap 5.5.3",
  "deis-store",
+ "deis-wire",
  "deno_ast",
  "deno_core",
  "deno_error",
@@ -2063,6 +2065,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.5.54",
+ "deis-wire",
  "prost",
  "rusqlite",
  "serde",
@@ -2088,6 +2091,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap 4.5.54",
+ "deis-wire",
  "prost",
  "rusqlite",
  "serde",

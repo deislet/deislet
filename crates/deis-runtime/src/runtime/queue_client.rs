@@ -19,8 +19,8 @@ impl QueueClient {
         let endpoint = endpoint.into();
         let client = GrpcQueueClient::connect(endpoint)
             .await?
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_SIZE);
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
         })

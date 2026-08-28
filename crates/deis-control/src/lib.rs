@@ -1,3 +1,7 @@
+// Re-exported so every component in the platform spells these the same
+// way; see deis_wire::conventions for why they live in one place.
+pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
+
 pub mod config;
 pub mod message;
 pub mod session;
@@ -33,18 +37,10 @@ pub use scheduler::{CronScheduler, CronTask};
 
 pub const VERSION: &str = "0.1.0";
 
-/// Upper bound for a single gRPC message, in both directions and on both
-/// sides of the control plane.
-///
-/// tonic defaults to 4 MB, which a manifest plus a batch of commands can
-/// exceed once applications grow; 16 MB leaves room without inviting an
-/// unbounded message. Bundles themselves never travel over gRPC - nodes
-/// download them over HTTP - so this is headroom for metadata, not for
-/// payloads.
-pub const MAX_GRPC_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
+
     use crate::config::ControlConfig;
     use crate::session::{SessionManager, NodeSession, NodeState};
     use crate::message::{NodeRole, NodeInfo, AuthData, RegisterRequest, HeartbeatRequest};
