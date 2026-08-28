@@ -72,11 +72,12 @@ impl ConfigDatabase {
 
     /// Create all required database tables
     async fn create_tables(&self) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().map_err(|_| {
-            DatabaseError::ConnectionError {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| DatabaseError::ConnectionError {
                 message: "Database connection mutex poisoned during table creation".to_string(),
-            }
-        })?;
+            })?;
 
         // Enable foreign key constraints
         conn.execute("PRAGMA foreign_keys = ON", [])?;
@@ -108,11 +109,12 @@ impl ConfigDatabase {
     /// * `Ok(HashMap<String, JsonValue>)` - All app configs mapped by app_id
     /// * `Err(DatabaseError)` - Database error
     pub async fn load_all_app_configs(&self) -> Result<HashMap<String, JsonValue>, DatabaseError> {
-        let conn = self.connection.lock().map_err(|_| {
-            DatabaseError::ConnectionError {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| DatabaseError::ConnectionError {
                 message: "Database connection mutex poisoned during app configs load".to_string(),
-            }
-        })?;
+            })?;
         let mut stmt = conn.prepare("SELECT app_id, config FROM app_configs")?;
 
         let app_rows = stmt.query_map([], |row| {
@@ -136,18 +138,18 @@ impl ConfigDatabase {
     /// # Returns
     /// * `Ok(timestamp)` - Latest version timestamp found, or Unix epoch if no configs
     /// * `Err(DatabaseError)` - Database error
-    pub async fn get_latest_version_timestamp(
-        &self,
-    ) -> Result<DateTime<Utc>, DatabaseError> {
-        let conn = self.connection.lock().map_err(|_| {
-            DatabaseError::ConnectionError {
-                message: "Database connection mutex poisoned during version timestamp lookup".to_string(),
-            }
-        })?;
+    pub async fn get_latest_version_timestamp(&self) -> Result<DateTime<Utc>, DatabaseError> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| DatabaseError::ConnectionError {
+                message: "Database connection mutex poisoned during version timestamp lookup"
+                    .to_string(),
+            })?;
         let mut stmt = conn.prepare("SELECT MAX(version_timestamp) FROM app_configs")?;
 
-        let timestamp_str: Option<String> = stmt
-            .query_row([], |row| row.get::<_, Option<String>>(0))?;
+        let timestamp_str: Option<String> =
+            stmt.query_row([], |row| row.get::<_, Option<String>>(0))?;
 
         match timestamp_str {
             Some(ts) => {
@@ -158,10 +160,11 @@ impl ConfigDatabase {
             }
             None => {
                 // Return Unix epoch if no configs exist
-                Ok(DateTime::from_timestamp(0, 0)
-                    .ok_or_else(|| DatabaseError::ParseError {
+                Ok(
+                    DateTime::from_timestamp(0, 0).ok_or_else(|| DatabaseError::ParseError {
                         message: "Failed to create Unix epoch timestamp".to_string(),
-                    })?)
+                    })?,
+                )
             }
         }
     }
@@ -184,14 +187,18 @@ impl ConfigDatabase {
         F: FnOnce(&HashMap<String, JsonValue>) -> Result<(), DatabaseError>,
     {
         if updates.is_empty() {
-            return Err(DatabaseError::ValidationError("No updates provided".to_string()));
+            return Err(DatabaseError::ValidationError(
+                "No updates provided".to_string(),
+            ));
         }
 
-        let conn = self.connection.lock().map_err(|_| {
-            DatabaseError::ConnectionError {
-                message: "Database connection mutex poisoned during incremental updates".to_string(),
-            }
-        })?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| DatabaseError::ConnectionError {
+                message: "Database connection mutex poisoned during incremental updates"
+                    .to_string(),
+            })?;
         let tx = conn.unchecked_transaction()?;
 
         // Replace into the updated app configs (duplicate by key app_id)
@@ -234,12 +241,15 @@ impl ConfigDatabase {
         tx.commit()?;
 
         // Return the latest version timestamp
-        let latest_version = updates.iter()
+        let latest_version = updates
+            .iter()
             .map(|update| update.version_timestamp)
             .max()
-            .ok_or_else(|| DatabaseError::ValidationError(
-                "No updates provided to calculate latest version".to_string()
-            ))?;
+            .ok_or_else(|| {
+                DatabaseError::ValidationError(
+                    "No updates provided to calculate latest version".to_string(),
+                )
+            })?;
 
         Ok(latest_version)
     }
@@ -260,11 +270,13 @@ impl ConfigDatabase {
     ) -> Result<Vec<AppConfigEntry>, DatabaseError> {
         let after_str = after_timestamp.to_rfc3339();
 
-        let conn = self.connection.lock().map_err(|_| {
-            DatabaseError::ConnectionError {
-                message: "Database connection mutex poisoned during incremental config query".to_string(),
-            }
-        })?;
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| DatabaseError::ConnectionError {
+                message: "Database connection mutex poisoned during incremental config query"
+                    .to_string(),
+            })?;
         let mut stmt = conn.prepare(
             "SELECT app_id, config, version_timestamp FROM app_configs WHERE version_timestamp > ?1 ORDER BY version_timestamp"
         )?;
@@ -283,7 +295,7 @@ impl ConfigDatabase {
             let version_timestamp = DateTime::parse_from_rfc3339(&version_str)
                 .map_err(|e| DatabaseError::ValidationError(format!("Invalid timestamp: {e}")))?
                 .with_timezone(&Utc);
-            
+
             configs.push(AppConfigEntry {
                 app_id,
                 config,
@@ -295,11 +307,11 @@ impl ConfigDatabase {
     }
 
     /// Save all app configurations (used for bulk updates)
-    /// 
+    ///
     /// # Arguments
     /// * `configs` - HashMap of all app configurations
     /// * `version_timestamp` - Timestamp for this version
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` - Successfully saved
     /// * `Err(DatabaseError)` - Save operation failed
@@ -308,11 +320,12 @@ impl ConfigDatabase {
         configs: &HashMap<String, JsonValue>,
         version_timestamp: DateTime<Utc>,
     ) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().map_err(|_| {
-            DatabaseError::ConnectionError {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| DatabaseError::ConnectionError {
                 message: "Database connection mutex poisoned during system config save".to_string(),
-            }
-        })?;
+            })?;
         let tx = conn.unchecked_transaction()?;
 
         let version_str = version_timestamp.to_rfc3339();
@@ -329,11 +342,7 @@ impl ConfigDatabase {
                 (app_id, config, version_timestamp) 
                 VALUES (?1, ?2, ?3)
                 "#,
-                params![
-                    app_id,
-                    config_str,
-                    version_str,
-                ],
+                params![app_id, config_str, version_str,],
             )?;
         }
 
@@ -343,7 +352,7 @@ impl ConfigDatabase {
     }
 
     /// Get database statistics
-    /// 
+    ///
     /// # Returns
     /// Database statistics including counts of stored data
     pub async fn get_stats(&self) -> Result<DatabaseStats, DatabaseError> {
@@ -351,16 +360,13 @@ impl ConfigDatabase {
         // `get_latest_version_timestamp` locks the same mutex, so holding the
         // guard across that call would deadlock (and trip `await_holding_lock`).
         let apps_count: u32 = {
-            let conn = self.connection.lock().map_err(|_| {
-                DatabaseError::ConnectionError {
+            let conn = self
+                .connection
+                .lock()
+                .map_err(|_| DatabaseError::ConnectionError {
                     message: "Database connection mutex poisoned during stats query".to_string(),
-                }
-            })?;
-            conn.query_row(
-                "SELECT COUNT(*) FROM app_configs",
-                [],
-                |row| row.get(0),
-            )?
+                })?;
+            conn.query_row("SELECT COUNT(*) FROM app_configs", [], |row| row.get(0))?
         };
 
         let latest_version = self.get_latest_version_timestamp().await?;

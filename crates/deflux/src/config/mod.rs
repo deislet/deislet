@@ -1,26 +1,26 @@
 //! Configuration management for Deflux
 //!
-//! This module provides hierarchical configuration management:
-//! - System configuration: default + local + supervisor overlay
-//! - App configuration: stored in database with atomic ArcSwap updates
+//! - System configuration: defaults + local file + supervisor overlay
+//! - App configuration: stored in the database and exposed to the data plane
+//!   as an atomically swapped route table
 
 mod apps;
+pub mod error;
 mod local;
 pub mod manager;
-pub mod system;
-
+pub mod routes;
 pub mod superv;
+pub mod system;
 mod util;
 
-pub mod error;
-
 pub use apps::AppConfig;
+pub use apps::certificate::CertificateConfig;
 pub use error::ConfigError;
-pub use manager::{ConfigManager, ConfigDatabase, DatabaseError};
-pub use superv::SupervisorSystemConfig;
+pub use manager::{AppConfigEntry, ConfigDatabase, ConfigManager, DatabaseError};
+pub use routes::RouteTable;
+pub use superv::{SupervisorAppsConfig, SupervisorSystemConfig};
 pub use system::SystemConfig;
 
-// Re-export LocalConfig for internal use
 pub(crate) use local::LocalConfig;
 
 pub trait Validatable {

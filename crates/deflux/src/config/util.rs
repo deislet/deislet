@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 /// Helper struct to parse size strings like "16GB", "1024KB", etc.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,7 +59,7 @@ pub enum CacheK {
     QueryString,
     Method,
     Protocol,
-    Header(String),  // header(header_name)
+    Header(String), // header(header_name)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -118,18 +118,15 @@ mod tests {
         let result = CacheKeys::from_str("$scheme$host$request_uri").unwrap();
         assert_eq!(
             result,
-            CacheKeys(vec![
-                CacheK::Scheme,
-                CacheK::Host,
-                CacheK::RequestUri
-            ])
+            CacheKeys(vec![CacheK::Scheme, CacheK::Host, CacheK::RequestUri])
         );
     }
 
     #[test]
     fn test_parse_cache_key_all_types() {
         // Test all cache key types
-        let result = CacheKeys::from_str("$scheme$host$request_uri$query_string$method$protocol").unwrap();
+        let result =
+            CacheKeys::from_str("$scheme$host$request_uri$query_string$method$protocol").unwrap();
         assert_eq!(
             result,
             CacheKeys(vec![
@@ -170,7 +167,8 @@ mod tests {
     #[test]
     fn test_parse_cache_key_complex() {
         // Test complex cache key with multiple types
-        let result = CacheKeys::from_str("$scheme$host$request_uri$header(X-User-ID)$method").unwrap();
+        let result =
+            CacheKeys::from_str("$scheme$host$request_uri$header(X-User-ID)$method").unwrap();
         assert_eq!(
             result,
             CacheKeys(vec![
@@ -213,30 +211,27 @@ mod tests {
 
         // Test multiple $ separators (should be handled correctly)
         let result = CacheKeys::from_str("$$scheme$$host$$").unwrap();
-        assert_eq!(
-            result,
-            CacheKeys(vec![CacheK::Scheme, CacheK::Host])
-        );
+        assert_eq!(result, CacheKeys(vec![CacheK::Scheme, CacheK::Host]));
     }
 
     /// Demonstration of parse_cache_key functionality
     #[test]
     fn test_parse_cache_key_demo() {
         println!("\n🎯 Cache Key Parsing Demo:");
-        
+
         let examples = vec![
             "$scheme$host$request_uri",
             "$scheme$host$request_uri$header(X-User-ID)",
             "$scheme$host$cookie(session_id)$header(Authorization)",
             "$method$host$request_uri$query_string$header(Content-Type)$cookie(user_token)",
         ];
-        
+
         for example in examples {
             match CacheKeys::from_str(example) {
                 Ok(keys) => {
                     println!("✅ Input: {}", example);
                     println!("   Parse Result: {:?}", keys);
-                },
+                }
                 Err(e) => {
                     println!("❌ Input: {}", example);
                     println!("   Error: {}", e);

@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{util::CacheKeys, ConfigError, Validatable};
+use crate::config::{ConfigError, Validatable, util::CacheKeys};
 
 // default_cache_key: CacheKeys::from_str("$scheme$host$request_uri").unwrap(),
 
@@ -97,8 +97,11 @@ impl Condition {
                     Ok(Self::ExistAndEq(key.to_owned(), value.to_owned()))
                 }
                 None => Err(ConfigError::ValidationError {
-                    message: format!("Invalid exists_and_eq condition format: missing ':' in '{}'.", s),
-                })
+                    message: format!(
+                        "Invalid exists_and_eq condition format: missing ':' in '{}'.",
+                        s
+                    ),
+                }),
             }
         } else if s.starts_with("exists_and_not_eq:") {
             let key_value = s.split_at(18).1;
@@ -109,12 +112,18 @@ impl Condition {
                     Ok(Self::ExistAndNotEq(key.to_owned(), value.to_owned()))
                 }
                 None => Err(ConfigError::ValidationError {
-                    message: format!("Invalid exists_and_not_eq condition format: missing ':' in '{}'.", s),
-                })
+                    message: format!(
+                        "Invalid exists_and_not_eq condition format: missing ':' in '{}'.",
+                        s
+                    ),
+                }),
             }
         } else {
             Err(ConfigError::ValidationError {
-                message: format!("Invalid cache condition: '{}'. Expected one of: always, exists:, not_exists:, exists_and_eq:, exists_and_not_eq:", s),
+                message: format!(
+                    "Invalid cache condition: '{}'. Expected one of: always, exists:, not_exists:, exists_and_eq:, exists_and_not_eq:",
+                    s
+                ),
             })
         }
     }

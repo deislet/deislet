@@ -214,6 +214,9 @@ EOF
     cat > "$DEFLUX_CONFIG" <<EOF
 listen_addr = ["127.0.0.1"]
 listen_ports = [${DEFLUX_PORT}]
+database = "${DEMO_DIR}/deflux.db"
+pid_file = "${DEMO_DIR}/deflux.pid"
+upgrade_sock = "${DEMO_DIR}/deflux_upgrade.sock"
 
 [[upstreams]]
 host = "127.0.0.1"

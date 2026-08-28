@@ -1,68 +1,93 @@
+//! Upstream selection strategy.
+
 use std::fmt::{self, Display};
 use std::str::FromStr;
-use regex::Regex;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, Validatable};
 
-/// Load balancing strategy
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// How the balancer picks an upstream for a request.
+///
+/// The strategy is fixed for the lifetime of the process; changing it
+/// requires a restart. The upstream list itself can change at runtime.
+///
+/// Serialized as a string: `round_robin`, `random`, `ip_hash` or
+/// `header_hash(<Header-Name>)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum BalancingStrategy {
-    /// Round robin
+    /// Cycle through upstreams in order, honouring weights.
     RoundRobin,
-    /// Least connections
-    LeastConnections,
-    /// Maximum power reserve
-    MaxPowerReserve,
-    /// The tasks are distributed according to the HTTP header field
+    /// Pick a weighted random upstream per request.
+    Random,
+    /// Hash the value of the named request header; requests carrying the
+    /// same value stick to the same upstream.
     HeaderHash(String),
+    /// Consistent hashing on the client IP address.
+    IpHash,
 }
 
 impl FromStr for BalancingStrategy {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
         match s {
-            "max_power_reserve" => Ok(BalancingStrategy::MaxPowerReserve),
-            _ => {
-                // Use regex to match header_hash(header_name) pattern
-                let re = Regex::new(r"^header_hash\s*?\(([^)]+)\)$")
-                    .map_err(|_| "Invalid regex pattern".to_string())?;
-                
-                if let Some(captures) = re.captures(s)
-                    && let Some(header_name) = captures.get(1)
-                {
-                    let header_name = header_name.as_str().trim();
-                    if header_name.is_empty() {
-                        return Err("Header name cannot be empty".to_string());
-                    }
-                    return Ok(BalancingStrategy::HeaderHash(header_name.to_string()));
-                }
-                
-                // if the string is not a valid balancing strategy, return an error
-                Err(format!("Unsupported balancing strategy: {s}"))
-            }
+            "round_robin" => return Ok(Self::RoundRobin),
+            "random" => return Ok(Self::Random),
+            "ip_hash" => return Ok(Self::IpHash),
+            _ => {}
         }
+        if let Some(rest) = s.strip_prefix("header_hash")
+            && let Some(name) = rest
+                .trim()
+                .strip_prefix('(')
+                .and_then(|r| r.strip_suffix(')'))
+        {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("header_hash requires a header name".to_string());
+            }
+            return Ok(Self::HeaderHash(name.to_string()));
+        }
+        Err(format!("unsupported balancing strategy: {s}"))
     }
 }
 
 impl Display for BalancingStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BalancingStrategy::RoundRobin => write!(f, "round_robin"),
-            BalancingStrategy::LeastConnections => write!(f, "least_connections"),
-            BalancingStrategy::MaxPowerReserve => write!(f, "max_power_reserve"),
-            BalancingStrategy::HeaderHash(header_name) => write!(f, "header_hash({})", header_name),
+            Self::RoundRobin => write!(f, "round_robin"),
+            Self::Random => write!(f, "random"),
+            Self::HeaderHash(name) => write!(f, "header_hash({name})"),
+            Self::IpHash => write!(f, "ip_hash"),
         }
+    }
+}
+
+impl TryFrom<String> for BalancingStrategy {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<BalancingStrategy> for String {
+    fn from(value: BalancingStrategy) -> Self {
+        value.to_string()
     }
 }
 
 impl Validatable for BalancingStrategy {
     fn validate(&self) -> Result<(), ConfigError> {
-        if let BalancingStrategy::HeaderHash(header_name) = self
-            && header_name.is_empty()
+        if let Self::HeaderHash(name) = self
+            && name.trim().is_empty()
         {
-            return Err(ConfigError::ValidationError { message: "header name is empty".to_string() });
+            return Err(ConfigError::ValidationError {
+                message: "header_hash requires a header name".to_string(),
+            });
         }
         Ok(())
     }
@@ -73,42 +98,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_header_hash_parsing() {
-        // Test successful parsing
-        let result = BalancingStrategy::from_str("header_hash(X-User-ID)");
-        assert_eq!(result, Ok(BalancingStrategy::HeaderHash("X-User-ID".to_string())));
-
-        let result = BalancingStrategy::from_str("header_hash (Authorization )");
-        assert_eq!(result, Ok(BalancingStrategy::HeaderHash("Authorization".to_string())));
-
-        // Test with spaces
-        let result = BalancingStrategy::from_str("header_hash( Content-Type )");
-        assert_eq!(result, Ok(BalancingStrategy::HeaderHash("Content-Type".to_string())));
-
-        // Test Display formatting
-        let strategy = BalancingStrategy::HeaderHash("X-User-ID".to_string());
-        assert_eq!(format!("{}", strategy), "header_hash(X-User-ID)");
+    fn parses_plain_strategies() {
+        assert_eq!("round_robin".parse(), Ok(BalancingStrategy::RoundRobin));
+        assert_eq!("random".parse(), Ok(BalancingStrategy::Random));
+        assert_eq!("ip_hash".parse(), Ok(BalancingStrategy::IpHash));
     }
 
     #[test]
-    fn test_header_hash_parsing_errors() {
-        // Test empty header name
-        let result = BalancingStrategy::from_str("header_hash()");
-        assert!(result.is_err());
-
-        let result = BalancingStrategy::from_str("header_hash(   )");
-        assert!(result.is_err());
-
-        // Test malformed input
-        let result = BalancingStrategy::from_str("header_hash(missing_paren");
-        assert!(result.is_err());
-
-        let result = BalancingStrategy::from_str("header_hashmissing_parens");
-        assert!(result.is_err());
+    fn parses_header_hash_with_loose_spacing() {
+        for input in [
+            "header_hash(X-User-ID)",
+            "header_hash (X-User-ID )",
+            "header_hash( X-User-ID)",
+        ] {
+            assert_eq!(
+                input.parse::<BalancingStrategy>(),
+                Ok(BalancingStrategy::HeaderHash("X-User-ID".to_string())),
+                "{input}"
+            );
+        }
     }
 
     #[test]
-    fn test_basic_strategies() {
-        assert_eq!(BalancingStrategy::from_str("max_power_reserve"), Ok(BalancingStrategy::MaxPowerReserve));
+    fn rejects_malformed_input() {
+        for input in [
+            "header_hash()",
+            "header_hash(   )",
+            "header_hash(missing",
+            "least_connections",
+            "",
+        ] {
+            assert!(input.parse::<BalancingStrategy>().is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn toml_round_trip() {
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            strategy: BalancingStrategy,
+        }
+        let parsed: Wrapper = toml::from_str(r#"strategy = "header_hash(Authorization)""#).unwrap();
+        assert_eq!(
+            parsed.strategy,
+            BalancingStrategy::HeaderHash("Authorization".to_string())
+        );
+        let text = toml::to_string(&parsed).unwrap();
+        assert!(text.contains("header_hash(Authorization)"));
     }
 }

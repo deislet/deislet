@@ -1,8 +1,8 @@
-pub mod certificate;
 pub mod cache;
+pub mod certificate;
 
-pub(crate) use certificate::*;
 pub(crate) use cache::*;
+pub(crate) use certificate::*;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, Validatable};
@@ -10,11 +10,11 @@ use crate::config::{ConfigError, Validatable};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
     pub id: String,
-    pub description: String, // human readable description
-    pub domains: Vec<String>, // domains of the app
+    pub description: String,                  // human readable description
+    pub domains: Vec<String>,                 // domains of the app
     pub certificates: Vec<CertificateConfig>, // certificates of the app
-    pub enabled: bool, // whether the app is enabled
-    pub cache: CacheConfig, // cache config of the app
+    pub enabled: bool,                        // whether the app is enabled
+    pub cache: CacheConfig,                   // cache config of the app
 }
 
 impl Validatable for AppConfig {
@@ -40,7 +40,7 @@ impl Validatable for AppConfig {
                     message: format!("Empty domain found in app '{}'", self.id),
                 });
             }
-            
+
             // Basic domain validation - should contain at least one dot and no spaces
             if !domain.contains('.') || domain.contains(' ') {
                 return Err(ConfigError::ValidationError {

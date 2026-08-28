@@ -1,9 +1,10 @@
-//! Supervisor integration module
-//!
-//! Provides complete integration with supervisor, including connection management, state management, and message processing
+//! Supervisor (denira) integration: registration, heartbeats, and commands
+//! that control this process.
 
 pub mod client;
+pub mod service;
 pub mod state;
 
-pub use client::{DefluxSupervisorClient, RestartSignal};
+pub use client::DefluxSupervisorClient;
+pub use service::SupervisorService;
 pub use state::DefluxStateManager;

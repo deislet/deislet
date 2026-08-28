@@ -29,3 +29,4 @@ examples/*
 .demo/
 *.db
 *.log
+sites.db
