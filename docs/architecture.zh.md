@@ -408,8 +408,9 @@ sequenceDiagram
 
 | 阶段 | 内容 | 说明 |
 |---|---|---|
-| **一** | depot：四套服务 + 授权 + namespace 管理；补队列消费接口；denira 加 namespace 与 binding 管理 | 完全独立可测，不动现有组件 |
-| **二** | 版本、环境与部署模型：数据表、流式传包、DeployVersion / ActivateVersion、节点自举拉取、denictl deploy/promote/rollback | 与阶段一互不依赖，可并行 |
+| **一 · A** | depot：四套服务 + 授权 + namespace 管理；补队列消费接口；denira 加 namespace 与 binding 管理 | 完全独立可测，不动现有组件 |
+| **一 · B** | deforge 增加 `Platform::Deislet` 与 adapter：产出含函数入口、路由表、资产清单的应用包；`ctx.params` 随之成立 | 与 A 并行。它是路由参数、静态资产、版本包结构的共同前提，晚做会拖住阶段二和三 |
+| **二** | 版本、环境与部署模型：数据表、流式传包、DeployVersion / ActivateVersion、节点自举拉取、denictl deploy/promote/rollback | 依赖一·B 定下的包结构 |
 | **三** | 静态资产：包内带资产、denix 资产优先命中、deflux 路径级路由与缓存、自动子域 | 依赖阶段二的版本包结构 |
 | **四** | 可观测：真实状态上报、日志回流、指标提取、面板展示 | 前三阶段跑通后才有真数据 |
 | **五** | cron 修正、secrets、限额三层化、出网控制 | 收尾的正确性与安全项 |
@@ -495,4 +496,6 @@ sequenceDiagram
 | **独立小项** | 二进制请求体、WebSocket 端到端验证、cron 接线 | 各自一两天，互不依赖 |
 | **真正的硬骨头** | Node.js 运行时、服务端渲染 | 见下 |
 
-**Node.js 兼容与 SSR 需要单独决策。** 注册 `deno_node` 扩展只是第一步，真正的成本在 npm 包解析、`node_modules` 布局、CJS/ESM 互操作，以及这些如何进入不可变版本包。Cloudflare 自己也只做到 `nodejs_compat` 的有限支持，我们在表里标 `Native` 比 CF 承诺得还满，不现实。建议要么降级为「有限支持」并明确列出可用的 `node:` 模块，要么从矩阵移除。
+**Node.js 兼容与 SSR 已定为「有限支持」。** 注册 `deno_node` 扩展，明确列出可用的 `node:` 模块白名单，**不做 npm 包解析**——`node_modules` 布局、CJS/ESM 互操作、npm 包进版本包这三项成本过高，且 Cloudflare 自己也只做到 `nodejs_compat` 的有限支持。原先在矩阵里标 `Native` 比 CF 承诺得还满，已改。SSR 跟随降级：能跑不依赖 npm 生态的服务端渲染，框架级 SSR 不承诺。
+
+`edge-canon/PLATFORM_MATRIX.md` 已按本节结论修正（提交 `b5a7239`）：未实现项从 ✅ 降为 ⚠️ Planned，实现一项改回一项。
