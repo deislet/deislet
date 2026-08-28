@@ -1,54 +1,27 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use colored::Colorize;
 
+/// Deployment is not wired to any platform API yet. Report the request and
+/// fail with a non-zero exit code instead of pretending to succeed.
 pub async fn execute(
     vendors: Vec<String>,
     env: String,
     tag: Option<String>,
-    // TODO: promote flow is not implemented yet
-    _promote: bool,
+    promote: bool,
 ) -> Result<()> {
-    println!("\n{}", "🚀 Deploying Edge Function...\n".bold());
-
-    println!("{}", "Building...".yellow());
-
-    // TODO: Actual build logic
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    println!("{}", "✓ Build completed\n".green());
-
-    println!("{}", format!("Deploying to {}...", env).yellow());
-
-    for (i, vendor) in vendors.iter().enumerate() {
-        println!("[{}/{}] Deploying to {}...", i + 1, vendors.len(), vendor);
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-        println!("{}", format!("  ✓ Deployed to {}", vendor).green());
-        println!(
-            "{}",
-            format!("    URL: https://{}.example.{}.dev", env, vendor).dimmed()
-        );
-        println!(
-            "{}",
-            format!("    Deployment ID: {}-{}", vendor, chrono::Utc::now().timestamp()).dimmed()
-        );
-        println!();
+    println!("\n{}", "Deploying Edge Function...".bold());
+    println!("  environment: {}", env);
+    println!("  vendors:     {}", vendors.join(", "));
+    if let Some(tag) = &tag {
+        println!("  tag:         {}", tag);
     }
-
-    println!("{}", "✅ All platforms deployed successfully".green());
-    println!("{}", format!("📋 Environment: {}", env).dimmed());
-    if let Some(tag) = tag {
-        println!("{}", format!("🏷️  Tag: {}", tag).dimmed());
+    if promote {
+        println!("  promote:     yes");
     }
     println!();
 
-    println!("{}", "ℹ Deployment implementation coming soon...".yellow());
-    println!("{}", "Full implementation will include:".dimmed());
-    println!("{}", "  - Actual platform API integration".dimmed());
-    println!("{}", "  - Deployment status tracking".dimmed());
-    println!("{}", "  - Rollback capabilities".dimmed());
-    println!("{}", "  - Deployment history\n".dimmed());
-
-    Ok(())
+    bail!(
+        "deploy is not implemented: no platform API integration exists yet. \
+         Run `build` to produce vendor artifacts and deploy them with each vendor's own tooling."
+    )
 }
