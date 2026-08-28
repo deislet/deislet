@@ -1,6 +1,7 @@
 //! Command line interface.
 
 use std::env;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::process;
 
@@ -8,16 +9,21 @@ use anyhow::{Context, Result, anyhow};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use crate::config::{LocalConfig, SystemConfig};
+use crate::config::{ConfigManager, SystemConfig};
 
 #[derive(Debug, Clone)]
 pub struct CliConfig {
-    /// Configuration file path.
+    /// Configuration file path, made absolute at parse time so that log
+    /// lines and relaunches never depend on the working directory.
     pub config_file: PathBuf,
     /// Detach and run in the background.
     pub daemon: bool,
     /// Take over the listening sockets of a running instance.
     pub upgrade: bool,
+    /// Inherited pipe to write one byte to once startup has succeeded and
+    /// the upgrade socket is about to be opened. Set by the process that
+    /// spawned this one for an upgrade; see [`crate::restart`].
+    pub ready_fd: Option<RawFd>,
     pub action: CliAction,
 }
 
@@ -48,6 +54,7 @@ impl Default for CliConfig {
             config_file: PathBuf::from("config.toml"),
             daemon: false,
             upgrade: false,
+            ready_fd: None,
             action: CliAction::Start,
         }
     }
@@ -90,6 +97,16 @@ impl CliConfig {
                         .ok_or_else(|| anyhow!("option -s requires a signal name"))?;
                     config.action = CliAction::Signal(Self::parse_signal(name.as_ref())?);
                 }
+                "--ready-fd" => {
+                    let fd = args
+                        .next()
+                        .ok_or_else(|| anyhow!("option --ready-fd requires a descriptor"))?;
+                    let fd: RawFd = fd
+                        .as_ref()
+                        .parse()
+                        .map_err(|_| anyhow!("invalid --ready-fd value: {}", fd.as_ref()))?;
+                    config.ready_fd = Some(fd);
+                }
                 other if other.starts_with('-') => return Err(anyhow!("unknown option: {other}")),
                 other => {
                     return Err(anyhow!(
@@ -98,6 +115,14 @@ impl CliConfig {
                 }
             }
         }
+        // Absolute, but without resolving symlinks: a deployment that
+        // re-points a config.toml link must see the new target on reload.
+        config.config_file = std::path::absolute(&config.config_file).with_context(|| {
+            format!(
+                "resolving configuration file path {}",
+                config.config_file.display()
+            )
+        })?;
         Ok(config)
     }
 
@@ -143,13 +168,12 @@ impl CliConfig {
                 self.config_file.display()
             ));
         }
-        let local = LocalConfig::from_toml(self.config_file.clone()).with_context(|| {
+        ConfigManager::load_system_config(&self.config_file).with_context(|| {
             format!(
                 "failed to parse configuration file {}",
                 self.config_file.display()
             )
-        })?;
-        Ok(SystemConfig::baseline() + local.get_system_config())
+        })
     }
 
     fn send_signal(&self, signal: SignalType) -> Result<()> {
@@ -229,7 +253,27 @@ mod tests {
         assert_eq!(config.config_file, PathBuf::from("/tmp/x.toml"));
         assert!(config.upgrade);
         assert!(config.daemon);
+        assert!(config.ready_fd.is_none());
         assert!(matches!(config.action, CliAction::Start));
+    }
+
+    #[test]
+    fn parses_ready_fd() {
+        let config = CliConfig::parse_from(["--ready-fd", "7"]).unwrap();
+        assert_eq!(config.ready_fd, Some(7));
+        assert!(CliConfig::parse_from(["--ready-fd", "seven"]).is_err());
+        assert!(CliConfig::parse_from(["--ready-fd"]).is_err());
+    }
+
+    #[test]
+    fn makes_relative_config_paths_absolute() {
+        let config = CliConfig::parse_from(["-c", "etc/deflux.toml"]).unwrap();
+        assert!(config.config_file.is_absolute());
+        assert!(config.config_file.ends_with("etc/deflux.toml"));
+
+        let config = CliConfig::parse_from(Vec::<&str>::new()).unwrap();
+        assert!(config.config_file.is_absolute());
+        assert!(config.config_file.ends_with("config.toml"));
     }
 
     #[test]

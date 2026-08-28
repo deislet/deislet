@@ -10,7 +10,7 @@ use crate::config::apps::certificate::CertificateConfig;
 use crate::config::{ConfigError, Validatable};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TlsConfig {
     /// Ports that terminate TLS, bound on every address in `listen_addr`.
     pub ports: Vec<u16>,

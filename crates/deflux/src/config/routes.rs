@@ -4,7 +4,7 @@
 //! data plane never parses JSON or reads certificate files on the request
 //! path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -25,6 +25,8 @@ pub struct RouteTable {
     certs_by_name: HashMap<String, Arc<LoadedCertificate>>,
     wildcard_certs: Vec<(String, Arc<LoadedCertificate>)>,
     default_cert: Option<Arc<LoadedCertificate>>,
+    /// Apps for which at least one of their own certificates loaded.
+    tls_apps: HashSet<String>,
 }
 
 impl RouteTable {
@@ -94,17 +96,25 @@ impl RouteTable {
                         }
                         loaded.push(cert);
                     }
-                    Err(e) => warn!(
+                    Err(e) if table.default_cert.is_some() => warn!(
                         app = %app.id,
                         cert = %cert_cfg.cert_file,
                         error = %e,
                         "certificate not loaded; TLS for this app will fall back to the default certificate"
+                    ),
+                    Err(e) => warn!(
+                        app = %app.id,
+                        cert = %cert_cfg.cert_file,
+                        error = %e,
+                        "certificate not loaded and no default certificate: HTTPS for this app \
+                         will fail and plain HTTP will be served without redirect"
                     ),
                 }
             }
             // A certificate whose subject names do not list the app's domains
             // (or list none at all) still has to serve those domains.
             if let Some(first) = loaded.first() {
+                table.tls_apps.insert(app.id.clone());
                 for domain in &app.domains {
                     let domain = normalize_host(domain);
                     if !table.has_certificate_named(&domain) {
@@ -199,6 +209,15 @@ impl RouteTable {
             || !self.certs_by_name.is_empty()
             || !self.wildcard_certs.is_empty()
     }
+
+    /// Whether a TLS handshake for this app can succeed: one of its own
+    /// certificates loaded, or it has certificates configured and the default
+    /// certificate stands in for the ones that failed to load. Redirecting to
+    /// HTTPS on any other basis would send clients to a port that rejects them.
+    pub fn https_available(&self, app: &AppConfig) -> bool {
+        self.tls_apps.contains(&app.id)
+            || (!app.certificates.is_empty() && self.default_cert.is_some())
+    }
 }
 
 /// Lowercase a host name and strip a trailing port (`example.com:8080`,
@@ -272,5 +291,93 @@ mod tests {
     fn empty_table_reports_empty() {
         let table = RouteTable::build(&HashMap::new(), None);
         assert!(table.is_empty());
+    }
+
+    fn app_with_missing_certificate(id: &str, domain: &str) -> JsonValue {
+        json!({
+            "id": id,
+            "description": "",
+            "domains": [domain],
+            "certificates": [
+                { "cert_file": "/nonexistent/deflux-test.pem", "key_file": "/nonexistent/deflux-test.key" }
+            ],
+            "enabled": true,
+            "cache": [],
+        })
+    }
+
+    #[test]
+    fn unloadable_certificate_keeps_app_routable_without_https() {
+        let mut apps = HashMap::new();
+        apps.insert(
+            "shop".to_string(),
+            app_with_missing_certificate("shop", "shop.example.com"),
+        );
+        let table = RouteTable::build(&apps, None);
+        let shop = table.app_by_host("shop.example.com").unwrap();
+        assert!(!table.https_available(shop));
+        assert!(table.certificate_for(Some("shop.example.com")).is_none());
+    }
+
+    #[test]
+    fn default_certificate_makes_https_available() {
+        let cert = CertificateConfig {
+            cert_file: "/nonexistent/default.pem".to_string(),
+            key_file: "/nonexistent/default.key".to_string(),
+        };
+        let mut apps = HashMap::new();
+        apps.insert(
+            "shop".to_string(),
+            app_with_missing_certificate("shop", "shop.example.com"),
+        );
+        apps.insert(
+            "plain".to_string(),
+            app("plain", &["plain.example.com"], true),
+        );
+        let mut table = RouteTable::build(&apps, Some(&cert));
+        // The default certificate file does not exist either; stand one in.
+        assert!(table.default_cert.is_none());
+        table.default_cert = Some(Arc::new(test_certificate()));
+
+        let shop = table.app_by_host("shop.example.com").unwrap();
+        assert!(table.https_available(shop));
+        let plain = table.app_by_host("plain.example.com").unwrap();
+        assert!(
+            !table.https_available(plain),
+            "an app without certificates is not redirected just because a default exists"
+        );
+    }
+
+    /// A throwaway self-signed certificate, generated in memory.
+    fn test_certificate() -> LoadedCertificate {
+        use openssl::asn1::Asn1Time;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::x509::{X509, X509NameBuilder};
+
+        let key = PKey::generate_ed25519().unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "default.example.com")
+            .unwrap();
+        let name = name.build();
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        // Ed25519 signatures embed their own digest.
+        builder.sign(&key, MessageDigest::null()).unwrap();
+        LoadedCertificate {
+            leaf: builder.build(),
+            chain: Vec::new(),
+            key,
+            names: vec!["default.example.com".to_string()],
+        }
     }
 }

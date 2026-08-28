@@ -54,6 +54,16 @@ impl LoadedCertificate {
         let leaf = certs.remove(0);
         let key = PKey::private_key_from_pem(&key_pem)
             .with_context(|| format!("parsing private key {}", config.key_file))?;
+        let public_key = leaf
+            .public_key()
+            .with_context(|| format!("reading the public key of {}", config.cert_file))?;
+        if !public_key.public_eq(&key) {
+            bail!(
+                "private key {} does not match certificate {}",
+                config.key_file,
+                config.cert_file
+            );
+        }
 
         let names = certificate_names(&leaf);
         if names.is_empty() {

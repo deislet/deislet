@@ -33,7 +33,7 @@ impl Display for CompressionAlgo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CompressionConfig {
     /// Offer compression to clients that accept it.
     pub enabled: bool,

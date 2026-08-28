@@ -20,7 +20,8 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0"
 regex = "1.11.1"
-nix = { version = "0.30.1", features = ["process", "signal"] }
+nix = { version = "0.30.1", features = ["fs", "process", "signal", "user"] }
+futures = "0.3"
 
 # Data plane: HTTP proxying, load balancing, TLS termination and
 # zero-downtime upgrades. The openssl backend is required for per-SNI
@@ -32,7 +33,11 @@ pingora = { version = "0.5", features = ["lb", "openssl"] }
 denira-workit = { path = "../workit" }
 yasm = "0.5.0"
 
-# Only used by the mock supervisor binary (src/bin/mock_superv.rs).
+[dev-dependencies]
+# Generates throwaway certificates for the route table tests; same crate the
+# pingora openssl backend is built on.
+openssl = "0.10"
+# In-process supervisor the client tests register against
+# (src/supervisor/mock.rs).
 tonic = "0.12"
-tokio-stream = "0.1"
-uuid = { version = "1.17", features = ["v4", "serde"] }
+tokio-stream = { version = "0.1", features = ["net"] }

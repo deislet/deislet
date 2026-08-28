@@ -1,7 +1,7 @@
 pub mod database;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -38,9 +38,29 @@ impl ConfigManager {
     /// Load the local configuration file, open the database it names, and
     /// build the initial route table.
     pub async fn new(local_config_path: PathBuf) -> Result<Self, ConfigError> {
-        let local_config = LocalConfig::from_toml(local_config_path)?;
-        let system_config = SystemConfig::baseline() + local_config.get_system_config();
+        let system_config = Self::load_system_config(&local_config_path)?;
+        Self::with_system_config(system_config).await
+    }
 
+    /// Layer the local configuration file onto the baseline, with every
+    /// relative path resolved against the current working directory. This is
+    /// the only step that touches the file, so callers can initialize logging
+    /// from the result before [`Self::with_system_config`] opens the database
+    /// and loads certificates.
+    pub fn load_system_config(local_config_path: &Path) -> Result<SystemConfig, ConfigError> {
+        let local_config = LocalConfig::from_toml(local_config_path.to_path_buf())?;
+        let mut system_config = SystemConfig::baseline() + local_config.get_system_config();
+        system_config.resolve_paths(&std::env::current_dir()?);
+        // The file was validated on its own; the merge can still combine a
+        // local value with a baseline one into something invalid (a port in
+        // both listen_ports and tls.ports, say), so validate the result too.
+        system_config.validate()?;
+        Ok(system_config)
+    }
+
+    /// Open the database named by an already loaded system configuration and
+    /// build the initial route table.
+    pub async fn with_system_config(system_config: SystemConfig) -> Result<Self, ConfigError> {
         let local_database = ConfigDatabase::init(system_config.database()).await?;
         let app_configs = local_database.load_all_app_configs().await?;
         let latest_version = local_database.get_latest_version_timestamp().await?;

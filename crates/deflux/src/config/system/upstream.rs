@@ -5,6 +5,7 @@ use crate::config::{ConfigError, Validatable};
 /// One backend server. Hostnames are resolved when the upstream list is
 /// (re)loaded; every resolved address becomes a separate backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamServer {
     pub host: String,
     pub port: u16,

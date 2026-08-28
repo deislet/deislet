@@ -2,18 +2,23 @@
 //!
 //! Request flow:
 //!
-//! 1. Resolve the application: an explicit `x-deis-app-id` header wins, then
-//!    the `Host` name is matched against the route table. Unknown hosts get a
-//!    404 once any application is configured; with none configured every
-//!    request is forwarded unchanged so a bare instance still works as a
-//!    plain reverse proxy.
+//! 1. Resolve the application: a non-empty `x-deis-app-id` header names the
+//!    app and must match a configured id (an unknown id is a 404, never a
+//!    fallback to the `Host`); otherwise the `Host` name is matched against
+//!    the route table. Unknown hosts get a 404 once any application is
+//!    configured; with none configured every request is forwarded unchanged
+//!    so a bare instance still works as a plain reverse proxy.
 //! 2. Disabled applications get a 403. Plain HTTP requests for an application
-//!    that has a certificate are redirected to HTTPS when the policy says so.
+//!    whose certificate is actually loaded are redirected to HTTPS when the
+//!    policy says so.
 //! 3. A backend is picked from the shared upstream pool and the request is
-//!    forwarded, carrying `x-deis-app-id` so denix knows which app to run.
+//!    forwarded. `x-deis-app-id` is set to the id deflux decided on,
+//!    replacing whatever the client sent, so denix only ever sees an id that
+//!    passed the checks above.
 
 pub mod access_log;
 pub mod balancer;
+pub mod service;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,12 +34,13 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType};
 use tracing::{debug, warn};
 
-use crate::config::ConfigManager;
-use crate::config::routes::normalize_host;
+use crate::config::routes::{RouteTable, normalize_host};
 use crate::config::system::CompressionAlgo;
+use crate::config::{AppConfig, ConfigManager};
 
 pub use access_log::AccessLog;
 pub use balancer::Balancer;
+pub use service::ExitOnPanic;
 
 /// Header naming the application a request is for. Forwarded to denix.
 pub const APP_ID_HEADER: &str = "x-deis-app-id";
@@ -79,7 +85,9 @@ impl DefluxProxy {
 }
 
 /// Host the client asked for: the URI authority (HTTP/2) or the `Host`
-/// header (HTTP/1.1), normalized.
+/// header (HTTP/1.1), normalized. Empty when the request carries neither;
+/// pingora does not enforce the HTTP/1.1 `Host` requirement, so this is
+/// reachable for any protocol version.
 fn request_host(session: &Session) -> String {
     let req = session.req_header();
     let raw = req
@@ -94,6 +102,50 @@ fn request_host(session: &Session) -> String {
         })
         .unwrap_or_default();
     normalize_host(&raw)
+}
+
+/// Authority for an HTTPS redirect: a normalized host (IPv6 literals have
+/// lost their brackets) plus the TLS port, omitted when it is the default.
+fn https_authority(host: &str, port: u16) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Outcome of matching a request against the route table.
+#[derive(Debug)]
+enum Resolution {
+    /// No application is configured at all: plain reverse proxy mode.
+    Passthrough,
+    /// Applications exist but none matches: 404.
+    NotFound,
+    App(Arc<AppConfig>),
+}
+
+/// The routing rule. A non-empty `x-deis-app-id` is authoritative: it must
+/// name a configured app, and an unknown value is rejected rather than
+/// silently replaced by whatever the `Host` maps to, because the id is what
+/// denix routes on and the two must not disagree. An empty header counts as
+/// absent.
+fn resolve_app(routes: &RouteTable, requested_id: Option<&str>, host: &str) -> Resolution {
+    if routes.is_empty() {
+        return Resolution::Passthrough;
+    }
+    let app = match requested_id.filter(|id| !id.is_empty()) {
+        Some(id) => routes.app_by_id(id),
+        None => routes.app_by_host(host),
+    };
+    match app {
+        Some(app) => Resolution::App(Arc::clone(app)),
+        None => Resolution::NotFound,
+    }
 }
 
 #[async_trait]
@@ -152,21 +204,22 @@ impl ProxyHttp for DefluxProxy {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
 
-        let app = requested_id
-            .as_deref()
-            .and_then(|id| routes.app_by_id(id))
-            .or_else(|| routes.app_by_host(&ctx.host));
-
-        let Some(app) = app else {
-            if routes.is_empty() {
+        let app = match resolve_app(&routes, requested_id.as_deref(), &ctx.host) {
+            Resolution::Passthrough => {
                 debug!(host = %ctx.host, "no applications configured; forwarding unchanged");
                 return Ok(false);
             }
-            debug!(host = %ctx.host, app_id = ?requested_id, "no application for request");
-            session
-                .respond_error_with_body(404, Bytes::from_static(b"no application for this host\n"))
-                .await?;
-            return Ok(true);
+            Resolution::NotFound => {
+                debug!(host = %ctx.host, app_id = ?requested_id, "no application for request");
+                session
+                    .respond_error_with_body(
+                        404,
+                        Bytes::from_static(b"no application for this host\n"),
+                    )
+                    .await?;
+                return Ok(true);
+            }
+            Resolution::App(app) => app,
         };
 
         if !app.enabled {
@@ -182,20 +235,23 @@ impl ProxyHttp for DefluxProxy {
         let tls_ports = system.tls_ports();
         if !ctx.tls
             && system.https().auto_redirect_to_https
-            && !app.certificates.is_empty()
+            && routes.https_available(&app)
             && let Some(port) = tls_ports.first()
         {
+            if ctx.host.is_empty() {
+                // Only reachable through the explicit app id header; the
+                // redirect is a convenience, so forward rather than build a
+                // Location without a host.
+                debug!(app_id = %app.id, "request carries no host; cannot build an HTTPS redirect, forwarding");
+                return Ok(false);
+            }
             let path = session
                 .req_header()
                 .uri
                 .path_and_query()
                 .map(|p| p.as_str())
                 .unwrap_or("/");
-            let authority = if *port == 443 {
-                ctx.host.clone()
-            } else {
-                format!("{}:{}", ctx.host, port)
-            };
+            let authority = https_authority(&ctx.host, *port);
             let location = format!("https://{authority}{path}");
             debug!(host = %ctx.host, app_id = %app.id, %location, "redirecting to HTTPS");
 
@@ -234,7 +290,14 @@ impl ProxyHttp for DefluxProxy {
         // Offloading means the upstream leg is plain even when the client
         // leg is TLS; otherwise TLS is carried through to the backend.
         let tls_upstream = ctx.tls && !system.https().auto_offload_https;
-        let mut peer = HttpPeer::new(addr, tls_upstream, ctx.host.clone());
+        // SNI only matters on a TLS leg; leaving it empty on plain legs keeps
+        // one connection pool per backend instead of one per client Host.
+        let sni = if tls_upstream {
+            ctx.host.clone()
+        } else {
+            String::new()
+        };
+        let mut peer = HttpPeer::new(addr, tls_upstream, sni);
         peer.options.connection_timeout = Some(system.upstream_connect_timeout());
         peer.options.read_timeout = Some(system.upstream_read_timeout());
         peer.options.write_timeout = Some(system.upstream_read_timeout());
@@ -247,9 +310,11 @@ impl ProxyHttp for DefluxProxy {
         upstream_request: &mut RequestHeader,
         ctx: &mut RequestCtx,
     ) -> pingora::Result<()> {
-        if let Some(app_id) = &ctx.app_id
-            && upstream_request.headers.get(APP_ID_HEADER).is_none()
-        {
+        // Pingora copies the downstream headers into the upstream request, so
+        // the client's own value is replaced by the id deflux decided on
+        // (insert_header replaces, and normalizes the header's case). With no
+        // app resolved (plain reverse proxy mode) the header is left alone.
+        if let Some(app_id) = &ctx.app_id {
             upstream_request.insert_header(APP_ID_HEADER, app_id.as_str())?;
         }
         Ok(())
@@ -282,5 +347,94 @@ impl ProxyHttp for DefluxProxy {
                 "request completed"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn table(apps: &[(&str, &str)]) -> RouteTable {
+        let apps: HashMap<String, serde_json::Value> = apps
+            .iter()
+            .map(|(id, domain)| {
+                (
+                    id.to_string(),
+                    json!({
+                        "id": id,
+                        "description": "",
+                        "domains": [domain],
+                        "certificates": [],
+                        "enabled": true,
+                        "cache": [],
+                    }),
+                )
+            })
+            .collect();
+        RouteTable::build(&apps, None)
+    }
+
+    fn resolved_id(resolution: Resolution) -> Option<String> {
+        match resolution {
+            Resolution::App(app) => Some(app.id.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn header_wins_when_it_names_a_known_app() {
+        let routes = table(&[("shop", "shop.example.com"), ("blog", "blog.example.com")]);
+        let resolution = resolve_app(&routes, Some("blog"), "shop.example.com");
+        assert_eq!(resolved_id(resolution).as_deref(), Some("blog"));
+    }
+
+    #[test]
+    fn unknown_header_is_rejected_even_for_a_known_host() {
+        let routes = table(&[("shop", "shop.example.com")]);
+        assert!(matches!(
+            resolve_app(&routes, Some("Shop"), "shop.example.com"),
+            Resolution::NotFound
+        ));
+        assert!(matches!(
+            resolve_app(&routes, Some("other"), "shop.example.com"),
+            Resolution::NotFound
+        ));
+    }
+
+    #[test]
+    fn empty_header_falls_back_to_the_host() {
+        let routes = table(&[("shop", "shop.example.com")]);
+        let resolution = resolve_app(&routes, Some(""), "shop.example.com");
+        assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
+        let resolution = resolve_app(&routes, None, "shop.example.com");
+        assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
+        assert!(matches!(
+            resolve_app(&routes, None, "other.example.com"),
+            Resolution::NotFound
+        ));
+    }
+
+    #[test]
+    fn no_apps_means_passthrough() {
+        let routes = table(&[]);
+        assert!(matches!(
+            resolve_app(&routes, Some("anything"), "any.example.com"),
+            Resolution::Passthrough
+        ));
+    }
+
+    #[test]
+    fn https_authority_brackets_ipv6_and_omits_the_default_port() {
+        assert_eq!(https_authority("::1", 19443), "[::1]:19443");
+        assert_eq!(https_authority("::1", 443), "[::1]");
+        assert_eq!(https_authority("shop.example.com", 443), "shop.example.com");
+        assert_eq!(
+            https_authority("shop.example.com", 8443),
+            "shop.example.com:8443"
+        );
     }
 }

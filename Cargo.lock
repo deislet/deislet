@@ -1846,7 +1846,9 @@ dependencies = [
  "bytes",
  "chrono",
  "denira-workit",
+ "futures",
  "nix 0.30.1",
+ "openssl",
  "pingora",
  "regex",
  "rusqlite",
@@ -1859,7 +1861,6 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
- "uuid",
  "yasm 0.5.0",
 ]
 

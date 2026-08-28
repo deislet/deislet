@@ -2,6 +2,8 @@
 //! that control this process.
 
 pub mod client;
+#[cfg(test)]
+mod mock;
 pub mod service;
 pub mod state;
 

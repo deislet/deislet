@@ -62,14 +62,7 @@ impl AccessLog {
                 AccessLogK::AppId => ctx.app_id.clone(),
                 AccessLogK::Method => Some(req.method.to_string()),
                 AccessLogK::Uri => req.uri.path_and_query().map(|p| p.to_string()),
-                AccessLogK::Protocol => Some(
-                    if session.is_http2() {
-                        "HTTP/2"
-                    } else {
-                        "HTTP/1.1"
-                    }
-                    .to_string(),
-                ),
+                AccessLogK::Protocol => Some(format!("{:?}", req.version)),
                 AccessLogK::Status => session
                     .response_written()
                     .map(|resp| resp.status.as_u16().to_string()),

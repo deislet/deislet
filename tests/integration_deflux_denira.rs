@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use deflux::supervisor::DefluxSupervisorClient;
 use denira_workit::SupervisorConfig;
 
 const TEST_SECRET: &str = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,12 +20,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = DefluxSupervisorClient::new(config)?;
     println!("[OK] Client created\n");
 
-    println!("[2] Starting client (connect + auth + register)...");
-    client.start().await?;
-    println!("[OK] Client started\n");
+    println!("[2] Connecting, authenticating and registering (retries until denira answers)...");
+    tokio::time::timeout(CONNECT_TIMEOUT, client.connect_with_backoff())
+        .await
+        .map_err(|_| {
+            format!("denira did not accept the registration within {CONNECT_TIMEOUT:?}")
+        })?;
+    println!("[OK] Registered\n");
 
     println!("[3] Verifying client is ready...");
-    assert!(client.is_ready().await, "client should be ready after start");
+    assert!(
+        client.is_ready().await,
+        "client should be ready after registration"
+    );
     println!("[OK] Client is ready\n");
 
     println!("[4] Disconnecting gracefully...");

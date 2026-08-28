@@ -74,7 +74,7 @@ pub struct AccessLogConfig {
 
 /// Logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     pub error_log: Option<ErrorLogConfig>,
     pub access_log: Option<AccessLogConfig>,

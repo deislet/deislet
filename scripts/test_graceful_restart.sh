@@ -6,6 +6,11 @@
 # to the old process. Requests keep flowing throughout; any failure during the
 # handover fails the test. Every wait is on a real event (HTTP readiness via
 # curl's own retry, process exit via tail --pid), never a fixed delay.
+#
+# A second case runs deflux as a daemon started with a relative `-c` path and
+# the default (relative) database from its own directory, then reloads it with
+# `deflux -s reload`; this is the path on which the replacement used to resolve
+# every relative path against `/` and die.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,7 +22,13 @@ PIDS=()
 cleanup() {
   touch "$WORK_DIR/stop"
   for pid in "${PIDS[@]}"; do
-    kill "$pid" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
+    # Reap it here so bash does not print a "Killed" job notice on exit.
+    wait "$pid" 2>/dev/null || true
+  done
+  # Daemons are not children; find them through the pid files they wrote.
+  for pidfile in "$WORK_DIR"/daemon/deflux.pid "$WORK_DIR"/daemon/deflux.pid.old; do
+    [ -f "$pidfile" ] && kill -9 "$(cat "$pidfile")" 2>/dev/null || true
   done
   rm -rf "$WORK_DIR"
 }
@@ -113,4 +124,81 @@ if [ "$FAILED" -ne 0 ]; then
   echo "FAIL"
   exit 1
 fi
-echo "PASS"
+echo "PASS: foreground handover"
+
+# Wait for the replacement to finish so the proxy port is free again.
+kill "$NEW_PID"
+timeout 60 tail --pid="$NEW_PID" -f /dev/null || true
+
+# --- Daemon mode with relative paths -------------------------------------
+# Everything relative, resolved against the directory deflux is started from:
+# the config path, the default database (sites.db), the pid file, the upgrade
+# socket and the error log. `user`/`group` stay unset so no root is needed.
+DAEMON_DIR="$WORK_DIR/daemon"
+mkdir -p "$DAEMON_DIR"
+cat > "$DAEMON_DIR/deflux.toml" <<EOF
+listen_addr = ["127.0.0.1"]
+listen_ports = [$PROXY_PORT]
+upgrade_sock = "upgrade.sock"
+pid_file = "deflux.pid"
+grace_period_secs = 2
+
+[[upstreams]]
+host = "127.0.0.1"
+port = $BACKEND_PORT
+
+[log.error_log]
+level = "info"
+path = "daemon.log"
+EOF
+
+echo "starting deflux as a daemon from $DAEMON_DIR with relative paths"
+(cd "$DAEMON_DIR" && "$DEFLUX" -c deflux.toml -d)
+wait_http "http://127.0.0.1:$PROXY_PORT/"
+DAEMON_PID=$(cat "$DAEMON_DIR/deflux.pid")
+[ -f "$DAEMON_DIR/sites.db" ] || { echo "FAIL: database not created next to the config"; exit 1; }
+echo "daemon $DAEMON_PID is serving"
+
+: > "$FAILURES"
+(
+  while [ ! -e "$WORK_DIR/stop" ]; do
+    curl -sf -o /dev/null -m 2 "http://127.0.0.1:$PROXY_PORT/" || echo fail >> "$FAILURES"
+  done
+) &
+LOAD_PID=$!
+PIDS+=($LOAD_PID)
+
+echo "reloading the daemon with -s reload"
+(cd "$DAEMON_DIR" && "$DEFLUX" -c deflux.toml -s reload)
+
+if ! timeout 60 tail --pid="$DAEMON_PID" -f /dev/null; then
+  echo "FAIL: old daemon $DAEMON_PID did not exit"
+  tail -40 "$DAEMON_DIR/daemon.log"
+  exit 1
+fi
+echo "old daemon $DAEMON_PID exited"
+
+NEW_DAEMON_PID=$(cat "$DAEMON_DIR/deflux.pid")
+if [ "$NEW_DAEMON_PID" = "$DAEMON_PID" ] || ! kill -0 "$NEW_DAEMON_PID" 2>/dev/null; then
+  echo "FAIL: no replacement daemon (pid file says $NEW_DAEMON_PID)"
+  tail -40 "$DAEMON_DIR/daemon.log"
+  exit 1
+fi
+wait_http "http://127.0.0.1:$PROXY_PORT/"
+echo "replacement daemon $NEW_DAEMON_PID is serving"
+
+touch "$WORK_DIR/stop"
+wait "$LOAD_PID" || true
+rm -f "$WORK_DIR/stop"
+
+FAILED=$(wc -l < "$FAILURES")
+echo "requests failed during daemon reload: $FAILED"
+if ! grep -q "replacement process is ready" "$DAEMON_DIR/daemon.log"; then
+  echo "warning: daemon log does not mention the readiness handshake"
+  tail -20 "$DAEMON_DIR/daemon.log"
+fi
+if [ "$FAILED" -ne 0 ]; then
+  echo "FAIL"
+  exit 1
+fi
+echo "PASS: daemon reload with relative paths"

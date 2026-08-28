@@ -24,7 +24,7 @@ use denira_workit::{
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
-use tokio::time::{Duration, MissedTickBehavior, interval};
+use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{
@@ -41,10 +41,28 @@ pub const CONFIG_KEY_APP_PREFIX: &str = "app.";
 /// `ConfigUpdate` key carrying a system configuration overlay.
 pub const CONFIG_KEY_SYSTEM: &str = "system";
 
+/// Delay policy between connection attempts: doubling from `first` up to
+/// `max`, starting over after every successful registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backoff {
+    pub first: Duration,
+    pub max: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            first: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+        }
+    }
+}
+
 pub struct DefluxSupervisorClient {
     workit_client: WorkitClient,
     state_manager: Arc<DefluxStateManager>,
     config: SupervisorConfig,
+    backoff: Backoff,
     /// Where commands that act on the whole process are sent.
     process_tx: Option<broadcast::Sender<ProcessCommand>>,
     /// Configuration store updated by pushes. Absent in tests.
@@ -68,6 +86,7 @@ impl DefluxSupervisorClient {
             workit_client,
             state_manager,
             config,
+            backoff: Backoff::default(),
             process_tx: None,
             config_manager: None,
             started_at: Instant::now(),
@@ -100,12 +119,94 @@ impl DefluxSupervisorClient {
         self.process_tx = Some(process_tx);
     }
 
-    /// Connect, authenticate and register; the instance is active afterwards.
-    pub async fn start(&mut self) -> SdkResult<()> {
-        info!(instance = %self.config.associated_id, addr = %self.config.addr, "connecting to supervisor");
-        self.connect_and_register().await?;
-        info!(instance = %self.config.associated_id, "registered with supervisor");
-        Ok(())
+    /// Override the delay policy between connection attempts.
+    pub fn with_backoff(mut self, backoff: Backoff) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// Serve until cancelled: connect (retrying until the supervisor
+    /// answers), handle heartbeats and messages, and reconnect whenever the
+    /// connection is lost. Never returns on its own; the caller races it
+    /// against the shutdown signal.
+    pub async fn run(&mut self) {
+        loop {
+            self.connect_with_backoff().await;
+            if let Err(e) = self.serve().await {
+                warn!(
+                    instance = %self.config.associated_id,
+                    error = %e,
+                    "supervisor connection lost; reconnecting"
+                );
+            }
+        }
+    }
+
+    /// Connect, authenticate and register, retrying with capped exponential
+    /// backoff until it works. Each attempt is bounded by the configured
+    /// request timeout so a supervisor that accepts TCP but never answers
+    /// cannot park the loop. Failed attempts are logged at WARN until
+    /// `retry_count` of them have failed, then at ERROR. A rejected secret or
+    /// registration is ERROR from the first attempt because retrying alone
+    /// will not fix it; the loop still keeps going so a fix on the supervisor
+    /// side takes effect without restarting deflux.
+    pub async fn connect_with_backoff(&mut self) {
+        let mut delay = self.backoff.first;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            info!(
+                instance = %self.config.associated_id,
+                addr = %self.config.addr,
+                attempt,
+                "connecting to supervisor"
+            );
+            let limit = self.config.request_timeout_duration();
+            let result = match timeout(limit, self.connect_and_register()).await {
+                Ok(result) => result,
+                Err(_) => Err(WorkitError::ConnectionError(format!(
+                    "no answer from the supervisor within {}s",
+                    limit.as_secs()
+                ))),
+            };
+            let error = match result {
+                Ok(()) => {
+                    info!(
+                        instance = %self.config.associated_id,
+                        attempt,
+                        "registered with supervisor"
+                    );
+                    return;
+                }
+                Err(error) => error,
+            };
+
+            // Drop any half-open channel before trying again.
+            let _ = self.workit_client.disconnect().await;
+            let rejected = matches!(
+                error,
+                WorkitError::AuthenticationError(_) | WorkitError::RegistrationError(_)
+            );
+            if rejected || attempt >= self.config.retry_count {
+                error!(
+                    instance = %self.config.associated_id,
+                    attempt,
+                    error = %error,
+                    next_attempt_in = ?delay,
+                    "supervisor connection attempt failed"
+                );
+            } else {
+                warn!(
+                    instance = %self.config.associated_id,
+                    attempt,
+                    error = %error,
+                    next_attempt_in = ?delay,
+                    "supervisor connection attempt failed"
+                );
+            }
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2).min(self.backoff.max);
+        }
     }
 
     async fn connect_and_register(&mut self) -> SdkResult<()> {
@@ -119,9 +220,9 @@ impl DefluxSupervisorClient {
         Ok(())
     }
 
-    /// Serve heartbeats and incoming messages until the connection is lost
-    /// beyond recovery.
-    pub async fn run(&mut self) -> SdkResult<()> {
+    /// Heartbeats and incoming messages on the current connection; returns
+    /// once it fails.
+    async fn serve(&mut self) -> SdkResult<()> {
         let mut heartbeat = interval(self.config.heartbeat_duration());
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -133,19 +234,12 @@ impl DefluxSupervisorClient {
 
             match event {
                 Event::Heartbeat => {
-                    if let Err(e) = self.workit_client.send_heartbeat().await {
-                        warn!(error = %e, "heartbeat failed; reconnecting");
-                        self.reconnect_with_backoff().await?;
-                    } else {
-                        debug!(instance = %self.config.associated_id, "heartbeat sent");
-                    }
+                    self.workit_client.send_heartbeat().await?;
+                    debug!(instance = %self.config.associated_id, "heartbeat sent");
                 }
                 Event::Received(Ok(Some(payload))) => self.handle_payload(payload).await,
                 Event::Received(Ok(None)) => debug!("empty payload from supervisor ignored"),
-                Event::Received(Err(e)) => {
-                    warn!(error = %e, "supervisor stream failed; reconnecting");
-                    self.reconnect_with_backoff().await?;
-                }
+                Event::Received(Err(e)) => return Err(e),
             }
         }
     }
@@ -268,22 +362,21 @@ impl DefluxSupervisorClient {
                 .map_err(ConfigError::from)
                 .and_then(|app| app.validate().map(|_| app))
             {
-                Ok(app) => {
-                    if app.id != app_id {
-                        warn!(key, id = %app.id, "app id in payload differs from key; using the key");
-                    }
-                    match serde_json::to_value(&app) {
-                        Ok(config) => config_manager
-                            .update_app_configs(vec![AppConfigEntry {
-                                app_id: app_id.to_string(),
-                                config,
-                                version_timestamp: version,
-                            }])
-                            .await
-                            .map(|_| ()),
-                        Err(e) => Err(ConfigError::from(e)),
-                    }
-                }
+                Ok(app) if app.id != app_id => Err(ConfigError::SupervisorError(format!(
+                    "app id {} in the payload does not match key {key}",
+                    app.id
+                ))),
+                Ok(app) => match serde_json::to_value(&app) {
+                    Ok(config) => config_manager
+                        .update_app_configs(vec![AppConfigEntry {
+                            app_id: app_id.to_string(),
+                            config,
+                            version_timestamp: version,
+                        }])
+                        .await
+                        .map(|_| ()),
+                    Err(e) => Err(ConfigError::from(e)),
+                },
                 Err(e) => Err(e),
             }
         } else if key == CONFIG_KEY_SYSTEM {
@@ -308,50 +401,30 @@ impl DefluxSupervisorClient {
             && self.state_manager.is_active().await
     }
 
+    /// Tear the connection down on shutdown. The lifecycle transitions only
+    /// apply to an instance that actually registered; one that is shutting
+    /// down while still waiting for the supervisor has nothing to unwind.
     pub async fn disconnect(&mut self) -> SdkResult<()> {
         if self.state_manager.is_active().await {
             let _ = self.state_manager.handle_shutdown().await;
         }
-        let _ = self.state_manager.handle_silenced().await;
-        self.workit_client.disconnect().await?;
-        info!(instance = %self.config.associated_id, "disconnected from supervisor");
+        if self.state_manager.is_sunsetting().await {
+            let _ = self.state_manager.handle_silenced().await;
+        }
+        if self.workit_client.is_connected() {
+            self.workit_client.disconnect().await?;
+            info!(instance = %self.config.associated_id, "disconnected from supervisor");
+        } else {
+            info!(
+                instance = %self.config.associated_id,
+                "shutting down before the supervisor connection was established"
+            );
+        }
         Ok(())
     }
 
     pub async fn current_state(&self) -> State {
         self.state_manager.current_state().await
-    }
-
-    /// Reconnect with exponential backoff between attempts.
-    async fn reconnect_with_backoff(&mut self) -> SdkResult<()> {
-        const MAX_RETRIES: u32 = 5;
-        const BASE_DELAY_MS: u64 = 1000;
-        const MAX_DELAY_MS: u64 = 30000;
-
-        let _ = self.workit_client.disconnect().await;
-        for attempt in 1..=MAX_RETRIES {
-            if attempt > 1 {
-                let delay = Duration::from_millis(
-                    (BASE_DELAY_MS * 2_u64.pow(attempt - 2)).min(MAX_DELAY_MS),
-                );
-                info!(attempt, ?delay, "waiting before reconnecting to supervisor");
-                tokio::time::sleep(delay).await;
-            }
-            match self.connect_and_register().await {
-                Ok(()) => {
-                    info!(attempt, "reconnected to supervisor");
-                    return Ok(());
-                }
-                Err(e) => warn!(attempt, error = %e, "reconnection attempt failed"),
-            }
-        }
-        error!(
-            retries = MAX_RETRIES,
-            "giving up on the supervisor connection"
-        );
-        Err(WorkitError::ConnectionError(
-            "maximum reconnection attempts exceeded".to_string(),
-        ))
     }
 
     #[cfg(test)]
@@ -363,16 +436,72 @@ impl DefluxSupervisorClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervisor::mock::MockSupervisor;
 
     fn test_config() -> SupervisorConfig {
+        config_for("http://localhost:8080")
+    }
+
+    fn config_for(addr: &str) -> SupervisorConfig {
         SupervisorConfig {
             associated_id: "test-worker".to_string(),
             secret: "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
-            addr: "http://localhost:8080".to_string(),
+            addr: addr.to_string(),
             heartbeat_interval: 30,
             request_timeout: 10,
             retry_count: 3,
         }
+    }
+
+    fn fast_backoff() -> Backoff {
+        Backoff {
+            first: Duration::from_millis(5),
+            max: Duration::from_millis(20),
+        }
+    }
+
+    #[tokio::test]
+    async fn registers_once_the_supervisor_answers() {
+        let mut supervisor = MockSupervisor::start().await;
+        supervisor.refuse_next(1);
+        let mut client = DefluxSupervisorClient::new(config_for(&supervisor.addr))
+            .unwrap()
+            .with_backoff(fast_backoff());
+
+        client.connect_with_backoff().await;
+
+        assert_eq!(client.current_state().await, State::Active);
+        assert!(client.is_ready().await);
+        assert_eq!(supervisor.next_registration().await, 2);
+        assert_eq!(supervisor.connections(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_an_outage_longer_than_five_attempts() {
+        let mut supervisor = MockSupervisor::start().await;
+        let mut client = DefluxSupervisorClient::new(config_for(&supervisor.addr))
+            .unwrap()
+            .with_backoff(fast_backoff());
+        client.connect_with_backoff().await;
+        assert_eq!(supervisor.next_registration().await, 1);
+        let state = Arc::clone(client.state_manager());
+
+        // Six refused attempts is more than the five the old policy allowed.
+        supervisor.refuse_next(6);
+        supervisor.cut_connections();
+        let running = tokio::spawn(async move { client.run().await });
+
+        assert_eq!(supervisor.next_registration().await, 8);
+        assert_eq!(state.current_state().await, State::Active);
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn disconnect_before_registration_leaves_pending() {
+        let mut client = DefluxSupervisorClient::new(test_config()).unwrap();
+        client.disconnect().await.unwrap();
+        assert_eq!(client.current_state().await, State::Pending);
+        assert_eq!(client.state_manager().history_count().await, 0);
     }
 
     fn request(command: &str) -> CommandRequest {

@@ -7,6 +7,7 @@ pub mod tls;
 pub mod upstream;
 
 use std::ops::Add;
+use std::path::Path;
 use std::time::Duration;
 
 use denira_workit::SupervisorConfig;
@@ -47,13 +48,15 @@ pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 /// The derived `Default` is the empty layer; [`SystemConfig::baseline`] holds
 /// the values a bare instance runs with.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SystemConfig {
     /// Detach from the terminal and run in the background.
     pub daemon: Option<bool>,
-    /// User to switch to after binding sockets (daemon mode only).
+    /// User to switch to in daemon mode. Pingora switches identity inside
+    /// `daemonize()`, before any listener is bound, so this user must be able
+    /// to bind every configured port; unset keeps the invoking identity.
     pub user: Option<String>,
-    /// Group to switch to after binding sockets (daemon mode only).
+    /// Group to switch to in daemon mode; same caveat as `user`.
     pub group: Option<String>,
     /// PID file written in daemon mode.
     pub pid_file: Option<String>,
@@ -99,12 +102,13 @@ pub struct SystemConfig {
 
 impl SystemConfig {
     /// Values a bare instance runs with before any configuration file is
-    /// applied: plain HTTP on every interface, round robin, gzip enabled.
+    /// applied: plain HTTP on every interface, round robin, gzip enabled,
+    /// no identity switch in daemon mode.
     pub fn baseline() -> Self {
         Self {
             daemon: Some(false),
-            user: Some("nobody".to_string()),
-            group: Some("nogroup".to_string()),
+            user: None,
+            group: None,
             pid_file: Some(DEFAULT_PID_FILE.to_string()),
             upgrade_sock: Some(DEFAULT_UPGRADE_SOCK.to_string()),
             worker_threads: None,
@@ -207,6 +211,48 @@ impl SystemConfig {
             self.upstream_read_timeout_secs
                 .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_SECS),
         )
+    }
+
+    /// Make every file path in this layer absolute by resolving relative
+    /// ones against `base`, normally the directory deflux was started from.
+    ///
+    /// Pingora's daemon mode changes the working directory to `/`, so paths
+    /// used after that point (the PID file pingora writes, the default
+    /// certificate when the route table is rebuilt after a supervisor push)
+    /// must not depend on the working directory. Symlinks are left alone on
+    /// purpose: re-pointing a link still takes effect on the next reload.
+    pub fn resolve_paths(&mut self, base: &Path) {
+        let resolve = |path: &mut String| {
+            if !Path::new(path.as_str()).is_absolute() {
+                *path = base.join(path.as_str()).to_string_lossy().into_owned();
+            }
+        };
+        for path in [
+            &mut self.database,
+            &mut self.pid_file,
+            &mut self.upgrade_sock,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            resolve(path);
+        }
+        if let Some(log) = &mut self.log {
+            if let Some(path) = log.error_log.as_mut().and_then(|e| e.path.as_mut()) {
+                resolve(path);
+            }
+            if let Some(access) = &mut log.access_log {
+                resolve(&mut access.path);
+            }
+        }
+        if let Some(cert) = self
+            .tls
+            .as_mut()
+            .and_then(|t| t.default_certificate.as_mut())
+        {
+            resolve(&mut cert.cert_file);
+            resolve(&mut cert.key_file);
+        }
     }
 }
 
@@ -366,5 +412,59 @@ ports = [443]
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn baseline_keeps_the_invoking_identity() {
+        let baseline = SystemConfig::baseline();
+        assert!(baseline.user.is_none());
+        assert!(baseline.group.is_none());
+    }
+
+    #[test]
+    fn resolves_relative_paths_against_the_base() {
+        let local: SystemConfig = toml::from_str(
+            r#"
+database = "sites.db"
+pid_file = "/run/deflux.pid"
+upgrade_sock = "run/upgrade.sock"
+[tls]
+default_certificate = { cert_file = "certs/default.pem", key_file = "/etc/deflux/default.key" }
+[log.error_log]
+path = "logs/error.log"
+[log.access_log]
+path = "logs/access.log"
+"#,
+        )
+        .unwrap();
+        let mut merged = SystemConfig::baseline() + local;
+        merged.resolve_paths(Path::new("/srv/deflux"));
+        assert_eq!(merged.database(), "/srv/deflux/sites.db");
+        assert_eq!(merged.pid_file(), "/run/deflux.pid");
+        assert_eq!(merged.upgrade_sock(), "/srv/deflux/run/upgrade.sock");
+        let cert = merged
+            .tls
+            .as_ref()
+            .and_then(|t| t.default_certificate.as_ref())
+            .unwrap();
+        assert_eq!(cert.cert_file, "/srv/deflux/certs/default.pem");
+        assert_eq!(cert.key_file, "/etc/deflux/default.key");
+        let log = merged.log.as_ref().unwrap();
+        assert_eq!(
+            log.error_log.as_ref().unwrap().path.as_deref(),
+            Some("/srv/deflux/logs/error.log")
+        );
+        assert_eq!(
+            log.access_log.as_ref().unwrap().path,
+            "/srv/deflux/logs/access.log"
+        );
+    }
+
+    #[test]
+    fn baseline_database_resolves_against_the_base() {
+        let mut merged = SystemConfig::baseline();
+        merged.resolve_paths(Path::new("/srv/deflux"));
+        assert_eq!(merged.database(), "/srv/deflux/sites.db");
+        assert_eq!(merged.pid_file(), DEFAULT_PID_FILE);
     }
 }

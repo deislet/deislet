@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future::join_all;
 use pingora::lb::discovery::ServiceDiscovery;
 use pingora::lb::health_check::TcpHealthCheck;
 use pingora::lb::selection::{
@@ -33,13 +34,25 @@ impl ServiceDiscovery for ConfigDiscovery {
         let system = self.config.get_system_config();
         let mut backends = BTreeSet::new();
 
-        for upstream in system.upstreams.iter().flatten() {
-            let address = upstream.address();
-            match tokio::net::lookup_host(&address).await {
+        // Resolve every upstream at once so a slow resolver costs one lookup
+        // latency rather than one per upstream.
+        let lookups = system
+            .upstreams
+            .iter()
+            .flatten()
+            .map(|upstream| async move {
+                let address = upstream.address();
+                let result = tokio::net::lookup_host(address.as_str())
+                    .await
+                    .map(|addrs| addrs.collect::<Vec<_>>());
+                (address, upstream.weight, result)
+            });
+        for (address, weight, result) in join_all(lookups).await {
+            match result {
                 Ok(addrs) => {
                     let mut resolved = 0;
                     for addr in addrs {
-                        match Backend::new_with_weight(&addr.to_string(), upstream.weight) {
+                        match Backend::new_with_weight(&addr.to_string(), weight) {
                             Ok(backend) => {
                                 backends.insert(backend);
                                 resolved += 1;

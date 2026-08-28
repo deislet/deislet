@@ -27,6 +27,9 @@ impl SupervisorSystemConfig {
         config.database = None;
         config.grace_period_secs = None;
         config.graceful_shutdown_timeout_secs = None;
+        // The balancer's schedule is fixed when the process starts; an
+        // overlay value would be stored but never applied.
+        config.health_check_interval_secs = None;
         config.listen_addr = None;
         config.listen_ports = None;
         config.tls = None;

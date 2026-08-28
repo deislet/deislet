@@ -25,26 +25,21 @@ impl BackgroundService for SupervisorService {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         let mut client = self.client.lock().await;
 
-        let outcome = tokio::select! {
-            result = async {
-                client.start().await?;
-                info!("supervisor client connected");
-                client.run().await
-            } => Some(result),
-            _ = shutdown.changed() => None,
+        // The client retries the connection until shutdown, so racing it
+        // against the shutdown watch here is what cancels a pending retry
+        // delay promptly.
+        let stopped = tokio::select! {
+            _ = client.run() => true,
+            _ = shutdown.changed() => false,
         };
 
-        match outcome {
-            Some(Ok(())) => info!("supervisor client stopped"),
-            Some(Err(e)) => {
-                error!(error = %e, "supervisor client failed; instance is no longer managed")
-            }
-            None => {
-                info!("server shutting down; disconnecting from supervisor");
-                if let Err(e) = client.disconnect().await {
-                    error!(error = %e, "supervisor disconnect failed");
-                }
-            }
+        if stopped {
+            error!("supervisor client stopped unexpectedly; instance is no longer managed");
+            return;
+        }
+        info!("server shutting down; disconnecting from supervisor");
+        if let Err(e) = client.disconnect().await {
+            error!(error = %e, "supervisor disconnect failed");
         }
     }
 }
