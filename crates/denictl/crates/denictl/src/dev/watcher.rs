@@ -1,7 +1,7 @@
 use anyhow::Result;
 use colored::Colorize;
-use denictl_core::ProjectConfig;
-use denictl_parser::TypeScriptParser;
+use deforge::ProjectConfig;
+use deforge::parser::TypeScriptParser;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

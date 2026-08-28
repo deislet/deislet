@@ -11,10 +11,7 @@ name = "denictl"
 path = "src/main.rs"
 
 [dependencies]
-denictl-core = { path = "../denictl-core" }
-denictl-parser = { path = "../denictl-parser" }
-denictl-compiler = { path = "../denictl-compiler" }
-denictl-adapters = { path = "../denictl-adapters" }
+deforge = { path = "../../../deforge" }
 
 clap = { version = "4.4", features = ["derive", "cargo"] }
 colored = "2.1"

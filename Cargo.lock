@@ -1964,13 +1964,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "chrono",
  "clap 4.5.54",
  "colored",
- "denictl-adapters",
- "denictl-compiler",
- "denictl-core",
- "denictl-parser",
+ "deforge",
  "dialoguer",
  "hyper 1.8.1",
  "indicatif",
@@ -1984,58 +1980,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "walkdir",
-]
-
-[[package]]
-name = "denictl-adapters"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "denictl-core",
- "handlebars",
- "serde",
- "serde_json",
- "toml",
- "walkdir",
-]
-
-[[package]]
-name = "denictl-compiler"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "denictl-adapters",
- "denictl-core",
- "denictl-parser",
- "serde",
- "serde_json",
- "swc_common 18.0.1",
- "swc_ecma_ast 20.0.1",
- "swc_ecma_parser 33.0.1",
- "swc_ecma_visit 20.0.0",
- "walkdir",
-]
-
-[[package]]
-name = "denictl-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "denictl-parser"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "denictl-core",
- "swc_common 18.0.1",
- "swc_ecma_ast 20.0.1",
- "swc_ecma_parser 33.0.1",
- "swc_ecma_visit 20.0.0",
 ]
 
 [[package]]

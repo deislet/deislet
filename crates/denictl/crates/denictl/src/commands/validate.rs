@@ -1,6 +1,6 @@
 use anyhow::Result;
 use colored::Colorize;
-use denictl_compiler::Compiler;
+use deforge::Compiler;
 use std::env;
 
 pub async fn execute(strict: bool) -> Result<()> {

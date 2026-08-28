@@ -17,13 +17,11 @@ DeniCTL 是一个用于 Edge Function 开发和部署的统一工具链,支持�
 
 ```
 denictl/
-├── crates/
-│   ├── denictl/           # CLI 可执行文件
-│   ├── denictl-core/      # 核心类型和配置
-│   ├── denictl-parser/    # TypeScript/JavaScript 解析器 (SWC)
-│   ├── denictl-compiler/  # 编译器 (验证、转换)
-│   └── denictl-adapters/  # 平台适配器代码生成
+└── crates/
+    └── denictl/           # CLI 可执行文件 (init / dev / validate / build / deploy / config)
 ```
+
+解析、验证、编译和平台适配器代码生成全部由同一 workspace 的 `deforge` 提供，denictl 只是它的命令行外壳，另加本地开发服务器（Mock KV + 热重载）。
 
 ## 技术思路
 
@@ -192,7 +190,7 @@ const kv = context.services.kv;
 
 这是一个 **Rust 实现**版本,包含:
 
-- ✅ 完整的 Rust 工作空间结构 (5 个 crates)
+- ✅ 单一 CLI crate，编译链路复用 `deforge`
 - ✅ CLI 工具 (使用 clap)
 - ✅ TypeScript/JavaScript 解析器 (使用 SWC)
 - ✅ 代码验证器 (平台特定代码检测)

@@ -3,21 +3,21 @@
 ## 🚀 第一优先级 - 核心功能完善
 
 ### 编译器增强
-- [ ] **完善代码转换器** (`denictl-compiler/src/transformer.rs`)
+- [ ] **完善代码转换器** (`deforge/src/compiler/`)
   - [ ] 实现完整的 AST 转换逻辑
   - [ ] 生成平台特定的入口点包装代码
   - [ ] 自动注入适配器导入语句
   - [ ] 处理动态路由参数映射
   - [ ] 支持中间件转换
 
-- [ ] **增强验证器** (`denictl-compiler/src/validator.rs`)
+- [ ] **增强验证器** (`deforge/src/compiler/validator.rs`)
   - [ ] 添加更精确的行号和列号定位
   - [ ] 检测更多平台特定模式 (如 `import.meta`, `__dirname`)
   - [ ] 验证环境变量使用 (区分 binding 和普通环境变量)
   - [ ] 检查服务使用与配置的一致性
   - [ ] 添加循环依赖检测
 
-- [ ] **优化解析器** (`denictl-parser/src/lib.rs`)
+- [ ] **优化解析器** (`deforge/src/parser/mod.rs`)
   - [ ] 提取更详细的类型信息
   - [ ] 识别异步函数签名
   - [ ] 检测 Context 类型使用
@@ -114,10 +114,8 @@
 
 ### 测试框架
 - [ ] **单元测试**
-  - [ ] denictl-core 测试
-  - [ ] denictl-parser 测试
-  - [ ] denictl-compiler 测试
-  - [ ] denictl-adapters 测试
+  - [ ] CLI 命令与 dev 服务器测试
+  - 解析/编译/适配器的测试随代码归入 `deforge`
 
 - [ ] **集成测试**
   - [ ] 完整编译流程测试

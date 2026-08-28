@@ -43,8 +43,7 @@ export function onRequest(context: EventContext): Response | Promise<Response> {
 ## ✅ 已完成功能
 
 ### 核心架构 (100%)
-- ✅ Rust Workspace 结构 (5 个 crates)
-- ✅ 模块化设计 (core, parser, compiler, adapters, cli)
+- ✅ 单一 CLI crate，解析/编译/适配器复用 `deforge`
 - ✅ 完整的类型系统
 - ✅ 错误处理机制
 

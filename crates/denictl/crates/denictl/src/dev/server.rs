@@ -9,7 +9,7 @@ use axum::{
     http::{StatusCode, HeaderMap},
 };
 use colored::Colorize;
-use denictl_core::ProjectConfig;
+use deforge::ProjectConfig;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
