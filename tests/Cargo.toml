@@ -1,17 +1,20 @@
 [package]
 name = "deislet-integration-tests"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
 
 [[bin]]
 name = "integration_workit_denira"
 path = "integration_workit_denira.rs"
 
 [[bin]]
-name = "integration_denix_supervisor"
-path = "integration_denix_supervisor.rs"
+name = "integration_deflux_denira"
+path = "integration_deflux_denira.rs"
 
 [dependencies]
-workit = { path = "../../_superv_workit" }
-denix = { path = "../../denix" }
+denira-workit = { path = "../crates/workit" }
+deflux = { path = "../crates/deflux" }
 tokio = { version = "1", features = ["full"] }

@@ -1959,6 +1959,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "deislet-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "deflux",
+ "denira-workit",
+ "tokio",
+]
+
+[[package]]
 name = "denictl"
 version = "0.1.0"
 dependencies = [

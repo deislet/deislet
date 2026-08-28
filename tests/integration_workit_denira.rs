@@ -1,4 +1,4 @@
-use workit::{SupervisorConfig, WorkerInfo, WorkerType, WorkitClient};
+use denira_workit::{SupervisorConfig, WorkerInfo, WorkerType, WorkitClient};
 
 const TEST_SECRET: &str = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
 
