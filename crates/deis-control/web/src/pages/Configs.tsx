@@ -1,28 +1,28 @@
 import { useState } from 'react'
-import { useWorkers, useConfigs } from '@/hooks/useApi'
+import { useNodes, useConfigs } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 
 import { RefreshCw, Save } from 'lucide-react'
 
 export function Configs() {
-  const { workers } = useWorkers()
-  const [selectedWorker, setSelectedWorker] = useState<string | null>(null)
-  const { configs, loading, error, refetch, updateConfig } = useConfigs(selectedWorker || undefined)
+  const { nodes } = useNodes()
+  const [selectedNode, setSelectedNode] = useState<string | null>(null)
+  const { configs, loading, error, refetch, updateConfig } = useConfigs(selectedNode || undefined)
   const [editedConfigs, setEditedConfigs] = useState<string>('')
   const [saving, setSaving] = useState(false)
 
-  const handleWorkerSelect = (workerId: string) => {
-    setSelectedWorker(workerId)
+  const handleNodeSelect = (nodeId: string) => {
+    setSelectedNode(nodeId)
     setEditedConfigs('')
   }
 
   const handleSave = async () => {
-    if (!selectedWorker) return
+    if (!selectedNode) return
     try {
       setSaving(true)
       const parsed = JSON.parse(editedConfigs)
-      await updateConfig(selectedWorker, parsed)
+      await updateConfig(selectedNode, parsed)
       setEditedConfigs('')
     } catch (err) {
       console.error('Failed to save config:', err)
@@ -36,7 +36,7 @@ export function Configs() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold">Configs</h1>
-          <p className="text-muted-foreground">Manage worker configurations</p>
+          <p className="text-muted-foreground">Manage node configurations</p>
         </div>
         <Button variant="outline" size="sm" onClick={refetch} disabled={loading}>
           <RefreshCw className={`h-4 w-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
@@ -47,25 +47,25 @@ export function Configs() {
       <div className="grid gap-4 md:grid-cols-4">
         <Card className="md:col-span-1">
           <CardHeader>
-            <CardTitle className="text-base">Workers</CardTitle>
+            <CardTitle className="text-base">Nodes</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="space-y-2">
-              {workers.map((worker) => (
+              {nodes.map((node) => (
                 <Button
-                  key={worker.id}
-                  variant={selectedWorker === worker.id ? 'default' : 'ghost'}
+                  key={node.id}
+                  variant={selectedNode === node.id ? 'default' : 'ghost'}
                   className="w-full justify-start text-left"
-                  onClick={() => handleWorkerSelect(worker.id)}
+                  onClick={() => handleNodeSelect(node.id)}
                 >
                   <div className="truncate">
-                    <p className="text-sm font-medium">{worker.worker_type}</p>
-                    <p className="text-xs text-muted-foreground truncate">{worker.id}</p>
+                    <p className="text-sm font-medium">{node.node_role}</p>
+                    <p className="text-xs text-muted-foreground truncate">{node.id}</p>
                   </div>
                 </Button>
               ))}
-              {workers.length === 0 && (
-                <p className="text-sm text-muted-foreground">No workers connected</p>
+              {nodes.length === 0 && (
+                <p className="text-sm text-muted-foreground">No nodes connected</p>
               )}
             </div>
           </CardContent>
@@ -74,9 +74,9 @@ export function Configs() {
         <Card className="md:col-span-3">
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="text-base">
-              {selectedWorker ? 'Configuration' : 'Select a worker'}
+              {selectedNode ? 'Configuration' : 'Select a node'}
             </CardTitle>
-            {selectedWorker && editedConfigs && (
+            {selectedNode && editedConfigs && (
               <Button size="sm" onClick={handleSave} disabled={saving}>
                 <Save className="h-4 w-4 mr-2" />
                 Save
@@ -86,8 +86,8 @@ export function Configs() {
           <CardContent>
             {error && <p className="text-destructive mb-4">{error}</p>}
             
-            {!selectedWorker ? (
-              <p className="text-muted-foreground">Select a worker to view its configuration</p>
+            {!selectedNode ? (
+              <p className="text-muted-foreground">Select a node to view its configuration</p>
             ) : loading ? (
               <p className="text-muted-foreground">Loading configuration...</p>
             ) : (

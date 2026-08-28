@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["kookyleo <kookyleo@gmail.com>"]
-description = "Worker communication toolkit for Control supervisor integration"
+description = "Node communication toolkit for Control control integration"
 
 [dependencies]
 async-trait = "0.1.83"

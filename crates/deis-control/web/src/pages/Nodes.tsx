@@ -1,4 +1,4 @@
-import { useWorkers } from '@/hooks/useApi'
+import { useNodes } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -33,41 +33,41 @@ function getStateBadgeVariant(state: string) {
   }
 }
 
-export function Workers() {
-  const { workers, loading, error, refetch } = useWorkers()
-  const [restartingWorker, setRestartingWorker] = useState<string | null>(null)
-  const [workerToRestart, setWorkerToRestart] = useState<{ id: string; type: string } | null>(null)
+export function Nodes() {
+  const { nodes, loading, error, refetch } = useNodes()
+  const [restartingNode, setRestartingNode] = useState<string | null>(null)
+  const [nodeToRestart, setNodeToRestart] = useState<{ id: string; type: string } | null>(null)
 
-  const handleRestartClick = (workerId: string, workerType: string) => {
-    setWorkerToRestart({ id: workerId, type: workerType })
+  const handleRestartClick = (nodeId: string, nodeType: string) => {
+    setNodeToRestart({ id: nodeId, type: nodeType })
   }
 
   const handleConfirmRestart = async () => {
-    if (!workerToRestart) return
+    if (!nodeToRestart) return
 
-    setRestartingWorker(workerToRestart.id)
-    setWorkerToRestart(null)
+    setRestartingNode(nodeToRestart.id)
+    setNodeToRestart(null)
 
     try {
-      const result = await api.executeCommand(workerToRestart.id, {
+      const result = await api.executeCommand(nodeToRestart.id, {
         command_type: 'custom',
         command_data: 'graceful_restart',
       })
 
       toast.success('Graceful restart initiated', {
-        description: `Worker ${workerToRestart.type} is restarting. Command ID: ${result.command_id}`,
+        description: `Node ${nodeToRestart.type} is restarting. Command ID: ${result.command_id}`,
       })
 
-      // 延迟一下再刷新，给 worker 时间处理
+      // 延迟一下再刷新，给 node 时间处理
       setTimeout(() => {
         refetch()
-        setRestartingWorker(null)
+        setRestartingNode(null)
       }, 2000)
     } catch (err) {
-      toast.error('Failed to restart worker', {
+      toast.error('Failed to restart node', {
         description: err instanceof Error ? err.message : 'Unknown error',
       })
-      setRestartingWorker(null)
+      setRestartingNode(null)
     }
   }
 
@@ -75,8 +75,8 @@ export function Workers() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold">Workers</h1>
-          <p className="text-muted-foreground">Manage connected worker nodes</p>
+          <h1 className="text-3xl font-bold">Nodes</h1>
+          <p className="text-muted-foreground">Manage connected node nodes</p>
         </div>
         <Button variant="outline" size="sm" onClick={refetch} disabled={loading}>
           <RefreshCw className={`h-4 w-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
@@ -92,34 +92,34 @@ export function Workers() {
         </Card>
       )}
 
-      {loading && workers.length === 0 ? (
+      {loading && nodes.length === 0 ? (
         <div className="flex items-center justify-center h-64">
-          <p className="text-muted-foreground">Loading workers...</p>
+          <p className="text-muted-foreground">Loading nodes...</p>
         </div>
-      ) : workers.length === 0 ? (
+      ) : nodes.length === 0 ? (
         <Card>
           <CardContent className="pt-6">
-            <p className="text-center text-muted-foreground">No workers connected</p>
+            <p className="text-center text-muted-foreground">No nodes connected</p>
           </CardContent>
         </Card>
       ) : (
         <div className="grid gap-4">
-          {workers.map((worker) => (
-            <Card key={worker.id}>
+          {nodes.map((node) => (
+            <Card key={node.id}>
               <CardHeader className="pb-2">
                 <div className="flex items-center justify-between">
-                  <CardTitle className="text-lg">{worker.worker_type}</CardTitle>
+                  <CardTitle className="text-lg">{node.node_role}</CardTitle>
                   <div className="flex items-center gap-2">
-                    <Badge variant={getStateBadgeVariant(worker.state)}>{worker.state}</Badge>
+                    <Badge variant={getStateBadgeVariant(node.state)}>{node.state}</Badge>
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => handleRestartClick(worker.id, worker.worker_type)}
-                      disabled={restartingWorker === worker.id || worker.state !== 'Active'}
+                      onClick={() => handleRestartClick(node.id, node.node_role)}
+                      disabled={restartingNode === node.id || node.state !== 'Active'}
                       className="h-8"
                     >
-                      <RotateCw className={`h-3.5 w-3.5 mr-1.5 ${restartingWorker === worker.id ? 'animate-spin' : ''}`} />
-                      {restartingWorker === worker.id ? 'Restarting...' : 'Restart'}
+                      <RotateCw className={`h-3.5 w-3.5 mr-1.5 ${restartingNode === node.id ? 'animate-spin' : ''}`} />
+                      {restartingNode === node.id ? 'Restarting...' : 'Restart'}
                     </Button>
                   </div>
                 </div>
@@ -128,27 +128,27 @@ export function Workers() {
                 <div className="grid gap-2 text-sm md:grid-cols-2 lg:grid-cols-4">
                   <div>
                     <p className="text-muted-foreground">ID</p>
-                    <p className="font-mono text-xs">{worker.id}</p>
+                    <p className="font-mono text-xs">{node.id}</p>
                   </div>
                   <div>
                     <p className="text-muted-foreground">Instance</p>
-                    <p className="font-mono text-xs">{worker.instance_id}</p>
+                    <p className="font-mono text-xs">{node.instance_id}</p>
                   </div>
                   <div>
                     <p className="text-muted-foreground">Address</p>
-                    <p>{worker.host}:{worker.ports.join(', ')}</p>
+                    <p>{node.host}:{node.ports.join(', ')}</p>
                   </div>
                   <div>
                     <p className="text-muted-foreground">Connected</p>
-                    <p>{formatDate(worker.connected_at)}</p>
+                    <p>{formatDate(node.connected_at)}</p>
                   </div>
                   <div>
                     <p className="text-muted-foreground">Last Heartbeat</p>
-                    <p>{formatDate(worker.last_heartbeat)}</p>
+                    <p>{formatDate(node.last_heartbeat)}</p>
                   </div>
                   <div>
                     <p className="text-muted-foreground">Power Reserve</p>
-                    <p>{worker.power_reserve}</p>
+                    <p>{node.power_reserve}</p>
                   </div>
                 </div>
               </CardContent>
@@ -158,12 +158,12 @@ export function Workers() {
       )}
 
       {/* Restart Confirmation Dialog */}
-      <Dialog open={!!workerToRestart} onOpenChange={(open: boolean) => !open && setWorkerToRestart(null)}>
+      <Dialog open={!!nodeToRestart} onOpenChange={(open: boolean) => !open && setNodeToRestart(null)}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Confirm Graceful Restart</DialogTitle>
             <DialogDescription>
-              Are you sure you want to restart worker <strong>{workerToRestart?.type}</strong>?
+              Are you sure you want to restart node <strong>{nodeToRestart?.type}</strong>?
               <br /><br />
               This will initiate a zero-downtime graceful restart:
               <ul className="list-disc list-inside mt-2 space-y-1">
@@ -174,11 +174,11 @@ export function Workers() {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setWorkerToRestart(null)}>
+            <Button variant="outline" onClick={() => setNodeToRestart(null)}>
               Cancel
             </Button>
             <Button onClick={handleConfirmRestart}>
-              Restart Worker
+              Restart Node
             </Button>
           </DialogFooter>
         </DialogContent>

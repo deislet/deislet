@@ -1,7 +1,7 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { Layout } from '@/components/layout/Layout'
 import { Dashboard } from '@/pages/Dashboard'
-import { Workers } from '@/pages/Workers'
+import { Nodes } from '@/pages/Nodes'
 import { Commands } from '@/pages/Commands'
 import { Configs } from '@/pages/Configs'
 import { Events } from '@/pages/Events'
@@ -12,7 +12,7 @@ function App() {
       <Routes>
         <Route path="/" element={<Layout />}>
           <Route index element={<Dashboard />} />
-          <Route path="workers" element={<Workers />} />
+          <Route path="nodes" element={<Nodes />} />
           <Route path="commands" element={<Commands />} />
           <Route path="configs" element={<Configs />} />
           <Route path="events" element={<Events />} />

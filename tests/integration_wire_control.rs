@@ -1,4 +1,4 @@
-use deis_wire::{SupervisorConfig, WorkerInfo, WorkerType, WireClient};
+use deis_wire::{ControlConfig, NodeInfo, NodeRole, WireClient};
 
 const TEST_SECRET: &str = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
 
@@ -6,19 +6,19 @@ const TEST_SECRET: &str = "a1b2c3d4e5f678901234567890123456789012345678901234567
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Wire → Control Integration Test ===\n");
 
-    let config = SupervisorConfig::new(
-        "test-deis_runtime-worker".to_string(),
+    let config = ControlConfig::new(
+        "test-deis_runtime-node".to_string(),
         TEST_SECRET.to_string(),
         "ws://127.0.0.1:9001".to_string(),
     );
 
-    let worker_info = WorkerInfo::new_single_port(
-        WorkerType::Runtime("1.0.0".to_string()),
+    let node_info = NodeInfo::new_single_port(
+        NodeRole::Runtime("1.0.0".to_string()),
         "127.0.0.1".to_string(),
         8000,
     );
 
-    let mut client = WireClient::new(config, worker_info);
+    let mut client = WireClient::new(config, node_info);
 
     println!("[1] Connecting to deis_control...");
     client.connect().await?;
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.authenticate().await?;
     println!("[OK] Authenticated\n");
 
-    println!("[3] Registering worker...");
+    println!("[3] Registering node...");
     client.register().await?;
     println!("[OK] Registered\n");
 

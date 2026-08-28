@@ -1,4 +1,4 @@
-//! In-process supervisor for client tests. It answers the handshake the way
+//! In-process control for client tests. It answers the handshake the way
 //! deis-control does and lets a test refuse connection attempts or cut the live
 //! streams, so retry behaviour can be exercised without a real outage.
 
@@ -6,9 +6,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use deis_wire::pb::supervisor_message::Payload;
-use deis_wire::pb::supervisor_service_server::{SupervisorService, SupervisorServiceServer};
-use deis_wire::pb::{AuthResponse, RegisterResponse, SupervisorMessage};
+use deis_wire::pb::control_message::Payload;
+use deis_wire::pb::control_service_server::{ControlService, ControlServiceServer};
+use deis_wire::pb::{AuthResponse, RegisterResponse, ControlMessage};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -16,8 +16,8 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
-pub struct MockSupervisor {
-    /// gRPC endpoint, ready to use as `SupervisorConfig::addr`.
+pub struct MockControl {
+    /// gRPC endpoint, ready to use as `ControlConfig::addr`.
     pub addr: String,
     connections: Arc<AtomicU32>,
     refuse: Arc<AtomicU32>,
@@ -33,7 +33,7 @@ struct Service {
     registered: mpsc::UnboundedSender<u32>,
 }
 
-impl MockSupervisor {
+impl MockControl {
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
@@ -49,10 +49,10 @@ impl MockSupervisor {
         };
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(SupervisorServiceServer::new(service))
+                .add_service(ControlServiceServer::new(service))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
-                .expect("mock supervisor failed");
+                .expect("mock control failed");
         });
         Self {
             addr,
@@ -69,7 +69,7 @@ impl MockSupervisor {
         self.refuse.store(count, Ordering::SeqCst);
     }
 
-    /// Close every live stream, as a supervisor restart would.
+    /// Close every live stream, as a control restart would.
     pub fn cut_connections(&self) {
         let _ = self.cut.send(());
     }
@@ -85,24 +85,24 @@ impl MockSupervisor {
         self.registrations
             .recv()
             .await
-            .expect("mock supervisor stopped")
+            .expect("mock control stopped")
     }
 }
 
-impl Drop for MockSupervisor {
+impl Drop for MockControl {
     fn drop(&mut self) {
         self.server.abort();
     }
 }
 
 #[tonic::async_trait]
-impl SupervisorService for Service {
+impl ControlService for Service {
     type EstablishChannelStream =
-        Pin<Box<dyn Stream<Item = Result<SupervisorMessage, Status>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = Result<ControlMessage, Status>> + Send + 'static>>;
 
     async fn establish_channel(
         &self,
-        request: Request<Streaming<SupervisorMessage>>,
+        request: Request<Streaming<ControlMessage>>,
     ) -> Result<Response<Self::EstablishChannelStream>, Status> {
         let connection = self.connections.fetch_add(1, Ordering::SeqCst) + 1;
         let refused = self
@@ -112,7 +112,7 @@ impl SupervisorService for Service {
             })
             .is_ok();
         if refused {
-            return Err(Status::unavailable("supervisor down"));
+            return Err(Status::unavailable("control down"));
         }
 
         let mut inbound = request.into_inner();
@@ -126,7 +126,7 @@ impl SupervisorService for Service {
                     message = inbound.next() => message,
                     _ = cut.recv() => break,
                 };
-                let Some(Ok(SupervisorMessage {
+                let Some(Ok(ControlMessage {
                     payload: Some(payload),
                 })) = message
                 else {
@@ -151,7 +151,7 @@ impl SupervisorService for Service {
                     }
                     _ => continue,
                 };
-                let reply = SupervisorMessage {
+                let reply = ControlMessage {
                     payload: Some(reply),
                 };
                 if tx.send(Ok(reply)).await.is_err() {

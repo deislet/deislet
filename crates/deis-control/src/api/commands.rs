@@ -25,7 +25,7 @@ pub struct ExecuteCommandRequest {
 /// Execute command
 pub async fn execute_command(
     State(state): State<CommandsState>,
-    Path(worker_id): Path<String>,
+    Path(node_id): Path<String>,
     Json(request): Json<ExecuteCommandRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let command_request = CommandRequest {
@@ -35,7 +35,7 @@ pub async fn execute_command(
 
     let command_id = state
         .command_executor
-        .execute(&worker_id, command_request)
+        .execute(&node_id, command_request)
         .await
         .map_err(|e| ApiError::InternalError(e.to_string()))?;
 
@@ -44,7 +44,7 @@ pub async fn execute_command(
         Json(json!({
             "success": true,
             "command_id": command_id.to_string(),
-            "worker_id": worker_id,
+            "node_id": node_id,
             "command_type": request.command_type.as_str(),
             "message": "Command submitted successfully"
         })),
@@ -85,19 +85,19 @@ pub async fn list_commands(
     })))
 }
 
-/// List commands for a specific worker
-pub async fn list_worker_commands(
+/// List commands for a specific node
+pub async fn list_node_commands(
     State(state): State<CommandsState>,
-    Path(worker_id): Path<String>,
+    Path(node_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let commands = state
         .command_executor
-        .list_worker_commands(&worker_id)
+        .list_node_commands(&node_id)
         .await;
 
     Ok(Json(json!({
         "success": true,
-        "worker_id": worker_id,
+        "node_id": node_id,
         "count": commands.len(),
         "commands": commands
     })))

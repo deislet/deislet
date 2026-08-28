@@ -58,11 +58,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let opts = Opts::from_args();
     info!("Starting Control v{}", deis_control::VERSION);
 
-    let mut config = deis_control::SupervisorConfig::default();
+    let mut config = deis_control::ControlConfig::default();
     if let Some(path) = opts.config
         && path.exists()
     {
-        config = deis_control::SupervisorConfig::load(path)?;
+        config = deis_control::ControlConfig::load(path)?;
     }
     if let Some(port) = opts.port {
         config.port = port;
@@ -78,7 +78,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let api_config = Arc::new(config.clone());
 
-    let server = deis_control::SupervisorServer::new(config)
+    let server = deis_control::ControlServer::new(config)
         .with_database(Arc::clone(&database));
 
     let sessions = server.sessions();

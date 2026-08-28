@@ -1,7 +1,7 @@
 //! Client side of the deis-runtime gRPC management plane.
 //!
-//! Runtime workers are autonomous: they expose a management service and wait
-//! for the supervisor to call them, instead of registering through deis-wire
+//! Runtime nodes are autonomous: they expose a management service and wait
+//! for the control to call them, instead of registering through deis-wire
 //! like deis-proxy does. This module keeps the list of configured deis-runtime nodes,
 //! polls their health in the background, and offers typed helpers used by
 //! the REST API layer.
@@ -23,7 +23,7 @@ use crate::config::RuntimeNodeConfig;
 use proto::runtime_management_client::RuntimeManagementClient;
 
 /// Connection timeout for a single management call. Nodes are on the same
-/// network segment as the supervisor; anything slower than this is down.
+/// network segment as the control; anything slower than this is down.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Per-RPC deadline. Deploys upload a package, so it is more generous.
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);

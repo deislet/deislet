@@ -2,7 +2,7 @@ use pwrzv::get_power_reserve_level_direct;
 use serde::{Deserialize, Serialize};
 
 /// Heartbeat request
-/// send (id, power_reserve) to supervisor
+/// send (id, power_reserve) to control
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     /// Instance (associated) Id

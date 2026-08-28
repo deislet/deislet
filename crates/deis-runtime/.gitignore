@@ -10,7 +10,7 @@ Cargo.lock
 *.db-shm
 *.db-wal
 
-# Applications (managed by supervisor)
+# Applications (managed by control)
 /apps/
 /examples/
 *.zip

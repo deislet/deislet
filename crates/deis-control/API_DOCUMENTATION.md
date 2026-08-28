@@ -8,7 +8,7 @@
 ## Table of Contents
 
 - [Authentication](#authentication)
-- [Workers API](#workers-api)
+- [Nodes API](#nodes-api)
 - [Configs API](#configs-api)
 - [Commands API](#commands-api)
 - [Events API](#events-api)
@@ -43,13 +43,13 @@ api_keys = [
 **Method 1: Authorization Header (Recommended)**
 ```bash
 curl -H "Authorization: Bearer your-secret-api-key-1" \
-     http://localhost:8080/api/workers
+     http://localhost:8080/api/nodes
 ```
 
 **Method 2: X-API-Key Header**
 ```bash
 curl -H "X-API-Key: your-secret-api-key-1" \
-     http://localhost:8080/api/workers
+     http://localhost:8080/api/nodes
 ```
 
 ### Public Endpoints
@@ -67,24 +67,24 @@ The following endpoints do not require authentication:
 
 ---
 
-## Workers API
+## Nodes API
 
-Manage connected workers.
+Manage connected nodes.
 
-### List All Workers
+### List All Nodes
 
 ```http
-GET /api/workers
+GET /api/nodes
 ```
 
 **Response Example**:
 ```json
 {
-  "workers": [
+  "nodes": [
     {
-      "worker_id": "deis-runtime-1",
+      "node_id": "deis-runtime-1",
       "instance_id": "deis-runtime-1-abc123",
-      "worker_type": "deis-runtime:1.0.0",
+      "node_role": "deis-runtime:1.0.0",
       "state": "Active",
       "host": "192.168.1.100",
       "ports": [8080],
@@ -95,21 +95,21 @@ GET /api/workers
 }
 ```
 
-### Get Worker Details
+### Get Node Details
 
 ```http
-GET /api/workers/:id
+GET /api/nodes/:id
 ```
 
 **Path Parameters**:
-- `id`: Worker ID
+- `id`: Node ID
 
 **Response Example**:
 ```json
 {
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "instance_id": "deis-runtime-1-abc123",
-  "worker_type": "deis-runtime:1.0.0",
+  "node_role": "deis-runtime:1.0.0",
   "state": "Active",
   "host": "192.168.1.100",
   "ports": [8080],
@@ -118,14 +118,14 @@ GET /api/workers/:id
 }
 ```
 
-### Get Worker Heartbeat History
+### Get Node Heartbeat History
 
 ```http
-GET /api/workers/:id/heartbeats?limit=10
+GET /api/nodes/:id/heartbeats?limit=10
 ```
 
 **Path Parameters**:
-- `id`: Worker ID
+- `id`: Node ID
 
 **Query Parameters**:
 - `limit`: Return count (Default: 100)
@@ -133,7 +133,7 @@ GET /api/workers/:id/heartbeats?limit=10
 **Response Example**:
 ```json
 {
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "heartbeats": [
     {
       "timestamp": "2026-01-11T10:30:00Z",
@@ -149,7 +149,7 @@ GET /api/workers/:id/heartbeats?limit=10
 
 ## Configs API
 
-Manage worker configurations.
+Manage node configurations.
 
 ### List All Configurations
 
@@ -184,22 +184,22 @@ GET /api/configs/stats
 ```json
 {
   "success": true,
-  "worker_count": 2,
+  "node_count": 2,
   "total_configs": 3
 }
 ```
 
-### Get Worker Configuration
+### Get Node Configuration
 
 ```http
-GET /api/configs/:worker_id
+GET /api/configs/:node_id
 ```
 
 **Response Example**:
 ```json
 {
   "success": true,
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "count": 2,
   "data": {
     "app.max_instances": 10,
@@ -211,23 +211,23 @@ GET /api/configs/:worker_id
 ### Get Single Configuration Value
 
 ```http
-GET /api/configs/:worker_id/:config_key
+GET /api/configs/:node_id/:config_key
 ```
 
 **Response Example**:
 ```json
 {
   "success": true,
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "config_key": "app.max_instances",
   "value": 10
 }
 ```
 
-### Update Worker Configuration
+### Update Node Configuration
 
 ```http
-POST /api/configs/:worker_id
+POST /api/configs/:node_id
 Content-Type: application/json
 ```
 
@@ -245,24 +245,24 @@ Content-Type: application/json
 ```json
 {
   "success": true,
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "version_timestamp": "2026-01-11T10:35:00Z",
   "updated_keys": ["app.max_instances", "app.timeout_seconds"],
   "message": "Configs updated successfully"
 }
 ```
 
-### Delete All Worker Configurations
+### Delete All Node Configurations
 
 ```http
-DELETE /api/configs/:worker_id
+DELETE /api/configs/:node_id
 ```
 
 **Response Example**:
 ```json
 {
   "success": true,
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "message": "All configs deleted successfully"
 }
 ```
@@ -270,48 +270,48 @@ DELETE /api/configs/:worker_id
 ### Delete Single Configuration
 
 ```http
-DELETE /api/configs/:worker_id/:config_key
+DELETE /api/configs/:node_id/:config_key
 ```
 
 **Response Example**:
 ```json
 {
   "success": true,
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "config_key": "app.max_instances",
   "message": "Config deleted successfully"
 }
 ```
 
-### Push All Configurations to Worker
+### Push All Configurations to Node
 
 ```http
-POST /api/configs/push/:worker_id
+POST /api/configs/push/:node_id
 ```
 
-Push all configurations to the specified worker (via WebSocket).
+Push all configurations to the specified node (via WebSocket).
 
 **Response Example**:
 ```json
 {
   "success": true,
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "pushed_count": 2,
   "message": "Pushed 2 configs successfully"
 }
 ```
 
-### Push Single Configuration to Worker
+### Push Single Configuration to Node
 
 ```http
-POST /api/configs/push/:worker_id/:config_key
+POST /api/configs/push/:node_id/:config_key
 ```
 
 **Response Example**:
 ```json
 {
   "success": true,
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "config_key": "app.max_instances",
   "message": "Config pushed successfully"
 }
@@ -321,7 +321,7 @@ POST /api/configs/push/:worker_id/:config_key
 
 ## Commands API
 
-Execute and manage worker commands.
+Execute and manage node commands.
 
 ### List All Commands
 
@@ -337,7 +337,7 @@ GET /api/commands
   "commands": [
     {
       "id": "550e8400-e29b-41d4-a716-446655440000",
-      "worker_id": "deis-runtime-1",
+      "node_id": "deis-runtime-1",
       "command_type": "get_status",
       "status": "Completed",
       "created_at": "2026-01-11T10:00:00Z"
@@ -349,7 +349,7 @@ GET /api/commands
 ### Execute Command
 
 ```http
-POST /api/commands/execute/:worker_id
+POST /api/commands/execute/:node_id
 Content-Type: application/json
 ```
 
@@ -362,8 +362,8 @@ Content-Type: application/json
 ```
 
 **Supported Command Types**:
-- `shutdown` - Shutdown worker
-- `restart` - Restart worker
+- `shutdown` - Shutdown node
+- `restart` - Restart node
 - `reload` - Reload configuration
 - `get_status` - Get status
 - `get_metrics` - Get metrics
@@ -375,7 +375,7 @@ Content-Type: application/json
 {
   "success": true,
   "command_id": "550e8400-e29b-41d4-a716-446655440000",
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "command_type": "get_status",
   "message": "Command submitted successfully"
 }
@@ -394,7 +394,7 @@ GET /api/commands/status/:command_id
   "command_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
-    "worker_id": "deis-runtime-1",
+    "node_id": "deis-runtime-1",
     "command_type": "get_status",
     "status": "Completed",
     "created_at": "2026-01-11T10:00:00Z",
@@ -404,17 +404,17 @@ GET /api/commands/status/:command_id
 }
 ```
 
-### List Worker's Commands
+### List Node's Commands
 
 ```http
-GET /api/commands/worker/:worker_id
+GET /api/commands/node/:node_id
 ```
 
 **Response Example**:
 ```json
 {
   "success": true,
-  "worker_id": "deis-runtime-1",
+  "node_id": "deis-runtime-1",
   "count": 3,
   "commands": [...]
 }
@@ -444,13 +444,13 @@ Query system event logs.
 ### List Events
 
 ```http
-GET /api/events?limit=100&offset=0&worker_id=deis-runtime-1&severity=Error
+GET /api/events?limit=100&offset=0&node_id=deis-runtime-1&severity=Error
 ```
 
 **Query Parameters**:
 - `limit`: Return count (Default: 100)
 - `offset`: Offset (Default: 0)
-- `worker_id`: Filter by Worker ID (Optional)
+- `node_id`: Filter by Node ID (Optional)
 - `severity`: Filter by Severity (Info/Warning/Error, Optional)
 
 **Response Example**:
@@ -462,10 +462,10 @@ GET /api/events?limit=100&offset=0&worker_id=deis-runtime-1&severity=Error
   "offset": 0,
   "events": [
     {
-      "event_type": "WorkerConnected",
-      "worker_id": "deis-runtime-1",
+      "event_type": "NodeConnected",
+      "node_id": "deis-runtime-1",
       "severity": "Info",
-      "message": "Worker deis-runtime-1 registered as deis-runtime-1-abc123",
+      "message": "Node deis-runtime-1 registered as deis-runtime-1-abc123",
       "metadata": null,
       "timestamp": "2026-01-11T10:00:00Z"
     }
@@ -491,7 +491,7 @@ GET /api/events/stats
       "Error": 5
     },
     "by_type": {
-      "WorkerConnected": 10,
+      "NodeConnected": 10,
       "HeartbeatReceived": 100,
       "ConfigUpdated": 20
     }
@@ -516,7 +516,7 @@ GET /api/metrics/summary
 {
   "success": true,
   "metrics": {
-    "workers": {
+    "nodes": {
       "total": 5,
       "active": 4,
       "connected": 1,
@@ -545,20 +545,20 @@ GET /api/metrics
 
 **Response Example**:
 ```
-# HELP deis_control_workers_total Total number of workers
-# TYPE deis_control_workers_total gauge
-deis_control_workers_total 5
+# HELP deis_control_nodes_total Total number of nodes
+# TYPE deis_control_nodes_total gauge
+deis_control_nodes_total 5
 
-# HELP deis_control_workers_active Number of active workers
-# TYPE deis_control_workers_active gauge
-deis_control_workers_active 4
+# HELP deis_control_nodes_active Number of active nodes
+# TYPE deis_control_nodes_active gauge
+deis_control_nodes_active 4
 
-# HELP deis_control_workers_by_type Number of workers by type
-# TYPE deis_control_workers_by_type gauge
-deis_control_workers_by_type{type="deis-runtime:1.0.0"} 3
-deis_control_workers_by_type{type="deis-proxy:2.0.0"} 2
+# HELP deis_control_nodes_by_role Number of nodes by type
+# TYPE deis_control_nodes_by_role gauge
+deis_control_nodes_by_role{type="deis-runtime:1.0.0"} 3
+deis_control_nodes_by_role{type="deis-proxy:2.0.0"} 2
 
-# HELP deis_control_uptime_seconds Supervisor uptime in seconds
+# HELP deis_control_uptime_seconds Control uptime in seconds
 # TYPE deis_control_uptime_seconds counter
 deis_control_uptime_seconds 3600
 
@@ -590,11 +590,11 @@ ws://localhost:8080/api/ws
 **Received Message Format**:
 ```json
 {
-  "event_type": "WorkerConnected",
+  "event_type": "NodeConnected",
   "data": {
-    "worker_id": "deis-runtime-1",
+    "node_id": "deis-runtime-1",
     "instance_id": "deis-runtime-1-abc123",
-    "worker_type": "deis-runtime:1.0.0",
+    "node_role": "deis-runtime:1.0.0",
     "host": "192.168.1.100",
     "ports": [8080],
     "timestamp": "2026-01-11T10:00:00Z"
@@ -603,9 +603,9 @@ ws://localhost:8080/api/ws
 ```
 
 **Event Types**:
-- `WorkerConnected` - Worker connected
-- `WorkerDisconnected` - Worker disconnected
-- `WorkerStateChanged` - Worker state changed
+- `NodeConnected` - Node connected
+- `NodeDisconnected` - Node disconnected
+- `NodeStateChanged` - Node state changed
 - `HeartbeatReceived` - Heartbeat received
 - `ConfigUpdated` - Configuration updated
 - `CommandSent` - Command sent
@@ -629,7 +629,7 @@ All API errors use a unified format:
 ```json
 {
   "error": "Resource not found",
-  "details": "Worker with ID 'nonexistent' not found"
+  "details": "Node with ID 'nonexistent' not found"
 }
 ```
 
@@ -656,15 +656,15 @@ All API errors use a unified format:
 ### Full Workflow Example
 
 ```bash
-# 1. List all workers
-curl http://localhost:8080/api/workers
+# 1. List all nodes
+curl http://localhost:8080/api/nodes
 
 # 2. Update configuration
 curl -X POST http://localhost:8080/api/configs/deis-runtime-1 \
   -H "Content-Type: application/json" \
   -d '{"configs": {"app.max_instances": 20}}'
 
-# 3. Push configuration to worker
+# 3. Push configuration to node
 curl -X POST http://localhost:8080/api/configs/push/deis-runtime-1
 
 # 4. Execute command
@@ -676,7 +676,7 @@ curl -X POST http://localhost:8080/api/commands/execute/deis-runtime-1 \
 curl http://localhost:8080/api/commands/status/550e8400-e29b-41d4-a716-446655440000
 
 # 6. List events
-curl "http://localhost:8080/api/events?worker_id=deis-runtime-1&limit=10"
+curl "http://localhost:8080/api/events?node_id=deis-runtime-1&limit=10"
 
 # 7. Get Prometheus metrics
 curl http://localhost:8080/api/metrics
@@ -688,6 +688,6 @@ curl http://localhost:8080/api/metrics
 
 ### v0.1.0 (2026-01-11)
 - Initial release
-- Implemented Workers, Configs, Commands, Events, and Metrics APIs
+- Implemented Nodes, Configs, Commands, Events, and Metrics APIs
 - WebSocket real-time event push
 - Prometheus metrics export

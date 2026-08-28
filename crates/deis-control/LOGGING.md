@@ -1,6 +1,6 @@
 # Structured Logging
 
-Control Supervisor supports flexible structured logging, facilitating development debugging and production log collection.
+Control Control supports flexible structured logging, facilitating development debugging and production log collection.
 
 ## Log Formats
 
@@ -20,9 +20,9 @@ LOG_FORMAT=text ./deis-control --config deis-control.toml
 
 **Output Example**:
 ```
-2025-01-16T12:00:00.123456Z  INFO deis-control::handler: Worker authenticated successfully associated_id="worker-123"
-2025-01-16T12:00:01.234567Z  INFO deis-control::handler: Worker registered worker_id="worker-123" instance_id="abc-def-123" worker_type=Runtime("1.0.0") host="192.168.1.10" ports=[8000, 8001]
-2025-01-16T12:00:05.345678Z  INFO deis-control::config_manager: Configuration updated worker_id="worker-123" config_keys=["port", "host"] version="2025-01-16T12:00:05Z" count=2
+2025-01-16T12:00:00.123456Z  INFO deis-control::handler: Node authenticated successfully associated_id="node-123"
+2025-01-16T12:00:01.234567Z  INFO deis-control::handler: Node registered node_id="node-123" instance_id="abc-def-123" node_role=Runtime("1.0.0") host="192.168.1.10" ports=[8000, 8001]
+2025-01-16T12:00:05.345678Z  INFO deis-control::config_manager: Configuration updated node_id="node-123" config_keys=["port", "host"] version="2025-01-16T12:00:05Z" count=2
 ```
 
 ### 2. JSON Format
@@ -35,9 +35,9 @@ LOG_FORMAT=json ./deis-control --config deis-control.toml
 
 **Output Example**:
 ```json
-{"timestamp":"2025-01-16T12:00:00.123456Z","level":"INFO","fields":{"message":"Worker authenticated successfully","associated_id":"worker-123"},"target":"deis-control::handler"}
-{"timestamp":"2025-01-16T12:00:01.234567Z","level":"INFO","fields":{"message":"Worker registered","worker_id":"worker-123","instance_id":"abc-def-123","worker_type":"Runtime(\"1.0.0\")","host":"192.168.1.10","ports":[8000,8001]},"target":"deis-control::handler"}
-{"timestamp":"2025-01-16T12:00:05.345678Z","level":"INFO","fields":{"message":"Configuration updated","worker_id":"worker-123","config_keys":["port","host"],"version":"2025-01-16T12:00:05Z","count":2},"target":"deis-control::config_manager"}
+{"timestamp":"2025-01-16T12:00:00.123456Z","level":"INFO","fields":{"message":"Node authenticated successfully","associated_id":"node-123"},"target":"deis-control::handler"}
+{"timestamp":"2025-01-16T12:00:01.234567Z","level":"INFO","fields":{"message":"Node registered","node_id":"node-123","instance_id":"abc-def-123","node_role":"Runtime(\"1.0.0\")","host":"192.168.1.10","ports":[8000,8001]},"target":"deis-control::handler"}
+{"timestamp":"2025-01-16T12:00:05.345678Z","level":"INFO","fields":{"message":"Configuration updated","node_id":"node-123","config_keys":["port","host"],"version":"2025-01-16T12:00:05Z","count":2},"target":"deis-control::config_manager"}
 ```
 
 ## Log Levels
@@ -69,23 +69,23 @@ RUST_LOG=warn ./deis-control --config deis-control.toml
 
 Key operations include structured fields for easy log querying and analysis:
 
-### Worker Lifecycle
+### Node Lifecycle
 
 **Authentication**:
 ```json
 {
-  "message": "Worker authenticated successfully",
-  "associated_id": "worker-123"
+  "message": "Node authenticated successfully",
+  "associated_id": "node-123"
 }
 ```
 
 **Registration**:
 ```json
 {
-  "message": "Worker registered",
-  "worker_id": "worker-123",
+  "message": "Node registered",
+  "node_id": "node-123",
   "instance_id": "abc-def-123",
-  "worker_type": "Runtime(\"1.0.0\")",
+  "node_role": "Runtime(\"1.0.0\")",
   "host": "192.168.1.10",
   "ports": [8000, 8001]
 }
@@ -94,8 +94,8 @@ Key operations include structured fields for easy log querying and analysis:
 **Disconnection**:
 ```json
 {
-  "message": "Worker disconnected",
-  "worker_id": "worker-123",
+  "message": "Node disconnected",
+  "node_id": "node-123",
   "instance_id": "abc-def-123",
   "reason": "Connection closed"
 }
@@ -107,7 +107,7 @@ Key operations include structured fields for easy log querying and analysis:
 ```json
 {
   "message": "Configuration updated",
-  "worker_id": "worker-123",
+  "node_id": "node-123",
   "config_keys": ["port", "host", "timeout"],
   "version": "2025-01-16T12:00:05Z",
   "count": 3
@@ -117,8 +117,8 @@ Key operations include structured fields for easy log querying and analysis:
 **Configuration Push**:
 ```json
 {
-  "message": "Pushed config to worker worker-123: port (version: 2025-01-16T12:00:05Z)",
-  "worker_id": "worker-123",
+  "message": "Pushed config to node node-123: port (version: 2025-01-16T12:00:05Z)",
+  "node_id": "node-123",
   "config_key": "port",
   "version": "2025-01-16T12:00:05Z"
 }
@@ -129,9 +129,9 @@ Key operations include structured fields for easy log querying and analysis:
 **Command Sending**:
 ```json
 {
-  "message": "Command sent to worker",
+  "message": "Command sent to node",
   "command_id": "550e8400-e29b-41d4-a716-446655440000",
-  "worker_id": "worker-123",
+  "node_id": "node-123",
   "command_type": "reload"
 }
 ```
@@ -192,11 +192,11 @@ scrape_configs:
           expressions:
             level: level
             message: fields.message
-            worker_id: fields.worker_id
+            node_id: fields.node_id
             timestamp: timestamp
       - labels:
           level:
-          worker_id:
+          node_id:
       - timestamp:
           source: timestamp
           format: RFC3339Nano
@@ -252,8 +252,8 @@ Filter logs using `jq`:
 # Find all error logs
 cat deis-control.log | jq 'select(.level=="ERROR")'
 
-# Find logs for a specific worker
-cat deis-control.log | jq 'select(.fields.worker_id=="worker-123")'
+# Find logs for a specific node
+cat deis-control.log | jq 'select(.fields.node_id=="node-123")'
 
 # Find configuration update events
 cat deis-control.log | jq 'select(.fields.message | contains("Configuration updated"))'
@@ -270,8 +270,8 @@ Filter logs using `grep`:
 # Find all error logs
 grep "ERROR" deis-control.log
 
-# Find logs for a specific worker
-grep "worker-123" deis-control.log
+# Find logs for a specific node
+grep "node-123" deis-control.log
 
 # Find configuration update events
 grep "Configuration updated" deis-control.log

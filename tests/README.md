@@ -6,11 +6,11 @@ client against a running `deis-control` and exits non-zero on the first failure.
 | Binary | Exercises |
 |---|---|
 | `integration_wire_control` | deis-wire SDK -> deis-control: connect, authenticate, register, heartbeat |
-| `integration_proxy_control` | deis-proxy supervisor client -> deis-control: full start sequence, readiness, graceful disconnect |
+| `integration_proxy_control` | deis-proxy control client -> deis-control: full start sequence, readiness, graceful disconnect |
 
 Both expect deis-control listening on `ws://127.0.0.1:9001` with the test secret
 `a1b2c3d4e5f67890123456789012345678901234567890123456789012345678` in
-`worker_preshared_keys`.
+`node_preshared_keys`.
 
 ```bash
 # terminal 1

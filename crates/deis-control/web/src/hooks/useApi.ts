@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 
-interface Worker {
+interface NodeSummary {
   id: string
   instance_id: string
-  worker_type: string
+  node_role: string
   host: string
   ports: number[]
   state: string
@@ -15,7 +15,7 @@ interface Worker {
 
 interface Event {
   event_type: string
-  worker_id?: string
+  node_id?: string
   severity: string
   message: string
   metadata?: Record<string, unknown>
@@ -23,7 +23,7 @@ interface Event {
 }
 
 interface MetricsSummary {
-  workers: {
+  nodes: {
     total: number
     active: number
     connected: number
@@ -74,25 +74,25 @@ export function useMetrics() {
   return { metrics, loading, error, refetch: fetchMetrics }
 }
 
-export function useWorkers() {
-  const [workers, setWorkers] = useState<Worker[]>([])
+export function useNodes() {
+  const [nodes, setNodes] = useState<NodeSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const initialLoadRef = useRef(true)
 
-  const fetchWorkers = useCallback(async () => {
+  const fetchNodes = useCallback(async () => {
     try {
       // 只在初始加载时显示 loading
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const res = await fetch('/api/workers')
+      const res = await fetch('/api/nodes')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      setWorkers(data.workers || (Array.isArray(data) ? data : []))
+      setNodes(data.nodes || (Array.isArray(data) ? data : []))
       setError(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch workers')
+      setError(err instanceof Error ? err.message : 'Failed to fetch nodes')
     } finally {
       if (initialLoadRef.current) {
         setLoading(false)
@@ -102,15 +102,15 @@ export function useWorkers() {
   }, [])
 
   useEffect(() => {
-    fetchWorkers()
-    const interval = setInterval(fetchWorkers, 5000)
+    fetchNodes()
+    const interval = setInterval(fetchNodes, 5000)
     return () => clearInterval(interval)
-  }, [fetchWorkers])
+  }, [fetchNodes])
 
-  return { workers, loading, error, refetch: fetchWorkers }
+  return { nodes, loading, error, refetch: fetchNodes }
 }
 
-export function useCommands(workerId?: string) {
+export function useCommands(nodeId?: string) {
   const [commands, setCommands] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -121,7 +121,7 @@ export function useCommands(workerId?: string) {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const url = workerId ? `/api/commands/worker/${workerId}` : '/api/commands'
+      const url = nodeId ? `/api/commands/node/${nodeId}` : '/api/commands'
       const res = await fetch(url)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
@@ -135,7 +135,7 @@ export function useCommands(workerId?: string) {
         initialLoadRef.current = false
       }
     }
-  }, [workerId])
+  }, [nodeId])
 
   useEffect(() => {
     fetchCommands()
@@ -143,8 +143,8 @@ export function useCommands(workerId?: string) {
     return () => clearInterval(interval)
   }, [fetchCommands])
 
-  const executeCommand = async (workerId: string, commandType: string, commandData?: any) => {
-    const res = await fetch(`/api/commands/execute/${workerId}`, {
+  const executeCommand = async (nodeId: string, commandType: string, commandData?: any) => {
+    const res = await fetch(`/api/commands/execute/${nodeId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command_type: commandType, command_data: commandData }),
@@ -200,7 +200,7 @@ export function useEvents() {
   return { events, loading, error, refetch: fetchEvents }
 }
 
-export function useConfigs(workerId?: string) {
+export function useConfigs(nodeId?: string) {
   const [configs, setConfigs] = useState<Record<string, unknown>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -211,7 +211,7 @@ export function useConfigs(workerId?: string) {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const url = workerId ? `/api/configs/${workerId}` : '/api/configs'
+      const url = nodeId ? `/api/configs/${nodeId}` : '/api/configs'
       const res = await fetch(url)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
@@ -225,15 +225,15 @@ export function useConfigs(workerId?: string) {
         initialLoadRef.current = false
       }
     }
-  }, [workerId])
+  }, [nodeId])
 
   useEffect(() => {
     initialLoadRef.current = true
     fetchConfigs()
   }, [fetchConfigs])
 
-  const updateConfig = async (workerId: string, configs: Record<string, unknown>) => {
-    const res = await fetch(`/api/configs/${workerId}`, {
+  const updateConfig = async (nodeId: string, configs: Record<string, unknown>) => {
+    const res = await fetch(`/api/configs/${nodeId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ configs }),

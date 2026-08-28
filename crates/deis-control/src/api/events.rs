@@ -17,8 +17,8 @@ pub struct EventsState {
 
 #[derive(Debug, Deserialize)]
 pub struct ListEventsQuery {
-    /// Worker ID filter (optional)
-    pub worker_id: Option<String>,
+    /// Node ID filter (optional)
+    pub node_id: Option<String>,
     /// Event severity filter (optional): Info, Warning, Error
     pub severity: Option<String>,
     /// Limit number of results
@@ -41,7 +41,7 @@ pub async fn list_events(
     let events = state
         .database
         .list_events(
-            query.worker_id.as_deref(),
+            query.node_id.as_deref(),
             query.severity.as_deref(),
             query.limit,
             query.offset,
@@ -58,7 +58,7 @@ pub async fn list_events(
         "offset": query.offset,
         "events": events.into_iter().map(|event| json!({
             "event_type": event.event_type,
-            "worker_id": event.worker_id,
+            "node_id": event.node_id,
             "severity": event.severity.as_str(),
             "message": event.message,
             "metadata": event.metadata,

@@ -5,12 +5,12 @@ Managed multi-site reverse proxy and load balancer for the Deislet platform.
 Proxy is the traffic entry point: it terminates HTTP/1.1, HTTP/2 and TLS,
 decides which application a request belongs to, and forwards it to a
 [deis-runtime](../deis-runtime) node from a shared, health-checked upstream pool. Its
-configuration is layered from a local file and from the supervisor
+configuration is layered from a local file and from the control
 ([deis-control](../deis-control)), and the binary can be upgraded without dropping
 connections.
 
 The data plane is [Pingora](https://github.com/cloudflare/pingora). Proxy
-adds application routing, configuration management and the supervisor
+adds application routing, configuration management and the control
 integration on top of it; it does not implement its own HTTP parsing,
 socket handling or process model.
 
@@ -48,7 +48,7 @@ presented; `tls.default_certificate` covers names no application claims.
 
 See [`config.toml.example`](config.toml.example) for every key. Values are
 layered: built-in baseline, then the file given with `-c`, then whatever
-the supervisor pushes. Notable behaviour:
+the control pushes. Notable behaviour:
 
 - `balancing_strategy` (`round_robin`, `random`, `ip_hash`,
   `header_hash(<Header>)`) is fixed for the lifetime of the process. The
@@ -63,15 +63,15 @@ the supervisor pushes. Notable behaviour:
   certificate files) are resolved against the directory deis-proxy was started
   from, and a `reload` starts the replacement from that same directory, so
   they keep resolving the same way across upgrades. Certificate paths in
-  application configurations pushed by the supervisor are used as given;
+  application configurations pushed by the control are used as given;
   make them absolute.
 - `[cache]` is parsed and validated but not applied to traffic yet.
 
 Applications (`id`, `description`, `domains`, `certificates`, `enabled`,
-`cache`) are not part of the file. They are pushed by the supervisor and persisted in `database`
+`cache`) are not part of the file. They are pushed by the control and persisted in `database`
 (SQLite), so they survive restarts.
 
-### Supervisor protocol
+### Control protocol
 
 Proxy registers with deis-control over deis-wire and then accepts:
 
@@ -79,14 +79,14 @@ Proxy registers with deis-control over deis-wire and then accepts:
 |---|---|
 | `ConfigUpdate { key = "apps" }` | Replace the whole application list with the JSON array in `value_json`. |
 | `ConfigUpdate { key = "app.<id>" }` | Insert or update one application. |
-| `ConfigUpdate { key = "system" }` | Layer a traffic-policy overlay onto the system configuration (listeners, daemon settings, logging and the supervisor connection are ignored). |
+| `ConfigUpdate { key = "system" }` | Layer a traffic-policy overlay onto the system configuration (listeners, daemon settings, logging and the control connection are ignored). |
 | Command `shutdown` | Stop accepting connections, exit when in-flight requests finish. |
 | Command `restart` / `reload` | Zero-downtime upgrade (see below). |
 | Command `get_status` | Answer with instance state and uptime. |
 
 `get_metrics` is answered with an explicit "not implemented".
 
-If the supervisor is unreachable, at startup or later, deis-proxy keeps
+If the control is unreachable, at startup or later, deis-proxy keeps
 serving traffic and keeps retrying the connection (1 s doubling to 30 s
 between attempts) until it succeeds or the process stops; a rejected secret
 is logged at ERROR on every attempt.
@@ -119,7 +119,7 @@ daemon running without one.
 
 ### Zero-downtime upgrade
 
-`reload` (or the supervisor's `restart`) starts a second `deis-proxy --upgrade`
+`reload` (or the control's `restart`) starts a second `deis-proxy --upgrade`
 process with the same configuration and from the same working directory,
 waits for it to report that its startup succeeded (configuration, database,
 logs and certificates loaded), then sends `SIGQUIT` to the running one.
@@ -142,7 +142,7 @@ cargo clippy -p deis-proxy --all-targets
 ../../scripts/demo.sh start              # full stack: deis-control + deis-runtime + deis-proxy
 ```
 
-`src/supervisor/mock.rs` is an in-process supervisor that the client tests
+`src/control/mock.rs` is an in-process control that the client tests
 register against, so retry and reconnect behaviour is covered without deis-control.
 
 ## Layout
@@ -153,6 +153,6 @@ register against, so retry and reconnect behaviour is covered without deis-contr
 | `src/proxy/` | `ProxyHttp` implementation, upstream pool, access log. |
 | `src/tls.rs` | Certificate loading and SNI selection. |
 | `src/config/` | Configuration model, layering, persistence, route table. |
-| `src/supervisor/` | Supervisor client and its background service. |
+| `src/control/` | Control client and its background service. |
 | `src/restart.rs` | Upgrade and shutdown via pingora's signals. |
 | `src/cli.rs` | Command line parsing. |

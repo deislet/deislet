@@ -1,24 +1,24 @@
-# Control - Deislet Cluster Management Supervisor
+# Control - Deislet Cluster Management Control
 
 > The brain of the Deislet system - coordinates and manages the entire platform
 
 ## Overview
 
-Control is the central supervisor component of the Deislet edge computing platform. It manages all Worker nodes (Runtime, Proxy) through WebSocket-based communication, handling authentication, registration, heartbeat monitoring, and configuration distribution.
+Control is the central control component of the Deislet edge computing platform. It manages all Node nodes (Runtime, Proxy) through WebSocket-based communication, handling authentication, registration, heartbeat monitoring, and configuration distribution.
 
 ## Features
 
 ### Core Features
-- **gRPC Server**: Accepts worker connections on http://0.0.0.0:8080 (HTTP/2)
-- **Worker Authentication**: Token-based authentication
-- **Registration**: Worker registration and instance ID assignment
+- **gRPC Server**: Accepts node connections on http://0.0.0.0:8080 (HTTP/2)
+- **Node Authentication**: Token-based authentication
+- **Registration**: Node registration and instance ID assignment
 - **Heartbeat Monitoring**: Health checks and stale session cleanup
-- **Session Management**: Track all connected workers with state management
+- **Session Management**: Track all connected nodes with state management
 
 ### New Features
-- **SQLite Database**: Persistent storage for workers, heartbeats, events, and commands
-- **HTTP REST API**: RESTful API for querying worker status and history (same port as gRPC)
-- **Web UI**: Modern Vue 3 dashboard for monitoring and managing workers
+- **SQLite Database**: Persistent storage for nodes, heartbeats, events, and commands
+- **HTTP REST API**: RESTful API for querying node status and history (same port as gRPC)
+- **Web UI**: Modern Vue 3 dashboard for monitoring and managing nodes
 - **Metrics Collection**: Prometheus-compatible metrics export
 
 ## Quick Start
@@ -80,35 +80,35 @@ port = 8080
 heartbeat_interval = 30
 heartbeat_timeout = 90
 
-# Pre-shared keys for worker authentication
-worker_preshared_keys = [
+# Pre-shared keys for node authentication
+node_preshared_keys = [
     "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678",
 ]
 ```
 
 ### Message Protocol (Protobuf)
 
-The communication protocol is defined in `supervisor.proto`.
+The communication protocol is defined in `control.proto`.
 
 **Core Messages:**
 - `AuthenticateRequest`: Initial handshake with instance ID and token.
-- `RegisterRequest`: Worker registration with metadata.
+- `RegisterRequest`: Node registration with metadata.
 - `Heartbeat`: Periodic health check.
 - `SystemConfig` / `AppConfigs`: Configuration distribution.
 - `ConfigUpdate`: Incremental configuration update.
 - `CommandRequest` / `CommandResponse`: Remote command execution.
 
-See `crates/deis-control-deis-wire/proto/supervisor.proto` for full definition.
+See `crates/deis-control-deis-wire/proto/control.proto` for full definition.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Control Supervisor                     │
+│                    Control Control                     │
 ├─────────────────────────────────────────────────────────┤
 │  ┌─────────────────────────────────────────────────────┐│
 │  │                  gRPC Server                         ││
-│  │  - Accept worker connections (HTTP/2)                ││
+│  │  - Accept node connections (HTTP/2)                ││
 │  │  - Handle authentication                             ││
 │  │  - Bi-directional streaming                          ││
 │  └─────────────────────────────────────────────────────┘│
@@ -122,8 +122,8 @@ See `crates/deis-control-deis-wire/proto/supervisor.proto` for full definition.
 │                          │                               │
 │  ┌───────────────────────▼───────────────────────────┐ │
 │  │              Session Manager                        │ │
-│  │  - Track all connected workers                     │ │
-│  │  - Manage worker state                             │ │
+│  │  - Track all connected nodes                     │ │
+│  │  - Manage node state                             │ │
 │  └─────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────┘
                           │
@@ -132,7 +132,7 @@ See `crates/deis-control-deis-wire/proto/supervisor.proto` for full definition.
          ▼                ▼                ▼
    ┌──────────┐    ┌──────────┐    ┌──────────┐
    │  Proxy  │    │  Runtime   │    │  Other   │
-   │  Workers │    │  Workers │    │  Workers │
+   │  Nodes │    │  Nodes │    │  Nodes │
    └──────────┘    └──────────┘    └──────────┘
 ```
 
@@ -140,28 +140,28 @@ See `crates/deis-control-deis-wire/proto/supervisor.proto` for full definition.
 
 The HTTP API server runs on port 8081 by default:
 
-### Workers API
+### Nodes API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/api/workers` | GET | List all workers |
-| `/api/workers/:id` | GET | Get worker details |
-| `/api/workers/:id/heartbeats` | GET | Get worker heartbeat history |
+| `/api/nodes` | GET | List all nodes |
+| `/api/nodes/:id` | GET | Get node details |
+| `/api/nodes/:id/heartbeats` | GET | Get node heartbeat history |
 
 ### Configuration API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/configs/:worker_id` | GET | Get worker configuration |
-| `/api/configs/:worker_id` | POST | Update worker configuration |
-| `/api/configs/push/:worker_id` | POST | Push configuration to worker |
+| `/api/configs/:node_id` | GET | Get node configuration |
+| `/api/configs/:node_id` | POST | Update node configuration |
+| `/api/configs/push/:node_id` | POST | Push configuration to node |
 
 ### Commands API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/commands/:worker_id` | POST | Send command to worker |
+| `/api/commands/:node_id` | POST | Send command to node |
 | `/api/commands/:command_id` | GET | Query command status |
 | `/api/commands` | GET | List all commands |
 
@@ -181,10 +181,10 @@ The HTTP API server runs on port 8081 by default:
 ### API Examples
 
 ```bash
-# Workers API
-curl http://localhost:8080/api/workers
-curl http://localhost:8080/api/workers/deis-proxy-01
-curl http://localhost:8080/api/workers/deis-proxy-01/heartbeats?limit=100
+# Nodes API
+curl http://localhost:8080/api/nodes
+curl http://localhost:8080/api/nodes/deis-proxy-01
+curl http://localhost:8080/api/nodes/deis-proxy-01/heartbeats?limit=100
 
 # Configuration API
 curl http://localhost:8080/api/configs/deis-proxy-01
@@ -212,32 +212,32 @@ curl http://localhost:8080/api/metrics/summary
 
 ### Configuration Management
 
-Control provides dynamic configuration management for all connected workers.
+Control provides dynamic configuration management for all connected nodes.
 
 **Features**:
 - Zero-lock configuration access using ArcSwap
 - Atomic configuration updates
 - Version-based configuration tracking
 - SQLite persistence
-- Push configuration to workers in real-time
+- Push configuration to nodes in real-time
 
 **Supported Operations**:
-- Update worker configuration via API
-- Push configuration updates to connected workers
-- Query current worker configuration
+- Update node configuration via API
+- Push configuration updates to connected nodes
+- Query current node configuration
 - Track configuration version history
 
 ### Command Execution
 
-Execute commands on workers and track their status.
+Execute commands on nodes and track their status.
 
 **Supported Commands**:
-- `GetStatus` - Query worker status
-- `Reload` - Reload worker configuration
+- `GetStatus` - Query node status
+- `Reload` - Reload node configuration
 - `Shutdown` - Graceful shutdown
-- `Restart` - Restart worker
+- `Restart` - Restart node
 - `UpdateConfig` - Apply new configuration
-- `GetMetrics` - Retrieve worker metrics
+- `GetMetrics` - Retrieve node metrics
 
 **Features**:
 - Async command-response pattern with oneshot channels
@@ -247,10 +247,10 @@ Execute commands on workers and track their status.
 
 ### Metrics Collection
 
-Collect and export system and worker metrics.
+Collect and export system and node metrics.
 
 **Exported Metrics** (Prometheus format):
-- `deis_control_workers_total` - Total number of workers by state
+- `deis_control_nodes_total` - Total number of nodes by state
 - `deis_control_heartbeat_latency_ms` - Heartbeat latency percentiles
 - `deis_control_commands_total` - Commands executed by status
 - `deis_control_config_updates_total` - Configuration updates
@@ -266,10 +266,10 @@ Collect and export system and worker metrics.
 
 Control uses SQLite for persistence with the following tables:
 
-**workers** - Worker registry
+**nodes** - Node registry
 - `id` (TEXT PRIMARY KEY)
 - `instance_id` (TEXT UNIQUE)
-- `worker_type` (TEXT)
+- `node_role` (TEXT)
 - `version` (TEXT)
 - `host` (TEXT)
 - `ports` (TEXT - JSON array)
@@ -282,7 +282,7 @@ Control uses SQLite for persistence with the following tables:
 **events** - System events log
 - `id` (INTEGER PRIMARY KEY AUTOINCREMENT)
 - `event_type` (TEXT)
-- `worker_id` (TEXT)
+- `node_id` (TEXT)
 - `severity` (TEXT)
 - `message` (TEXT)
 - `metadata` (TEXT - JSON)
@@ -290,23 +290,23 @@ Control uses SQLite for persistence with the following tables:
 
 **heartbeats** - Heartbeat history
 - `id` (INTEGER PRIMARY KEY AUTOINCREMENT)
-- `worker_id` (TEXT)
+- `node_id` (TEXT)
 - `timestamp` (TEXT)
 - `power_reserve` (INTEGER)
 - `latency_ms` (INTEGER)
 
-**configs** - Worker configurations
-- `worker_id` (TEXT)
+**configs** - Node configurations
+- `node_id` (TEXT)
 - `config_key` (TEXT)
 - `config_value` (TEXT - JSON)
 - `version_timestamp` (TEXT)
 - `created_at` (TEXT)
 - `updated_at` (TEXT)
-- PRIMARY KEY (worker_id, config_key)
+- PRIMARY KEY (node_id, config_key)
 
 **commands** - Command execution log
 - `id` (TEXT PRIMARY KEY - UUID)
-- `worker_id` (TEXT)
+- `node_id` (TEXT)
 - `command_type` (TEXT)
 - `command_data` (TEXT - JSON)
 - `status` (TEXT)
@@ -338,7 +338,7 @@ deis-control/
 │   ├── config_manager/      # Configuration management
 │   │   ├── mod.rs           # Config manager core
 │   │   ├── storage.rs       # Config persistence
-│   │   └── pusher.rs        # Config push to workers
+│   │   └── pusher.rs        # Config push to nodes
 │   ├── command/             # Command execution system
 │   │   ├── mod.rs           # Command executor
 │   │   └── tracker.rs       # Command tracking
@@ -350,7 +350,7 @@ deis-control/
 │   └── api/                 # HTTP REST API
 │       ├── mod.rs           # API router
 │       ├── error.rs         # Error handling
-│       ├── workers.rs       # Worker endpoints
+│       ├── nodes.rs       # Node endpoints
 │       ├── configs.rs       # Config endpoints
 │       ├── commands.rs      # Command endpoints
 │       ├── metrics.rs       # Metrics endpoints

@@ -25,7 +25,7 @@ pub async fn start_server(
     app_manager: Arc<ApplicationManager>,
     config_store: Arc<ConfigStore>,
     app_repo: Arc<AppRepo>,
-    worker_id: String,
+    node_id: String,
     port: u16,
 ) -> Result<()> {
     let state = AppState {
@@ -34,7 +34,7 @@ pub async fn start_server(
 
     // Create gRPC services
     let management_service =
-        ManagementServer::create_service(app_manager.clone(), config_store, app_repo, worker_id);
+        ManagementServer::create_service(app_manager.clone(), config_store, app_repo, node_id);
     let trigger_service = TriggerServer::create_service(app_manager.clone());
 
     // Combine gRPC services

@@ -13,5 +13,5 @@ pub use messages::{
     AuthMessage, AuthResponseMessage, CommandData, CommandMessage, CommandResponseMessage,
     ConfigPushAckMessage, ConfigPushData, ConfigPushMessage, HeartbeatAckMessage,
     HeartbeatMessage, Message, MessageBuilder, RegisterMessage, RegisterResponseMessage,
-    StatusUpdateMessage, WorkerCommand, WireMessage, deis_proxy, deis_runtime, supervisor,
+    StatusUpdateMessage, NodeCommand, WireMessage, deis_proxy, deis_runtime, control,
 };

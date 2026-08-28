@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 /// Simplified WebSocket authentication data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthData {
-    /// Associated ID (Worker Instance ID)
+    /// Associated ID (Node Instance ID)
     pub associated_id: String,
     /// Authentication signature (used only once at connection time)
     pub signature: String,

@@ -1,4 +1,4 @@
-// Management service module - gRPC interface for supervisor to call
+// Management service module - gRPC interface for control to call
 
 mod server;
 mod service;

@@ -24,7 +24,7 @@ async fn wait_for_server_ready(port: u16) {
 #[tokio::test]
 async fn test_api_server_health() {
     // Create test configuration
-    let config = SupervisorConfig::default();
+    let config = ControlConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
 
     // Create server components
@@ -73,8 +73,8 @@ async fn test_api_server_health() {
 }
 
 #[tokio::test]
-async fn test_api_workers_endpoint() {
-    let config = SupervisorConfig::default();
+async fn test_api_nodes_endpoint() {
+    let config = ControlConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
     let broadcaster = Arc::new(EventBroadcaster::new());
@@ -105,24 +105,24 @@ async fn test_api_workers_endpoint() {
 
     wait_for_server_ready(18082).await;
 
-    // Test the workers endpoint
+    // Test the nodes endpoint
     let client = reqwest::Client::new();
     let response = client
-        .get("http://localhost:18082/api/workers")
+        .get("http://localhost:18082/api/nodes")
         .send()
         .await
-        .expect("Failed to call workers endpoint");
+        .expect("Failed to call nodes endpoint");
 
     assert_eq!(response.status(), 200);
 
     let json: serde_json::Value = response.json().await.unwrap();
-    assert!(json.get("workers").is_some());
+    assert!(json.get("nodes").is_some());
     assert!(json.get("total").is_some());
 }
 
 #[tokio::test]
 async fn test_api_metrics_endpoint() {
-    let config = SupervisorConfig::default();
+    let config = ControlConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
     let broadcaster = Arc::new(EventBroadcaster::new());
@@ -165,13 +165,13 @@ async fn test_api_metrics_endpoint() {
 
     let json: serde_json::Value = response.json().await.unwrap();
     assert!(json.get("metrics").is_some());
-    assert!(json["metrics"].get("workers").is_some());
+    assert!(json["metrics"].get("nodes").is_some());
     assert!(json["metrics"].get("system").is_some());
 }
 
 #[tokio::test]
 async fn test_api_events_endpoint() {
-    let config = SupervisorConfig::default();
+    let config = ControlConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
     let broadcaster = Arc::new(EventBroadcaster::new());

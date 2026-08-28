@@ -1,4 +1,4 @@
-# Control Supervisor Simplified Enhancement Plan
+# Control Control Simplified Enhancement Plan
 
 **Date**: 2026-01-16
 **Version**: v2.0 (Simplified)
@@ -16,7 +16,7 @@
 ├────────────────────────────────────────────┤
 │                                             │
 │  ┌─────────────────────────────────────┐   │
-│  │   Control Supervisor (Single Instance) │   │
+│  │   Control Control (Single Instance) │   │
 │  │   - Management Interface              │   │
 │  │   - Configuration Deployment          │   │
 │  │   - Status Monitoring                 │   │
@@ -26,7 +26,7 @@
 │       ▼            ▼            ▼           │
 │  ┌─────────┐  ┌─────────┐  ┌──────────┐   │
 │  │ Proxy  │  │ Proxy  │  │  Runtime   │   │
-│  │  (LB1)  │  │  (LB2)  │  │ (Worker) │   │
+│  │  (LB1)  │  │  (LB2)  │  │ (Node) │   │
 │  └─────────┘  └─────────┘  └──────────┘   │
 │       │            │            │           │
 │       └────────────┴────────────┘          │
@@ -35,7 +35,7 @@
 └────────────────────────────────────────────┘
 
 Scale Estimation:
-- Workers: 2-10
+- Nodes: 2-10
 - Concurrent Connections: < 100
 - Configuration Update Frequency: Low (Manual trigger)
 ```
@@ -56,32 +56,32 @@ Scale Estimation:
 
 ### 2.1 Fix Configuration Deletion Logic ✅
 
-**Problem**: Deleting a single configuration key causes the entire worker configuration to disappear.
+**Problem**: Deleting a single configuration key causes the entire node configuration to disappear.
 
 **Simplified Fix**:
 ```rust
 // src/config_manager/mod.rs
 
-pub async fn delete_config(&self, worker_id: &str, key: &str) -> Result<()> {
+pub async fn delete_config(&self, node_id: &str, key: &str) -> Result<()> {
     // 1. Database deletion
-    self.db.delete_config_key(worker_id, key).await?;
+    self.db.delete_config_key(node_id, key).await?;
 
-    // 2. Memory update (Reload this worker's config directly from DB)
-    let worker_configs = self.db.get_worker_configs(worker_id).await?;
+    // 2. Memory update (Reload this node's config directly from DB)
+    let node_configs = self.db.get_node_configs(node_id).await?;
 
     let configs = self.configs.load();
     let mut new_configs = (**configs).clone();
 
-    if worker_configs.is_empty() {
-        new_configs.remove(worker_id);
+    if node_configs.is_empty() {
+        new_configs.remove(node_id);
     } else {
-        new_configs.insert(worker_id.to_string(), worker_configs);
+        new_configs.insert(node_id.to_string(), node_configs);
     }
 
     self.configs.store(Arc::new(new_configs));
 
     tracing::info!(
-        worker_id = %worker_id,
+        node_id = %node_id,
         config_key = %key,
         "Configuration key deleted"
     );
@@ -103,8 +103,8 @@ pub async fn delete_config(&self, worker_id: &str, key: &str) -> Result<()> {
 
 pub async fn execute_command(
     &self,
-    worker_id: &str,
-    command: WorkerCommand,
+    node_id: &str,
+    command: NodeCommand,
 ) -> Result<CommandResponse, String> {
     let command_id = Uuid::new_v4();
 
@@ -114,7 +114,7 @@ pub async fn execute_command(
     // 2. Create tracker
     let tracker = CommandTracker {
         command_id,
-        worker_id: worker_id.to_string(),
+        node_id: node_id.to_string(),
         command: command.clone(),
         status: CommandStatus::Pending,
         created_at: Utc::now(),
@@ -123,12 +123,12 @@ pub async fn execute_command(
 
     self.pending_commands.insert(command_id, Arc::new(Mutex::new(tracker)));
 
-    // 3. Send command to Worker
-    if let Some(session) = self.sessions.get_worker(worker_id) {
+    // 3. Send command to Node
+    if let Some(session) = self.sessions.get_node(node_id) {
         session.send(command.into_message()).await
             .map_err(|e| format!("Failed to send command: {}", e))?;
     } else {
-        return Err(format!("Worker {} not found", worker_id));
+        return Err(format!("Node {} not found", node_id));
     }
 
     // 4. Wait for response (30-second timeout)
@@ -167,7 +167,7 @@ pub async fn handle_response(
 
         tracing::info!(
             command_id = %command_id,
-            worker_id = %tracker.worker_id,
+            node_id = %tracker.node_id,
             success = response.success,
             "Command completed"
         );
@@ -199,23 +199,23 @@ pub async fn handle_response(
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum BroadcastEvent {
-    WorkerConnected {
-        worker_id: String,
+    NodeConnected {
+        node_id: String,
         instance_id: String,
         timestamp: DateTime<Utc>,
     },
-    WorkerDisconnected {
-        worker_id: String,
+    NodeDisconnected {
+        node_id: String,
         instance_id: String,
         timestamp: DateTime<Utc>,
     },
     HeartbeatReceived {
-        worker_id: String,
+        node_id: String,
         power_reserve: i64,
         timestamp: DateTime<Utc>,
     },
     ConfigUpdated {
-        worker_id: String,
+        node_id: String,
         config_key: String,
         timestamp: DateTime<Utc>,
     },
@@ -248,8 +248,8 @@ pub async fn handle_register(...) -> RegisterResponse {
 
     // ✅ Integrated
     if let Some(broadcaster) = &self.broadcaster {
-        broadcaster.broadcast(BroadcastEvent::WorkerConnected {
-            worker_id: session.worker_id.clone(),
+        broadcaster.broadcast(BroadcastEvent::NodeConnected {
+            node_id: session.node_id.clone(),
             instance_id: session.instance_id.clone(),
             timestamp: Utc::now(),
         });
@@ -264,7 +264,7 @@ pub async fn handle_heartbeat(...) -> HeartbeatAck {
     // ✅ Integrated
     if let Some(broadcaster) = &self.broadcaster {
         broadcaster.broadcast(BroadcastEvent::HeartbeatReceived {
-            worker_id: session.worker_id.clone(),
+            node_id: session.node_id.clone(),
             power_reserve: request.power_reserve,
             timestamp: now,
         });
@@ -306,7 +306,7 @@ pub async fn handle_heartbeat(...) -> HeartbeatAck {
 | Feature | Reason |
 |------|------|
 | Advanced Scheduler | Minimal demand for scheduled tasks; can use system cron |
-| Distributed Deployment | Single Supervisor instance is sufficient |
+| Distributed Deployment | Single Control instance is sufficient |
 | Automatic Failover | Manual intervention is more reliable |
 
 ---
@@ -361,7 +361,7 @@ pub async fn auth_middleware<B>(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer ").or(Some(v)));
 
-    let config = req.extensions().get::<Arc<SupervisorConfig>>()
+    let config = req.extensions().get::<Arc<ControlConfig>>()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if let Some(key) = api_key {
@@ -390,19 +390,19 @@ pub async fn auth_middleware<B>(
 ```sql
 -- configs table already has version_timestamp field
 CREATE TABLE configs (
-    worker_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
     config_key TEXT NOT NULL,
     config_value TEXT NOT NULL,
     version_timestamp TEXT NOT NULL,  -- ✅ Already exists
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (worker_id, config_key)
+    PRIMARY KEY (node_id, config_key)
 );
 
 -- New: Configuration History Table
 CREATE TABLE config_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    worker_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
     config_key TEXT NOT NULL,
     config_value TEXT NOT NULL,
     version_timestamp TEXT NOT NULL,
@@ -410,7 +410,7 @@ CREATE TABLE config_history (
     created_at TEXT NOT NULL
 );
 
-CREATE INDEX idx_config_history_worker ON config_history (worker_id, created_at DESC);
+CREATE INDEX idx_config_history_node ON config_history (node_id, created_at DESC);
 ```
 
 ### 5.2 Record History on Configuration Update
@@ -420,23 +420,23 @@ CREATE INDEX idx_config_history_worker ON config_history (worker_id, created_at 
 
 pub async fn update_config(
     &self,
-    worker_id: &str,
+    node_id: &str,
     key: &str,
     value: JsonValue,
 ) -> Result<()> {
     let now = Utc::now();
 
     // 1. Save to current configuration table
-    self.db.save_config(worker_id, key, &value, now).await?;
+    self.db.save_config(node_id, key, &value, now).await?;
 
     // 2. Record history (for rollback)
-    self.db.save_config_history(worker_id, key, &value, "update", now).await?;
+    self.db.save_config_history(node_id, key, &value, "update", now).await?;
 
     // 3. Update memory configuration
     // ... ArcSwap update ...
 
     tracing::info!(
-        worker_id = %worker_id,
+        node_id = %node_id,
         config_key = %key,
         version = %now.to_rfc3339(),
         "Configuration updated"
@@ -457,7 +457,7 @@ pub struct RollbackRequest {
 }
 
 async fn rollback_config(
-    Path((worker_id, key)): Path<(String, String)>,
+    Path((node_id, key)): Path<(String, String)>,
     Extension(config_manager): Extension<Arc<ConfigManager>>,
     Json(req): Json<RollbackRequest>,
 ) -> Result<Json<ApiResponse>, ApiError> {
@@ -467,11 +467,11 @@ async fn rollback_config(
 
     // Query specified version of configuration from history table
     let value = config_manager.db
-        .get_config_version(&worker_id, &key, timestamp)
+        .get_config_version(&node_id, &key, timestamp)
         .await?;
 
     // Apply that version
-    config_manager.update_config(&worker_id, &key, value).await?;
+    config_manager.update_config(&node_id, &key, value).await?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -503,14 +503,14 @@ impl PrometheusExporter {
     pub fn export(collector: &MetricsCollector) -> String {
         let mut output = String::new();
 
-        // Worker Metrics
-        let _ = writeln!(output, "# HELP deis_control_workers_total Total number of workers");
-        let _ = writeln!(output, "# TYPE deis_control_workers_total gauge");
-        let _ = writeln!(output, "deis_control_workers_total {}", collector.total_workers());
+        // Node Metrics
+        let _ = writeln!(output, "# HELP deis_control_nodes_total Total number of nodes");
+        let _ = writeln!(output, "# TYPE deis_control_nodes_total gauge");
+        let _ = writeln!(output, "deis_control_nodes_total {}", collector.total_nodes());
 
-        let _ = writeln!(output, "# HELP deis_control_workers_connected Connected workers");
-        let _ = writeln!(output, "# TYPE deis_control_workers_connected gauge");
-        let _ = writeln!(output, "deis_control_workers_connected {}", collector.connected_workers());
+        let _ = writeln!(output, "# HELP deis_control_nodes_connected Connected nodes");
+        let _ = writeln!(output, "# TYPE deis_control_nodes_connected gauge");
+        let _ = writeln!(output, "deis_control_nodes_connected {}", collector.connected_nodes());
 
         // Heartbeat Latency
         let _ = writeln!(output, "# HELP deis_control_heartbeat_latency_ms Heartbeat latency");
@@ -555,9 +555,9 @@ async fn prometheus_metrics(
 
 | Feature | Priority | Description |
 |------|--------|------|
-| Worker Connection Management | P0 | gRPC bi-directional streaming, Session management |
-| Configuration Deployment | P0 | Dynamic configuration updates (no Worker restart required) |
-| Heartbeat Monitoring | P0 | Detection of Worker liveness |
+| Node Connection Management | P0 | gRPC bi-directional streaming, Session management |
+| Configuration Deployment | P0 | Dynamic configuration updates (no Node restart required) |
+| Heartbeat Monitoring | P0 | Detection of Node liveness |
 | Simple Command Execution | P0 | Basic commands like status, restart, etc. |
 | Event Logs | P1 | Recording critical operations to SQLite |
 | HTTP API | P1 | Simple REST API for management |
@@ -621,7 +621,7 @@ async fn prometheus_metrics(
 
 3. Manual Testing
    - WebSocket real-time event reception.
-   - Multiple Workers connected simultaneously.
+   - Multiple Nodes connected simultaneously.
 
 ### Phase 3: Documentation and Cleanup (0.5 Days)
 
@@ -671,16 +671,16 @@ if let Err(e) = Arc::clone(&scheduler).start().await {
 ```rust
 // Structured Logging (Keep it simple)
 tracing::info!(
-    worker_id = %worker_id,
+    node_id = %node_id,
     command = ?command_type,
     "Executing command"
 );
 
 // Error Logging (Includes context)
 tracing::error!(
-    worker_id = %worker_id,
+    node_id = %node_id,
     error = %e,
-    "Failed to send command to worker"
+    "Failed to send command to node"
 );
 ```
 
@@ -692,7 +692,7 @@ tracing::error!(
 async fn health_check() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        workers_connected: sessions.count(),
+        nodes_connected: sessions.count(),
         database_ok: database.is_some(),
         uptime_seconds: get_uptime(),
     })
@@ -728,13 +728,13 @@ async fn health_check() -> Json<HealthResponse> {
 - [ ] Command execution succeeds, status is correctly returned.
 - [ ] Frontend WebSocket can receive events in real-time.
 - [ ] No issues with 2 Proxy + 1 Runtime connected simultaneously.
-- [ ] Configuration and Worker status correctly restored after Supervisor restart.
+- [ ] Configuration and Node status correctly restored after Control restart.
 
 ### Robustness Acceptance
 
-- [ ] Session correctly cleaned up after Worker disconnects.
-- [ ] Configuration correctly deployed after Worker reconnects.
-- [ ] Supervisor still starts after database file is deleted (degraded mode).
+- [ ] Session correctly cleaned up after Node disconnects.
+- [ ] Configuration correctly deployed after Node reconnects.
+- [ ] Control still starts after database file is deleted (degraded mode).
 - [ ] Logging information is clear and easy to debug.
 
 ---

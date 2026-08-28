@@ -17,10 +17,10 @@ Transform Runtime from a **Dependent Agent** to an **Autonomous Edge Runtime**. 
 ### Legacy Model (Dependent)
 ```
 ┌─────────────┐          ┌──────────────┐
-│   Runtime     │─────────▶│  Supervisor  │
+│   Runtime     │─────────▶│  Control  │
 │  (Client)   │  Connect │   (Server)   │
 └─────────────┘          └──────────────┘
-     ❌ Fails if supervisor is down
+     ❌ Fails if control is down
      ❌ Config pull dependent
      ❌ Logs lost on crash
 ```
@@ -28,7 +28,7 @@ Transform Runtime from a **Dependent Agent** to an **Autonomous Edge Runtime**. 
 ### Current Model (Autonomous)
 ```
 ┌─────────────┐          ┌──────────────┐
-│   Runtime     │◀─────────│  Supervisor  │
+│   Runtime     │◀─────────│  Control  │
 │  (Server)   │  Push    │   (Client)   │
 │             │          └──────────────┘
 │ ┌─────────┐ │

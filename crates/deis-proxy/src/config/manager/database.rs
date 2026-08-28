@@ -256,7 +256,7 @@ impl ConfigDatabase {
 
     /// Get app configs updated after a specific timestamp
     ///
-    /// This is used for incremental updates from supervisor
+    /// This is used for incremental updates from control
     ///
     /// # Arguments
     /// * `after_timestamp` - Only return configs updated after this timestamp

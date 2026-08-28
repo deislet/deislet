@@ -15,9 +15,9 @@ impl ManagementServer {
         app_manager: Arc<ApplicationManager>,
         config_store: Arc<ConfigStore>,
         app_repo: Arc<AppRepo>,
-        worker_id: String,
+        node_id: String,
     ) -> ProtoServer<RuntimeManagementService> {
-        let service = RuntimeManagementService::new(app_manager, config_store, app_repo, worker_id);
+        let service = RuntimeManagementService::new(app_manager, config_store, app_repo, node_id);
         ProtoServer::new(service)
     }
 }

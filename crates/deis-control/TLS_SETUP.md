@@ -99,7 +99,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
     
-    # Worker WebSocket Proxy
+    # Node WebSocket Proxy
     location /ws {
         proxy_pass http://localhost:8080;
         proxy_http_version 1.1;
@@ -123,7 +123,7 @@ deis-control.yourdomain.com {
     # API Endpoints
     reverse_proxy /api/* localhost:8080
     
-    # Worker WebSocket
+    # Node WebSocket
     reverse_proxy /ws localhost:8080
     
     # Caddy handles Let's Encrypt certificates automatically
@@ -218,7 +218,7 @@ key_path = "key.pem"
 
 ```bash
 curl -k -H "Authorization: Bearer your-secret-key" \
-     https://localhost:8080/api/workers
+     https://localhost:8080/api/nodes
 ```
 
 ## Frequently Asked Questions

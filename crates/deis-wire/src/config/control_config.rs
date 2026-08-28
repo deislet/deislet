@@ -5,14 +5,14 @@ const DEFAULT_HEARTBEAT_INTERVAL: u64 = 30; // seconds
 const DEFAULT_REQUEST_TIMEOUT: u64 = 10; // seconds
 const DEFAULT_RETRY_COUNT: u32 = 3; // max 5
 
-/// Supervisor connection configuration
+/// Control connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SupervisorConfig {
+pub struct ControlConfig {
     /// (Associated) Instance ID
     pub associated_id: String,
     /// Pre-shared key
     pub secret: String,
-    /// Supervisor service address
+    /// Control service address
     pub addr: String,
     /// Heartbeat interval in seconds
     #[serde(default = "default_heartbeat_interval")]
@@ -25,7 +25,7 @@ pub struct SupervisorConfig {
     pub retry_count: u32,
 }
 
-impl SupervisorConfig {
+impl ControlConfig {
     /// Create new configuration
     pub fn new(associated_id: String, secret: String, addr: String) -> Self {
         Self {
@@ -103,8 +103,8 @@ mod tests {
     const VALID_SECRET: &str = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
 
     #[test]
-    fn test_supervisor_config_new() {
-        let config = SupervisorConfig::new(
+    fn test_control_config_new() {
+        let config = ControlConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
             "http://localhost:8080".to_string(),
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_duration_methods() {
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
             "http://localhost:8080".to_string(),
@@ -132,14 +132,14 @@ mod tests {
 
     #[test]
     fn test_grpc_endpoint_building() {
-        let ws_config = SupervisorConfig::new(
+        let ws_config = ControlConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
             "http://localhost:8080".to_string(),
         );
         assert_eq!(ws_config.grpc_endpoint(), "http://localhost:8080");
 
-        let wss_config = SupervisorConfig::new(
+        let wss_config = ControlConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
             "https://example.com:8443".to_string(),
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_validation_success() {
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
             "http://localhost:8080".to_string(),
@@ -160,7 +160,7 @@ mod tests {
 // ...
     #[test]
     fn test_validation_invalid_addr_scheme() {
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
             "ws://example.com".to_string(),
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_validation_empty_associated_id() {
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "".to_string(),
             VALID_SECRET.to_string(),
             "http://localhost:8080".to_string(),
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_validation_empty_secret() {
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "test-id".to_string(),
             "".to_string(),
             "http://localhost:8080".to_string(),
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_validation_invalid_secret_length() {
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "test-id".to_string(),
             "short".to_string(),
             "http://localhost:8080".to_string(),
@@ -218,7 +218,7 @@ mod tests {
         let invalid_secret = "g1h2i3j4k5l6m7n8o9p0q1r2s3t4u5v6w7x8y9z0a1b2c3d4e5f6g7h8i9j0k1l2";
         assert_eq!(invalid_secret.len(), 64);
 
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "test-id".to_string(),
             invalid_secret.to_string(),
             "http://localhost:8080".to_string(),
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_validation_empty_addr() {
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
             "".to_string(),
@@ -247,14 +247,14 @@ mod tests {
 
     #[test]
     fn test_serde_serialization() {
-        let config = SupervisorConfig::new(
+        let config = ControlConfig::new(
             "test-id".to_string(),
             VALID_SECRET.to_string(),
             "http://localhost:8080".to_string(),
         );
 
         let serialized = serde_json::to_string(&config).unwrap();
-        let deserialized: SupervisorConfig = serde_json::from_str(&serialized).unwrap();
+        let deserialized: ControlConfig = serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(config.associated_id, deserialized.associated_id);
         assert_eq!(config.secret, deserialized.secret);

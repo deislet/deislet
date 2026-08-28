@@ -8,12 +8,12 @@ pub mod error;
 pub mod models;
 
 pub mod pb {
-    tonic::include_proto!("deis.supervisor");
+    tonic::include_proto!("deis.control");
 }
 
 // Re-export core types
 pub use client::WireClient;
-pub use config::{SupervisorConfig, WorkerInfo, WorkerType};
+pub use config::{ControlConfig, NodeInfo, NodeRole};
 pub use error::{SdkResult, WireError};
 
 // Re-export models
@@ -39,10 +39,10 @@ pub use models::messages::{
     RegisterResponseMessage,
     StatusUpdateMessage,
     // Data types
-    WorkerCommand,
+    NodeCommand,
     WireMessage,
     deis_proxy,
     deis_runtime,
     // Extension modules
-    supervisor,
+    control,
 };

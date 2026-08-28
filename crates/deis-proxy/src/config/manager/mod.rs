@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::{
-    AppConfig, ConfigError, LocalConfig, RouteTable, SupervisorSystemConfig, SystemConfig,
+    AppConfig, ConfigError, LocalConfig, RouteTable, ControlSystemConfig, SystemConfig,
     Validatable,
 };
 
@@ -19,13 +19,13 @@ pub use database::{AppConfigEntry, ConfigDatabase, DatabaseError};
 
 /// Configuration manager that owns the complete configuration lifecycle.
 ///
-/// - System config: baseline + local file (+ supervisor overlay), swapped
+/// - System config: baseline + local file (+ control overlay), swapped
 ///   atomically so readers never block.
 /// - App configs: persisted in the database, mirrored in memory, and
 ///   compiled into a [`RouteTable`] whenever they change.
 pub struct ConfigManager {
     system_config: ArcSwap<SystemConfig>,
-    /// Raw app configurations keyed by app id, as pushed by the supervisor.
+    /// Raw app configurations keyed by app id, as pushed by the control.
     app_configs: Arc<ArcSwap<HashMap<String, JsonValue>>>,
     /// Lookup structures derived from `app_configs`.
     routes: ArcSwap<RouteTable>,
@@ -87,7 +87,7 @@ impl ConfigManager {
         })
     }
 
-    /// Apply incremental app config updates from the supervisor, persist
+    /// Apply incremental app config updates from the control, persist
     /// them, and rebuild the route table.
     pub async fn update_app_configs(
         &self,
@@ -148,12 +148,12 @@ impl ConfigManager {
         Ok(())
     }
 
-    /// Layer a supervisor overlay onto the running system configuration.
+    /// Layer a control overlay onto the running system configuration.
     ///
     /// Only traffic policy can change this way; the overlay type already
     /// strips everything else. The balancing strategy is fixed per process,
     /// so a change there is recorded but only takes effect after a restart.
-    pub fn apply_system_overlay(&self, overlay: SupervisorSystemConfig) -> Result<(), ConfigError> {
+    pub fn apply_system_overlay(&self, overlay: ControlSystemConfig) -> Result<(), ConfigError> {
         let current = self.system_config.load_full();
         let merged = (*current).clone() + overlay.get_system_config();
         merged.validate()?;
@@ -161,7 +161,7 @@ impl ConfigManager {
             warn!(
                 active = %current.balancing_strategy(),
                 requested = %merged.balancing_strategy(),
-                "balancing strategy changed by supervisor; restart to apply"
+                "balancing strategy changed by control; restart to apply"
             );
         }
         self.system_config.store(Arc::new(merged));

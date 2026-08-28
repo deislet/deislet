@@ -9,29 +9,29 @@ import { api } from "../lib/api";
 import type { ExecuteCommandRequest } from "../lib/api";
 import { toast } from "sonner";
 
-// ==================== Workers ====================
+// ==================== Nodes ====================
 
-export function useWorkers() {
+export function useNodes() {
   return useQuery({
-    queryKey: ["workers"],
-    queryFn: () => api.getWorkers(),
+    queryKey: ["nodes"],
+    queryFn: () => api.getNodes(),
     refetchInterval: 5000, // 每 5 秒刷新
   });
 }
 
-export function useWorker(id: string) {
+export function useNode(id: string) {
   return useQuery({
-    queryKey: ["workers", id],
-    queryFn: () => api.getWorker(id),
+    queryKey: ["nodes", id],
+    queryFn: () => api.getNode(id),
     enabled: !!id,
     refetchInterval: 3000,
   });
 }
 
-export function useWorkerHeartbeats(id: string, limit = 100) {
+export function useNodeHeartbeats(id: string, limit = 100) {
   return useQuery({
-    queryKey: ["workers", id, "heartbeats"],
-    queryFn: () => api.getWorkerHeartbeats(id, limit),
+    queryKey: ["nodes", id, "heartbeats"],
+    queryFn: () => api.getNodeHeartbeats(id, limit),
     enabled: !!id,
   });
 }
@@ -52,24 +52,24 @@ export function useConfigStats() {
   });
 }
 
-export function useWorkerConfig(workerId: string) {
+export function useNodeConfig(nodeId: string) {
   return useQuery({
-    queryKey: ["configs", workerId],
-    queryFn: () => api.getWorkerConfig(workerId),
-    enabled: !!workerId,
+    queryKey: ["configs", nodeId],
+    queryFn: () => api.getNodeConfig(nodeId),
+    enabled: !!nodeId,
   });
 }
 
-export function useUpdateWorkerConfig() {
+export function useUpdateNodeConfig() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ workerId, configs }: { workerId: string; configs: any }) =>
-      api.updateWorkerConfig(workerId, configs),
+    mutationFn: ({ nodeId, configs }: { nodeId: string; configs: any }) =>
+      api.updateNodeConfig(nodeId, configs),
     onSuccess: (_, variables) => {
       toast.success("配置已更新");
       queryClient.invalidateQueries({ queryKey: ["configs"] });
-      queryClient.invalidateQueries({ queryKey: ["configs", variables.workerId] });
+      queryClient.invalidateQueries({ queryKey: ["configs", variables.nodeId] });
     },
     onError: (error: any) => {
       toast.error(`配置更新失败: ${error.message}`);
@@ -77,11 +77,11 @@ export function useUpdateWorkerConfig() {
   });
 }
 
-export function useDeleteWorkerConfig() {
+export function useDeleteNodeConfig() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (workerId: string) => api.deleteWorkerConfig(workerId),
+    mutationFn: (nodeId: string) => api.deleteNodeConfig(nodeId),
     onSuccess: () => {
       toast.success("配置已删除");
       queryClient.invalidateQueries({ queryKey: ["configs"] });
@@ -96,12 +96,12 @@ export function useDeleteConfigKey() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ workerId, key }: { workerId: string; key: string }) =>
-      api.deleteConfigKey(workerId, key),
+    mutationFn: ({ nodeId, key }: { nodeId: string; key: string }) =>
+      api.deleteConfigKey(nodeId, key),
     onSuccess: (_, variables) => {
       toast.success("配置项已删除");
       queryClient.invalidateQueries({ queryKey: ["configs"] });
-      queryClient.invalidateQueries({ queryKey: ["configs", variables.workerId] });
+      queryClient.invalidateQueries({ queryKey: ["configs", variables.nodeId] });
     },
     onError: (error: any) => {
       toast.error(`删除失败: ${error.message}`);
@@ -109,19 +109,19 @@ export function useDeleteConfigKey() {
   });
 }
 
-export function useConfigHistory(workerId: string, limit = 100) {
+export function useConfigHistory(nodeId: string, limit = 100) {
   return useQuery({
-    queryKey: ["configs", workerId, "history"],
-    queryFn: () => api.getConfigHistory(workerId, limit),
-    enabled: !!workerId,
+    queryKey: ["configs", nodeId, "history"],
+    queryFn: () => api.getConfigHistory(nodeId, limit),
+    enabled: !!nodeId,
   });
 }
 
-export function useConfigKeyHistory(workerId: string, key: string, limit = 50) {
+export function useConfigKeyHistory(nodeId: string, key: string, limit = 50) {
   return useQuery({
-    queryKey: ["configs", workerId, key, "history"],
-    queryFn: () => api.getConfigKeyHistory(workerId, key, limit),
-    enabled: !!workerId && !!key,
+    queryKey: ["configs", nodeId, key, "history"],
+    queryFn: () => api.getConfigKeyHistory(nodeId, key, limit),
+    enabled: !!nodeId && !!key,
   });
 }
 
@@ -130,19 +130,19 @@ export function useRollbackConfig() {
 
   return useMutation({
     mutationFn: ({
-      workerId,
+      nodeId,
       key,
       versionTimestamp,
     }: {
-      workerId: string;
+      nodeId: string;
       key: string;
       versionTimestamp: string;
-    }) => api.rollbackConfig(workerId, key, versionTimestamp),
+    }) => api.rollbackConfig(nodeId, key, versionTimestamp),
     onSuccess: (_, variables) => {
       toast.success("配置已回滚");
       queryClient.invalidateQueries({ queryKey: ["configs"] });
-      queryClient.invalidateQueries({ queryKey: ["configs", variables.workerId] });
-      queryClient.invalidateQueries({ queryKey: ["configs", variables.workerId, "history"] });
+      queryClient.invalidateQueries({ queryKey: ["configs", variables.nodeId] });
+      queryClient.invalidateQueries({ queryKey: ["configs", variables.nodeId, "history"] });
     },
     onError: (error: any) => {
       toast.error(`回滚失败: ${error.message}`);
@@ -152,10 +152,10 @@ export function useRollbackConfig() {
 
 export function usePushConfig() {
   return useMutation({
-    mutationFn: ({ workerId, key }: { workerId: string; key?: string }) =>
-      api.pushConfig(workerId, key),
+    mutationFn: ({ nodeId, key }: { nodeId: string; key?: string }) =>
+      api.pushConfig(nodeId, key),
     onSuccess: () => {
-      toast.success("配置已推送到 Worker");
+      toast.success("配置已推送到 Node");
     },
     onError: (error: any) => {
       toast.error(`推送失败: ${error.message}`);
@@ -173,11 +173,11 @@ export function useCommands() {
   });
 }
 
-export function useWorkerCommands(workerId: string) {
+export function useNodeCommands(nodeId: string) {
   return useQuery({
-    queryKey: ["commands", "worker", workerId],
-    queryFn: () => api.getWorkerCommands(workerId),
-    enabled: !!workerId,
+    queryKey: ["commands", "node", nodeId],
+    queryFn: () => api.getNodeCommands(nodeId),
+    enabled: !!nodeId,
     refetchInterval: 3000,
   });
 }
@@ -195,8 +195,8 @@ export function useExecuteCommand() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ workerId, command }: { workerId: string; command: ExecuteCommandRequest }) =>
-      api.executeCommand(workerId, command),
+    mutationFn: ({ nodeId, command }: { nodeId: string; command: ExecuteCommandRequest }) =>
+      api.executeCommand(nodeId, command),
     onSuccess: () => {
       toast.success("命令已发送");
       queryClient.invalidateQueries({ queryKey: ["commands"] });
@@ -225,7 +225,7 @@ export function useCancelCommand() {
 // ==================== Events ====================
 
 export function useEvents(params?: {
-  worker_id?: string;
+  node_id?: string;
   severity?: string;
   limit?: number;
   offset?: number;

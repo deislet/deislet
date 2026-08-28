@@ -12,7 +12,7 @@ use deis_runtime::logging::{RuntimeLayer, LogBuffer, LogShipper, ShipperConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let worker_id = hostname::get()
+    let node_id = hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
                 .with_target(false)
                 .with_thread_ids(true),
         )
-        .with(RuntimeLayer::new(log_buffer.clone(), worker_id.clone()))
+        .with(RuntimeLayer::new(log_buffer.clone(), node_id.clone()))
         .init();
 
     info!("🚀 Starting Runtime Platform (Rust)");
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     let config = RuntimeConfig::load()?;
     let port = config.http_port;
 
-    info!("Worker ID: {}", worker_id);
+    info!("Worker ID: {}", node_id);
     info!("HTTP Port: {}", port);
 
     // Initialize data storage (Single SQLite DB)
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     info!("====================================");
 
     // Start HTTP + gRPC server (reuse same port)
-    dispatcher::start_server(app_manager, config_store, app_repo, worker_id, port).await?;
+    dispatcher::start_server(app_manager, config_store, app_repo, node_id, port).await?;
 
     Ok(())
 }

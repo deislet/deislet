@@ -5,66 +5,66 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
-use crate::session::WorkerState;
+use crate::session::NodeState;
 
 /// Broadcast event types
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event_type", content = "data")]
 pub enum BroadcastEvent {
-    WorkerConnected {
-        worker_id: String,
+    NodeConnected {
+        node_id: String,
         instance_id: String,
-        worker_type: String,
+        node_role: String,
         host: String,
         ports: Vec<u16>,
         timestamp: DateTime<Utc>,
     },
-    WorkerDisconnected {
-        worker_id: String,
+    NodeDisconnected {
+        node_id: String,
         instance_id: String,
         reason: String,
         timestamp: DateTime<Utc>,
     },
-    WorkerStateChanged {
-        worker_id: String,
+    NodeStateChanged {
+        node_id: String,
         instance_id: String,
         old_state: String,
         new_state: String,
         timestamp: DateTime<Utc>,
     },
     HeartbeatReceived {
-        worker_id: String,
+        node_id: String,
         instance_id: String,
         power_reserve: u8,
         timestamp: DateTime<Utc>,
     },
     ConfigUpdated {
-        worker_id: String,
+        node_id: String,
         config_keys: Vec<String>,
         version_timestamp: DateTime<Utc>,
         timestamp: DateTime<Utc>,
     },
     CommandSent {
         command_id: String,
-        worker_id: String,
+        node_id: String,
         command_type: String,
         timestamp: DateTime<Utc>,
     },
     CommandCompleted {
         command_id: String,
-        worker_id: String,
+        node_id: String,
         success: bool,
         timestamp: DateTime<Utc>,
     },
 }
 
 impl BroadcastEvent {
-    pub fn worker_state_to_string(state: &WorkerState) -> String {
+    pub fn node_state_to_string(state: &NodeState) -> String {
         match state {
-            WorkerState::Connected => "Connected".to_string(),
-            WorkerState::Registered => "Registered".to_string(),
-            WorkerState::Active => "Active".to_string(),
-            WorkerState::Disconnected => "Disconnected".to_string(),
+            NodeState::Connected => "Connected".to_string(),
+            NodeState::Registered => "Registered".to_string(),
+            NodeState::Active => "Active".to_string(),
+            NodeState::Disconnected => "Disconnected".to_string(),
         }
     }
 }
@@ -178,10 +178,10 @@ mod tests {
 
         broadcaster.register(client_id, tx);
 
-        let event = BroadcastEvent::WorkerConnected {
-            worker_id: "test-worker".to_string(),
+        let event = BroadcastEvent::NodeConnected {
+            node_id: "test-node".to_string(),
             instance_id: "test-instance".to_string(),
-            worker_type: "deis_runtime:1.0.0".to_string(),
+            node_role: "deis_runtime:1.0.0".to_string(),
             host: "localhost".to_string(),
             ports: vec![8000],
             timestamp: Utc::now(),
@@ -191,14 +191,14 @@ mod tests {
 
         // Should receive the broadcasted message
         let msg = rx.recv().await.unwrap();
-        assert!(msg.contains("test-worker"));
-        assert!(msg.contains("WorkerConnected"));
+        assert!(msg.contains("test-node"));
+        assert!(msg.contains("NodeConnected"));
     }
 
     #[test]
     fn test_event_serialization() {
         let event = BroadcastEvent::HeartbeatReceived {
-            worker_id: "worker-1".to_string(),
+            node_id: "node-1".to_string(),
             instance_id: "instance-1".to_string(),
             power_reserve: 85,
             timestamp: Utc::now(),
@@ -206,7 +206,7 @@ mod tests {
 
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("HeartbeatReceived"));
-        assert!(json.contains("worker-1"));
+        assert!(json.contains("node-1"));
         assert!(json.contains("85"));
     }
 }

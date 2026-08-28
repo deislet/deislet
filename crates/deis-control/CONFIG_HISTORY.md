@@ -1,23 +1,23 @@
 # Configuration Version History Feature
 
-Control Supervisor supports full configuration version history tracking and rollback functionality, providing auditing and recovery capabilities for configuration management.
+Control Control supports full configuration version history tracking and rollback functionality, providing auditing and recovery capabilities for configuration management.
 
 ## Features
 
 - **Automatic History Recording**: All configuration creation, update, and deletion operations are automatically recorded in the history table.
 - **Version Timestamp**: Each configuration change has a unique version timestamp, supporting precise point-in-time recovery.
 - **Operation Types**: Distinguishes between `create`, `update`, and `delete` operation types.
-- **Query History**: Supports querying configuration history for an entire worker or for a single configuration key.
+- **Query History**: Supports querying configuration history for an entire node or for a single configuration key.
 - **Version Rollback**: Supports rolling back configuration items to any historical version.
 
 ## API Endpoints
 
-### 1. Get Worker Configuration History
+### 1. Get Node Configuration History
 
-Retrieve all configuration change history for a specified worker.
+Retrieve all configuration change history for a specified node.
 
 ```bash
-GET /api/configs/:worker_id/history?limit=100
+GET /api/configs/:node_id/history?limit=100
 ```
 
 **Query Parameters**:
@@ -27,7 +27,7 @@ GET /api/configs/:worker_id/history?limit=100
 ```json
 {
   "success": true,
-  "worker_id": "worker-123",
+  "node_id": "node-123",
   "history": [
     {
       "id": 42,
@@ -52,10 +52,10 @@ GET /api/configs/:worker_id/history?limit=100
 
 ### 2. Get Configuration Key History
 
-Retrieve all change history for a specific configuration key of a specified worker.
+Retrieve all change history for a specific configuration key of a specified node.
 
 ```bash
-GET /api/configs/:worker_id/:config_key/history?limit=50
+GET /api/configs/:node_id/:config_key/history?limit=50
 ```
 
 **Query Parameters**:
@@ -65,7 +65,7 @@ GET /api/configs/:worker_id/:config_key/history?limit=50
 ```json
 {
   "success": true,
-  "worker_id": "worker-123",
+  "node_id": "node-123",
   "config_key": "port",
   "history": [
     {
@@ -86,7 +86,7 @@ GET /api/configs/:worker_id/:config_key/history?limit=50
 Roll back a specified configuration key to a historical version.
 
 ```bash
-POST /api/configs/:worker_id/:config_key/rollback
+POST /api/configs/:node_id/:config_key/rollback
 Content-Type: application/json
 
 {
@@ -101,7 +101,7 @@ Content-Type: application/json
 ```json
 {
   "success": true,
-  "worker_id": "worker-123",
+  "node_id": "node-123",
   "config_key": "port",
   "rolled_back_to": "2025-01-16T11:00:00Z",
   "new_version": "2025-01-16T13:00:00Z",
@@ -114,11 +114,11 @@ Content-Type: application/json
 
 ### Use Case 1: Auditing Configuration Changes
 
-View all configuration history for a worker to understand the change record:
+View all configuration history for a node to understand the change record:
 
 ```bash
 curl -H "X-API-Key: your-api-key" \
-  http://localhost:8080/api/configs/worker-123/history?limit=20
+  http://localhost:8080/api/configs/node-123/history?limit=20
 ```
 
 ### Use Case 2: Tracking a Specific Configuration
@@ -127,7 +127,7 @@ View the historical changes of a specific configuration key (e.g., `port`):
 
 ```bash
 curl -H "X-API-Key: your-api-key" \
-  http://localhost:8080/api/configs/worker-123/port/history
+  http://localhost:8080/api/configs/node-123/port/history
 ```
 
 ### Use Case 3: Rolling Back Erroneous Configuration
@@ -137,14 +137,14 @@ If a configuration error is discovered, you can quickly roll back to a previous 
 ```bash
 # 1. View history first to find the correct version timestamp
 curl -H "X-API-Key: your-api-key" \
-  http://localhost:8080/api/configs/worker-123/port/history
+  http://localhost:8080/api/configs/node-123/port/history
 
 # 2. Roll back to the specified version
 curl -X POST \
   -H "X-API-Key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"version_timestamp": "2025-01-16T11:00:00Z"}' \
-  http://localhost:8080/api/configs/worker-123/port/rollback
+  http://localhost:8080/api/configs/node-123/port/rollback
 ```
 
 ## Database Implementation
@@ -154,7 +154,7 @@ Configuration history is stored in the `config_history` table:
 ```sql
 CREATE TABLE IF NOT EXISTS config_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    worker_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
     config_key TEXT NOT NULL,
     config_value TEXT NOT NULL,
     version_timestamp TEXT NOT NULL,
@@ -167,8 +167,8 @@ CREATE TABLE IF NOT EXISTS config_history (
 
 To improve query efficiency, the system creates the following indexes:
 
-- `idx_config_history_worker`: Index by `worker_id` and `created_at`
-- `idx_config_history_key`: Index by `worker_id`, `config_key`, and `created_at`
+- `idx_config_history_node`: Index by `node_id` and `created_at`
+- `idx_config_history_key`: Index by `node_id`, `config_key`, and `created_at`
 
 ## Notes
 

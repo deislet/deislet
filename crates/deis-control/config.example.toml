@@ -1,4 +1,4 @@
-# Control Supervisor Configuration Example
+# Control Control Configuration Example
 
 # WebSocket server bind address
 bind_addr = "0.0.0.0"
@@ -6,17 +6,17 @@ bind_addr = "0.0.0.0"
 # WebSocket server port
 port = 8080
 
-# Heartbeat interval in seconds (how often workers should send heartbeats)
+# Heartbeat interval in seconds (how often nodes should send heartbeats)
 heartbeat_interval = 30
 
-# Heartbeat timeout in seconds (after which a worker is considered disconnected)
+# Heartbeat timeout in seconds (after which a node is considered disconnected)
 heartbeat_timeout = 90
 
-# Pre-shared keys for worker authentication
-# Workers must provide one of these keys to authenticate
-worker_preshared_keys = [
-    "your-worker-secret-key-here",
-    "another-worker-key-for-different-workers"
+# Pre-shared keys for node authentication
+# Nodes must provide one of these keys to authenticate
+node_preshared_keys = [
+    "your-node-secret-key-here",
+    "another-node-key-for-different-nodes"
 ]
 
 # ========================================
@@ -38,7 +38,7 @@ api_keys = [
 
 # Example usage:
 #   curl -H "Authorization: Bearer deis-control-admin-key-replace-this-in-production" \
-#        http://localhost:8081/api/workers
+#        http://localhost:8081/api/nodes
 #
 #   curl -H "X-API-Key: deis-control-admin-key-replace-this-in-production" \
 #        http://localhost:8081/api/configs

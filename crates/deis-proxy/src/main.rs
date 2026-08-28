@@ -20,7 +20,7 @@ use deis_proxy::config::system::LogLevel;
 use deis_proxy::config::{ConfigManager, SystemConfig};
 use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic};
 use deis_proxy::restart::{ProcessControl, RelaunchArgs, announce_ready};
-use deis_proxy::supervisor::{ProxySupervisorClient, SupervisorService};
+use deis_proxy::control::{ProxyControlClient, ControlService};
 use deis_proxy::tls::SniCertificates;
 
 /// Upper bound on the initial upstream discovery. It runs after the listening
@@ -328,22 +328,22 @@ fn main() -> Result<()> {
         ),
     ));
 
-    match &system.supervisor {
-        Some(supervisor) => {
-            info!(addr = %supervisor.addr, instance = %supervisor.associated_id, "supervisor configured");
+    match &system.control {
+        Some(control) => {
+            info!(addr = %control.addr, instance = %control.associated_id, "control configured");
             let mut ports = system.listen_ports();
             ports.extend(tls_ports.iter().copied());
-            let mut client = ProxySupervisorClient::new(supervisor.clone())
-                .map_err(|e| anyhow::anyhow!("creating supervisor client: {e}"))?
+            let mut client = ProxyControlClient::new(control.clone())
+                .map_err(|e| anyhow::anyhow!("creating control client: {e}"))?
                 .with_listen_ports(ports)
                 .with_config_manager(Arc::clone(&config));
             client.set_process_channel(commands.clone());
             server.add_service(background_service(
-                "supervisor",
-                SupervisorService::new(client),
+                "control",
+                ControlService::new(client),
             ));
         }
-        None => info!("no supervisor configured; running standalone"),
+        None => info!("no control configured; running standalone"),
     }
 
     server.run_forever()

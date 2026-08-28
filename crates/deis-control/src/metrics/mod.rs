@@ -1,19 +1,19 @@
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
-use crate::session::{SessionManager, WorkerState};
+use crate::session::{SessionManager, NodeState};
 use crate::database::Database;
 
 /// Metrics summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSummary {
-    pub workers: WorkersMetrics,
+    pub nodes: NodesMetrics,
     pub system: SystemMetrics,
 }
 
-/// Workers metrics
+/// Nodes metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkersMetrics {
+pub struct NodesMetrics {
     pub total: usize,
     pub active: usize,
     pub connected: usize,
@@ -56,17 +56,17 @@ impl MetricsCollector {
 
     /// Collect metrics summary
     pub async fn collect_summary(&self) -> MetricsSummary {
-        let workers = self.collect_workers_metrics().await;
+        let nodes = self.collect_nodes_metrics().await;
         let system = self.collect_system_metrics().await;
 
         MetricsSummary {
-            workers,
+            nodes,
             system,
         }
     }
 
-    /// Collect workers metrics
-    async fn collect_workers_metrics(&self) -> WorkersMetrics {
+    /// Collect nodes metrics
+    async fn collect_nodes_metrics(&self) -> NodesMetrics {
         let mut total = 0;
         let mut active = 0;
         let mut connected = 0;
@@ -80,21 +80,21 @@ impl MetricsCollector {
 
             let state = session.get_state().await;
             match state {
-                WorkerState::Active => active += 1,
-                WorkerState::Connected => connected += 1,
-                WorkerState::Registered => registered += 1,
-                WorkerState::Disconnected => disconnected += 1,
+                NodeState::Active => active += 1,
+                NodeState::Connected => connected += 1,
+                NodeState::Registered => registered += 1,
+                NodeState::Disconnected => disconnected += 1,
             }
 
-            let worker_type = match &session.worker_type {
-                crate::message::WorkerType::Runtime(v) => format!("deis_runtime:{}", v),
-                crate::message::WorkerType::Proxy(v) => format!("deis_proxy:{}", v),
+            let node_role = match &session.node_role {
+                crate::message::NodeRole::Runtime(v) => format!("deis_runtime:{}", v),
+                crate::message::NodeRole::Proxy(v) => format!("deis_proxy:{}", v),
             };
 
-            *by_type.entry(worker_type).or_insert(0) += 1;
+            *by_type.entry(node_role).or_insert(0) += 1;
         }
 
-        WorkersMetrics {
+        NodesMetrics {
             total,
             active,
             connected,
@@ -133,24 +133,24 @@ impl MetricsCollector {
 
         let mut output = String::new();
 
-        // Workers metrics
-        output.push_str("# HELP deis_control_workers_total Total number of workers\n");
-        output.push_str("# TYPE deis_control_workers_total gauge\n");
-        output.push_str(&format!("deis_control_workers_total {}\n", summary.workers.total));
+        // Nodes metrics
+        output.push_str("# HELP deis_control_nodes_total Total number of nodes\n");
+        output.push_str("# TYPE deis_control_nodes_total gauge\n");
+        output.push_str(&format!("deis_control_nodes_total {}\n", summary.nodes.total));
 
-        output.push_str("# HELP deis_control_workers_by_state Number of workers by state\n");
-        output.push_str("# TYPE deis_control_workers_by_state gauge\n");
-        output.push_str(&format!("deis_control_workers_by_state{{state=\"active\"}} {}\n", summary.workers.active));
-        output.push_str(&format!("deis_control_workers_by_state{{state=\"connected\"}} {}\n", summary.workers.connected));
-        output.push_str(&format!("deis_control_workers_by_state{{state=\"registered\"}} {}\n", summary.workers.registered));
-        output.push_str(&format!("deis_control_workers_by_state{{state=\"disconnected\"}} {}\n", summary.workers.disconnected));
+        output.push_str("# HELP deis_control_nodes_by_state Number of nodes by state\n");
+        output.push_str("# TYPE deis_control_nodes_by_state gauge\n");
+        output.push_str(&format!("deis_control_nodes_by_state{{state=\"active\"}} {}\n", summary.nodes.active));
+        output.push_str(&format!("deis_control_nodes_by_state{{state=\"connected\"}} {}\n", summary.nodes.connected));
+        output.push_str(&format!("deis_control_nodes_by_state{{state=\"registered\"}} {}\n", summary.nodes.registered));
+        output.push_str(&format!("deis_control_nodes_by_state{{state=\"disconnected\"}} {}\n", summary.nodes.disconnected));
 
         // Statistics by type
-        if !summary.workers.by_type.is_empty() {
-            output.push_str("# HELP deis_control_workers_by_type Number of workers by type\n");
-            output.push_str("# TYPE deis_control_workers_by_type gauge\n");
-            for (worker_type, count) in &summary.workers.by_type {
-                output.push_str(&format!("deis_control_workers_by_type{{type=\"{}\"}} {}\n", worker_type, count));
+        if !summary.nodes.by_type.is_empty() {
+            output.push_str("# HELP deis_control_nodes_by_role Number of nodes by role\n");
+            output.push_str("# TYPE deis_control_nodes_by_role gauge\n");
+            for (node_role, count) in &summary.nodes.by_type {
+                output.push_str(&format!("deis_control_nodes_by_role{{role=\"{}\"}} {}\n", node_role, count));
             }
         }
 
@@ -178,8 +178,8 @@ impl MetricsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{WorkerSession};
-    use crate::message::{WorkerInfo, WorkerType};
+    use crate::session::{NodeSession};
+    use crate::message::{NodeInfo, NodeRole};
 
     #[tokio::test]
     async fn test_metrics_collector_creation() {
@@ -196,27 +196,27 @@ mod tests {
 
         let summary = collector.collect_summary().await;
 
-        assert_eq!(summary.workers.total, 0);
-        assert_eq!(summary.workers.active, 0);
+        assert_eq!(summary.nodes.total, 0);
+        assert_eq!(summary.nodes.active, 0);
     }
 
     #[tokio::test]
-    async fn test_collect_workers_metrics() {
+    async fn test_collect_nodes_metrics() {
         let sessions = Arc::new(SessionManager::new());
 
-        let info = WorkerInfo {
-            worker_type: WorkerType::Runtime("1.0.0".to_string()),
+        let info = NodeInfo {
+            node_role: NodeRole::Runtime("1.0.0".to_string()),
             listen_host: "localhost".to_string(),
             listen_port: vec![8000],
         };
-        let session = Arc::new(WorkerSession::new("worker-1".to_string(), info));
+        let session = Arc::new(NodeSession::new("node-1".to_string(), info));
         sessions.add(session);
 
         let collector = MetricsCollector::new(sessions);
         let summary = collector.collect_summary().await;
 
-        assert_eq!(summary.workers.total, 1);
-        assert_eq!(summary.workers.connected, 1);
+        assert_eq!(summary.nodes.total, 1);
+        assert_eq!(summary.nodes.connected, 1);
     }
 
     #[tokio::test]
@@ -226,7 +226,7 @@ mod tests {
 
         let prometheus = collector.export_prometheus().await;
 
-        assert!(prometheus.contains("deis_control_workers_total"));
+        assert!(prometheus.contains("deis_control_nodes_total"));
         assert!(prometheus.contains("deis_control_uptime_seconds"));
     }
 }

@@ -14,7 +14,7 @@ pub struct RuntimeManagementService {
     app_manager: Arc<ApplicationManager>,
     config_store: Arc<ConfigStore>,
     app_repo: Arc<AppRepo>,
-    worker_id: String,
+    node_id: String,
 }
 
 fn map_proto_limits(
@@ -83,13 +83,13 @@ impl RuntimeManagementService {
         app_manager: Arc<ApplicationManager>,
         config_store: Arc<ConfigStore>,
         app_repo: Arc<AppRepo>,
-        worker_id: String,
+        node_id: String,
     ) -> Self {
         Self {
             app_manager,
             config_store,
             app_repo,
-            worker_id,
+            node_id,
         }
     }
 }
@@ -369,8 +369,8 @@ impl RuntimeManagement for RuntimeManagementService {
         info!("Status query received, include_apps: {}", req.include_apps);
 
         // Basic Worker information
-        let worker_info = Some(WorkerInfo {
-            worker_id: self.worker_id.clone(),
+        let node_info = Some(NodeInfo {
+            node_id: self.node_id.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: 0, // TODO: Calculate actual uptime
             hostname: hostname::get()
@@ -423,7 +423,7 @@ impl RuntimeManagement for RuntimeManagementService {
         });
 
         Ok(Response::new(GetStatusResponse {
-            worker_info,
+            node_info,
             apps,
             resource_usage,
             op_metrics,

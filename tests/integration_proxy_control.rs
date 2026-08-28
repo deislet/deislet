@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use deis_proxy::supervisor::ProxySupervisorClient;
-use deis_wire::SupervisorConfig;
+use deis_proxy::control::ProxyControlClient;
+use deis_wire::ControlConfig;
 
 const TEST_SECRET: &str = "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -10,14 +10,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Proxy <-> Control Integration Test ===\n");
 
-    let config = SupervisorConfig::new(
-        "deis-proxy-test-worker".to_string(),
+    let config = ControlConfig::new(
+        "deis-proxy-test-node".to_string(),
         TEST_SECRET.to_string(),
         "ws://127.0.0.1:9001".to_string(),
     );
 
-    println!("[1] Creating Proxy supervisor client...");
-    let mut client = ProxySupervisorClient::new(config)?;
+    println!("[1] Creating Proxy control client...");
+    let mut client = ProxyControlClient::new(config)?;
     println!("[OK] Client created\n");
 
     println!("[2] Connecting, authenticating and registering (retries until deis_control answers)...");

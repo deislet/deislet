@@ -12,8 +12,8 @@ pub enum WireError {
     AuthenticationError(String),
     /// Network error
     NetworkError(String),
-    /// Supervisor returned an error
-    SupervisorError {
+    /// Control returned an error
+    ControlError {
         code: String,
         message: String,
         help: Option<String>,
@@ -36,7 +36,7 @@ impl fmt::Display for WireError {
             WireError::ConfigurationError(msg) => write!(f, "Configuration error: {msg}"),
             WireError::AuthenticationError(msg) => write!(f, "Authentication error: {msg}"),
             WireError::NetworkError(msg) => write!(f, "Network error: {msg}"),
-            WireError::SupervisorError {
+            WireError::ControlError {
                 code,
                 message,
                 help,
@@ -44,10 +44,10 @@ impl fmt::Display for WireError {
                 if let Some(help_text) = help {
                     write!(
                         f,
-                        "Supervisor error [{code}]: {message} (help: {help_text})"
+                        "Control error [{code}]: {message} (help: {help_text})"
                     )
                 } else {
-                    write!(f, "Supervisor error [{code}]: {message}")
+                    write!(f, "Control error [{code}]: {message}")
                 }
             }
             WireError::InstanceStatusError(msg) => write!(f, "Instance status error: {msg}"),
@@ -73,9 +73,9 @@ impl From<String> for WireError {
     }
 }
 
-/// Supervisor error response structure
+/// Control error response structure
 #[derive(Debug, Deserialize, Serialize)]
-pub struct SupervisorErrorResponse {
+pub struct ControlErrorResponse {
     pub success: bool,
     pub error: String,
     pub message: String,
@@ -108,28 +108,28 @@ mod tests {
     }
 
     #[test]
-    fn test_supervisor_error_display_with_help() {
-        let error = WireError::SupervisorError {
+    fn test_control_error_display_with_help() {
+        let error = WireError::ControlError {
             code: "INVALID_REQUEST".to_string(),
             message: "Bad request".to_string(),
             help: Some("Check your parameters".to_string()),
         };
         assert_eq!(
             error.to_string(),
-            "Supervisor error [INVALID_REQUEST]: Bad request (help: Check your parameters)"
+            "Control error [INVALID_REQUEST]: Bad request (help: Check your parameters)"
         );
     }
 
     #[test]
-    fn test_supervisor_error_display_without_help() {
-        let error = WireError::SupervisorError {
+    fn test_control_error_display_without_help() {
+        let error = WireError::ControlError {
             code: "SERVER_ERROR".to_string(),
             message: "Internal server error".to_string(),
             help: None,
         };
         assert_eq!(
             error.to_string(),
-            "Supervisor error [SERVER_ERROR]: Internal server error"
+            "Control error [SERVER_ERROR]: Internal server error"
         );
     }
 
@@ -166,8 +166,8 @@ mod tests {
     }
 
     #[test]
-    fn test_supervisor_error_response_serialization() {
-        let response = SupervisorErrorResponse {
+    fn test_control_error_response_serialization() {
+        let response = ControlErrorResponse {
             success: false,
             error: "INVALID_REQUEST".to_string(),
             message: "Bad request".to_string(),
@@ -175,7 +175,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&response).unwrap();
-        let deserialized: SupervisorErrorResponse = serde_json::from_str(&json).unwrap();
+        let deserialized: ControlErrorResponse = serde_json::from_str(&json).unwrap();
 
         assert_eq!(response.success, deserialized.success);
         assert_eq!(response.error, deserialized.error);

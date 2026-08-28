@@ -423,9 +423,9 @@ impl Message for HeartbeatAckMessage {
     }
 }
 
-/// Worker command data
+/// Node command data
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerCommand {
+pub enum NodeCommand {
     Shutdown {
         timeout_seconds: Option<u64>,
         reason: Option<String>,
@@ -449,8 +449,8 @@ pub enum WorkerCommand {
 /// Configuration push data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPushData {
-    /// Worker ID to push config to
-    pub worker_id: String,
+    /// Node ID to push config to
+    pub node_id: String,
     /// Configuration key (e.g., "app.runtime", "gateway.cors")
     pub config_key: String,
     /// Configuration value as JSON
@@ -545,7 +545,7 @@ impl Message for ConfigPushAckMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandData {
     pub command_id: Uuid,
-    pub command: WorkerCommand,
+    pub command: NodeCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -589,8 +589,8 @@ impl Message for CommandMessage {
 // Extension message types
 // =============================================================================
 
-/// Supervisor related messages
-pub mod supervisor {
+/// Control related messages
+pub mod control {
     use super::*;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -602,13 +602,13 @@ pub mod supervisor {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct SupervisorMessage {
+    pub struct ControlMessage {
         pub operation_data: BatchOperationData,
         pub message_id: Option<Uuid>,
     }
 
-    impl Message for SupervisorMessage {
-        const MESSAGE_TYPE: &'static str = "supervisor_operation";
+    impl Message for ControlMessage {
+        const MESSAGE_TYPE: &'static str = "control_operation";
         type Data = BatchOperationData;
 
         fn data(&self) -> &Self::Data {
@@ -787,20 +787,20 @@ impl MessageBuilder {
         WireMessage::new(StatusUpdateMessage::new(status_data))
     }
 
-    /// Create supervisor operation message
-    pub fn supervisor_operation(
+    /// Create control operation message
+    pub fn control_operation(
         operation_type: String,
         targets: Vec<String>,
         config: serde_json::Value,
         parallel_limit: Option<u32>,
-    ) -> WireMessage<supervisor::SupervisorMessage> {
-        let operation_data = supervisor::BatchOperationData {
+    ) -> WireMessage<control::ControlMessage> {
+        let operation_data = control::BatchOperationData {
             operation_type,
             targets,
             config,
             parallel_limit,
         };
-        WireMessage::new(supervisor::SupervisorMessage::new(operation_data))
+        WireMessage::new(control::ControlMessage::new(operation_data))
     }
 
     /// Create deis-runtime deployment message
@@ -879,7 +879,7 @@ impl MessageBuilder {
     }
 
     /// Create command message
-    pub fn command(command_id: Uuid, command: WorkerCommand) -> WireMessage<CommandMessage> {
+    pub fn command(command_id: Uuid, command: NodeCommand) -> WireMessage<CommandMessage> {
         let command_data = CommandData {
             command_id,
             command,
@@ -889,13 +889,13 @@ impl MessageBuilder {
 
     /// Create config push message
     pub fn config_push(
-        worker_id: String,
+        node_id: String,
         config_key: String,
         config_value: serde_json::Value,
         version_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> WireMessage<ConfigPushMessage> {
         let push_data = ConfigPushData {
-            worker_id,
+            node_id,
             config_key,
             config_value,
             version_timestamp,
@@ -927,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_auth_message() {
-        let auth_data = AuthData::new("test_worker".to_string(), b"test_key").unwrap();
+        let auth_data = AuthData::new("test_node".to_string(), b"test_key").unwrap();
         let auth_msg = AuthMessage::new(auth_data);
 
         assert_eq!(AuthMessage::MESSAGE_TYPE, "authenticate");
@@ -938,22 +938,22 @@ mod tests {
     }
 
     #[test]
-    fn test_supervisor_message() {
-        let operation_data = supervisor::BatchOperationData {
+    fn test_control_message() {
+        let operation_data = control::BatchOperationData {
             operation_type: "batch_deploy".to_string(),
-            targets: vec!["worker1".to_string()],
+            targets: vec!["node1".to_string()],
             config: json!({}),
             parallel_limit: None,
         };
 
-        let supervisor_msg = supervisor::SupervisorMessage::new(operation_data);
-        let deis_wire_msg = WireMessage::new(supervisor_msg);
-        assert_eq!(deis_wire_msg.message_type, "supervisor_operation");
+        let control_msg = control::ControlMessage::new(operation_data);
+        let deis_wire_msg = WireMessage::new(control_msg);
+        assert_eq!(deis_wire_msg.message_type, "control_operation");
     }
 
     #[test]
     fn test_message_serialization() {
-        let auth_data = AuthData::new("test_worker".to_string(), b"test_key").unwrap();
+        let auth_data = AuthData::new("test_node".to_string(), b"test_key").unwrap();
         let auth_msg = AuthMessage::new(auth_data);
         let deis_wire_msg = WireMessage::new(auth_msg);
 
@@ -968,7 +968,7 @@ mod tests {
         let request_id = Uuid::new_v4();
 
         // Create request
-        let auth_data = AuthData::new("test_worker".to_string(), b"test_key").unwrap();
+        let auth_data = AuthData::new("test_node".to_string(), b"test_key").unwrap();
         let auth_msg = AuthMessage::with_id(auth_data, request_id);
         let request = WireMessage::new(auth_msg);
 
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_message_builder() {
-        let auth_data = AuthData::new("test_worker".to_string(), b"test_key").unwrap();
+        let auth_data = AuthData::new("test_node".to_string(), b"test_key").unwrap();
         let msg = MessageBuilder::auth(auth_data);
 
         assert_eq!(msg.message_type, "authenticate");

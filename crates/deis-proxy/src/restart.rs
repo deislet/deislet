@@ -11,7 +11,7 @@
 //! - `SIGTERM` stops accepting connections and exits after the grace period.
 //!
 //! Requests arrive from `SIGUSR1` (`deis-proxy -s reload`) and from the
-//! supervisor client.
+//! control client.
 
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -49,7 +49,7 @@ pub struct RelaunchArgs {
     /// Directory this process was started from, captured before pingora's
     /// daemon mode changes it to `/`. The replacement runs from the same
     /// directory so every relative path (database, logs, certificate files
-    /// named by the supervisor) resolves exactly as it did for this process,
+    /// named by the control) resolves exactly as it did for this process,
     /// and each replacement captures its own launch directory in turn.
     pub working_dir: PathBuf,
 }
@@ -160,7 +160,7 @@ pub fn graceful_shutdown() -> Result<()> {
     kill(Pid::this(), Signal::SIGTERM).context("requesting graceful shutdown")
 }
 
-/// Background service that turns `SIGUSR1` and supervisor commands into
+/// Background service that turns `SIGUSR1` and control commands into
 /// process actions.
 pub struct ProcessControl {
     args: RelaunchArgs,

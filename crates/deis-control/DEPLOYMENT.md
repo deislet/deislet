@@ -11,9 +11,9 @@
 
 - **Operating System**: Linux (Ubuntu 20.04+, CentOS 8+ recommended)
 - **CPU**: 2+ cores
-- **Memory**: 2GB+ (depending on the number of Workers)
+- **Memory**: 2GB+ (depending on the number of Nodes)
 - **Disk**: 10GB+ (for database and logs)
-- **Network**: Network environment capable of accessing Worker nodes
+- **Network**: Network environment capable of accessing Node nodes
 
 ### Software Dependencies
 
@@ -60,7 +60,7 @@ bind_addr = "0.0.0.0"
 port = 8080
 
 # Change to a strong random key
-worker_preshared_keys = [
+node_preshared_keys = [
     "your-random-key-here-change-me-in-production"
 ]
 
@@ -228,7 +228,7 @@ server {
         proxy_set_header Connection "upgrade";
     }
 
-    # Worker WebSocket
+    # Node WebSocket
     location /ws {
         proxy_pass http://localhost:8080;
         proxy_http_version 1.1;
@@ -264,7 +264,7 @@ Create service file (`/etc/systemd/system/deis-control.service`):
 
 ```ini
 [Unit]
-Description=Control Cluster Supervisor
+Description=Control Cluster Control
 After=network.target
 
 [Service]
@@ -420,12 +420,12 @@ deis-control -c /etc/deis-control/config.toml --check-config
 RUST_LOG=debug deis-control -c config.toml
 ```
 
-#### 2. Worker cannot connect
+#### 2. Node cannot connect
 
 - Check network connectivity: `telnet deis-control-host 8080`
 - Check firewall rules
 - Verify consistent PSK configuration
-- View worker-side logs
+- View node-side logs
 
 #### 3. Database locked
 

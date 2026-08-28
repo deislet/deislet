@@ -5,9 +5,9 @@ port = 8082
 heartbeat_interval = 30
 heartbeat_timeout = 90
 
-# Worker authentication
-worker_preshared_keys = [
-    "test-worker-key-12345"
+# Node authentication
+node_preshared_keys = [
+    "test-node-key-12345"
 ]
 
 # API authentication

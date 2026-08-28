@@ -1,6 +1,6 @@
 # Proxy configuration
 #
-# Layering: baseline defaults + this file + supervisor overlay. Every key is
+# Layering: baseline defaults + this file + control overlay. Every key is
 # optional; an unset key keeps the baseline value shown here.
 
 # Relative paths anywhere in this file (database, pid_file, upgrade_sock,
@@ -25,7 +25,7 @@ pid_file = "/tmp/deis-proxy.pid"
 upgrade_sock = "/tmp/deis_proxy_upgrade.sock"
 # Proxy worker threads. Default: number of CPUs.
 # worker_threads = 8
-# SQLite database holding the application list pushed by the supervisor.
+# SQLite database holding the application list pushed by the control.
 database = "sites.db"
 
 # Plain HTTP listeners: every address combined with every port.
@@ -92,8 +92,8 @@ level = "info"  # trace | debug | info | warn | error; RUST_LOG overrides
 # path = "/var/log/deis-proxy/access.log"
 # format = "$time_local $remote_addr $host $app_id $method $uri $status $request_time $upstream_addr"
 
-# Supervisor (deis-control). Omit this table to run standalone.
-# [supervisor]
+# Control (deis-control). Omit this table to run standalone.
+# [control]
 # addr = "http://127.0.0.1:8085"
 # associated_id = "deis-proxy-01"
 # secret = "<64 hex characters>"

@@ -7,7 +7,7 @@ pub mod grpc;
 pub mod metrics;
 pub mod middleware;
 pub mod static_files;
-pub mod workers;
+pub mod nodes;
 
 use axum::{
     middleware as axum_middleware,
@@ -24,7 +24,7 @@ use tracing::info;
 use crate::{
     broadcast::EventBroadcaster,
     command::CommandExecutor,
-    config::SupervisorConfig,
+    config::ControlConfig,
     config_manager::ConfigManager,
     database::Database,
     metrics::MetricsCollector,
@@ -55,7 +55,7 @@ pub fn build_api_router(
     command_executor: Arc<CommandExecutor>,
     metrics_collector: Arc<MetricsCollector>,
     deis_runtime_manager: Arc<crate::runtime_client::RuntimeNodeManager>,
-    config: Arc<SupervisorConfig>,
+    config: Arc<ControlConfig>,
 ) -> ApiRouter {
     let app_state = AppState {
         sessions: Arc::clone(&sessions),
@@ -84,29 +84,29 @@ pub fn build_api_router(
         deis_runtime: Arc::clone(&deis_runtime_manager),
     };
 
-    let auth_config = middleware::AuthConfig::from_supervisor_config(&config);
+    let auth_config = middleware::AuthConfig::from_control_config(&config);
 
     let protected_routes = Router::new()
-        .route("/api/workers", get(workers::list_workers))
-        .route("/api/workers/:id", get(workers::get_worker))
-        .route("/api/workers/:id/heartbeats", get(workers::get_heartbeats))
+        .route("/api/nodes", get(nodes::list_nodes))
+        .route("/api/nodes/:id", get(nodes::get_node))
+        .route("/api/nodes/:id/heartbeats", get(nodes::get_heartbeats))
         .with_state(app_state.clone())
         .route("/api/configs", get(configs::list_all_configs))
         .route("/api/configs/stats", get(configs::get_config_stats))
-        .route("/api/configs/:worker_id", get(configs::get_worker_configs))
-        .route("/api/configs/:worker_id", post(configs::update_worker_configs))
-        .route("/api/configs/:worker_id", delete(configs::delete_worker_configs))
-        .route("/api/configs/:worker_id/history", get(configs::get_config_history))
-        .route("/api/configs/:worker_id/:config_key", get(configs::get_config_value))
-        .route("/api/configs/:worker_id/:config_key", delete(configs::delete_config))
-        .route("/api/configs/:worker_id/:config_key/history", get(configs::get_config_key_history))
-        .route("/api/configs/:worker_id/:config_key/rollback", post(configs::rollback_config_key))
-        .route("/api/configs/push/:worker_id", post(configs::push_all_configs))
-        .route("/api/configs/push/:worker_id/:config_key", post(configs::push_config))
+        .route("/api/configs/:node_id", get(configs::get_node_configs))
+        .route("/api/configs/:node_id", post(configs::update_node_configs))
+        .route("/api/configs/:node_id", delete(configs::delete_node_configs))
+        .route("/api/configs/:node_id/history", get(configs::get_config_history))
+        .route("/api/configs/:node_id/:config_key", get(configs::get_config_value))
+        .route("/api/configs/:node_id/:config_key", delete(configs::delete_config))
+        .route("/api/configs/:node_id/:config_key/history", get(configs::get_config_key_history))
+        .route("/api/configs/:node_id/:config_key/rollback", post(configs::rollback_config_key))
+        .route("/api/configs/push/:node_id", post(configs::push_all_configs))
+        .route("/api/configs/push/:node_id/:config_key", post(configs::push_config))
         .with_state(configs_state)
         .route("/api/commands", get(commands::list_commands))
-        .route("/api/commands/execute/:worker_id", post(commands::execute_command))
-        .route("/api/commands/worker/:worker_id", get(commands::list_worker_commands))
+        .route("/api/commands/execute/:node_id", post(commands::execute_command))
+        .route("/api/commands/node/:node_id", get(commands::list_node_commands))
         .route("/api/commands/status/:command_id", get(commands::get_command_status))
         .route("/api/commands/cancel/:command_id", post(commands::cancel_command))
         .with_state(commands_state)
@@ -178,7 +178,7 @@ pub async fn start_api_server(
     config_manager: Arc<ConfigManager>,
     command_executor: Arc<CommandExecutor>,
     metrics_collector: Arc<MetricsCollector>,
-    config: Arc<SupervisorConfig>,
+    config: Arc<ControlConfig>,
     port: u16,
 ) -> anyhow::Result<()> {
     let tls_config = config.tls.clone();

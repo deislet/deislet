@@ -2,11 +2,11 @@
 //!
 //! Async client based on gRPC unified message system
 
-use crate::config::{SupervisorConfig, WorkerInfo};
+use crate::config::{ControlConfig, NodeInfo};
 use crate::error::WireError;
-use crate::pb::supervisor_service_client::SupervisorServiceClient;
+use crate::pb::control_service_client::ControlServiceClient;
 use crate::pb::{
-    supervisor_message::Payload, AuthenticateRequest, Heartbeat, RegisterRequest, SupervisorMessage,
+    control_message::Payload, AuthenticateRequest, Heartbeat, RegisterRequest, ControlMessage,
 };
 
 use serde_json;
@@ -18,14 +18,14 @@ use tonic::{Request, Streaming};
 /// Wire client
 #[derive(Debug)]
 pub struct WireClient {
-    /// Supervisor configuration
-    config: SupervisorConfig,
-    /// Worker information
-    worker_info: WorkerInfo,
+    /// Control configuration
+    config: ControlConfig,
+    /// Node information
+    node_info: NodeInfo,
     /// gRPC request sender
-    request_tx: Option<mpsc::Sender<SupervisorMessage>>,
+    request_tx: Option<mpsc::Sender<ControlMessage>>,
     /// gRPC response receiver
-    response_rx: Option<Mutex<Streaming<SupervisorMessage>>>,
+    response_rx: Option<Mutex<Streaming<ControlMessage>>>,
     /// Authentication status
     authenticated: bool,
     /// Registration status
@@ -34,10 +34,10 @@ pub struct WireClient {
 
 impl WireClient {
     /// Create a new client instance
-    pub fn new(config: SupervisorConfig, worker_info: WorkerInfo) -> Self {
+    pub fn new(config: ControlConfig, node_info: NodeInfo) -> Self {
         Self {
             config,
-            worker_info,
+            node_info,
             request_tx: None,
             response_rx: None,
             authenticated: false,
@@ -45,7 +45,7 @@ impl WireClient {
         }
     }
 
-    /// Connect to supervisor
+    /// Connect to control
     pub async fn connect(&mut self) -> Result<(), WireError> {
         let url = self.config.grpc_endpoint();
 
@@ -57,7 +57,7 @@ impl WireClient {
                 WireError::ConnectionError(format!("Failed to connect to {url}: {e}"))
             })?;
 
-        let mut client = SupervisorServiceClient::new(channel);
+        let mut client = ControlServiceClient::new(channel);
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 
@@ -75,7 +75,7 @@ impl WireClient {
     /// Send message
     pub async fn send_message(&self, payload: Payload) -> Result<(), WireError> {
         if let Some(sender) = &self.request_tx {
-            let message = SupervisorMessage {
+            let message = ControlMessage {
                 payload: Some(payload),
             };
             
@@ -127,7 +127,7 @@ impl WireClient {
         }
     }
 
-    /// Register worker
+    /// Register node
     pub async fn register(&mut self) -> Result<(), WireError> {
         if !self.authenticated {
             return Err(WireError::AuthenticationError(
@@ -135,12 +135,12 @@ impl WireClient {
             ));
         }
 
-        let worker_info_json = serde_json::to_string(&self.worker_info).map_err(|e| {
-            WireError::SerializationError(format!("Failed to serialize worker info: {e}"))
+        let node_info_json = serde_json::to_string(&self.node_info).map_err(|e| {
+            WireError::SerializationError(format!("Failed to serialize node info: {e}"))
         })?;
 
         let req = RegisterRequest {
-            worker_info_json,
+            node_info_json,
         };
 
         self.send_message(Payload::Register(req)).await?;
@@ -245,18 +245,18 @@ impl WireClient {
     }
 
     /// Clone the sender for independent message sending (e.g., heartbeat task)
-    pub fn clone_sender(&self) -> Option<mpsc::Sender<SupervisorMessage>> {
+    pub fn clone_sender(&self) -> Option<mpsc::Sender<ControlMessage>> {
         self.request_tx.clone()
     }
 
     /// Send heartbeat using a cloned sender (doesn't require &mut self)
     pub async fn send_heartbeat_with_sender(
-        sender: &mpsc::Sender<SupervisorMessage>,
+        sender: &mpsc::Sender<ControlMessage>,
     ) -> Result<(), WireError> {
         let req = Heartbeat {
             status: "active".to_string(),
         };
-        let message = SupervisorMessage {
+        let message = ControlMessage {
             payload: Some(Payload::Heartbeat(req)),
         };
         sender.send(message).await.map_err(|e| {
@@ -269,17 +269,17 @@ impl WireClient {
 mod tests {
     use super::*;
 
-    fn create_test_config() -> SupervisorConfig {
-        SupervisorConfig::new(
-            "test_worker".to_string(),
+    fn create_test_config() -> ControlConfig {
+        ControlConfig::new(
+            "test_node".to_string(),
             "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
             "http://localhost:8080".to_string(),
         )
     }
 
-    fn create_test_worker_info() -> WorkerInfo {
-        WorkerInfo::new(
-            crate::WorkerType::Runtime("1.0".to_string()),
+    fn create_test_node_info() -> NodeInfo {
+        NodeInfo::new(
+            crate::NodeRole::Runtime("1.0".to_string()),
             "127.0.0.1".to_string(),
             vec![8080],
         )
@@ -288,8 +288,8 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let config = create_test_config();
-        let worker_info = create_test_worker_info();
-        let client = WireClient::new(config, worker_info);
+        let node_info = create_test_node_info();
+        let client = WireClient::new(config, node_info);
 
         assert!(!client.is_connected());
         assert!(!client.is_authenticated());

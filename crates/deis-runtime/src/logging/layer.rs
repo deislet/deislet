@@ -7,12 +7,12 @@ use tracing_subscriber::Layer;
 
 pub struct RuntimeLayer {
     buffer: Arc<LogBuffer>,
-    worker_id: String,
+    node_id: String,
 }
 
 impl RuntimeLayer {
-    pub fn new(buffer: Arc<LogBuffer>, worker_id: String) -> Self {
-        Self { buffer, worker_id }
+    pub fn new(buffer: Arc<LogBuffer>, node_id: String) -> Self {
+        Self { buffer, node_id }
     }
 }
 
@@ -33,7 +33,7 @@ where
 
         let message = visitor.message.unwrap_or_else(|| "".to_string());
 
-        let entry = LogEntry::new(self.worker_id.clone(), level, message);
+        let entry = LogEntry::new(self.node_id.clone(), level, message);
 
         self.buffer.push(entry);
     }

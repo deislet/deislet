@@ -1,16 +1,16 @@
 syntax = "proto3";
 
-package deis.supervisor;
+package deis.control;
 
-// SupervisorService manages the lifecycle and configuration of Proxy instances.
-service SupervisorService {
+// ControlService manages the lifecycle and configuration of Proxy instances.
+service ControlService {
   // Connect establishes a bi-directional stream for authentication,
   // registration, and configuration updates.
-  rpc EstablishChannel(stream SupervisorMessage) returns (stream SupervisorMessage);
+  rpc EstablishChannel(stream ControlMessage) returns (stream ControlMessage);
 }
 
 // Wrapper for all possible messages in the stream.
-message SupervisorMessage {
+message ControlMessage {
   oneof payload {
     // Client -> Server messages
     AuthenticateRequest authenticate = 1;
@@ -40,10 +40,10 @@ message AuthResponse {
   string message = 2;
 }
 
-// Client -> Server: Worker registration
+// Client -> Server: Node registration
 message RegisterRequest {
-  // JSON encoded worker info, similar to existing implementation
-  string worker_info_json = 1;
+  // JSON encoded node info, similar to existing implementation
+  string node_info_json = 1;
 }
 
 // Server -> Client: Registration result

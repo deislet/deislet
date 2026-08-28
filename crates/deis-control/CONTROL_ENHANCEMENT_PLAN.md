@@ -1,4 +1,4 @@
-# Control Supervisor Enhancement Plan
+# Control Control Enhancement Plan
 
 **Date**: 2026-01-16
 **Version**: v1.0
@@ -12,7 +12,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Control Supervisor                         │
+│                    Control Control                         │
 │                     (Control Plane - 80% Complete)           │
 ├─────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
@@ -35,7 +35,7 @@
           ▼                ▼                ▼
     ┌──────────┐    ┌──────────┐    ┌──────────┐
     │  Proxy  │    │  Runtime   │    │  Other   │
-    │ (Pingora)│    │ Workers  │    │ Workers  │
+    │ (Pingora)│    │ Nodes  │    │ Nodes  │
     └──────────┘    └──────────┘    └──────────┘
 ```
 
@@ -43,8 +43,8 @@
 
 | Issue | Location | Impact | Fix Difficulty |
 |------|------|------|---------|
-| Config deletion logic error | `src/api/configs.rs` | Deleting a single key causes entire Worker config to disappear | ⭐ Simple |
-| Command response unhandled | `src/command/mod.rs` | Worker status doesn't update after command execution | ⭐⭐ Medium |
+| Config deletion logic error | `src/api/configs.rs` | Deleting a single key causes entire Node config to disappear | ⭐ Simple |
+| Command response unhandled | `src/command/mod.rs` | Node status doesn't update after command execution | ⭐⭐ Medium |
 | WebSocket broadcast not integrated | `src/handler.rs` | Frontend cannot receive real-time status updates | ⭐ Simple |
 | Scheduler not enabled | `src/main.rs` | Cron task functionality unavailable | ⭐ Simple |
 | API no authentication | `src/api/mod.rs` | Security risk | ⭐⭐ Medium |
@@ -151,7 +151,7 @@ async fn get_cert(&self, domain: &str) -> CertKeyPair {
 ```
 
 **Control Application**:
-- Current `WorkerSession::state` uses `Arc<Mutex<WorkerState>>`
+- Current `NodeSession::state` uses `Arc<Mutex<NodeState>>`
 - 🔧 Consider using `RwLock` or `AtomicU8` (enum value)
 
 ---
@@ -169,7 +169,7 @@ let (hosts, locations, acls) = tokio::try_join!(
 ```
 
 **Control Application**:
-- 🔧 Query multiple Worker configurations in parallel during configuration loading
+- 🔧 Query multiple Node configurations in parallel during configuration loading
 - 🔧 Initialize various modules in parallel during startup
 
 ---
@@ -220,27 +220,27 @@ let cert_manager = match tls_manager::DynamicCertManager::new(...) {
 
 #### 1.1 Fix Configuration Deletion Logic
 
-**Problem**: DELETE `/api/configs/:worker_id/:key` deletes the entire worker configuration after a single key is deleted.
+**Problem**: DELETE `/api/configs/:node_id/:key` deletes the entire node configuration after a single key is deleted.
 
 **Fix Solution**:
 ```rust
 // src/config_manager/mod.rs
 
-pub async fn delete_config(&self, worker_id: &str, key: &str) -> Result<()> {
+pub async fn delete_config(&self, node_id: &str, key: &str) -> Result<()> {
     // 1. Delete single key from database
-    self.db.delete_config_key(worker_id, key).await?;
+    self.db.delete_config_key(node_id, key).await?;
 
-    // 2. Reload memory configuration (affects only this worker)
-    let worker_configs = self.db.get_worker_configs(worker_id).await?;
+    // 2. Reload memory configuration (affects only this node)
+    let node_configs = self.db.get_node_configs(node_id).await?;
 
     // 3. Atomic update (using ArcSwap)
     let configs = self.configs.load();
     let mut new_configs = (**configs).clone();
 
-    if worker_configs.is_empty() {
-        new_configs.remove(worker_id);
+    if node_configs.is_empty() {
+        new_configs.remove(node_id);
     } else {
-        new_configs.insert(worker_id.to_string(), worker_configs);
+        new_configs.insert(node_id.to_string(), node_configs);
     }
 
     self.configs.store(Arc::new(new_configs));
@@ -254,14 +254,14 @@ pub async fn delete_config(&self, worker_id: &str, key: &str) -> Result<()> {
 #[tokio::test]
 async fn test_delete_single_config_key() {
     // 1. Add multiple configuration keys
-    config_manager.update_config("worker-1", "key1", json!("value1")).await?;
-    config_manager.update_config("worker-1", "key2", json!("value2")).await?;
+    config_manager.update_config("node-1", "key1", json!("value1")).await?;
+    config_manager.update_config("node-1", "key2", json!("value2")).await?;
 
     // 2. Delete single key
-    config_manager.delete_config("worker-1", "key1").await?;
+    config_manager.delete_config("node-1", "key1").await?;
 
     // 3. Verify: key1 deleted, key2 still exists
-    let configs = config_manager.get_config("worker-1").await?;
+    let configs = config_manager.get_config("node-1").await?;
     assert!(configs.get("key1").is_none());
     assert_eq!(configs.get("key2"), Some(&json!("value2")));
 }
@@ -271,14 +271,14 @@ async fn test_delete_single_config_key() {
 
 #### 1.2 Implement Command Response Handling
 
-**Problem**: No response handling after Worker command execution; status won't update to Completed/Failed.
+**Problem**: No response handling after Node command execution; status won't update to Completed/Failed.
 
 **Full Flow**:
 ```
 1. API calls CommandExecutor::execute_command()
 2. Create CommandTracker, store in pending_commands
-3. Send command to Worker via gRPC
-4. Worker sends CommandResponse after execution
+3. Send command to Node via gRPC
+4. Node sends CommandResponse after execution
 5. gRPC handler receives response → MessageHandler::handle_command_response()
 6. CommandExecutor::handle_response() updates status
 7. Trigger oneshot to notify waiter
@@ -290,9 +290,9 @@ async fn test_delete_single_config_key() {
 
 **Step 1: Refine gRPC Message Definition**
 ```proto
-// deis-wire/proto/supervisor.proto
+// deis-wire/proto/control.proto
 
-message WorkerMessage {
+message NodeMessage {
   oneof message {
     ...
     CommandResponse command_response = 7;
@@ -312,14 +312,14 @@ message CommandResponse {
 ```rust
 // src/api/grpc.rs
 
-async fn supervisor_stream(
+async fn control_stream(
     &self,
-    request: Request<Streaming<WorkerMessage>>,
-) -> Result<Response<Self::SupervisorStreamStream>, Status> {
+    request: Request<Streaming<NodeMessage>>,
+) -> Result<Response<Self::ControlStreamStream>, Status> {
     // ...
 
     while let Some(msg) = stream.message().await? {
-        if let Some(worker_msg::Message::CommandResponse(resp)) = msg.message {
+        if let Some(node_msg::Message::CommandResponse(resp)) = msg.message {
             // Parse command_id
             let command_id = Uuid::parse_str(&resp.command_id)
                 .map_err(|_| Status::invalid_argument("Invalid command ID"))?;
@@ -386,7 +386,7 @@ pub async fn handle_response(
     if let Some(broadcaster) = &self.broadcaster {
         broadcaster.broadcast(BroadcastEvent::CommandCompleted {
             command_id,
-            worker_id: tracker.worker_id.clone(),
+            node_id: tracker.node_id.clone(),
             success: response.success,
             message: response.message.clone(),
             timestamp: Utc::now(),
@@ -395,7 +395,7 @@ pub async fn handle_response(
 
     tracing::info!(
         command_id = %command_id,
-        worker_id = %tracker.worker_id,
+        node_id = %tracker.node_id,
         success = response.success,
         "Command completed"
     );
@@ -458,7 +458,7 @@ impl CommandExecutor {
 
                         tracing::warn!(
                             command_id = %command_id,
-                            worker_id = %tracker.worker_id,
+                            node_id = %tracker.node_id,
                             "Command timeout"
                         );
                     }
@@ -491,11 +491,11 @@ Arc::clone(&command_executor).start_timeout_cleanup();
 async fn test_command_response_handling() {
     // 1. Execute command
     let command_id = executor.execute_command(
-        "worker-1",
-        WorkerCommand::GetStatus,
+        "node-1",
+        NodeCommand::GetStatus,
     ).await?;
 
-    // 2. Mock Worker response
+    // 2. Mock Node response
     let response = CommandResponse {
         success: true,
         message: "Status OK".to_string(),
@@ -513,8 +513,8 @@ async fn test_command_response_handling() {
 async fn test_command_timeout() {
     // 1. Execute command (timeout 1 second)
     let command_id = executor.execute_command_with_timeout(
-        "worker-1",
-        WorkerCommand::GetStatus,
+        "node-1",
+        NodeCommand::GetStatus,
         Duration::from_secs(1),
     ).await?;
 
@@ -540,9 +540,9 @@ async fn test_command_timeout() {
 // src/broadcast/mod.rs
 
 pub enum BroadcastEvent {
-    WorkerConnected { ... },
-    WorkerDisconnected { ... },
-    WorkerStateChanged { ... },
+    NodeConnected { ... },
+    NodeDisconnected { ... },
+    NodeStateChanged { ... },
     HeartbeatReceived { ... },
     ConfigUpdated { ... },
     CommandSent { ... },
@@ -554,18 +554,18 @@ pub enum BroadcastEvent {
 ```rust
 // src/handler.rs
 
-pub async fn handle_register(&self, request: RegisterRequest, session: &Arc<WorkerSession>) -> RegisterResponse {
-    session.set_state(WorkerState::Registered).await;
+pub async fn handle_register(&self, request: RegisterRequest, session: &Arc<NodeSession>) -> RegisterResponse {
+    session.set_state(NodeState::Registered).await;
     self.sessions.add(Arc::clone(session));
 
     // ... Save to database ...
 
     // ✅ Integrated
     if let Some(broadcaster) = &self.broadcaster {
-        let event = BroadcastEvent::WorkerConnected {
-            worker_id: session.worker_id.clone(),
+        let event = BroadcastEvent::NodeConnected {
+            node_id: session.node_id.clone(),
             instance_id: session.instance_id.clone(),
-            worker_type: worker_type_str,
+            node_role: node_role_str,
             host: session.host.clone(),
             ports: session.ports.clone(),
             timestamp: Utc::now(),
@@ -579,18 +579,18 @@ pub async fn handle_register(&self, request: RegisterRequest, session: &Arc<Work
 
 **Step 3: Add More Event Broadcast Points**
 ```rust
-// src/handler.rs - Add Worker disconnection event
+// src/handler.rs - Add Node disconnection event
 
-pub async fn handle_disconnect(&self, session: &Arc<WorkerSession>) {
-    session.set_state(WorkerState::Disconnected).await;
+pub async fn handle_disconnect(&self, session: &Arc<NodeSession>) {
+    session.set_state(NodeState::Disconnected).await;
 
     // Save event to database
     if let Some(db) = &self.database {
         let event = Event {
-            event_type: "WorkerDisconnected".to_string(),
-            worker_id: Some(session.worker_id.clone()),
+            event_type: "NodeDisconnected".to_string(),
+            node_id: Some(session.node_id.clone()),
             severity: EventSeverity::Warning,
-            message: format!("Worker {} disconnected", session.instance_id),
+            message: format!("Node {} disconnected", session.instance_id),
             metadata: None,
         };
         let _ = db.save_event(&event).await;
@@ -598,8 +598,8 @@ pub async fn handle_disconnect(&self, session: &Arc<WorkerSession>) {
 
     // Broadcast disconnection event
     if let Some(broadcaster) = &self.broadcaster {
-        broadcaster.broadcast(BroadcastEvent::WorkerDisconnected {
-            worker_id: session.worker_id.clone(),
+        broadcaster.broadcast(BroadcastEvent::NodeDisconnected {
+            node_id: session.node_id.clone(),
             instance_id: session.instance_id.clone(),
             timestamp: Utc::now(),
         });
@@ -610,13 +610,13 @@ pub async fn handle_disconnect(&self, session: &Arc<WorkerSession>) {
 ```rust
 // src/config_manager/mod.rs - Config update event
 
-pub async fn update_config(&self, worker_id: &str, key: &str, value: JsonValue) -> Result<()> {
+pub async fn update_config(&self, node_id: &str, key: &str, value: JsonValue) -> Result<()> {
     // ... Save and update logic ...
 
     // Broadcast config update event
     if let Some(broadcaster) = &self.broadcaster {
         broadcaster.broadcast(BroadcastEvent::ConfigUpdated {
-            worker_id: worker_id.to_string(),
+            node_id: node_id.to_string(),
             config_key: key.to_string(),
             timestamp: Utc::now(),
         });
@@ -642,11 +642,11 @@ export function useWebSocket() {
 
       // Update state based on event type
       switch (broadcastEvent.type) {
-        case 'WorkerConnected':
-          // Refresh Worker list
+        case 'NodeConnected':
+          // Refresh Node list
           break;
         case 'HeartbeatReceived':
-          // Update Worker status
+          // Update Node status
           break;
       }
     };
@@ -678,7 +678,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
     pub task_id: String,
-    pub worker_id: String,
+    pub node_id: String,
     pub cron_expr: String,
     pub command_type: String,
     pub command_data: Option<String>,
@@ -699,7 +699,7 @@ async fn create_task(
 ) -> Result<Json<ApiResponse>, ApiError> {
     let task = CronTask {
         task_id: req.task_id,
-        worker_id: req.worker_id,
+        node_id: req.node_id,
         cron_expr: req.cron_expr,
         command_type: req.command_type,
         command_data: req.command_data,
@@ -764,7 +764,7 @@ pub async fn auth_middleware<B>(
     req: Request<B>,
     next: Next<B>,
 ) -> Result<Response, StatusCode> {
-    let config = req.extensions().get::<Arc<SupervisorConfig>>()
+    let config = req.extensions().get::<Arc<ControlConfig>>()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Paths to skip authentication
@@ -802,10 +802,10 @@ use axum::middleware::from_fn_with_state;
 
 pub fn build_api_router(
     // ...
-    api_config: Arc<SupervisorConfig>,
+    api_config: Arc<ControlConfig>,
 ) -> ApiService {
     let router = Router::new()
-        .merge(workers_routes(...))
+        .merge(nodes_routes(...))
         .merge(configs_routes(...))
         // ...
         .layer(from_fn_with_state(api_config.clone(), middleware::auth_middleware));
@@ -873,18 +873,18 @@ rt.block_on(async {
 // src/handler.rs
 
 tracing::info!(
-    target: "worker.register",
-    worker_id = %session.worker_id,
+    target: "node.register",
+    node_id = %session.node_id,
     instance_id = %session.instance_id,
-    worker_type = %worker_type_str,
+    node_role = %node_role_str,
     host = %session.host,
     ports = ?session.ports,
-    "Worker registered"
+    "Node registered"
 );
 
 tracing::info!(
-    target: "worker.heartbeat",
-    worker_id = %session.worker_id,
+    target: "node.heartbeat",
+    node_id = %session.node_id,
     power_reserve = request.power_reserve,
     latency_ms = latency_ms,
     "Heartbeat received"
@@ -898,7 +898,7 @@ tracing::info!(
 #### 4.1 Dashboard Page
 
 **Features**:
-- Total Workers, online count, offline count
+- Total Nodes, online count, offline count
 - Latest 5 events
 - Real-time heartbeat status chart
 
@@ -906,12 +906,12 @@ tracing::info!(
 
 ---
 
-#### 4.2 Workers List Page
+#### 4.2 Nodes List Page
 
 **Features**:
-- Worker list (table format)
+- Node list (table format)
 - Filtering, searching
-- Single Worker detail page
+- Single Node detail page
 
 ---
 
@@ -933,8 +933,8 @@ tracing::info!(
 |------|--------|---------|
 | API response time | P99 < 100ms | wrk benchmark |
 | Config update latency | < 200ms | Integration test |
-| Memory usage | < 200MB (1000 Workers) | Monitoring |
-| Concurrent connections | Support 1000+ Workers | Stress test |
+| Memory usage | < 200MB (1000 Nodes) | Monitoring |
+| Concurrent connections | Support 1000+ Nodes | Stress test |
 
 ---
 
@@ -959,7 +959,7 @@ tracing::info!(
 
 **Future Planning**:
 1. Implement LB-specific management features (Upstream health monitor aggregation, dynamic routing management, etc.)
-2. Add advanced orchestration capabilities (Worker grouping, traffic allocation strategies, A/B testing)
+2. Add advanced orchestration capabilities (Node grouping, traffic allocation strategies, A/B testing)
 3. Refine Web UI (Charts, real-time monitoring, config editor)
 
 ---

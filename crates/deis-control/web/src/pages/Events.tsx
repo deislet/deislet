@@ -74,9 +74,9 @@ export function Events() {
                           {new Date(event.timestamp).toLocaleString()}
                         </p>
                       </div>
-                      {event.worker_id && (
+                      {event.node_id && (
                         <p className="text-xs text-muted-foreground">
-                          Worker: <span className="font-mono">{event.worker_id}</span>
+                          Node: <span className="font-mono">{event.node_id}</span>
                         </p>
                       )}
                       {event.metadata && Object.keys(event.metadata).length > 0 && (

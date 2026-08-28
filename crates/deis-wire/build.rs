@@ -3,10 +3,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .compile_protos(
-            &["proto/supervisor.proto"],
+            &["proto/control.proto"],
             &["proto"],
         )?;
     
-    println!("cargo:rerun-if-changed=proto/supervisor.proto");
+    println!("cargo:rerun-if-changed=proto/control.proto");
     Ok(())
 }

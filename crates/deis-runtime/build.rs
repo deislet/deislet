@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["proto/logging.proto"], &["proto"])?;
 
-    // Compiling management proto (server - receives supervisor control)
+    // Compiling management proto (server - receives control control)
     tonic_build::configure()
         .build_server(true)
         .build_client(false)

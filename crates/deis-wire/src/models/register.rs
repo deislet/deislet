@@ -1,22 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-use crate::WorkerInfo;
+use crate::NodeInfo;
 
 /// Register request (simplified - authentication happens at connection level)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
     /// (Associated) Instance Id  
     pub id: String,
-    /// Worker Info
-    pub info: WorkerInfo,
+    /// Node Info
+    pub info: NodeInfo,
 }
 
 impl RegisterRequest {
     /// Create new register request (no authentication data needed)
-    pub fn new(id: String, worker_info: WorkerInfo, _psk: &[u8]) -> Self {
+    pub fn new(id: String, node_info: NodeInfo, _psk: &[u8]) -> Self {
         Self {
             id,
-            info: worker_info,
+            info: node_info,
         }
     }
 }

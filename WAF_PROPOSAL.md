@@ -15,7 +15,7 @@
 - 路径遍历和命令注入检测
 - 限流和 IP 黑白名单
 - 高性能（<10ms 延迟增加）
-- 配置热重载（通过 Supervisor）
+- 配置热重载（通过 Control）
 - Prometheus 指标集成
 
 ---
@@ -139,7 +139,7 @@ pub trait Plugin: Sync + Send {
 1. 采用 **pingap 的插件系统架构**（高扩展性）
 2. 移植 **pingora-waf 的检测规则**（完整的 WAF 能力）
 3. 使用 **Proxy 现有的配置系统**（TOML + ArcSwap）
-4. 通过 **Supervisor 管理 WAF 配置**（热更新）
+4. 通过 **Control 管理 WAF 配置**（热更新）
 
 **架构设计**:
 
@@ -147,7 +147,7 @@ pub trait Plugin: Sync + Send {
 ┌─────────────────────────────────────────────────────────────┐
 │                        Proxy LB                             │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐    │
-│  │   Pingora   │  │  Config      │  │  Supervisor     │    │
+│  │   Pingora   │  │  Config      │  │  Control     │    │
 │  │   Proxy     │◄─┤  Manager     │◄─┤  Client         │    │
 │  │             │  │  (ArcSwap)   │  │  (gRPC)         │    │
 │  └──────┬──────┘  └──────────────┘  └─────────────────┘    │
@@ -189,7 +189,7 @@ pub trait Plugin: Sync + Send {
 - **插件系统**: 参考 pingap 的 Plugin Trait + PluginFactory
 - **检测规则**: 移植 pingora-waf 的 SecurityRule
 - **配置管理**: 扩展 Proxy 的 TOML 配置
-- **热更新**: 利用 Proxy 的 ArcSwap + Supervisor 通道
+- **热更新**: 利用 Proxy 的 ArcSwap + Control 通道
 - **并发**: DashMap（插件注册）+ Arc（共享检测器）
 
 ---
@@ -202,7 +202,7 @@ pub trait Plugin: Sync + Send {
 1. Fork pingora-waf 并降级到 Pingora 0.5
 2. 适配配置系统（YAML → TOML）
 3. 集成到 Proxy 的 ProxyHttp 实现
-4. 通过 Supervisor 管理配置
+4. 通过 Control 管理配置
 
 **优势**:
 - ✅ 实施快速（2-3 周）
@@ -648,14 +648,14 @@ pub struct ProxyConfig {
 }
 ```
 
-### 3.5 Supervisor 集成
+### 3.5 Control 集成
 
 ```rust
-// src/supervisor/client.rs
+// src/control/client.rs
 
-// 新增 Supervisor 命令
+// 新增 Control 命令
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SupervisorCommand {
+pub enum ControlCommand {
     // 现有命令...
     UpdateWafConfig(WafConfig),
     ReloadWafRules,
@@ -663,7 +663,7 @@ pub enum SupervisorCommand {
     DisableWafPlugin { plugin: String },
 }
 
-impl ProxySupervisorClient {
+impl ProxyControlClient {
     // 处理 WAF 配置更新
     async fn handle_waf_update(&mut self, config: WafConfig) -> Result<()> {
         info!("Applying WAF configuration update");
@@ -785,17 +785,17 @@ impl WafMetrics {
 - Grafana dashboard JSON
 - 日志查询示例
 
-### Phase 5: Supervisor 集成（1-2 周）
+### Phase 5: Control 集成（1-2 周）
 
 **目标**: 支持动态配置管理
 
-- [ ] Supervisor 协议扩展（WAF 命令）
+- [ ] Control 协议扩展（WAF 命令）
 - [ ] 配置热更新（ArcSwap）
 - [ ] Control Web UI 集成（WAF 管理页面）
 - [ ] 规则验证和测试
 
 **交付物**:
-- Supervisor 命令支持
+- Control 命令支持
 - Web UI WAF 配置页面
 - 配置验证 API
 
@@ -942,7 +942,7 @@ impl WafMetrics {
 
 ### 8.3 可用性
 
-- ✅ 配置热更新（通过 Supervisor）
+- ✅ 配置热更新（通过 Control）
 - ✅ 两种模式（block/log）
 - ✅ Web UI 管理界面
 - ✅ Prometheus 指标

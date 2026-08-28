@@ -161,7 +161,7 @@ npm test
 
 **Example**:
 ```bash
-git commit -m "feat(api): add worker health check endpoint"
+git commit -m "feat(api): add node health check endpoint"
 git commit -m "fix(session): resolve memory leak in session cleanup"
 git commit -m "docs: update deployment guide for Docker"
 ```
@@ -181,14 +181,14 @@ mod tests {
 
     #[test]
     fn test_session_creation() {
-        let info = WorkerInfo {
-            worker_type: "test".to_string(),
+        let info = NodeInfo {
+            node_role: "test".to_string(),
             listen_host: "localhost".to_string(),
             listen_port: Some(vec![8080]),
         };
 
-        let session = WorkerSession::new("worker-1".to_string(), info);
-        assert_eq!(session.worker_id, "worker-1");
+        let session = NodeSession::new("node-1".to_string(), info);
+        assert_eq!(session.node_id, "node-1");
     }
 
     #[tokio::test]
@@ -221,13 +221,13 @@ use std::sync::Arc;
 #[tokio::test]
 async fn test_full_workflow() {
     // 1. Create test environment
-    let config = SupervisorConfig::default();
+    let config = ControlConfig::default();
     let db = Arc::new(Database::init(":memory:").await.unwrap());
 
     // 2. Start services
     // ...
 
-    // 3. Mock Worker connection
+    // 3. Mock Node connection
     // ...
 
     // 4. Verify behavior
@@ -239,11 +239,11 @@ async fn test_full_workflow() {
 
 ```rust
 // tests/common/mod.rs
-pub fn create_test_config() -> SupervisorConfig {
-    SupervisorConfig {
+pub fn create_test_config() -> ControlConfig {
+    ControlConfig {
         bind_addr: "127.0.0.1".to_string(),
         port: 18080,
-        worker_preshared_keys: vec!["test-key".to_string()],
+        node_preshared_keys: vec!["test-key".to_string()],
         ..Default::default()
     }
 }
@@ -331,7 +331,7 @@ cargo doc --open
 
 **Steps**:
 
-1. Define data structure (`src/api/workers.rs`):
+1. Define data structure (`src/api/nodes.rs`):
 ```rust
 #[derive(Serialize, Deserialize)]
 pub struct NewFeatureRequest {
@@ -362,7 +362,7 @@ pub async fn handle_new_feature(
 
 3. Register route (`src/api/mod.rs`):
 ```rust
-.route("/api/newfeature", post(workers::handle_new_feature))
+.route("/api/newfeature", post(nodes::handle_new_feature))
 ```
 
 4. Write tests:
@@ -470,9 +470,9 @@ Ok(Json(Response{data}))
 
 ```typescript
 // ✅ Good
-export async function fetchWorkers(): Promise<Worker[]> {
-  const response = await api.getWorkers()
-  return response.workers
+export async function fetchNodes(): Promise<Node[]> {
+  const response = await api.getNodes()
+  return response.nodes
 }
 
 // Component naming: PascalCase

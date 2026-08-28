@@ -21,6 +21,6 @@ pub enum ConfigError {
     #[error("Database error: {0}")]
     DatabaseError(#[from] crate::config::manager::database::DatabaseError),
 
-    #[error("Supervisor error: {0}")]
-    SupervisorError(String),
+    #[error("Control error: {0}")]
+    ControlError(String),
 }

@@ -120,10 +120,10 @@ impl Message for HeartbeatMessage {
 
 ## Extended Message Types
 
-### Supervisor System
+### Control System
 
 ```rust
-pub mod supervisor {
+pub mod control {
     use super::*;
     
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,13 +135,13 @@ pub mod supervisor {
     }
     
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct SupervisorMessage {
+    pub struct ControlMessage {
         pub operation_data: BatchOperationData,
         pub message_id: Option<Uuid>,
     }
     
-    impl Message for SupervisorMessage {
-        const MESSAGE_TYPE: &'static str = "supervisor_operation";
+    impl Message for ControlMessage {
+        const MESSAGE_TYPE: &'static str = "control_operation";
         type Data = BatchOperationData;
         // ... implementation details
     }
@@ -214,19 +214,19 @@ use deis-wire::models::messages::{MessageBuilder, WireMessage};
 use deis-wire::models::{AuthData, RegisterRequest, HeartbeatRequest};
 
 // Create authentication message
-let auth_data = AuthData::new("worker_001".to_string(), b"secret_key")?;
+let auth_data = AuthData::new("node_001".to_string(), b"secret_key")?;
 let auth_message = MessageBuilder::auth(auth_data);
 
 // Create registration message
 let register_data = RegisterRequest {
-    id: "worker_001".to_string(),
-    info: worker_info,
+    id: "node_001".to_string(),
+    info: node_info,
 };
 let register_message = MessageBuilder::register(register_data);
 
 // Create heartbeat message
 let heartbeat_data = HeartbeatRequest {
-    id: "worker_001".to_string(),
+    id: "node_001".to_string(),
     power_reserve: 85,
 };
 let heartbeat_message = MessageBuilder::heartbeat(heartbeat_data);
@@ -237,10 +237,10 @@ let heartbeat_message = MessageBuilder::heartbeat(heartbeat_data);
 ```rust
 use serde_json::json;
 
-// Supervisor batch operation
-let supervisor_message = MessageBuilder::supervisor_operation(
+// Control batch operation
+let control_message = MessageBuilder::control_operation(
     "batch_deploy".to_string(),
-    vec!["worker1".to_string(), "worker2".to_string()],
+    vec!["node1".to_string(), "node2".to_string()],
     json!({
         "image": "myapp:v1.2.3",
         "replicas": 3,
@@ -283,7 +283,7 @@ use uuid::Uuid;
 
 // Create request
 let request_id = Uuid::new_v4();
-let auth_data = AuthData::new("worker_001".to_string(), b"secret_key")?;
+let auth_data = AuthData::new("node_001".to_string(), b"secret_key")?;
 let auth_msg = AuthMessage::with_id(auth_data, request_id);
 let request = WireMessage::new(auth_msg);
 
@@ -365,7 +365,7 @@ impl Message for MonitoringMessage {
 
 - Use clear, descriptive names
 - Follow `snake_case` naming conventions
-- Include system prefixes (e.g., `supervisor_`, `deis_runtime_`, `deis_proxy_`)
+- Include system prefixes (e.g., `control_`, `deis_runtime_`, `deis_proxy_`)
 
 ### 2. Data Structure Design
 

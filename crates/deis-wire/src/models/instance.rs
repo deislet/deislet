@@ -22,15 +22,15 @@ pub mod instance_fsm {
 // Re-export for easy access
 pub use instance_fsm::State as InstanceStatus;
 
-use crate::WorkerInfo;
+use crate::NodeInfo;
 
 /// Instance detailed information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceDetails {
     /// Instance ID
     pub id: String,
-    /// Worker Info
-    pub info: WorkerInfo,
+    /// Node Info
+    pub info: NodeInfo,
     /// Current status
     pub status: InstanceStatus,
     /// Last heartbeat time

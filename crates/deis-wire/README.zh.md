@@ -4,14 +4,14 @@
 [![Documentation](https://docs.rs/deis-wire/badge.svg)](https://docs.rs/deis-wire)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Wire 是一个用于 Control supervisor 和 Worker 服务器（Runtime/Proxy）之间基于 WebSocket 通信的 Rust SDK。它提供安全、实时的双向通信，具有**可扩展消息系统**、认证、注册、心跳监控和命令执行功能。
+Wire 是一个用于 Control control 和 Node 服务器（Runtime/Proxy）之间基于 WebSocket 通信的 Rust SDK。它提供安全、实时的双向通信，具有**可扩展消息系统**、认证、注册、心跳监控和命令执行功能。
 
 ## 特性
 
 - 🚀 **WebSocket 通信**: 通过 WebSocket 进行实时双向通信
 - 🔐 **安全认证**: 基于连接时 PSK 认证和 HMAC-SHA256 签名
 - 💓 **心跳监控**: 自动心跳发送和连接监控
-- 📡 **命令处理**: 来自 supervisor 的命令处理
+- 📡 **命令处理**: 来自 control 的命令处理
 - 🎯 **类型安全**: 强类型可扩展消息系统，具有编译时验证
 - ⚡ **异步支持**: 基于 Tokio 的完全异步 API
 - 🔧 **可扩展**: 支持自定义消息类型和扩展
@@ -22,16 +22,16 @@ Wire 基于**统一消息系统**构建，允许类型安全、可扩展的通�
 
 ### 核心消息类型
 
-- **AuthMessage**: 与 supervisor 的认证
-- **RegisterMessage**: Worker 注册
+- **AuthMessage**: 与 control 的认证
+- **RegisterMessage**: Node 注册
 - **HeartbeatMessage**: 定期健康检查
 - **CommandMessage**: 命令执行请求
 - **CommandResponseMessage**: 命令执行结果
-- **StatusUpdateMessage**: Worker 状态更新
+- **StatusUpdateMessage**: Node 状态更新
 
 ### 扩展消息类型
 
-- **SupervisorMessage**: 批量操作和管理
+- **ControlMessage**: 批量操作和管理
 - **RuntimeMessage**: 容器部署和编排
 - **ProxyMessage**: 数据管道管理
 
@@ -98,34 +98,34 @@ deis-wire = "0.1.0"
 ### 基本使用
 
 ```rust
-use deis-wire::{WireClient, SupervisorConfig, WorkerInfo, WorkerType};
+use deis-wire::{WireClient, ControlConfig, NodeInfo, NodeRole};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 配置 supervisor 连接信息
-    let config = SupervisorConfig::new(
-        "worker-001".to_string(),
+    // 配置 control 连接信息
+    let config = ControlConfig::new(
+        "node-001".to_string(),
         "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
         "ws://localhost:8080".to_string(),
     );
     
-    // 配置 worker 信息
-    let worker_info = WorkerInfo::new(
-        WorkerType::Runtime("1.0.0".to_string()),
+    // 配置 node 信息
+    let node_info = NodeInfo::new(
+        NodeRole::Runtime("1.0.0".to_string()),
         "127.0.0.1".to_string(),
         vec![3000],
     );
     
     // 创建客户端
-    let mut client = WireClient::new(config, worker_info);
+    let mut client = WireClient::new(config, node_info);
     
     // 建立连接
     client.connect().await?;
     
-    // 与 supervisor 认证
+    // 与 control 认证
     client.authenticate().await?;
     
-    // 注册 worker
+    // 注册 node
     client.register().await?;
     
     // 发送心跳
@@ -145,19 +145,19 @@ use deis-wire::models::{AuthData, HeartbeatRequest, RegisterRequest};
 use deis-wire::models::messages::{MessageBuilder, WireMessage};
 
 // 创建认证消息
-let auth_data = AuthData::new("worker-001".to_string(), b"secret_key")?;
+let auth_data = AuthData::new("node-001".to_string(), b"secret_key")?;
 let auth_message = MessageBuilder::auth(auth_data);
 
 // 创建注册消息
 let register_data = RegisterRequest {
-    id: "worker-001".to_string(),
-    info: worker_info,
+    id: "node-001".to_string(),
+    info: node_info,
 };
 let register_message = MessageBuilder::register(register_data);
 
 // 创建心跳消息
 let heartbeat_data = HeartbeatRequest {
-    id: "worker-001".to_string(),
+    id: "node-001".to_string(),
     power_reserve: 85,
 };
 let heartbeat_message = MessageBuilder::heartbeat(heartbeat_data);
@@ -169,10 +169,10 @@ let heartbeat_message = MessageBuilder::heartbeat(heartbeat_data);
 use deis-wire::models::messages::MessageBuilder;
 use serde_json::json;
 
-// Supervisor 批量操作
-let supervisor_message = MessageBuilder::supervisor_operation(
+// Control 批量操作
+let control_message = MessageBuilder::control_operation(
     "batch_deploy".to_string(),
-    vec!["worker-001".to_string(), "worker-002".to_string()],
+    vec!["node-001".to_string(), "node-002".to_string()],
     json!({
         "image": "myapp:v1.2.3",
         "replicas": 3
@@ -201,10 +201,10 @@ let deis_proxy_message = MessageBuilder::proxy_pipeline(
 
 ### 主要类型
 
-- `WireClient`: 与 supervisor 通信的主客户端
-- `SupervisorConfig`: Supervisor 连接配置
-- `WorkerInfo`: Worker 实例信息
-- `WorkerType`: Worker 类型（Runtime 或 Proxy）
+- `WireClient`: 与 control 通信的主客户端
+- `ControlConfig`: Control 连接配置
+- `NodeInfo`: Node 实例信息
+- `NodeRole`: Node 类型（Runtime 或 Proxy）
 - `Message`: 所有消息类型的 trait
 - `WireMessage<M>`: 通用消息包装器
 - `MessageBuilder`: 便捷的消息创建
@@ -212,19 +212,19 @@ let deis_proxy_message = MessageBuilder::proxy_pipeline(
 ### 主要方法
 
 - `connect()`: 建立 WebSocket 连接
-- `authenticate()`: 与 supervisor 认证
-- `register()`: 向 supervisor 注册 worker
+- `authenticate()`: 与 control 认证
+- `register()`: 向 control 注册 node
 - `send_heartbeat()`: 发送心跳消息
 - `run()`: 启动主客户端循环
-- `disconnect()`: 断开与 supervisor 的连接
+- `disconnect()`: 断开与 control 的连接
 
 ### 配置
 
-`SupervisorConfig` 支持以下配置选项：
+`ControlConfig` 支持以下配置选项：
 
-- `associated_id`: Worker 实例 ID
+- `associated_id`: Node 实例 ID
 - `secret`: 64 字符的十六进制 PSK 密钥
-- `addr`: Supervisor WebSocket 地址 (ws:// 或 wss://)
+- `addr`: Control WebSocket 地址 (ws:// 或 wss://)
 
 ### 消息系统
 

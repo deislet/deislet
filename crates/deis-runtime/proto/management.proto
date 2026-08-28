@@ -2,24 +2,24 @@ syntax = "proto3";
 
 package deis.management;
 
-// Runtime management service - receives control commands from the supervisor
+// Runtime management service - receives control commands from the control
 service RuntimeManagement {
-    // Supervisor pushes configuration
+    // Control pushes configuration
     rpc PushConfig(PushConfigRequest) returns (PushConfigResponse);
 
-    // Supervisor deploys an app
+    // Control deploys an app
     rpc DeployApp(DeployAppRequest) returns (DeployAppResponse);
 
-    // Supervisor unloads an app
+    // Control unloads an app
     rpc UnloadApp(UnloadAppRequest) returns (UnloadAppResponse);
 
-    // Supervisor updates an app
+    // Control updates an app
     rpc UpdateApp(UpdateAppRequest) returns (UpdateAppResponse);
 
-    // Supervisor queries status
+    // Control queries status
     rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 
-    // Supervisor executes a command
+    // Control executes a command
     rpc ExecuteCommand(ExecuteCommandRequest) returns (ExecuteCommandResponse);
 
     // Health check
@@ -170,7 +170,7 @@ message GetStatusRequest {
 // Get status response
 message GetStatusResponse {
     // Basic worker info
-    WorkerInfo worker_info = 1;
+    NodeInfo node_info = 1;
 
     // Application list
     repeated AppStatus apps = 2;
@@ -197,8 +197,8 @@ message OpMetricsSummary {
 }
 
 // Worker info
-message WorkerInfo {
-    string worker_id = 1;
+message NodeInfo {
+    string node_id = 1;
     string version = 2;
     int64 uptime_seconds = 3;
     string hostname = 4;

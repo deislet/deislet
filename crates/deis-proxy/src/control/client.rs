@@ -1,4 +1,4 @@
-//! Supervisor client: registers this instance with deis-control, keeps the
+//! Control client: registers this instance with deis-control, keeps the
 //! heartbeat going, and applies the commands and configuration it pushes.
 //!
 //! Commands arrive as `CommandRequest { command, args_json }` where `command`
@@ -11,16 +11,16 @@
 //! - `apps`: the complete application list; replaces everything.
 //! - `app.<id>`: one application, inserted or updated.
 //! - `system`: a system configuration overlay (traffic policy only, see
-//!   [`SupervisorSystemConfig`]).
+//!   [`ControlSystemConfig`]).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use deis_wire::pb::supervisor_message::Payload;
+use deis_wire::pb::control_message::Payload;
 use deis_wire::pb::{CommandRequest, CommandResponse};
 use deis_wire::{
-    SdkResult, SupervisorConfig, WorkerInfo, WorkerType, WireClient, WireError,
+    SdkResult, ControlConfig, NodeInfo, NodeRole, WireClient, WireError,
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
@@ -28,11 +28,11 @@ use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{
-    AppConfig, AppConfigEntry, ConfigError, ConfigManager, SupervisorAppsConfig,
-    SupervisorSystemConfig, Validatable,
+    AppConfig, AppConfigEntry, ConfigError, ConfigManager, ControlAppsConfig,
+    ControlSystemConfig, Validatable,
 };
 use crate::restart::ProcessCommand;
-use crate::supervisor::state::{ProxyStateManager, State};
+use crate::control::state::{ProxyStateManager, State};
 
 /// `ConfigUpdate` key carrying the complete application list.
 pub const CONFIG_KEY_APPS: &str = "apps";
@@ -58,10 +58,10 @@ impl Default for Backoff {
     }
 }
 
-pub struct ProxySupervisorClient {
+pub struct ProxyControlClient {
     deis_wire_client: WireClient,
     state_manager: Arc<ProxyStateManager>,
-    config: SupervisorConfig,
+    config: ControlConfig,
     backoff: Backoff,
     /// Where commands that act on the whole process are sent.
     process_tx: Option<broadcast::Sender<ProcessCommand>>,
@@ -75,10 +75,10 @@ enum Event {
     Received(Result<Option<Payload>, WireError>),
 }
 
-impl ProxySupervisorClient {
+impl ProxyControlClient {
     /// Create a client announcing the default HTTP/HTTPS ports. Use
     /// [`with_listen_ports`](Self::with_listen_ports) to announce the real ones.
-    pub fn new(config: SupervisorConfig) -> SdkResult<Self> {
+    pub fn new(config: ControlConfig) -> SdkResult<Self> {
         config.validate().map_err(WireError::ConfigurationError)?;
         let state_manager = Arc::new(ProxyStateManager::new(config.associated_id.clone()));
         let deis_wire_client = Self::build_deis_wire_client(&config, vec![80, 443]);
@@ -93,13 +93,13 @@ impl ProxySupervisorClient {
         })
     }
 
-    fn build_deis_wire_client(config: &SupervisorConfig, ports: Vec<u16>) -> WireClient {
-        let worker_info = WorkerInfo::new(
-            WorkerType::Proxy(env!("CARGO_PKG_VERSION").to_string()),
+    fn build_deis_wire_client(config: &ControlConfig, ports: Vec<u16>) -> WireClient {
+        let node_info = NodeInfo::new(
+            NodeRole::Proxy(env!("CARGO_PKG_VERSION").to_string()),
             "0.0.0.0".to_string(),
             ports,
         );
-        WireClient::new(config.clone(), worker_info)
+        WireClient::new(config.clone(), node_info)
     }
 
     /// Announce the ports this instance actually listens on.
@@ -125,7 +125,7 @@ impl ProxySupervisorClient {
         self
     }
 
-    /// Serve until cancelled: connect (retrying until the supervisor
+    /// Serve until cancelled: connect (retrying until the control
     /// answers), handle heartbeats and messages, and reconnect whenever the
     /// connection is lost. Never returns on its own; the caller races it
     /// against the shutdown signal.
@@ -136,7 +136,7 @@ impl ProxySupervisorClient {
                 warn!(
                     instance = %self.config.associated_id,
                     error = %e,
-                    "supervisor connection lost; reconnecting"
+                    "control connection lost; reconnecting"
                 );
             }
         }
@@ -144,11 +144,11 @@ impl ProxySupervisorClient {
 
     /// Connect, authenticate and register, retrying with capped exponential
     /// backoff until it works. Each attempt is bounded by the configured
-    /// request timeout so a supervisor that accepts TCP but never answers
+    /// request timeout so a control that accepts TCP but never answers
     /// cannot park the loop. Failed attempts are logged at WARN until
     /// `retry_count` of them have failed, then at ERROR. A rejected secret or
     /// registration is ERROR from the first attempt because retrying alone
-    /// will not fix it; the loop still keeps going so a fix on the supervisor
+    /// will not fix it; the loop still keeps going so a fix on the control
     /// side takes effect without restarting deis-proxy.
     pub async fn connect_with_backoff(&mut self) {
         let mut delay = self.backoff.first;
@@ -159,13 +159,13 @@ impl ProxySupervisorClient {
                 instance = %self.config.associated_id,
                 addr = %self.config.addr,
                 attempt,
-                "connecting to supervisor"
+                "connecting to control"
             );
             let limit = self.config.request_timeout_duration();
             let result = match timeout(limit, self.connect_and_register()).await {
                 Ok(result) => result,
                 Err(_) => Err(WireError::ConnectionError(format!(
-                    "no answer from the supervisor within {}s",
+                    "no answer from the control within {}s",
                     limit.as_secs()
                 ))),
             };
@@ -174,7 +174,7 @@ impl ProxySupervisorClient {
                     info!(
                         instance = %self.config.associated_id,
                         attempt,
-                        "registered with supervisor"
+                        "registered with control"
                     );
                     return;
                 }
@@ -193,7 +193,7 @@ impl ProxySupervisorClient {
                     attempt,
                     error = %error,
                     next_attempt_in = ?delay,
-                    "supervisor connection attempt failed"
+                    "control connection attempt failed"
                 );
             } else {
                 warn!(
@@ -201,7 +201,7 @@ impl ProxySupervisorClient {
                     attempt,
                     error = %error,
                     next_attempt_in = ?delay,
-                    "supervisor connection attempt failed"
+                    "control connection attempt failed"
                 );
             }
             tokio::time::sleep(delay).await;
@@ -238,7 +238,7 @@ impl ProxySupervisorClient {
                     debug!(instance = %self.config.associated_id, "heartbeat sent");
                 }
                 Event::Received(Ok(Some(payload))) => self.handle_payload(payload).await,
-                Event::Received(Ok(None)) => debug!("empty payload from supervisor ignored"),
+                Event::Received(Ok(None)) => debug!("empty payload from control ignored"),
                 Event::Received(Err(e)) => return Err(e),
             }
         }
@@ -271,7 +271,7 @@ impl ProxySupervisorClient {
             Payload::AuthResponse(_) | Payload::RegisterResponse(_) => {
                 debug!("late handshake response ignored")
             }
-            other => debug!(?other, "unexpected payload from supervisor ignored"),
+            other => debug!(?other, "unexpected payload from control ignored"),
         }
     }
 
@@ -349,7 +349,7 @@ impl ProxySupervisorClient {
             .unwrap_or_else(|_| Utc::now());
 
         let outcome = if key == CONFIG_KEY_APPS {
-            match SupervisorAppsConfig::from_json(value_json) {
+            match ControlAppsConfig::from_json(value_json) {
                 Ok(apps) => {
                     config_manager
                         .replace_app_configs(apps.get_apps(), version)
@@ -362,7 +362,7 @@ impl ProxySupervisorClient {
                 .map_err(ConfigError::from)
                 .and_then(|app| app.validate().map(|_| app))
             {
-                Ok(app) if app.id != app_id => Err(ConfigError::SupervisorError(format!(
+                Ok(app) if app.id != app_id => Err(ConfigError::ControlError(format!(
                     "app id {} in the payload does not match key {key}",
                     app.id
                 ))),
@@ -380,10 +380,10 @@ impl ProxySupervisorClient {
                 Err(e) => Err(e),
             }
         } else if key == CONFIG_KEY_SYSTEM {
-            SupervisorSystemConfig::from_json(value_json)
+            ControlSystemConfig::from_json(value_json)
                 .and_then(|overlay| config_manager.apply_system_overlay(overlay))
         } else {
-            Err(ConfigError::SupervisorError(format!(
+            Err(ConfigError::ControlError(format!(
                 "unknown configuration key: {key}"
             )))
         };
@@ -403,7 +403,7 @@ impl ProxySupervisorClient {
 
     /// Tear the connection down on shutdown. The lifecycle transitions only
     /// apply to an instance that actually registered; one that is shutting
-    /// down while still waiting for the supervisor has nothing to unwind.
+    /// down while still waiting for the control has nothing to unwind.
     pub async fn disconnect(&mut self) -> SdkResult<()> {
         if self.state_manager.is_active().await {
             let _ = self.state_manager.handle_shutdown().await;
@@ -413,11 +413,11 @@ impl ProxySupervisorClient {
         }
         if self.deis_wire_client.is_connected() {
             self.deis_wire_client.disconnect().await?;
-            info!(instance = %self.config.associated_id, "disconnected from supervisor");
+            info!(instance = %self.config.associated_id, "disconnected from control");
         } else {
             info!(
                 instance = %self.config.associated_id,
-                "shutting down before the supervisor connection was established"
+                "shutting down before the control connection was established"
             );
         }
         Ok(())
@@ -436,14 +436,14 @@ impl ProxySupervisorClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervisor::mock::MockSupervisor;
+    use crate::control::mock::MockControl;
 
-    fn test_config() -> SupervisorConfig {
+    fn test_config() -> ControlConfig {
         config_for("http://localhost:8080")
     }
 
-    fn config_for(addr: &str) -> SupervisorConfig {
-        SupervisorConfig {
+    fn config_for(addr: &str) -> ControlConfig {
+        ControlConfig {
             associated_id: "test-worker".to_string(),
             secret: "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
             addr: addr.to_string(),
@@ -461,10 +461,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registers_once_the_supervisor_answers() {
-        let mut supervisor = MockSupervisor::start().await;
-        supervisor.refuse_next(1);
-        let mut client = ProxySupervisorClient::new(config_for(&supervisor.addr))
+    async fn registers_once_the_control_answers() {
+        let mut control = MockControl::start().await;
+        control.refuse_next(1);
+        let mut client = ProxyControlClient::new(config_for(&control.addr))
             .unwrap()
             .with_backoff(fast_backoff());
 
@@ -472,33 +472,33 @@ mod tests {
 
         assert_eq!(client.current_state().await, State::Active);
         assert!(client.is_ready().await);
-        assert_eq!(supervisor.next_registration().await, 2);
-        assert_eq!(supervisor.connections(), 2);
+        assert_eq!(control.next_registration().await, 2);
+        assert_eq!(control.connections(), 2);
     }
 
     #[tokio::test]
     async fn reconnects_after_an_outage_longer_than_five_attempts() {
-        let mut supervisor = MockSupervisor::start().await;
-        let mut client = ProxySupervisorClient::new(config_for(&supervisor.addr))
+        let mut control = MockControl::start().await;
+        let mut client = ProxyControlClient::new(config_for(&control.addr))
             .unwrap()
             .with_backoff(fast_backoff());
         client.connect_with_backoff().await;
-        assert_eq!(supervisor.next_registration().await, 1);
+        assert_eq!(control.next_registration().await, 1);
         let state = Arc::clone(client.state_manager());
 
         // Six refused attempts is more than the five the old policy allowed.
-        supervisor.refuse_next(6);
-        supervisor.cut_connections();
+        control.refuse_next(6);
+        control.cut_connections();
         let running = tokio::spawn(async move { client.run().await });
 
-        assert_eq!(supervisor.next_registration().await, 8);
+        assert_eq!(control.next_registration().await, 8);
         assert_eq!(state.current_state().await, State::Active);
         running.abort();
     }
 
     #[tokio::test]
     async fn disconnect_before_registration_leaves_pending() {
-        let mut client = ProxySupervisorClient::new(test_config()).unwrap();
+        let mut client = ProxyControlClient::new(test_config()).unwrap();
         client.disconnect().await.unwrap();
         assert_eq!(client.current_state().await, State::Pending);
         assert_eq!(client.state_manager().history_count().await, 0);
@@ -514,19 +514,19 @@ mod tests {
 
     #[test]
     fn creates_client() {
-        assert!(ProxySupervisorClient::new(test_config()).is_ok());
+        assert!(ProxyControlClient::new(test_config()).is_ok());
     }
 
     #[test]
     fn rejects_invalid_secret() {
         let mut config = test_config();
         config.secret = "invalid".to_string();
-        assert!(ProxySupervisorClient::new(config).is_err());
+        assert!(ProxyControlClient::new(config).is_err());
     }
 
     #[tokio::test]
     async fn starts_pending() {
-        let client = ProxySupervisorClient::new(test_config()).unwrap();
+        let client = ProxyControlClient::new(test_config()).unwrap();
         assert_eq!(client.current_state().await, State::Pending);
         assert_eq!(client.state_manager().instance_id(), "test-worker");
         assert!(!client.is_ready().await);
@@ -534,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn answers_status() {
-        let client = ProxySupervisorClient::new(test_config()).unwrap();
+        let client = ProxyControlClient::new(test_config()).unwrap();
         let response = client.handle_command_request(&request("get_status")).await;
         assert!(response.success);
         let status: JsonValue = serde_json::from_str(&response.message).unwrap();
@@ -544,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unknown_and_unimplemented_commands() {
-        let client = ProxySupervisorClient::new(test_config()).unwrap();
+        let client = ProxyControlClient::new(test_config()).unwrap();
         let response = client.handle_command_request(&request("get_metrics")).await;
         assert!(!response.success);
         let response = client.handle_command_request(&request("dance")).await;
@@ -554,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_commands_need_a_channel() {
-        let mut client = ProxySupervisorClient::new(test_config()).unwrap();
+        let mut client = ProxyControlClient::new(test_config()).unwrap();
         let response = client.handle_command_request(&request("restart")).await;
         assert!(!response.success);
 

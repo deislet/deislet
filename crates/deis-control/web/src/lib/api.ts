@@ -97,30 +97,30 @@ export const api = {
     }
   },
 
-  // ==================== Workers API ====================
+  // ==================== Nodes API ====================
 
   /**
-   * 获取所有 workers
+   * 获取所有 nodes
    */
-  getWorkers: () => api.request<Worker[]>("/api/workers"),
+  getNodes: () => api.request<NodeSummary[]>("/api/nodes"),
 
   /**
-   * 获取单个 worker 详情
+   * 获取单个 node 详情
    */
-  getWorker: (id: string) => api.request<Worker>(`/api/workers/${id}`),
+  getNode: (id: string) => api.request<NodeSummary>(`/api/nodes/${id}`),
 
   /**
-   * 获取 worker 心跳历史
+   * 获取 node 心跳历史
    */
-  getWorkerHeartbeats: (id: string, limit = 100) =>
-    api.request<Heartbeat[]>(`/api/workers/${id}/heartbeats?limit=${limit}`),
+  getNodeHeartbeats: (id: string, limit = 100) =>
+    api.request<Heartbeat[]>(`/api/nodes/${id}/heartbeats?limit=${limit}`),
 
   // ==================== Configs API ====================
 
   /**
    * 获取所有配置
    */
-  getConfigs: () => api.request<{ [workerId: string]: { [key: string]: any } }>("/api/configs"),
+  getConfigs: () => api.request<{ [nodeId: string]: { [key: string]: any } }>("/api/configs"),
 
   /**
    * 获取配置统计
@@ -128,60 +128,60 @@ export const api = {
   getConfigStats: () => api.request<ConfigStats>("/api/configs/stats"),
 
   /**
-   * 获取 worker 配置
+   * 获取 node 配置
    */
-  getWorkerConfig: (workerId: string) =>
-    api.request<{ [key: string]: any }>(`/api/configs/${workerId}`),
+  getNodeConfig: (nodeId: string) =>
+    api.request<{ [key: string]: any }>(`/api/configs/${nodeId}`),
 
   /**
-   * 更新 worker 配置
+   * 更新 node 配置
    */
-  updateWorkerConfig: (workerId: string, configs: { [key: string]: any }) =>
-    api.request(`/api/configs/${workerId}`, {
+  updateNodeConfig: (nodeId: string, configs: { [key: string]: any }) =>
+    api.request(`/api/configs/${nodeId}`, {
       method: "POST",
       body: JSON.stringify({ configs }),
     }),
 
   /**
-   * 删除 worker 配置
+   * 删除 node 配置
    */
-  deleteWorkerConfig: (workerId: string) =>
-    api.request(`/api/configs/${workerId}`, { method: "DELETE" }),
+  deleteNodeConfig: (nodeId: string) =>
+    api.request(`/api/configs/${nodeId}`, { method: "DELETE" }),
 
   /**
    * 删除单个配置项
    */
-  deleteConfigKey: (workerId: string, key: string) =>
-    api.request(`/api/configs/${workerId}/${key}`, { method: "DELETE" }),
+  deleteConfigKey: (nodeId: string, key: string) =>
+    api.request(`/api/configs/${nodeId}/${key}`, { method: "DELETE" }),
 
   /**
    * 获取配置历史
    */
-  getConfigHistory: (workerId: string, limit = 100) =>
-    api.request<ConfigHistory[]>(`/api/configs/${workerId}/history?limit=${limit}`),
+  getConfigHistory: (nodeId: string, limit = 100) =>
+    api.request<ConfigHistory[]>(`/api/configs/${nodeId}/history?limit=${limit}`),
 
   /**
    * 获取配置键历史
    */
-  getConfigKeyHistory: (workerId: string, key: string, limit = 50) =>
-    api.request<ConfigHistory[]>(`/api/configs/${workerId}/${key}/history?limit=${limit}`),
+  getConfigKeyHistory: (nodeId: string, key: string, limit = 50) =>
+    api.request<ConfigHistory[]>(`/api/configs/${nodeId}/${key}/history?limit=${limit}`),
 
   /**
    * 回滚配置
    */
-  rollbackConfig: (workerId: string, key: string, versionTimestamp: string) =>
-    api.request(`/api/configs/${workerId}/${key}/rollback`, {
+  rollbackConfig: (nodeId: string, key: string, versionTimestamp: string) =>
+    api.request(`/api/configs/${nodeId}/${key}/rollback`, {
       method: "POST",
       body: JSON.stringify({ version_timestamp: versionTimestamp }),
     }),
 
   /**
-   * 推送配置到 worker
+   * 推送配置到 node
    */
-  pushConfig: (workerId: string, key?: string) => {
+  pushConfig: (nodeId: string, key?: string) => {
     const endpoint = key
-      ? `/api/configs/push/${workerId}/${key}`
-      : `/api/configs/push/${workerId}`;
+      ? `/api/configs/push/${nodeId}/${key}`
+      : `/api/configs/push/${nodeId}`;
     return api.request(endpoint, { method: "POST" });
   },
 
@@ -193,10 +193,10 @@ export const api = {
   getCommands: () => api.request<Command[]>("/api/commands"),
 
   /**
-   * 获取 worker 的命令
+   * 获取 node 的命令
    */
-  getWorkerCommands: (workerId: string) =>
-    api.request<Command[]>(`/api/commands/worker/${workerId}`),
+  getNodeCommands: (nodeId: string) =>
+    api.request<Command[]>(`/api/commands/node/${nodeId}`),
 
   /**
    * 获取命令状态
@@ -207,8 +207,8 @@ export const api = {
   /**
    * 执行命令
    */
-  executeCommand: (workerId: string, command: ExecuteCommandRequest) =>
-    api.request<{ command_id: string }>(`/api/commands/execute/${workerId}`, {
+  executeCommand: (nodeId: string, command: ExecuteCommandRequest) =>
+    api.request<{ command_id: string }>(`/api/commands/execute/${nodeId}`, {
       method: "POST",
       body: JSON.stringify(command),
     }),
@@ -226,7 +226,7 @@ export const api = {
    */
   getEvents: (params?: EventsParams) => {
     const query = new URLSearchParams();
-    if (params?.worker_id) query.set("worker_id", params.worker_id);
+    if (params?.node_id) query.set("node_id", params.node_id);
     if (params?.severity) query.set("severity", params.severity);
     if (params?.limit) query.set("limit", params.limit.toString());
     if (params?.offset) query.set("offset", params.offset.toString());
@@ -250,10 +250,10 @@ export const api = {
 
 // ==================== 类型定义 ====================
 
-export interface Worker {
+export interface NodeSummary {
   id: string;
   instance_id: string;
-  worker_type: string;
+  node_role: string;
   version: string;
   host: string;
   ports: number[];
@@ -265,7 +265,7 @@ export interface Worker {
 }
 
 export interface Heartbeat {
-  worker_id: string;
+  node_id: string;
   instance_id: string;
   timestamp: string;
   power_reserve: number;
@@ -273,7 +273,7 @@ export interface Heartbeat {
 }
 
 export interface ConfigStats {
-  worker_count: number;
+  node_count: number;
   total_configs: number;
 }
 
@@ -288,7 +288,7 @@ export interface ConfigHistory {
 
 export interface Command {
   id: string;
-  worker_id: string;
+  node_id: string;
   command_type: string;
   command_data: any;
   status: "Pending" | "Sent" | "Acknowledged" | "Completed" | "Failed" | "Timeout";
@@ -308,7 +308,7 @@ export interface ExecuteCommandRequest {
 
 export interface Event {
   event_type: string;
-  worker_id?: string;
+  node_id?: string;
   severity: "Info" | "Warning" | "Error";
   message: string;
   metadata?: any;
@@ -316,7 +316,7 @@ export interface Event {
 }
 
 export interface EventsParams {
-  worker_id?: string;
+  node_id?: string;
   severity?: string;
   limit?: number;
   offset?: number;
@@ -329,7 +329,7 @@ export interface EventStats {
 }
 
 export interface MetricsSummary {
-  workers: {
+  nodes: {
     total: number;
     active: number;
     connected: number;

@@ -11,16 +11,16 @@
 
 ## 📐 System Architecture Overview
 
-Control is a distributed cluster management supervisor used to manage and monitor multiple worker nodes. Written in Rust, it features high performance, low latency, and high reliability.
+Control is a distributed cluster management control used to manage and monitor multiple node nodes. Written in Rust, it features high performance, low latency, and high reliability.
 
 ### Core Components
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Control Supervisor                      │
+│                        Control Control                      │
 ├───────────────────┬─────────────────┬──────────────────────────┤
 │  gRPC Server      │   HTTP API      │   Web UI + WS            │
-│ (Worker Connections)│ (Management Interface)│ (Console + Events)  │
+│ (Node Connections)│ (Management Interface)│ (Console + Events)  │
 └──────┬────────────┴─────┬───────────┴────┬─────────────────────┘
        │                  │                │
        ▼                  ▼                ▼
@@ -44,7 +44,7 @@ Control is a distributed cluster management supervisor used to manage and monito
                            │
                            ▼
                ┌────────────────────────┐
-               │   Workers (deis-proxy,     │
+               │   Nodes (deis-proxy,     │
                │   deis-runtime, etc.)         │
                └────────────────────────┘
 ```
@@ -55,14 +55,14 @@ Control is a distributed cluster management supervisor used to manage and monito
 
 ### 1. **gRPC Server** (`src/server.rs`)
 
-Responsible for persistent connections and communication with worker nodes,
+Responsible for persistent connections and communication with node nodes,
 over a Tonic bidirectional stream defined by the `deis-wire` SDK.
 
-> WebSocket is *not* used for workers. The `/api/ws` endpoint exists only to push
+> WebSocket is *not* used for nodes. The `/api/ws` endpoint exists only to push
 > events to the browser console; see `src/broadcast/`.
 
 **Responsibilities**:
-- Accept worker gRPC streams
+- Accept node gRPC streams
 - Handle authentication (PSK + HMAC-SHA256)
 - Manage session lifecycle
 - Receive heartbeats and status updates
@@ -70,14 +70,14 @@ over a Tonic bidirectional stream defined by the `deis-wire` SDK.
 
 **Message Flow**:
 ```
-Worker → gRPC stream → Server → Handler → SessionManager/Database
-Worker ← gRPC stream ← Server ← CommandExecutor
+Node → gRPC stream → Server → Handler → SessionManager/Database
+Node ← gRPC stream ← Server ← CommandExecutor
 ```
 
 **Key Types**:
-- `SupervisorServer` - Main server structure
+- `ControlServer` - Main server structure
 - `MessageHandler` - Message handler
-- `WorkerSession` - Worker session
+- `NodeSession` - Node session
 
 ### 2. **HTTP API Server** (`src/api/`)
 
@@ -85,7 +85,7 @@ Provides a RESTful API for administrators and frontend use.
 
 **Submodules**:
 - `mod.rs` - Routes and server startup
-- `workers.rs` - Workers management API
+- `nodes.rs` - Nodes management API
 - `configs.rs` - Configuration management API
 - `commands.rs` - Command execution API
 - `events.rs` - Event query API
@@ -100,19 +100,19 @@ Provides a RESTful API for administrators and frontend use.
 
 ### 3. **Session Management** (`src/session.rs`)
 
-Manages worker connection sessions and status.
+Manages node connection sessions and status.
 
 **Core Structures**:
 ```rust
 pub struct SessionManager {
-    sessions: Arc<DashMap<String, Arc<WorkerSession>>>,
+    sessions: Arc<DashMap<String, Arc<NodeSession>>>,
 }
 
-pub struct WorkerSession {
+pub struct NodeSession {
     pub id: String,
-    pub worker_id: String,
+    pub node_id: String,
     pub instance_id: String,
-    pub state: Arc<RwLock<WorkerState>>,
+    pub state: Arc<RwLock<NodeState>>,
     pub sender: Option<UnboundedSender<String>>,
     // ...
 }
@@ -135,7 +135,7 @@ pub struct ConfigManager {
     versions: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
     // Database persistence
     db: Arc<Database>,
-    // Worker sessions (for pushing)
+    // Node sessions (for pushing)
     sessions: Arc<SessionManager>,
 }
 ```
@@ -144,13 +144,13 @@ pub struct ConfigManager {
 - **Zero-lock reads**: `ArcSwap` allows lock-free reads
 - **Atomic updates**: Uses `store()` to atomically replace the entire configuration tree
 - **Version tracking**: Records a timestamp for each update
-- **Push mechanism**: Actively pushes to workers via WebSocket
+- **Push mechanism**: Actively pushes to nodes via WebSocket
 
 **Workflow**:
 1. Client updates configuration via API
 2. Save to database (transaction)
 3. Atomically update in-memory configuration (ArcSwap)
-4. Push to target worker (asynchronously)
+4. Push to target node (asynchronously)
 
 ### 5. **Command Execution** (`src/command/`)
 
@@ -168,8 +168,8 @@ pub struct CommandExecutor {
 
 pub struct CommandTracker {
     command_id: Uuid,
-    worker_id: String,
-    command: WorkerCommand,
+    node_id: String,
+    command: NodeCommand,
     status: CommandStatus,
     created_at: DateTime<Utc>,
     timeout_at: DateTime<Utc>,
@@ -180,8 +180,8 @@ pub struct CommandTracker {
 **Execution Flow**:
 1. API calls `execute_command()`
 2. Create `CommandTracker` and assign UUID
-3. Send command to worker via WebSocket
-4. Worker executes asynchronously and returns response
+3. Send command to node via WebSocket
+4. Node executes asynchronously and returns response
 5. `handle_response()` updates status
 6. Trigger `oneshot` to notify waiters
 
@@ -201,9 +201,9 @@ pub struct EventBroadcaster {
 }
 
 pub enum BroadcastEvent {
-    WorkerConnected { ... },
-    WorkerDisconnected { ... },
-    WorkerStateChanged { ... },
+    NodeConnected { ... },
+    NodeDisconnected { ... },
+    NodeStateChanged { ... },
     HeartbeatReceived { ... },
     ConfigUpdated { ... },
     CommandSent { ... },
@@ -212,7 +212,7 @@ pub enum BroadcastEvent {
 ```
 
 **Integration Points**:
-- `src/handler.rs` - Worker state changes
+- `src/handler.rs` - Node state changes
 - `src/command/mod.rs` - Command state changes
 - `src/config_manager/mod.rs` - Configuration updates
 
@@ -221,7 +221,7 @@ pub enum BroadcastEvent {
 SQLite database wrapper.
 
 **Table Structure**:
-- `workers` - Worker information
+- `nodes` - Node information
 - `configs` - Configuration key-value pairs
 - `commands` - Command history
 - `events` - Event logs
@@ -257,7 +257,7 @@ pub struct CronScheduler {
 Prometheus-compatible metrics collection and export.
 
 **Metric Types**:
-- **Workers**: total, connected, active, by_type
+- **Nodes**: total, connected, active, by_type
 - **System**: uptime, total_events, total_commands, total_heartbeats
 
 **Export Formats**:
@@ -270,7 +270,7 @@ Prometheus-compatible metrics collection and export.
 
 ### Authentication Mechanisms
 
-**Worker Authentication**:
+**Node Authentication**:
 1. PSK (Pre-Shared Key) configuration
 2. HMAC-SHA256 signature verification
 3. Timestamp-based anti-replay
@@ -295,10 +295,10 @@ Future Plans: **RBAC** (Role-Based Access Control)
 
 ## 🔄 Data Flow
 
-### Worker Registration Flow
+### Node Registration Flow
 
 ```
-Worker                  Supervisor
+Node                  Control
   │                        │
   │──── WebSocket connection ─→│
   │                        │
@@ -319,7 +319,7 @@ Worker                  Supervisor
 ### Configuration Deployment Flow
 
 ```
-Admin/UI              Supervisor              Worker
+Admin/UI              Control              Node
   │                      │                      │
   │── POST /configs ────→│                      │
   │                      │  Save to database    │
@@ -340,7 +340,7 @@ Admin/UI              Supervisor              Worker
 ### Command Execution Flow
 
 ```
-Admin/UI           Supervisor          Worker
+Admin/UI           Control          Node
   │                   │                   │
   │─ POST /commands ─→│                   │
   │                   │  Create Tracker   │
@@ -386,7 +386,7 @@ Admin/UI           Supervisor          Worker
 ┌─────────────────────────────┐
 │        Server               │
 │  ┌──────────────────────┐   │
-│  │  Control Supervisor   │   │
+│  │  Control Control   │   │
 │  │  - WebSocket: 8080   │   │
 │  │  - API + gRPC: 8080         │   │
 │  └──────────────────────┘   │
@@ -399,11 +399,11 @@ Admin/UI           Supervisor          Worker
            │
     ┌──────┴──────┬──────┬──────┐
     │             │      │      │
-  Worker1      Worker2  Worker3  ...
+  Node1      Node2  Node3  ...
 ```
 
 ### Distributed Deployment (Future)
-- Multiple Supervisor clusters
+- Multiple Control clusters
 - Shared database or distributed storage
 - Load balancing
 
@@ -425,9 +425,9 @@ Admin/UI           Supervisor          Worker
 
 ## 📈 Performance Characteristics
 
-- **Concurrent Connections**: Support for 1000+ Workers
+- **Concurrent Connections**: Support for 1000+ Nodes
 - **Heartbeat Latency**: < 10ms (Intranet)
-- **Configuration Push**: < 100ms (Per worker)
+- **Configuration Push**: < 100ms (Per node)
 - **API Response**: < 50ms (Simple queries)
 - **Database Write**: Batch transactions < 10ms
 
@@ -436,7 +436,7 @@ Admin/UI           Supervisor          Worker
 ## 🚀 Future Plans
 
 1. **High Availability**
-   - Supervisor clusters
+   - Control clusters
    - Raft consensus
 
 2. **Observability**
@@ -451,7 +451,7 @@ Admin/UI           Supervisor          Worker
 4. **Feature Extension**
    - Configuration templates
    - Batch commands
-   - Worker grouping
+   - Node grouping
 
 ---
 

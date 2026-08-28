@@ -20,7 +20,7 @@ Options:
   --deis-control-port <port>       Control HTTP/gRPC port (default 8085)
   --deis-runtime-port <port>        Runtime HTTP port (default 8086)
   --deis-proxy-port <port>       Proxy HTTP port (default 8087)
-  --secret <hex>             Supervisor shared secret (64-char hex)
+  --secret <hex>             Control shared secret (64-char hex)
   --demo-dir <path>          Runtime directory (default .demo)
   --log-dir <path>           Log directory (default .demo/logs)
   --help                     Show this help
@@ -192,7 +192,7 @@ bind_addr = "0.0.0.0"
 port = ${DEIS_CONTROL_PORT}
 heartbeat_interval = 30
 heartbeat_timeout = 90
-worker_preshared_keys = ["${SECRET}"]
+node_preshared_keys = ["${SECRET}"]
 deis_runtime_poll_interval = 5
 
 [[deis_runtime_nodes]]
@@ -203,7 +203,7 @@ EOF
     cat > "$DEIS_RUNTIME_CONFIG" <<EOF
 http_port = ${DEIS_RUNTIME_PORT}
 
-[supervisor]
+[control]
 enabled = true
 addr = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 associated_id = "deis-runtime-demo-01"
@@ -226,7 +226,7 @@ port = ${DEIS_RUNTIME_PORT}
 level = "info"
 path = "${LOG_DIR}/deis_proxy_error.log"
 
-[supervisor]
+[control]
 addr = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 associated_id = "deis-proxy-demo-01"
 secret = "${SECRET}"

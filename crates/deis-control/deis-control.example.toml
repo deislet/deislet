@@ -1,4 +1,4 @@
-# Control Supervisor example configuration
+# Control Control example configuration
 
 # Bind address
 bind_addr = "0.0.0.0"
@@ -10,9 +10,9 @@ port = 8080
 heartbeat_interval = 30
 heartbeat_timeout = 90
 
-# Worker pre-shared keys (used for gRPC authentication)
-worker_preshared_keys = [
-    "your-worker-psk-here-change-this-in-production"
+# Node pre-shared keys (used for gRPC authentication)
+node_preshared_keys = [
+    "your-node-psk-here-change-this-in-production"
 ]
 
 # ========================================
@@ -49,14 +49,14 @@ api_enabled = false
 # ========================================
 
 # 1. Copy this file to deis-control.toml
-# 2. Change worker_preshared_keys and api_keys to secure random strings
+# 2. Change node_preshared_keys and api_keys to secure random strings
 # 3. To enable authentication, set api_auth_enabled = true
 # 4. Start Control: ./deis-control --config deis-control.toml
 
 # Example API requests (with authentication enabled):
-# curl -H "X-API-Key: deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/workers
+# curl -H "X-API-Key: deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/nodes
 # or
-# curl -H "Authorization: Bearer deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/workers
+# curl -H "Authorization: Bearer deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/nodes
 
 # Endpoints that do not require authentication:
 # - /health - Health check

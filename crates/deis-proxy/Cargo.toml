@@ -29,7 +29,7 @@ futures = "0.3"
 # callbacks in this release.
 pingora = { version = "0.5", features = ["lb", "openssl"] }
 
-# Supervisor (deis-control) client.
+# Control (deis-control) client.
 deis-wire = { path = "../deis-wire" }
 yasm = "0.5.0"
 
@@ -37,7 +37,7 @@ yasm = "0.5.0"
 # Generates throwaway certificates for the route table tests; same crate the
 # pingora openssl backend is built on.
 openssl = "0.10"
-# In-process supervisor the client tests register against
-# (src/supervisor/mock.rs).
+# In-process control the client tests register against
+# (src/control/mock.rs).
 tonic = "0.12"
 tokio-stream = { version = "0.1", features = ["net"] }

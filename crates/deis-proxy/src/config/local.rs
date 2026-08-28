@@ -3,7 +3,7 @@
 //! This module defines the static configuration that is loaded from config.toml
 //! at startup time. Only includes essential local configurations needed for startup.
 //! Runtime configurations (upstreams, load balancing, cache, etc.) are dynamically
-//! delivered through supervisor.
+//! delivered through control.
 
 use std::path::PathBuf;
 

@@ -1,5 +1,5 @@
-pub mod supervisor_config;
-pub mod worker_info;
+pub mod control_config;
+pub mod node_info;
 
-pub use supervisor_config::SupervisorConfig;
-pub use worker_info::{WorkerInfo, WorkerType};
+pub use control_config::ControlConfig;
+pub use node_info::{NodeInfo, NodeRole};

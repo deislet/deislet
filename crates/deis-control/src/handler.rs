@@ -1,15 +1,15 @@
 use std::sync::Arc;
 use chrono::Utc;
 use uuid::Uuid;
-use crate::config::SupervisorConfig;
-use crate::session::{SessionManager, WorkerSession, WorkerState};
+use crate::config::ControlConfig;
+use crate::session::{SessionManager, NodeSession, NodeState};
 use crate::message::{AuthData, AuthResponse, RegisterRequest, RegisterResponse, HeartbeatRequest, HeartbeatAck};
 use crate::database::{Database, Event, EventSeverity, HeartbeatEntry};
 use crate::broadcast::{EventBroadcaster, BroadcastEvent};
 use crate::command::{CommandExecutor, CommandResponse};
 
 pub struct MessageHandler {
-    config: Arc<SupervisorConfig>,
+    config: Arc<ControlConfig>,
     sessions: Arc<SessionManager>,
     database: Option<Arc<Database>>,
     broadcaster: Option<Arc<EventBroadcaster>>,
@@ -17,7 +17,7 @@ pub struct MessageHandler {
 }
 
 impl MessageHandler {
-    pub fn new(config: Arc<SupervisorConfig>, sessions: Arc<SessionManager>) -> Self {
+    pub fn new(config: Arc<ControlConfig>, sessions: Arc<SessionManager>) -> Self {
         Self {
             config,
             sessions,
@@ -42,14 +42,14 @@ impl MessageHandler {
         self
     }
 
-    pub fn config(&self) -> &SupervisorConfig {
+    pub fn config(&self) -> &ControlConfig {
         &self.config
     }
 
     pub async fn handle_auth(&self, data: AuthData) -> AuthResponse {
         let associated_id = &data.associated_id;
         
-        if self.config.worker_preshared_keys.is_empty() {
+        if self.config.node_preshared_keys.is_empty() {
             tracing::warn!(
                 associated_id = %associated_id,
                 "No PSK configured, allowing all connections"
@@ -61,11 +61,11 @@ impl MessageHandler {
             };
         }
 
-        for psk in &self.config.worker_preshared_keys {
+        for psk in &self.config.node_preshared_keys {
             if data.validate(psk) {
                 tracing::info!(
                     associated_id = %associated_id,
-                    "Worker authenticated successfully"
+                    "Node authenticated successfully"
                 );
                 return AuthResponse {
                     authenticated: true,
@@ -86,35 +86,35 @@ impl MessageHandler {
         }
     }
 
-    pub async fn handle_register(&self, request: RegisterRequest, session: &Arc<WorkerSession>) -> RegisterResponse {
-        session.set_state(WorkerState::Registered).await;
+    pub async fn handle_register(&self, request: RegisterRequest, session: &Arc<NodeSession>) -> RegisterResponse {
+        session.set_state(NodeState::Registered).await;
         self.sessions.add(Arc::clone(session));
 
         tracing::info!(
-            worker_id = %request.id,
+            node_id = %request.id,
             instance_id = %session.instance_id,
-            worker_type = ?session.worker_type,
+            node_role = ?session.node_role,
             host = %session.host,
             ports = ?session.ports,
-            "Worker registered"
+            "Node registered"
         );
 
-        let worker_type_str = match &session.worker_type {
-            crate::message::WorkerType::Runtime(v) => format!("deis_runtime:{}", v),
-            crate::message::WorkerType::Proxy(v) => format!("deis_proxy:{}", v),
+        let node_role_str = match &session.node_role {
+            crate::message::NodeRole::Runtime(v) => format!("deis_runtime:{}", v),
+            crate::message::NodeRole::Proxy(v) => format!("deis_proxy:{}", v),
         };
 
         // Save to database if available
         if let Some(db) = &self.database {
-            if let Err(e) = db.save_worker(session).await {
-                tracing::error!("Failed to save worker to database: {}", e);
+            if let Err(e) = db.save_node(session).await {
+                tracing::error!("Failed to save node to database: {}", e);
             }
 
             let event = Event {
-                event_type: "WorkerConnected".to_string(),
-                worker_id: Some(session.worker_id.clone()),
+                event_type: "NodeConnected".to_string(),
+                node_id: Some(session.node_id.clone()),
                 severity: EventSeverity::Info,
-                message: format!("Worker {} registered as {}", request.id, session.instance_id),
+                message: format!("Node {} registered as {}", request.id, session.instance_id),
                 metadata: None,
             };
 
@@ -125,10 +125,10 @@ impl MessageHandler {
 
         // Broadcast event if available
         if let Some(broadcaster) = &self.broadcaster {
-            let event = BroadcastEvent::WorkerConnected {
-                worker_id: session.worker_id.clone(),
+            let event = BroadcastEvent::NodeConnected {
+                node_id: session.node_id.clone(),
                 instance_id: session.instance_id.clone(),
-                worker_type: worker_type_str,
+                node_role: node_role_str,
                 host: session.host.clone(),
                 ports: session.ports.clone(),
                 timestamp: Utc::now(),
@@ -143,15 +143,15 @@ impl MessageHandler {
         }
     }
 
-    pub async fn handle_heartbeat(&self, request: HeartbeatRequest, session: &Arc<WorkerSession>) -> HeartbeatAck {
+    pub async fn handle_heartbeat(&self, request: HeartbeatRequest, session: &Arc<NodeSession>) -> HeartbeatAck {
         let now = Utc::now();
         *session.last_heartbeat.lock().await = now;
-        session.set_state(WorkerState::Active).await;
+        session.set_state(NodeState::Active).await;
 
         // Save heartbeat to database if available
         if let Some(db) = &self.database {
             let entry = HeartbeatEntry {
-                worker_id: session.worker_id.clone(),
+                node_id: session.node_id.clone(),
                 instance_id: session.instance_id.clone(),
                 timestamp: now,
                 power_reserve: request.power_reserve,
@@ -166,7 +166,7 @@ impl MessageHandler {
         // Broadcast heartbeat event if available
         if let Some(broadcaster) = &self.broadcaster {
             let event = BroadcastEvent::HeartbeatReceived {
-                worker_id: session.worker_id.clone(),
+                node_id: session.node_id.clone(),
                 instance_id: session.instance_id.clone(),
                 power_reserve: request.power_reserve,
                 timestamp: now,
@@ -209,17 +209,17 @@ impl MessageHandler {
         }
     }
 
-    /// Handle worker disconnection
-    pub async fn handle_disconnect(&self, session: &Arc<WorkerSession>, reason: &str) {
-        session.set_state(WorkerState::Disconnected).await;
+    /// Handle node disconnection
+    pub async fn handle_disconnect(&self, session: &Arc<NodeSession>, reason: &str) {
+        session.set_state(NodeState::Disconnected).await;
 
         // Save disconnection event to database
         if let Some(db) = &self.database {
             let event = Event {
-                event_type: "WorkerDisconnected".to_string(),
-                worker_id: Some(session.worker_id.clone()),
+                event_type: "NodeDisconnected".to_string(),
+                node_id: Some(session.node_id.clone()),
                 severity: EventSeverity::Warning,
-                message: format!("Worker {} disconnected: {}", session.instance_id, reason),
+                message: format!("Node {} disconnected: {}", session.instance_id, reason),
                 metadata: None,
             };
 
@@ -230,8 +230,8 @@ impl MessageHandler {
 
         // Broadcast disconnection event
         if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.broadcast(BroadcastEvent::WorkerDisconnected {
-                worker_id: session.worker_id.clone(),
+            broadcaster.broadcast(BroadcastEvent::NodeDisconnected {
+                node_id: session.node_id.clone(),
                 instance_id: session.instance_id.clone(),
                 reason: reason.to_string(),
                 timestamp: Utc::now(),
@@ -239,37 +239,37 @@ impl MessageHandler {
         }
 
         tracing::info!(
-            worker_id = %session.worker_id,
+            node_id = %session.node_id,
             instance_id = %session.instance_id,
             reason = %reason,
-            "Worker disconnected"
+            "Node disconnected"
         );
     }
 
-    /// Handle worker state change
+    /// Handle node state change
     pub async fn handle_state_change(
         &self,
-        session: &Arc<WorkerSession>,
-        old_state: WorkerState,
-        new_state: WorkerState,
+        session: &Arc<NodeSession>,
+        old_state: NodeState,
+        new_state: NodeState,
     ) {
         // Broadcast state change event
         if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.broadcast(BroadcastEvent::WorkerStateChanged {
-                worker_id: session.worker_id.clone(),
+            broadcaster.broadcast(BroadcastEvent::NodeStateChanged {
+                node_id: session.node_id.clone(),
                 instance_id: session.instance_id.clone(),
-                old_state: BroadcastEvent::worker_state_to_string(&old_state),
-                new_state: BroadcastEvent::worker_state_to_string(&new_state),
+                old_state: BroadcastEvent::node_state_to_string(&old_state),
+                new_state: BroadcastEvent::node_state_to_string(&new_state),
                 timestamp: Utc::now(),
             });
         }
 
         tracing::debug!(
-            worker_id = %session.worker_id,
+            node_id = %session.node_id,
             instance_id = %session.instance_id,
             old_state = ?old_state,
             new_state = ?new_state,
-            "Worker state changed"
+            "Node state changed"
         );
     }
 }
@@ -279,13 +279,13 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use crate::session::SessionManager;
-    use crate::message::{WorkerInfo, WorkerType};
+    use crate::message::{NodeInfo, NodeRole};
     use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_disconnect_broadcasts_event() {
         // Create dependencies
-        let config = Arc::new(SupervisorConfig::default());
+        let config = Arc::new(ControlConfig::default());
         let sessions = Arc::new(SessionManager::new());
         let database = Arc::new(Database::init(":memory:").await.unwrap());
         let broadcaster = Arc::new(EventBroadcaster::new());
@@ -301,27 +301,27 @@ mod tests {
             .with_broadcaster(broadcaster);
 
         // Create a test session
-        let worker_info = WorkerInfo {
-            worker_type: WorkerType::Runtime("1.0.0".to_string()),
+        let node_info = NodeInfo {
+            node_role: NodeRole::Runtime("1.0.0".to_string()),
             listen_host: "localhost".to_string(),
             listen_port: vec![8000],
         };
 
-        let session = Arc::new(WorkerSession::new("test-worker".to_string(), worker_info));
+        let session = Arc::new(NodeSession::new("test-node".to_string(), node_info));
 
         // Call handle_disconnect
         handler.handle_disconnect(&session, "Test disconnect").await;
 
-        // Verify: WorkerDisconnected event should be received
+        // Verify: NodeDisconnected event should be received
         let event_json = rx.recv().await.unwrap();
-        assert!(event_json.contains("WorkerDisconnected"));
-        assert!(event_json.contains("test-worker"));
+        assert!(event_json.contains("NodeDisconnected"));
+        assert!(event_json.contains("test-node"));
         assert!(event_json.contains("Test disconnect"));
     }
 
     #[tokio::test]
     async fn test_state_change_broadcasts_event() {
-        let config = Arc::new(SupervisorConfig::default());
+        let config = Arc::new(ControlConfig::default());
         let sessions = Arc::new(SessionManager::new());
         let broadcaster = Arc::new(EventBroadcaster::new());
 
@@ -332,24 +332,24 @@ mod tests {
         let handler = MessageHandler::new(config, sessions.clone())
             .with_broadcaster(broadcaster);
 
-        let worker_info = WorkerInfo {
-            worker_type: WorkerType::Runtime("1.0.0".to_string()),
+        let node_info = NodeInfo {
+            node_role: NodeRole::Runtime("1.0.0".to_string()),
             listen_host: "localhost".to_string(),
             listen_port: vec![8000],
         };
 
-        let session = Arc::new(WorkerSession::new("test-worker".to_string(), worker_info));
+        let session = Arc::new(NodeSession::new("test-node".to_string(), node_info));
 
         // Call handle_state_change
         handler.handle_state_change(
             &session,
-            WorkerState::Connected,
-            WorkerState::Active,
+            NodeState::Connected,
+            NodeState::Active,
         ).await;
 
-        // Verify: WorkerStateChanged event should be received
+        // Verify: NodeStateChanged event should be received
         let event_json = rx.recv().await.unwrap();
-        assert!(event_json.contains("WorkerStateChanged"));
+        assert!(event_json.contains("NodeStateChanged"));
         assert!(event_json.contains("Connected"));
         assert!(event_json.contains("Active"));
     }

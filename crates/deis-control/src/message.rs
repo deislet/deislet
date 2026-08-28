@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerType {
+pub enum NodeRole {
     #[serde(rename = "runtime")]
     Runtime(String),
     #[serde(rename = "proxy")]
@@ -10,8 +10,8 @@ pub enum WorkerType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerInfo {
-    pub worker_type: WorkerType,
+pub struct NodeInfo {
+    pub node_role: NodeRole,
     pub listen_host: String,
     pub listen_port: Vec<u16>,
 }
@@ -20,7 +20,7 @@ pub struct WorkerInfo {
 /// Uses HMAC-SHA256 signature for secure authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthData {
-    /// Associated ID (Worker Instance ID)
+    /// Associated ID (Node Instance ID)
     pub associated_id: String,
     /// Authentication signature: SHA256(secret + associated_id + timestamp)
     pub signature: String,
@@ -77,7 +77,7 @@ pub struct AuthResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub id: String,
-    pub info: WorkerInfo,
+    pub info: NodeInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,15 +120,15 @@ pub struct Message {
     pub data: serde_json::Value,
 }
 
-/// Config update message (supervisor -> worker)
+/// Config update message (control -> node)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdateMessage {
-    pub worker_id: String,
+    pub node_id: String,
     pub configs: std::collections::HashMap<String, serde_json::Value>,
     pub version_timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-/// Config update acknowledgment (worker -> supervisor)
+/// Config update acknowledgment (node -> control)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdateAck {
     pub success: bool,

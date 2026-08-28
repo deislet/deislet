@@ -1,4 +1,4 @@
-import { useWorkers, useMetrics, useCommands } from '@/hooks/useApi'
+import { useNodes, useMetrics, useCommands } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Server, Activity, Clock, Terminal } from 'lucide-react'
@@ -14,19 +14,19 @@ function formatUptime(seconds: number): string {
 }
 
 export function Dashboard() {
-  const { workers, loading: workersLoading } = useWorkers()
+  const { nodes, loading: nodesLoading } = useNodes()
   const { metrics, loading: metricsLoading } = useMetrics()
   const { commands, loading: commandsLoading } = useCommands()
 
-  const activeWorkers = workers.filter((w) => w.state === 'Active').length
+  const activeNodes = nodes.filter((w) => w.state === 'Active').length
   const pendingCommands = commands.filter((c) => c.status === 'Pending' || c.status === 'Sent').length
 
   const stats = [
     {
-      title: 'Total Workers',
-      value: metrics?.workers.total || workers.length,
+      title: 'Total Nodes',
+      value: metrics?.nodes.total || nodes.length,
       icon: Server,
-      description: `${activeWorkers} active`,
+      description: `${activeNodes} active`,
     },
     {
       title: 'System Uptime',
@@ -48,7 +48,7 @@ export function Dashboard() {
     },
   ]
 
-  if (workersLoading || metricsLoading || commandsLoading) {
+  if (nodesLoading || metricsLoading || commandsLoading) {
     return (
       <div className="flex items-center justify-center h-64">
         <p className="text-muted-foreground">Loading...</p>
@@ -60,7 +60,7 @@ export function Dashboard() {
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold">Dashboard</h1>
-        <p className="text-muted-foreground">Control Supervisor Overview</p>
+        <p className="text-muted-foreground">Control Control Overview</p>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
@@ -81,23 +81,23 @@ export function Dashboard() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Recent Workers</CardTitle>
+            <CardTitle>Recent Nodes</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {workers.slice(0, 5).map((worker) => (
-                <div key={worker.id} className="flex items-center justify-between">
+              {nodes.slice(0, 5).map((node) => (
+                <div key={node.id} className="flex items-center justify-between">
                   <div className="space-y-1">
-                    <p className="text-sm font-medium">{worker.worker_type}</p>
-                    <p className="text-xs text-muted-foreground">{worker.host}:{worker.ports[0]}</p>
+                    <p className="text-sm font-medium">{node.node_role}</p>
+                    <p className="text-xs text-muted-foreground">{node.host}:{node.ports[0]}</p>
                   </div>
-                  <Badge variant={worker.state === 'Active' ? 'success' : 'secondary'}>
-                    {worker.state}
+                  <Badge variant={node.state === 'Active' ? 'success' : 'secondary'}>
+                    {node.state}
                   </Badge>
                 </div>
               ))}
-              {workers.length === 0 && (
-                <p className="text-sm text-muted-foreground">No workers connected</p>
+              {nodes.length === 0 && (
+                <p className="text-sm text-muted-foreground">No nodes connected</p>
               )}
             </div>
           </CardContent>
@@ -105,11 +105,11 @@ export function Dashboard() {
 
         <Card>
           <CardHeader>
-            <CardTitle>Worker Types Distribution</CardTitle>
+            <CardTitle>Node Types Distribution</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {metrics?.workers.by_type && Object.entries(metrics.workers.by_type).map(([type, count]) => (
+              {metrics?.nodes.by_type && Object.entries(metrics.nodes.by_type).map(([type, count]) => (
                 <div key={type} className="flex items-center justify-between">
                   <div className="space-y-1">
                     <p className="text-sm font-medium">{type}</p>
@@ -117,8 +117,8 @@ export function Dashboard() {
                   <Badge variant="outline">{count}</Badge>
                 </div>
               ))}
-              {(!metrics?.workers.by_type || Object.keys(metrics.workers.by_type).length === 0) && (
-                <p className="text-sm text-muted-foreground">No worker types available</p>
+              {(!metrics?.nodes.by_type || Object.keys(metrics.nodes.by_type).length === 0) && (
+                <p className="text-sm text-muted-foreground">No node types available</p>
               )}
             </div>
           </CardContent>

@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use crate::database::{Database, CommandStatus, CommandEntry};
 use crate::session::SessionManager;
 use crate::broadcast::{EventBroadcaster, BroadcastEvent};
-use deis_wire::pb::{SupervisorMessage, CommandRequest as ProtoCommandRequest, supervisor_message::Payload};
+use deis_wire::pb::{ControlMessage, CommandRequest as ProtoCommandRequest, control_message::Payload};
 
 /// Command type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +59,7 @@ pub struct CommandResponse {
 #[allow(dead_code)]
 struct CommandTracker {
     command_id: Uuid,
-    worker_id: String,
+    node_id: String,
     command_type: CommandType,
     status: Arc<RwLock<CommandStatus>>,
     created_at: DateTime<Utc>,
@@ -105,7 +105,7 @@ impl CommandExecutor {
     /// Execute command and wait for response asynchronously
     pub async fn execute_command(
         &self,
-        worker_id: &str,
+        node_id: &str,
         request: CommandRequest,
         timeout_duration: Duration,
     ) -> Result<CommandResponse, ExecuteError> {
@@ -114,10 +114,10 @@ impl CommandExecutor {
         let timeout_at = now + chrono::Duration::from_std(timeout_duration)
             .map_err(|_| ExecuteError::InvalidTimeout)?;
 
-        // Get worker session
+        // Get node session
         let session = self.sessions
-            .get_worker(worker_id)
-            .ok_or_else(|| ExecuteError::WorkerNotFound(worker_id.to_string()))?;
+            .get_node(node_id)
+            .ok_or_else(|| ExecuteError::NodeNotFound(node_id.to_string()))?;
 
         // Create response channel
         let (response_tx, response_rx) = oneshot::channel();
@@ -125,7 +125,7 @@ impl CommandExecutor {
         // Create tracker
         let tracker = CommandTracker {
             command_id,
-            worker_id: worker_id.to_string(),
+            node_id: node_id.to_string(),
             command_type: request.command_type.clone(),
             status: Arc::new(RwLock::new(CommandStatus::Pending)),
             created_at: now,
@@ -136,7 +136,7 @@ impl CommandExecutor {
         // Save to database
         let command_entry = CommandEntry {
             id: command_id.to_string(),
-            worker_id: worker_id.to_string(),
+            node_id: node_id.to_string(),
             command_type: request.command_type.as_str(),
             command_data: request.data.clone().unwrap_or(JsonValue::Null),
             status: CommandStatus::Pending,
@@ -161,7 +161,7 @@ impl CommandExecutor {
             args_json: request.data.clone().unwrap_or(JsonValue::Null).to_string(),
         };
 
-        let message = SupervisorMessage {
+        let message = ControlMessage {
             payload: Some(Payload::CommandRequest(command_msg)),
         };
 
@@ -186,7 +186,7 @@ impl CommandExecutor {
         if let Some(broadcaster) = &self.broadcaster {
             broadcaster.broadcast(BroadcastEvent::CommandSent {
                 command_id: command_id.to_string(),
-                worker_id: worker_id.to_string(),
+                node_id: node_id.to_string(),
                 command_type: request.command_type.as_str(),
                 timestamp: now,
             });
@@ -194,9 +194,9 @@ impl CommandExecutor {
 
         tracing::info!(
             command_id = %command_id,
-            worker_id = %worker_id,
+            node_id = %node_id,
             command_type = %request.command_type.as_str(),
-            "Command sent to worker"
+            "Command sent to node"
         );
 
         // Wait for response or timeout
@@ -209,7 +209,7 @@ impl CommandExecutor {
                 if let Some(broadcaster) = &self.broadcaster {
                     broadcaster.broadcast(BroadcastEvent::CommandCompleted {
                         command_id: command_id.to_string(),
-                        worker_id: worker_id.to_string(),
+                        node_id: node_id.to_string(),
                         success: response.success,
                         timestamp: Utc::now(),
                     });
@@ -314,7 +314,7 @@ impl CommandExecutor {
     /// Execute command (does not wait for response, suitable for HTTP API)
     pub async fn execute(
         &self,
-        worker_id: &str,
+        node_id: &str,
         request: CommandRequest,
     ) -> Result<Uuid, ExecuteError> {
         let command_id = Uuid::new_v4();
@@ -323,15 +323,15 @@ impl CommandExecutor {
         let timeout_at = now + chrono::Duration::from_std(timeout_duration)
             .map_err(|_| ExecuteError::InvalidTimeout)?;
 
-        // Get worker session
+        // Get node session
         let session = self.sessions
-            .get_worker(worker_id)
-            .ok_or_else(|| ExecuteError::WorkerNotFound(worker_id.to_string()))?;
+            .get_node(node_id)
+            .ok_or_else(|| ExecuteError::NodeNotFound(node_id.to_string()))?;
 
         // Create tracker (without creating response channel)
         let tracker = CommandTracker {
             command_id,
-            worker_id: worker_id.to_string(),
+            node_id: node_id.to_string(),
             command_type: request.command_type.clone(),
             status: Arc::new(RwLock::new(CommandStatus::Pending)),
             created_at: now,
@@ -342,7 +342,7 @@ impl CommandExecutor {
         // Save to database
         let command_entry = CommandEntry {
             id: command_id.to_string(),
-            worker_id: worker_id.to_string(),
+            node_id: node_id.to_string(),
             command_type: request.command_type.as_str(),
             command_data: request.data.clone().unwrap_or(JsonValue::Null),
             status: CommandStatus::Pending,
@@ -367,7 +367,7 @@ impl CommandExecutor {
             args_json: request.data.clone().unwrap_or(JsonValue::Null).to_string(),
         };
 
-        let message = SupervisorMessage {
+        let message = ControlMessage {
             payload: Some(Payload::CommandRequest(command_msg)),
         };
 
@@ -392,7 +392,7 @@ impl CommandExecutor {
         if let Some(broadcaster) = &self.broadcaster {
             broadcaster.broadcast(BroadcastEvent::CommandSent {
                 command_id: command_id.to_string(),
-                worker_id: worker_id.to_string(),
+                node_id: node_id.to_string(),
                 command_type: request.command_type.as_str(),
                 timestamp: now,
             });
@@ -400,9 +400,9 @@ impl CommandExecutor {
 
         tracing::info!(
             command_id = %command_id,
-            worker_id = %worker_id,
+            node_id = %node_id,
             command_type = %request.command_type.as_str(),
-            "Command sent to worker"
+            "Command sent to node"
         );
 
         Ok(command_id)
@@ -432,7 +432,7 @@ impl CommandExecutor {
             .into_iter()
             .map(|entry| serde_json::json!({
                 "id": entry.id,
-                "worker_id": entry.worker_id,
+                "node_id": entry.node_id,
                 "command_type": entry.command_type,
                 "status": entry.status.as_str(),
                 "created_at": entry.created_at,
@@ -442,16 +442,16 @@ impl CommandExecutor {
             .collect()
     }
 
-    /// List commands for a specific worker
-    pub async fn list_worker_commands(&self, worker_id: &str) -> Vec<serde_json::Value> {
+    /// List commands for a specific node
+    pub async fn list_node_commands(&self, node_id: &str) -> Vec<serde_json::Value> {
         self.database
-            .list_commands(Some(worker_id))
+            .list_commands(Some(node_id))
             .await
             .unwrap_or_default()
             .into_iter()
             .map(|entry| serde_json::json!({
                 "id": entry.id,
-                "worker_id": entry.worker_id,
+                "node_id": entry.node_id,
                 "command_type": entry.command_type,
                 "status": entry.status.as_str(),
                 "created_at": entry.created_at,
@@ -494,8 +494,8 @@ pub struct CommandMessage {
 /// Command execution error
 #[derive(Debug, thiserror::Error)]
 pub enum ExecuteError {
-    #[error("Worker not found: {0}")]
-    WorkerNotFound(String),
+    #[error("Node not found: {0}")]
+    NodeNotFound(String),
 
     #[error("Command not found")]
     CommandNotFound,
@@ -577,7 +577,7 @@ mod tests {
 
         let tracker = CommandTracker {
             command_id,
-            worker_id: "test-worker".to_string(),
+            node_id: "test-node".to_string(),
             command_type: CommandType::GetStatus,
             status: Arc::new(tokio::sync::RwLock::new(CommandStatus::Pending)),
             created_at: Utc::now(),
@@ -618,7 +618,7 @@ mod tests {
 
         let tracker = CommandTracker {
             command_id,
-            worker_id: "test-worker".to_string(),
+            node_id: "test-node".to_string(),
             command_type: CommandType::Restart,
             status: Arc::new(tokio::sync::RwLock::new(CommandStatus::Pending)),
             created_at: Utc::now(),

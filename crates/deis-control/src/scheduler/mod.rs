@@ -1,9 +1,9 @@
 // Cron scheduler module
 //
 // Responsibilities:
-// 1. Manage worker cron task configurations
+// 1. Manage node cron task configurations
 // 2. Periodically check cron expressions and trigger tasks
-// 3. Send scheduled events to workers
+// 3. Send scheduled events to nodes
 
 use crate::command::CommandExecutor;
 use crate::database::Database;
@@ -20,8 +20,8 @@ use tracing::{debug, error, info, warn};
 pub struct CronTask {
     /// Task ID
     pub id: String,
-    /// Worker ID
-    pub worker_id: String,
+    /// Node ID
+    pub node_id: String,
     /// Cron expression (simplified, minute-level only)
     pub cron_expr: String,
     /// Whether enabled
@@ -36,7 +36,7 @@ pub struct CronTask {
 
 /// Cron scheduler
 pub struct CronScheduler {
-    /// Task list (worker_id -> Vec<CronTask>)
+    /// Task list (node_id -> Vec<CronTask>)
     tasks: Arc<DashMap<String, Vec<CronTask>>>,
     /// Command executor
     command_executor: Arc<CommandExecutor>,
@@ -87,17 +87,17 @@ impl CronScheduler {
 
     /// Add cron task
     pub async fn add_task(&self, task: CronTask) -> Result<()> {
-        info!("Adding cron task {} for worker {}", task.id, task.worker_id);
+        info!("Adding cron task {} for node {}", task.id, task.node_id);
 
         // Calculate next execution time
         let mut task = task;
         task.next_run = self.calculate_next_run(&task.cron_expr)?;
 
-        let worker_id = task.worker_id.clone();
+        let node_id = task.node_id.clone();
 
         // Add to memory
         self.tasks
-            .entry(worker_id)
+            .entry(node_id)
             .or_default()
             .push(task.clone());
 
@@ -105,7 +105,7 @@ impl CronScheduler {
         if let Some(db) = &self.database {
             db.save_cron_task(
                 &task.id,
-                &task.worker_id,
+                &task.node_id,
                 &task.cron_expr,
                 task.enabled,
                 task.last_run,
@@ -120,11 +120,11 @@ impl CronScheduler {
     }
 
     /// Remove cron task
-    pub async fn remove_task(&self, worker_id: &str, task_id: &str) -> Result<()> {
-        info!("Removing cron task {} from worker {}", task_id, worker_id);
+    pub async fn remove_task(&self, node_id: &str, task_id: &str) -> Result<()> {
+        info!("Removing cron task {} from node {}", task_id, node_id);
 
         // Remove from memory
-        if let Some(mut tasks) = self.tasks.get_mut(worker_id) {
+        if let Some(mut tasks) = self.tasks.get_mut(node_id) {
             tasks.retain(|t| t.id != task_id);
         }
 
@@ -138,10 +138,10 @@ impl CronScheduler {
         Ok(())
     }
 
-    /// List all tasks for a worker
-    pub fn list_tasks(&self, worker_id: &str) -> Vec<CronTask> {
+    /// List all tasks for a node
+    pub fn list_tasks(&self, node_id: &str) -> Vec<CronTask> {
         self.tasks
-            .get(worker_id)
+            .get(node_id)
             .map(|tasks| tasks.clone())
             .unwrap_or_default()
     }
@@ -161,7 +161,7 @@ impl CronScheduler {
         debug!("Checking cron tasks at {}", now);
 
         for mut entry in self.tasks.iter_mut() {
-            let worker_id = entry.key().clone();
+            let node_id = entry.key().clone();
             let tasks = entry.value_mut();
 
             for task in tasks.iter_mut() {
@@ -173,15 +173,15 @@ impl CronScheduler {
                     && next_run <= now
                 {
                     info!(
-                        "Triggering cron task {} for worker {} (cron: {})",
-                        task.id, worker_id, task.cron_expr
+                        "Triggering cron task {} for node {} (cron: {})",
+                        task.id, node_id, task.cron_expr
                     );
 
                     // Trigger task
-                    if let Err(e) = self.trigger_task(&worker_id, task).await {
+                    if let Err(e) = self.trigger_task(&node_id, task).await {
                         error!(
-                            "Failed to trigger cron task {} for worker {}: {}",
-                            task.id, worker_id, e
+                            "Failed to trigger cron task {} for node {}: {}",
+                            task.id, node_id, e
                         );
                     }
 
@@ -211,7 +211,7 @@ impl CronScheduler {
     }
 
     /// Trigger single task
-    async fn trigger_task(&self, worker_id: &str, task: &CronTask) -> Result<()> {
+    async fn trigger_task(&self, node_id: &str, task: &CronTask) -> Result<()> {
         use crate::command::{CommandType, CommandRequest};
         use serde_json::json;
 
@@ -231,17 +231,17 @@ impl CronScheduler {
         // Execute command (don't wait for response, fire and forget)
         match self
             .command_executor
-            .execute_command(worker_id, command, tokio::time::Duration::from_millis(5000))
+            .execute_command(node_id, command, tokio::time::Duration::from_millis(5000))
             .await
         {
             Ok(_) => {
-                info!("Scheduled task {} sent to worker {}", task.id, worker_id);
+                info!("Scheduled task {} sent to node {}", task.id, node_id);
                 Ok(())
             }
             Err(e) => {
                 warn!(
-                    "Failed to send scheduled task {} to worker {}: {}",
-                    task.id, worker_id, e
+                    "Failed to send scheduled task {} to node {}: {}",
+                    task.id, node_id, e
                 );
                 Err(anyhow::anyhow!("Command execution error: {}", e))
             }
@@ -277,10 +277,10 @@ impl CronScheduler {
                 .await
                 .map_err(|e| anyhow::anyhow!("Database error: {}", e))?;
 
-            for (id, worker_id, cron_expr, enabled, last_run, next_run, created_at) in task_tuples {
+            for (id, node_id, cron_expr, enabled, last_run, next_run, created_at) in task_tuples {
                 let task = CronTask {
                     id,
-                    worker_id: worker_id.clone(),
+                    node_id: node_id.clone(),
                     cron_expr,
                     enabled,
                     last_run,
@@ -289,12 +289,12 @@ impl CronScheduler {
                 };
 
                 self.tasks
-                    .entry(worker_id)
+                    .entry(node_id)
                     .or_default()
                     .push(task);
             }
 
-            info!("Loaded {} workers with cron tasks", self.tasks.len());
+            info!("Loaded {} nodes with cron tasks", self.tasks.len());
         }
 
         Ok(())

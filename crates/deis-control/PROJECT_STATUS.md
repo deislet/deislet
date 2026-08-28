@@ -16,7 +16,7 @@
 | Event Broadcasting | ✅ | 100% | Fully integrated into all critical operations |
 | Metrics | ✅ | 100% | Prometheus + JSON format export |
 | HTTP API | ✅ | 100% | 24 endpoints + API authentication |
-| gRPC Server | ✅ | 100% | Bi-directional streaming for Worker communication |
+| gRPC Server | ✅ | 100% | Bi-directional streaming for Node communication |
 | Scheduler | ✅ | 100% | Cron task scheduling enabled |
 | Logging System | ✅ | 100% | Structured logging (JSON/Text) |
 | Documentation | ✅ | 80% | Core function documentation complete |
@@ -32,9 +32,9 @@
 - ✅ Added `config_history` table to record all configuration changes
 - ✅ Automatic tracking of create/update/delete operations
 - ✅ 3 new API endpoints:
-  - `GET /api/configs/:worker_id/history` - Query config history
-  - `GET /api/configs/:worker_id/:config_key/history` - Query key history
-  - `POST /api/configs/:worker_id/:config_key/rollback` - Rollback configuration
+  - `GET /api/configs/:node_id/history` - Query config history
+  - `GET /api/configs/:node_id/:config_key/history` - Query key history
+  - `POST /api/configs/:node_id/:config_key/rollback` - Rollback configuration
 - ✅ 5 new tests covering history tracking and rollback functionality
 - ✅ Full documentation: `CONFIG_HISTORY.md`
 
@@ -48,9 +48,9 @@
 #### 3. Structured Logging 📝
 - ✅ Support for both JSON and Text formats (environment variable controlled)
 - ✅ Added structured fields for critical operations:
-  - Worker Lifecycle: worker_id, instance_id, host, ports
-  - Config Update: worker_id, config_keys, version, count
-  - Command Execution: command_id, worker_id, command_type
+  - Node Lifecycle: node_id, instance_id, host, ports
+  - Config Update: node_id, config_keys, version, count
+  - Command Execution: command_id, node_id, command_type
 - ✅ Log level control via `RUST_LOG` environment variable
 - ✅ Full documentation: `LOGGING.md`
 
@@ -67,14 +67,14 @@
 ### 1. Core Infrastructure (100%)
 
 **gRPC Server**
-- ✅ Worker bi-directional streaming connection
+- ✅ Node bi-directional streaming connection
 - ✅ PSK + HMAC-SHA256 authentication
 - ✅ Session management (DashMap for concurrency safety)
 - ✅ Heartbeat monitoring and status tracking
 - ✅ Command response handling
 
 **Data Persistence (SQLite)**
-- ✅ Workers table (6 fields)
+- ✅ Nodes table (6 fields)
 - ✅ Configs table (6 fields)
 - ✅ **Config History table (7 fields)** 🆕
 - ✅ Commands table (11 fields)
@@ -89,7 +89,7 @@
 - ✅ Configuration version management (timestamp tracking)
 - ✅ **Configuration history recording and rollback** 🆕
 - ✅ Database persistence (transactional guarantees)
-- ✅ Push to workers (via gRPC)
+- ✅ Push to nodes (via gRPC)
 - ✅ Batch push and single push support
 - ✅ Configuration deletion (single key and all)
 
@@ -98,7 +98,7 @@
 - ✅ CommandExecutor architecture
 - ✅ Command tracker (DashMap + oneshot)
 - ✅ Asynchronous command execution
-- ✅ **Worker response handling** 🆕
+- ✅ **Node response handling** 🆕
 - ✅ **Timeout management (tokio::timeout)** 🆕
 - ✅ Database recording and status updates
 - ✅ Command cancellation feature
@@ -106,29 +106,29 @@
 
 ### 4. HTTP API (100%)
 
-**Workers API** (3 endpoints)
-- ✅ GET `/api/workers` - List all workers
-- ✅ GET `/api/workers/:id` - Get worker details
-- ✅ GET `/api/workers/:id/heartbeats` - Heartbeat history
+**Nodes API** (3 endpoints)
+- ✅ GET `/api/nodes` - List all nodes
+- ✅ GET `/api/nodes/:id` - Get node details
+- ✅ GET `/api/nodes/:id/heartbeats` - Heartbeat history
 
 **Configs API** (12 endpoints) 🆕
 - ✅ GET `/api/configs` - List all configurations
 - ✅ GET `/api/configs/stats` - Configuration statistics
-- ✅ GET `/api/configs/:worker_id` - Get worker configuration
-- ✅ POST `/api/configs/:worker_id` - Update configuration
-- ✅ DELETE `/api/configs/:worker_id` - Delete worker configuration
-- ✅ GET `/api/configs/:worker_id/:key` - Get single configuration value
-- ✅ DELETE `/api/configs/:worker_id/:key` - Delete single configuration
-- ✅ POST `/api/configs/push/:worker_id` - Push all configurations
-- ✅ POST `/api/configs/push/:worker_id/:key` - Push single configuration
-- ✅ **GET `/api/configs/:worker_id/history` - Query configuration history** 🆕
-- ✅ **GET `/api/configs/:worker_id/:key/history` - Query key history** 🆕
-- ✅ **POST `/api/configs/:worker_id/:key/rollback` - Rollback configuration** 🆕
+- ✅ GET `/api/configs/:node_id` - Get node configuration
+- ✅ POST `/api/configs/:node_id` - Update configuration
+- ✅ DELETE `/api/configs/:node_id` - Delete node configuration
+- ✅ GET `/api/configs/:node_id/:key` - Get single configuration value
+- ✅ DELETE `/api/configs/:node_id/:key` - Delete single configuration
+- ✅ POST `/api/configs/push/:node_id` - Push all configurations
+- ✅ POST `/api/configs/push/:node_id/:key` - Push single configuration
+- ✅ **GET `/api/configs/:node_id/history` - Query configuration history** 🆕
+- ✅ **GET `/api/configs/:node_id/:key/history` - Query key history** 🆕
+- ✅ **POST `/api/configs/:node_id/:key/rollback` - Rollback configuration** 🆕
 
 **Commands API** (5 endpoints)
 - ✅ GET `/api/commands` - List all commands
-- ✅ POST `/api/commands/execute/:worker_id` - Execute command
-- ✅ GET `/api/commands/worker/:worker_id` - List worker's commands
+- ✅ POST `/api/commands/execute/:node_id` - Execute command
+- ✅ GET `/api/commands/node/:node_id` - List node's commands
 - ✅ GET `/api/commands/status/:command_id` - Query command status
 - ✅ POST `/api/commands/cancel/:command_id` - Cancel command
 
@@ -148,7 +148,7 @@
 ### 5. Monitoring Metrics System (100%)
 
 - ✅ MetricsCollector implementation
-- ✅ Worker Metrics (total, active, connected, registered, disconnected, by_type)
+- ✅ Node Metrics (total, active, connected, registered, disconnected, by_type)
 - ✅ System Metrics (uptime, events, commands, heartbeats)
 - ✅ Prometheus format export (standard metrics format)
 - ✅ JSON format export (REST API)
@@ -161,8 +161,8 @@
 - ✅ WebSocket client pool management
 - ✅ **Fully integrated into handler.rs** 🆕
 - ✅ **Real-time broadcast of all state changes** 🆕
-  - Worker connection/disconnection
-  - Worker state changes
+  - Node connection/disconnection
+  - Node state changes
   - Configuration updates
   - Command execution
   - Heartbeat reception
@@ -173,7 +173,7 @@
 - ✅ Environment variable control:
   - `LOG_FORMAT`: json | text (default: text)
   - `RUST_LOG`: Log level control
-- ✅ Structured fields (worker_id, command_id, config_keys, etc.)
+- ✅ Structured fields (node_id, command_id, config_keys, etc.)
 - ✅ Compatible with log collection systems (ELK, Loki, Grafana)
 - ✅ Full documentation: `LOGGING.md`
 
@@ -240,8 +240,8 @@
 
 **Missing Components**:
 - ❌ Dashboard.vue - Overview dashboard
-- ❌ WorkerList.vue - Workers list
-- ❌ WorkerDetail.vue - Worker details
+- ❌ NodeList.vue - Nodes list
+- ❌ NodeDetail.vue - Node details
 - ❌ ConfigEditor.vue - Config editor (with history and rollback)
 - ❌ CommandPanel.vue - Command panel
 - ❌ MetricsChart.vue - Chart components
@@ -281,7 +281,7 @@
 ### Former P1 Issues (All Resolved)
 
 1. ✅ **Configuration Deletion Logic Error** - Fixed
-   - Fixed issue where deleting a single key caused the entire worker configuration to disappear.
+   - Fixed issue where deleting a single key caused the entire node configuration to disappear.
    - Implemented correct single key deletion logic.
    - Added configuration history records (including deletions).
 
@@ -292,7 +292,7 @@
 
 3. ✅ **WebSocket Broadcast Not Integrated** - Completed
    - Integrated broadcast in all critical operations in `handler.rs`.
-   - Worker connection/disconnection, state changes, configuration updates, command execution.
+   - Node connection/disconnection, state changes, configuration updates, command execution.
    - Frontend can receive all state updates in real-time.
 
 4. ✅ **No API Authentication** - Implemented
@@ -333,7 +333,7 @@ Based on the current state (Backend 95% complete), the following sequence is rec
 
 1. **Implement Basic Web UI** (3-5 days)
    - Dashboard overview page
-   - Workers list and details
+   - Nodes list and details
    - Configuration management interface (with history view and rollback)
    - Command execution panel
    - Event log view
@@ -378,7 +378,7 @@ Based on the current state (Backend 95% complete), the following sequence is rec
 
 ## 🎉 Conclusion
 
-**Control Supervisor backend functionality is near complete (~95%)**:
+**Control Control backend functionality is near complete (~95%)**:
 
 ✅ **Completed**:
 - Core features: configuration management, command execution, event broadcasting

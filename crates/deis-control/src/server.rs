@@ -3,24 +3,24 @@ use std::net::SocketAddr;
 use tonic::transport::Server;
 use tracing::info;
 
-use crate::config::SupervisorConfig;
+use crate::config::ControlConfig;
 use crate::session::SessionManager;
 use crate::database::Database;
 use crate::broadcast::EventBroadcaster;
 use crate::command::CommandExecutor;
-use crate::api::grpc::GrpcSupervisorService;
-use deis_wire::pb::supervisor_service_server::SupervisorServiceServer;
+use crate::api::grpc::GrpcControlService;
+use deis_wire::pb::control_service_server::ControlServiceServer;
 
-pub struct SupervisorServer {
-    config: Arc<SupervisorConfig>,
+pub struct ControlServer {
+    config: Arc<ControlConfig>,
     sessions: Arc<SessionManager>,
     database: Option<Arc<Database>>,
     broadcaster: Arc<EventBroadcaster>,
     command_executor: Option<Arc<CommandExecutor>>,
 }
 
-impl SupervisorServer {
-    pub fn new(config: SupervisorConfig) -> Self {
+impl ControlServer {
+    pub fn new(config: ControlConfig) -> Self {
         Self {
             config: Arc::new(config),
             sessions: Arc::new(SessionManager::new()),
@@ -52,12 +52,12 @@ impl SupervisorServer {
         self.database.as_ref().map(Arc::clone)
     }
 
-    pub fn build_grpc_service(&self) -> SupervisorServiceServer<GrpcSupervisorService> {
+    pub fn build_grpc_service(&self) -> ControlServiceServer<GrpcControlService> {
         let sessions = Arc::clone(&self.sessions);
         let config = Arc::clone(&self.config);
         let broadcaster = Arc::clone(&self.broadcaster);
 
-        let mut grpc_service = GrpcSupervisorService::new(
+        let mut grpc_service = GrpcControlService::new(
             config,
             sessions,
             broadcaster,
@@ -71,14 +71,14 @@ impl SupervisorServer {
             grpc_service = grpc_service.with_command_executor(executor.clone());
         }
 
-        SupervisorServiceServer::new(grpc_service)
+        ControlServiceServer::new(grpc_service)
     }
 
     pub async fn start(&self) -> Result<(), anyhow::Error> {
         let addr_str = format!("{}:{}", self.config.bind_addr, self.config.port);
         let addr: SocketAddr = addr_str.parse()?;
 
-        info!("Supervisor gRPC listening on {}", addr);
+        info!("Control gRPC listening on {}", addr);
 
         let grpc_service = self.build_grpc_service();
 

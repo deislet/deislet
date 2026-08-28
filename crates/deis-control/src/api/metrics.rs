@@ -23,13 +23,13 @@ pub async fn get_metrics_summary(
     Ok(Json(json!({
         "success": true,
         "metrics": {
-            "workers": {
-                "total": summary.workers.total,
-                "active": summary.workers.active,
-                "connected": summary.workers.connected,
-                "registered": summary.workers.registered,
-                "disconnected": summary.workers.disconnected,
-                "by_type": summary.workers.by_type,
+            "nodes": {
+                "total": summary.nodes.total,
+                "active": summary.nodes.active,
+                "connected": summary.nodes.connected,
+                "registered": summary.nodes.registered,
+                "disconnected": summary.nodes.disconnected,
+                "by_type": summary.nodes.by_type,
             },
             "system": {
                 "uptime_seconds": summary.system.uptime_seconds,
@@ -49,49 +49,49 @@ pub async fn export_prometheus(
 
     let mut output = String::new();
 
-    // Workers metrics
+    // Nodes metrics
     output.push_str(&format!(
-        "# HELP deis_control_workers_total Total number of workers\n\
-         # TYPE deis_control_workers_total gauge\n\
-         deis_control_workers_total {}\n\n",
-        summary.workers.total
+        "# HELP deis_control_nodes_total Total number of nodes\n\
+         # TYPE deis_control_nodes_total gauge\n\
+         deis_control_nodes_total {}\n\n",
+        summary.nodes.total
     ));
 
     output.push_str(&format!(
-        "# HELP deis_control_workers_active Number of active workers\n\
-         # TYPE deis_control_workers_active gauge\n\
-         deis_control_workers_active {}\n\n",
-        summary.workers.active
+        "# HELP deis_control_nodes_active Number of active nodes\n\
+         # TYPE deis_control_nodes_active gauge\n\
+         deis_control_nodes_active {}\n\n",
+        summary.nodes.active
     ));
 
     output.push_str(&format!(
-        "# HELP deis_control_workers_connected Number of connected workers\n\
-         # TYPE deis_control_workers_connected gauge\n\
-         deis_control_workers_connected {}\n\n",
-        summary.workers.connected
+        "# HELP deis_control_nodes_connected Number of connected nodes\n\
+         # TYPE deis_control_nodes_connected gauge\n\
+         deis_control_nodes_connected {}\n\n",
+        summary.nodes.connected
     ));
 
     output.push_str(&format!(
-        "# HELP deis_control_workers_registered Number of registered workers\n\
-         # TYPE deis_control_workers_registered gauge\n\
-         deis_control_workers_registered {}\n\n",
-        summary.workers.registered
+        "# HELP deis_control_nodes_registered Number of registered nodes\n\
+         # TYPE deis_control_nodes_registered gauge\n\
+         deis_control_nodes_registered {}\n\n",
+        summary.nodes.registered
     ));
 
-    // Workers by type
-    output.push_str("# HELP deis_control_workers_by_type Number of workers by type\n");
-    output.push_str("# TYPE deis_control_workers_by_type gauge\n");
-    for (worker_type, count) in &summary.workers.by_type {
+    // Nodes by type
+    output.push_str("# HELP deis_control_nodes_by_role Number of nodes by role\n");
+    output.push_str("# TYPE deis_control_nodes_by_role gauge\n");
+    for (node_role, count) in &summary.nodes.by_type {
         output.push_str(&format!(
-            "deis_control_workers_by_type{{type=\"{}\"}} {}\n",
-            worker_type, count
+            "deis_control_nodes_by_role{{role=\"{}\"}} {}\n",
+            node_role, count
         ));
     }
     output.push('\n');
 
     // System metrics
     output.push_str(&format!(
-        "# HELP deis_control_uptime_seconds Supervisor uptime in seconds\n\
+        "# HELP deis_control_uptime_seconds Control uptime in seconds\n\
          # TYPE deis_control_uptime_seconds counter\n\
          deis_control_uptime_seconds {}\n\n",
         summary.system.uptime_seconds

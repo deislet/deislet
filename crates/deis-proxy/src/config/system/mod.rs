@@ -10,7 +10,7 @@ use std::ops::Add;
 use std::path::Path;
 use std::time::Duration;
 
-use deis_wire::SupervisorConfig;
+use deis_wire::ControlConfig;
 use serde::{Deserialize, Serialize};
 
 pub use balancing::BalancingStrategy;
@@ -96,8 +96,8 @@ pub struct SystemConfig {
     pub log: Option<LoggingConfig>,
     /// Downstream response compression.
     pub compression: Option<CompressionConfig>,
-    /// Supervisor (deis-control) connection. Absent means standalone mode.
-    pub supervisor: Option<SupervisorConfig>,
+    /// Control (deis-control) connection. Absent means standalone mode.
+    pub control: Option<ControlConfig>,
 }
 
 impl SystemConfig {
@@ -127,7 +127,7 @@ impl SystemConfig {
             cache: Some(CacheConfig::default()),
             log: Some(LoggingConfig::default()),
             compression: Some(CompressionConfig::default()),
-            supervisor: None,
+            control: None,
         }
     }
 
@@ -218,7 +218,7 @@ impl SystemConfig {
     ///
     /// Pingora's daemon mode changes the working directory to `/`, so paths
     /// used after that point (the PID file pingora writes, the default
-    /// certificate when the route table is rebuilt after a supervisor push)
+    /// certificate when the route table is rebuilt after a control push)
     /// must not depend on the working directory. Symlinks are left alone on
     /// purpose: re-pointing a link still takes effect on the next reload.
     pub fn resolve_paths(&mut self, base: &Path) {
@@ -319,8 +319,8 @@ impl Validatable for SystemConfig {
         if let Some(compression) = &self.compression {
             compression.validate()?;
         }
-        if let Some(supervisor) = &self.supervisor {
-            supervisor
+        if let Some(control) = &self.control {
+            control
                 .validate()
                 .map_err(|e| ConfigError::ValidationError {
                     message: e.to_string(),
@@ -365,7 +365,7 @@ impl Add<SystemConfig> for SystemConfig {
             cache: other.cache.or(self.cache),
             log: other.log.or(self.log),
             compression: other.compression.or(self.compression),
-            supervisor: other.supervisor.or(self.supervisor),
+            control: other.control.or(self.control),
         }
     }
 }

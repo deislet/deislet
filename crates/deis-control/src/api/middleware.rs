@@ -8,7 +8,7 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::config::SupervisorConfig;
+use crate::config::ControlConfig;
 
 /// API authentication middleware state
 #[derive(Clone)]
@@ -18,7 +18,7 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn from_supervisor_config(config: &SupervisorConfig) -> Self {
+    pub fn from_control_config(config: &ControlConfig) -> Self {
         Self {
             enabled: config.api_auth_enabled,
             api_keys: Arc::new(config.api_keys.clone()),
@@ -91,14 +91,14 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
-    fn test_auth_config_from_supervisor_config() {
-        let config = crate::config::SupervisorConfig {
+    fn test_auth_config_from_control_config() {
+        let config = crate::config::ControlConfig {
             api_auth_enabled: true,
             api_keys: vec!["test-key-123".to_string()],
             ..Default::default()
         };
 
-        let auth_config = AuthConfig::from_supervisor_config(&config);
+        let auth_config = AuthConfig::from_control_config(&config);
         assert!(auth_config.enabled);
         assert_eq!(auth_config.api_keys.len(), 1);
         assert_eq!(auth_config.api_keys[0], "test-key-123");
@@ -106,8 +106,8 @@ mod tests {
 
     #[test]
     fn test_auth_config_disabled_by_default() {
-        let config = crate::config::SupervisorConfig::default();
-        let auth_config = AuthConfig::from_supervisor_config(&config);
+        let config = crate::config::ControlConfig::default();
+        let auth_config = AuthConfig::from_control_config(&config);
         assert!(!auth_config.enabled);
     }
 

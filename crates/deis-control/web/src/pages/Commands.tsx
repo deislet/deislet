@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useWorkers, useCommands } from '@/hooks/useApi'
+import { useNodes, useCommands } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -45,19 +45,19 @@ function getCommandStatusBadgeVariant(status: string) {
 }
 
 interface ExecuteCommandDialogProps {
-  workers: any[]
-  onExecute: (workerId: string, commandType: string, commandData?: any) => Promise<void>
+  nodes: any[]
+  onExecute: (nodeId: string, commandType: string, commandData?: any) => Promise<void>
 }
 
-function ExecuteCommandDialog({ workers, onExecute }: ExecuteCommandDialogProps) {
+function ExecuteCommandDialog({ nodes, onExecute }: ExecuteCommandDialogProps) {
   const [open, setOpen] = useState(false)
-  const [selectedWorker, setSelectedWorker] = useState<string>('')
+  const [selectedNode, setSelectedNode] = useState<string>('')
   const [commandType, setCommandType] = useState<string>('')
   const [commandData, setCommandData] = useState<string>('')
   const [executing, setExecuting] = useState(false)
 
   const handleExecute = async () => {
-    if (!selectedWorker || !commandType) return
+    if (!selectedNode || !commandType) return
 
     try {
       setExecuting(true)
@@ -71,9 +71,9 @@ function ExecuteCommandDialog({ workers, onExecute }: ExecuteCommandDialogProps)
         }
       }
 
-      await onExecute(selectedWorker, commandType, parsedData)
+      await onExecute(selectedNode, commandType, parsedData)
       setOpen(false)
-      setSelectedWorker('')
+      setSelectedNode('')
       setCommandType('')
       setCommandData('')
     } catch (err) {
@@ -96,20 +96,20 @@ function ExecuteCommandDialog({ workers, onExecute }: ExecuteCommandDialogProps)
         <DialogHeader>
           <DialogTitle>Execute Command</DialogTitle>
           <DialogDescription>
-            Send a command to a specific worker for execution.
+            Send a command to a specific node for execution.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="worker">Select Worker</Label>
-            <Select value={selectedWorker} onValueChange={setSelectedWorker}>
-              <SelectTrigger id="worker">
-                <SelectValue placeholder="Choose a worker..." />
+            <Label htmlFor="node">Select Node</Label>
+            <Select value={selectedNode} onValueChange={setSelectedNode}>
+              <SelectTrigger id="node">
+                <SelectValue placeholder="Choose a node..." />
               </SelectTrigger>
               <SelectContent>
-                {workers.map((worker) => (
-                  <SelectItem key={worker.id} value={worker.id}>
-                    {worker.worker_type} ({worker.id.substring(0, 8)}...)
+                {nodes.map((node) => (
+                  <SelectItem key={node.id} value={node.id}>
+                    {node.node_role} ({node.id.substring(0, 8)}...)
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -141,7 +141,7 @@ function ExecuteCommandDialog({ workers, onExecute }: ExecuteCommandDialogProps)
           <Button variant="outline" onClick={() => setOpen(false)}>
             Cancel
           </Button>
-          <Button onClick={handleExecute} disabled={!selectedWorker || !commandType || executing}>
+          <Button onClick={handleExecute} disabled={!selectedNode || !commandType || executing}>
             {executing ? 'Executing...' : 'Execute'}
           </Button>
         </DialogFooter>
@@ -151,12 +151,12 @@ function ExecuteCommandDialog({ workers, onExecute }: ExecuteCommandDialogProps)
 }
 
 export function Commands() {
-  const { workers } = useWorkers()
+  const { nodes } = useNodes()
   const { commands, loading, error, refetch, executeCommand, cancelCommand } = useCommands()
   const [cancelling, setCancelling] = useState<string | null>(null)
 
-  const handleExecuteCommand = async (workerId: string, commandType: string, commandData?: any) => {
-    await executeCommand(workerId, commandType, commandData)
+  const handleExecuteCommand = async (nodeId: string, commandType: string, commandData?: any) => {
+    await executeCommand(nodeId, commandType, commandData)
   }
 
   const handleCancelCommand = async (commandId: string) => {
@@ -175,14 +175,14 @@ export function Commands() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold">Commands</h1>
-          <p className="text-muted-foreground">Execute and monitor worker commands</p>
+          <p className="text-muted-foreground">Execute and monitor node commands</p>
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={refetch} disabled={loading}>
             <RefreshCw className={`h-4 w-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
             Refresh
           </Button>
-          <ExecuteCommandDialog workers={workers} onExecute={handleExecuteCommand} />
+          <ExecuteCommandDialog nodes={nodes} onExecute={handleExecuteCommand} />
         </div>
       </div>
 
@@ -231,8 +231,8 @@ export function Commands() {
               <CardContent>
                 <div className="grid gap-2 text-sm md:grid-cols-2 lg:grid-cols-4">
                   <div>
-                    <p className="text-muted-foreground">Worker ID</p>
-                    <p className="font-mono text-xs">{command.worker_id}</p>
+                    <p className="text-muted-foreground">Node ID</p>
+                    <p className="font-mono text-xs">{command.node_id}</p>
                   </div>
                   <div>
                     <p className="text-muted-foreground">Command Type</p>

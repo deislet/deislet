@@ -4,15 +4,15 @@
 //! per-application certificates selected by SNI, upstream load balancing with
 //! health checks, and zero-downtime binary upgrades. Proxy adds domain based
 //! application routing, configuration layering (defaults + local file +
-//! supervisor), and the supervisor client that registers the instance with
+//! control), and the control client that registers the instance with
 //! deis-control.
 
 pub mod cli;
 pub mod config;
 pub mod proxy;
 pub mod restart;
-pub mod supervisor;
+pub mod control;
 pub mod tls;
 
 pub use config::{AppConfig, ConfigManager, SystemConfig};
-pub use supervisor::ProxySupervisorClient;
+pub use control::ProxyControlClient;

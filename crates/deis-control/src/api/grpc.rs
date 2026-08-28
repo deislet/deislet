@@ -6,31 +6,31 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use deis_wire::pb::supervisor_service_server::SupervisorService;
+use deis_wire::pb::control_service_server::ControlService;
 use deis_wire::pb::{
-    supervisor_message::Payload, Heartbeat, SupervisorMessage,
+    control_message::Payload, Heartbeat, ControlMessage,
     AuthResponse, RegisterResponse,
 };
 
-use crate::config::SupervisorConfig;
-use crate::session::{SessionManager, WorkerSession};
-use crate::message::{RegisterRequest as InternalRegisterRequest, WorkerInfo};
+use crate::config::ControlConfig;
+use crate::session::{SessionManager, NodeSession};
+use crate::message::{RegisterRequest as InternalRegisterRequest, NodeInfo};
 use crate::handler::MessageHandler;
 use crate::database::Database;
 use crate::broadcast::EventBroadcaster;
 use crate::command::CommandExecutor;
 
-pub struct GrpcSupervisorService {
-    config: Arc<SupervisorConfig>,
+pub struct GrpcControlService {
+    config: Arc<ControlConfig>,
     sessions: Arc<SessionManager>,
     database: Option<Arc<Database>>,
     broadcaster: Arc<EventBroadcaster>,
     command_executor: Option<Arc<CommandExecutor>>,
 }
 
-impl GrpcSupervisorService {
+impl GrpcControlService {
     pub fn new(
-        config: Arc<SupervisorConfig>,
+        config: Arc<ControlConfig>,
         sessions: Arc<SessionManager>,
         broadcaster: Arc<EventBroadcaster>,
     ) -> Self {
@@ -55,12 +55,12 @@ impl GrpcSupervisorService {
 }
 
 #[tonic::async_trait]
-impl SupervisorService for GrpcSupervisorService {
-    type EstablishChannelStream = Pin<Box<dyn Stream<Item = Result<SupervisorMessage, Status>> + Send + 'static>>;
+impl ControlService for GrpcControlService {
+    type EstablishChannelStream = Pin<Box<dyn Stream<Item = Result<ControlMessage, Status>> + Send + 'static>>;
 
     async fn establish_channel(
         &self,
-        request: Request<Streaming<SupervisorMessage>>,
+        request: Request<Streaming<ControlMessage>>,
     ) -> Result<Response<Self::EstablishChannelStream>, Status> {
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
@@ -86,7 +86,7 @@ impl SupervisorService for GrpcSupervisorService {
 
         // Spawn connection handling loop
         tokio::spawn(async move {
-            let mut current_session: Option<Arc<WorkerSession>> = None;
+            let mut current_session: Option<Arc<NodeSession>> = None;
             let mut authenticated = false;
 
             while let Some(result) = in_stream.next().await {
@@ -129,15 +129,15 @@ impl SupervisorService for GrpcSupervisorService {
 
 async fn handle_payload(
     payload: Payload,
-    tx: &mpsc::Sender<Result<SupervisorMessage, Status>>,
+    tx: &mpsc::Sender<Result<ControlMessage, Status>>,
     _sessions: &Arc<SessionManager>,
     handler: &MessageHandler,
-    current_session: &mut Option<Arc<WorkerSession>>,
+    current_session: &mut Option<Arc<NodeSession>>,
     authenticated: &mut bool,
 ) {
     match payload {
         Payload::Authenticate(req) => {
-            let preshared_keys = &handler.config().worker_preshared_keys;
+            let preshared_keys = &handler.config().node_preshared_keys;
             let valid = preshared_keys.is_empty() || preshared_keys.contains(&req.secret);
             *authenticated = valid;
 
@@ -170,11 +170,11 @@ async fn handle_payload(
                 return;
             }
 
-            // Deserialize worker info from JSON
-            let worker_info: WorkerInfo = match serde_json::from_str(&req.worker_info_json) {
+            // Deserialize node info from JSON
+            let node_info: NodeInfo = match serde_json::from_str(&req.node_info_json) {
                 Ok(info) => info,
                 Err(e) => {
-                    error!("Failed to parse worker info: {}", e);
+                    error!("Failed to parse node info: {}", e);
                     return;
                 }
             };
@@ -182,16 +182,16 @@ async fn handle_payload(
             // Reconstruct internal RegisterRequest
             let internal_req = InternalRegisterRequest {
                 id: Uuid::new_v4().to_string(), // Or use associated_id if available context
-                info: worker_info.clone(),
+                info: node_info.clone(),
             };
 
             // Create session with gRPC sender
-            // Note: worker_id is derived from context, here simplistic
-            // Ideally we track worker_id from auth phase
-            let worker_id = internal_req.id.clone(); 
+            // Note: node_id is derived from context, here simplistic
+            // Ideally we track node_id from auth phase
+            let node_id = internal_req.id.clone(); 
             
             let session = Arc::new(
-                WorkerSession::new(worker_id, worker_info)
+                NodeSession::new(node_id, node_info)
                     .with_sender(tx.clone())
             );
             
@@ -214,7 +214,7 @@ async fn handle_payload(
                 let power_reserve = 100; // Placeholder
 
                 let internal_req = crate::message::HeartbeatRequest {
-                    id: session.worker_id.clone(),
+                    id: session.node_id.clone(),
                     power_reserve,
                 };
 
@@ -226,7 +226,7 @@ async fn handle_payload(
                 // Yes, it waits for response.
 
                 // I didn't add HeartbeatAck to proto messages explicitly in oneof?
-                // `SupervisorMessage` oneof payload: `Heartbeat heartbeat` (client->server).
+                // `ControlMessage` oneof payload: `Heartbeat heartbeat` (client->server).
                 // Server->Client?
                 // Proto definitions:
                 // message Heartbeat { status = 1; }
@@ -242,7 +242,7 @@ async fn handle_payload(
             }
         }
         Payload::CommandResponse(resp) => {
-            // Worker sends command response
+            // Node sends command response
             // Parse command_id
             let command_id = match Uuid::parse_str(&resp.id) {
                 Ok(id) => id,
@@ -290,10 +290,10 @@ async fn handle_payload(
 }
 
 async fn send_payload(
-    tx: &mpsc::Sender<Result<SupervisorMessage, Status>>,
+    tx: &mpsc::Sender<Result<ControlMessage, Status>>,
     payload: Payload,
 ) {
-    let msg = SupervisorMessage { payload: Some(payload) };
+    let msg = ControlMessage { payload: Some(payload) };
     if let Err(e) = tx.send(Ok(msg)).await {
         error!("Failed to send gRPC message: {}", e);
     }

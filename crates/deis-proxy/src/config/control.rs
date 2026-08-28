@@ -1,20 +1,20 @@
-//! Configuration layers pushed by the supervisor.
+//! Configuration layers pushed by the control.
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::apps::AppConfig;
 use crate::config::{ConfigError, Validatable, system::SystemConfig};
 
-/// System configuration overlay received from the supervisor.
+/// System configuration overlay received from the control.
 ///
 /// Only traffic policy may be overridden remotely. Anything that binds the
 /// process to its host (listeners, daemon settings, database, logging, the
-/// supervisor connection itself) is cleared so a remote push cannot detach
+/// control connection itself) is cleared so a remote push cannot detach
 /// the instance from its operator.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SupervisorSystemConfig(SystemConfig);
+pub struct ControlSystemConfig(SystemConfig);
 
-impl SupervisorSystemConfig {
+impl ControlSystemConfig {
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
         let mut config: SystemConfig = serde_json::from_str::<SystemConfig>(json)?;
 
@@ -35,7 +35,7 @@ impl SupervisorSystemConfig {
         config.tls = None;
         config.log = None;
         config.cache = None;
-        config.supervisor = None;
+        config.control = None;
 
         config.validate()?;
         Ok(Self(config))
@@ -46,11 +46,11 @@ impl SupervisorSystemConfig {
     }
 }
 
-/// Application list received from the supervisor.
+/// Application list received from the control.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SupervisorAppsConfig(Vec<AppConfig>);
+pub struct ControlAppsConfig(Vec<AppConfig>);
 
-impl SupervisorAppsConfig {
+impl ControlAppsConfig {
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
         let apps: Vec<AppConfig> = serde_json::from_str(json)?;
         Self::from_apps(apps)
@@ -82,8 +82,8 @@ mod tests {
 
     #[test]
     fn remote_overlay_cannot_rebind_listeners() {
-        let overlay = SupervisorSystemConfig::from_json(
-            r#"{"listen_ports": [1], "balancing_strategy": "random", "supervisor": null}"#,
+        let overlay = ControlSystemConfig::from_json(
+            r#"{"listen_ports": [1], "balancing_strategy": "random", "control": null}"#,
         )
         .unwrap()
         .get_system_config();

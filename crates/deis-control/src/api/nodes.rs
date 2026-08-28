@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use super::{error::{ApiError, ApiResult}, AppState};
 
 #[derive(Serialize)]
-pub struct WorkerInfo {
+pub struct NodeInfo {
     pub id: String,
     pub instance_id: String,
-    pub worker_type: String,
+    pub node_role: String,
     pub host: String,
     pub ports: Vec<u16>,
     pub state: String,
@@ -20,8 +20,8 @@ pub struct WorkerInfo {
 }
 
 #[derive(Serialize)]
-pub struct WorkersResponse {
-    pub workers: Vec<WorkerInfo>,
+pub struct NodesResponse {
+    pub nodes: Vec<NodeInfo>,
     pub total: usize,
 }
 
@@ -37,28 +37,28 @@ pub struct HeartbeatsQuery {
     pub limit: Option<usize>,
 }
 
-/// List all workers
-pub async fn list_workers(State(app_state): State<AppState>) -> ApiResult<Json<WorkersResponse>> {
-    let mut workers = Vec::new();
+/// List all nodes
+pub async fn list_nodes(State(app_state): State<AppState>) -> ApiResult<Json<NodesResponse>> {
+    let mut nodes = Vec::new();
 
     for entry in app_state.sessions.iter() {
         let session = entry.value();
         let state_str = match session.get_state().await {
-            crate::session::WorkerState::Connected => "Connected",
-            crate::session::WorkerState::Registered => "Registered",
-            crate::session::WorkerState::Active => "Active",
-            crate::session::WorkerState::Disconnected => "Disconnected",
+            crate::session::NodeState::Connected => "Connected",
+            crate::session::NodeState::Registered => "Registered",
+            crate::session::NodeState::Active => "Active",
+            crate::session::NodeState::Disconnected => "Disconnected",
         };
 
-        let worker_type = match &session.worker_type {
-            crate::message::WorkerType::Runtime(v) => format!("deis_runtime:{}", v),
-            crate::message::WorkerType::Proxy(v) => format!("deis_proxy:{}", v),
+        let node_role = match &session.node_role {
+            crate::message::NodeRole::Runtime(v) => format!("deis_runtime:{}", v),
+            crate::message::NodeRole::Proxy(v) => format!("deis_proxy:{}", v),
         };
 
-        workers.push(WorkerInfo {
-            id: session.worker_id.clone(),
+        nodes.push(NodeInfo {
+            id: session.node_id.clone(),
             instance_id: session.instance_id.clone(),
-            worker_type,
+            node_role,
             host: session.host.clone(),
             ports: session.ports.clone(),
             state: state_str.to_string(),
@@ -68,37 +68,37 @@ pub async fn list_workers(State(app_state): State<AppState>) -> ApiResult<Json<W
         });
     }
 
-    let total = workers.len();
+    let total = nodes.len();
 
-    Ok(Json(WorkersResponse { workers, total }))
+    Ok(Json(NodesResponse { nodes, total }))
 }
 
-/// Get worker details
-pub async fn get_worker(
+/// Get node details
+pub async fn get_node(
     State(app_state): State<AppState>,
-    Path(worker_id): Path<String>,
-) -> ApiResult<Json<WorkerInfo>> {
+    Path(node_id): Path<String>,
+) -> ApiResult<Json<NodeInfo>> {
     let session = app_state
         .sessions
-        .get_worker(&worker_id)
-        .ok_or_else(|| ApiError::NotFound(format!("Worker {} not found", worker_id)))?;
+        .get_node(&node_id)
+        .ok_or_else(|| ApiError::NotFound(format!("Node {} not found", node_id)))?;
 
     let state_str = match session.get_state().await {
-        crate::session::WorkerState::Connected => "Connected",
-        crate::session::WorkerState::Registered => "Registered",
-        crate::session::WorkerState::Active => "Active",
-        crate::session::WorkerState::Disconnected => "Disconnected",
+        crate::session::NodeState::Connected => "Connected",
+        crate::session::NodeState::Registered => "Registered",
+        crate::session::NodeState::Active => "Active",
+        crate::session::NodeState::Disconnected => "Disconnected",
     };
 
-    let worker_type = match &session.worker_type {
-        crate::message::WorkerType::Runtime(v) => format!("deis_runtime:{}", v),
-        crate::message::WorkerType::Proxy(v) => format!("deis_proxy:{}", v),
+    let node_role = match &session.node_role {
+        crate::message::NodeRole::Runtime(v) => format!("deis_runtime:{}", v),
+        crate::message::NodeRole::Proxy(v) => format!("deis_proxy:{}", v),
     };
 
-    Ok(Json(WorkerInfo {
-        id: session.worker_id.clone(),
+    Ok(Json(NodeInfo {
+        id: session.node_id.clone(),
         instance_id: session.instance_id.clone(),
-        worker_type,
+        node_role,
         host: session.host.clone(),
         ports: session.ports.clone(),
         state: state_str.to_string(),
@@ -108,10 +108,10 @@ pub async fn get_worker(
     }))
 }
 
-/// Get worker heartbeats
+/// Get node heartbeats
 pub async fn get_heartbeats(
     State(app_state): State<AppState>,
-    Path(worker_id): Path<String>,
+    Path(node_id): Path<String>,
     Query(query): Query<HeartbeatsQuery>,
 ) -> ApiResult<Json<Vec<HeartbeatInfo>>> {
     let db = app_state
@@ -120,7 +120,7 @@ pub async fn get_heartbeats(
         .ok_or_else(|| ApiError::InternalError("Database not available".to_string()))?;
 
     let limit = query.limit.unwrap_or(100);
-    let heartbeats = db.get_recent_heartbeats(&worker_id, limit).await?;
+    let heartbeats = db.get_recent_heartbeats(&node_id, limit).await?;
 
     let heartbeat_infos: Vec<HeartbeatInfo> = heartbeats
         .into_iter()

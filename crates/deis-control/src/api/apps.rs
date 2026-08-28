@@ -15,7 +15,7 @@ use tracing::warn;
 use crate::runtime_client::{RuntimeNodeManager, NodeError};
 
 /// Hard cap for uploaded app packages. Keeps a misbehaving client from
-/// buffering arbitrary amounts of memory in the supervisor.
+/// buffering arbitrary amounts of memory in the control.
 const MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -83,16 +83,16 @@ pub async fn node_status(
                     error_message: a.error_message.clone(),
                 })
                 .collect();
-            let worker = status.worker_info.as_ref();
+            let info = status.node_info.as_ref();
             (
                 StatusCode::OK,
                 Json(json!({
                     "node": node,
-                    "worker": {
-                        "worker_id": worker.map(|w| w.worker_id.clone()),
-                        "version": worker.map(|w| w.version.clone()),
-                        "uptime_seconds": worker.map(|w| w.uptime_seconds),
-                        "hostname": worker.map(|w| w.hostname.clone()),
+                    "node_info": {
+                        "node_id": info.map(|i| i.node_id.clone()),
+                        "version": info.map(|i| i.version.clone()),
+                        "uptime_seconds": info.map(|i| i.uptime_seconds),
+                        "hostname": info.map(|i| i.hostname.clone()),
                     },
                     "apps": apps,
                     "resource_usage": status.resource_usage.as_ref().map(|r| json!({
