@@ -17,9 +17,9 @@ flowchart TB
 
     subgraph tool["Toolchain — developer machine"]
         direction LR
-        denictl["<b>denictl</b>
+        deis["<b>deis</b>
         CLI"]
-        deforge["<b>deforge</b>
+        deis-build["<b>deis-build</b>
         compiler"]
     end
 
@@ -32,39 +32,39 @@ flowchart TB
 
     subgraph self["Self-hosted cluster"]
         direction TB
-        deflux["<b>deflux</b>
+        deis-proxy["<b>deis-proxy</b>
         traffic entry, built on Pingora"]
-        denix["<b>denix</b>
+        deis-runtime["<b>deis-runtime</b>
         JS/TS/Wasm runtime, one V8 isolate per app"]
     end
 
-    denira["<b>denira</b>
+    deis-control["<b>deis-control</b>
     control plane: deployments, routing, node management
     REST API + web console + Prometheus"]
 
-    canon -.governs.-> deforge
-    canon -.governs.-> denix
-    denictl --delegates to--> deforge
-    deforge --emits--> third
-    deflux --forwards--> denix
-    deflux <-->|"workit gRPC"| denira
-    denira --manages--> denix
+    canon -.governs.-> deis-build
+    canon -.governs.-> deis-runtime
+    deis --delegates to--> deis-build
+    deis-build --emits--> third
+    deis-proxy --forwards--> deis-runtime
+    deis-proxy <-->|"deis-wire gRPC"| deis-control
+    deis-control --manages--> deis-runtime
 ```
 
-A request travels **client → deflux → denix**. deflux terminates TLS, picks the certificate by SNI, resolves the application by `x-deis-app-id` or Host, and load-balances across runtime nodes.
+A request travels **client → deis-proxy → deis-runtime**. deis-proxy terminates TLS, picks the certificate by SNI, resolves the application by `x-deis-app-id` or Host, and load-balances across runtime nodes.
 
-The control plane runs in two directions: deflux connects out to denira as a managed worker, while denix is autonomous and waits to be called by denira.
+The control plane runs in two directions: deis-proxy connects out to deis-control as a managed worker, while deis-runtime is autonomous and waits to be called by deis-control.
 
 ## Components
 
 | Crate | Role |
 |---|---|
-| [`deforge`](crates/deforge) | Compiler. Translates Edge Canon code into platform-specific output via SWC and rolldown. Translation only — it does not deploy. |
-| [`denictl`](crates/denictl) | Developer CLI. Project scaffolding, local dev server, validation, build. Delegates all parsing and compilation to deforge. |
-| [`deflux`](crates/deflux) | Traffic entry. Pingora-based proxy with TLS termination, per-app SNI certificates, host-based routing, load balancing and zero-downtime upgrades. |
-| [`denix`](crates/denix) | Runtime. Multi-tenant JS/TS/Wasm execution on deno_core, one isolate per application, autonomous via local SQLite. |
-| [`denira`](crates/denira) | Control plane. Worker authentication and registration, configuration distribution, node health, web console, metrics. |
-| [`workit`](crates/workit) | The gRPC protocol SDK shared by denira and its workers. |
+| [`deis-build`](crates/deis-build) | Compiler. Translates Edge Canon code into platform-specific output via SWC and rolldown. Translation only — it does not deploy. |
+| [`deis`](crates/deis) | Developer CLI. Project scaffolding, local dev server, validation, build. Delegates all parsing and compilation to deis-build. |
+| [`deis-proxy`](crates/deis-proxy) | Traffic entry. Pingora-based proxy with TLS termination, per-app SNI certificates, host-based routing, load balancing and zero-downtime upgrades. |
+| [`deis-runtime`](crates/deis-runtime) | Runtime. Multi-tenant JS/TS/Wasm execution on deno_core, one isolate per application, autonomous via local SQLite. |
+| [`deis-control`](crates/deis-control) | Control plane. Worker authentication and registration, configuration distribution, node health, web console, metrics. |
+| [`deis-wire`](crates/deis-wire) | The gRPC protocol SDK shared by deis-control and its workers. |
 
 ## Quick start
 
@@ -74,12 +74,12 @@ curl -H 'x-deis-app-id: demo' http://127.0.0.1:8087/hello
 scripts/demo.sh stop
 ```
 
-This builds all components, starts denira, denix and deflux, deploys a sample application through the control plane, and serves it through the data plane.
+This builds all components, starts deis-control, deis-runtime and deis-proxy, deploys a sample application through the control plane, and serves it through the data plane.
 
-Building denira requires its web console assets, which are not checked in:
+Building deis-control requires its web console assets, which are not checked in:
 
 ```bash
-cd crates/denira/web && npm ci && npm run build
+cd crates/deis-control/web && npm ci && npm run build
 ```
 
 ## Documentation
@@ -94,7 +94,7 @@ cd crates/denira/web && npm ci && npm run build
 | Repository | Purpose |
 |---|---|
 | [edge-canon](https://github.com/deislet/edge-canon) | The edge function specification. Public. |
-| coraza | A Rust port of the Coraza WAF engine, intended to run in front of deflux. |
+| coraza | A Rust port of the Coraza WAF engine, intended to run in front of deis-proxy. |
 | capkit | Capability-based multi-cloud abstraction, used for provisioning external resources. |
 
 ## License

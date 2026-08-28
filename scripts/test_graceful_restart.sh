@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Zero-downtime upgrade check for deflux.
+# Zero-downtime upgrade check for deis-proxy.
 #
-# Starts a backend and a deflux instance, then performs the same handover that
-# `deflux -s reload` does: spawn a replacement with --upgrade and send SIGQUIT
+# Starts a backend and a deis-proxy instance, then performs the same handover that
+# `deis-proxy -s reload` does: spawn a replacement with --upgrade and send SIGQUIT
 # to the old process. Requests keep flowing throughout; any failure during the
 # handover fails the test. Every wait is on a real event (HTTP readiness via
 # curl's own retry, process exit via tail --pid), never a fixed delay.
 #
-# A second case runs deflux as a daemon started with a relative `-c` path and
+# A second case runs deis-proxy as a daemon started with a relative `-c` path and
 # the default (relative) database from its own directory, then reloads it with
-# `deflux -s reload`; this is the path on which the replacement used to resolve
+# `deis-proxy -s reload`; this is the path on which the replacement used to resolve
 # every relative path against `/` and die.
 set -euo pipefail
 
@@ -27,7 +27,7 @@ cleanup() {
     wait "$pid" 2>/dev/null || true
   done
   # Daemons are not children; find them through the pid files they wrote.
-  for pidfile in "$WORK_DIR"/daemon/deflux.pid "$WORK_DIR"/daemon/deflux.pid.old; do
+  for pidfile in "$WORK_DIR"/daemon/deis-proxy.pid "$WORK_DIR"/daemon/deis-proxy.pid.old; do
     [ -f "$pidfile" ] && kill -9 "$(cat "$pidfile")" 2>/dev/null || true
   done
   rm -rf "$WORK_DIR"
@@ -42,13 +42,13 @@ for tool in curl python3 tail timeout; do
   command -v "$tool" >/dev/null || { echo "missing tool: $tool"; exit 2; }
 done
 
-echo "building deflux"
-(cd "$ROOT_DIR" && cargo build -q -p deflux)
+echo "building deis-proxy"
+(cd "$ROOT_DIR" && cargo build -q -p deis-proxy)
 # Respect a redirected target directory (CARGO_TARGET_DIR or .cargo/config).
 TARGET_DIR="$(cd "$ROOT_DIR" && cargo metadata --format-version 1 --no-deps \
   | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
-DEFLUX="$TARGET_DIR/debug/deflux"
-[ -x "$DEFLUX" ] || { echo "binary not found: $DEFLUX"; exit 2; }
+DEIS_PROXY="$TARGET_DIR/debug/deis-proxy"
+[ -x "$DEIS_PROXY" ] || { echo "binary not found: $DEIS_PROXY"; exit 2; }
 
 echo "starting backend on 127.0.0.1:$BACKEND_PORT"
 echo ok > "$WORK_DIR/index.html"
@@ -56,11 +56,11 @@ python3 -m http.server "$BACKEND_PORT" --bind 127.0.0.1 --directory "$WORK_DIR" 
 PIDS+=($!)
 wait_http "http://127.0.0.1:$BACKEND_PORT/"
 
-cat > "$WORK_DIR/deflux.toml" <<EOF
+cat > "$WORK_DIR/deis-proxy.toml" <<EOF
 listen_addr = ["127.0.0.1"]
 listen_ports = [$PROXY_PORT]
 upgrade_sock = "$WORK_DIR/upgrade.sock"
-pid_file = "$WORK_DIR/deflux.pid"
+pid_file = "$WORK_DIR/deis-proxy.pid"
 database = "$WORK_DIR/sites.db"
 
 [[upstreams]]
@@ -71,8 +71,8 @@ port = $BACKEND_PORT
 level = "info"
 EOF
 
-echo "starting deflux on 127.0.0.1:$PROXY_PORT"
-"$DEFLUX" -c "$WORK_DIR/deflux.toml" > "$WORK_DIR/old.log" 2>&1 &
+echo "starting deis-proxy on 127.0.0.1:$PROXY_PORT"
+"$DEIS_PROXY" -c "$WORK_DIR/deis-proxy.toml" > "$WORK_DIR/old.log" 2>&1 &
 OLD_PID=$!
 PIDS+=($OLD_PID)
 wait_http "http://127.0.0.1:$PROXY_PORT/"
@@ -90,7 +90,7 @@ LOAD_PID=$!
 PIDS+=($LOAD_PID)
 
 echo "spawning replacement and handing over the listening sockets"
-"$DEFLUX" -c "$WORK_DIR/deflux.toml" --upgrade > "$WORK_DIR/new.log" 2>&1 &
+"$DEIS_PROXY" -c "$WORK_DIR/deis-proxy.toml" --upgrade > "$WORK_DIR/new.log" 2>&1 &
 NEW_PID=$!
 PIDS+=($NEW_PID)
 kill -QUIT "$OLD_PID"
@@ -131,16 +131,16 @@ kill "$NEW_PID"
 timeout 60 tail --pid="$NEW_PID" -f /dev/null || true
 
 # --- Daemon mode with relative paths -------------------------------------
-# Everything relative, resolved against the directory deflux is started from:
+# Everything relative, resolved against the directory deis-proxy is started from:
 # the config path, the default database (sites.db), the pid file, the upgrade
 # socket and the error log. `user`/`group` stay unset so no root is needed.
 DAEMON_DIR="$WORK_DIR/daemon"
 mkdir -p "$DAEMON_DIR"
-cat > "$DAEMON_DIR/deflux.toml" <<EOF
+cat > "$DAEMON_DIR/deis-proxy.toml" <<EOF
 listen_addr = ["127.0.0.1"]
 listen_ports = [$PROXY_PORT]
 upgrade_sock = "upgrade.sock"
-pid_file = "deflux.pid"
+pid_file = "deis-proxy.pid"
 grace_period_secs = 2
 
 [[upstreams]]
@@ -152,10 +152,10 @@ level = "info"
 path = "daemon.log"
 EOF
 
-echo "starting deflux as a daemon from $DAEMON_DIR with relative paths"
-(cd "$DAEMON_DIR" && "$DEFLUX" -c deflux.toml -d)
+echo "starting deis-proxy as a daemon from $DAEMON_DIR with relative paths"
+(cd "$DAEMON_DIR" && "$DEIS_PROXY" -c deis-proxy.toml -d)
 wait_http "http://127.0.0.1:$PROXY_PORT/"
-DAEMON_PID=$(cat "$DAEMON_DIR/deflux.pid")
+DAEMON_PID=$(cat "$DAEMON_DIR/deis-proxy.pid")
 [ -f "$DAEMON_DIR/sites.db" ] || { echo "FAIL: database not created next to the config"; exit 1; }
 echo "daemon $DAEMON_PID is serving"
 
@@ -169,7 +169,7 @@ LOAD_PID=$!
 PIDS+=($LOAD_PID)
 
 echo "reloading the daemon with -s reload"
-(cd "$DAEMON_DIR" && "$DEFLUX" -c deflux.toml -s reload)
+(cd "$DAEMON_DIR" && "$DEIS_PROXY" -c deis-proxy.toml -s reload)
 
 if ! timeout 60 tail --pid="$DAEMON_PID" -f /dev/null; then
   echo "FAIL: old daemon $DAEMON_PID did not exit"
@@ -178,7 +178,7 @@ if ! timeout 60 tail --pid="$DAEMON_PID" -f /dev/null; then
 fi
 echo "old daemon $DAEMON_PID exited"
 
-NEW_DAEMON_PID=$(cat "$DAEMON_DIR/deflux.pid")
+NEW_DAEMON_PID=$(cat "$DAEMON_DIR/deis-proxy.pid")
 if [ "$NEW_DAEMON_PID" = "$DAEMON_PID" ] || ! kill -0 "$NEW_DAEMON_PID" 2>/dev/null; then
   echo "FAIL: no replacement daemon (pid file says $NEW_DAEMON_PID)"
   tail -40 "$DAEMON_DIR/daemon.log"

@@ -110,7 +110,7 @@
 
 ## 使用建议
 
-### 为 Denira/Deflux 添加功能时的参考
+### 为 Control/Proxy 添加功能时的参考
 
 1. **WAF 功能** → 参考 `pingora-waf`
    - SQL 注入、XSS 检测规则

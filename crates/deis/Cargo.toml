@@ -1,0 +1,31 @@
+[package]
+name = "deis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "deis"
+path = "src/main.rs"
+
+[dependencies]
+deis-build = { path = "../deis-build" }
+
+clap = { version = "4.4", features = ["derive", "cargo"] }
+colored = "2.1"
+indicatif = "0.17"
+dialoguer = "0.11"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+hyper = "1.0"
+notify = "6.1"
+walkdir = "2.4"
+url = "2.5"

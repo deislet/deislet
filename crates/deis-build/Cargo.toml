@@ -1,0 +1,46 @@
+[package]
+name = "deis-build"
+version = "0.1.0"
+edition = "2021"
+authors = ["kookyleo <kookyleo@gmail.com>"]
+license = "Apache-2.0"
+description = "Universal Edge Function Compiler - Transform standard code to platform-specific deployables"
+repository = "https://github.com/deislet/deis-build"
+homepage = "https://github.com/deislet/deis-build"
+keywords = ["edge", "serverless", "compiler", "cloudflare", "deno"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
+readme = "README.md"
+documentation = "https://docs.rs/deis-build"
+
+[lib]
+name = "deis_build"
+path = "src/lib.rs"
+crate-type = ["lib"]
+
+[[bin]]
+name = "deis-build"
+path = "src/main.rs"
+
+[dependencies]
+deis-build-core = { version = "0.1.0", path = "../deis-build-core" }
+deis-build-adapter-cf = { version = "0.1.0", path = "../deis-build-adapter-cf" }
+deis-build-adapter-dc = { version = "0.1.0", path = "../deis-build-adapter-dc" }
+deis-build-adapter-eo = { version = "0.1.0", path = "../deis-build-adapter-eo" }
+
+clap = { version = "4.4", features = ["derive", "cargo"] }
+colored = "2.1"
+indicatif = "0.17"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+walkdir = "2.4"
+
+# SWC dependencies (for parser module)
+swc_core = "0.100"
+swc_common = "18.0"
+swc_ecma_ast = "20.0"
+swc_ecma_parser = "33.0"
+swc_ecma_visit = "20.0"

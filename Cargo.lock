@@ -1837,121 +1837,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "deflux"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "bytes",
- "chrono",
- "denira-workit",
- "futures",
- "nix 0.30.1",
- "openssl",
- "pingora",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "yasm 0.5.0",
-]
-
-[[package]]
-name = "deforge"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap 4.5.54",
- "colored",
- "deforge-adapter-cf",
- "deforge-adapter-dc",
- "deforge-adapter-eo",
- "deforge-core",
- "indicatif",
- "serde",
- "serde_json",
- "swc_common 18.0.1",
- "swc_core",
- "swc_ecma_ast 20.0.1",
- "swc_ecma_parser 33.0.1",
- "swc_ecma_visit 20.0.0",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "walkdir",
-]
-
-[[package]]
-name = "deforge-adapter-cf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "deforge-core",
- "handlebars",
- "serde",
- "serde_json",
- "walkdir",
-]
-
-[[package]]
-name = "deforge-adapter-dc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "deforge-core",
- "serde",
- "serde_json",
- "walkdir",
-]
-
-[[package]]
-name = "deforge-adapter-eo"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "deforge-core",
- "serde_json",
- "walkdir",
-]
-
-[[package]]
-name = "deforge-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rolldown",
- "rolldown_common",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "deislet-integration-tests"
-version = "0.1.0"
-dependencies = [
- "deflux",
- "denira-workit",
- "tokio",
-]
-
-[[package]]
-name = "denictl"
+name = "deis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap 4.5.54",
  "colored",
- "deforge",
+ "deis-build",
  "dialoguer",
  "hyper 1.8.1",
  "indicatif",
@@ -1968,7 +1861,77 @@ dependencies = [
 ]
 
 [[package]]
-name = "denira"
+name = "deis-build"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap 4.5.54",
+ "colored",
+ "deis-build-adapter-cf",
+ "deis-build-adapter-dc",
+ "deis-build-adapter-eo",
+ "deis-build-core",
+ "indicatif",
+ "serde",
+ "serde_json",
+ "swc_common 18.0.1",
+ "swc_core",
+ "swc_ecma_ast 20.0.1",
+ "swc_ecma_parser 33.0.1",
+ "swc_ecma_visit 20.0.0",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+]
+
+[[package]]
+name = "deis-build-adapter-cf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deis-build-core",
+ "handlebars",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
+name = "deis-build-adapter-dc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deis-build-core",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
+name = "deis-build-adapter-eo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deis-build-core",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
+name = "deis-build-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rolldown",
+ "rolldown_common",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "deis-control"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1977,7 +1940,7 @@ dependencies = [
  "axum-server",
  "chrono",
  "dashmap 6.1.0",
- "denira-workit",
+ "deis-wire",
  "futures",
  "futures-util",
  "hex",
@@ -2008,32 +1971,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "denira-workit"
+name = "deis-proxy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "arc-swap",
  "async-trait",
+ "bytes",
  "chrono",
- "futures-util",
- "hex",
- "hmac",
- "prost",
- "pwrzv",
+ "deis-wire",
+ "futures",
+ "nix 0.30.1",
+ "openssl",
+ "pingora",
+ "regex",
+ "rusqlite",
  "serde",
  "serde_json",
- "sha2",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-stream",
- "tokio-tungstenite 0.24.0",
+ "toml",
  "tonic",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
- "uuid",
- "yasm 0.4.1",
+ "yasm 0.5.0",
 ]
 
 [[package]]
-name = "denix"
+name = "deis-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2075,6 +2041,40 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "deis-wire"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "hex",
+ "hmac",
+ "prost",
+ "pwrzv",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.24.0",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "yasm 0.4.1",
+]
+
+[[package]]
+name = "deislet-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "deis-proxy",
+ "deis-wire",
+ "tokio",
 ]
 
 [[package]]

@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package deis.supervisor;
+
+// SupervisorService manages the lifecycle and configuration of Proxy instances.
+service SupervisorService {
+  // Connect establishes a bi-directional stream for authentication,
+  // registration, and configuration updates.
+  rpc EstablishChannel(stream SupervisorMessage) returns (stream SupervisorMessage);
+}
+
+// Wrapper for all possible messages in the stream.
+message SupervisorMessage {
+  oneof payload {
+    // Client -> Server messages
+    AuthenticateRequest authenticate = 1;
+    RegisterRequest register = 2;
+    Heartbeat heartbeat = 3;
+
+    // Server -> Client messages
+    AuthResponse auth_response = 4;
+    RegisterResponse register_response = 5;
+    SystemConfig system_config = 6;
+    AppConfigs app_configs = 7;
+    ConfigUpdate config_update = 8;
+    CommandRequest command_request = 9;
+    CommandResponse command_response = 10;
+  }
+}
+
+// Client -> Server: Initial handshake
+message AuthenticateRequest {
+  string instance_id = 1;
+  string secret = 2;
+}
+
+// Server -> Client: Auth result
+message AuthResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Client -> Server: Worker registration
+message RegisterRequest {
+  // JSON encoded worker info, similar to existing implementation
+  string worker_info_json = 1;
+}
+
+// Server -> Client: Registration result
+message RegisterResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Client -> Server: Periodic heartbeat
+message Heartbeat {
+  string status = 1;
+  // Optional: Add load metrics here later
+}
+
+// Server -> Client: Global system configuration
+message SystemConfig {
+  string version = 1;
+  // JSON encoded configuration for flexibility during migration
+  string config_json = 2;
+}
+
+// Server -> Client: Application backend configuration
+message AppConfigs {
+  string version = 1;
+  // JSON encoded application list
+  string configs_json = 2;
+}
+
+// Server -> Client: Incremental config update
+message ConfigUpdate {
+  string key = 1;
+  string value_json = 2;
+  string version = 3;
+}
+
+// Server -> Client: Execute command
+message CommandRequest {
+  string id = 1;
+  string command = 2;
+  string args_json = 3;
+}
+
+// Client -> Server: Command result
+message CommandResponse {
+  string id = 1;
+  bool success = 2;
+  string message = 3;
+  string error = 4;
+}

@@ -7,14 +7,14 @@ authors.workspace = true
 publish = false
 
 [[bin]]
-name = "integration_workit_denira"
-path = "integration_workit_denira.rs"
+name = "integration_wire_control"
+path = "integration_wire_control.rs"
 
 [[bin]]
-name = "integration_deflux_denira"
-path = "integration_deflux_denira.rs"
+name = "integration_proxy_control"
+path = "integration_proxy_control.rs"
 
 [dependencies]
-denira-workit = { path = "../crates/workit" }
-deflux = { path = "../crates/deflux" }
+deis-wire = { path = "../crates/deis-wire" }
+deis-proxy = { path = "../crates/deis-proxy" }
 tokio = { version = "1", features = ["full"] }

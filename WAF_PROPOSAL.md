@@ -1,14 +1,14 @@
-# Deflux WAF 实现方案建议
+# Proxy WAF 实现方案建议
 
 **文档版本**: 1.0
 **创建日期**: 2026-01-16
-**目标组件**: Deflux (Load Balancer)
+**目标组件**: Proxy (Load Balancer)
 
 ---
 
 ## 执行摘要
 
-基于对 `pingora-waf`、`pingap`、`aralez` 和官方 Pingora 框架的深入分析，本文档提出了为 Deflux 添加 WAF（Web Application Firewall）功能的三个实现方案，并给出推荐方案和实施路线图。
+基于对 `pingora-waf`、`pingap`、`aralez` 和官方 Pingora 框架的深入分析，本文档提出了为 Proxy 添加 WAF（Web Application Firewall）功能的三个实现方案，并给出推荐方案和实施路线图。
 
 **核心需求**:
 - SQL 注入和 XSS 攻击防护
@@ -52,7 +52,7 @@
 
 **劣势**:
 - ❌ Pingora 版本不匹配（0.6 vs 0.5）
-- ❌ 配置系统与 Deflux 不兼容（YAML vs TOML）
+- ❌ 配置系统与 Proxy 不兼容（YAML vs TOML）
 - ❌ 缺乏插件化设计（硬编码规则）
 - ❌ 不支持自定义规则扩展
 
@@ -65,8 +65,8 @@
 ✓ 完整的插件系统架构
 ✓ 18+ 种插件（认证、安全、限流、缓存等）
 ✓ 基于 Pingora git-main（最新）
-✓ TOML 配置（与 Deflux 一致）
-✓ ArcSwap 配置热更新（与 Deflux 一致）
+✓ TOML 配置（与 Proxy 一致）
+✓ ArcSwap 配置热更新（与 Proxy 一致）
 ✓ DashMap 插件注册表
 ```
 
@@ -94,7 +94,7 @@ pub trait Plugin: Sync + Send {
 
 **优势**:
 - ✅ 插件架构高度可扩展
-- ✅ 配置系统与 Deflux 兼容
+- ✅ 配置系统与 Proxy 兼容
 - ✅ 多种现成的安全插件
 - ✅ 良好的性能设计（DashMap、ArcSwap）
 - ✅ 支持自定义插件
@@ -131,21 +131,21 @@ pub trait Plugin: Sync + Send {
 
 ## 2. 推荐方案
 
-基于 Deflux 的架构特点和需求，**推荐采用混合方案**：
+基于 Proxy 的架构特点和需求，**推荐采用混合方案**：
 
 ### 方案 A：插件化 WAF 架构（推荐 ⭐）
 
 **核心思路**:
 1. 采用 **pingap 的插件系统架构**（高扩展性）
 2. 移植 **pingora-waf 的检测规则**（完整的 WAF 能力）
-3. 使用 **Deflux 现有的配置系统**（TOML + ArcSwap）
+3. 使用 **Proxy 现有的配置系统**（TOML + ArcSwap）
 4. 通过 **Supervisor 管理 WAF 配置**（热更新）
 
 **架构设计**:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Deflux LB                             │
+│                        Proxy LB                             │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐    │
 │  │   Pingora   │  │  Config      │  │  Supervisor     │    │
 │  │   Proxy     │◄─┤  Manager     │◄─┤  Client         │    │
@@ -188,8 +188,8 @@ pub trait Plugin: Sync + Send {
 **技术栈**:
 - **插件系统**: 参考 pingap 的 Plugin Trait + PluginFactory
 - **检测规则**: 移植 pingora-waf 的 SecurityRule
-- **配置管理**: 扩展 Deflux 的 TOML 配置
-- **热更新**: 利用 Deflux 的 ArcSwap + Supervisor 通道
+- **配置管理**: 扩展 Proxy 的 TOML 配置
+- **热更新**: 利用 Proxy 的 ArcSwap + Supervisor 通道
 - **并发**: DashMap（插件注册）+ Arc（共享检测器）
 
 ---
@@ -201,7 +201,7 @@ pub trait Plugin: Sync + Send {
 **实施步骤**:
 1. Fork pingora-waf 并降级到 Pingora 0.5
 2. 适配配置系统（YAML → TOML）
-3. 集成到 Deflux 的 ProxyHttp 实现
+3. 集成到 Proxy 的 ProxyHttp 实现
 4. 通过 Supervisor 管理配置
 
 **优势**:
@@ -243,7 +243,7 @@ pub trait Plugin: Sync + Send {
 ### 3.1 模块结构
 
 ```
-crates/deflux/
+crates/deis-proxy/
 ├── src/
 │   ├── waf/                    # WAF 模块（新增）
 │   │   ├── mod.rs              # 模块入口
@@ -468,7 +468,7 @@ impl WafEngine {
 ```rust
 // src/proxy/service.rs
 #[async_trait]
-impl ProxyHttp for DefluxProxy {
+impl ProxyHttp for DeisProxy {
     type CTX = ProxyContext;
 
     fn new_ctx(&self) -> Self::CTX {
@@ -562,7 +562,7 @@ impl ProxyHttp for DefluxProxy {
 #### TOML 配置格式
 
 ```toml
-# deflux.toml
+# deis-proxy.toml
 
 # WAF 全局配置
 [waf]
@@ -640,9 +640,9 @@ pub struct PluginConfig {
     pub settings: HashMap<String, serde_json::Value>,
 }
 
-// 集成到 Deflux 的主配置
+// 集成到 Proxy 的主配置
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DefluxConfig {
+pub struct ProxyConfig {
     // 现有字段...
     pub waf: Option<WafConfig>,  // 新增
 }
@@ -663,7 +663,7 @@ pub enum SupervisorCommand {
     DisableWafPlugin { plugin: String },
 }
 
-impl DefluxSupervisorClient {
+impl ProxySupervisorClient {
     // 处理 WAF 配置更新
     async fn handle_waf_update(&mut self, config: WafConfig) -> Result<()> {
         info!("Applying WAF configuration update");
@@ -694,17 +694,17 @@ pub struct WafMetrics {
 impl WafMetrics {
     pub fn new(registry: &Registry) -> Result<Self> {
         let total = IntCounter::new(
-            "deflux_waf_total_requests",
+            "deis_proxy_waf_total_requests",
             "Total requests processed by WAF"
         )?;
 
         let blocked = IntCounterVec::new(
-            Opts::new("deflux_waf_blocked_requests", "Blocked requests by reason"),
+            Opts::new("deis_proxy_waf_blocked_requests", "Blocked requests by reason"),
             &["reason"]
         )?;
 
         let latency = HistogramVec::new(
-            HistogramOpts::new("deflux_waf_plugin_latency_ms", "Plugin execution latency"),
+            HistogramOpts::new("deis_proxy_waf_plugin_latency_ms", "Plugin execution latency"),
             &["plugin"]
         )?;
 
@@ -791,7 +791,7 @@ impl WafMetrics {
 
 - [ ] Supervisor 协议扩展（WAF 命令）
 - [ ] 配置热更新（ArcSwap）
-- [ ] Denira Web UI 集成（WAF 管理页面）
+- [ ] Control Web UI 集成（WAF 管理页面）
 - [ ] 规则验证和测试
 
 **交付物**:
@@ -845,7 +845,7 @@ impl WafMetrics {
 
 ### 6.1 Pingora 版本兼容性
 
-**风险**: Deflux 使用 Pingora 0.5，而 pingora-waf 基于 0.6
+**风险**: Proxy 使用 Pingora 0.5，而 pingora-waf 基于 0.6
 
 **缓解**:
 - 仅移植检测逻辑（正则表达式和检测函数）
@@ -967,7 +967,7 @@ impl WafMetrics {
    - [ ] 确定优先级
 
 2. **环境准备**
-   - [ ] 创建 `crates/deflux/src/waf/` 目录结构
+   - [ ] 创建 `crates/deis-proxy/src/waf/` 目录结构
    - [ ] 添加依赖到 Cargo.toml（regex, once_cell, dashmap 等）
    - [ ] 设置基准测试环境
 
@@ -1044,7 +1044,7 @@ tracing = "0.1"
 
 ## 附录 B：配置示例
 
-完整配置示例请参考：`examples/deflux-waf-config.toml`
+完整配置示例请参考：`examples/deis-proxy-waf-config.toml`
 
 ---
 

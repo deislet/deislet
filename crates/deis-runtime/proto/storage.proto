@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package deis.storage;
+
+// KV Store Service
+// Provides simple key-value storage
+service KvStore {
+  // Get a value
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // Set a value
+  rpc Set(SetRequest) returns (SetResponse);
+
+  // Delete a key
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // List keys matching a prefix
+  rpc List(ListRequest) returns (ListResponse);
+
+  // Check whether a key exists
+  rpc Has(HasRequest) returns (HasResponse);
+}
+
+// Get request
+message GetRequest {
+  string key = 1;
+}
+
+// Get response
+message GetResponse {
+  // If found, value is present; otherwise it is absent
+  optional string value = 1;
+}
+
+// Set request
+message SetRequest {
+  string key = 1;
+  string value = 2;
+}
+
+// Set response
+message SetResponse {
+  bool success = 1;
+}
+
+// Delete request
+message DeleteRequest {
+  string key = 1;
+}
+
+// Delete response
+message DeleteResponse {
+  bool success = 1;
+}
+
+// List request
+message ListRequest {
+  string prefix = 1;
+  // Optional pagination parameters
+  optional int32 limit = 2;
+  optional string cursor = 3;
+}
+
+// List response
+message ListResponse {
+  repeated string keys = 1;
+  // Cursor for the next page (if any)
+  optional string next_cursor = 2;
+}
+
+// Has request
+message HasRequest {
+  string key = 1;
+}
+
+// Has response
+message HasResponse {
+  bool exists = 1;
+}
+
+// Database Service
+// Provides SQL database functionality similar to Cloudflare D1
+service Database {
+  // Execute a SQL statement (INSERT, UPDATE, DELETE, etc.)
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Run a SQL query (SELECT)
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Execute multiple SQL statements in a batch
+  rpc Batch(BatchRequest) returns (BatchResponse);
+
+  // Prepare a statement
+  rpc Prepare(PrepareRequest) returns (PrepareResponse);
+
+  // Execute a prepared statement
+  rpc ExecutePrepared(ExecutePreparedRequest) returns (ExecuteResponse);
+
+  // Query with a prepared statement
+  rpc QueryPrepared(QueryPreparedRequest) returns (QueryResponse);
+}
+
+// Execute request
+message ExecuteRequest {
+  string sql = 1;
+  // JSON-encoded parameter array
+  optional string params = 2;
+}
+
+// Execute response
+message ExecuteResponse {
+  bool success = 1;
+  // Number of affected rows
+  int64 rows_affected = 2;
+  // Last inserted row ID
+  optional int64 last_insert_id = 3;
+  // Error message (if any)
+  optional string error = 4;
+}
+
+// Query request
+message QueryRequest {
+  string sql = 1;
+  // JSON-encoded parameter array
+  optional string params = 2;
+}
+
+// Query response
+message QueryResponse {
+  bool success = 1;
+  // JSON-encoded array of result rows
+  string rows = 2;
+  // Column names
+  repeated string columns = 3;
+  // Error message (if any)
+  optional string error = 4;
+}
+
+// Batch request
+message BatchRequest {
+  repeated ExecuteRequest statements = 1;
+}
+
+// Batch response
+message BatchResponse {
+  bool success = 1;
+  repeated ExecuteResponse results = 2;
+  optional string error = 3;
+}
+
+// Prepare request
+message PrepareRequest {
+  string sql = 1;
+}
+
+// Prepare response
+message PrepareResponse {
+  bool success = 1;
+  // Prepared statement ID
+  string statement_id = 2;
+  optional string error = 3;
+}
+
+// ExecutePrepared request
+message ExecutePreparedRequest {
+  string statement_id = 1;
+  // JSON-encoded parameter array
+  optional string params = 2;
+}
+
+// QueryPrepared request
+message QueryPreparedRequest {
+  string statement_id = 1;
+  // JSON-encoded parameter array
+  optional string params = 2;
+}

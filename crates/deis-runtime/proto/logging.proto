@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package deis.logging;
+
+// Log service - receives logs shipped by deis-runtime
+service LogService {
+    // Push logs (batched)
+    rpc PushLogs(PushLogsRequest) returns (PushLogsResponse);
+
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// Log level
+enum LogLevel {
+    LOG_LEVEL_UNSPECIFIED = 0;
+    TRACE = 1;
+    DEBUG = 2;
+    INFO = 3;
+    WARN = 4;
+    ERROR = 5;
+    FATAL = 6;
+}
+
+// A single log record
+message LogEntry {
+    // Timestamp (microseconds)
+    int64 timestamp_us = 1;
+
+    // Log level
+    LogLevel level = 2;
+
+    // Log source (worker ID)
+    string source = 3;
+
+    // Application ID (optional)
+    string app_id = 4;
+
+    // Log message
+    string message = 5;
+
+    // Structured fields
+    map<string, string> fields = 6;
+
+    // Trace ID (for distributed tracing)
+    string trace_id = 7;
+
+    // Span ID
+    string span_id = 8;
+}
+
+// Push logs request
+message PushLogsRequest {
+    // Batched log entries
+    repeated LogEntry entries = 1;
+
+    // Request metadata
+    map<string, string> metadata = 2;
+}
+
+// Push logs response
+message PushLogsResponse {
+    // Number of log entries successfully accepted
+    int32 accepted_count = 1;
+
+    // Number of log entries rejected
+    int32 rejected_count = 2;
+
+    // Error message (if any)
+    string error_message = 3;
+}
+
+// Health check request
+message HealthCheckRequest {}
+
+// Health check response
+message HealthCheckResponse {
+    // Service status
+    bool healthy = 1;
+
+    // Version info
+    string version = 2;
+}

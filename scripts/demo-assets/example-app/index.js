@@ -4,7 +4,7 @@ export default async function handler(ctx) {
   return new Response(
     JSON.stringify({
       app: "demo",
-      message: "Hello from Denix",
+      message: "Hello from Runtime",
       method,
       url,
       time: new Date().toISOString(),

@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package deis.blob;
+
+service BlobStore {
+  // Get object
+  rpc Get(GetRequest) returns (GetResponse);
+  
+  // Put object
+  rpc Put(PutRequest) returns (PutResponse);
+  
+  // Delete object
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  optional bytes data = 1;
+  optional string error = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes data = 2;
+}
+
+message PutResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  optional string error = 2;
+}

@@ -12,16 +12,16 @@
 | # | 原则 | 含义 |
 |---|---|---|
 | 1 | **资产优先** | 静态文件先命中先返回，未命中才落到函数。Workers 和 Pages 两半都做 |
-| 2 | **全量复制** | 每个 denix 节点都跑全部应用，与 CF 的边缘模型一致。不做按应用调度 |
-| 3 | **存储自建** | KV / DB / Blob / Queue 由独立组件 depot 提供，不外接 Redis/PG/MinIO，也不塞进控制面 |
+| 2 | **全量复制** | 每个 deis-runtime 节点都跑全部应用，与 CF 的边缘模型一致。不做按应用调度 |
+| 3 | **存储自建** | KV / DB / Blob / Queue 由独立组件 deis-store 提供，不外接 Redis/PG/MinIO，也不塞进控制面 |
 | 4 | **版本不可变** | 每次部署产生不可变版本，部署是指向版本的指针，回滚即改指针 |
-| 5 | **资产随包走** | 静态资产打进版本包，由 denix 服务，deflux 只做缓存。保证回滚天然覆盖资产 |
-| 6 | **cron 归属应用** | 定时任务挂在应用上，由 denira 挑一个健康节点直连 denix 触发 |
+| 5 | **资产随包走** | 静态资产打进版本包，由 deis-runtime 服务，deis-proxy 只做缓存。保证回滚天然覆盖资产 |
+| 6 | **cron 归属应用** | 定时任务挂在应用上，由 deis-control 挑一个健康节点直连 deis-runtime 触发 |
 | 7 | **大对象流式传输** | 应用包与 Blob 走流式分块；KV/DB 保持一次性调用，消息上限提到 16MB |
-| 8 | **节点主动拉** | denix 启动时向 denira 拉取「我该跑哪些应用的哪个版本」，拉完才报健康 |
-| 9 | **队列轮询消费** | denix 定期向 depot 拉自己该消费的消息，靠租约避免重复。depot 保持无状态 |
+| 8 | **节点主动拉** | deis-runtime 启动时向 deis-control 拉取「我该跑哪些应用的哪个版本」，拉完才报健康 |
+| 9 | **队列轮询消费** | deis-runtime 定期向 deis-store 拉自己该消费的消息，靠租约避免重复。deis-store 保持无状态 |
 | 10 | **环境维度** | 每个应用有 production 与任意多个预览环境，各自独立的版本指针、绑定与密钥 |
-| 11 | **观测独立** | 日志汇聚与指标提取由独立组件 delog 承担，不放进控制面。存活判断走直连健康检查，质量判断才查 delog |
+| 11 | **观测独立** | 日志汇聚与指标提取由独立组件 deis-telemetry 承担，不放进控制面。存活判断走直连健康检查，质量判断才查 deis-telemetry |
 
 ---
 
@@ -34,9 +34,9 @@ flowchart TB
 
     subgraph tool["工具链 · 开发者本地"]
         direction LR
-        denictl["<b>denictl</b> · CLI
+        deis["<b>deis</b> · CLI
         init / dev / validate / build / deploy / rollback"]
-        deforge["<b>deforge</b> · 编译器
+        deis-build["<b>deis-build</b> · 编译器
         SWC 解析 + rolldown 打包 + 平台能力校验"]
     end
 
@@ -49,18 +49,18 @@ flowchart TB
 
     subgraph self["线 A · 自建平台"]
         direction TB
-        deflux["<b>deflux</b> · 入口
+        deis-proxy["<b>deis-proxy</b> · 入口
         TLS + SNI 选证书 · 域名与路径选应用
         负载均衡 · 资产响应缓存"]
-        denix["<b>denix</b> · 运行时（每节点全量应用）
+        deis-runtime["<b>deis-runtime</b> · 运行时（每节点全量应用）
         资产优先命中 → 未命中起 V8 Isolate"]
-        depot["<b>depot</b> · 存储
+        deis-store["<b>deis-store</b> · 存储
         KV / DB / Blob / Queue 四套 gRPC 服务"]
-        delog["<b>delog</b> · 日志与指标
+        deis-telemetry["<b>deis-telemetry</b> · 日志与指标
         接收全组件日志 · 提取指标 · 供查询"]
     end
 
-    denira["<b>denira</b> · 控制面
+    deis-control["<b>deis-control</b> · 控制面
     版本与部署 · 环境 · 路由绑定 · 绑定与密钥
     节点管理 · cron 调度 · 日志汇聚与指标提取
     REST + Vue 面板 + Prometheus"]
@@ -68,44 +68,44 @@ flowchart TB
     coraza["<b>coraza</b> · WAF"]
     capkit["<b>capkit</b> · 多云能力"]
 
-    canon -.规范.-> deforge
-    canon -.规范.-> denix
-    denictl --委托--> deforge
-    deforge --产出第三方代码--> third
-    denictl --"deploy / rollback"--> denira
+    canon -.规范.-> deis-build
+    canon -.规范.-> deis-runtime
+    deis --委托--> deis-build
+    deis-build --产出第三方代码--> third
+    deis --"deploy / rollback"--> deis-control
 
-    deflux --转发--> denix
-    denix --"ctx.kv / db / blob / queue"--> depot
-    denix --"轮询拉队列消息"--> depot
-    deflux <-->|"workit gRPC"| denira
-    denira --"部署版本 / 查状态 / cron 触发"--> denix
-    denix --"启动拉配置"--> denira
-    denira --"建 namespace / 授权"--> depot
-    deflux --日志--> delog
-    denix --日志--> delog
-    depot --日志--> delog
-    denira --日志--> delog
-    denira --"查聚合指标"--> delog
+    deis-proxy --转发--> deis-runtime
+    deis-runtime --"ctx.kv / db / blob / queue"--> deis-store
+    deis-runtime --"轮询拉队列消息"--> deis-store
+    deis-proxy <-->|"deis-wire gRPC"| deis-control
+    deis-control --"部署版本 / 查状态 / cron 触发"--> deis-runtime
+    deis-runtime --"启动拉配置"--> deis-control
+    deis-control --"建 namespace / 授权"--> deis-store
+    deis-proxy --日志--> deis-telemetry
+    deis-runtime --日志--> deis-telemetry
+    deis-store --日志--> deis-telemetry
+    deis-control --日志--> deis-telemetry
+    deis-control --"查聚合指标"--> deis-telemetry
 
-    coraza -.待接入.-> deflux
-    capkit -.待接入.-> denira
+    coraza -.待接入.-> deis-proxy
+    capkit -.待接入.-> deis-control
 
     classDef done fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
     classDef new fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#01579b
     classDef gap fill:#fff3e0,stroke:#e65100,stroke-width:2px,stroke-dasharray:4 3,color:#e65100
-    class deflux,denix,denira,deforge done
-    class depot,delog new
-    class coraza,capkit,denictl gap
+    class deis-proxy,deis-runtime,deis-control,deis-build done
+    class deis-store,deis-telemetry new
+    class coraza,capkit,deis gap
 ```
 
-### denix 的定位变化
+### deis-runtime 的定位变化
 
-原先 denix 是纯被动的自治节点：不主动连任何人，等 denira 调它的管理面。现在**多了两条它主动发起的连接**：
+原先 deis-runtime 是纯被动的自治节点：不主动连任何人，等 deis-control 调它的管理面。现在**多了两条它主动发起的连接**：
 
-- 启动时向 denira 拉应用清单（原则 8）
-- 日志批量投递给 delog
+- 启动时向 deis-control 拉应用清单（原则 8）
+- 日志批量投递给 deis-telemetry
 
-自治性本身没变——拉完之后本地 SQLite 就能撑住，denira 挂了照常服务。但「denix 从不外连」这条不再成立，配置里需要有 denira 的地址。
+自治性本身没变——拉完之后本地 SQLite 就能撑住，deis-control 挂了照常服务。但「deis-runtime 从不外连」这条不再成立，配置里需要有 deis-control 的地址。
 
 ---
 
@@ -123,7 +123,7 @@ erDiagram
     ENVIRONMENT ||--o{ CRON : "定义"
     VERSION ||--|| BUNDLE : "含"
     BUNDLE ||--o{ ASSET : "含静态资产"
-    BINDING }o--|| NAMESPACE : "指向 depot 里的"
+    BINDING }o--|| NAMESPACE : "指向 deis-store 里的"
 
     APP {
         string id PK
@@ -176,7 +176,7 @@ erDiagram
 
 **环境是第二主键。** 部署指针、路由、绑定、密钥、定时任务全部挂在「应用 + 环境」上，不挂在应用上。这样预览环境用自己的 KV namespace，测试数据不会写脏生产。版本本身跨环境共享——同一个包可以先部署到 dev 验证，再把 production 的指针指向它，不用重新上传。
 
-**存储位置**：以上全部是 denira 的 SQLite，denira 是元数据的唯一权威。denix 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪个版本」，用于断网自治。
+**存储位置**：以上全部是 deis-control 的 SQLite，deis-control 是元数据的唯一权威。deis-runtime 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪个版本」，用于断网自治。
 
 ### 与现有代码的差距
 
@@ -186,7 +186,7 @@ erDiagram
 | ENVIRONMENT | 没有 |
 | VERSION | 没有。`AppManifest.version` 是用户手写字符串，不是平台生成的版本 |
 | DEPLOYMENT | 没有。`DeployApp` 直接热替换 |
-| ROUTE | 半个。deflux 只有域名级，没有路径段 |
+| ROUTE | 半个。deis-proxy 只有域名级，没有路径段 |
 | BINDING | 没有。`AppManifest.resources: Vec<String>` 是雏形，含义未定义、无人消费 |
 | SECRET | 没有。只有明文 `env` |
 | CRON | 有但接错了，挂在 worker 上 |
@@ -200,13 +200,13 @@ erDiagram
 sequenceDiagram
     autonumber
     actor Dev as 开发者
-    participant CLI as denictl
-    participant R as denira
-    participant X as denix ×N
-    participant F as deflux
+    participant CLI as deis
+    participant R as deis-control
+    participant X as deis-runtime ×N
+    participant F as deis-proxy
 
-    Dev->>CLI: denictl deploy --env dev
-    CLI->>CLI: 调 deforge 编译打包（函数 + 静态资产）
+    Dev->>CLI: deis deploy --env dev
+    CLI->>CLI: 调 deis-build 编译打包（函数 + 静态资产）
     CLI->>R: 流式上传 ZIP + manifest
     R->>R: 算 checksum，与已有版本比对
     alt 内容相同
@@ -228,14 +228,14 @@ sequenceDiagram
     end
 
     Note over Dev,F: —— dev 验证通过，推生产 ——
-    Dev->>CLI: denictl promote v(N+1) --to production
+    Dev->>CLI: deis promote v(N+1) --to production
     R->>R: production 的 DEPLOYMENT 指向 v(N+1)
     Note over R,X: 包已在各节点，无需重传
     R->>X: ActivateVersion
     R->>F: ConfigUpdate
 
     Note over Dev,F: —— 出问题，回滚 ——
-    Dev->>CLI: denictl rollback --env production
+    Dev->>CLI: deis rollback --env production
     R->>R: 指针改回 v(N)
     R->>X: ActivateVersion(v(N))
     R-->>CLI: ✓ 秒级完成
@@ -244,7 +244,7 @@ sequenceDiagram
 - **版本保留**：每应用默认保留最近 10 个包，超出即删。回滚只在保留窗口内秒级完成。
 - **去重**：checksum 相同不新建版本，避免反复 deploy 同样代码堆出一堆版本。
 - **部署失败不切指针**：任一节点没 ack，指针不动，旧版本继续服务。比「切了再回滚」安全。
-- **不做百分比灰度**。全量复制下灰度需要 denix 同时驻留两个版本的 Isolate，本轮不做，但模型留了口子。
+- **不做百分比灰度**。全量复制下灰度需要 deis-runtime 同时驻留两个版本的 Isolate，本轮不做，但模型留了口子。
 
 ---
 
@@ -252,19 +252,19 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-    req["请求进来"] --> tls["deflux：TLS 握手<br/>按 SNI 选证书"]
-    tls --> pick["deflux：选应用与环境<br/>① x-deis-app-id 头<br/>② 域名+路径 精确<br/>③ 域名+路径 通配<br/>④ 预览子域 env.app.zone"]
+    req["请求进来"] --> tls["deis-proxy：TLS 握手<br/>按 SNI 选证书"]
+    tls --> pick["deis-proxy：选应用与环境<br/>① x-deis-app-id 头<br/>② 域名+路径 精确<br/>③ 域名+路径 通配<br/>④ 预览子域 env.app.zone"]
     pick -->|没匹配| e404["404"]
     pick -->|应用禁用| e403["403"]
-    pick --> cache{"deflux 缓存<br/>有这个资产吗"}
-    cache -->|命中| hit["直接返回<br/>不碰 denix"]
-    cache -->|未命中| fwd["转发到 denix"]
-    fwd --> asset{"denix：路径命中<br/>当前版本资产清单吗"}
+    pick --> cache{"deis-proxy 缓存<br/>有这个资产吗"}
+    cache -->|命中| hit["直接返回<br/>不碰 deis-runtime"]
+    cache -->|未命中| fwd["转发到 deis-runtime"]
+    fwd --> asset{"deis-runtime：路径命中<br/>当前版本资产清单吗"}
     asset -->|命中| serve["读本地文件返回<br/><b>不起 Isolate</b><br/>带 Cache-Control 与 ETag"]
     asset -->|未命中| fn["起 V8 Isolate 跑函数<br/>路径参数交给应用内部路由"]
     serve --> back["回程"]
     fn --> back
-    back --> store["deflux 按 Cache-Control 缓存"]
+    back --> store["deis-proxy 按 Cache-Control 缓存"]
     hit --> done["响应"]
     store --> done
 
@@ -285,31 +285,31 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     autonumber
-    participant F as deflux（Worker）
-    participant R as denira
-    participant X as denix
-    participant D as depot
-    participant L as delog
+    participant F as deis-proxy（Worker）
+    participant R as deis-control
+    participant X as deis-runtime
+    participant D as deis-store
+    participant L as deis-telemetry
 
     rect rgb(232, 245, 233)
-    Note over F,R: ① deflux 主动连 denira —— 不变
+    Note over F,R: ① deis-proxy 主动连 deis-control —— 不变
     F->>R: 认证、注册、心跳
     R->>F: 路由表（含路径与环境）、系统策略、命令
     end
 
     rect rgb(227, 242, 253)
-    Note over X,R: ② denix 启动自举 —— 新增
+    Note over X,R: ② deis-runtime 启动自举 —— 新增
     X->>R: 我上线了，该跑哪些应用的哪个版本
     R-->>X: 清单（app, environment, version）
     loop 逐个拉取
         X->>R: 流式拉版本包
     end
     X->>R: 同步完成，可以接流量
-    Note over R,F: 此前该节点不进 deflux 上游池
+    Note over R,F: 此前该节点不进 deis-proxy 上游池
     end
 
     rect rgb(227, 242, 253)
-    Note over R,X: ③ denira 管理 denix —— 扩展
+    Note over R,X: ③ deis-control 管理 deis-runtime —— 扩展
     R->>X: DeployVersion / ActivateVersion
     R->>X: 下发 bindings 与 secrets（只进内存，不落盘）
     loop 轮询
@@ -327,7 +327,7 @@ sequenceDiagram
     end
 
     rect rgb(243, 229, 245)
-    Note over X,L: ⑤ 日志汇聚 —— 目标是 delog，不是 denira
+    Note over X,L: ⑤ 日志汇聚 —— 目标是 deis-telemetry，不是 deis-control
     X-)L: LogService.PushLogs（批量、背压、丢弃最旧）
     F-)L: 访问日志（请求量与耗时的主要来源）
     D-)L: 存储服务日志
@@ -348,13 +348,13 @@ sequenceDiagram
     end
 ```
 
-**cron 为什么这么改**：任务在概念上属于应用，不属于节点。全量复制下每个节点都有这个应用，谁执行由 denira 决定——挑一个健康节点触发，天然避免重复。denira 本来就是单点，不需要 leader 选举。
+**cron 为什么这么改**：任务在概念上属于应用，不属于节点。全量复制下每个节点都有这个应用，谁执行由 deis-control 决定——挑一个健康节点触发，天然避免重复。deis-control 本来就是单点，不需要 leader 选举。
 
 ---
 
-## 6. depot：存储组件
+## 6. deis-store：存储组件
 
-新 crate（`crates/depot`），四套 gRPC 服务。proto 复用 denix 现有的 `storage.proto`、`blob.proto`、`queue.proto`——客户端已经写好，接口基本不用重新设计。
+新 crate（`crates/deis-store`），四套 gRPC 服务。proto 复用 deis-runtime 现有的 `storage.proto`、`blob.proto`、`queue.proto`——客户端已经写好，接口基本不用重新设计。
 
 | 服务 | 底层 | 隔离 | proto 改动 |
 |---|---|---|---|
@@ -367,41 +367,41 @@ sequenceDiagram
 
 现在 `queue.proto` 只有 `Send` 和 `SendBatch`，**没有任何消费接口**。补齐后的语义：
 
-- **拉模式**：denix 定期 `Receive(queue, max, lease_secs)`，depot 把消息标记为「租约中」并返回。
-- **租约**：租约期内其他节点看不到这条消息。超时未 Ack 则重新可见。全量复制下多个 denix 拉同一队列，靠这个防重复消费。
+- **拉模式**：deis-runtime 定期 `Receive(queue, max, lease_secs)`，deis-store 把消息标记为「租约中」并返回。
+- **租约**：租约期内其他节点看不到这条消息。超时未 Ack 则重新可见。全量复制下多个 deis-runtime 拉同一队列，靠这个防重复消费。
 - **至少一次**：Ack 之前的崩溃会导致重投。应用侧需要幂等。
 - **死信**：重试超过 N 次（默认 5）进死信队列，不再投递，留待人工处理。
 
 ### 其他取舍
 
 - **先单机**。SQLite + 本地盘对内部使用够用。接口层不暴露单机假设，以后换后端不动 proto。
-- **授权由 depot 自己校验**，不信任调用方。调用带 app_id + environment + binding 名，depot 查授权表。否则拿到地址就能读所有数据。
-- **不做跨节点复制**。depot 单实例，是全量复制模型下唯一的有状态点，也是单点。内部使用先接受，需配定期快照备份。
-- **地址由 denira 下发**给 denix，不写死在 denix 配置里。
+- **授权由 deis-store 自己校验**，不信任调用方。调用带 app_id + environment + binding 名，deis-store 查授权表。否则拿到地址就能读所有数据。
+- **不做跨节点复制**。deis-store 单实例，是全量复制模型下唯一的有状态点，也是单点。内部使用先接受，需配定期快照备份。
+- **地址由 deis-control 下发**给 deis-runtime，不写死在 deis-runtime 配置里。
 
 ---
 
-## 7. delog：日志汇聚与指标
+## 7. deis-telemetry：日志汇聚与指标
 
 ### 为什么必须独立成一个组件
 
-本设计早前的版本把日志汇聚安在 denira 上，那是错的。denira 一旦既接收全部日志、又依据日志做调度决策，就形成了闭环：
+本设计早前的版本把日志汇聚安在 deis-control 上，那是错的。deis-control 一旦既接收全部日志、又依据日志做调度决策，就形成了闭环：
 
 ```mermaid
 flowchart LR
-    subgraph bad["错误的形状：denira 既当记分员又当裁判"]
+    subgraph bad["错误的形状：deis-control 既当记分员又当裁判"]
         direction TB
-        c1["deflux / denix / depot"] -->|"写日志"| r1["<b>denira</b>
+        c1["deis-proxy / deis-runtime / deis-store"] -->|"写日志"| r1["<b>deis-control</b>
         接收日志 · 提取指标 · 依据指标决策 · 下发调度"]
         r1 -->|"调度"| c1
         r1 -.->|"自己的日志给自己"| r1
     end
 
-    subgraph good["拆开后：delog 对谁都不依赖"]
+    subgraph good["拆开后：deis-telemetry 对谁都不依赖"]
         direction TB
-        c2["deflux / denix / depot / denira"] -->|"写日志"| d2["<b>delog</b>
+        c2["deis-proxy / deis-runtime / deis-store / deis-control"] -->|"写日志"| d2["<b>deis-telemetry</b>
         接收 · 存储 · 提取指标 · 供查询"]
-        r2["<b>denira</b>
+        r2["<b>deis-control</b>
         查询聚合指标 · 决策 · 下发调度"] -->|"查询"| d2
         r2 -->|"调度"| c2
     end
@@ -415,50 +415,50 @@ flowchart LR
 具体是三个问题，不只是形状难看：
 
 1. **数据性质冲突**。日志是高频追加的时序数据，控制元数据是低频可变的关系数据。挤在同一个 SQLite 里会写竞争，一次日志洪峰能把部署操作拖慢甚至阻塞。
-2. **自我观测盲区**。denira 自己出故障时，本该记录这次故障的东西正是出故障的东西。控制面是最需要事后追查的部分，却恰恰没有记录。
-3. **故障放大**。日志处理的一个 bug 能拖垮控制面；反过来，重启 denira 做版本升级会中断整条日志管道。两件事的可用性要求完全不同——丢日志可以接受，丢部署元数据不行。
+2. **自我观测盲区**。deis-control 自己出故障时，本该记录这次故障的东西正是出故障的东西。控制面是最需要事后追查的部分，却恰恰没有记录。
+3. **故障放大**。日志处理的一个 bug 能拖垮控制面；反过来，重启 deis-control 做版本升级会中断整条日志管道。两件事的可用性要求完全不同——丢日志可以接受，丢部署元数据不行。
 
-拆开之后 delog **对任何组件都不依赖**，denira 退回成它的一个查询方。这不是把环改成大环，是真的断开。
+拆开之后 deis-telemetry **对任何组件都不依赖**，deis-control 退回成它的一个查询方。这不是把环改成大环，是真的断开。
 
-### 保持解耦的关键：delog 必须是「哑」的
+### 保持解耦的关键：deis-telemetry 必须是「哑」的
 
-delog 只做：接收带标签的日志条目、存储、按规则聚合、供查询。**它不认识应用模型**——不知道什么是版本、环境、部署指针，也不做任何判断。所有解释工作在 denira。
+deis-telemetry 只做：接收带标签的日志条目、存储、按规则聚合、供查询。**它不认识应用模型**——不知道什么是版本、环境、部署指针，也不做任何判断。所有解释工作在 deis-control。
 
-一旦 delog 开始理解应用语义（比如"这个应用错误率高，通知 denira 回滚"），依赖就又长回去了。
+一旦 deis-telemetry 开始理解应用语义（比如"这个应用错误率高，通知 deis-control 回滚"），依赖就又长回去了。
 
 ### 职责边界
 
 | 能力 | 说明 |
 |---|---|
-| **接收** | `LogService.PushLogs`，批量、幂等。来源包括 denix、deflux、depot，以及 denira 自己 |
+| **接收** | `LogService.PushLogs`，批量、幂等。来源包括 deis-runtime、deis-proxy、deis-store，以及 deis-control 自己 |
 | **存储与保留** | 按天分表的 SQLite，按时间与总量双重上限淘汰。日志可丢，不做备份 |
 | **指标提取** | 落实 edge-canon 定的 Log-based Metrics：从结构化字段里按规则提取计数、耗时分布、错误率 |
-| **查询 API** | 供 denira 决策与 Web 面板展示。**denira 查的是聚合指标，不是原始日志流** |
-| **Prometheus** | 由 delog 暴露应用与请求维度的指标 |
+| **查询 API** | 供 deis-control 决策与 Web 面板展示。**deis-control 查的是聚合指标，不是原始日志流** |
+| **Prometheus** | 由 deis-telemetry 暴露应用与请求维度的指标 |
 | **实时 tail** | 流式订阅，供开发者看某个应用的实时日志（类似 `wrangler tail`） |
 
-delog 自己的日志只写 stderr，不自摄入，避免递归。
+deis-telemetry 自己的日志只写 stderr，不自摄入，避免递归。
 
 ### 硬约束：两条观测路径必须分开
 
 这是把日志用于决策时最容易踩的坑，写死在设计里：
 
-- **存活判断走直连**：denira → denix / deflux 的健康检查，不经过 delog。这条路必须快且可靠。
-- **质量判断走 delog**：错误率、耗时退化、自动回滚这类统计性决策，查 delog 的聚合指标。这条路慢、可降级。
+- **存活判断走直连**：deis-control → deis-runtime / deis-proxy 的健康检查，不经过 deis-telemetry。这条路必须快且可靠。
+- **质量判断走 deis-telemetry**：错误率、耗时退化、自动回滚这类统计性决策，查 deis-telemetry 的聚合指标。这条路慢、可降级。
 
-如果存活判断依赖 delog，那 delog 一挂，整个集群会被误判成全部死亡，然后触发一轮灾难性的调度。
+如果存活判断依赖 deis-telemetry，那 deis-telemetry 一挂，整个集群会被误判成全部死亡，然后触发一轮灾难性的调度。
 
 ### 与现有代码的关系
 
 这不是重构，是把已有的东西接到正确的地方：
 
-- `crates/denix/proto/logging.proto` **本来就是按独立服务设计的**——`source` 是通用来源标识，带 `app_id`、`trace_id`、`span_id`，还自带 `HealthCheck`。它从一开始就不是 denira 的一部分。
-- denix 的 `logging/shipper.rs` 已经是「配一个 endpoint、批量投递、指数退避」的形态，`ShipperConfig.endpoint` 指向 delog 即可，投递逻辑本身要补的只是真正的 gRPC 调用。
-- denix 的 `LogBuffer` 是固定容量环形缓冲、丢最旧，delog 不可达时应用照常服务。deflux 和 depot 需要各自加一个同样的缓冲与投递。
+- `crates/deis-runtime/proto/logging.proto` **本来就是按独立服务设计的**——`source` 是通用来源标识，带 `app_id`、`trace_id`、`span_id`，还自带 `HealthCheck`。它从一开始就不是 deis-control 的一部分。
+- deis-runtime 的 `logging/shipper.rs` 已经是「配一个 endpoint、批量投递、指数退避」的形态，`ShipperConfig.endpoint` 指向 deis-telemetry 即可，投递逻辑本身要补的只是真正的 gRPC 调用。
+- deis-runtime 的 `LogBuffer` 是固定容量环形缓冲、丢最旧，deis-telemetry 不可达时应用照常服务。deis-proxy 和 deis-store 需要各自加一个同样的缓冲与投递。
 
 ### 可选的中间路线
 
-如果不想多一个进程，可以让 delog 和 depot 跑在同一个二进制里，作为两个独立服务、两套独立存储。代码与数据仍然分离，以后能平滑拆开。代价是失去故障隔离——日志洪峰会影响用户数据服务的响应。**建议还是分开**：delog 是全系统吞吐最高的数据通道，把它和用户数据放一起，等于让平台自身的可观测性去和业务抢资源。
+如果不想多一个进程，可以让 deis-telemetry 和 deis-store 跑在同一个二进制里，作为两个独立服务、两套独立存储。代码与数据仍然分离，以后能平滑拆开。代价是失去故障隔离——日志洪峰会影响用户数据服务的响应。**建议还是分开**：deis-telemetry 是全系统吞吐最高的数据通道，把它和用户数据放一起，等于让平台自身的可观测性去和业务抢资源。
 
 ---
 
@@ -476,12 +476,12 @@ delog 自己的日志只写 stderr，不自摄入，避免递归。
 }
 ```
 
-代码里 `ctx.services.kv` 拿到的就是绑到该 namespace 的客户端。denira 在部署时确保 namespace 存在并授权，denix 起 Isolate 时按 binding 注入。**绑定按环境分**——预览环境指向自己的 namespace，不碰生产数据。
+代码里 `ctx.services.kv` 拿到的就是绑到该 namespace 的客户端。deis-control 在部署时确保 namespace 存在并授权，deis-runtime 起 Isolate 时按 binding 注入。**绑定按环境分**——预览环境指向自己的 namespace，不碰生产数据。
 
 **Secrets**：与普通 env 彻底分开。
 
-- denira 用主密钥（从环境变量或文件读，不进代码不进库）加密后存 SQLite。
-- 下发给 denix 时经 TLS 传明文，denix **只放内存**，不落本地 SQLite。节点重启后重新拉。
+- deis-control 用主密钥（从环境变量或文件读，不进代码不进库）加密后存 SQLite。
+- 下发给 deis-runtime 时经 TLS 传明文，deis-runtime **只放内存**，不落本地 SQLite。节点重启后重新拉。
 - 面板和 CLI 只能写和删，不能读回。
 - 现状是明文 env 经 gRPC 下发、明文落 SQLite，属于必须改的。
 
@@ -489,7 +489,7 @@ delog 自己的日志只写 stderr，不自摄入，避免递归。
 
 ## 9. 限额
 
-现状全部写死在代码里（30 秒超时、1000 ops/s、堆上限），改成三层：平台默认（denix 配置）→ 应用覆盖（denira 下发）→ 硬上限（应用覆盖不能突破）。
+现状全部写死在代码里（30 秒超时、1000 ops/s、堆上限），改成三层：平台默认（deis-runtime 配置）→ 应用覆盖（deis-control 下发）→ 硬上限（应用覆盖不能突破）。
 
 两项现在完全没有的：
 
@@ -502,11 +502,11 @@ delog 自己的日志只写 stderr，不自摄入，避免递归。
 
 | 阶段 | 内容 | 说明 |
 |---|---|---|
-| **一 · A** | depot：四套服务 + 授权 + namespace 管理；补队列消费接口；denira 加 namespace 与 binding 管理 | 完全独立可测，不动现有组件 |
-| **一 · B** | deforge 增加 `Platform::Deislet` 与 adapter：产出含函数入口、路由表、资产清单的应用包；`ctx.params` 随之成立 | 与 A 并行。它是路由参数、静态资产、版本包结构的共同前提，晚做会拖住阶段二和三 |
-| **二** | 版本、环境与部署模型：数据表、流式传包、DeployVersion / ActivateVersion、节点自举拉取、denictl deploy/promote/rollback | 依赖一·B 定下的包结构 |
-| **三** | 静态资产：包内带资产、denix 资产优先命中、deflux 路径级路由与缓存、自动子域 | 依赖阶段二的版本包结构 |
-| **四** | 可观测：delog 组件（接收、保留、指标提取、查询与 Prometheus）；denix / deflux / depot 三侧投递；denix 真实状态上报；面板展示 | 前三阶段跑通后才有真数据可看。delog 本身不依赖任何组件，也可提前起手 |
+| **一 · A** | deis-store：四套服务 + 授权 + namespace 管理；补队列消费接口；deis-control 加 namespace 与 binding 管理 | 完全独立可测，不动现有组件 |
+| **一 · B** | deis-build 增加 `Platform::Deislet` 与 adapter：产出含函数入口、路由表、资产清单的应用包；`ctx.params` 随之成立 | 与 A 并行。它是路由参数、静态资产、版本包结构的共同前提，晚做会拖住阶段二和三 |
+| **二** | 版本、环境与部署模型：数据表、流式传包、DeployVersion / ActivateVersion、节点自举拉取、deis deploy/promote/rollback | 依赖一·B 定下的包结构 |
+| **三** | 静态资产：包内带资产、deis-runtime 资产优先命中、deis-proxy 路径级路由与缓存、自动子域 | 依赖阶段二的版本包结构 |
+| **四** | 可观测：deis-telemetry 组件（接收、保留、指标提取、查询与 Prometheus）；deis-runtime / deis-proxy / deis-store 三侧投递；deis-runtime 真实状态上报；面板展示 | 前三阶段跑通后才有真数据可看。deis-telemetry 本身不依赖任何组件，也可提前起手 |
 | **五** | cron 修正、secrets、限额三层化、出网控制 | 收尾的正确性与安全项 |
 
 ---
@@ -516,21 +516,21 @@ delog 自己的日志只写 stderr，不自摄入，避免递归。
 **边做边定**
 
 - 证书自动签发（ACME）。自动子域需要泛域名证书，届时一并考虑。`examples/pingap` 有现成模块可参考。
-- `denictl dev` 怎么执行用户代码。现在返回假响应。三条路：起本地 denix、调 deno CLI、把 deno_core 嵌进 denictl。
-- delog 的日志保留时长与总量上限，以及从结构化日志里提取哪些字段成为指标。
-- delog 与 depot 是否合并为同一个二进制（设计倾向分开，见 §7）。
+- `deis dev` 怎么执行用户代码。现在返回假响应。三条路：起本地 deis-runtime、调 deno CLI、把 deno_core 嵌进 deis。
+- deis-telemetry 的日志保留时长与总量上限，以及从结构化日志里提取哪些字段成为指标。
+- deis-telemetry 与 deis-store 是否合并为同一个二进制（设计倾向分开，见 §7）。
 - 出网控制用黑名单还是白名单。
-- depot 的备份周期与保留策略。
+- deis-store 的备份周期与保留策略。
 
 **涉及对外承诺，需单独处理**
 
-- **WebSocket 端到端从未验证**。pingora 内置支持 upgrade 隧道，denix 也有 WS 桥接，但两头从没连起来测过；HTTP/2 下还需要 extended CONNECT。而 `PLATFORM_MATRIX.md` 已写 ✅ Native。
+- **WebSocket 端到端从未验证**。pingora 内置支持 upgrade 隧道，deis-runtime 也有 WS 桥接，但两头从没连起来测过；HTTP/2 下还需要 extended CONNECT。而 `PLATFORM_MATRIX.md` 已写 ✅ Native。
 - **`edge-canon/PLATFORM_MATRIX.md` 过度承诺**。Deislet 一列几乎全 ✅，实际大半为空。这是公开仓库，要么加「实现状态」列，要么把未实现的降级为「计划中」。
-- **denira 面板认证是 API Key 且默认关闭**（`api_auth_enabled` 默认 false），没有用户与角色概念。
+- **deis-control 面板认证是 API Key 且默认关闭**（`api_auth_enabled` 默认 false），没有用户与角色概念。
 
 **明确推迟**
 
-百分比灰度、Durable Objects、depot 多副本高可用、计费与配额。
+百分比灰度、Durable Objects、deis-store 多副本高可用、计费与配额。
 
 ---
 
@@ -549,7 +549,7 @@ delog 自己的日志只写 stderr，不自摄入，避免递归。
 | KV 存储 | ✅ | **不成立** | op 齐全，但需要 OpState 里有 `KvClient`；无服务端时运行时返回 "KV service not available" |
 | Cache API | ✅ | 成立 | moka 进程内缓存，`globalThis.caches` 已挂。语义上是单节点缓存，与 CF 的 per-colo 缓存接近 |
 | 生命周期 `waitUntil` | ✅ | 成立 | `runtime.js` 中已实现 |
-| 结构化日志 | ✅ | 部分成立 | 本地 `op_log` → 环形缓冲正常；投递是空壳，且接收端（delog）尚不存在 |
+| 结构化日志 | ✅ | 部分成立 | 本地 `op_log` → 环形缓冲正常；投递是空壳，且接收端（deis-telemetry）尚不存在 |
 | Web 标准 | ✅ | 成立 | deno_web / fetch / crypto / net / websocket / tls 均已注册 |
 
 ### 扩展特性
@@ -565,13 +565,13 @@ delog 自己的日志只写 stderr，不自摄入，避免递归。
 | 定时任务 | ✅ Native | **不成立** | 链路三段错位，见 §5 |
 | 消息队列 | ✅ Native (Memory) | **不成立** | 运行时只有 `op_queue_send`，无消费 op；无服务端 |
 | Durable Objects | ⚠️ Planned | 与表一致 | — |
-| WebSocket | ✅ Native | 未验证 | denix 有 `ws_server_ops`；deflux 侧 pingora 内置 upgrade 隧道支持，但两端从未端到端验证；HTTP/2 下还需 extended CONNECT |
+| WebSocket | ✅ Native | 未验证 | deis-runtime 有 `ws_server_ops`；deis-proxy 侧 pingora 内置 upgrade 隧道支持，但两端从未端到端验证；HTTP/2 下还需 extended CONNECT |
 | BroadcastChannel | ✅ Native | 成立（单进程） | `InMemoryBroadcastChannel`，跨节点不通。全量复制下同一应用在多节点各有一份，广播不互通 |
 | Workers AI | ❌ | 与表一致 | — |
 
 ### 矩阵没体现的缺口：工具链没有自家平台目标
 
-`deforge` 的 `Platform` 枚举只有 `Cloudflare` / `Deno` / `Tencent`，**没有 Deislet**。编译器不能为自家平台产出代码。
+`deis-build` 的 `Platform` 枚举只有 `Cloudflare` / `Deno` / `Tencent`，**没有 Deislet**。编译器不能为自家平台产出代码。
 
 后果：
 
@@ -579,14 +579,14 @@ delog 自己的日志只写 stderr，不自摄入，避免递归。
 - edge-canon §5 的自动路由（文件路径映射到 URL 路径）在自家平台上编译不出来。**这也是 `ctx.params` 恒为空的根因**：文件路由的参数本该由编译器生成的分发代码填充，而自家平台没有编译目标，所以没人填。
 - 静态资产（§4）要求包里带资产清单，同样需要编译器产出。
 
-**补齐路径**：`deforge` 增加 `Platform::Deislet` 与对应 adapter，产出包含函数入口、路由表、资产清单的应用包，`denictl deploy` 直接上传该包。这项应排进落地顺序的阶段二，它是版本包结构的前提。
+**补齐路径**：`deis-build` 增加 `Platform::Deislet` 与对应 adapter，产出包含函数入口、路由表、资产清单的应用包，`deis deploy` 直接上传该包。这项应排进落地顺序的阶段二，它是版本包结构的前提。
 
 ### 补齐工作量分组
 
 | 组 | 项目 | 说明 |
 |---|---|---|
-| **随阶段一自然补齐** | KV、SQL 数据库、对象存储、消息队列 | 客户端和 proto 都在，缺的就是 depot |
-| **随阶段二、三自然补齐** | 路由参数、静态资产、SSR 的前置条件 | 需要 deforge 的 Deislet 目标与版本包结构 |
+| **随阶段一自然补齐** | KV、SQL 数据库、对象存储、消息队列 | 客户端和 proto 都在，缺的就是 deis-store |
+| **随阶段二、三自然补齐** | 路由参数、静态资产、SSR 的前置条件 | 需要 deis-build 的 Deislet 目标与版本包结构 |
 | **独立小项** | 二进制请求体、WebSocket 端到端验证、cron 接线 | 各自一两天，互不依赖 |
 | **真正的硬骨头** | Node.js 运行时、服务端渲染 | 见下 |
 

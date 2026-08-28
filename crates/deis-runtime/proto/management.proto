@@ -1,0 +1,258 @@
+syntax = "proto3";
+
+package deis.management;
+
+// Runtime management service - receives control commands from the supervisor
+service RuntimeManagement {
+    // Supervisor pushes configuration
+    rpc PushConfig(PushConfigRequest) returns (PushConfigResponse);
+
+    // Supervisor deploys an app
+    rpc DeployApp(DeployAppRequest) returns (DeployAppResponse);
+
+    // Supervisor unloads an app
+    rpc UnloadApp(UnloadAppRequest) returns (UnloadAppResponse);
+
+    // Supervisor updates an app
+    rpc UpdateApp(UpdateAppRequest) returns (UpdateAppResponse);
+
+    // Supervisor queries status
+    rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+    // Supervisor executes a command
+    rpc ExecuteCommand(ExecuteCommandRequest) returns (ExecuteCommandResponse);
+
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+    // Start an inspect (debug) session
+    rpc StartInspect(StartInspectRequest) returns (StartInspectResponse);
+}
+
+// ============ Inspect management ============
+
+message StartInspectRequest {
+    string app_id = 1;
+    // Inspect session TTL (seconds), defaults to 300 seconds
+    int32 ttl_seconds = 2;
+}
+
+message StartInspectResponse {
+    // Inspect app ID (e.g. _inspect:<app_id>)
+    string inspect_app_id = 1;
+    // Inspect token (must be sent in the x-deis-inspect-token header)
+    string token = 2;
+}
+
+// ============ Configuration management ============
+
+// Push configuration request
+message PushConfigRequest {
+    // Configuration version number
+    int64 version = 1;
+
+    // Configuration content (JSON format)
+    string config_json = 2;
+
+    // Configuration type
+    ConfigType config_type = 3;
+
+    // Whether to force the update
+    bool force = 4;
+}
+
+// Configuration type
+enum ConfigType {
+    CONFIG_TYPE_UNSPECIFIED = 0;
+    GLOBAL = 1;      // Global configuration
+    APP = 2;         // Application configuration
+    RESOURCE = 3;    // Resource configuration
+}
+
+// Push configuration response
+message PushConfigResponse {
+    bool success = 1;
+    string message = 2;
+    int64 applied_version = 3;
+}
+
+// ============ Application management ============
+
+// Deploy app request
+message DeployAppRequest {
+    // Application ID
+    string app_id = 1;
+
+    // Application ZIP package data
+    bytes package_data = 2;
+
+    // Application config (optional; overrides the config in the manifest)
+    AppConfig config = 3;
+}
+
+// Application configuration
+message AppConfig {
+    // Environment variables
+    map<string, string> env = 1;
+
+    // Resource limits
+    ResourceLimits limits = 2;
+
+    // Routing rules
+    repeated RouteRule routes = 3;
+}
+
+// Resource limits
+message ResourceLimits {
+    // Memory limit (MB)
+    int32 memory_mb = 1;
+
+    // CPU limit (millicores)
+    int32 cpu_milli = 2;
+
+    // Maximum concurrent requests
+    int32 max_concurrency = 3;
+
+    // Maximum number of ResourceTable entries
+    int32 resource_table_max = 4;
+}
+
+// Routing rule
+message RouteRule {
+    // Path to match (wildcards supported)
+    string path = 1;
+
+    // Methods to match
+    repeated string methods = 2;
+}
+
+// Deploy app response
+message DeployAppResponse {
+    bool success = 1;
+    string message = 2;
+    string app_id = 3;
+}
+
+// Unload app request
+message UnloadAppRequest {
+    string app_id = 1;
+}
+
+// Unload app response
+message UnloadAppResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// Update app request
+message UpdateAppRequest {
+    string app_id = 1;
+    // Application ZIP package data
+    bytes package_data = 2;
+    // Application config (optional; overrides the config in the manifest)
+    AppConfig config = 3;
+}
+
+// Update app response
+message UpdateAppResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ============ Status queries ============
+
+// Get status request
+message GetStatusRequest {
+    // Whether to include app details
+    bool include_apps = 1;
+}
+
+// Get status response
+message GetStatusResponse {
+    // Basic worker info
+    WorkerInfo worker_info = 1;
+
+    // Application list
+    repeated AppStatus apps = 2;
+
+    // System resource usage
+    ResourceUsage resource_usage = 3;
+
+    // Per-app OpMetrics summary
+    repeated AppOpMetrics op_metrics = 4;
+}
+
+// Per-app OpMetrics summary
+message AppOpMetrics {
+    string app_id = 1;
+    OpMetricsSummary summary = 2;
+}
+
+// OpMetrics summary
+message OpMetricsSummary {
+    uint64 ops_dispatched_sync = 1;
+    uint64 ops_dispatched_async = 2;
+    uint64 ops_dispatched_fast = 3;
+    uint64 ops_completed_async = 4;
+}
+
+// Worker info
+message WorkerInfo {
+    string worker_id = 1;
+    string version = 2;
+    int64 uptime_seconds = 3;
+    string hostname = 4;
+}
+
+// Application status
+message AppStatus {
+    string app_id = 1;
+    AppState state = 2;
+    int64 request_count = 3;
+    int64 error_count = 4;
+    string error_message = 5;
+}
+
+// Application state enum
+enum AppState {
+    APP_STATE_UNSPECIFIED = 0;
+    LOADING = 1;
+    RUNNING = 2;
+    STOPPED = 3;
+    ERROR = 4;
+}
+
+// Resource usage
+message ResourceUsage {
+    double cpu_percent = 1;
+    int64 memory_bytes = 2;
+    int64 goroutines = 3;
+}
+
+// ============ Command execution ============
+
+// Execute command request
+message ExecuteCommandRequest {
+    string command = 1;
+    repeated string args = 2;
+    map<string, string> options = 3;
+}
+
+// Execute command response
+message ExecuteCommandResponse {
+    bool success = 1;
+    string output = 2;
+    string error = 3;
+}
+
+// ============ Health check ============
+
+// Health check request
+message HealthCheckRequest {}
+
+// Health check response
+message HealthCheckResponse {
+    bool healthy = 1;
+    string version = 2;
+    map<string, string> details = 3;
+}
