@@ -145,7 +145,13 @@ impl AssignmentClient {
         timeout: Duration,
         credential: Option<NodeCredential>,
     ) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder().timeout(timeout).build()?;
+        // The node's own traffic, not an application's: it keeps whatever
+        // proxy the operator's environment named, which `crate::egress_proxy`
+        // took out of that environment so applications would stop inheriting
+        // it silently.
+        let client =
+            crate::egress_proxy::for_node_clients(reqwest::Client::builder().timeout(timeout))?
+                .build()?;
         let url = format!(
             "{}{}",
             endpoint.trim_end_matches('/'),

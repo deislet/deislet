@@ -17,9 +17,27 @@
 // past `ctx.services`, past everything. Inside a closure none of these names
 // exist outside this file, and the only way in is the handful of properties
 // explicitly written onto `globalThis` below.
+//
+// # Why `Deno` is not the only door that has to be shut
+//
+// `deno_core` publishes its op table on the global object twice: as
+// `globalThis.Deno.core` and as `globalThis.__bootstrap.core`. The second is
+// the namespace `99_main.js` cleans up at the end of a full Deno bootstrap --
+// which this runtime does not run, so it is left behind. Either one hands an
+// application `core.ops.op_fetch`, `core.ops.op_net_connect_tcp` and every
+// other op directly, which is every bit as much a bypass of the outbound
+// fetch policy as reaching `Deno.core` would be: a raw `op_net_connect_tcp`
+// opens a socket to any address deno's coarse net backstop does not deny, and
+// on a node that means a loopback service the policy would have refused.
+// `ext:core/mod.js` captured `core` into this module's imports before either
+// global existed for an application to read, so deleting both here costs the
+// runtime nothing and closes the door for good. `isolate_test.rs` asserts an
+// application can reach neither.
 (() => {
 
-const DenoCore = Deno.core; delete globalThis.Deno;
+const DenoCore = Deno.core;
+delete globalThis.Deno;
+delete globalThis.__bootstrap;
 
 // ---------------------------------------------------------
 // 0. Encoding
@@ -817,10 +835,19 @@ globalThis.__deis_runtime_wait_until_all = async function() {
   }
 
   // Last thing on every path the Rust side runs -- request, queue batch and
-  // cron tick all end here, after waitUntil work has been awaited. An interval
-  // still running at this point would keep firing inside every later request
-  // this isolate serves; see the timers section of js/bootstrap.js for why
-  // that is unbounded and why timeouts are left alone.
+  // cron tick all end here, after waitUntil work has been awaited.
+  //
+  // The deadline timers go first and silently: they are this runtime's own
+  // bookkeeping, one per outbound fetch, and an invocation that ends with one
+  // still armed has done nothing wrong. Leaving them would mean a later
+  // request in this same isolate carried an abort timer belonging to an
+  // invocation that is already over.
+  globalThis.__deis_runtime_sweep_fetch_budgets();
+
+  // An interval still running at this point would keep firing inside every
+  // later request this isolate serves; see the timers section of
+  // js/bootstrap.js for why that is unbounded and why timeouts are left
+  // alone.
   const swept = globalThis.__deis_runtime_sweep_intervals();
   if (swept > 0) {
     console.warn(

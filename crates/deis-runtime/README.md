@@ -110,11 +110,21 @@ Measured inside a real isolate by asking `typeof globalThis[name]`:
 `queueMicrotask`, `console`, `caches`, `WebSocketPair`, `WebSocketServer`,
 `TextEncoder`, `TextDecoder`, `atob`, `btoa`.
 
-**Absent:** `Deno`, `Blob`, `File`, `FormData`, `URLPattern`, `WebSocket` (the
-client), `BroadcastChannel`, `structuredClone`, `Event`, `performance`,
-`navigator`, `addEventListener`, `MessageChannel`, `MessagePort`,
+**Absent:** `Deno`, `__bootstrap`, `Blob`, `File`, `FormData`, `URLPattern`,
+`WebSocket` (the client), `BroadcastChannel`, `structuredClone`, `Event`,
+`performance`, `navigator`, `addEventListener`, `MessageChannel`, `MessagePort`,
 `CompressionStream`, `DecompressionStream`, `EventSource`, `FileReader`,
 `reportError`.
+
+`Deno` and `__bootstrap` are the two that are removed for a security reason,
+not a tidiness one: `deno_core` publishes its op table on both of them
+(`Deno.core.ops` and `__bootstrap.core.ops`), and a single op —
+`op_net_connect_tcp` — opens a raw socket the outbound `fetch` policy never
+sees. A full Deno boot deletes `__bootstrap` in `99_main.js`; this runtime does
+not run that, so `js/runtime.js` deletes both by hand before any application
+code runs. The wrapper's captured references were taken at module load, so the
+`fetch` an application calls keeps working while the door to the raw ops is
+shut.
 
 That covers all of SPECIFICATION_BASIC.md section 8.1. Several of the absent
 names are loaded and working *inside* the isolate — `deno_fetch` needs `Blob`
@@ -173,55 +183,100 @@ So `fetch` is **deny by default and allow by exception**:
 - A refusal is logged at `warn` with the application, the destination and the
   reason, and reaches the handler as a `TypeError` it can catch. Nothing is
   dialled.
-- A **redirect** is a destination the application never named, and `fetch`
-  follows one by default, so the blocked ranges are also handed to deno's own
-  net permission as a deny list — which it checks inside `op_fetch`, on every
-  hop. A `Location:` pointing at `http://127.0.0.1:8090/` is refused there.
+- A **redirect** is a destination the application never named — whoever
+  answered the previous hop chose it — so `js/bootstrap.js` issues every
+  request with `redirect: "manual"` and follows the chain itself, putting each
+  hop through the same check with the URL the connector will actually be given.
+  One decision point, with one set of rules, for every destination a call
+  reaches. Hop limit 20, `Location:` resolved against the URL that returned it,
+  303 (and 301/302 on a POST) turning the request into a GET without a body,
+  credentials and `Host:` dropped when the origin changes, and a `Location:`
+  that is not `http`/`https` refused. `response.url` and `response.redirected`
+  say where the call ended up.
 
 An operator who has an internal service applications are meant to call opens it
 with `[fetch] allow` in the node's configuration (`host`, `host:port`, or a
 whole URL; an entry with no port covers every port on that host). That list
 cannot be widened into the platform's own services.
 
-#### What the redirect backstop still does not cover
+#### Why the redirect loop is in the wrapper and not in deno
 
-Both of these were measured against a running node, not reasoned about, and
-both are limits of the *redirect* layer only: every destination an application
-names itself goes through the full check above, IPv6 and ports included.
+Following redirects used to be deno's job, which left deno's net deny list as
+the only thing looking at a hop. Both of the following were measured against a
+running node, and both are gone now that every hop goes through the same check
+as the first request:
 
 - **IPv6 ranges.** deno's net descriptor has no spelling for an IPv6 subnet —
   it reads `fc00::/7` as a host and a port and gives up — so the deny list
-  carries the IPv4 ranges and the two exact addresses `::1` and `::`, and not
-  `fc00::/7` or `fe80::/10`. A `Location:` naming an IPv6 unique-local or
-  link-local *literal* is refused by nothing; deno logs
-  `Granted net access to "[fd00::1]:8091"` and follows it. Closing this needs
-  either an upstream descriptor that can carry an IPv6 prefix, or following
-  redirects in the wrapper with `redirect: "manual"` so every hop is checked.
+  could carry the IPv4 ranges and the two exact addresses `::1` and `::`, and
+  not `fc00::/7` or `fe80::/10`. A `Location:` naming an IPv6 unique-local or
+  link-local literal was refused by nothing; deno logged
+  `Granted net access to "[fd00::1]:8091"` and followed it.
 - **Other ports on an address an operator opened.** A deny list has no per-port
-  exception, so an allowlist entry that is a literal address is punched out of
-  the range covering it — one address, every port. The platform's own endpoints
-  are written into the deny list as exact `host:port` entries precisely so this
-  cannot swallow them, in both their IPv4 and IPv4-mapped-IPv6 spellings, since
-  deno matches the host as the URL writes it. Anything *else* the node happens
-  to run on that address is still reachable through a redirect. An allowlist
-  entry that is a **name** has none of this problem and is the shape to prefer.
+  exception, so an allowlist entry that is a literal address has to be punched
+  out of the range covering it — one address, every port. Every other port on
+  that address became a legal redirect hop, and on a node that is where
+  deis-control, deis-store, deis-queue and deis-telemetry all listen; the
+  telemetry metrics port was reachable this way.
 
-#### An HTTP proxy in the node's environment moves the socket
+The deny list is still installed, now as a backstop underneath the wrapper
+rather than as the mechanism: it is checked inside `op_fetch`, so any path that
+reached `op_fetch` without passing the guard would still be refused a loopback
+or private address. No such path is reachable from an application — the op
+table itself is not (see the global-scope section on `Deno` and `__bootstrap`)
+— but a coarse deny list one layer down is worth keeping against a future
+change that forgets the guard.
+
+#### An HTTP proxy in the node's environment is not inherited
 
 `deno_fetch` builds its client with `proxy::from_env()`, unconditionally and
-with no option to suppress it, so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
-`NO_PROXY` in the **node process's** environment decide where an application's
+with no option to suppress it, so `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`
+in the **node process's** environment would decide where an application's
 `fetch` actually connects. When a proxy intercepts, the connector dials the
 proxy and the destination travels as a `CONNECT` target, which means the
 policy's DNS resolver resolves the proxy's host and never sees the
-destination's.
+destination's — the rebinding guarantee is gone.
 
-The pre-flight check and the deny list still judge the URL, so a destination an
-application names is refused exactly as before. What is lost is the rebinding
-guarantee — the name is resolved once here and once more by the proxy, and
-nothing in this process constrains the second answer. An operator who wants
-that guarantee has to keep those variables out of the environment
-deis-runtime starts in.
+So those variables are read once at startup, before the tokio runtime exists
+and before any HTTP client is built, and taken out of the process environment;
+what was removed is logged at `warn`. The node's *own* control-plane traffic
+still uses the proxy: the values are captured before they are removed and handed
+to the assignment, registration and bundle-download clients explicitly. The
+proxy is part of how the operator connects their node, not a routing decision
+applications were ever told about.
+
+`[fetch] proxy_from_env = true` puts it back for applications as well. It is an
+explicit choice, it is logged at `warn` on every start, and the line says what
+it costs — the resolver guarantee, for application traffic only. `NO_PROXY` is
+left alone: it can only narrow what a proxy intercepts.
+
+#### An outbound call cannot outlive the request that made it
+
+An execution timeout is enforced by terminating V8, and terminating V8 does
+nothing to a Rust operation already in flight. A `fetch` to an address that
+accepts the connection and then says nothing was measured returning after 81
+seconds against a 30-second budget — and for all of that time it held the
+runtime thread its application shares with every other application on that
+thread.
+
+So every outbound call carries an `AbortSignal` armed on what is left of the
+invocation's execution budget, which closes deno's cancel handle and unwinds
+the Rust op. The budget stops slightly short of the isolate's own deadline —
+a tenth of it, at least 50 ms and at most 500 ms — so the handler is handed a
+`DOMException` named `TimeoutError` it can catch and answer, rather than being
+terminated mid-statement. The host lookup the pre-flight check does is bounded
+by the same budget, because it runs before there is anything for the signal to
+abort.
+
+That covers the call the handler awaits. A call it starts and never awaits —
+and never hands to `waitUntil` — is still open when the handler returns, and
+its budget timer would not fire for the rest of the budget; left alone, its
+socket stays charged to the node process, a resource shared with every other
+application, so a handler firing one such call per request would pile them up
+without bound. The sweep at the end of every invocation therefore aborts every
+call still bounded by the budget, not merely stops its countdown, so a detached
+call cannot outlive its request either. `waitUntil` work is awaited before that
+sweep runs, so it is never caught by it.
 
 The reasoning and the address classification are in
 [`src/runtime/fetch_policy.rs`](src/runtime/fetch_policy.rs).

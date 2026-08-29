@@ -92,10 +92,18 @@ TOML 路径大写、用下划线连起来、前面加 `DEIS_RUNTIME_`。
 `caches`、`WebSocketPair`、`WebSocketServer`、`TextEncoder`、`TextDecoder`、
 `atob`、`btoa`。
 
-**没有：** `Deno`、`Blob`、`File`、`FormData`、`URLPattern`、客户端 `WebSocket`、
-`BroadcastChannel`、`structuredClone`、`Event`、`performance`、`navigator`、
-`addEventListener`、`MessageChannel`、`MessagePort`、`CompressionStream`、
-`DecompressionStream`、`EventSource`、`FileReader`、`reportError`。
+**没有：** `Deno`、`__bootstrap`、`Blob`、`File`、`FormData`、`URLPattern`、客户端
+`WebSocket`、`BroadcastChannel`、`structuredClone`、`Event`、`performance`、
+`navigator`、`addEventListener`、`MessageChannel`、`MessagePort`、
+`CompressionStream`、`DecompressionStream`、`EventSource`、`FileReader`、
+`reportError`。
+
+`Deno` 和 `__bootstrap` 这两个是为了安全才删的，不是为了整洁：`deno_core` 把它的
+op 表同时挂在这两个上（`Deno.core.ops` 和 `__bootstrap.core.ops`），而其中一个 op
+——`op_net_connect_tcp`——能开一条出站 `fetch` 策略根本看不到的裸 socket。完整的
+Deno 启动会在 `99_main.js` 里删掉 `__bootstrap`，而这个运行时不跑那一步，所以
+`js/runtime.js` 在任何应用代码跑起来之前把两个都手动删掉。包装器捕获的引用是在模块
+加载时就拿到的，所以应用调用的那个 `fetch` 照常能用，通往裸 op 的门却关上了。
 
 SPECIFICATION_BASIC.md 第 8.1 节要求的名字现在一个不缺。「没有」那列里有几个其实在
 Isolate 内部是活的——`deno_fetch` 自己要用 `Blob` 和 `FormData`，`deno_web` 要用
@@ -141,42 +149,74 @@ deis-queue、deis-control、deis-telemetry——都监听在环回地址上，�
 - 平台自己的服务端点无论白名单怎么写都拒。
 - 拒绝会以 `warn` 记一条日志，带上应用、目标和原因，并作为一个处理函数**能 catch 的**
   `TypeError` 返回给应用。什么都没有拨号出去。
-- **重定向**是应用自己没写过的第二个目标，而 `fetch` 默认会跟。所以那批被封的网段还会
-  以 deno 自己的网络权限「拒绝列表」的形式再挂一份，由 deno 在 `op_fetch` 里对**每一跳**
-  检查：`Location:` 指到 `http://127.0.0.1:8090/` 会在那一层被拒。
+- **重定向**是应用自己没写过的第二个目标——是上一跳的应答方替它挑的。所以
+  `js/bootstrap.js` 每次请求都带 `redirect: "manual"` 发出去，自己跟这条链，每一跳都
+  拿**连接器真正会收到的那个 URL** 再过一遍同样的检查。一条调用能到达的每个目标，
+  都由同一个判定点、同一套规则说了算。跳数上限 20；`Location:` 按发出它的那一跳的
+  URL 解析；303（以及 POST 上的 301/302）把请求变成不带 body 的 GET；跨源时丢掉
+  凭证类头和 `Host:`；`Location:` 不是 `http`/`https` 一律不跟。`response.url` 和
+  `response.redirected` 如实反映这条链最后停在哪。
 
 运维如果确有内部服务要让应用调，用节点配置里的 `[fetch] allow` 开口子（写 `host`、
 `host:port` 或整个 URL；不写端口就是这台主机的所有端口）。这个口子开不到平台自己的
 服务上去。
 
-#### 重定向兜底层还盖不住的两件事
+#### 为什么这个循环写在包装里，而不交给 deno
 
-两条都是顶着跑起来的节点量出来的，不是推的；也都**只**是重定向那一层的限制，应用
-自己写出来的目标仍然走完整检查，IPv6 和端口都算。
+以前跟重定向是 deno 的事，于是看着每一跳的就只剩 deno 的 net 拒绝列表。下面两条都是
+顶着跑起来的节点量出来的，不是推的；现在每一跳都走和首个请求一样的检查，两条都没了：
 
 - **IPv6 网段写不出来**。deno 的 net 描述符没有 IPv6 子网的写法——`fc00::/7` 会被当成
   host 加 port 解析失败——所以拒绝列表里只有 IPv4 网段和 `::1`、`::` 这两个单地址，
-  没有 `fc00::/7` 或 `fe80::/10`。`Location:` 写成 IPv6 唯一本地或链路本地**字面量**
-  的重定向没有任何一层拦得住，deno 会打出 `Granted net access to "[fd00::1]:8091"`
-  然后跟过去。要关掉，要么等 deno 的描述符支持 IPv6 前缀，要么在 JS 包装里用
-  `redirect: "manual"` 自己跟重定向，让每一跳都过预检。
+  没有 `fc00::/7` 或 `fe80::/10`。`Location:` 写成 IPv6 唯一本地或链路本地字面量的
+  重定向没有任何一层拦得住，deno 会打出 `Granted net access to "[fd00::1]:8091"`
+  然后跟过去。
 - **运维开的那个地址上的其它端口**。拒绝列表没有按端口的例外，所以白名单里写死的
-  字面地址会被从覆盖它的网段里整个抠掉——一个地址、所有端口。平台自己的端点正是
-  为了不被这一下吞掉，才作为精确的 `host:port` 条目单独写进拒绝列表，而且 IPv4 与
-  IPv4-mapped IPv6 两种拼法都写，因为 deno 是按 URL 里字面写的主机名匹配的。但节点上
-  **别的**服务如果也听在那个地址，重定向仍然到得了。白名单写**域名**则完全没有这个
-  问题，也是该优先用的写法。
+  字面地址必须从覆盖它的网段里整个抠掉——一个地址、所有端口。那个地址上别的端口于是
+  都成了合法的重定向落点，而节点上 deis-control、deis-store、deis-queue、deis-telemetry
+  恰恰都听在那里；telemetry 的 metrics 端口就是这么被够着的。
 
-#### 节点环境里的 HTTP 代理会改变实际拨号的地址
+拒绝列表仍然挂着，但角色变了：它现在是包装底下的兜底，而不是机制本身。deno 在
+`op_fetch` 里检查它，所以万一有哪条路径绕过了 guard 直接到了 `op_fetch`，环回和私有
+地址在那里仍然会被拒。应用其实够不到这样的路径——op 表本身就够不到（见前面全局作用域
+那节讲 `Deno` 与 `__bootstrap` 的部分）——但留一层粗粒度的拒绝列表在底下，是为了防将来
+某次改动忘了那道 guard。
+
+#### 节点环境里的 HTTP 代理不会被应用继承
 
 `deno_fetch` 建客户端时无条件调 `proxy::from_env()`，没有开关可以关，所以**节点进程**
-环境里的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` 决定了应用的 `fetch`
-实际连到哪里。一旦命中代理，连接器拨的是代理，目的地只作为 `CONNECT` 目标发过去
-——于是策略里那个 DNS 解析器解析的是代理的主机名，根本看不到目的地。
+环境里的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 本来会决定应用的 `fetch` 实际连到
+哪里。一旦命中代理，连接器拨的是代理，目的地只作为 `CONNECT` 目标发过去——于是策略里
+那个 DNS 解析器解析的是代理的主机名，根本看不到目的地，防重绑定那道保证就没了。
 
-预检和拒绝列表仍然按 URL 判，所以应用自己写出来的目的地照拦不误。丢掉的是防重绑定
-那道保证：名字在这里解析一次，代理那边再解析一次，第二次的答案本进程管不着。要保住
-它，运维得把这几个变量从 deis-runtime 的启动环境里拿掉。
+所以这几个变量在启动时读一次——在 tokio 运行时建起来之前、在任何 HTTP 客户端建起来
+之前——然后从进程环境里拿掉，拿掉了什么以 `warn` 记一条。节点**自己**跟控制面的流量
+照走代理：这些值在被拿掉之前先留了一份，再显式交给拉分配、注册和下载 bundle 那三个
+客户端。代理是运维接这台节点的方式，不是应用被告知过的路由选择。
+
+`[fetch] proxy_from_env = true` 可以把应用那一份也放回去。这是一个明写出来的选择，
+每次启动都以 `warn` 记一条，并且那条日志会说清代价：仅就应用流量而言，防重绑定那道
+保证没了。`NO_PROXY` 不动——它只会让代理少拦一些。
+
+#### 一次出站调用活不过发起它的那次请求
+
+执行超时是靠终止 V8 实现的，而终止 V8 对一个**已经派发出去**的 Rust 异步操作毫无作用。
+一个连到「接了连接就不说话」的地址的 `fetch`，在 30 秒预算下量到 81 秒才返回——这段
+时间里它一直占着运行时线程，而这条线程上其它应用都在排队。
+
+所以每次出站调用都带一个 `AbortSignal`，按这次调用剩下的执行预算武装；它一响就关掉
+deno 的 cancel handle，把那个 Rust op 卷回来。这个预算比 Isolate 自己的截止时间**提前
+一点**结束——预算的十分之一，最少 50 毫秒、最多 500 毫秒——好让处理函数拿到一个能
+catch 的、`name` 为 `TimeoutError` 的 `DOMException`，自己决定怎么应答，而不是在语句
+中间被直接终止。预检做的那次域名解析也按同一个预算限时，因为它跑在信号还没有东西
+可以 abort 的时候。
+
+以上说的是处理函数会 `await` 的那次调用。它发起但**不** `await`、也不交给 `waitUntil`
+的调用，在处理函数返回时还开着，而它的预算定时器要到预算走完才响；放着不管，它的
+socket 就一直挂在节点进程上——这是与其它应用共享的资源——所以一个每次请求都发一发
+这种调用的处理函数，会把连接无上限地堆起来。因此每次调用结束时的那次清扫不只是停掉
+倒计时，而是把所有还受预算约束的调用都 abort 掉，这样脱离掌管的调用也活不过它那次
+请求。`waitUntil` 的活是在这次清扫之前就 await 完的，所以不会被它误伤。
 
 判定逻辑与地址分类见 [`src/runtime/fetch_policy.rs`](src/runtime/fetch_policy.rs)。
 

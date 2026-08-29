@@ -5,9 +5,10 @@ use super::kv_client::KvClient;
 use deno_core::{extension, op2, OpState};
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 /// The error an app sees when it calls a service it does not have.
 ///
@@ -235,6 +236,26 @@ fn op_set_response(state: &mut OpState, #[string] response_json: String) {
     let store = state.borrow::<ResponseStore>().clone();
     *store.borrow_mut() = Some(response_json);
 }
+
+/// When the invocation currently running in this isolate runs out of time.
+///
+/// `None` means no invocation is in flight -- the snapshot build, module
+/// evaluation, the `waitUntil` tail that runs after a request has already been
+/// answered -- and nothing is bounded by a deadline then.
+///
+/// It lives in `OpState` rather than being passed to each op because the
+/// consumer is `js/bootstrap.js`: an outbound `fetch` asks how much of the
+/// budget is left and aborts itself when that runs out. Terminating V8, which
+/// is how the execution timeout is enforced, does not touch a Rust operation
+/// that is already in flight, so without this a single `fetch` to an address
+/// that never answers holds a runtime thread -- and every other application
+/// sharing it -- long past the budget the operator set. Measured at 81 seconds
+/// against a 30-second timeout.
+///
+/// `Cell` rather than `RefCell`: an `Instant` is `Copy`, the value is written
+/// by `AppRuntime` between executions and read by an op, and neither ever
+/// holds it across an await.
+pub type ExecutionDeadline = Rc<Cell<Option<Instant>>>;
 
 // Environment variables store
 pub type EnvStore = Rc<RefCell<HashMap<String, String>>>;

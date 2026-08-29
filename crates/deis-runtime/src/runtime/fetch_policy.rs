@@ -57,64 +57,54 @@
 //!
 //! ## Redirects
 //!
-//! A redirect is a second destination that the application never named, and
-//! `fetch` follows one by default. deno re-enters `op_fetch` for each hop, so
-//! the hop that matters never passes [`FetchPolicy::check`], which runs once,
-//! in front of the call. A hop to a *name* is still caught by
-//! [`PolicyResolver`]; a hop to an IP literal would not be caught by anything.
+//! A redirect is a second destination the application never named, and `fetch`
+//! follows one by default. `js/bootstrap.js` therefore issues every request
+//! with `redirect: "manual"` and follows the chain itself, calling
+//! [`FetchPolicy::check`] again -- through `op_deis_fetch_guard` -- for each
+//! hop, with the URL the connector will actually be given. So a hop is judged
+//! by exactly the rules the first destination was judged by: the same
+//! schemes, the same ranges, the same ports, the same allowlist, the same
+//! refusal of this platform's own endpoints.
 //!
-//! That last gap is closed by [`FetchPolicy::denied_net_ranges`], which hands
-//! the blocked ranges to deno's own net permission as a deny list. deno checks
-//! it inside `op_fetch`, on every hop, against the address in the URL -- so a
-//! `Location:` pointing at `http://127.0.0.1:8090/` is refused there even
-//! though nothing in this module saw it. It is a backstop and not the policy:
-//! it cannot see ports, and it does not fire for a hostname, both of which the
-//! two layers above handle.
+//! It used to be otherwise, and the two holes that left are the reason the
+//! loop exists. deno re-enters `op_fetch` for each hop, so the only thing
+//! looking at a redirect was deno's own net permission -- the deny list
+//! [`FetchPolicy::denied_net_ranges`] hands it. A deny list of address
+//! descriptors cannot say what this policy says:
 //!
-//! ### What that backstop still does not reach
+//! * **IPv6 ranges.** deno's net descriptor has no spelling for an IPv6
+//!   *subnet* -- it parses `fc00::/7` as a host and a port and gives up -- so
+//!   the list can carry the IPv4 ranges and the two exact addresses `::1` and
+//!   `::`, and not `fc00::/7` or `fe80::/10`. A `Location:` naming an IPv6
+//!   unique-local or link-local literal was refused by nothing; deno logged it
+//!   as "Granted net access".
+//! * **Ports on an address the operator opened.** A deny list has no per-port
+//!   exception, so an allowlist entry that is a literal address is punched out
+//!   of the range that covers it -- one address wide, every port. Every other
+//!   port on that address became a legal redirect hop, and on a node that is
+//!   where deis-control, deis-store, deis-queue and deis-telemetry live. The
+//!   telemetry metrics port was reachable this way in testing.
 //!
-//! It is a backstop and not the policy, and two holes in it are known and
-//! measured rather than assumed. Both are holes in *redirect* handling only:
-//! every destination an application names itself goes through
-//! [`FetchPolicy::check`] in full, IPv6 and ports included.
+//! Both are gone because nothing decides a redirect from an address
+//! descriptor any more. The deny list is still installed, and is still worth
+//! having: it is now a backstop behind the loop rather than the mechanism, and
+//! it is what would still refuse a hop if the wrapper were ever bypassed.
 //!
-//! **IPv6 ranges.** deno's net descriptor has no spelling for an IPv6
-//! *subnet* -- it parses `fc00::/7` as a host and a port and gives up -- so
-//! the deny list carries the IPv4 ranges and the two exact IPv6 addresses
-//! `::1` and `::`, and not `fc00::/7` or `fe80::/10`. A `Location:` naming an
-//! IPv6 unique-local or link-local *literal*, or the IPv4-mapped spelling
-//! `[::ffff:127.0.0.1]`, is refused by nothing here; deno logs it as
-//! "Granted net access". Closing it needs either an upstream descriptor that
-//! can carry an IPv6 prefix, or following redirects in the wrapper with
-//! `redirect: "manual"` so that every hop passes [`FetchPolicy::check`].
-//!
-//! **Ports on an address the operator opened.** A deny list has no per-port
-//! exception, so an allowlist entry that is a literal address is punched out
-//! of the range that covers it -- one address wide, every port. Every other
-//! port on that address then becomes a legal redirect hop. The platform's own
-//! endpoints are named explicitly in the deny list for exactly this reason
-//! (see [`FetchPolicy::denied_net_ranges`]), so they are not among those
-//! ports; anything *else* the node happens to run on that address is. An
-//! allowlist entry that is a *name* has none of this problem, and is the
-//! shape to prefer: deno compares the URL's host against these entries, and a
-//! hostname never matches an address range.
-//!
-//! ## An HTTP proxy in the node's environment moves the socket
+//! ## An HTTP proxy in the node's environment would move the socket
 //!
 //! `deno_fetch` builds its client with `proxy::from_env()`, unconditionally
-//! and with no option to suppress it, so `HTTP_PROXY`, `HTTPS_PROXY`,
-//! `ALL_PROXY` and `NO_PROXY` in the *node process's* environment decide where
-//! an application's `fetch` actually connects. When a proxy intercepts, the
+//! and with no option to suppress it, so `HTTP_PROXY`, `HTTPS_PROXY` and
+//! `ALL_PROXY` in the *node process's* environment would decide where an
+//! application's `fetch` actually connects. When a proxy intercepts, the
 //! connector dials the proxy and the destination travels as a `CONNECT`
-//! target or a request line, which means [`PolicyResolver`] resolves the
-//! proxy's host and never sees the destination's.
+//! target, which means [`PolicyResolver`] resolves the proxy's host and never
+//! sees the destination's -- the rebinding guarantee is gone.
 //!
-//! [`FetchPolicy::check`] and the deny list still judge the URL, so a
-//! destination the application names is refused exactly as before. What is
-//! lost is the rebinding guarantee: the name is resolved once here and once
-//! more by the proxy, and nothing in this process constrains the second
-//! answer. An operator who wants that guarantee has to keep those variables
-//! out of the environment deis-runtime is started in.
+//! So those variables are taken out of the process environment before any
+//! client is built, and the node's own control-plane clients are handed the
+//! values explicitly instead. An operator who genuinely needs applications to
+//! egress through a proxy asks for it in the configuration, and is told what
+//! it costs. See [`crate::egress_proxy`].
 //!
 //! # The platform's own services are not merely denied by default
 //!
@@ -122,9 +112,10 @@
 //! (`[fetch] allow` in the node's configuration). They must not be able to
 //! widen it into deis-store by accident, so the platform's own endpoints are
 //! refused *after* the allowlist has been consulted rather than before, and no
-//! allowlist entry can reach them -- on the way in through
-//! [`FetchPolicy::check`], and on a redirect hop through the explicit entries
-//! [`FetchPolicy::denied_net_ranges`] adds.
+//! allowlist entry can reach them. That holds for every hop of a redirect
+//! chain as well, because every hop goes through [`FetchPolicy::check`]; the
+//! explicit entries [`FetchPolicy::denied_net_ranges`] adds say the same thing
+//! again one layer down.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -510,10 +501,17 @@ impl FetchPolicy {
     /// The blocked ranges as deno's net permission spells them, for
     /// `PermissionsOptions::deny_net`.
     ///
-    /// This is the redirect backstop described in the module comment: deno
-    /// applies it inside `op_fetch`, on every hop, so a `Location:` header
-    /// pointing at a loopback or private address is refused even though it was
-    /// never handed to [`Self::check`].
+    /// **A backstop, not the mechanism.** Redirects are followed in
+    /// `js/bootstrap.js` now, and every hop passes [`Self::check`] with the
+    /// URL the connector will be given, so this list no longer decides
+    /// anything a redirect does. It is kept because deno applies it inside
+    /// `op_fetch`, underneath everything above: if the wrapper were ever
+    /// bypassed -- a path that reached `op_fetch` without going through
+    /// `globalThis.fetch`, a future change that forgot the guard -- a call
+    /// into a private or loopback address would still be refused here. What
+    /// this list cannot express is exactly why it stopped being the mechanism:
+    /// it has no spelling for an IPv6 prefix and no per-port exception. See
+    /// the redirect section of the module comment.
     ///
     /// An address the operator's allowlist opens is *punched out* of the range
     /// that covers it, rather than the range being dropped. deno's deny list
@@ -525,8 +523,10 @@ impl FetchPolicy {
     /// handful more entries in a list deno holds in a set.
     ///
     /// The hole is one address wide and covers every port on it, because a
-    /// deny list cannot carry a per-port exception. The pre-flight check is
-    /// still port-exact for every destination an application names itself.
+    /// deny list cannot carry a per-port exception. That no longer opens a
+    /// redirect hop, because [`Self::check`] runs on every hop and is
+    /// port-exact; it only means this backstop is coarser than the policy in
+    /// front of it, which is what a backstop is allowed to be.
     ///
     /// An allowlist entry that is a *name* needs no hole: deno compares the
     /// URL's host against these entries, and a hostname never matches an
@@ -552,16 +552,15 @@ impl FetchPolicy {
         // operator who opens one address on the node -- `127.0.0.1:8095`, the
         // shape the demo ships -- takes the whole of that address out of the
         // deny list, because deno's deny list has no per-port exception. Every
-        // other port on it then becomes a legal redirect hop, and on a node
-        // that is where deis-control, deis-store, deis-queue and
-        // deis-telemetry all live. A `Location:` pointing at the control
-        // plane's REST API would have been followed.
+        // other port on it would then be unremarked here, and on a node that
+        // is where deis-control, deis-store, deis-queue and deis-telemetry all
+        // live.
         //
-        // Naming them here costs a handful of entries and restores what
-        // `check` promises on the way in: an allowlist may widen the policy,
-        // and it may not widen it into the platform. Entries with no port
-        // cover every port on that host, which is the same reading `covers`
-        // takes.
+        // `check` refuses them on every hop regardless, so this is no longer
+        // the only thing standing in the way; naming them keeps the backstop
+        // from being *silent* about the one class of destination that must
+        // never be reachable. Entries with no port cover every port on that
+        // host, which is the same reading `covers` takes.
         let platform: Vec<String> = self
             .rules
             .platform
@@ -867,7 +866,47 @@ impl deno_runtime::deno_fetch::dns::Resolve for PolicyResolver {
                 .collect::<Vec<SocketAddr>>();
 
             if policy.is_allowlisted(&host, None) {
-                return Ok(addresses.into_iter());
+                // The allowlist opens destinations that are not public -- an
+                // operator's internal service on a private range is the whole
+                // point -- so the blocked-range filter below is deliberately
+                // not applied here. The platform's own endpoints are the one
+                // exception the allowlist may never cover, and that exception
+                // has to hold at connect time as well: an allowlisted *name*
+                // that resolved to a public address when `check` ran and to a
+                // platform endpoint's address now is a rebind, and letting it
+                // through here would reach deis-store past every gate. So the
+                // platform's addresses are dropped even for an allowlisted
+                // name; everything else the operator opened is kept.
+                let mut kept = Vec::with_capacity(addresses.len());
+                for addr in addresses {
+                    if policy.is_a_platform_service_address(addr.ip(), None) {
+                        tracing::warn!(
+                            target: "app",
+                            app_id = %app_id,
+                            host = %host,
+                            address = %addr.ip(),
+                            "Dropped {} from the addresses of {} for {}: it is one of the \
+                             platform's own service endpoints, which no allowlist entry may \
+                             reach. The allowlisted name resolved to it at connect time, which \
+                             is a rebind; the connection is not opened",
+                            addr.ip(),
+                            host,
+                            app_id
+                        );
+                    } else {
+                        kept.push(addr);
+                    }
+                }
+                if kept.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "{host} is allowlisted but resolves only to the platform's own \
+                             service endpoints"
+                        ),
+                    ));
+                }
+                return Ok(kept.into_iter());
             }
 
             let mut kept = Vec::with_capacity(addresses.len());

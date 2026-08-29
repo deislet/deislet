@@ -5,7 +5,7 @@ use super::cache_ops::{create_cache_store, CacheStore};
 use super::fetch_policy::FetchPolicy;
 use super::loader::DbModuleLoader;
 use super::metrics::{recorder, MetricsRegistry, RequestOutcome};
-use super::ops::{AppId, EnvStore, ResponseStore};
+use super::ops::{AppId, EnvStore, ExecutionDeadline, ResponseStore};
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
 use super::rate_limit::RateLimiter;
@@ -23,11 +23,11 @@ use deno_core::{
 use deno_runtime::deno_permissions;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use sys_traits::impls::RealSys;
 use tokio::sync::oneshot;
 
@@ -171,6 +171,10 @@ pub struct AppRuntime {
     /// Where this isolate's request, error, execution-time and cut-off
     /// counters go. See `super::metrics`.
     metrics: Arc<MetricsRegistry>,
+    /// The instant the invocation currently running runs out of time, shared
+    /// with the isolate's `OpState` so `js/bootstrap.js` can bound an outbound
+    /// `fetch` by it. See [`ExecutionDeadline`].
+    execution_deadline: ExecutionDeadline,
 }
 
 impl AppRuntime {
@@ -335,6 +339,8 @@ impl AppRuntime {
         // Initialize Handle
         let _ = isolate_handle_cell.set(runtime.v8_isolate().thread_safe_handle());
 
+        let execution_deadline: ExecutionDeadline = Rc::new(Cell::new(None));
+
         {
             let sys = RealSys;
             let parser = Arc::new(deno_permissions::RuntimePermissionDescriptorParser::new(
@@ -380,12 +386,17 @@ impl AppRuntime {
                 Some(permissions_config.allow_env)
             };
 
-            // The redirect backstop. `fetch` follows redirects by default and
-            // deno re-enters `op_fetch` for each hop, so a `Location:` header
-            // pointing at `http://127.0.0.1:8090/` never passes the pre-flight
-            // guard -- it is a destination the application never named. deno
-            // checks this list on every hop, which is where that one is
-            // refused. See `super::fetch_policy` on redirects.
+            // The backstop, and only the backstop. Redirects are followed in
+            // `js/bootstrap.js`, which puts every hop through
+            // `op_deis_fetch_guard` with the URL the connector will be given,
+            // so this list no longer decides where a `Location:` header may
+            // lead -- it could not say what the policy says anyway, having no
+            // spelling for an IPv6 prefix and no per-port exception, which is
+            // exactly why the wrapper does the following. It stays because
+            // deno applies it inside `op_fetch`, underneath everything else:
+            // any path that reached `op_fetch` without passing the guard would
+            // still be refused a private or loopback address here. See
+            // `super::fetch_policy` on redirects.
             let deny_net = fetch_policy.denied_net_ranges(&app_id);
 
             let permission_opts = deno_permissions::PermissionsOptions {
@@ -418,6 +429,13 @@ impl AppRuntime {
 
             let env_store: EnvStore = Rc::new(RefCell::new(env));
             state.put(env_store);
+
+            // Empty until an invocation arms it. `terminate_execution` is what
+            // enforces the timeout, and it does not reach a Rust operation that
+            // is already in flight, so an outbound `fetch` reads this and
+            // aborts itself instead of running on past the budget and holding
+            // the runtime thread every other application on it is waiting for.
+            state.put(execution_deadline.clone());
 
             // The same policy the HTTP client's resolver was built with, put
             // where `op_deis_fetch_guard` can read it. Both halves have to see
@@ -496,7 +514,33 @@ impl AppRuntime {
             timeout_ms,
             rate_limit_ops_per_sec,
             metrics,
+            execution_deadline,
         })
+    }
+
+    /// Start this invocation's clock, and publish the instant it runs out to
+    /// the isolate so an outbound `fetch` can bound itself by it.
+    ///
+    /// Returns the deadline so the caller's cut-off task can sleep until the
+    /// same instant: two clocks started a few lines apart would drift, and the
+    /// one an application is told about must be the one it is actually held
+    /// to.
+    ///
+    /// Armed *before* the script is executed, not after: a handler's first
+    /// statement can be a `fetch`, and that runs synchronously inside
+    /// `execute_script`, before the cut-off task below has been spawned.
+    fn arm_execution_budget(&self) -> Instant {
+        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
+        self.execution_deadline.set(Some(deadline));
+        deadline
+    }
+
+    /// Stop the clock. Anything that runs after this point -- the `waitUntil`
+    /// tail, which the cut-off task no longer covers either -- makes outbound
+    /// calls with no deadline on them, which is what it did before this
+    /// existed.
+    fn disarm_execution_budget(&self) {
+        self.execution_deadline.set(None);
     }
 
     /// Clear V8's termination flag, so a cut-off costs one execution and not
@@ -703,9 +747,18 @@ impl AppRuntime {
             request_json
         );
 
-        let promise = self.runtime.execute_script("<fetch>", code)?;
+        // Set execution timeout: platform default, or this app's configured
+        // override. Armed before the script runs; see `arm_execution_budget`.
+        let deadline = self.arm_execution_budget();
+        let promise = self
+            .runtime
+            .execute_script("<fetch>", code)
+            // The budget is armed above, so a script that never starts has to give
+            // it back: nothing else runs on this isolate between invocations, but
+            // a WebSocket message dispatched afterwards would otherwise be told
+            // that a budget it never had has already run out.
+            .inspect_err(|_| self.disarm_execution_budget())?;
 
-        // Set execution timeout: platform default, or this app's configured override.
         let timeout_ms = self.timeout_ms;
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
         let app_id_for_timeout = self.app_id.clone();
@@ -713,7 +766,7 @@ impl AppRuntime {
 
         // Start timeout monitoring task
         let timeout_task = tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
             metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
             tracing::warn!(
                 target: "app",
@@ -733,6 +786,7 @@ impl AppRuntime {
 
         // Cancel timeout task
         timeout_task.abort();
+        self.disarm_execution_budget();
 
         // The timeout task and the rate limiter both work by terminating the
         // isolate, and that flag outlives the execution it killed.
@@ -888,7 +942,15 @@ impl AppRuntime {
             serde_json::to_string(&payload)?
         );
 
-        let promise = self.runtime.execute_script("<queue>", code)?;
+        let deadline = self.arm_execution_budget();
+        let promise = self
+            .runtime
+            .execute_script("<queue>", code)
+            // The budget is armed above, so a script that never starts has to give
+            // it back: nothing else runs on this isolate between invocations, but
+            // a WebSocket message dispatched afterwards would otherwise be told
+            // that a budget it never had has already run out.
+            .inspect_err(|_| self.disarm_execution_budget())?;
 
         let timeout_ms = self.timeout_ms;
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
@@ -896,7 +958,7 @@ impl AppRuntime {
         let queue_for_timeout = queue.clone();
         let metrics_for_timeout = self.metrics.clone();
         let timeout_task = tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
             metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
             tracing::warn!(
                 target: "app",
@@ -917,6 +979,7 @@ impl AppRuntime {
             .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
             .await;
         timeout_task.abort();
+        self.disarm_execution_budget();
         // Without this the batch that ran long would also be the last thing
         // this isolate ever did: every following batch would be handed back
         // and the app's messages would end up dead lettered.
@@ -1003,7 +1066,15 @@ impl AppRuntime {
             serde_json::to_string(&payload)?
         );
 
-        let promise = self.runtime.execute_script("<scheduled>", code)?;
+        let deadline = self.arm_execution_budget();
+        let promise = self
+            .runtime
+            .execute_script("<scheduled>", code)
+            // The budget is armed above, so a script that never starts has to give
+            // it back: nothing else runs on this isolate between invocations, but
+            // a WebSocket message dispatched afterwards would otherwise be told
+            // that a budget it never had has already run out.
+            .inspect_err(|_| self.disarm_execution_budget())?;
 
         let timeout_ms = self.timeout_ms;
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
@@ -1011,7 +1082,7 @@ impl AppRuntime {
         let cron_for_timeout = cron.clone();
         let metrics_for_timeout = self.metrics.clone();
         let timeout_task = tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
             metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
             tracing::warn!(
                 target: "app",
@@ -1031,6 +1102,7 @@ impl AppRuntime {
             .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
             .await;
         timeout_task.abort();
+        self.disarm_execution_budget();
         self.clear_termination();
         result?;
 

@@ -654,7 +654,7 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 | **二** | 版本、环境与部署模型：建表、ApplyDeployment 指针下发、节点自举拉取与自取包 | **完成** |
 | **三** | 静态资产：包内带资产、节点资产优先命中 | **完成**（deis-proxy 的路径级路由与资产缓存、自动子域仍缺，见 §4） |
 | **四** | 可观测：deis-telemetry；节点侧日志与指标投递；真实状态上报 | **完成**（`deis logs` / `deis tail` 已有；控制面面板的日志视图仍缺） |
-| **五** | cron 修正、secrets、限额两层化 | **完成**；出网控制与硬上限仍缺（见 §9） |
+| **五** | cron 修正、secrets、限额两层化 | **完成**；出网控制已随 `fetch` 落地（见 §9/§12），CPU 硬上限仍缺（见 §9） |
 | **六** | `deis` CLI 闭环：deploy / rollback / versions / tail / dev 接真运行时 | **完成**（`deis dev` 起的是真的 deis-runtime，走的是控制面同一个 `ApplyDeployment`） |
 
 ---
@@ -749,8 +749,12 @@ SSR。
 - 这些扩展的 JS 模块（`ext/web/08_text_encoding.js`、`ext/fetch/23_response.js` 等）
   只 `export`，没有一处往 `globalThis` 上赋值——Deno CLI 是在自己的
   `99_main.js` 里统一挂全局的，那个文件不在这里。
-- `deno_core` 自己只挂一个 `globalThis.console`，另外挂的 `Deno` 被
-  `runtime.js` 第一行删掉了。
+- `deno_core` 自己只挂一个 `globalThis.console`，另外它把 op 表同时挂在
+  `globalThis.Deno.core` 和 `globalThis.__bootstrap.core` 上。这两个 `runtime.js`
+  都删掉——不只是 `Deno`。任何一个留着，应用都能拿到 `core.ops`，其中
+  `op_net_connect_tcp` 一个 op 就能开一条出站 `fetch` 策略根本看不到的裸 socket，等于
+  绕过整套出网策略去连 deis-store。完整的 Deno 启动会在 `99_main.js` 里删 `__bootstrap`，
+  这个运行时不跑那一步，所以两个都得自己手动删，且在任何应用代码之前删。
 
 于是那些类在 Isolate 内存里活着，却没有任何一个应用能叫出它们的名字。2026-08-29 的
 探针实测确认了这一点：`fetch`、`crypto`、`ReadableStream`、`setInterval` 全部
@@ -762,7 +766,7 @@ SSR。
 
 | 有 | 没有 |
 |---|---|
-| `fetch`、`crypto`、`Request`、`Response`、`Headers`、`URL`、`URLSearchParams`、`ReadableStream` / `WritableStream` / `TransformStream`、`setTimeout` / `clearTimeout`、`setInterval` / `clearInterval`、`AbortController` / `AbortSignal`、`DOMException`、`TextEncoder` / `TextDecoder`、`atob` / `btoa`、`EventTarget`、`queueMicrotask`、`console`、`caches`、`WebSocketPair` / `WebSocketServer` | `Deno`、`Blob`、`File`、`FormData`、`URLPattern`、客户端 `WebSocket`、`BroadcastChannel`、`structuredClone`、`Event`、`performance`、`navigator`、`addEventListener` |
+| `fetch`、`crypto`、`Request`、`Response`、`Headers`、`URL`、`URLSearchParams`、`ReadableStream` / `WritableStream` / `TransformStream`、`setTimeout` / `clearTimeout`、`setInterval` / `clearInterval`、`AbortController` / `AbortSignal`、`DOMException`、`TextEncoder` / `TextDecoder`、`atob` / `btoa`、`EventTarget`、`queueMicrotask`、`console`、`caches`、`WebSocketPair` / `WebSocketServer` | `Deno`、`__bootstrap`、`Blob`、`File`、`FormData`、`URLPattern`、客户端 `WebSocket`、`BroadcastChannel`、`structuredClone`、`Event`、`performance`、`navigator`、`addEventListener` |
 
 右边那一列里的大半**并不是没实现**：`Blob`、`FormData`、`Event` 这些在 Isolate 内部
 是活的，deno_fetch 和 deno_web 自己就要用——`response.blob()`、`response.formData()`
@@ -807,37 +811,60 @@ UTF-8**，没有换成 deno_web 那一套。这是有意收窄，理由写在 `r
 1. **调用前的预检**（`op_deis_fetch_guard`）。这里产出 warn 日志和应用能 catch 的
    `TypeError`——按规范 `fetch` 失败本来就抛 `TypeError`，所以处理函数原有的错误
    分支就能接住。URL 里的账号密码会先剥掉再记日志。被拒的调用一个 socket 都不开。
+   **每一跳都过它**，见第 3 点。
 2. **HTTP 客户端里的解析器**（`PolicyResolver`，装进 `deno_fetch::Options.resolver`）。
    只把策略认可的地址交给连接器，堵住 DNS 重绑定：名字在第 1 层解析一次、连接器再
-   解析一次，两次答案可以不同，这一层保证真正拨出去的地址一定是策略点过头的。
-3. **重定向兜底**。`fetch` 默认跟重定向，而每一跳都是应用没写过的目的地，第 1 层看
-   不到。所以被封网段同时作为 deno 自己的 `deny_net` 挂上，deno 在每一跳都查它。
+   解析一次，两次答案可以不同，这一层保证真正拨出去的地址一定是策略认可的。运维用
+   域名开的白名单也走它；但平台自身端点是个例外——白名单再怎么开也不许够到它们，这条
+   在连接时也得成立：一个白名单里的域名，预检时解析到公网地址、连接时却解析到某个平台
+   端点的环回地址（这就是重绑定），这一层会把那个平台地址丢掉，不让它连出去。
+3. **每一跳都自己跟、都过第 1 层**。`fetch` 默认跟重定向，而每一跳都是应用没写过的
+   目的地——是上一跳的应答方替它选的。所以 `js/bootstrap.js` 用 `redirect: "manual"`
+   自己跟这条链，对**连接器真正会拿到的那个 URL** 再调一次 `op_deis_fetch_guard`。于是
+   一次调用能到达的每个目标，都由同一个判定点、同一套规则说了算：同样的 scheme、地址段、
+   端口、白名单，同样地拒绝平台自身端点。跳数上限 20，`Location:` 按发出它那一跳解析，
+   303（及 POST 上的 301/302）改成不带 body 的 GET，跨源丢凭证与 `Host:`，非 http(s)
+   的 `Location:` 直接拒。
 
-**这一层有两个已经量出来的洞，不是推测的**：
+**这两个曾经量出来的洞，现在都关上了**，正是「每一跳都过第 1 层」把它们关上的。以前
+跟重定向是 deno 的事，只有 deno 自己的 `deny_net` 在看每一跳，而它说不出第 1 层能说
+的话：
 
 - **IPv6 网段写不出来**。deno 的 net descriptor 没有 IPv6 子网的写法（`fc00::/7`
   会被当成 host:port 解析失败），所以 deny 列表里只有 IPv4 网段和 `::1` / `::` 两个
-  单地址。一个 `Location:` 指向 IPv6 唯一本地或链路本地**字面量**的重定向，兜底层
-  拦不住——实测日志里是 `Granted net access to "[fd00::1]:8091"`。彻底关掉要么等
-  deno 支持 IPv6 前缀，要么在 JS 包装里自己跟重定向（`redirect: manual`），让每一跳
-  都过第 1 层。
+  单地址。一个 `Location:` 指向 IPv6 唯一本地或链路本地**字面量**的重定向以前拦不住
+  ——实测日志里是 `Granted net access to "[fd00::1]:8091"`。
 - **白名单里写字面 IP 会开一个「一个地址、所有端口」的洞**。deny 列表没有按端口的
-  例外，所以运维开的字面地址会被从覆盖它的网段里整个抠掉。平台自己的端点（控制面、
-  deis-store、deis-queue、deis-telemetry，以及本节点自己的 HTTP 监听口）已经作为
-  精确条目单独写进 deny 列表，正是为了不被这个洞吞掉——每个都同时写 IPv4 与
-  IPv4-mapped IPv6 两种拼法，因为 deno 是按 URL 里的字面主机名匹配的。但节点上**别的**
-  东西如果也听在那个地址上，仍然进得去。写域名则完全没有这个问题，也是该优先用的写法。
+  例外，运维开的字面地址会被从覆盖它的网段里整个抠掉，那个地址上别的端口就都成了
+  合法的重定向落点——节点上 deis-control、deis-store、deis-queue、deis-telemetry
+  恰恰都听在那里，telemetry 的 metrics 端口当年就是这么被够着的。
 
-还有一条不是洞、但会改变结论的事：**deno_fetch 无条件读进程环境里的 `HTTP_PROXY` /
-`HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`**（`create_http_client` 里的
-`proxy::from_env()`，没有开关可关）。一旦命中代理，连接器拨的是代理，目的地只作为
-`CONNECT` 目标发过去，于是第 2 层解析的是代理的主机名、根本看不到目的地——DNS
-重绑定的那道保证就没了（第 1 层和 deny 列表仍然按 URL 判，所以应用自己写出来的
-目的地照样拦）。要保住那道保证，运维得把这几个变量从 deis-runtime 的启动环境里拿掉。
+deny 列表仍然挂着，但角色变了：它现在是包装底下的兜底，不是机制本身。deno 在
+`op_fetch` 里查它，万一哪条路径绕过 guard 直接到了 `op_fetch`，环回和私有地址在那里
+仍然会被拒——不过应用其实够不到这样的路径，因为 op 表本身就够不到（见前面全局作用域
+那节讲 `Deno` 与 `__bootstrap` 的部分）。
 
-平台自身端点是在白名单**之后**再判一次的，所以运维再怎么开也开不到 deis-store 身上。
-配置写错（`[fetch] allow` 里一条解析不了）直接启动失败，不会静悄悄跳过——一条被
-忽略的白名单看起来和一条生效的完全一样。
+**节点环境里的 HTTP 代理不会被应用继承**。`deno_fetch` 建客户端时无条件调
+`proxy::from_env()`（`create_http_client` 里，没有开关可关），所以**节点进程**环境里的
+`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 本来会决定应用的 `fetch` 实际连到哪里。一旦
+命中代理，连接器拨的是代理、目的地只作为 `CONNECT` 目标发过去，于是第 2 层解析的是
+代理主机名、看不到目的地——防重绑定那道保证就没了。所以这几个变量在启动时（tokio
+运行时和任何 HTTP 客户端建起来之前、进程还单线程时）读一次、从进程环境里拿掉，拿掉了
+什么以 `warn` 记一条；节点自己跟控制面的流量照走代理（值在拿掉前先留一份，显式喂给
+拉分配 / 注册 / 下 bundle 那三个客户端）。`[fetch] proxy_from_env = true` 可以把应用
+那份也放回去——明写的选择，每次启动 `warn` 一条并说清代价。`NO_PROXY` 不动，它只会让
+代理少拦一些。
+
+还有一条与出网同批的保证：**一次出站调用活不过发起它的那次请求**。执行超时靠终止
+V8，而终止 V8 对已经派发出去的 Rust op 无效，所以每次调用都按剩余执行预算武装一个
+`AbortSignal`，预算一到就把 op 卷回来、给处理函数一个能 catch 的 `TimeoutError`；连
+处理函数发起后不 `await`、也不交给 `waitUntil` 的调用，也会在这次调用结束的清扫里被
+abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细节见两份
+`crates/deis-runtime/README`。
+
+平台自身端点是在白名单**之后**再判一次的，所以运维再怎么开也开不到 deis-store 身上，
+这一点在重定向的每一跳也成立。配置写错（`[fetch] allow` 里一条解析不了）直接启动失败，
+不会静悄悄跳过——一条被忽略的白名单看起来和一条生效的完全一样。
 
 ### 扩展特性
 

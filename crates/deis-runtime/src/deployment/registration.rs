@@ -167,7 +167,11 @@ impl NodeRegistrar {
         timeout: Duration,
         credential: Option<NodeCredential>,
     ) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder().timeout(timeout).build()?;
+        // See `crate::egress_proxy`: this node keeps the operator's proxy,
+        // applications no longer inherit it.
+        let client =
+            crate::egress_proxy::for_node_clients(reqwest::Client::builder().timeout(timeout))?
+                .build()?;
         let url = format!(
             "{}{}",
             endpoint.trim_end_matches('/'),

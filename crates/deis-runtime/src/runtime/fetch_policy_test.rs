@@ -398,6 +398,24 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
+    #[tokio::test]
+    async fn the_resolver_drops_a_platform_address_an_allowlisted_name_rebinds_to() {
+        // The platform's endpoints are configured by address on a real node
+        // (`127.0.0.1:<port>`), not by name. An operator may also allowlist a
+        // hostname. If that name resolves to a public address when `check`
+        // runs and to the loopback address a platform service listens on when
+        // the socket is opened -- a DNS rebind -- the allowlist must not carry
+        // it through: "no allowlist entry can reach them" holds for the
+        // connect-time answer too. `localhost` stands in for the rebound name;
+        // it resolves to the loopback address every platform endpoint shares.
+        let policy = FetchPolicy::new(["localhost"], ["127.0.0.1:8091"]).unwrap();
+        let error = PolicyResolver::new(policy, "store-reader.production")
+            .resolve(name("localhost"))
+            .await
+            .expect_err("a platform address is refused even to an allowlisted name");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
     #[test]
     fn a_malformed_allowlist_entry_is_an_error_not_a_shrug() {
         // Silently dropping the entry would look exactly like one that worked

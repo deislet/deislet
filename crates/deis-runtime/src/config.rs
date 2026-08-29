@@ -345,6 +345,32 @@ pub struct FetchConfig {
     /// destinations and nothing else.
     #[serde(default)]
     pub allow: Vec<String>,
+
+    /// Whether an HTTP proxy named in this node's environment
+    /// (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) may carry applications'
+    /// outbound calls.
+    ///
+    /// `false`, the default, takes those variables out of the process
+    /// environment at startup. `deno_fetch` reads them unconditionally when it
+    /// builds an application's HTTP client and offers no way to say no, so
+    /// left in place they -- not this file -- decide where every `fetch()`
+    /// actually connects. This node's own control-plane traffic still uses the
+    /// proxy: the values are captured before they are removed and handed back
+    /// to those clients explicitly.
+    ///
+    /// `true` puts it back for applications too. That is a real choice for a
+    /// deployment whose applications are meant to egress through a proxy, and
+    /// it costs something specific: a proxied connection dials the proxy and
+    /// carries the destination as a `CONNECT` target, so the outbound policy's
+    /// own DNS resolver -- the layer that keeps a name from resolving to one
+    /// address for the check and another for the socket -- never sees the
+    /// destination's addresses. The pre-flight check on the URL, and the
+    /// refusal of this platform's own endpoints, are unaffected. The node logs
+    /// the trade at warn on every start.
+    ///
+    /// See `crate::egress_proxy`.
+    #[serde(default)]
+    pub proxy_from_env: bool,
 }
 
 impl FetchConfig {
@@ -565,6 +591,11 @@ impl RuntimeConfig {
                 .filter(|entry| !entry.is_empty())
                 .map(str::to_string)
                 .collect();
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_FETCH_PROXY_FROM_ENV") {
+            self.fetch.proxy_from_env =
+                parse_env(&value, "DEIS_RUNTIME_FETCH_PROXY_FROM_ENV", "true|false")?;
         }
 
         if let Some(value) = env_var("DEIS_RUNTIME_LOGGING_ENABLED") {
@@ -1044,6 +1075,28 @@ mod tests {
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let error = config.validate().expect_err("that entry is not a host");
         assert!(error.to_string().contains("fetch.allow"), "{error}");
+    }
+
+    #[test]
+    fn applications_do_not_inherit_the_nodes_proxy_unless_it_is_asked_for() {
+        // The default has to be the closed one. `deno_fetch` reads the proxy
+        // variables unconditionally, so a node that says nothing about them
+        // would otherwise have its applications' egress decided by whatever
+        // shell, unit file or container env the binary happened to start in.
+        let config: RuntimeConfig = toml::from_str("http_port = 9000").unwrap();
+        assert!(
+            !config.fetch.proxy_from_env,
+            "a node that says nothing must not hand applications the node's proxy"
+        );
+
+        let asked: RuntimeConfig = toml::from_str(
+            r#"
+            [fetch]
+            proxy_from_env = true
+        "#,
+        )
+        .unwrap();
+        assert!(asked.fetch.proxy_from_env);
     }
 
     #[test]

@@ -157,3 +157,22 @@ max_bytes = 134217728
 # been consulted, so an entry that happens to cover one of them still does not
 # reach it.
 allow = []
+
+# Whether an HTTP proxy named in this node's environment (HTTP_PROXY,
+# HTTPS_PROXY, ALL_PROXY) may carry applications' outbound calls.
+#
+# false, the default, takes those variables out of the process environment at
+# startup and logs at warn what was removed. deno_fetch reads them
+# unconditionally when it builds an application's HTTP client and offers no way
+# to say no, so left in place they -- not this file -- decide where every
+# fetch() actually connects. This node's own control-plane traffic is
+# unaffected: the values are captured before they are removed and handed to the
+# node's own clients explicitly.
+#
+# true puts it back for applications too. The cost is specific: a proxied
+# connection dials the proxy and carries the destination as a CONNECT target,
+# so the outbound policy's DNS resolver never sees the destination's addresses
+# and the DNS-rebinding guarantee is gone for application traffic. The
+# pre-flight check on the URL, and the refusal of this platform's own
+# endpoints, are unaffected. The trade is logged at warn on every start.
+proxy_from_env = false

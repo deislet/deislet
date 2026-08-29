@@ -1574,6 +1574,14 @@ export default function handler(context: any): Response {
     /// platform promises stays one an operator can reason about.
     const EXTRA_GLOBALS_ABSENT: &[&str] = &[
         "Deno",
+        // `deno_core` publishes its op table on both `globalThis.Deno.core`
+        // and `globalThis.__bootstrap.core`. A full Deno boot deletes the
+        // latter in `99_main.js`; this runtime does not run that, so
+        // `runtime/js/runtime.js` deletes it by hand next to `Deno`. Either
+        // one left standing hands an application `core.ops.op_net_connect_tcp`
+        // and every other op, which is a total bypass of the outbound fetch
+        // policy. See `an_application_cannot_reach_the_raw_op_table`.
+        "__bootstrap",
         "Blob",
         "File",
         "FormData",
@@ -1645,6 +1653,63 @@ export default function handler(context: any): Response {
                  to crates/deis-runtime/README.md and edge-canon's PLATFORM_MATRIX.md"
             );
         }
+    }
+
+    /// An application must not be able to reach the raw op table.
+    ///
+    /// The whole outbound fetch policy rests on the `fetch` wrapper in
+    /// `js/bootstrap.js` being the only way an application can open a socket.
+    /// `deno_core` exposes its op table on the global object twice --
+    /// `globalThis.Deno.core.ops` and `globalThis.__bootstrap.core.ops` -- and
+    /// either one hands an application `op_fetch` and, worse,
+    /// `op_net_connect_tcp`: a raw TCP connect the policy's pre-flight guard,
+    /// its DNS resolver and its redirect loop never see. `runtime/js/runtime.js`
+    /// deletes both globals before any application code runs. This drives the
+    /// same two doors an attacker would and asserts each is shut, down to the
+    /// op an application would actually call to reach a loopback service.
+    #[tokio::test]
+    async fn an_application_cannot_reach_the_raw_op_table() {
+        let code = r#"
+            export default function handler() {
+                const g = globalThis;
+                const bootstrapOps =
+                    !!(g.__bootstrap && g.__bootstrap.core && g.__bootstrap.core.ops);
+                const denoOps = !!(g.Deno && g.Deno.core && g.Deno.core.ops);
+                let connectReachable = false;
+                try {
+                    const ops =
+                        (g.__bootstrap && g.__bootstrap.core && g.__bootstrap.core.ops) ||
+                        (g.Deno && g.Deno.core && g.Deno.core.ops);
+                    connectReachable =
+                        !!(ops && typeof ops.op_net_connect_tcp === "function");
+                } catch (_) {}
+                return new Response(
+                    JSON.stringify({ bootstrapOps, denoOps, connectReachable }),
+                );
+            }
+        "#;
+        let body = body_of(
+            "op_table_app",
+            code,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .await;
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            seen["bootstrapOps"], false,
+            "globalThis.__bootstrap.core.ops is reachable from an application, which hands it \
+             every op directly and bypasses the outbound fetch policy"
+        );
+        assert_eq!(
+            seen["denoOps"], false,
+            "globalThis.Deno.core.ops is reachable from an application"
+        );
+        assert_eq!(
+            seen["connectReachable"], false,
+            "op_net_connect_tcp is reachable from an application; it opens a raw socket the \
+             fetch policy never sees"
+        );
     }
 
     // --- outbound fetch ----------------------------------------------------
@@ -2406,5 +2471,802 @@ export default function handler(context: any): Response {
         );
         assert_eq!(seen["missingIsNull"], true);
         assert_eq!(seen["deletedIsNull"], true);
+    }
+
+    // --- redirects ---------------------------------------------------------
+    //
+    // A redirect is the destination an application never named: whoever
+    // answered the first hop chose it. `js/bootstrap.js` follows the chain
+    // itself, with `redirect: "manual"`, so that every hop goes through the
+    // same policy check the first request did.
+    //
+    // These tests redirect for real -- a server on loopback answering 3xx with
+    // a `Location:` header -- rather than asserting anything about how the
+    // following is implemented. Two of them cover destinations that were
+    // reachable before the wrapper followed redirects itself, because deno's
+    // net deny list, which was the only thing looking at a hop, cannot spell
+    // an IPv6 prefix and cannot make a per-port exception.
+
+    /// Start a router on loopback and hand back the address it answers on.
+    async fn serve(router: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        addr
+    }
+
+    /// A handler that reports everything about one outbound call that a
+    /// redirect can change: whether it arrived, where it ended up, whether it
+    /// was redirected at all, and -- when it failed -- what the application was
+    /// told and by what kind of error.
+    const REDIRECT_PROBE: &str = r#"
+        export default async function handler(ctx) {
+            const init = ctx.env.FETCH_INIT
+                ? JSON.parse(ctx.env.FETCH_INIT)
+                : undefined;
+            try {
+                const response = await fetch(ctx.env.PROBE_URL, init);
+                return new Response(JSON.stringify({
+                    ok: true,
+                    status: response.status,
+                    url: response.url,
+                    redirected: response.redirected,
+                    location: response.headers.get("location"),
+                    body: await response.text(),
+                }));
+            } catch (e) {
+                return new Response(JSON.stringify({
+                    ok: false,
+                    name: e.name,
+                    kind: e.constructor.name,
+                    message: String((e && e.message) || e),
+                }));
+            }
+        }
+    "#;
+
+    /// Run [`REDIRECT_PROBE`] against `url` and hand back what it reported.
+    async fn probe(
+        app: &str,
+        url: &str,
+        init: Option<&str>,
+        policy: crate::runtime::FetchPolicy,
+    ) -> serde_json::Value {
+        probe_with_limits(app, url, init, policy, ExecutionLimits::default()).await
+    }
+
+    async fn probe_with_limits(
+        app: &str,
+        url: &str,
+        init: Option<&str>,
+        policy: crate::runtime::FetchPolicy,
+        limits: ExecutionLimits,
+    ) -> serde_json::Value {
+        let mut env = HashMap::from([("PROBE_URL".to_string(), url.to_string())]);
+        if let Some(init) = init {
+            env.insert("FETCH_INIT".to_string(), init.to_string());
+        }
+        let spec = IsolateSpec {
+            env,
+            fetch_policy: policy,
+            limits,
+            ..IsolateSpec::default()
+        };
+        let body = body_of(app, REDIRECT_PROBE, spec, &ServiceWiring::default()).await;
+        serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("the probe did not report JSON ({e}): {body}"))
+    }
+
+    /// An allowlist entry naming one loopback port by name. A *name* is used
+    /// wherever the test is not about ports: an entry that is a literal
+    /// address is punched out of deno's deny list, and a test whose upstream
+    /// was allowlisted that way would be proving less than it looks.
+    fn allow_localhost(port: u16) -> crate::runtime::FetchPolicy {
+        crate::runtime::FetchPolicy::new([format!("localhost:{port}")], Vec::<String>::new())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_an_ipv6_unique_local_address_is_refused() {
+        // The first of the two holes the wrapper closes. deno's net descriptor
+        // has no spelling for an IPv6 *subnet* -- it reads `fc00::/7` as a host
+        // and a port and gives up -- so the deny list that used to be the only
+        // thing looking at a redirect carried the IPv4 ranges and the two exact
+        // addresses `::1` and `::`, and nothing that covers `fd00::1`. deno
+        // logged this hop as "Granted net access".
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        let addr = serve(axum::Router::new().route(
+            "/",
+            get(|| async { Redirect::temporary("http://[fd00::1]:8090/kv/get").into_response() }),
+        ))
+        .await;
+
+        let seen = probe(
+            "redirect-v6.production",
+            &format!("http://localhost:{}/", addr.port()),
+            None,
+            allow_localhost(addr.port()),
+        )
+        .await;
+
+        assert_eq!(seen["ok"], false, "the hop was followed: {seen}");
+        let message = seen["message"].as_str().unwrap();
+        assert!(message.contains("fd00::1"), "{message}");
+        assert!(message.contains("unique-local"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_port_on_an_allowlisted_address_is_refused() {
+        // The second hole. deno's deny list has no per-port exception, so an
+        // allowlist entry that is a literal address has to be punched out of
+        // the range that covers it -- one address wide, *every port*. On a node
+        // that address is where deis-control, deis-store, deis-queue and
+        // deis-telemetry all listen, and the telemetry metrics port was
+        // reachable exactly this way.
+        //
+        // The operator here opened one port on 127.0.0.1. The redirect goes to
+        // a different port on the same address, which the pre-flight check has
+        // always refused for a destination an application named itself -- and
+        // now refuses for one it did not.
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        let secret = serve(
+            axum::Router::new().route("/metrics", get(|| async { "deis_requests_total 41" })),
+        )
+        .await;
+        let redirector = serve(axum::Router::new().route(
+            "/",
+            get(move || async move {
+                Redirect::temporary(&format!("http://127.0.0.1:{}/metrics", secret.port()))
+                    .into_response()
+            }),
+        ))
+        .await;
+
+        // A literal address with a port: the shape that punches the hole.
+        let policy = crate::runtime::FetchPolicy::new(
+            [format!("127.0.0.1:{}", redirector.port())],
+            Vec::<String>::new(),
+        )
+        .unwrap();
+
+        let seen = probe(
+            "redirect-port.production",
+            &format!("http://127.0.0.1:{}/", redirector.port()),
+            None,
+            policy,
+        )
+        .await;
+
+        assert_eq!(
+            seen["ok"], false,
+            "the redirect reached another port on the node: {seen}"
+        );
+        let message = seen["message"].as_str().unwrap();
+        assert!(message.contains(&secret.port().to_string()), "{message}");
+        assert!(message.contains("loopback"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_followed_and_the_response_says_where_it_ended_up() {
+        // The other half: a policy that refused every hop would pass both
+        // tests above and be useless. `url` and `redirected` are part of what
+        // `fetch` promises, and following the chain here rather than inside
+        // deno_fetch means nothing else fills them in.
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        let destination =
+            serve(axum::Router::new().route("/final", get(|| async { "arrived" }))).await;
+        let entry = serve(axum::Router::new().route(
+            "/",
+            get(move || async move {
+                Redirect::temporary(&format!("http://localhost:{}/final", destination.port()))
+                    .into_response()
+            }),
+        ))
+        .await;
+
+        let policy = crate::runtime::FetchPolicy::new(
+            [
+                format!("localhost:{}", entry.port()),
+                format!("localhost:{}", destination.port()),
+            ],
+            Vec::<String>::new(),
+        )
+        .unwrap();
+
+        let seen = probe(
+            "redirect-followed.production",
+            &format!("http://localhost:{}/", entry.port()),
+            None,
+            policy,
+        )
+        .await;
+
+        assert_eq!(seen["ok"], true, "{seen}");
+        assert_eq!(seen["status"], 200, "{seen}");
+        assert_eq!(seen["body"], "arrived", "{seen}");
+        assert_eq!(
+            seen["url"],
+            format!("http://localhost:{}/final", destination.port()),
+            "response.url must be where the call ended, not where it started: {seen}"
+        );
+        assert_eq!(seen["redirected"], true, "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_relative_location_is_resolved_against_the_url_that_sent_it() {
+        // `Location: /landed` is the common case and it is only meaningful
+        // relative to the hop that returned it. Resolving it against anything
+        // else -- the original request, or nothing at all -- turns a working
+        // redirect into a failure or, worse, into a different destination.
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        let addr = serve(
+            axum::Router::new()
+                .route(
+                    "/deep/start",
+                    get(|| async { Redirect::temporary("../landed").into_response() }),
+                )
+                .route("/landed", get(|| async { "arrived" })),
+        )
+        .await;
+
+        let seen = probe(
+            "redirect-relative.production",
+            &format!("http://localhost:{}/deep/start", addr.port()),
+            None,
+            allow_localhost(addr.port()),
+        )
+        .await;
+
+        assert_eq!(seen["ok"], true, "{seen}");
+        assert_eq!(seen["body"], "arrived", "{seen}");
+        assert_eq!(
+            seen["url"],
+            format!("http://localhost:{}/landed", addr.port()),
+            "{seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_loop_is_given_up_on_rather_than_followed_forever() {
+        // Without a limit this is a handler that never returns, holding the
+        // runtime thread until the execution timeout terminates the isolate.
+        // With one, the application gets a `TypeError` naming the limit, which
+        // is what it would get from any other `fetch`.
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        let addr = serve(axum::Router::new().route(
+            "/",
+            get(|| async { Redirect::temporary("/").into_response() }),
+        ))
+        .await;
+
+        let seen = probe(
+            "redirect-loop.production",
+            &format!("http://localhost:{}/", addr.port()),
+            None,
+            allow_localhost(addr.port()),
+        )
+        .await;
+
+        assert_eq!(seen["ok"], false, "{seen}");
+        assert_eq!(seen["kind"], "TypeError", "{seen}");
+        let message = seen["message"].as_str().unwrap();
+        assert!(
+            message.contains("redirected more than 20 times"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_303_turns_a_post_into_a_get_and_a_307_repeats_it() {
+        // The rules `fetch` is defined by, and applications rely on them: a 303
+        // means "now go and GET this instead", a 307 means "do the same thing
+        // again over there". Following redirects by hand means implementing
+        // both, and getting either wrong sends a body somewhere it was not
+        // meant to go or drops one that was.
+        use axum::extract::Request;
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::{any, post};
+
+        let router = axum::Router::new()
+            .route(
+                "/see-other",
+                post(|| async { Redirect::to("/echo").into_response() }),
+            )
+            .route(
+                "/keep",
+                post(|| async { Redirect::temporary("/echo").into_response() }),
+            )
+            .route(
+                "/echo",
+                any(|request: Request| async move {
+                    let method = request.method().clone();
+                    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+                        .await
+                        .unwrap();
+                    format!("{method}:{}", String::from_utf8_lossy(&body))
+                }),
+            );
+        let addr = serve(router).await;
+
+        let init = r#"{"method":"POST","body":"payload"}"#;
+
+        let see_other = probe(
+            "redirect-303.production",
+            &format!("http://localhost:{}/see-other", addr.port()),
+            Some(init),
+            allow_localhost(addr.port()),
+        )
+        .await;
+        assert_eq!(see_other["ok"], true, "{see_other}");
+        assert_eq!(
+            see_other["body"], "GET:",
+            "a 303 must arrive as a GET with no body: {see_other}"
+        );
+
+        let keep = probe(
+            "redirect-307.production",
+            &format!("http://localhost:{}/keep", addr.port()),
+            Some(init),
+            allow_localhost(addr.port()),
+        )
+        .await;
+        assert_eq!(keep["ok"], true, "{keep}");
+        assert_eq!(
+            keep["body"], "POST:payload",
+            "a 307 must arrive as the same request: {keep}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_is_not_carried_to_a_different_origin() {
+        // A `Location:` header is written by whoever answered the previous hop.
+        // Carrying an `Authorization:` across it hands that party's pick of
+        // destination a credential the application only ever meant for the
+        // destination it named itself.
+        use axum::http::HeaderMap;
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        fn echo_auth(headers: HeaderMap) -> String {
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_string()
+        }
+
+        let elsewhere = serve(axum::Router::new().route(
+            "/echo",
+            get(|headers: HeaderMap| async move { echo_auth(headers) }),
+        ))
+        .await;
+        let entry = serve(
+            axum::Router::new()
+                .route(
+                    "/cross",
+                    get(move || async move {
+                        Redirect::temporary(&format!("http://localhost:{}/echo", elsewhere.port()))
+                            .into_response()
+                    }),
+                )
+                .route(
+                    "/same",
+                    get(|| async { Redirect::temporary("/echo").into_response() }),
+                )
+                .route(
+                    "/echo",
+                    get(|headers: HeaderMap| async move { echo_auth(headers) }),
+                ),
+        )
+        .await;
+
+        let policy = crate::runtime::FetchPolicy::new(
+            [
+                format!("localhost:{}", entry.port()),
+                format!("localhost:{}", elsewhere.port()),
+            ],
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        let init = r#"{"headers":{"authorization":"Bearer s3cret"}}"#;
+
+        let crossed = probe(
+            "redirect-cross-origin.production",
+            &format!("http://localhost:{}/cross", entry.port()),
+            Some(init),
+            policy.clone(),
+        )
+        .await;
+        assert_eq!(crossed["ok"], true, "{crossed}");
+        assert_eq!(
+            crossed["body"], "none",
+            "the credential travelled to another origin: {crossed}"
+        );
+
+        // ... and dropping it on a redirect that stays where it was would be
+        // just as wrong: an application that authenticates to a service must
+        // still be authenticated after that service moves the path.
+        let stayed = probe(
+            "redirect-same-origin.production",
+            &format!("http://localhost:{}/same", entry.port()),
+            Some(init),
+            policy,
+        )
+        .await;
+        assert_eq!(stayed["ok"], true, "{stayed}");
+        assert_eq!(stayed["body"], "Bearer s3cret", "{stayed}");
+    }
+
+    #[tokio::test]
+    async fn a_location_that_is_not_http_is_not_followed() {
+        // `file:` is the node's own disk and `data:` never leaves the isolate;
+        // neither is something an outbound HTTP call may be turned into by the
+        // server that answered it.
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        for location in ["file:///etc/passwd", "data:text/plain,pwned"] {
+            let addr = serve(axum::Router::new().route(
+                "/",
+                get(move || async move { Redirect::temporary(location).into_response() }),
+            ))
+            .await;
+
+            let seen = probe(
+                "redirect-scheme.production",
+                &format!("http://localhost:{}/", addr.port()),
+                None,
+                allow_localhost(addr.port()),
+            )
+            .await;
+
+            assert_eq!(seen["ok"], false, "{location} was followed: {seen}");
+            let message = seen["message"].as_str().unwrap();
+            assert!(
+                message.contains("http and https") || message.contains("scheme"),
+                "{location}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_manual_and_redirect_error_still_mean_what_they_mean() {
+        // Following redirects here must not take the application's own say in
+        // it away. `manual` hands the 3xx back -- and an application that then
+        // acts on it makes another `fetch`, which comes through the same guard
+        // -- and `error` fails the call.
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        let addr = serve(
+            axum::Router::new()
+                .route(
+                    "/",
+                    get(|| async { Redirect::temporary("/landed").into_response() }),
+                )
+                .route("/landed", get(|| async { "arrived" })),
+        )
+        .await;
+        let url = format!("http://localhost:{}/", addr.port());
+
+        let manual = probe(
+            "redirect-manual.production",
+            &url,
+            Some(r#"{"redirect":"manual"}"#),
+            allow_localhost(addr.port()),
+        )
+        .await;
+        assert_eq!(manual["ok"], true, "{manual}");
+        assert_eq!(manual["status"], 307, "{manual}");
+        assert_eq!(manual["location"], "/landed", "{manual}");
+        assert_eq!(manual["redirected"], false, "{manual}");
+        assert_eq!(manual["url"], url, "{manual}");
+
+        let errored = probe(
+            "redirect-error.production",
+            &url,
+            Some(r#"{"redirect":"error"}"#),
+            allow_localhost(addr.port()),
+        )
+        .await;
+        assert_eq!(errored["ok"], false, "{errored}");
+        assert_eq!(errored["kind"], "TypeError", "{errored}");
+        assert!(
+            errored["message"].as_str().unwrap().contains("error"),
+            "{errored}"
+        );
+    }
+
+    // --- the execution budget ----------------------------------------------
+
+    #[tokio::test]
+    async fn a_fetch_that_never_answers_is_cut_off_by_the_execution_budget() {
+        // The defect this closes: an execution timeout is enforced by
+        // terminating V8, and terminating V8 does nothing to a Rust operation
+        // already in flight. A `fetch` to an address that accepts the
+        // connection and then says nothing was measured returning after 81
+        // seconds against a 30-second budget -- and for all of that time it
+        // held the runtime thread its application shares with every other
+        // application on that thread.
+        //
+        // Two things are asserted, and the first is the one that would have
+        // been impossible before: the *application* comes back, with an error
+        // it could catch, inside its own budget. A terminated isolate produces
+        // no response at all, so `body_of` would not have got one.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accepted and then held open, unanswered, for as long as the test
+            // runs. Dropping the sockets would answer with a close, which is
+            // an answer.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let policy =
+            crate::runtime::FetchPolicy::new([addr.to_string()], Vec::<String>::new()).unwrap();
+        let limits = ExecutionLimits {
+            timeout_ms: 2_000,
+            ..ExecutionLimits::default()
+        };
+
+        let started = std::time::Instant::now();
+        let seen = probe_with_limits(
+            "budget-hang.production",
+            &format!("http://{addr}/"),
+            None,
+            policy,
+            limits,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(seen["ok"], false, "{seen}");
+        assert_eq!(
+            seen["name"], "TimeoutError",
+            "the application has to be able to tell this apart from any other \
+             network failure: {seen}"
+        );
+        assert!(
+            seen["message"]
+                .as_str()
+                .unwrap()
+                .contains("execution budget"),
+            "{seen}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "the call was not cut off by the budget: it took {elapsed:?} against a \
+             2000ms timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_fetch_is_aborted_when_the_invocation_ends() {
+        // The other half of the budget's guarantee. The hang test above covers
+        // the call the handler awaits; this covers the one it does not. A
+        // `fetch` started and neither awaited nor handed to `waitUntil` is
+        // still open when the handler returns. Its budget timer would not fire
+        // for the rest of the budget, and the end-of-invocation sweep used to
+        // only stop that timer -- so the call stayed open, its socket charged
+        // to the node process, a resource shared with every other application,
+        // until the far end closed it. A handler firing one such call per
+        // request piled them up without bound. The sweep now aborts every call
+        // still bounded by the budget, so a detached one cannot outlive its
+        // request.
+        //
+        // Asserted where the abort is observable: the detached fetch's own
+        // promise. The first request starts it against an upstream that
+        // accepts and never answers, and stashes the promise on the isolate.
+        // The sweep aborts the call as that request ends, rejecting the
+        // promise with the `TimeoutError` the budget raises -- a rejection that
+        // carries this specific name only when the budget aborted it. The
+        // second request reads what the promise settled to, racing a short
+        // timer so a promise still pending reports itself rather than hanging.
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept and hold, unanswered, so the only way the fetch settles is
+            // an abort.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1];
+                    let _ = stream.read(&mut buf).await;
+                });
+            }
+        });
+
+        // One isolate, two requests: the first stashes the detached fetch on a
+        // global, the second reads what it settled to. Both live in one module
+        // that branches on whether the stash exists yet.
+        let code = r#"
+            export default async function handler(ctx) {
+                if (!globalThis.__detached) {
+                    globalThis.__detached = fetch(ctx.env.HANG_URL).then(
+                        () => "resolved",
+                        (e) => "rejected:" + (e && e.name ? e.name : String(e)),
+                    );
+                    // Deliberately neither awaited nor handed to waitUntil.
+                    return new Response("started");
+                }
+                const pending = new Promise((r) => setTimeout(() => r("still-pending"), 200));
+                return new Response(await Promise.race([globalThis.__detached, pending]));
+            }
+        "#;
+
+        let policy =
+            crate::runtime::FetchPolicy::new([addr.to_string()], Vec::<String>::new()).unwrap();
+        let spec = IsolateSpec {
+            env: HashMap::from([("HANG_URL".to_string(), format!("http://{addr}/"))]),
+            fetch_policy: policy,
+            limits: ExecutionLimits {
+                timeout_ms: 30_000,
+                ..ExecutionLimits::default()
+            },
+            ..IsolateSpec::default()
+        };
+
+        let mut runtime = AppRuntime::new(
+            "detached-fetch.production".to_string(),
+            code.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body.as_deref(), Some("started"));
+
+        let (tx2, rx2) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx2,
+            )
+            .await
+            .unwrap();
+        let (_status2, _, body2) = rx2.await.unwrap().unwrap();
+        let outcome = body2.unwrap_or_default();
+        assert_eq!(
+            outcome, "rejected:TimeoutError",
+            "a detached fetch was not aborted when its invocation ended (outcome: {outcome}); \
+             its socket would outlive the request that made it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_isolate_serves_a_second_request_after_one_that_fetched() {
+        // An isolate is reused, and the budget arms a timer per outbound call.
+        // A timer left armed would be counting down inside the next request in
+        // this same isolate; the sweep at the end of every invocation is what
+        // stops that, and this is the test that would notice if the sweep, or
+        // the arming, left the isolate unable to serve again.
+        use axum::routing::get;
+
+        let addr = serve(axum::Router::new().route("/", get(|| async { "again" }))).await;
+        let url = format!("http://localhost:{}/", addr.port());
+        let spec = IsolateSpec {
+            env: HashMap::from([("PROBE_URL".to_string(), url)]),
+            fetch_policy: allow_localhost(addr.port()),
+            ..IsolateSpec::default()
+        };
+
+        let mut runtime = AppRuntime::new(
+            "fetch-reuse.production".to_string(),
+            REDIRECT_PROBE.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        for attempt in 1..=2 {
+            let (tx, rx) = oneshot::channel();
+            runtime
+                .execute_fetch(
+                    "http://localhost/".to_string(),
+                    "GET".to_string(),
+                    HashMap::new(),
+                    None,
+                    tx,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("request {attempt} did not complete: {e}"));
+            let (status, _, body) = rx.await.unwrap().unwrap();
+            assert_eq!(status, 200, "request {attempt}: {body:?}");
+            let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+            assert_eq!(seen["ok"], true, "request {attempt}: {seen}");
+            assert_eq!(seen["body"], "again", "request {attempt}: {seen}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fetch_started_in_wait_until_still_runs_after_the_response_is_sent() {
+        // The budget is disarmed when the handler's own execution ends, which
+        // is before the `waitUntil` tail runs -- the cut-off task is cancelled
+        // at the same point, so that tail has never been bounded by the
+        // timeout either. Leaving the deadline armed instead would have made
+        // every `waitUntil` fetch fail with an expired budget.
+        use axum::routing::get;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let addr = serve(axum::Router::new().route(
+            "/",
+            get(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    "counted"
+                }
+            }),
+        ))
+        .await;
+
+        let code = r#"
+            export default function handler(ctx) {
+                ctx.waitUntil(fetch(ctx.env.PROBE_URL).then((r) => r.text()));
+                return new Response("sent");
+            }
+        "#;
+        let spec = IsolateSpec {
+            env: HashMap::from([(
+                "PROBE_URL".to_string(),
+                format!("http://localhost:{}/", addr.port()),
+            )]),
+            fetch_policy: allow_localhost(addr.port()),
+            ..IsolateSpec::default()
+        };
+
+        let body = body_of(
+            "fetch-wait-until.production",
+            code,
+            spec,
+            &ServiceWiring::default(),
+        )
+        .await;
+
+        assert_eq!(body, "sent");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the waitUntil call never reached the upstream"
+        );
     }
 }

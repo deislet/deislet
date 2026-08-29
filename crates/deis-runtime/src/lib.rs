@@ -16,6 +16,7 @@ pub mod assets;
 pub mod config;
 pub mod deployment;
 pub mod dispatcher;
+pub mod egress_proxy;
 pub mod health;
 pub mod logging;
 pub mod management;

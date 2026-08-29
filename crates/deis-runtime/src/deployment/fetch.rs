@@ -103,12 +103,16 @@ impl BundleFetcher {
         max_bytes: u64,
         credential: Option<NodeCredential>,
     ) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            // Applies to the idle gap between chunks: a control plane that
-            // stops sending mid-bundle must not hold this download open for
-            // the whole outer deadline.
-            .read_timeout(timeout)
-            .build()?;
+        // See `crate::egress_proxy`: this node keeps the operator's proxy,
+        // applications no longer inherit it.
+        let client = crate::egress_proxy::for_node_clients(
+            reqwest::Client::builder()
+                // Applies to the idle gap between chunks: a control plane that
+                // stops sending mid-bundle must not hold this download open
+                // for the whole outer deadline.
+                .read_timeout(timeout),
+        )?
+        .build()?;
         Ok(Self {
             client,
             max_bytes,

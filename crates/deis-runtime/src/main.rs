@@ -10,21 +10,45 @@ use deis_runtime::deployment::{
     AssignmentClient, DeploymentManager, NodeRegistrar, NodeRegistration,
 };
 use deis_runtime::dispatcher::{self, ServerOptions};
+use deis_runtime::egress_proxy::{self, ProxyDecision};
 use deis_runtime::health::NodeHealth;
 use deis_runtime::logging::{LogBuffer, LogShipper, RuntimeLayer, ShipperConfig};
 use deis_runtime::runtime::{FetchPolicy, MetricShipper, MetricShipperConfig};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Everything that has to happen while this process is still single-threaded.
+///
+/// Removing a variable from the process environment mutates a table the whole
+/// process shares; doing it with worker threads already running is a data
+/// race, and doing it after any HTTP client has been built is too late to
+/// matter. So the configuration is read and the proxy question is settled
+/// here, on the main thread, and only then is the tokio runtime built.
+fn main() -> Result<()> {
+    // Configuration is read before logging is set up because it sizes the log
+    // buffer. A bad value stops the node here, with the reason on stderr,
+    // instead of turning into failing requests later.
+    let config = RuntimeConfig::load().context("loading the deis-runtime configuration")?;
+
+    // Whether an HTTP proxy named in this node's environment gets to carry
+    // applications' outbound calls. `deno_fetch` reads those variables
+    // unconditionally when it builds an application's client, so this is the
+    // only place the answer can be given. See `deis_runtime::egress_proxy`;
+    // the line that says what was done is emitted once logging exists.
+    let proxy = ProxyDecision::settle(config.fetch.proxy_from_env);
+    egress_proxy::install(proxy.clone());
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?
+        .block_on(run(config, proxy))
+}
+
+async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
     // Taken first, so the uptime this node reports to the control plane is the
     // process's own and not the moment some later component happened to be
     // built.
     let started_at = std::time::Instant::now();
 
-    // Configuration is read before logging is set up because it sizes the log
-    // buffer. A bad value stops the node here, with the reason on stderr,
-    // instead of turning into failing requests later.
-    let config = RuntimeConfig::load().context("loading the deis-runtime configuration")?;
     let port = config.http_port;
     let node_id = config.resolved_node_id();
 
@@ -44,6 +68,10 @@ async fn main() -> Result<()> {
 
     info!("Node ID: {}", node_id);
     info!("HTTP Port: {}", port);
+
+    // Held back until now because it happens before logging exists: what
+    // became of this node's proxy variables, and what that costs.
+    proxy.log();
 
     // Initialize data storage (Single SQLite DB)
     let data_dir = &config.data_dir;
