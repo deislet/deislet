@@ -1,4 +1,4 @@
-# Control Control example configuration
+# deis-control example configuration
 
 # Bind address
 bind_addr = "0.0.0.0"
@@ -24,11 +24,12 @@ heartbeat_timeout = 90
 # had. So those endpoints authenticate with this list whatever
 # api_auth_enabled says below, and an API key is not accepted on them.
 #
-# Leave this empty and there is no node credential at all: the endpoints
-# still answer (nobody could authenticate anyway), so anyone who can reach
-# this port can add a delivery target, and the assignment list defends
-# itself by leaving out every application that has a secret and saying so in
-# an ERROR line. Set a key here and the same value on every node.
+# Leave this empty and the control plane cannot tell a node from any other
+# caller, so it serves none of them: those endpoints answer 503 and no node
+# can register, fetch assignments or download a bundle. Rather than start
+# that way, the control plane generates a key on startup and prints it once
+# in a WARN line - copy it into this list and into every node, because it is
+# a different key after the next restart.
 #
 #   openssl rand -hex 32
 node_preshared_keys = [
@@ -142,14 +143,14 @@ bundle_dir = "data/bundles"
 # TLS / HTTPS configuration (optional)
 # ========================================
 
-# All four fields go together: uncomment the section as a whole. cert_path
+# The three fields go together: uncomment the section as a whole. cert_path
 # and key_path have no defaults, so a [tls] section without them stops the
 # control plane from reading this file at all.
 #
 # [tls]
-# api_enabled = true          # HTTPS for the HTTP API
-# ws_enabled = false          # WebSocket TLS is usually better terminated
-#                             # by a reverse proxy
+# api_enabled = true          # HTTPS on the port this control plane serves,
+#                             # which carries the REST API and the node gRPC
+#                             # channel together
 # cert_path = "/path/to/fullchain.pem"   # PEM certificate
 # key_path = "/path/to/privkey.pem"      # PEM private key
 #
@@ -176,9 +177,9 @@ bundle_dir = "data/bundles"
 # deis-telemetry.example.toml.
 
 # Example API requests (with authentication enabled):
-# curl -H "X-API-Key: deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/nodes
+# curl -H "X-API-Key: deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/sessions
 # or
-# curl -H "Authorization: Bearer deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/nodes
+# curl -H "Authorization: Bearer deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/runtime
 
 # Endpoints that do not require an API key:
 # - /health - Health check

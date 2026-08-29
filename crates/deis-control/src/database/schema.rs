@@ -21,7 +21,6 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             state TEXT NOT NULL,
             connected_at TEXT NOT NULL,
             last_heartbeat TEXT NOT NULL,
-            power_reserve INTEGER DEFAULT 0,
             metadata TEXT
         )
         "#,
@@ -98,13 +97,14 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             node_id TEXT NOT NULL,
             instance_id TEXT NOT NULL,
             timestamp TEXT NOT NULL,
-            power_reserve INTEGER NOT NULL,
             latency_ms INTEGER,
             FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
         )
         "#,
         [],
     )?;
+
+    drop_power_reserve(conn)?;
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_heartbeats_node ON heartbeats(node_id, timestamp)",
@@ -356,6 +356,60 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Take `power_reserve` off a database created before it was removed.
+///
+/// The column never held a measurement. The wire's `Heartbeat` message
+/// carries a status string and nothing else, so the control plane wrote a
+/// constant into every row while its own API answered with a different
+/// constant. Both are gone; the old rows keep their timestamps and their
+/// latency, which are the parts that were ever real.
+///
+/// `heartbeats.power_reserve` was `NOT NULL`, so an insert that omits it
+/// fails until the table is rebuilt - SQLite cannot drop a column in place
+/// on the versions this has to run on. `nodes.power_reserve` was nullable
+/// and is simply left where it is: nothing writes it and nothing reads it.
+fn drop_power_reserve(conn: &Connection) -> Result<()> {
+    let has_column = conn
+        .prepare("PRAGMA table_info(heartbeats)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "power_reserve");
+    if !has_column {
+        return Ok(());
+    }
+
+    info!("Rebuilding the heartbeats table to drop power_reserve, which never held a measurement");
+    conn.execute_batch(
+        r#"
+        BEGIN;
+        CREATE TABLE heartbeats_rebuilt (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            latency_ms INTEGER,
+            FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+        );
+        INSERT INTO heartbeats_rebuilt (id, node_id, instance_id, timestamp, latency_ms)
+            SELECT id, node_id, instance_id, timestamp, latency_ms FROM heartbeats;
+        DROP TABLE heartbeats;
+        ALTER TABLE heartbeats_rebuilt RENAME TO heartbeats;
+        COMMIT;
+        "#,
+    )?;
+    // The indexes went with the old table.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_heartbeats_node ON heartbeats(node_id, timestamp)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_heartbeats_timestamp ON heartbeats(timestamp)",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +450,79 @@ mod tests {
                 "table {expected} is missing after migration"
             );
         }
+    }
+
+    /// A database written by an older build has `heartbeats.power_reserve`
+    /// as `NOT NULL`, so an insert that no longer supplies it would fail on
+    /// every heartbeat from every node. The rebuild takes the column off and
+    /// keeps the rows that were real.
+    #[test]
+    fn an_older_heartbeats_table_loses_power_reserve_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE nodes (
+                id TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL UNIQUE,
+                node_role TEXT NOT NULL,
+                version TEXT NOT NULL,
+                host TEXT NOT NULL,
+                ports TEXT NOT NULL,
+                state TEXT NOT NULL,
+                connected_at TEXT NOT NULL,
+                last_heartbeat TEXT NOT NULL,
+                power_reserve INTEGER DEFAULT 0,
+                metadata TEXT
+            );
+            CREATE TABLE heartbeats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                power_reserve INTEGER NOT NULL,
+                latency_ms INTEGER,
+                FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+            );
+            INSERT INTO nodes
+                (id, instance_id, node_role, version, host, ports, state, connected_at, last_heartbeat)
+                VALUES ('node-1', 'node-1-abc', 'deis_proxy:1', '', 'h', '[]', 'Active',
+                        '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+            INSERT INTO heartbeats (node_id, instance_id, timestamp, power_reserve, latency_ms)
+                VALUES ('node-1', 'node-1-abc', '2026-01-01T00:00:00+00:00', 100, 7);
+            "#,
+        )
+        .unwrap();
+
+        create_tables(&conn).unwrap();
+        // Twice, because every start runs it.
+        create_tables(&conn).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(heartbeats)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(!columns.iter().any(|c| c == "power_reserve"));
+
+        let (timestamp, latency): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT timestamp, latency_ms FROM heartbeats WHERE node_id = 'node-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(timestamp, "2026-01-01T00:00:00+00:00");
+        assert_eq!(latency, Some(7));
+
+        // And the shape a running control plane writes now goes in.
+        conn.execute(
+            "INSERT INTO heartbeats (node_id, instance_id, timestamp, latency_ms)
+             VALUES ('node-1', 'node-1-abc', '2026-01-01T00:00:01+00:00', NULL)",
+            [],
+        )
+        .unwrap();
     }
 
     /// Versions carry a per-app monotonic number; the schema itself must

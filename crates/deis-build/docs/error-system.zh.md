@@ -431,5 +431,7 @@ Error: SPEC_PLATFORM_DETECTION
 ## 参考
 
 - [deislet/spec](https://github.com/deislet/spec) - 规范文档
-- [Platform Capabilities](./src/platform_capabilities.rs) - 平台能力系统
-- [Error Codes Reference](./ERROR_CODES.md) - 完整错误代码列表
+- [平台能力系统](../../deis-build-core/src/platform_capabilities.rs) - 每个平台
+  支持什么，以及「形态上没有」与「暂缺」的区别
+- 错误类型的完整清单以 [`deis-build-core/src/error.rs`](../../deis-build-core/src/error.rs)
+  为准；没有单独的错误代码表

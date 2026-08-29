@@ -360,12 +360,15 @@ impl Compiler {
             features.push(Feature::NodeRuntime);
         }
 
-        // TODO: More feature usage could be detected via code analysis in the future
-        // - SSR: detect whether a rendering framework is used
-        // - ISR: detect whether incremental static regeneration is configured
-        // - CronJobs: detect whether scheduled task definitions exist
-        // - WebSockets: detect whether the WebSocket API is used in the code
-        // - etc.
+        // Everything above is read from `.config.json`, and that is the whole
+        // reach of this check by design: a declared feature that the target
+        // platform does not have fails the build here, before anything is
+        // deployed. A feature the code uses without declaring it - SSR, a
+        // rendering framework, `BroadcastChannel`, `fetch` - has nowhere to be
+        // declared, so it cannot be caught here and fails at runtime instead.
+        // That split is written down in docs/architecture.zh.md section 12;
+        // widening it means giving those features a place in the project
+        // configuration first, not guessing at them from the source.
 
         features
     }
@@ -561,12 +564,23 @@ impl Compiler {
             }
         }
 
-        // Call Adapter to get Artifacts (In Memory)
+        // Call Adapter to get Artifacts (In Memory).
+        //
+        // The arms match on each adapter's own `VENDOR` constant rather than
+        // on a literal, so the vendor value, the crate name and this dispatch
+        // are one fact: an adapter renamed without its constant fails to
+        // compile here instead of silently losing a target.
         let artifacts = match vendor {
-            "cloudflare" => deis_build_adapter_cf::generate(&routes, config)?,
-            "deno" => deis_build_adapter_dc::generate(&routes, config)?,
-            "tencent" => deis_build_adapter_eo::generate(&routes, config)?,
-            "deislet" => deis_build_adapter_deislet::generate(&routes, config)?,
+            deis_build_adapter_cloudflare::VENDOR => {
+                deis_build_adapter_cloudflare::generate(&routes, config)?
+            }
+            deis_build_adapter_deno::VENDOR => deis_build_adapter_deno::generate(&routes, config)?,
+            deis_build_adapter_tencent::VENDOR => {
+                deis_build_adapter_tencent::generate(&routes, config)?
+            }
+            deis_build_adapter_deislet::VENDOR => {
+                deis_build_adapter_deislet::generate(&routes, config)?
+            }
             _ => return Err(anyhow::anyhow!("Unknown vendor: {vendor}")),
         };
 

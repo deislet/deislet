@@ -22,6 +22,15 @@
 //!   so the same input has to produce the same bytes. See [`archive`].
 //!
 
+/// The `--vendor` value this adapter answers for.
+///
+/// One adapter per vendor, and the crate is named after the value it serves:
+/// `deis build --vendor deislet` is served by `deis-build-adapter-deislet`.
+/// `deis-build` dispatches on this string, so it and the crate name are the
+/// same fact written twice; `the_crate_is_named_after_the_vendor` below fails
+/// if they stop agreeing.
+pub const VENDOR: &str = "deislet";
+
 mod archive;
 mod assets;
 mod entry;
@@ -93,6 +102,21 @@ mod tests {
         assert!(
             artifacts.config_files.is_empty(),
             "a bundle has no vendor config file"
+        );
+    }
+}
+
+#[cfg(test)]
+mod naming {
+    /// A crate whose name no longer matches the vendor it serves sends the
+    /// next reader looking for `deis-build-adapter-deislet` in the wrong
+    /// place - which is exactly what the `-cf` / `-dc` / `-eo` names used to
+    /// do.
+    #[test]
+    fn the_crate_is_named_after_the_vendor() {
+        assert_eq!(
+            env!("CARGO_PKG_NAME"),
+            format!("deis-build-adapter-{}", super::VENDOR)
         );
     }
 }

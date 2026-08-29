@@ -79,7 +79,7 @@ scripts/demo-assets/example-app/
 
 ## verify 检查什么
 
-`./scripts/demo.sh verify` 分十一组跑十八项，每项打印它据以判断的证据：
+`./scripts/demo.sh verify` 分十一组跑十九项，每项打印它据以判断的证据：
 
 | 组 | 检查 | 证明了什么 |
 |---|---|---|
@@ -91,7 +91,7 @@ scripts/demo-assets/example-app/
 | 密钥 | `deis secret list` | 只列出名字与最后修改时间；JSON 与人读两种输出都不含值，也没有任何命令能打印值 |
 | | 同一响应的 `secretPresent` | 加密存库的密钥被解开、随下发进了 Isolate |
 | | 递归 grep 数据目录与全部日志 | 解开后的明文哪儿都没落下 |
-| 存储 | `PUT` 再 `GET /api/kv/<key>` | `ctx.services.kv` 真的走到了 deis-store（在它自己的库里能 grep 到这一行） |
+| 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的 |
 | 队列 | `POST /api/enqueue` 后轮询 `/api/kv/job:<key>` | 消息进了 deis-queue，节点的轮询任务领到并交给 `_queue.ts` |
 | cron | 轮询 `/api/kv/cron:last-run` | 控制面到点挑了**一个**节点触发，应用的 `_scheduled.ts` 真的跑了 |
 | 环境 | 同一应用的 production 与 preview 各打一发 | 两个环境在同一台节点上并行，各返回各自版本的标签 |
@@ -100,11 +100,13 @@ scripts/demo-assets/example-app/
 | 观测 | `LogService/Query` | 应用自己 `console.log` 的那行能从 deis-telemetry 按应用查回来，并带上是哪个环境写的 |
 | | `deis tail` 开流 → 之后才发一个请求 | 跟到的是**开流之后**产生的那一行（用一次性探针名字确认），不是历史里捞的 |
 | 机队 | 控制面的 `/api/runtime` | 节点自己 `PUT .../registration` 登记上了；写在配置文件里的地址没有被节点自报的主机名覆盖掉 |
+| | 拿节点凭据给一个**没写在** `deis_runtime_nodes` 里的 id 也发一次 `PUT .../registration` | 机队里真的多出这个 id，且 `source` 是 `registered` 而非 `configured`——证明一台配置文件从未提过的机器，光靠自己登记就能加入机队，而不是全靠这行演示脚本里唯一的节点本来就在配置文件里、这条登记路径从没被真正走过 |
 | | `deis status` | 节点是健康的、问得到的，而且它自己报出正在服务哪些环境——「目录说该跑什么」与「节点说在跑什么」是两回事 |
 
-日志那一项需要 `grpcurl`，缺了会报为失败并说明原因，而不是悄悄跳过；其余各项除
-`curl` 与 `jq` 外没有额外依赖。cron 那一项最长要等一个 tick 加一分钟，所以整体会跑
-一两分钟。
+日志那一项和存储那一项都需要 `grpcurl`：分别用来直接问 deis-telemetry 和
+deis-store，缺了会各自报为失败并说明原因，而不是悄悄跳过或者放宽标准去凑一个通过；
+其余各项除 `curl` 与 `jq` 外没有额外依赖。cron 那一项最长要等一个 tick 加一分钟，所以
+整体会跑一两分钟。
 
 ## 验证日志链路（手工）
 
@@ -189,13 +191,21 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
   gitignore 掉了，而 `deis-control` 在编译期把它嵌进二进制，所以少了它
   `cargo build` 直接失败。`demo.sh` 不会替你做这一步：
   `cd crates/deis-control/web && npm ci && npm run build`
-- `verify` 里查日志那一项需要 `grpcurl`；缺了它这一项报失败，其余照跑
+- `verify` 里查日志、以及直接向 deis-store 求证 KV 那两项需要 `grpcurl`；缺了它这两项
+  各自报失败，其余照跑
 - `verify` 里发请求的各项都直接打节点端口，不经 deis-proxy（原因见上文）
-- 节点这次是自己去连控制面的：`[control] endpoint` 一配，节点启动就调
-  `GET /api/nodes/<id>/assignments`，把清单里每一版拉下来装好才报 healthy（原则 8）。
-  节点也会向 `POST /api/nodes/<id>/register` 登记自己，用同一套凭据。演示里控制面
+- 节点这次是自己去连控制面的：`[control] endpoint` 一配，节点启动就去拉自己的清单
+  （`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`），把里面每一版拉下来装好才报
+  healthy（原则 8）。节点也会用同一套凭据向控制面登记自己
+  （`NODE_REGISTRATION_ROUTE`，方法是 `PUT`：登记是在陈述「这个节点是什么」，不是
+  请求创建一条记录）。这两条路径不在文档里抄字面量——本文档以前把登记写成
+  `POST .../register`，与代码里的 `PUT .../registration` 对不上，客户端侧拼路径请用
+  `node_assignments_path` / `node_registration_path`。演示里控制面
   配置仍然写着 `[[deis_runtime_nodes]]`：配置里列出来的节点不受登记过期影响，而
-  「推」这个方向（新部署、改密钥当场送达）需要控制面知道这个节点在哪
+  「推」这个方向（新部署、改密钥当场送达）需要控制面知道这个节点在哪。但这也意味着
+  演示自己唯一的那个节点从来不用靠登记才能被控制面认得——所以 `verify` 里另外拿同一套
+  凭据、给一个配置文件里没写过的 id 也发一次登记，专门证明单靠登记本身也能把一台机器
+  加进机队
 - 存储地址不写在节点配置里：`store_endpoint` / `queue_endpoint` 配在控制面，随每次下发
   进环境表。节点在进 Isolate 之前把它们取走，所以应用的 `ctx.env` 里看不到，也无法用
   同名变量把存储客户端指到别处

@@ -18,8 +18,7 @@ Add the following to `config.toml`:
 
 ```toml
 [tls]
-api_enabled = true
-ws_enabled = false  # WebSocket TLS is recommended to be implemented via reverse proxy
+api_enabled = true   # one port carries the REST API and the node gRPC channel
 cert_path = "cert.pem"
 key_path = "key.pem"
 ```
@@ -68,7 +67,7 @@ sudo crontab -e
 # Add: 0 3 * * * certbot renew --quiet && systemctl restart deis-control
 ```
 
-### Option 2: Use Reverse Proxy (Recommended for WebSocket TLS)
+### Option 2: Use Reverse Proxy
 
 #### Nginx Configuration
 
@@ -89,22 +88,17 @@ server {
     location /api {
         proxy_pass http://localhost:8080;
         proxy_http_version 1.1;
-        
-        # WebSocket Support
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
-    
-    # Node WebSocket Proxy
-    location /ws {
-        proxy_pass http://localhost:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+
+    # The node control channel is gRPC over HTTP/2 on the same port, not a
+    # WebSocket upgrade. It needs a proxy that speaks h2c end to end;
+    # terminating HTTP/1.1 in front of it breaks every node's channel.
+    location /deis.control.ControlService/ {
+        grpc_pass grpc://localhost:8080;
     }
 }
 
@@ -122,9 +116,10 @@ server {
 deis-control.yourdomain.com {
     # API Endpoints
     reverse_proxy /api/* localhost:8080
-    
-    # Node WebSocket
-    reverse_proxy /ws localhost:8080
+
+    # Node control channel: gRPC over HTTP/2, same port
+    reverse_proxy /deis.control.ControlService/* h2c://localhost:8080
+
     
     # Caddy handles Let's Encrypt certificates automatically
 }
@@ -184,11 +179,12 @@ openssl rsa -in key.pem -check
 2. Confirm time synchronization (certificate validity).
 3. Check firewall rules.
 
-### WebSocket Connection Failure
+### Node Control Channel Failure
 
-- Ensure you use `wss://` instead of `ws://`.
-- Check reverse proxy WebSocket configuration.
-- Confirm Upgrade headers are correctly forwarded.
+- The channel is gRPC over HTTP/2, not a WebSocket. There is no `ws://` or
+  `wss://` endpoint on this process at all.
+- Behind a reverse proxy, confirm it forwards HTTP/2 (`grpc_pass` in Nginx,
+  `h2c://` in Caddy) rather than downgrading to HTTP/1.1.
 
 ## Performance Optimization
 
@@ -218,14 +214,16 @@ key_path = "key.pem"
 
 ```bash
 curl -k -H "Authorization: Bearer your-secret-key" \
-     https://localhost:8080/api/nodes
+     https://localhost:8080/api/sessions
 ```
 
 ## Frequently Asked Questions
 
-**Q: Why doesn't WebSocket support TLS directly?**
+**Q: Is there a WebSocket endpoint to secure?**
 
-A: Implementing WebSocket over TLS is complex, and reverse proxy solutions are more mature and flexible. In production, we recommend using Nginx/Caddy for TLS termination.
+A: No. This process serves the REST API and the node gRPC channel on one
+port, and nothing else. Earlier versions of this document described a
+WebSocket node link; that was never what shipped.
 
 **Q: Can I provide both HTTP and HTTPS?**
 

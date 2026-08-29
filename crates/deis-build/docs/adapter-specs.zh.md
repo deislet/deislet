@@ -4,7 +4,7 @@ This directory contains platform-specific specification documents for each deis-
 
 ## Available Specifications
 
-### 1. Cloudflare Workers (`deis-build-adapter-cf/spec.mdc`)
+### 1. Cloudflare Workers (`deis-build-adapter-cloudflare/spec.mdc`)
 
 **Platform**: Cloudflare Workers
 **Size**: ~13 KB
@@ -26,7 +26,7 @@ This directory contains platform-specific specification documents for each deis-
 
 ---
 
-### 2. Deno Deploy (`deis-build-adapter-dc/spec.mdc`)
+### 2. Deno Deploy (`deis-build-adapter-deno/spec.mdc`)
 
 **Platform**: Deno Deploy
 **Size**: ~17 KB
@@ -50,7 +50,7 @@ This directory contains platform-specific specification documents for each deis-
 
 ---
 
-### 3. EdgeOne Pages (`deis-build-adapter-eo/spec.mdc`)
+### 3. EdgeOne Pages (`deis-build-adapter-tencent/spec.mdc`)
 
 **Platform**: Tencent EdgeOne Pages
 **Size**: ~46 KB
@@ -85,13 +85,11 @@ Each `spec.mdc` file provides:
 5. **Best practices** - Recommended patterns and approaches
 6. **Configuration formats** - How to configure projects
 
-### For LLM/AI Assistance
+### 为什么是 `.mdc`
 
-These files are formatted in `.mdc` (Markdown Context) format, making them ideal for:
-
-- **Cursor AI** - Place in `.cursor/rules/` for project-specific guidance
-- **Claude/ChatGPT** - Reference when asking for platform-specific help
-- **Code generation** - Ensure generated code follows platform specs
+这些文件用 `.mdc`（Markdown Context）格式，是为了让一份规范同时给人读、也能直接
+喂给编辑器的规则目录（例如放进 `.cursor/rules/`）。写新适配器或改旧的时候，它是
+判断产物对不对的依据。
 
 ### Compliance Checklist
 

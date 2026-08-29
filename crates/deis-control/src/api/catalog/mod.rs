@@ -163,11 +163,15 @@ pub(crate) mod tests {
         pub _bundle_dir: tempfile::TempDir,
     }
 
-    /// A router with no node credential configured: the node endpoints are
-    /// open, which is what most of these tests exercise, and what the
-    /// assignment list reacts to by withholding secrets.
+    /// The node key every harness below is built with. There is no
+    /// credential-less variant on purpose: a control plane without a node
+    /// key serves none of these routes at all.
+    pub(crate) const TEST_NODE_KEY: &str = "node-psk";
+
+    /// A router with the ordinary shape: one node key, so the node
+    /// endpoints answer a caller that presents it and nobody else.
     pub(crate) async fn harness(secrets_ready: bool) -> Harness {
-        harness_with(secrets_ready, Vec::new()).await
+        harness_with(secrets_ready, vec![TEST_NODE_KEY.to_string()]).await
     }
 
     pub(crate) async fn harness_with(secrets_ready: bool, node_keys: Vec<String>) -> Harness {
@@ -411,38 +415,26 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
-    /// With no node credential configured nobody can prove they are a node,
-    /// so an environment that has secrets is left out of the list entirely
-    /// rather than having its values published to whoever asked.
+    /// With no node credential nobody can prove they are a node, so the
+    /// channel is shut rather than served anonymously. There is no
+    /// half-answer to build: the list carries decrypted secrets, and the
+    /// bundle download beside it is the code those secrets belong to.
     #[tokio::test]
-    async fn a_control_plane_without_a_node_key_serves_no_secret_to_anyone() {
-        let h = harness(true).await;
+    async fn a_control_plane_without_a_node_key_serves_no_node_endpoint() {
+        let h = harness_with(true, Vec::new()).await;
         let router = &h.router;
         deployed_app(router, "with-secret", Some(("API_KEY", "super-secret"))).await;
-        deployed_app(router, "plain", None).await;
 
-        let (status, headers, body) =
-            get_as_node_full(router, "/api/nodes/node-a/assignments", None).await;
-        assert_eq!(status, StatusCode::OK, "the channel itself still answers");
-        assert!(!body.to_string().contains("super-secret"), "got {body}");
-
-        let apps: Vec<&str> = body
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a["app_id"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            apps,
-            ["plain"],
-            "the application with a secret is withheld; the one without still runs"
-        );
-
-        // A short list must not be read as an instruction to unload. The
-        // application with the secret may well be running on this node right
-        // now, and taking it off because this control plane cannot describe
-        // it today would turn a configuration problem into an outage.
-        assert_eq!(completeness(&headers), (false, 1));
+        for credential in [None, Some("guess")] {
+            let (status, body) =
+                get_as_node(router, "/api/nodes/node-a/assignments", credential).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an unconfigured node channel must be shut, not open"
+            );
+            assert!(!body.to_string().contains("super-secret"), "got {body}");
+        }
     }
 
     /// The other half of deletion. Push cannot reach a node that is down, so
@@ -575,7 +567,7 @@ pub(crate) mod tests {
 
         // Nothing is deployed yet, so no assignment exists.
         let (status, body) =
-            json(router, "GET", "/api/nodes/node-a/assignments", Value::Null).await;
+            get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_array().unwrap().len(), 0);
 
@@ -610,7 +602,7 @@ pub(crate) mod tests {
 
         // The assignment list points at v2 with a downloadable bundle URL.
         let (status, body) =
-            json(router, "GET", "/api/nodes/node-a/assignments", Value::Null).await;
+            get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
         assert_eq!(status, StatusCode::OK);
         let assignments = body.as_array().unwrap();
         assert_eq!(assignments.len(), 1);
@@ -653,7 +645,7 @@ pub(crate) mod tests {
         assert_eq!(body["total"], 3, "rollback must append, never rewrite");
 
         let (status, body) =
-            json(router, "GET", "/api/nodes/node-a/assignments", Value::Null).await;
+            get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body[0]["version_id"], v1);
     }
@@ -684,6 +676,7 @@ pub(crate) mod tests {
         let request = Request::builder()
             .method("GET")
             .uri(format!("/api/apps/demo/versions/{version_id}/bundle"))
+            .header("Authorization", format!("Bearer {TEST_NODE_KEY}"))
             .body(Body::empty())
             .unwrap();
         let response = router.clone().oneshot(request).await.unwrap();
@@ -896,7 +889,8 @@ pub(crate) mod tests {
         let (status, _) = json(router, "GET", "/api/apps/demo", Value::Null).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let (_, body) = json(router, "GET", "/api/nodes/node-a/assignments", Value::Null).await;
+        let (_, body) =
+            get_as_node(router, "/api/nodes/node-a/assignments", Some(TEST_NODE_KEY)).await;
         assert_eq!(body.as_array().unwrap().len(), 0);
     }
 }

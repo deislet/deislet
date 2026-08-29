@@ -55,7 +55,7 @@ deis-control/
 ├── src/                    # Rust backend source code
 │   ├── main.rs            # Program entry point
 │   ├── lib.rs             # Library entry point
-│   ├── server.rs          # WebSocket server
+│   ├── server.rs          # gRPC server for the node control channels
 │   ├── handler.rs         # Message handler
 │   ├── session.rs         # Session management
 │   ├── config.rs          # Configuration definitions
@@ -64,7 +64,6 @@ deis-control/
 │   ├── database/          # Database layer
 │   ├── config_manager/    # Configuration management
 │   ├── command/           # Command execution
-│   ├── broadcast/         # Event broadcasting
 │   ├── metrics/           # Metrics collection
 │   ├── scheduler/         # Task scheduling
 │   └── tls.rs             # TLS support

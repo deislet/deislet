@@ -1,245 +1,118 @@
-# Wire
+# deis-wire —— 控制面与节点之间的那条线
 
-[![Crates.io](https://img.shields.io/crates/v/deis-wire.svg)](https://crates.io/crates/deis-wire)
-[![Documentation](https://docs.rs/deis-wire/badge.svg)](https://docs.rs/deis-wire)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+这个 crate 里有两样东西，面向的人不一样：
 
-Wire 是一个用于 Control control 和 Node 服务器（Runtime/Proxy）之间基于 WebSocket 通信的 Rust SDK。它提供安全、实时的双向通信，具有**可扩展消息系统**、认证、注册、心跳监控和命令执行功能。
+1. **节点链路**：gRPC 协议（`proto/control.proto`，包名 `deis.control`）、消息模型，
+   以及 [`WireClient`]——节点用来主动连 deis-control 的客户端：认证、注册、心跳、
+   接命令。今天用它的是 `deis-proxy`。
+2. **[`conventions`]**：平台里每个组件都必须拼得一模一样的那几个名字。deis-store、
+   deis-queue、deis-telemetry 依赖这个 crate，就只是为了这一个模块——它们不认识任何
+   控制面概念。
 
-## 特性
+English: [README.md](README.md)。
 
-- 🚀 **WebSocket 通信**: 通过 WebSocket 进行实时双向通信
-- 🔐 **安全认证**: 基于连接时 PSK 认证和 HMAC-SHA256 签名
-- 💓 **心跳监控**: 自动心跳发送和连接监控
-- 📡 **命令处理**: 来自 control 的命令处理
-- 🎯 **类型安全**: 强类型可扩展消息系统，具有编译时验证
-- ⚡ **异步支持**: 基于 Tokio 的完全异步 API
-- 🔧 **可扩展**: 支持自定义消息类型和扩展
+## conventions —— 大多数组件真正需要的那部分
 
-## 消息系统架构
+这里刻意只放常量和小函数。六个独立的二进制要就同一件事达成一致，而这里不一致**不会
+编译失败**：它会在运行时、几天之后，以「一个请求被用错误的理由拒了」或者「一支机队
+永远学不会自己有哪些节点」的形式炸出来。
 
-Wire 基于**统一消息系统**构建，允许类型安全、可扩展的通信：
+| 名字 | 它钉住了什么 |
+|---|---|
+| `APP_ID_HEADER`（`x-deis-app-id`） | 进来的请求是给哪个应用的 |
+| `ENVIRONMENT_HEADER`（`x-deis-environment`） | 是这个应用的哪个环境；不带就是 `DEFAULT_ENVIRONMENT` |
+| `DEFAULT_ENVIRONMENT`（`production`） | 让还不知道有「环境」这回事的调用方也能落到一个说得通的地方 |
+| `TENANT_HEADER`（`x-deis-tenant`） | 存储租户——**另起一个头**，因为它装的是另一样东西 |
+| `tenant_id(app, env)` / `split_tenant` / `is_valid_tenant_part` | `demo.production`；字符集里没有 `.`、`/`、`\`，所以任何合法的两半都拼不出上级目录 |
+| `MAX_GRPC_MESSAGE_BYTES`（16 MB） | 一个上限，两个方向，全部服务通用 |
+| `STREAM_CHUNK_BYTES`（1 MB） | blob 上传下载的分块大小 |
+| `STORE_ENDPOINT_ENV` / `QUEUE_ENDPOINT_ENV` | 装存储地址的保留 env 键，进 Isolate 之前会被取走 |
+| `NODE_REGISTRATION_ROUTE` / `NODE_ASSIGNMENTS_ROUTE` | axum 的 `:id` 路由模板 |
+| `node_registration_path(id)` / `node_assignments_path(id)` | 客户端拼具体路径的那一半 |
+| `ASSIGNMENTS_COMPLETE_HEADER` / `ASSIGNMENTS_WITHHELD_HEADER` | 这份清单是不是这个节点的全部真相 |
 
-### 核心消息类型
+那两个路由常量之所以存在，是因为它们曾经不存在：节点去请求 `/register`，控制面提供的
+是 `/registration`，两边都编译得过，唯一的症状是一支里面一个节点都没有的机队。
 
-- **AuthMessage**: 与 control 的认证
-- **RegisterMessage**: Node 注册
-- **HeartbeatMessage**: 定期健康检查
-- **CommandMessage**: 命令执行请求
-- **CommandResponseMessage**: 命令执行结果
-- **StatusUpdateMessage**: Node 状态更新
+## 节点链路
 
-### 扩展消息类型
-
-- **ControlMessage**: 批量操作和管理
-- **RuntimeMessage**: 容器部署和编排
-- **ProxyMessage**: 数据管道管理
-
-### 自定义消息类型
-
-您可以通过实现 `Message` trait 轻松创建自定义消息类型：
-
-```rust
-use deis-wire::models::messages::{Message, WireMessage};
-use serde::{Serialize, Deserialize};
-use uuid::Uuid;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CustomData {
-    pub field1: String,
-    pub field2: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CustomMessage {
-    pub data: CustomData,
-    pub message_id: Option<Uuid>,
-}
-
-impl Message for CustomMessage {
-    const MESSAGE_TYPE: &'static str = "custom_message";
-    type Data = CustomData;
-
-    fn data(&self) -> &Self::Data {
-        &self.data
-    }
-
-    fn message_id(&self) -> Option<Uuid> {
-        self.message_id
-    }
-
-    fn new(data: Self::Data) -> Self {
-        Self {
-            data,
-            message_id: Some(Uuid::new_v4()),
-        }
-    }
-
-    fn with_id(data: Self::Data, message_id: Uuid) -> Self {
-        Self {
-            data,
-            message_id: Some(message_id),
-        }
-    }
-}
-```
-
-## 安装
-
-将以下内容添加到您的 `Cargo.toml`:
-
-```toml
-[dependencies]
-deis-wire = "0.1.0"
-```
-
-## 快速开始
-
-### 基本使用
+传输是 gRPC over HTTP/2（Tonic），**不是 WebSocket**——本文件的旧版本说是，而且
+`src/models/auth.rs` 的注释里至今还留着「WebSocket connection」的字样。
 
 ```rust
-use deis-wire::{WireClient, ControlConfig, NodeInfo, NodeRole};
+use deis_wire::{ControlConfig, NodeInfo, NodeRole, WireClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 配置 control 连接信息
     let config = ControlConfig::new(
         "node-001".to_string(),
         "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
-        "ws://localhost:8080".to_string(),
+        "http://127.0.0.1:8085".to_string(),
     );
-    
-    // 配置 node 信息
+
     let node_info = NodeInfo::new(
-        NodeRole::Runtime("1.0.0".to_string()),
+        NodeRole::Proxy("1.0.0".to_string()),
         "127.0.0.1".to_string(),
-        vec![3000],
+        vec![8087],
     );
-    
-    // 创建客户端
+
     let mut client = WireClient::new(config, node_info);
-    
-    // 建立连接
-    client.connect().await?;
-    
-    // 与 control 认证
+
+    client.connect().await?;        // 打开双向流
     client.authenticate().await?;
-    
-    // 注册 node
     client.register().await?;
-    
-    // 发送心跳
-    client.send_heartbeat().await?;
-    
-    // 运行主客户端循环（处理心跳和传入消息）
-    client.run().await?;
-    
+    client.run().await?;            // 心跳与收消息
+
     Ok(())
 }
 ```
 
-### 使用消息构建器
+`ControlConfig::addr` 原样交给 Tonic，所以写 `http://`（或 `https://`）。凡是不是
+`https` 的都按明文连——`tests/integration_*_control.rs` 里那个写死的 `ws://` 之所以
+能用就是因为这个，但那是历史遗留，不是受支持的写法。
 
-```rust
-use deis-wire::models::{AuthData, HeartbeatRequest, RegisterRequest};
-use deis-wire::models::messages::{MessageBuilder, WireMessage};
+### 认证：把它说准
 
-// 创建认证消息
-let auth_data = AuthData::new("node-001".to_string(), b"secret_key")?;
-let auth_message = MessageBuilder::auth(auth_data);
+节点发过去的是 `sha256(secret ‖ node_id ‖ timestamp)` 加上那个时间戳；控制面自己算一
+遍对比，超过 300 秒的一律拒。
 
-// 创建注册消息
-let register_data = RegisterRequest {
-    id: "node-001".to_string(),
-    info: node_info,
-};
-let register_message = MessageBuilder::register(register_data);
+这是一个 **secret-prefix 的 SHA-256 构造，不是 HMAC-SHA256**，尽管
+`src/models/auth.rs` 里紧挨着它的注释写着「HMAC」，而且文档一直照抄。这个区别对任何
+要论证它抗不抗长度扩展的人都要紧；换构造是两侧同改的协议变更。
 
-// 创建心跳消息
-let heartbeat_data = HeartbeatRequest {
-    id: "node-001".to_string(),
-    power_reserve: 85,
-};
-let heartbeat_message = MessageBuilder::heartbeat(heartbeat_data);
+### 消息类型
+
+核心：`AuthMessage`、`RegisterMessage`、`HeartbeatMessage`、`CommandMessage`、
+`CommandResponseMessage`、`StatusUpdateMessage`，回来的是 `HeartbeatAckMessage`
+与两个 response 消息。
+
+按角色分的扩展在 `models::messages::{control, deis_proxy, deis_runtime}`。要加自己的
+消息类型，看 [docs/extensible-messages.md](docs/extensible-messages.md)。
+
+protobuf 定义在 [`proto/control.proto`](proto/control.proto)，由 `build.rs` 编译进
+`deis_wire::pb`。
+
+## 目录
+
+```
+deis-wire/
+├── proto/control.proto     # gRPC 服务与它的消息
+├── src/
+│   ├── conventions.rs      # 每个组件都必须拼一样的那些名字
+│   ├── client.rs           # WireClient
+│   ├── config/             # ControlConfig、NodeInfo、NodeRole
+│   ├── models/             # auth、register、heartbeat、instance、messages
+│   └── error.rs
+└── docs/extensible-messages.md
 ```
 
-### 扩展消息
+## 开发
 
-```rust
-use deis-wire::models::messages::MessageBuilder;
-use serde_json::json;
-
-// Control 批量操作
-let control_message = MessageBuilder::control_operation(
-    "batch_deploy".to_string(),
-    vec!["node-001".to_string(), "node-002".to_string()],
-    json!({
-        "image": "myapp:v1.2.3",
-        "replicas": 3
-    }),
-    Some(2), // 并行限制
-);
-
-// Runtime 容器部署
-let deis_runtime_message = MessageBuilder::runtime_deployment(
-    "nginx:1.21".to_string(),
-    3, // 副本数
-    "production".to_string(), // 命名空间
-    "500m".to_string(), // CPU
-    "1Gi".to_string(),  // 内存
-);
-
-// Proxy 数据管道
-let deis_proxy_message = MessageBuilder::proxy_pipeline(
-    "analytics_pipeline".to_string(),
-    "数据处理管道".to_string(),
-    pipeline_stages,
-);
+```bash
+cargo test -p deis-wire
+cargo clippy -p deis-wire --all-targets
 ```
 
-## API 参考
+## License
 
-### 主要类型
-
-- `WireClient`: 与 control 通信的主客户端
-- `ControlConfig`: Control 连接配置
-- `NodeInfo`: Node 实例信息
-- `NodeRole`: Node 类型（Runtime 或 Proxy）
-- `Message`: 所有消息类型的 trait
-- `WireMessage<M>`: 通用消息包装器
-- `MessageBuilder`: 便捷的消息创建
-
-### 主要方法
-
-- `connect()`: 建立 WebSocket 连接
-- `authenticate()`: 与 control 认证
-- `register()`: 向 control 注册 node
-- `send_heartbeat()`: 发送心跳消息
-- `run()`: 启动主客户端循环
-- `disconnect()`: 断开与 control 的连接
-
-### 配置
-
-`ControlConfig` 支持以下配置选项：
-
-- `associated_id`: Node 实例 ID
-- `secret`: 64 字符的十六进制 PSK 密钥
-- `addr`: Control WebSocket 地址 (ws:// 或 wss://)
-
-### 消息系统
-
-- 类型安全的消息创建和处理
-- 自定义消息类型的可扩展架构
-- 内置序列化/反序列化
-- 请求-响应关联支持
-- 时间戳和 ID 跟踪
-
-## 示例
-
-查看 `examples/` 目录获取更详细的使用示例：
-
-- `extensible_messages.rs`: 演示可扩展消息系统
-
-## 许可证
-
-本项目基于 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。 
+Apache-2.0，见 [LICENSE](LICENSE)。

@@ -1,12 +1,12 @@
 import { useState } from 'react'
-import { useNodes, useConfigs } from '@/hooks/useApi'
+import { useSessions, useConfigs } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 
 import { RefreshCw, Save } from 'lucide-react'
 
 export function Configs() {
-  const { nodes } = useNodes()
+  const { sessions: nodes } = useSessions()
   const [selectedNode, setSelectedNode] = useState<string | null>(null)
   const { configs, loading, error, refetch, updateConfig } = useConfigs(selectedNode || undefined)
   const [editedConfigs, setEditedConfigs] = useState<string>('')

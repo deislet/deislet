@@ -27,7 +27,7 @@ deis-build = { git = "https://github.com/deislet/deis-build" }
 ### 示例 1: 编译项目到所有平台
 
 ```rust
-use deis-build::{Compiler, CompilerOptions};
+use deis_build::{Compiler, CompilerOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
 ### 示例 2: 编译到特定平台
 
 ```rust
-use deis-build::{Compiler, CompilerOptions};
+use deis_build::{Compiler, CompilerOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 ### 示例 2.1: 内存模式 - 获取生成的代码而不写文件
 
 ```rust
-use deis-build::{Compiler, CompilerOptions, OutputMode};
+use deis_build::{Compiler, CompilerOptions, OutputMode};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
 ### 示例 2.2: 同时获取文件和内存内容
 
 ```rust
-use deis-build::{Compiler, CompilerOptions, OutputMode};
+use deis_build::{Compiler, CompilerOptions, OutputMode};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -154,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
 ### 示例 3: 验证项目
 
 ```rust
-use deis-build::{Compiler, load_project_config};
+use deis_build::{Compiler, load_project_config};
 use std::path::Path;
 
 #[tokio::main]
@@ -186,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
 ### 示例 4: 检查平台能力
 
 ```rust
-use deis-build::{Platform, PlatformCapabilities, Feature};
+use deis_build::{Platform, PlatformCapabilities, Feature};
 
 fn main() {
     // 检查 Cloudflare 支持的特性
@@ -310,7 +310,7 @@ pub struct BuildArtifacts {
 ### 自定义解析器
 
 ```rust
-use deis-build::parser::TypeScriptParser;
+use deis_build::parser::TypeScriptParser;
 
 fn main() -> anyhow::Result<()> {
     let parser = TypeScriptParser::new();
@@ -333,9 +333,13 @@ fn main() -> anyhow::Result<()> {
 
 ### 直接使用适配器
 
+适配器只暴露一个自由函数 `generate(routes, config) -> AdapterArtifacts`——没有
+Adapter 类型，也没有 `new()`。`routes` 是「路由模式 → 入口模块 import 路径」的对，
+由编译器从文件树算出来。
+
 ```rust
-use deis-build::adapter_cf::CloudflareAdapter;
-use deis-build::{ProjectConfig, HandlerInfo};
+use deis_build::adapter_cloudflare;
+use deis_build::ProjectConfig;
 
 fn main() -> anyhow::Result<()> {
     let config = ProjectConfig {
@@ -344,34 +348,36 @@ fn main() -> anyhow::Result<()> {
         runtime: "edge".to_string(),
         language: "typescript".to_string(),
         function_root: "functions".to_string(),
-        routing: None,
         environment: None,
         services: None,
         vendors: None,
         build: None,
         limits: None,
+        assets: None,
+        cron: Vec::new(),
+        queues: Vec::new(),
     };
 
-    let handlers = vec![
-        HandlerInfo {
-            path: "functions/index.ts".to_string(),
-            route: "/".to_string(),
-            has_default_export: true,
-            named_exports: vec![],
-            used_services: vec!["kv".to_string()],
-            imports: vec![],
-        }
+    // (URL 模式, 从生成的 router 出发的 import 路径)
+    let routes = vec![
+        ("/".to_string(), "../src/index.ts".to_string()),
+        ("/users/:id".to_string(), "../src/users/[id].ts".to_string()),
     ];
 
-    let adapter = CloudflareAdapter::new();
-    let artifacts = adapter.generate(&config, &handlers)?;
+    let artifacts = adapter_cloudflare::generate(&routes, &config)?;
 
     println!("生成的路由器代码:");
     println!("{}", artifacts.router_code);
+    for (name, contents) in &artifacts.config_files {
+        println!("{name}: {} 字节", contents.len());
+    }
 
     Ok(())
 }
 ```
+
+`ProjectConfig` 的字段以 `crates/deis-build-core/src/config.rs` 为准；这里列全是为了
+让例子能编译，实际用的时候通常是 `load_project_config()` 读 `.config.json` 得到它。
 
 ---
 
@@ -380,7 +386,7 @@ fn main() -> anyhow::Result<()> {
 ### 核心类型（从 deis-build-core 重导出）
 
 ```rust
-use deis-build::{
+use deis_build::{
     // 配置
     ProjectConfig,
     ServicesConfig,
@@ -412,7 +418,7 @@ use deis-build::{
 ### 编译器
 
 ```rust
-use deis-build::{
+use deis_build::{
     Compiler,           // 主编译器
     CompilerOptions,    // 编译器配置
 };
@@ -420,18 +426,21 @@ use deis-build::{
 
 ### 适配器
 
+每个适配器 crate 名就是 `--vendor` 的取值本身，re-export 的别名也跟着它走：
+
 ```rust
-use deis-build::{
-    adapter_cf,  // Cloudflare Workers 适配器
-    adapter_dc,  // Deno Deploy 适配器
-    adapter_eo,  // EdgeOne Pages 适配器
+use deis_build::{
+    adapter_cloudflare, // --vendor cloudflare  (deis-build-adapter-cloudflare)
+    adapter_deno,       // --vendor deno        (deis-build-adapter-deno)
+    adapter_tencent,    // --vendor tencent     (deis-build-adapter-tencent，腾讯 EdgeOne)
+    adapter_deislet,    // --vendor deislet     (deis-build-adapter-deislet，应用包)
 };
 ```
 
 ### 辅助函数
 
 ```rust
-use deis-build::{
+use deis_build::{
     check_config_exists,     // 检查配置文件是否存在
     load_project_config,     // 加载项目配置
     VERSION,                 // 库版本
@@ -443,7 +452,7 @@ use deis-build::{
 ## 完整示例：自定义构建工具
 
 ```rust
-use deis-build::{
+use deis_build::{
     Compiler, CompilerOptions, Platform, PlatformCapabilities,
     load_project_config, Feature,
 };
@@ -522,7 +531,7 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 #[cfg(test)]
 mod tests {
-    use deis-build::{Compiler, Platform, PlatformCapabilities, Feature};
+    use deis_build::{Compiler, Platform, PlatformCapabilities, Feature};
 
     #[test]
     fn test_compiler_creation() {
@@ -547,7 +556,7 @@ mod tests {
 deis-build 使用 `anyhow::Result` 和自定义错误类型：
 
 ```rust
-use deis-build::{DeniError, Result};
+use deis_build::{DeniError, Result};
 
 fn my_function() -> Result<()> {
     // DeniError 会自动转换为 anyhow::Error
@@ -567,7 +576,7 @@ fn my_function() -> Result<()> {
 
 ## 参考
 
-- [README.md](./README.md) - 项目概述
-- [BASIC_SERVICES.md](./BASIC_SERVICES.md) - 基础服务说明
+- [README.zh.md](../README.zh.md) - 这个 crate 的概述
+- [基础服务](./basic-services.zh.md) - KV 与 Cache 说明
 - [API 文档](https://docs.rs/deis-build) - 完整 API 文档（待发布）
 - [Edge Canon 规范](https://github.com/deislet/edge-canon) - 标准规范

@@ -1,27 +1,93 @@
-// Cache Ops definitions
-// Provides high-performance local caching based on moka
+//! `ctx.services.cache` and `globalThis.caches.default`: the Cache API.
+//!
+//! Edge Canon makes an HTTP response cache a *basic* feature
+//! (`SPECIFICATION_BASIC.md` section 7), so every application may assume it
+//! exists without declaring anything. There is nothing to declare here either:
+//! the store is built with the isolate and lives entirely inside it.
+//!
+//! # What the scope of this cache actually is
+//!
+//! One store per isolate, and deis-runtime gives each `(application,
+//! environment)` an isolate of its own on each node it is loaded on. So an
+//! entry written by one request is visible to the next request for the same
+//! application on the *same node*, and to nothing else: not to another node,
+//! and not to the replacement isolate a new version is loaded into. That is
+//! narrower than a shared cache tier and roughly what a Cloudflare colo gives
+//! an application; a hit is an optimisation, never a place to keep state.
+//!
+//! # Freshness
+//!
+//! An entry carries the lifetime the response asked for. The JavaScript side
+//! reads `s-maxage`, then `max-age`, off the response's `Cache-Control` and
+//! passes it here as whole seconds; zero means the response said nothing and
+//! the store's own default applies. Expiry is from the write, not from the
+//! last read: reading a cached response does not make it fresher.
 
 use deno_core::{extension, op2, OpState};
 use moka::future::Cache;
+use moka::Expiry;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Cache storage type
-/// Wrapped in Arc to support cross-thread sharing and async access
-pub type CacheStore = Arc<Cache<String, String>>;
+/// One cached response, plus how long it asked to stay fresh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEntry {
+    /// The serialised response, exactly as the JavaScript side wrote it.
+    pub payload: String,
+    /// Whole seconds of freshness taken from the response's `Cache-Control`.
+    /// `None` means the response named no lifetime, so the store's default
+    /// applies.
+    pub ttl: Option<Duration>,
+}
 
-/// Cache Get operation
+/// Cache storage type.
 ///
-/// Get value from cache
+/// Wrapped in `Arc` because the ops reach it through `OpState` from an async
+/// context and must not hold the state borrow across an await.
+pub type CacheStore = Arc<Cache<String, CacheEntry>>;
+
+/// Applies each entry's own lifetime, falling back to the store's default.
 ///
-/// # Parameters
-/// - key: Cache key
+/// Only the create/update hooks are implemented. Leaving `expire_after_read`
+/// at its default is the point: an HTTP cache entry goes stale a fixed time
+/// after it was written, and a stream of reads must not keep a stale response
+/// alive forever.
+pub(crate) struct ResponseFreshness {
+    /// Applied to an entry whose response named no `max-age`. `None` means
+    /// such an entry never expires on its own.
+    pub(crate) default_ttl: Option<Duration>,
+}
+
+impl Expiry<String, CacheEntry> for ResponseFreshness {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &CacheEntry,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        value.ttl.or(self.default_ttl)
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &CacheEntry,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        // A second `put` for the same key is a fresh response, so its clock
+        // starts again rather than inheriting what was left of the old one.
+        value.ttl.or(self.default_ttl)
+    }
+}
+
+/// Read a cached response.
 ///
 /// # Returns
-/// - Some(value): Cache hit
-/// - None: Cache miss or expired
+/// - `Some(payload)`: hit, and still fresh.
+/// - `None`: never written, evicted, or past its lifetime.
 #[op2(async)]
 #[string]
 async fn op_cache_get(state: Rc<RefCell<OpState>>, #[string] key: String) -> Option<String> {
@@ -29,61 +95,52 @@ async fn op_cache_get(state: Rc<RefCell<OpState>>, #[string] key: String) -> Opt
         let state_borrow = state.borrow();
         state_borrow.borrow::<CacheStore>().clone()
     };
-    cache.get(&key).await
+    cache.get(&key).await.map(|entry| entry.payload)
 }
 
-/// Cache Set operation
+/// Write a cached response.
 ///
-/// Set cache value
-///
-/// # Parameters
-/// - key: Cache key
-/// - value: Cache value
-/// - ttl: TTL in seconds, currently uses global TTL config, this parameter is reserved
-///
-/// # Note
-/// Current version uses global TTL setting from Cache creation
-/// Future versions will support per-entry TTL
+/// `ttl_seconds` is the freshness the response asked for; zero means it asked
+/// for none and the store's default applies.
 #[op2(async)]
 async fn op_cache_set(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
     #[string] value: String,
-    _ttl: u32,
+    ttl_seconds: u32,
 ) {
     let cache = {
         let state_borrow = state.borrow();
         state_borrow.borrow::<CacheStore>().clone()
     };
 
-    cache.insert(key, value).await;
+    let entry = CacheEntry {
+        payload: value,
+        ttl: if ttl_seconds == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(u64::from(ttl_seconds)))
+        },
+    };
+
+    cache.insert(key, entry).await;
 }
 
-/// Cache Delete operation
+/// Drop a cached response.
 ///
-/// Delete cache item
-///
-/// # Parameters
-/// - key: Cache key
+/// Returns whether there was one to drop, which is what the Cache API's
+/// `delete()` resolves to; answering `true` unconditionally would tell an
+/// application it had invalidated something it never had.
 #[op2(async)]
-async fn op_cache_delete(state: Rc<RefCell<OpState>>, #[string] key: String) {
+async fn op_cache_delete(state: Rc<RefCell<OpState>>, #[string] key: String) -> bool {
     let cache = {
         let state_borrow = state.borrow();
         state_borrow.borrow::<CacheStore>().clone()
     };
-    cache.invalidate(&key).await;
+    cache.remove(&key).await.is_some()
 }
 
-/// Cache Has operation
-///
-/// Check if cache key exists
-///
-/// # Parameters
-/// - key: Cache key
-///
-/// # Returns
-/// - true: Exists and not expired
-/// - false: Does not exist or expired
+/// Whether a key is present and still fresh.
 #[op2(async)]
 async fn op_cache_has(state: Rc<RefCell<OpState>>, #[string] key: String) -> bool {
     let cache = {
@@ -93,9 +150,7 @@ async fn op_cache_has(state: Rc<RefCell<OpState>>, #[string] key: String) -> boo
     cache.contains_key(&key)
 }
 
-/// Cache Clear operation
-///
-/// Clear all caches
+/// Drop every cached response of this isolate.
 #[op2(async)]
 async fn op_cache_clear(state: Rc<RefCell<OpState>>) {
     let cache = {
@@ -107,9 +162,7 @@ async fn op_cache_clear(state: Rc<RefCell<OpState>>) {
     cache.run_pending_tasks().await;
 }
 
-/// Cache statistics
-///
-/// Returns cache statistics
+/// Cache statistics.
 ///
 /// # Returns
 /// JSON object containing:
@@ -150,22 +203,26 @@ pub fn init_cache_extension() -> deno_core::Extension {
     deis_runtime_cache_ops::init()
 }
 
-/// Create CacheStore instance
+/// Create a `CacheStore`.
 ///
 /// # Parameters
-/// - max_capacity: Maximum capacity (number of entries)
-/// - tti: Time-to-idle (seconds), 0 for none
-///
-/// # Returns
-/// CacheStore instance
-pub fn create_cache_store(max_capacity: u64, tti: u64) -> CacheStore {
-    let mut builder = Cache::builder().max_capacity(max_capacity);
+/// - `max_capacity`: entries kept before the least useful are evicted.
+/// - `default_ttl_secs`: how long an entry whose response named no `max-age`
+///   stays fresh. Zero means such entries only ever leave by eviction or by
+///   `delete()`.
+pub fn create_cache_store(max_capacity: u64, default_ttl_secs: u64) -> CacheStore {
+    let default_ttl = if default_ttl_secs > 0 {
+        Some(Duration::from_secs(default_ttl_secs))
+    } else {
+        None
+    };
 
-    if tti > 0 {
-        builder = builder.time_to_idle(Duration::from_secs(tti));
-    }
-
-    Arc::new(builder.build())
+    Arc::new(
+        Cache::builder()
+            .max_capacity(max_capacity)
+            .expire_after(ResponseFreshness { default_ttl })
+            .build(),
+    )
 }
 
 #[cfg(test)]

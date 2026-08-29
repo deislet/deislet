@@ -1865,10 +1865,10 @@ dependencies = [
  "anyhow",
  "clap 4.5.54",
  "colored",
- "deis-build-adapter-cf",
- "deis-build-adapter-dc",
+ "deis-build-adapter-cloudflare",
  "deis-build-adapter-deislet",
- "deis-build-adapter-eo",
+ "deis-build-adapter-deno",
+ "deis-build-adapter-tencent",
  "deis-build-core",
  "deis-bundle",
  "hex",
@@ -1890,23 +1890,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "deis-build-adapter-cf"
+name = "deis-build-adapter-cloudflare"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "deis-build-core",
  "handlebars",
- "serde",
- "serde_json",
- "walkdir",
-]
-
-[[package]]
-name = "deis-build-adapter-dc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "deis-build-core",
  "serde",
  "serde_json",
  "walkdir",
@@ -1928,7 +1917,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "deis-build-adapter-eo"
+name = "deis-build-adapter-deno"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deis-build-core",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
+name = "deis-build-adapter-tencent"
 version = "0.1.0"
 dependencies = [
  "anyhow",

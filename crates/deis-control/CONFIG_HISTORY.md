@@ -1,6 +1,6 @@
 # Configuration Version History Feature
 
-Control Control supports full configuration version history tracking and rollback functionality, providing auditing and recovery capabilities for configuration management.
+deis-control supports full configuration version history tracking and rollback functionality, providing auditing and recovery capabilities for configuration management.
 
 ## Features
 

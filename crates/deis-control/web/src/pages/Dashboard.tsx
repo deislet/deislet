@@ -1,7 +1,7 @@
-import { useNodes, useMetrics, useCommands } from '@/hooks/useApi'
+import { useSessions, useFleet, useMetrics, useCommands } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { Server, Activity, Clock, Terminal } from 'lucide-react'
+import { Server, Boxes, Clock, Terminal } from 'lucide-react'
 
 function formatUptime(seconds: number): string {
   const days = Math.floor(seconds / 86400)
@@ -14,31 +14,33 @@ function formatUptime(seconds: number): string {
 }
 
 export function Dashboard() {
-  const { nodes, loading: nodesLoading } = useNodes()
+  const { sessions, loading: sessionsLoading } = useSessions()
+  const { fleet, loading: fleetLoading } = useFleet()
   const { metrics, loading: metricsLoading } = useMetrics()
   const { commands, loading: commandsLoading } = useCommands()
 
-  const activeNodes = nodes.filter((w) => w.state === 'Active').length
+  const activeSessions = sessions.filter((s) => s.state === 'Active').length
+  const healthyFleet = fleet.filter((n) => n.healthy).length
   const pendingCommands = commands.filter((c) => c.status === 'Pending' || c.status === 'Sent').length
 
   const stats = [
     {
-      title: 'Total Nodes',
-      value: metrics?.nodes.total || nodes.length,
+      title: 'Control channels',
+      value: metrics?.nodes.total || sessions.length,
       icon: Server,
-      description: `${activeNodes} active`,
+      description: `${activeSessions} active`,
+    },
+    {
+      title: 'Runtime fleet',
+      value: fleet.length,
+      icon: Boxes,
+      description: `${healthyFleet} reachable`,
     },
     {
       title: 'System Uptime',
       value: metrics?.system.uptime_seconds ? formatUptime(metrics.system.uptime_seconds) : '-',
       icon: Clock,
       description: 'System running time',
-    },
-    {
-      title: 'Total Events',
-      value: metrics?.system.total_events || 0,
-      icon: Activity,
-      description: 'Events recorded',
     },
     {
       title: 'Pending Commands',
@@ -48,7 +50,7 @@ export function Dashboard() {
     },
   ]
 
-  if (nodesLoading || metricsLoading || commandsLoading) {
+  if (sessionsLoading || fleetLoading || metricsLoading || commandsLoading) {
     return (
       <div className="flex items-center justify-center h-64">
         <p className="text-muted-foreground">Loading...</p>
@@ -81,23 +83,25 @@ export function Dashboard() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Recent Nodes</CardTitle>
+            <CardTitle>Open control channels</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {nodes.slice(0, 5).map((node) => (
-                <div key={node.id} className="flex items-center justify-between">
+              {sessions.slice(0, 5).map((session) => (
+                <div key={session.id} className="flex items-center justify-between">
                   <div className="space-y-1">
-                    <p className="text-sm font-medium">{node.node_role}</p>
-                    <p className="text-xs text-muted-foreground">{node.host}:{node.ports[0]}</p>
+                    <p className="text-sm font-medium">{session.node_role}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {session.host}:{session.ports[0]}
+                    </p>
                   </div>
-                  <Badge variant={node.state === 'Active' ? 'success' : 'secondary'}>
-                    {node.state}
+                  <Badge variant={session.state === 'Active' ? 'success' : 'secondary'}>
+                    {session.state}
                   </Badge>
                 </div>
               ))}
-              {nodes.length === 0 && (
-                <p className="text-sm text-muted-foreground">No nodes connected</p>
+              {sessions.length === 0 && (
+                <p className="text-sm text-muted-foreground">No node is connected</p>
               )}
             </div>
           </CardContent>

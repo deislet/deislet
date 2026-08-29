@@ -1,73 +1,57 @@
-# React + TypeScript + Vite
+# deis-control dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The read-mostly web UI the control plane serves from its own port. React 19 +
+TypeScript, built by Vite, styled with Tailwind and shadcn/ui components over
+Radix primitives.
 
-Currently, two official plugins are available:
+## How it reaches the browser
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+There is no separate web server and no separate port. `npm run build` writes
+`dist/`, and `crates/deis-control/src/api/static_files.rs` embeds that
+directory into the `deis-control` binary with `rust-embed`, serving it from the
+same listener that answers the API. So a change here is only live after a
+rebuild of the crate.
 
-## React Compiler
+`dist/` is a build product and is not in git. The crate's `build.rs` creates an
+empty one when it is missing, because `rust-embed` cannot expand without the
+directory and the crate would otherwise not compile on a fresh clone at all.
+A binary built that way is a working control plane with no dashboard: the API
+answers normally and the dashboard pages return 404, and the build prints a
+warning saying so. To get the dashboard, run `npm run build` here and rebuild
+the crate.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Working on it
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev      # Vite dev server; it proxies /api to http://localhost:8085
+npm run build    # tsc -b && vite build, which is what the crate embeds
+npm run lint
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+`npm run build` must pass before the crate is built for release; `tsc -b` is
+part of it on purpose, so a type error stops the build rather than shipping.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Where things live
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+- `src/pages/` — one file per route: Dashboard, Nodes, Commands, Configs,
+  Events.
+- `src/hooks/useApi.ts` — the polling hooks the pages read from. The dashboard
+  polls; there is no server push, and there is no WebSocket endpoint to
+  subscribe to.
+- `src/lib/api.ts` — the typed request layer, including the `X-API-Key` header
+  and the 401 handling.
+- `src/components/ui/` — shadcn/ui components, generated and then owned here.
+
+## Two names that are not interchangeable
+
+- A **node** is a registered process — a `deis-runtime` or `deis-proxy` that
+  announced itself to the control plane.
+- A **worker** is a Cloudflare Worker, which is an application concept and
+  never a machine. The UI says "node" for the fleet and never "worker".
+
+The Nodes page shows the two halves separately for the same reason: *control
+channels* are the sessions currently attached over gRPC, and the *runtime
+fleet* is what the control plane will deploy to and fire cron on. A node can be
+in one and not the other, and averaging them into a single "nodes" count hid
+exactly that.

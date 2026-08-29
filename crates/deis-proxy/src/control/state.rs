@@ -215,9 +215,16 @@ impl ProxyStateManager {
         self.transition_to(State::Pending, "startup").await
     }
 
-    /// Handle uncontrolled termination (e.g., process killed)
+    /// Record that this instance is going down without having passed through
+    /// `handle_shutdown`.
     ///
-    /// Attempt to report status and record it
+    /// It reports nothing to the control plane, and deliberately so: by the
+    /// time this is reachable the process is on its way out, and a report that
+    /// may or may not arrive is worse evidence than none. The control plane
+    /// notices the same fact on its own, by the node's registration lease
+    /// lapsing. What this leaves behind is a pair of error lines - the state
+    /// the instance died in, and how many transitions it had made - which is
+    /// what an operator reading the log afterwards actually needs.
     pub async fn handle_uncontrolled_termination(&self) -> Result<(), String> {
         let current_state = self.current_state().await;
         error!(
@@ -231,8 +238,6 @@ impl ProxyStateManager {
             "Instance {} had {} state transitions before termination",
             self.instance_id, history_count
         );
-
-        // TODO: Implement status reporting logic
 
         Ok(())
     }

@@ -1,6 +1,6 @@
 # Structured Logging
 
-Control Control supports flexible structured logging, facilitating development debugging and production log collection.
+deis-control supports flexible structured logging, facilitating development debugging and production log collection.
 
 ## Log Formats
 

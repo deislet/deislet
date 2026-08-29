@@ -25,7 +25,7 @@ Starting from version 0.1.0, deis-build supports three output modes for differen
 
 **Example:**
 ```rust
-use deis-build::{Compiler, CompilerOptions, OutputMode};
+use deis_build::{Compiler, CompilerOptions, OutputMode};
 
 let options = CompilerOptions {
     project_dir: "./my-app".to_string(),
@@ -62,4 +62,4 @@ println!("Output: {}", result.builds["cloudflare"].output_path);
 - Debugging with files while auto-deploying
 - Build analysis and optimization
 
-See [Chinese version](../zh/output-modes.md) for complete documentation.
+See [Chinese version](./output-modes.zh.md) for complete documentation.

@@ -1,243 +1,143 @@
-# Control Architecture Documentation
-
-**Version**: v0.1.0
-**Last Updated**: 2026-08-29
+# deis-control architecture
 
 > This document covers deis-control internals only. For the platform-wide design —
 > data model, deployment and versioning, request path — see
-> [`docs/architecture.zh.md`](../../docs/architecture.zh.md).
+> [`docs/architecture.zh.md`](../../docs/architecture.zh.md). For the HTTP
+> surface and how to run it, see [README.md](README.md).
 
 ---
 
-## 📐 System Architecture Overview
+## 📐 Overview
 
-Control is a distributed cluster management control used to manage and monitor multiple node nodes. Written in Rust, it features high performance, low latency, and high reliability.
+deis-control is the platform's control plane: the single authority on what
+should be running where. It stores the catalog (applications, versions,
+environments, deployment pointers, routes, encrypted secrets), keeps track of
+the fleet, pushes every change out to the nodes, and fires cron. It carries no
+data plane traffic — a request from a browser never passes through it.
 
-### Core Components
+It is a single process on a single port, serving HTTP and gRPC together.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Control Control                      │
-├───────────────────┬─────────────────┬──────────────────────────┤
-│  gRPC Server      │   HTTP API      │   Web UI + WS            │
-│ (Node Connections)│ (Management Interface)│ (Console + Events)  │
-└──────┬────────────┴─────┬───────────┴────┬─────────────────────┘
-       │                  │                │
-       ▼                  ▼                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                     Core Service Layer                       │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐        │
-│  │ SessionMgr  │  │ ConfigMgr    │  │ CommandExec   │        │
-│  │ (Session Mgmt)│  │ (Config Mgmt) │  │ (Command Exec)│        │
-│  └─────────────┘  └──────────────┘  └───────────────┘        │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐        │
-│  │ Broadcaster │  │ Metrics      │  │ Scheduler     │        │
-│  │ (Event Broadcast)│ (Metrics Coll)│  │ (Task Sched)  │        │
-│  └─────────────┘  └──────────────┘  └───────────────┘        │
-└──────────────────────────┬────────────────────────────────────┘
-                           │
+│                        deis-control                          │
+├──────────────────┬───────────────────┬───────────────────────┤
+│  gRPC server     │  HTTP API         │  Embedded console     │
+│  (deis-proxy     │  (deis CLI and    │  (React 19, built by  │
+│   dials in)      │   the console)    │   Vite, served at /)  │
+└────────┬─────────┴─────────┬─────────┴───────────────────────┘
+         │                   │
+         ▼                   ▼
+┌──────────────────────────────────────────────────────────────┐
+│                      Core services                           │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐  │
+│  │ Catalog   │  │ Delivery  │  │ Scheduler │  │ Sessions  │  │
+│  │ (product) │  │ (push)    │  │ (cron)    │  │ (gRPC)    │  │
+│  └───────────┘  └───────────┘  └───────────┘  └───────────┘  │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐                 │
+│  │ ConfigMgr │  │ CommandEx │  │ Metrics   │                 │
+│  └───────────┘  └───────────┘  └───────────┘                 │
+└──────────────────────────┬───────────────────────────────────┘
                            ▼
-                    ┌─────────────┐
-                    │  SQLite DB  │
-                    │  (Persistence)│
-                    └─────────────┘
+                   ┌───────────────┐
+                   │   SQLite      │
+                   └───────────────┘
                            │
-                           ▼
-               ┌────────────────────────┐
-               │   Nodes (deis-proxy,     │
-               │   deis-runtime, etc.)         │
-               └────────────────────────┘
+         ┌─────────────────┴──────────────────┐
+         ▼                                    ▼
+   deis-proxy (dials in over gRPC)   deis-runtime nodes
+                                     (control plane dials out)
 ```
+
+The two node types are reached in opposite directions, and mixing them up is
+the single most common misreading of this component:
+
+- **deis-proxy dials in.** It opens a bidirectional gRPC stream
+  (`EstablishChannel`) and holds it: authenticate, register, heartbeat, receive
+  configuration and commands. Those open streams are what `/api/sessions`
+  lists.
+- **A runtime node is dialled out to.** deis-control is the gRPC *client* of
+  the node's own management service. It also serves the node three HTTP
+  endpoints the node calls itself — registration, assignment list, bundle
+  download. The fleet those make up is what `/api/runtime` lists.
+
+WebSocket is not used anywhere in this component. Earlier versions of this
+document described the node link as WebSocket; it is gRPC over HTTP/2.
 
 ---
 
-## 🏗️ Module Architecture
+## 🏗️ Modules
 
-### 1. **gRPC Server** (`src/server.rs`)
+### 1. gRPC server (`src/server.rs`)
 
-Responsible for persistent connections and communication with node nodes,
-over a Tonic bidirectional stream defined by the `deis-wire` SDK.
+Accepts and holds node streams, over a Tonic bidirectional stream defined by
+the `deis-wire` SDK.
 
-> WebSocket is *not* used for nodes. The `/api/ws` endpoint exists only to push
-> events to the browser console; see `src/broadcast/`.
-
-**Responsibilities**:
+**Responsibilities**
 - Accept node gRPC streams
-- Handle authentication (PSK + HMAC-SHA256)
+- Authenticate (see *Security* below — it is a SHA-256 construction, not HMAC)
 - Manage session lifecycle
 - Receive heartbeats and status updates
 - Handle command responses
 
-**Message Flow**:
+**Message flow**
 ```
-Node → gRPC stream → Server → Handler → SessionManager/Database
+Node → gRPC stream → Server → Handler → SessionManager / Database
 Node ← gRPC stream ← Server ← CommandExecutor
 ```
 
-**Key Types**:
-- `ControlServer` - Main server structure
-- `MessageHandler` - Message handler
-- `NodeSession` - Node session
+**Key types**: `ControlServer`, `MessageHandler`, `NodeSession`.
 
-### 2. **HTTP API Server** (`src/api/`)
+### 2. HTTP API (`src/api/`)
 
-Provides a RESTful API for administrators and frontend use.
+Two routers with two different credentials — see README.md, *Two audiences,
+two credentials*.
 
-**Submodules**:
-- `mod.rs` - Routes and server startup
-- `nodes.rs` - Nodes management API
-- `configs.rs` - Configuration management API
-- `commands.rs` - Command execution API
-- `events.rs` - Event query API
-- `metrics.rs` - Metrics export API
-- `websocket.rs` - Frontend WebSocket push
-- `middleware.rs` - Authentication middleware
+| File | Surface |
+|---|---|
+| `mod.rs` | routing and startup |
+| `catalog/` | apps, versions, environments, deployments, routes, secrets, assignments |
+| `apps.rs` | the runtime fleet (`/api/runtime`) |
+| `nodes.rs` | open gRPC control channels (`/api/sessions`) |
+| `registration.rs` | a node putting itself on the fleet list |
+| `configs.rs`, `commands.rs`, `events.rs`, `metrics.rs` | operations |
+| `middleware.rs` | API-key auth for humans, node auth for nodes |
+| `static_files.rs` | the embedded console |
 
-**Technology Stack**:
-- Axum - Web framework
-- Tower HTTP - Middleware
-- axum-server - HTTPS support
+Axum, Tower HTTP, axum-server (for TLS).
 
-### 3. **Session Management** (`src/session.rs`)
+### 3. Session management (`src/session.rs`)
 
-Manages node connection sessions and status.
-
-**Core Structures**:
 ```rust
 pub struct SessionManager {
     sessions: Arc<DashMap<String, Arc<NodeSession>>>,
 }
-
-pub struct NodeSession {
-    pub id: String,
-    pub node_id: String,
-    pub instance_id: String,
-    pub state: Arc<RwLock<NodeState>>,
-    pub sender: Option<UnboundedSender<String>>,
-    // ...
-}
 ```
 
-**Concurrency Safety**:
-- Uses `DashMap` for lock-free concurrent access
-- `Arc<RwLock<_>>` protects state changes
+`DashMap` for concurrent access, `Arc<RwLock<_>>` around mutable state.
 
-### 4. **Configuration Management** (`src/config_manager/`)
+### 4. Catalog (`src/catalog/`)
 
-Provides storage, version control, and push functionality for configurations.
+The product model, and the reason this component exists. Applications,
+immutable versions addressed by their bundle's sha256, environments,
+deployment pointers, routes, and secrets encrypted with AES-256-GCM under a
+master key read from `secret_key_file`. `bundle.rs` stores and serves the
+uploaded archives.
 
-**Architecture Design**:
-```rust
-pub struct ConfigManager {
-    // ArcSwap implements zero-lock reads
-    configs: Arc<ArcSwap<HashMap<String, HashMap<String, JsonValue>>>>,
-    // Configuration version management
-    versions: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
-    // Database persistence
-    db: Arc<Database>,
-    // Node sessions (for pushing)
-    sessions: Arc<SessionManager>,
-}
-```
+A version is never mutated and never says it is current — an environment
+points at it. That is what makes a rollback a pointer move.
 
-**Features**:
-- **Zero-lock reads**: `ArcSwap` allows lock-free reads
-- **Atomic updates**: Uses `store()` to atomically replace the entire configuration tree
-- **Version tracking**: Records a timestamp for each update
-- **Push mechanism**: Actively pushes to nodes via WebSocket
+### 5. Delivery (`src/delivery/`)
 
-**Workflow**:
-1. Client updates configuration via API
-2. Save to database (transaction)
-3. Atomically update in-memory configuration (ArcSwap)
-4. Push to target node (asynchronously)
+Turns a catalog change into an `ApplyDeployment` call on every node in the
+fleet: app, version, environment, bundle URL, digest, and the env map
+(manifest variables plus secrets decrypted at send time). The bundle itself is
+fetched by the node over HTTP. Deploy, rollback and secret change all end here,
+and the response says which nodes took it and which did not.
 
-### 5. **Command Execution** (`src/command/`)
-
-Asynchronous command execution and tracking system.
-
-**Architecture**:
-```rust
-pub struct CommandExecutor {
-    // Command tracking table
-    pending_commands: Arc<DashMap<Uuid, Arc<Mutex<CommandTracker>>>>,
-    sessions: Arc<SessionManager>,
-    db: Arc<Database>,
-    broadcaster: Option<Arc<EventBroadcaster>>,
-}
-
-pub struct CommandTracker {
-    command_id: Uuid,
-    node_id: String,
-    command: NodeCommand,
-    status: CommandStatus,
-    created_at: DateTime<Utc>,
-    timeout_at: DateTime<Utc>,
-    response_tx: Option<oneshot::Sender<CommandResponse>>,
-}
-```
-
-**Execution Flow**:
-1. API calls `execute_command()`
-2. Create `CommandTracker` and assign UUID
-3. Send command to node via WebSocket
-4. Node executes asynchronously and returns response
-5. `handle_response()` updates status
-6. Trigger `oneshot` to notify waiters
-
-**Timeout Handling**:
-- Set a timeout for each command
-- Background task periodically cleans up timed-out commands
-
-### 6. **Event Broadcasting** (`src/broadcast/`)
-
-Real-time event push to frontend WebSocket connections.
-
-**Architecture**:
-```rust
-pub struct EventBroadcaster {
-    // Frontend WebSocket connection pool
-    ws_clients: Arc<DashMap<Uuid, mpsc::UnboundedSender<String>>>,
-}
-
-pub enum BroadcastEvent {
-    NodeConnected { ... },
-    NodeDisconnected { ... },
-    NodeStateChanged { ... },
-    HeartbeatReceived { ... },
-    ConfigUpdated { ... },
-    CommandSent { ... },
-    CommandCompleted { ... },
-}
-```
-
-**Integration Points**:
-- `src/handler.rs` - Node state changes
-- `src/command/mod.rs` - Command state changes
-- `src/config_manager/mod.rs` - Configuration updates
-
-### 7. **Data Persistence** (`src/database/`)
-
-SQLite database wrapper.
-
-**Table Structure**:
-- `nodes` - Node information
-- `configs` - Configuration key-value pairs
-- `commands` - Command history
-- `events` - Event logs
-- `heartbeats` - Heartbeat records
-- `apps` / `versions` / `environments` / `deployments` / `routes` / `secrets` - the catalog
-
-**Features**:
-- **Asynchronous API**: Uses `tokio::task::spawn_blocking`
-- **Connection Pool**: Internal `Mutex<Connection>`
-- **Transaction Support**: Atomicity for batch operations
-
-### 8. **Scheduler** (`src/scheduler/`)
+### 6. Scheduler (`src/scheduler/`)
 
 Cron for applications. A trigger belongs to an app, never to a node.
 
-**Architecture**:
 ```rust
 pub struct CronScheduler {
     store: Arc<CatalogStore>,
@@ -248,230 +148,200 @@ pub struct CronScheduler {
 }
 ```
 
-**How it Works**:
 1. Rebuild the task list from the catalog: the expressions are whatever
    `manifest.cron` of each environment's currently deployed version declares,
-   so they follow deploys and rollbacks and are never persisted separately
+   so they follow deploys and rollbacks and are never persisted separately.
 2. Fire everything due, one occurrence to exactly one node, trying the next
-   node when one refuses; an occurrence nobody takes is skipped, not retried
-3. Advance to the next occurrence
+   node when one refuses; an occurrence nobody takes is skipped, not retried.
+3. Advance to the next occurrence.
 
-### 8b. **Delivery** (`src/delivery/`)
+A handler that throws is *not* retried on another node: the same code would
+fail the same way elsewhere, and it may already have had side effects.
 
-Turns a catalog change into an `ApplyDeployment` call on every node: app,
-version, environment, bundle URL, digest, and the env map (manifest variables
-plus secrets decrypted at send time). The bundle itself is fetched by the node
-over HTTP. Deploy, rollback and secret change all end here.
+### 7. Runtime client (`src/runtime_client/`)
 
-### 9. **Monitoring Metrics** (`src/metrics/`)
+The client half of a node's management service: `ApplyDeployment`,
+`UnloadApp`, `GetStatus`, `HealthCheck`, `StartInspect`, and
+`Trigger.OnScheduled`. Also the fleet list — configured entries plus
+self-registrations, with health polled on a timer.
 
-Prometheus-compatible metrics collection and export.
+### 8. Configuration management (`src/config_manager/`)
 
-**Metric Types**:
-- **Nodes**: total, connected, active, by_type
-- **System**: uptime, total_events, total_commands, total_heartbeats
+Per-node configuration with storage, version history and push.
 
-**Export Formats**:
-- JSON: `/api/metrics/summary`
-- Prometheus: `/api/metrics`
+```rust
+pub struct ConfigManager {
+    configs: Arc<ArcSwap<HashMap<String, HashMap<String, JsonValue>>>>,
+    versions: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
+    db: Arc<Database>,
+    sessions: Arc<SessionManager>,
+}
+```
+
+Lock-free reads through `ArcSwap`; an update writes the database in a
+transaction, swaps the whole tree atomically, then pushes to the target node
+over its open gRPC stream.
+
+### 9. Command execution (`src/command/`)
+
+```rust
+pub struct CommandExecutor {
+    pending_commands: Arc<DashMap<Uuid, Arc<Mutex<CommandTracker>>>>,
+    sessions: Arc<SessionManager>,
+    db: Arc<Database>,
+}
+```
+
+An API call creates a tracker with a UUID, sends the command down the node's
+stream, and waits on a `oneshot`. A background task expires trackers whose
+deadline passed. History is kept in the database.
+
+### 10. Persistence (`src/database/`)
+
+SQLite, with rusqlite calls run on `spawn_blocking` so no synchronous SQL
+executes on an async thread. Schema in `src/database/schema.rs`, which is the
+authority; it is not reproduced here because a column list in a document is a
+column list that drifts.
+
+### 11. Metrics (`src/metrics/`)
+
+Prometheus text format at `/api/metrics`, JSON summary at
+`/api/metrics/summary`.
 
 ---
 
-## 🔒 Security Architecture
+## 🔒 Security
 
-### Authentication Mechanisms
+**Node authentication.** A pre-shared key from `node_preshared_keys`.
 
-**Node Authentication**:
-1. PSK (Pre-Shared Key) configuration
-2. HMAC-SHA256 signature verification
-3. Timestamp-based anti-replay
+On the gRPC handshake the node sends `sha256(secret ‖ node_id ‖ timestamp)`
+together with the timestamp, and this side recomputes it; a timestamp more than
+300 seconds old is rejected. Note what that is and is not: it is a
+secret-prefix SHA-256, **not** HMAC-SHA256, even though the comment beside it
+in `deis-wire/src/models/auth.rs` says "HMAC". Documents here have called it
+HMAC before; they were wrong, and the difference matters if anyone ever reasons
+about its resistance to length extension. Changing the construction is a
+protocol change on both sides, so it is not something to do quietly.
 
-**API Authentication**:
-1. API Key authentication (optional)
-2. Authorization Bearer or X-API-Key headers
-3. Middleware interception
+On the node-facing HTTP endpoints the same list is presented directly as a
+bearer credential, with no signature step.
 
-**TLS/HTTPS**:
-1. Implemented with Rustls
-2. Supports self-signed and Let's Encrypt certificates
-3. TLS 1.2/1.3
+The process refuses to run without a credential: if the configuration names
+none, one is generated at startup and printed once, because an empty list would
+let anyone who can reach the port register a node — and a registered node is
+handed every environment's decrypted secrets.
 
-### Authorization Model
+**Human API authentication.** An API key (`Authorization: Bearer` or
+`X-API-Key`), enabled by `api_auth_enabled`, which defaults to **off**. It does
+not gate the node endpoints, on purpose.
 
-Current Version: **Flat Authorization** (all API Keys have the same permissions)
+**TLS.** Rustls, TLS 1.2/1.3, self-signed or a real certificate.
 
-Future Plans: **RBAC** (Role-Based Access Control)
-
----
-
-## 🔄 Data Flow
-
-### Node Registration Flow
-
-```
-Node                  Control
-  │                        │
-  │──── WebSocket connection ─→│
-  │                        │
-  │──── authenticate ─────→│
-  │                        │  Verify PSK
-  │←─── auth_response ────│
-  │                        │
-  │──── register ─────────→│
-  │                        │  Create Session
-  │                        │  Save to database
-  │                        │  Broadcast event
-  │←─── register_response ─│
-  │                        │
-  │──── heartbeat (loop) ──→│
-  │←─── heartbeat_ack ────│
-```
-
-### Configuration Deployment Flow
-
-```
-Admin/UI              Control              Node
-  │                      │                      │
-  │── POST /configs ────→│                      │
-  │                      │  Save to database    │
-  │                      │  Update memory (ArcSwap) │
-  │←─── 200 OK ─────────│                      │
-  │                      │                      │
-  │── POST /configs/push ─→│                    │
-  │                      │                      │
-  │                      │──── config_update ──→│
-  │                      │                      │  Apply configuration
-  │                      │←─── config_ack ─────│
-  │                      │                      │
-  │                      │  Update status      │
-  │                      │  Broadcast event    │
-  │←─── push result ────│                      │
-```
-
-### Command Execution Flow
-
-```
-Admin/UI           Control          Node
-  │                   │                   │
-  │─ POST /commands ─→│                   │
-  │                   │  Create Tracker   │
-  │                   │  Generate UUID    │
-  │                   │                   │
-  │                   │─── command ──────→│
-  │                   │                   │  Execute
-  │←─ 202 Accepted ──│                   │
-  │   (command_id)    │                   │
-  │                   │                   │
-  │                   │←── response ─────│
-  │                   │                   │
-  │                   │  Update status    │
-  │                   │  Trigger oneshot  │
-  │                   │  Save to database │
-  │                   │  Broadcast event  │
-  │                   │                   │
-  │─ GET /status ────→│                   │
-  │←─ Completed ─────│                   │
-```
+**Authorization.** Flat: every API key has the same rights. There are no users
+and no roles.
 
 ---
 
-## 🧪 Testing Strategy
+## 🔄 Flows
 
-### Unit Testing
-- Each module is tested independently
-- Mock external dependencies
+### A runtime node joining and being fed
 
-### Integration Testing
-- `tests/api_integration_test.rs` - API end-to-end testing
-- `tests/config_push_e2e.rs` - Configuration push testing
-
-### Performance Testing
-- Plan to add criterion benchmarks
-
----
-
-## 📦 Deployment Architecture
-
-### Single Machine Deployment
 ```
-┌─────────────────────────────┐
-│        Server               │
-│  ┌──────────────────────┐   │
-│  │  Control Control   │   │
-│  │  - WebSocket: 8080   │   │
-│  │  - API + gRPC: 8080         │   │
-│  └──────────────────────┘   │
-│  ┌──────────────────────┐   │
-│  │  SQLite DB           │   │
-│  └──────────────────────┘   │
-└─────────────────────────────┘
-           ▲
-           │ WebSocket + HTTPS
-           │
-    ┌──────┴──────┬──────┬──────┐
-    │             │      │      │
-  Node1      Node2  Node3  ...
+Node                         deis-control
+  │                                │
+  │── PUT  registration ──────────→│  (node credential)
+  │                                │  on the fleet list, eligible for
+  │←── 200 + lease ────────────────│  pushes and cron
+  │                                │
+  │── GET  assignments ───────────→│  (node credential)
+  │←── [ {app, env, version,       │  secrets decrypted at send time
+  │       bundle_url, sha, env} ]  │
+  │                                │
+  │── GET  bundle_url ────────────→│  streamed, sha256 verified by the node
+  │                                │
+  │   (loads everything, only      │
+  │    then reports healthy)       │
+  │                                │
+  │←── ApplyDeployment ────────────│  every later deploy, as a push
 ```
 
-### Distributed Deployment (Future)
-- Multiple Control clusters
-- Shared database or distributed storage
-- Load balancing
+The paths are `deis_wire::conventions::NODE_REGISTRATION_ROUTE` and
+`NODE_ASSIGNMENTS_ROUTE`. They live in deis-wire because nothing checks that
+two crates spell an HTTP path the same way, and they did not once: a node asked
+for `/register` while this control plane served `/registration`, both compiled,
+and the only symptom was a fleet that never learned about its own nodes.
+
+### deis-proxy connecting
+
+```
+deis-proxy                   deis-control
+  │                                │
+  │── gRPC EstablishChannel ──────→│
+  │── authenticate ───────────────→│  verify PSK
+  │←── auth response ──────────────│
+  │── register ───────────────────→│  create session, persist, record an event
+  │←── register response ──────────│
+  │── heartbeat (loop) ───────────→│
+  │←── heartbeat ack ──────────────│
+  │←── config update / command ────│  pushed down the same stream
+```
+
+### A deploy
+
+```
+deis CLI                deis-control            nodes
+  │                          │                    │
+  │── POST versions (zip) ──→│  sha256, store     │
+  │── POST deployments ─────→│  move the pointer  │
+  │                          │── ApplyDeployment →│  (pointer only)
+  │                          │←── ack ────────────│
+  │←── delivery report ──────│                    │
+```
+
+A node that did not take it is named in the response, and `deis deploy` exits
+non-zero: the pointer moved, but that machine is still serving what it had.
 
 ---
 
-## 🔧 Technology Selection
+## 🧪 Testing
 
-| Component | Technology | Reason |
-|------|------|------|
-| Async Runtime | Tokio | Mature ecosystem, excellent performance |
-| WebSocket | tokio-tungstenite | Tokio native support |
-| HTTP Framework | Axum | Modern, type-safe, high performance |
-| Database | SQLite | Embedded, zero-config, reliable |
-| Zero-lock config reads | ArcSwap | High-performance atomic pointer swapping |
-| Concurrent Collections | DashMap | Lock-free concurrent HashMap |
-| TLS | Rustls | Pure Rust, no OpenSSL dependency |
+- Unit tests per module, with the router exercised through `tower::ServiceExt`
+  so handler tests are real HTTP round-trips.
+- `tests/` for cross-module checks.
+- `scripts/demo.sh` at the repository root is the end-to-end run: this
+  component against a real node, a real proxy, and the three data-plane
+  services.
 
 ---
 
-## 📈 Performance Characteristics
+## 🔧 Technology choices
 
-- **Concurrent Connections**: Support for 1000+ Nodes
-- **Heartbeat Latency**: < 10ms (Intranet)
-- **Configuration Push**: < 100ms (Per node)
-- **API Response**: < 50ms (Simple queries)
-- **Database Write**: Batch transactions < 10ms
-
----
-
-## 🚀 Future Plans
-
-1. **High Availability**
-   - Control clusters
-   - Raft consensus
-
-2. **Observability**
-   - Distributed tracing
-   - Richer metrics
-
-3. **Security Enhancement**
-   - RBAC
-   - mTLS
-   - Audit logs
-
-4. **Feature Extension**
-   - Configuration templates
-   - Batch commands
-   - Node grouping
+| Concern | Choice | Why |
+|---|---|---|
+| Async runtime | Tokio | mature, well understood |
+| Node transport | Tonic (gRPC over HTTP/2) | typed messages, bidirectional streaming |
+| HTTP framework | Axum | shares the listener with Tonic |
+| Database | SQLite | embedded, no operator to run |
+| Lock-free config reads | ArcSwap | hot path is read-only |
+| Concurrent maps | DashMap | |
+| TLS | Rustls | no OpenSSL dependency |
+| Console | React 19 + Vite + Tailwind | embedded in the binary at compile time |
 
 ---
 
-## 📚 References
+## 🚀 Not done
 
-- [Wire SDK](../deis-wire/)
-- [Axum Documentation](https://docs.rs/axum/)
-- [Tokio Documentation](https://tokio.rs/)
-- [Rustls Documentation](https://docs.rs/rustls/)
+- **High availability.** One process, one SQLite file. No clustering, no
+  consensus. The whole design assumes a single control plane, which is also
+  why cron needs no leader election.
+- **RBAC, mTLS, audit log.**
+- **The routes table is not consumed.** Host and path-prefix routes are stored
+  and served at `/api/routes`, but deis-proxy still resolves an application by
+  `Host` or by `x-deis-app-id` only. Path-prefix routing and automatic preview
+  subdomains both wait on that link.
+- **Only deis-runtime ships logs to deis-telemetry.** This component still
+  writes to its own stdout.
 
-**Maintainers**: Control Team
-**License**: Apache 2.0
+---
+
+**License**: Apache-2.0

@@ -227,10 +227,10 @@ function handler(context) {
         assert_eq!(result.errors[0].severity, Severity::Error);
     }
 
-    // TODO: Stricter validation rule tests - visitor patterns need further investigation
-    // Similar to Parser service detection, the AST visitor pattern matching needs refinement
-    // These are enforcement features for best practices, not blocking for MVP core functionality
-    // Core validation works: exports checking (5 tests pass)
+    // Not covered here: the style rules that walk the AST looking for
+    // discouraged patterns. What is covered is the check that decides whether
+    // a build succeeds - an entry module with no usable export - so a gap in
+    // the style rules costs advice, never a wrong build result.
 
     #[test]
     fn test_valid_context_usage() {

@@ -25,7 +25,7 @@
 
 **示例：**
 ```rust
-use deis-build::{Compiler, CompilerOptions, OutputMode};
+use deis_build::{Compiler, CompilerOptions, OutputMode};
 
 let options = CompilerOptions {
     project_dir: "./my-app".to_string(),
@@ -57,7 +57,7 @@ println!("输出目录: {}", result.builds["cloudflare"].output_path);
 
 **示例：**
 ```rust
-use deis-build::{Compiler, CompilerOptions, OutputMode};
+use deis_build::{Compiler, CompilerOptions, OutputMode};
 
 let options = CompilerOptions {
     project_dir: "./my-app".to_string(),
@@ -101,7 +101,7 @@ if let Some(build) = result.builds.get("cloudflare") {
 
 **示例：**
 ```rust
-use deis-build::{Compiler, CompilerOptions, OutputMode};
+use deis_build::{Compiler, CompilerOptions, OutputMode};
 
 let options = CompilerOptions {
     project_dir: "./my-app".to_string(),

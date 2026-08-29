@@ -27,9 +27,11 @@ impl Validatable for CertificateConfig {
             });
         }
 
-        // TODO: Add file existence validation if needed
-        // For now, we just validate the paths are not empty
-
+        // Only the shape is checked here. Whether the files exist and parse is
+        // settled when the listener loads them, which is the only moment the
+        // answer is still true: a certificate that was there at config-parse
+        // time can be rotated or removed before it is read, and a check here
+        // would report a state the process never acts on.
         Ok(())
     }
 }

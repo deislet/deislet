@@ -17,11 +17,13 @@ use tonic::Request;
 use super::RuntimeManagementService;
 use crate::app::{test_host, AppConfig, AppKey, ApplicationManager};
 use crate::config::RuntimeConfig;
-use crate::config_store::ConfigStore;
 use crate::deployment::DeploymentManager;
 use crate::health::NodeHealth;
 use crate::management::proto::runtime_management_server::RuntimeManagement;
-use crate::management::proto::{GetStatusRequest, UnloadAppRequest, UpdateAppRequest};
+use crate::management::proto::{
+    ConfigType, ExecuteCommandRequest, GetStatusRequest, PushConfigRequest, StartInspectRequest,
+    UnloadAppRequest, UpdateAppRequest,
+};
 use crate::runtime::metrics::{recorder, RequestOutcome};
 
 const HANDLER: &str = r#"
@@ -36,9 +38,6 @@ async fn service_with(
     app_id: &str,
     environments: &[&str],
 ) -> (Arc<ApplicationManager>, RuntimeManagementService) {
-    let db = dir.join("node.db");
-    let db = db.to_string_lossy().to_string();
-
     let apps = test_host::host();
     for environment in environments {
         apps.load_app(
@@ -59,7 +58,6 @@ async fn service_with(
 
     let service = RuntimeManagementService::new(
         apps.clone(),
-        Arc::new(ConfigStore::new(&db).await.unwrap()),
         Arc::new(
             DeploymentManager::from_config(apps.clone(), &config)
                 .await
@@ -218,4 +216,113 @@ async fn unloading_names_the_environments_that_stopped() {
     assert!(response.environments.is_empty());
 
     unload_all(&apps, "status-unload", &environments).await;
+}
+
+#[tokio::test]
+async fn an_inspect_session_attaches_to_the_environment_the_request_names() {
+    // A node runs every environment of an application at once, so attaching a
+    // debugger to "the app" is ambiguous. The RPC carries the environment;
+    // pinning it to production here would open a session against the wrong
+    // isolate - and report success while doing it.
+    let _turn = test_host::take();
+    let dir = tempfile::tempdir().unwrap();
+    let environments = ["production", "preview-3"];
+    let (apps, service) = service_with(dir.path(), "status-inspect", &environments).await;
+
+    let response = service
+        .start_inspect(Request::new(StartInspectRequest {
+            app_id: "status-inspect".to_string(),
+            ttl_seconds: 60,
+            environment: "preview-3".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let preview = AppKey::new("status-inspect", "preview-3");
+    assert!(
+        apps.validate_inspect_token(&preview, &response.token),
+        "the token belongs to the environment that was asked for"
+    );
+    assert!(
+        !apps.validate_inspect_token(&AppKey::production("status-inspect"), &response.token),
+        "production must not have been opened instead"
+    );
+
+    // An empty environment still means the default one, so callers written
+    // before the field existed keep working.
+    let response = service
+        .start_inspect(Request::new(StartInspectRequest {
+            app_id: "status-inspect".to_string(),
+            ttl_seconds: 60,
+            environment: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(apps.validate_inspect_token(&AppKey::production("status-inspect"), &response.token));
+
+    // An environment this node does not run is refused, not silently
+    // redirected to one it does.
+    let status = service
+        .start_inspect(Request::new(StartInspectRequest {
+            app_id: "status-inspect".to_string(),
+            ttl_seconds: 60,
+            environment: "no-such-environment".to_string(),
+        }))
+        .await
+        .expect_err("an environment that is not loaded has nothing to inspect");
+    assert_eq!(status.code(), tonic::Code::Internal);
+
+    unload_all(&apps, "status-inspect", &environments).await;
+}
+
+#[tokio::test]
+async fn a_config_push_is_refused_rather_than_written_somewhere_nobody_reads() {
+    // The previous implementation filed the payload in a local table that no
+    // part of this node ever read back, then answered "Config applied
+    // successfully". A caller had no way to tell that from a configuration
+    // that had actually taken effect.
+    let _turn = test_host::take();
+    let dir = tempfile::tempdir().unwrap();
+    let environments = ["production"];
+    let (apps, service) = service_with(dir.path(), "status-config", &environments).await;
+
+    let status = service
+        .push_config(Request::new(PushConfigRequest {
+            version: 7,
+            config_json: "{\"anything\":true}".to_string(),
+            config_type: ConfigType::Global as i32,
+            force: true,
+        }))
+        .await
+        .expect_err("nothing applies a pushed config, so it must not report success");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(status.message().contains("PushConfig"), "{status}");
+
+    unload_all(&apps, "status-config", &environments).await;
+}
+
+#[tokio::test]
+async fn a_command_is_refused_rather_than_reported_as_a_failure() {
+    // `success: false` reads as "the command ran and lost", which invites a
+    // retry of something that was never going to run. There is no command
+    // surface on this node at all.
+    let _turn = test_host::take();
+    let dir = tempfile::tempdir().unwrap();
+    let environments = ["production"];
+    let (apps, service) = service_with(dir.path(), "status-command", &environments).await;
+
+    let status = service
+        .execute_command(Request::new(ExecuteCommandRequest {
+            command: "restart".to_string(),
+            args: Vec::new(),
+            options: std::collections::HashMap::new(),
+        }))
+        .await
+        .expect_err("a node that runs no commands must say so");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(status.message().contains("ExecuteCommand"), "{status}");
+
+    unload_all(&apps, "status-command", &environments).await;
 }

@@ -29,7 +29,6 @@ async fn test_api_server_health() {
 
     // Create server components
     let sessions = Arc::new(SessionManager::new());
-    let broadcaster = Arc::new(EventBroadcaster::new());
     let config_manager = Arc::new(ConfigManager::new(
         Arc::clone(&database),
         Arc::clone(&sessions),
@@ -41,16 +40,14 @@ async fn test_api_server_health() {
     let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
 
     // Start the API server in the background
-    let api_config = Arc::new(config.clone());
     tokio::spawn(async move {
         let _ = deis_control::api::start_api_server(
             sessions,
             database,
-            broadcaster,
             config_manager,
             command_executor,
             metrics_collector,
-            api_config,
+            config,
             18081,
         )
         .await;
@@ -73,11 +70,10 @@ async fn test_api_server_health() {
 }
 
 #[tokio::test]
-async fn test_api_nodes_endpoint() {
+async fn test_api_sessions_and_fleet_are_two_different_lists() {
     let config = ControlConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
-    let broadcaster = Arc::new(EventBroadcaster::new());
     let config_manager = Arc::new(ConfigManager::new(
         Arc::clone(&database),
         Arc::clone(&sessions),
@@ -88,16 +84,14 @@ async fn test_api_nodes_endpoint() {
     ));
     let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
 
-    let api_config = Arc::new(config.clone());
     tokio::spawn(async move {
         let _ = deis_control::api::start_api_server(
             sessions,
             database,
-            broadcaster,
             config_manager,
             command_executor,
             metrics_collector,
-            api_config,
+            config,
             18082,
         )
         .await;
@@ -105,19 +99,32 @@ async fn test_api_nodes_endpoint() {
 
     wait_for_server_ready(18082).await;
 
-    // Test the nodes endpoint
+    // The control channels open to this process - not the runtime fleet,
+    // which is a different list at /api/runtime.
     let client = reqwest::Client::new();
     let response = client
-        .get("http://localhost:18082/api/nodes")
+        .get("http://localhost:18082/api/sessions")
         .send()
         .await
-        .expect("Failed to call nodes endpoint");
+        .expect("Failed to call the sessions endpoint");
 
     assert_eq!(response.status(), 200);
 
     let json: serde_json::Value = response.json().await.unwrap();
-    assert!(json.get("nodes").is_some());
+    assert!(json.get("sessions").is_some());
     assert!(json.get("total").is_some());
+
+    let fleet = client
+        .get("http://localhost:18082/api/runtime")
+        .send()
+        .await
+        .expect("Failed to call the runtime fleet endpoint");
+    assert_eq!(fleet.status(), 200);
+    let fleet: serde_json::Value = fleet.json().await.unwrap();
+    assert!(
+        fleet.get("nodes").is_some(),
+        "the fleet is a separate list from the open control channels"
+    );
 }
 
 #[tokio::test]
@@ -125,7 +132,6 @@ async fn test_api_metrics_endpoint() {
     let config = ControlConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
-    let broadcaster = Arc::new(EventBroadcaster::new());
     let config_manager = Arc::new(ConfigManager::new(
         Arc::clone(&database),
         Arc::clone(&sessions),
@@ -136,16 +142,14 @@ async fn test_api_metrics_endpoint() {
     ));
     let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
 
-    let api_config = Arc::new(config.clone());
     tokio::spawn(async move {
         let _ = deis_control::api::start_api_server(
             sessions,
             database,
-            broadcaster,
             config_manager,
             command_executor,
             metrics_collector,
-            api_config,
+            config,
             18083,
         )
         .await;
@@ -174,7 +178,6 @@ async fn test_api_events_endpoint() {
     let config = ControlConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
-    let broadcaster = Arc::new(EventBroadcaster::new());
     let config_manager = Arc::new(ConfigManager::new(
         Arc::clone(&database),
         Arc::clone(&sessions),
@@ -185,16 +188,14 @@ async fn test_api_events_endpoint() {
     ));
     let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
 
-    let api_config = Arc::new(config.clone());
     tokio::spawn(async move {
         let _ = deis_control::api::start_api_server(
             sessions,
             database,
-            broadcaster,
             config_manager,
             command_executor,
             metrics_collector,
-            api_config,
+            config,
             18084,
         )
         .await;
@@ -253,7 +254,6 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
     };
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
-    let broadcaster = Arc::new(EventBroadcaster::new());
     let config_manager = Arc::new(ConfigManager::new(
         Arc::clone(&database),
         Arc::clone(&sessions),
@@ -266,7 +266,6 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
     let api = deis_control::api::build_api_router(
         sessions,
         database,
-        broadcaster,
         config_manager,
         command_executor,
         metrics_collector,
@@ -307,6 +306,157 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
         status_of("/api/apps", Some("node-psk")).await,
         StatusCode::UNAUTHORIZED
     );
+
+    // Registration is on the same credential, on the assembled router: a
+    // caller that can put a node on the fleet list has given itself a
+    // delivery target, and a delivery target is handed every environment's
+    // decrypted secrets on its first assignment fetch.
+    let register = |credential: Option<&str>| {
+        let router = api.router.clone();
+        let mut builder = Request::builder()
+            .method("PUT")
+            .uri("/api/nodes/intruder/registration")
+            .header("content-type", "application/json");
+        if let Some(credential) = credential {
+            builder = builder.header("Authorization", format!("Bearer {credential}"));
+        }
+        let request = builder
+            .body(Body::from(r#"{"address":"http://10.0.0.7:8086"}"#))
+            .unwrap();
+        async move { router.oneshot(request).await.unwrap().status() }
+    };
+    assert_eq!(register(None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        register(Some("dashboard-key")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(register(Some("node-psk")).await, StatusCode::OK);
+}
+
+/// The Restart button's whole round trip, in the shape the dashboard sends
+/// it. It used to post `{command_type: 'custom', command_data: ...}`, which
+/// the control plane could not deserialize at all: the command never reached
+/// a node and the caller got a 422 about a field name.
+///
+/// And the answer for a node that is not connected has to say so: a command
+/// can only go down a control channel the node is holding open, so naming a
+/// node that has none is the caller's mistake, not a control plane failure.
+#[tokio::test]
+async fn the_dashboards_restart_body_is_the_one_the_control_plane_accepts() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let database = Arc::new(Database::init(":memory:").await.unwrap());
+    let sessions = Arc::new(SessionManager::new());
+    let config_manager = Arc::new(ConfigManager::new(
+        Arc::clone(&database),
+        Arc::clone(&sessions),
+    ));
+    let command_executor = Arc::new(CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&database),
+    ));
+    let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+    let api = deis_control::api::build_api_router(
+        sessions,
+        database,
+        config_manager,
+        command_executor,
+        metrics_collector,
+        Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
+        Arc::new(ControlConfig::default()),
+    );
+
+    let post = |body: &'static str| {
+        let router = api.router.clone();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/commands/execute/deis-proxy-1")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        async move {
+            let response = router.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    // What the button used to send: the server could not read it, so this
+    // never became a command at all.
+    let (status, _) = post(r#"{"command_type":"custom","command_data":"graceful_restart"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the old body must still be rejected, so nothing goes back to sending it"
+    );
+
+    // What it sends now. No node is connected in this test, so the answer is
+    // about the fleet rather than about the control plane.
+    let (status, body) = post(r#"{"command_type":"restart"}"#).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.contains("control channel"),
+        "the refusal must say why nothing could be sent: {body}"
+    );
+
+    // A free-form command travels as the tagged form, and gets the same
+    // answer rather than a deserialization failure.
+    let (status, _) = post(r#"{"command_type":{"custom":"graceful_restart"},"data":null}"#).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The blocker in its own right: a control plane assembled from a
+/// configuration that names no node key must not serve the node endpoints to
+/// anyone. "Unconfigured" used to mean "unguarded" here, so anyone who could
+/// reach the port could inject a node into the fleet.
+#[tokio::test]
+async fn a_router_built_without_a_node_key_registers_nobody() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let config = ControlConfig::default();
+    assert!(
+        config.node_preshared_keys.is_empty(),
+        "the default is the case this test is about"
+    );
+    let database = Arc::new(Database::init(":memory:").await.unwrap());
+    let sessions = Arc::new(SessionManager::new());
+    let config_manager = Arc::new(ConfigManager::new(
+        Arc::clone(&database),
+        Arc::clone(&sessions),
+    ));
+    let command_executor = Arc::new(CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&database),
+    ));
+    let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+    let fleet = Arc::new(RuntimeNodeManager::new(Vec::new(), 60));
+    let api = deis_control::api::build_api_router(
+        sessions,
+        database,
+        config_manager,
+        command_executor,
+        metrics_collector,
+        Arc::clone(&fleet),
+        Arc::new(config),
+    );
+
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/api/nodes/intruder/registration")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"address":"http://10.0.0.7:8086"}"#))
+        .unwrap();
+    let status = api.router.clone().oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        fleet.is_empty(),
+        "nothing may join the fleet through an unauthenticated call"
+    );
 }
 
 /// A stop signal must drain rather than kill: the listener stops taking new
@@ -319,7 +469,6 @@ async fn a_stop_signal_drains_in_flight_requests_before_the_server_stops() {
     let config = ControlConfig::default();
     let database = Arc::new(Database::init(":memory:").await.unwrap());
     let sessions = Arc::new(SessionManager::new());
-    let broadcaster = Arc::new(EventBroadcaster::new());
     let config_manager = Arc::new(ConfigManager::new(
         Arc::clone(&database),
         Arc::clone(&sessions),
@@ -335,7 +484,6 @@ async fn a_stop_signal_drains_in_flight_requests_before_the_server_stops() {
     let api = deis_control::api::build_api_router(
         sessions,
         database,
-        broadcaster,
         config_manager,
         command_executor,
         metrics_collector,
@@ -425,12 +573,14 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
         control_service_client::ControlServiceClient,
     };
 
-    let config = ControlConfig::default();
+    let config = ControlConfig {
+        node_preshared_keys: vec!["node-psk".to_string()],
+        ..Default::default()
+    };
     let database = Arc::new(Database::init(":memory:").await.unwrap());
 
     let server = ControlServer::new(config.clone()).with_database(Arc::clone(&database));
     let sessions = server.sessions();
-    let broadcaster = server.broadcaster();
     let config_manager = Arc::new(ConfigManager::new(
         Arc::clone(&database),
         Arc::clone(&sessions),
@@ -445,7 +595,6 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
     let api = deis_control::api::build_api_router(
         Arc::clone(&sessions),
         Arc::clone(&database),
-        broadcaster,
         config_manager,
         command_executor,
         metrics_collector,
@@ -480,7 +629,7 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
         .send(ControlMessage {
             payload: Some(Payload::Authenticate(AuthenticateRequest {
                 instance_id: "test-node".to_string(),
-                secret: String::new(),
+                secret: "node-psk".to_string(),
             })),
         })
         .await
@@ -511,4 +660,81 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
         .expect("the server did not stop while a node channel was open")
         .unwrap()
         .expect("the server reported an error while stopping");
+}
+
+/// Pushing configuration to a node that is not connected is a fact about the
+/// fleet, not a fault in the control plane.
+///
+/// Both push endpoints mapped every failure to 500, so "this node is not
+/// here" and "this process is broken" were the same answer - the same defect
+/// the command path had, one module over. A `deis-runtime` node never holds a
+/// control channel at all, so this is the answer an operator gets whenever
+/// they aim a push at one.
+#[tokio::test]
+async fn pushing_config_to_an_unconnected_node_is_a_404_not_a_500() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let database = Arc::new(Database::init(":memory:").await.unwrap());
+    let sessions = Arc::new(SessionManager::new());
+    let config_manager = Arc::new(ConfigManager::new(
+        Arc::clone(&database),
+        Arc::clone(&sessions),
+    ));
+    let command_executor = Arc::new(CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&database),
+    ));
+    let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+
+    // Store something to push, so the push fails on "this node is not
+    // connected" rather than on "there is nothing stored for it" - both are
+    // 404, and only the first is the case under test.
+    config_manager
+        .update_config(
+            "deis-runtime-1",
+            std::collections::HashMap::from([(
+                "app.max_instances".to_string(),
+                serde_json::json!(20),
+            )]),
+        )
+        .await
+        .expect("the configuration is stored");
+
+    let api = deis_control::api::build_api_router(
+        sessions,
+        database,
+        Arc::clone(&config_manager),
+        command_executor,
+        metrics_collector,
+        Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
+        Arc::new(ControlConfig::default()),
+    );
+
+    let post = |uri: &'static str| {
+        let router = api.router.clone();
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        async move {
+            let response = router.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    let (status, body) = post("/api/configs/push/deis-runtime-1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.contains("control channel"),
+        "the refusal must say why nothing could be pushed: {body}"
+    );
+
+    let (status, body) = post("/api/configs/push/deis-runtime-1/app.max_instances").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("control channel"), "{body}");
 }

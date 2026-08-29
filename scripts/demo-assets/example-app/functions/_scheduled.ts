@@ -8,7 +8,15 @@
 //
 // A tick is fire-and-forget: it is not retried and a missed one is never made
 // up. Anything that must not be lost belongs on a queue this handler fills.
-export default async function scheduled(event: any, context: any): Promise<void> {
+//
+// The signature is the canon's `scheduled(event, env, context)`
+// (SPECIFICATION_EXT.md section 3.1), the same three-parameter shape as the
+// queue consumer next door.
+export default async function scheduled(
+  event: any,
+  _env: any,
+  context: any,
+): Promise<void> {
   const at = new Date(event.scheduledTime).toISOString();
   await context.services.kv.put("cron:last-run", at);
   console.log(`scheduled run for ${event.cron} due at ${at}`);

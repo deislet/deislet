@@ -9,7 +9,7 @@ running application. The specification an application is written against is
 [Edge Canon](https://github.com/deislet/edge-canon).
 
 ```
-deis build ──► bundle.zip ──► control plane stores it as an immutable version
+deis deploy ──► bundle.zip ──► control plane stores it as an immutable version
                                    │
                         an environment points at a version
                                    │
@@ -27,15 +27,19 @@ node.
 
 ## What works today
 
-`scripts/demo.sh` brings up six processes, deploys an application through the
-same HTTP API a person would use, and then checks twelve properties one at a
-time, printing the evidence for each:
+`scripts/demo.sh` brings up six processes, deploys an application with
+`deis deploy` — the same command a person would run, not a `curl` against the
+REST API — and then runs nineteen checks in eleven groups, printing the
+evidence for each:
 
-| | |
+| Check | Evidence |
 |---|---|
+| `deis deploy` takes a project from source to serving | one command builds, uploads a version, moves the pointer, and the app answers |
+| `deis versions` lists what was deployed | both versions, with the one production points at marked |
 | static asset served from the bundle | without entering an isolate |
 | `If-None-Match` answers 304 | the ETag is the asset's own sha256 |
 | a route placeholder reaches `context.params` | `/hello/:name` |
+| `deis secret list` never prints a value | names and times only, in both human and `--json` output |
 | the environment's secret reached the isolate | delivered decrypted, in memory |
 | the decrypted secret is written nowhere | the data directories and logs are grepped for it |
 | `context.services.kv` round-trips | through deis-store, in this tenant's rows |
@@ -43,8 +47,12 @@ time, printing the evidence for each:
 | a cron expression fires on one node | and runs the app's `scheduled` export |
 | two environments of one app serve at once | each on its own version |
 | a preview cannot see production's KV | separate storage tenants |
-| rollback puts the previous version back | function and assets together |
+| `deis rollback` puts the previous version back | function and assets together |
 | the app's logs come back from deis-telemetry | queried by application |
+| `deis tail` streams a line produced after the stream opened | confirmed with a one-shot probe name |
+| the node registered itself with the control plane | and the configured address survived its self-report |
+| a node the configuration never mentioned joins by registering | the fleet gains that id with `source: registered`, not `configured` |
+| `deis status` reports the node actually serving | the catalog's claim and the node's claim, side by side |
 
 ## The nine components
 
@@ -59,14 +67,16 @@ protocol.
 | [`deis-store`](crates/deis-store) | KV, per-tenant SQL and content-addressed blobs, as three gRPC services in one process on SQLite and the local disk. Knows nothing about versions, deployments or environments. |
 | [`deis-queue`](crates/deis-queue) | A durable queue with lease-based consumption: `Send`, `Pull` under a lease, `Ack`, `Nack` with a delay, and a dead-letter table once a message has been tried too often. Nodes poll it; it never pushes. |
 | [`deis-telemetry`](crates/deis-telemetry) | Log aggregation and metrics, independent of everything else. Receives batched logs, answers `Query` and a streaming `Tail`, extracts metrics and exports them in Prometheus format. Only deis-runtime ships to it so far; the other components still log to their own stdout. |
-| [`deis`](crates/deis) | The developer CLI: `init`, `dev`, `validate`, `build`. Delegates every bit of parsing and compiling to deis-build. |
+| [`deis`](crates/deis) | The developer CLI, and the only interface a person needs. `init`, `dev`, `validate` and `build` work on the project on disk; `deploy`, `versions`, `rollback`, `status`, `secret`, `logs` and `tail` talk to a running platform. Delegates every bit of parsing and compiling to deis-build. |
 | [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four targets — Cloudflare Workers, Deno Deploy, Tencent EdgeOne, and this platform. Translation only: it never deploys. |
 | [`deis-wire`](crates/deis-wire) | The gRPC toolkit and, in `deis_wire::conventions`, the names both sides of every wire agree on: the header names, the tenant id, the message ceiling, the reserved environment keys. |
 
 Two library crates carry contracts rather than behaviour:
 [`deis-bundle`](crates/deis-bundle) is the bundle format — manifest, asset
 index, archive layout — shared by the compiler, the control plane and the
-node; `deis-build-adapter-*` are one code generator per compile target.
+node; `deis-build-adapter-*` are one code generator per compile target, each
+named after the `--vendor` value it answers for —
+`deis-build-adapter-{cloudflare,deno,tencent,deislet}`.
 
 ## How the pieces are addressed
 
@@ -83,13 +93,20 @@ environments: they get `x-deis-tenant`, whose value is
 preview writing to its KV therefore cannot overwrite production's, which
 matters because rolling back returns the code and not the data.
 
-**Nodes pull, the control plane also pushes.** A node asks
-`GET /api/nodes/{id}/assignments` on startup, fetches each bundle over HTTP,
-verifies its sha256, loads it, and only then reports healthy. After that a new
-deployment reaches it as a push. Both of those node-facing endpoints need a
-node credential from `node_preshared_keys`, independently of whether the
+**Nodes pull, the control plane also pushes.** A node fetches its assignment
+list on startup, fetches each bundle over HTTP, verifies its sha256, loads it,
+and only then reports healthy. It also states its own existence to the control
+plane, which is what makes it a push target and a candidate for cron. After
+that a new deployment reaches it as a push. Both of those node-facing endpoints
+need a node credential from `node_preshared_keys`, independently of whether the
 human-facing API has authentication turned on at all — the assignment list
 contains decrypted secrets.
+
+The two paths are not spelled out here on purpose. They are
+`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE` and `NODE_REGISTRATION_ROUTE`
+(with `node_assignments_path` / `node_registration_path` for the client side),
+and a path copied into prose is a path that goes stale the next time one moves
+— which has already happened once.
 
 **Bundles never travel inside a gRPC message.** The control plane sends a
 pointer (`app`, `version`, `environment`, `bundle_url`, `bundle_sha`, plus the
@@ -98,8 +115,8 @@ environment map) and the node fetches the bytes itself.
 ## Running the demo
 
 ```bash
-scripts/demo.sh start     # build everything, start six processes, deploy the example app
-scripts/demo.sh verify    # run the twelve checks and print the evidence for each
+scripts/demo.sh start     # build everything, start six processes, deploy the example app with `deis deploy`
+scripts/demo.sh verify    # run the nineteen checks and print the evidence for each
 scripts/demo.sh stop      # stop everything and wait until each process has really exited
 ```
 
@@ -109,9 +126,10 @@ Then talk to the deployed application:
 curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
 ```
 
-`start` needs `cargo`, `curl` and `jq`; the log check in `verify` needs
-`grpcurl` and reports a failure rather than skipping when it is missing. The
-whole run takes a minute or two, because the cron check waits for a real
+`start` needs `cargo`, `curl` and `jq`; two checks in `verify` — the log query
+and the one that asks deis-store directly whether the KV row is there — need
+`grpcurl`, and each reports a failure rather than skipping when it is missing.
+The whole run takes a minute or two, because the cron check waits for a real
 occurrence.
 
 On a fresh clone, build the web console first. Its output is gitignored and
@@ -136,6 +154,11 @@ check proves, and what lands in the `.demo/` run directory.
 - [DEMO.md](DEMO.md) — the demo script in detail.
 - [WAF_PROPOSAL.md](WAF_PROPOSAL.md) — a proposal for putting the Coraza engine
   in front of deis-proxy. Not implemented.
+- [crates/deis/CONTRIBUTING.md](crates/deis/CONTRIBUTING.md) — how to work in
+  this repository: the build loop, the naming rules, and what a change owes the
+  written record.
+- [crates/deis/QUICKSTART.md](crates/deis/QUICKSTART.md) — from `deis init` to
+  a deployed application and back.
 - Each crate carries its own README, and `crates/deis-build/docs/` covers the
   compiler in depth.
 
@@ -149,21 +172,35 @@ order it is likely to matter:
   still resolves an application by host or by header only. Path-prefix routing
   and automatic preview subdomains (`<env>.<app>.<zone>`) both wait on that
   link.
-- **The CLI stops at `build`.** `deis build --vendor deislet` produces the
-  bundle; deploying and rolling back are done against the control plane's HTTP
-  API, which is what `scripts/demo.sh` does.
 - **Request and response bodies are strings.** Binary payloads are not carried
   through the isolate boundary yet, and the `Request` / `Response` an isolate
   sees are the runtime's own minimal classes, not `deno_fetch`'s.
 - **Most Web API globals are missing, `fetch` among them.** The extensions are
-  registered, but their JS modules only export — nothing binds them to
-  `globalThis`. Measured with a probe application: an isolate has `Headers`,
-  `Request`, `Response`, `URL`, `URLSearchParams`, `EventTarget`, `setTimeout`,
-  `queueMicrotask`, `console` and `caches`, and does **not** have `fetch`,
-  `crypto`, `TextEncoder`/`TextDecoder`, `atob`/`btoa`, `AbortController`,
-  `ReadableStream`, `Blob`, `FormData`, `URLPattern`, `WebSocket`,
-  `BroadcastChannel` or `structuredClone`. Nothing in the test suite touches
-  any of them, so nothing goes red. See §12 of the architecture document.
+  registered — `deno_web`, `deno_fetch`, `deno_crypto`, `deno_websocket` are
+  all in `build_runtime_extensions()` — but their JS modules only export;
+  nothing binds them to `globalThis`, because the file that does that in Deno
+  itself (`99_main.js`) is not part of this runtime.
+
+  Measured with a probe that asks `typeof globalThis[name]` inside a real
+  isolate. **Present:** `Headers`, `Request`, `Response`, `URL`,
+  `URLSearchParams`, `EventTarget`, `setTimeout`, `clearTimeout`,
+  `queueMicrotask`, `console`, `caches`, `WebSocketPair`, `WebSocketServer`.
+  **Absent:** `fetch`, `crypto`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`,
+  `AbortController`, `AbortSignal`, `ReadableStream`, `WritableStream`,
+  `TransformStream`, `Blob`, `File`, `FormData`, `URLPattern`, `WebSocket`,
+  `BroadcastChannel`, `structuredClone`, `Event`, `setInterval`,
+  `clearInterval`, `performance`, `DOMException`, `MessageChannel`,
+  `MessagePort`, `CompressionStream`, `DecompressionStream`, `EventSource`,
+  `FileReader`, `navigator`, `reportError`.
+
+  Of the `Present` names, `console` and `queueMicrotask` come from deno_core's
+  own `01_core.js`; every other one is defined by the runtime's own
+  `src/runtime/js/runtime.js`, not by Deno. They are minimal stand-ins, so
+  `Response.json()` and `Response.prototype.arrayBuffer()` are not there
+  either. Nothing in the test suite touches
+  any of the absent ones, so nothing goes red; the missing piece is a
+  conformance test that walks Edge Canon's global list and fails per name.
+  See §12 of the architecture document.
 - **No Node.js built-ins and no npm resolution**, and therefore no framework
   SSR. This is a decision, not a gap: see the capability matrix.
 - **Only the node ships logs.** deis-proxy, deis-store, deis-queue and

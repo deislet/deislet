@@ -21,6 +21,8 @@ pub mod route_match;
 mod runtime_init;
 mod snapshot;
 mod tenant;
+#[cfg(test)]
+pub(crate) mod test_store;
 mod tls_ops;
 // mod ws_ops;
 mod ws_server_ops;

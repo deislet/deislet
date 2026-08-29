@@ -71,8 +71,14 @@ impl Validatable for Condition {
 }
 
 impl Validatable for CacheKeys {
+    /// Nothing left to check.
+    ///
+    /// A `CacheKeys` can only be built by `FromStr`, which already rejects
+    /// every part it does not recognise and an empty `header(...)` name. By
+    /// the time one exists it is a list of enum variants with no invalid
+    /// state left to express, so this is a genuine no-op rather than a check
+    /// that was never written.
     fn validate(&self) -> Result<(), ConfigError> {
-        // TODO: Implement validation
         Ok(())
     }
 }

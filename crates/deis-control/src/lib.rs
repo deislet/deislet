@@ -3,7 +3,6 @@
 pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 
 pub mod api;
-pub mod broadcast;
 pub mod catalog;
 pub mod command;
 pub mod config;
@@ -20,7 +19,6 @@ pub mod session;
 pub mod shutdown;
 pub mod tls;
 
-pub use broadcast::{BroadcastEvent, EventBroadcaster};
 pub use catalog::{
     App, Assignment, BundleManifest, BundleStore, CatalogError, CatalogStore, DeployedVersion,
     Deployment, Environment, Route, SecretCipher, SecretsBackend, Version,
@@ -144,9 +142,13 @@ mod tests {
         assert_eq!(manager.count(), 0);
     }
 
+    /// A control plane with no node credential admits no node. It used to
+    /// admit every one of them, which made "no configuration" the same
+    /// thing as "no authentication".
     #[tokio::test]
     async fn test_message_handler_auth_no_psk() {
         let config = ControlConfig::default();
+        assert!(config.node_preshared_keys.is_empty());
         let sessions = SessionManager::new();
         let handler =
             MessageHandler::new(std::sync::Arc::new(config), std::sync::Arc::new(sessions));
@@ -158,8 +160,8 @@ mod tests {
         };
 
         let response = handler.handle_auth(auth_data).await;
-        assert!(response.authenticated);
-        assert!(response.message.contains("test-node"));
+        assert!(!response.authenticated);
+        assert!(response.error.is_some());
     }
 
     #[tokio::test]
@@ -270,7 +272,6 @@ mod tests {
 
         let heartbeat_request = HeartbeatRequest {
             id: "lb".to_string(),
-            power_reserve: 85,
         };
 
         let response = handler.handle_heartbeat(heartbeat_request, &session).await;

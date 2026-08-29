@@ -1083,6 +1083,7 @@ check_secret_delivery() {
 }
 
 check_kv_roundtrip() {
+  local title="context.services.kv round-trips through deis-store"
   local key="demo-kv-$$"
   local value="stored-through-deis-store"
   local headers="${LOG_DIR}/verify-kv.headers"
@@ -1092,28 +1093,52 @@ check_kv_roundtrip() {
     --data-binary "$value" \
     "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/${key}")
   if [ "$(http_status "$headers")" != "201" ]; then
-    fail_check "context.services.kv round-trips through deis-store" \
-      "PUT answered $(http_status "$headers"): ${put}"
+    fail_check "$title" "PUT answered $(http_status "$headers"): ${put}"
     return
   fi
 
   local got
   got=$(app_request "${LOG_DIR}/verify-kv-get.headers" "/api/kv/${key}")
   if [ "$(echo "$got" | jq -r '.value // empty' || true)" != "$value" ]; then
-    fail_check "context.services.kv round-trips through deis-store" \
+    fail_check "$title" \
       "GET answered $(http_status "${LOG_DIR}/verify-kv-get.headers"): ${got}"
     return
   fi
 
-  # Reading it back proves the isolate got an answer; finding it in
-  # deis-store's own database proves the answer came from deis-store and not
-  # from something inside the isolate.
-  if grep -qa "$value" "${DEMO_DIR}/deis-store-data"/*.sqlite* 2>/dev/null; then
-    pass_check "context.services.kv round-trips through deis-store" \
-      "PUT then GET returned ${value}, and the value is in deis-store's own database"
+  # Reading it back through the node only proves the isolate received an
+  # answer, not where the answer came from - a cache inside the node would
+  # look identical from here. What proves deis-store itself holds the row is
+  # asking deis-store's own KvStore.Get directly, over the same gRPC service
+  # the node calls and with the same tenant header a request for this
+  # application and environment carries (deis_wire::conventions::tenant_id).
+  #
+  # A grep of deis-store's sqlite file at rest was tried here before and
+  # dropped: that file runs in WAL mode, a just-written row can sit in the
+  # -wal file for a while, and a grep of the base file alone would then find
+  # nothing and prove nothing either way about whether the write happened -
+  # which is not evidence, in either direction. Asking the service is
+  # deterministic instead of racing its checkpoint.
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" \
+      "PUT then GET returned ${value} from the node, but grpcurl is not installed so deis-store could not be asked directly whether it holds the row"
+    return
+  fi
+
+  local tenant="${APP_ID}.${ENV_NAME}"
+  local direct direct_value
+  direct=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -d "{\"key\":\"${key}\"}" \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1)
+  direct_value=$(echo "$direct" | jq -r '.value // empty' 2>/dev/null || true)
+
+  if [ "$direct_value" = "$value" ]; then
+    pass_check "$title" \
+      "PUT then GET returned ${value} from the node, and deis-store's own KvStore.Get answers the same value directly for tenant ${tenant}, key ${key}"
   else
-    pass_check "context.services.kv round-trips through deis-store" \
-      "PUT then GET returned ${value} (deis-store's file could not be grepped, likely still in WAL)"
+    fail_check "$title" \
+      "the node answered ${value}, but deis-store's own KvStore.Get for tenant ${tenant}, key ${key} returned: $(echo "$direct" | tr '\n' ' ' | head -c 200)"
   fi
 }
 
@@ -1587,6 +1612,58 @@ check_node_registration() {
     "${NODE_ID} registered at ${registered} on PUT /api/nodes/${NODE_ID}/registration, and the address from deis_runtime_nodes (${addr}) survived its self-report"
 }
 
+# The check above only shows that a node the config file already names also
+# calls the registration endpoint - which every node here always does, so it
+# would pass the same way even if a machine absent from deis_runtime_nodes
+# could never join at all. That absence is exactly what "self-registration"
+# is supposed to fix (see the module docs on
+# crates/deis-control/src/api/registration.rs), and the demo's one node,
+# being pre-listed, never puts it to the test.
+#
+# This calls the same endpoint by hand for an id that appears nowhere in the
+# config file, with the node credential the demo's real node also uses, and
+# checks that the control plane's fleet view now carries it with
+# source=registered - not because an operator wrote it down, but because it
+# announced itself. This is not a REST shortcut around `deis deploy`: there
+# is no CLI command for a node to register with (that is deis-runtime's job,
+# not a developer's), so speaking the same protocol a node speaks is the only
+# way to exercise this from outside deis-runtime's own code. The address
+# given is the demo's real node, so this is a second identity for a process
+# that already exists rather than a node calling home to nowhere.
+check_dynamic_node_registration() {
+  local title="a node absent from deis_runtime_nodes joins the fleet by registering itself"
+  local dynamic_id="${NODE_ID}-unlisted"
+  local fleet="${LOG_DIR}/verify-fleet-dynamic.json"
+
+  local status
+  status=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X PUT -H "Authorization: Bearer ${SECRET}" -H 'content-type: application/json' \
+    -d "{\"address\":\"http://127.0.0.1:${DEIS_RUNTIME_PORT}\"}" \
+    "$(control_url)/api/nodes/${dynamic_id}/registration")
+
+  if [ "$status" != "200" ]; then
+    fail_check "$title" \
+      "PUT /api/nodes/${dynamic_id}/registration, presenting the node credential, answered HTTP ${status}"
+    return
+  fi
+
+  curl -s "$(control_url)/api/runtime" > "$fleet" 2>/dev/null || true
+
+  local source registered_at
+  source=$(jq -r --arg id "$dynamic_id" \
+    '.nodes[] | select(.id == $id) | .source // empty' < "$fleet" 2>/dev/null || true)
+  registered_at=$(jq -r --arg id "$dynamic_id" \
+    '.nodes[] | select(.id == $id) | .registered_at // empty' < "$fleet" 2>/dev/null || true)
+
+  if [ "$source" = "registered" ] && [ -n "$registered_at" ]; then
+    pass_check "$title" \
+      "${dynamic_id} is not in deis_runtime_nodes; PUT .../registration alone put it on the fleet, with source=registered since ${registered_at}"
+  else
+    fail_check "$title" \
+      "PUT .../registration for ${dynamic_id} answered HTTP ${status}, but the fleet shows source='${source:-<absent>}' registered_at='${registered_at:-<none>}' instead of a registered entry"
+  fi
+}
+
 check_cli_tail() {
   local out="${LOG_DIR}/verify-cli-tail.log"
   local title="deis tail streams a line from a request made after it started"
@@ -1701,6 +1778,7 @@ verify_demo() {
   check_cli_tail
   echo "-- the fleet --"
   check_node_registration
+  check_dynamic_node_registration
   check_cli_status
 
   echo

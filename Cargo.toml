@@ -12,7 +12,7 @@ license = "Apache-2.0"
 authors = ["kookyleo <kookyleo@gmail.com>"]
 
 [workspace.dependencies]
-# 共享依赖
+# Shared dependencies
 tokio = { version = "1.45", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -1,5 +1,10 @@
-//! REST endpoints for inspecting deis-runtime nodes through their gRPC
-//! management plane, and for taking an app off one.
+//! The runtime fleet: the nodes that receive deployments and run cron
+//! occurrences, inspected through their gRPC management plane, and the one
+//! operation that takes an app off one of them.
+//!
+//! Not to be confused with [`crate::api::nodes`], which lists the control
+//! channels open to this process. That list is about who is connected to
+//! the control plane; this one is about who can be given work.
 //!
 //! Deploying is deliberately *not* here. An application reaches a node
 //! because an environment points at a version (`POST
@@ -34,8 +39,14 @@ fn node_error_response(e: &NodeError) -> (StatusCode, Json<serde_json::Value>) {
     (status, Json(json!({ "error": e.to_string() })))
 }
 
-/// GET /api/runtime — all configured nodes with cached health.
-pub async fn list_nodes(State(state): State<AppsState>) -> impl IntoResponse {
+/// GET /api/runtime — the runtime fleet: every node that can be handed a
+/// deployment or a cron occurrence, with the health last probed for it.
+///
+/// A node is on this list because the control plane's configuration file
+/// names it or because it registered itself; holding a gRPC control channel
+/// open has nothing to do with it, and the nodes that do that are a
+/// different list at `GET /api/sessions` ([`crate::api::nodes`]).
+pub async fn list_fleet(State(state): State<AppsState>) -> impl IntoResponse {
     Json(json!({ "nodes": state.deis_runtime.list() }))
 }
 

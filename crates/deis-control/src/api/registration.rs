@@ -38,8 +38,9 @@ use crate::runtime_client::{NodeSource, Registered, RegistrationError, RuntimeNo
 #[derive(Clone)]
 pub struct RegistrationState {
     pub nodes: Arc<RuntimeNodeManager>,
-    /// Held only so the handler can say, in the log, whether the caller had
-    /// to prove anything to get here. The check itself is the layer below.
+    /// The credential this route is mounted behind, kept here so
+    /// [`node_router`] can apply the layer itself and no caller can mount
+    /// the route without it.
     pub node_auth: NodeAuthConfig,
 }
 
@@ -133,7 +134,6 @@ pub async fn register(
             address = %request.address,
             version = ?request.version,
             fleet_size = state.nodes.len(),
-            authenticated = state.node_auth.is_configured(),
             "A node registered itself; it now receives deployment pushes and is eligible to run cron occurrences"
         ),
         Registered::AddressChanged => warn!(
@@ -389,6 +389,35 @@ mod tests {
             assert_eq!(status, StatusCode::UNAUTHORIZED);
         }
         assert!(nodes.is_empty());
+    }
+
+    /// The blocker this route had: with no node key configured it used to
+    /// let anyone through, so anyone who could reach the port could put a
+    /// machine on the fleet list - and the fleet list is what receives
+    /// deployment pushes, cron fires and decrypted secrets.
+    #[tokio::test]
+    async fn a_control_plane_without_a_node_key_registers_nobody() {
+        let (router, nodes) = router(Vec::new(), Vec::new());
+
+        for credential in [None, Some("anything")] {
+            let (status, body) = call(
+                &router,
+                "PUT",
+                "/api/nodes/intruder/registration",
+                credential,
+                json!({"address": "http://10.0.0.7:8086"}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an unconfigured node channel must be shut, not open: {body}"
+            );
+        }
+        assert!(
+            nodes.is_empty(),
+            "nothing may join the fleet through an unauthenticated call"
+        );
     }
 
     #[tokio::test]

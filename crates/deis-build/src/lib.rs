@@ -72,11 +72,14 @@ pub use deis_build_core::{
     },
 };
 
-// Re-export adapters
-pub use deis_build_adapter_cf as adapter_cf;
-pub use deis_build_adapter_dc as adapter_dc;
+// Re-export the adapters. There is one per vendor, and the crate name is the
+// vendor value verbatim (`--vendor cloudflare` is served by
+// `deis-build-adapter-cloudflare`), so no table has to be consulted to know
+// which crate answers for which target.
+pub use deis_build_adapter_cloudflare as adapter_cloudflare;
 pub use deis_build_adapter_deislet as adapter_deislet;
-pub use deis_build_adapter_eo as adapter_eo;
+pub use deis_build_adapter_deno as adapter_deno;
+pub use deis_build_adapter_tencent as adapter_tencent;
 
 // Export the main compiler interface
 pub use compiler::{Compiler, CompilerOptions};

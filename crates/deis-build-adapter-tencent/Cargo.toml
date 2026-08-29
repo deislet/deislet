@@ -1,0 +1,16 @@
+[package]
+name = "deis-build-adapter-tencent"
+version = "0.1.0"
+edition = "2021"
+authors = ["kookyleo <kookyleo@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/deislet/deislet"
+homepage = "https://github.com/deislet/deislet"
+description = "Tencent EdgeOne adapter for deis-build"
+
+[dependencies]
+deis-build-core = { version = "0.1.0", path = "../deis-build-core" }
+
+anyhow = "1.0"
+walkdir = "2.4"
+serde_json = "1.0"

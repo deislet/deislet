@@ -36,8 +36,7 @@ pub async fn execute_command(
     let command_id = state
         .command_executor
         .execute(&node_id, command_request)
-        .await
-        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+        .await?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -108,11 +107,7 @@ pub async fn cancel_command(
     let command_id = uuid::Uuid::parse_str(&command_id)
         .map_err(|_| ApiError::BadRequest("Invalid command ID format".to_string()))?;
 
-    state
-        .command_executor
-        .cancel(&command_id)
-        .await
-        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+    state.command_executor.cancel(&command_id).await?;
 
     Ok(Json(json!({
         "success": true,

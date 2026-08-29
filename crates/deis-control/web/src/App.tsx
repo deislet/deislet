@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { Toaster } from 'sonner'
 import { Layout } from '@/components/layout/Layout'
 import { Dashboard } from '@/pages/Dashboard'
 import { Nodes } from '@/pages/Nodes'
@@ -9,6 +10,12 @@ import { Events } from '@/pages/Events'
 function App() {
   return (
     <BrowserRouter>
+      {/*
+        Without this nothing rendered the toasts, so every outcome the pages
+        reported - a restart accepted, a restart refused - was raised into a
+        component that was not mounted and the operator saw nothing at all.
+      */}
+      <Toaster richColors position="top-right" />
       <Routes>
         <Route path="/" element={<Layout />}>
           <Route index element={<Dashboard />} />

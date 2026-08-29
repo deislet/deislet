@@ -8,7 +8,6 @@ use tokio::sync::{RwLock, oneshot};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::broadcast::{BroadcastEvent, EventBroadcaster};
 use crate::database::{CommandEntry, CommandStatus, Database};
 use crate::session::SessionManager;
 use deis_wire::pb::{
@@ -79,9 +78,6 @@ pub struct CommandExecutor {
 
     /// Database handle
     database: Arc<Database>,
-
-    /// Event broadcaster
-    broadcaster: Option<Arc<EventBroadcaster>>,
 }
 
 impl CommandExecutor {
@@ -91,14 +87,7 @@ impl CommandExecutor {
             pending_commands: Arc::new(DashMap::new()),
             sessions,
             database,
-            broadcaster: None,
         }
-    }
-
-    /// Set event broadcaster
-    pub fn with_broadcaster(mut self, broadcaster: Arc<EventBroadcaster>) -> Self {
-        self.broadcaster = Some(broadcaster);
-        self
     }
 
     /// Execute command and wait for response asynchronously
@@ -185,16 +174,6 @@ impl CommandExecutor {
             .await
             .ok();
 
-        // Broadcast event
-        if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.broadcast(BroadcastEvent::CommandSent {
-                command_id: command_id.to_string(),
-                node_id: node_id.to_string(),
-                command_type: request.command_type.as_str(),
-                timestamp: now,
-            });
-        }
-
         tracing::info!(
             command_id = %command_id,
             node_id = %node_id,
@@ -207,17 +186,6 @@ impl CommandExecutor {
             Ok(Ok(response)) => {
                 // Received response
                 self.pending_commands.remove(&command_id);
-
-                // Broadcast event
-                if let Some(broadcaster) = &self.broadcaster {
-                    broadcaster.broadcast(BroadcastEvent::CommandCompleted {
-                        command_id: command_id.to_string(),
-                        node_id: node_id.to_string(),
-                        success: response.success,
-                        timestamp: Utc::now(),
-                    });
-                }
-
                 Ok(response)
             }
             Ok(Err(_)) => {
@@ -413,16 +381,6 @@ impl CommandExecutor {
             .await
             .ok();
 
-        // Broadcast event
-        if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.broadcast(BroadcastEvent::CommandSent {
-                command_id: command_id.to_string(),
-                node_id: node_id.to_string(),
-                command_type: request.command_type.as_str(),
-                timestamp: now,
-            });
-        }
-
         tracing::info!(
             command_id = %command_id,
             node_id = %node_id,
@@ -571,13 +529,26 @@ mod tests {
         assert_eq!(cmd2.as_str(), "test_command");
     }
 
+    /// A command aimed at a node that holds no control channel is refused
+    /// where it is issued, rather than being recorded as sent and then
+    /// waiting out its timeout.
     #[tokio::test]
-    async fn test_command_executor_creation() {
+    async fn a_command_for_an_unknown_node_is_refused() {
         let db = Arc::new(Database::init(":memory:").await.unwrap());
         let sessions = Arc::new(SessionManager::new());
 
         let executor = CommandExecutor::new(sessions, db);
-        assert!(executor.broadcaster.is_none());
+        let error = executor
+            .execute(
+                "no-such-node",
+                CommandRequest {
+                    command_type: CommandType::Restart,
+                    data: None,
+                },
+            )
+            .await
+            .expect_err("there is no session to send this to");
+        assert!(matches!(error, ExecuteError::NodeNotFound(id) if id == "no-such-node"));
     }
 
     #[tokio::test]

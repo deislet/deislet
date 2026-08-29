@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
@@ -7,6 +8,15 @@ pub struct ControlConfig {
     pub port: u16,
     pub heartbeat_interval: u64,
     pub heartbeat_timeout: u64,
+    /// The credential every node presents, on its gRPC control channel and
+    /// on the two HTTP endpoints that serve nodes.
+    ///
+    /// It is never allowed to be empty on a running control plane: an empty
+    /// list would leave `PUT /api/nodes/{id}/registration` open to anyone who
+    /// can reach the port, and a caller that can inject a node becomes a
+    /// delivery target that is handed every environment's decrypted secrets.
+    /// [`ControlConfig::ensure_node_credential`] mints one when the file names
+    /// none, and the endpoints refuse everything while the list is empty.
     pub node_preshared_keys: Vec<String>,
     /// API Keys for HTTP API authentication (optional)
     #[serde(default)]
@@ -134,12 +144,10 @@ pub struct RuntimeNodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
-    /// Enable TLS for API server
+    /// Enable TLS on the port this control plane serves, which carries the
+    /// REST API and the node gRPC channel together.
     #[serde(default)]
     pub api_enabled: bool,
-    /// Enable TLS for WebSocket server
-    #[serde(default)]
-    pub ws_enabled: bool,
     /// Path to TLS certificate file (PEM format)
     pub cert_path: PathBuf,
     /// Path to TLS private key file (PEM format)
@@ -170,10 +178,63 @@ impl Default for ControlConfig {
     }
 }
 
+/// Where the node channel's credential came from, so startup can say it
+/// out loud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCredentialSource {
+    /// The configuration file named at least one key.
+    Configured { keys: usize },
+    /// The file named none, so one was minted for this run. The value is
+    /// handed back so it can be printed once - it exists nowhere else.
+    Generated(String),
+}
+
+/// Mint a node credential: 32 random bytes as hex, the same shape the
+/// documented example keys have, so an operator can paste it into both the
+/// control plane's file and every node's `[control] secret` unchanged.
+fn generate_node_key() -> String {
+    let bytes: [u8; 32] = rand::random();
+    hex::encode(bytes)
+}
+
 impl ControlConfig {
     pub fn load(path: std::path::PathBuf) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&content)?)
+    }
+
+    /// Guarantee this control plane has a node credential before it serves
+    /// anything, and say where that credential came from.
+    ///
+    /// Blank entries are dropped first: a `""` left in the file is a typo,
+    /// not a credential, and treating it as one would make the fleet's
+    /// authentication a formality.
+    ///
+    /// If nothing is left, one key is generated for this run. That is
+    /// deliberately not written to disk: the configuration file is where a
+    /// node credential belongs, and a key quietly cached in a data directory
+    /// would be a second source of truth that nobody edits and nobody
+    /// rotates. Each restart therefore mints a new one until the file names
+    /// one - loud, and self-correcting - while an unconfigured control plane
+    /// is never open.
+    pub fn ensure_node_credential(&mut self) -> NodeCredentialSource {
+        self.node_preshared_keys
+            .retain(|key| !key.trim().is_empty());
+
+        if let Some(count) = std::num::NonZeroUsize::new(self.node_preshared_keys.len()) {
+            info!(
+                node_keys = count.get(),
+                "Node credential taken from the configuration file; the node gRPC channel and the two HTTP endpoints that serve nodes accept only these keys"
+            );
+            return NodeCredentialSource::Configured { keys: count.get() };
+        }
+
+        let key = generate_node_key();
+        self.node_preshared_keys.push(key.clone());
+        warn!(
+            "node_preshared_keys is empty, so a node credential was generated for this run only. Nothing can register, fetch assignments or download a bundle without it, and it changes on every restart until the configuration file names one"
+        );
+        NodeCredentialSource::Generated(key)
     }
 }
 
@@ -198,5 +259,59 @@ mod tests {
             "the example must show a node key: without one the assignment list serves no secret to any node"
         );
         assert!(config.api_auth_enabled);
+    }
+
+    /// The defect this exists to prevent: a control plane started with no
+    /// configuration file used to run with an empty node key list, which
+    /// left `PUT /api/nodes/{id}/registration` open to anyone who could
+    /// reach the port. Now the default grows a credential before it serves.
+    #[test]
+    fn a_control_plane_with_no_configured_node_key_mints_one() {
+        let mut config = ControlConfig::default();
+        assert!(config.node_preshared_keys.is_empty());
+
+        let source = config.ensure_node_credential();
+        let NodeCredentialSource::Generated(key) = source else {
+            panic!("an empty list must be reported as generated, not as configured");
+        };
+        assert_eq!(config.node_preshared_keys, vec![key.clone()]);
+        assert_eq!(key.len(), 64, "32 random bytes as hex");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Two runs do not share a credential, which is what makes the
+        // generated one useless to anyone who saw an earlier log.
+        let mut other = ControlConfig::default();
+        let NodeCredentialSource::Generated(second) = other.ensure_node_credential() else {
+            panic!("expected a generated key");
+        };
+        assert_ne!(key, second);
+    }
+
+    /// A blank entry is a typo, not a credential. Counting it would leave
+    /// the fleet authenticating against the empty string.
+    #[test]
+    fn blank_entries_are_not_credentials() {
+        let mut config = ControlConfig {
+            node_preshared_keys: vec!["  ".to_string(), String::new()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.ensure_node_credential(),
+            NodeCredentialSource::Generated(_)
+        ));
+        assert_eq!(config.node_preshared_keys.len(), 1);
+    }
+
+    #[test]
+    fn a_configured_key_is_left_alone() {
+        let mut config = ControlConfig {
+            node_preshared_keys: vec!["node-psk".to_string(), " ".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.ensure_node_credential(),
+            NodeCredentialSource::Configured { keys: 1 }
+        );
+        assert_eq!(config.node_preshared_keys, vec!["node-psk".to_string()]);
     }
 }

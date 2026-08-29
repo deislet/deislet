@@ -14,7 +14,6 @@ pub mod app;
 pub mod app_repo;
 pub mod assets;
 pub mod config;
-pub mod config_store;
 pub mod deployment;
 pub mod dispatcher;
 pub mod health;

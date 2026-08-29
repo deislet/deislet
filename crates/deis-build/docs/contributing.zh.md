@@ -80,9 +80,9 @@ deis-build/
 │   │   │   ├── platform_capabilities.rs  # 平台能力系统
 │   │   │   ├── types.rs     # 核心类型定义
 │   │   │   └── error.rs     # 错误类型
-│   ├── deis-build-adapter-cf/  # Cloudflare 适配器
-│   ├── deis-build-adapter-dc/  # Deno 适配器
-│   └── deis-build-adapter-eo/  # EdgeOne 适配器
+│   ├── deis-build-adapter-cloudflare/  # Cloudflare 适配器
+│   ├── deis-build-adapter-deno/  # Deno 适配器
+│   └── deis-build-adapter-tencent/  # EdgeOne 适配器
 ├── examples/                # 示例代码
 ├── docs/                    # 文档
 └── tests/                   # 集成测试
@@ -262,8 +262,8 @@ pub fn generate(
 // src/compiler/mod.rs
 
 let artifacts = match vendor {
-    "cloudflare" => deis_build_adapter_cf::generate(&routes, config)?,
-    "deno" => deis_build_adapter_dc::generate(&routes, config)?,
+    "cloudflare" => deis_build_adapter_cloudflare::generate(&routes, config)?,
+    "deno" => deis_build_adapter_deno::generate(&routes, config)?,
     "your-platform" => deis_build_adapter_your::generate(&routes, config)?,
     _ => return Err(anyhow::anyhow!("Unknown vendor: {vendor}")),
 };
@@ -330,7 +330,7 @@ mod tests {
 ```rust
 // tests/integration_test.rs
 
-use deis-build::{Compiler, CompilerOptions};
+use deis_build::{Compiler, CompilerOptions};
 
 #[tokio::test]
 async fn test_build_cloudflare() {

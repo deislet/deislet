@@ -3,6 +3,240 @@ const DenoCore = Deno.core; delete globalThis.Deno;
 // Native Deno Runtime extensions enabled.
 
 // ---------------------------------------------------------
+// 0. Encoding
+// ---------------------------------------------------------
+//
+// TextEncoder, TextDecoder, btoa and atob, which SPECIFICATION_BASIC.md
+// section 8.1 lists among the Web APIs every platform must provide. They are
+// written out here rather than pulled from deno_core because this runtime
+// boots the bare `deno_core` engine: nothing but `console` and
+// `queueMicrotask` comes with it.
+//
+// They are not decoration. Several things below already reached for them and
+// therefore threw ReferenceError instead of doing their job: reading a binary
+// request body, `request.arrayBuffer()`, `blob.put(key, "a string")`,
+// `(await blob.get(key)).text()` and a binary WebSocket frame.
+//
+// UTF-8 is the only encoding implemented, which is the only one the canon
+// asks for; any other label is refused rather than silently decoded as UTF-8.
+
+if (typeof globalThis.TextEncoder === "undefined") {
+  class TextEncoder {
+    get encoding() { return "utf-8"; }
+
+    encode(input = "") {
+      const str = String(input);
+      const bytes = [];
+      for (let i = 0; i < str.length; i++) {
+        let cp = str.codePointAt(i);
+        if (cp > 0xffff) {
+          // A surrogate pair is one code point spelled with two units.
+          i++;
+        } else if (cp >= 0xd800 && cp <= 0xdfff) {
+          // A lone surrogate is not a character; UTF-8 has no encoding for
+          // it, and the standard replaces it rather than emitting bytes no
+          // decoder would accept.
+          cp = 0xfffd;
+        }
+
+        if (cp < 0x80) {
+          bytes.push(cp);
+        } else if (cp < 0x800) {
+          bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+        } else if (cp < 0x10000) {
+          bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+        } else {
+          bytes.push(
+            0xf0 | (cp >> 18),
+            0x80 | ((cp >> 12) & 0x3f),
+            0x80 | ((cp >> 6) & 0x3f),
+            0x80 | (cp & 0x3f),
+          );
+        }
+      }
+      return new Uint8Array(bytes);
+    }
+
+    encodeInto(source, destination) {
+      const encoded = this.encode(source);
+      // Only whole code points are written, so a destination that cannot hold
+      // the last one is left short rather than filled with half a character.
+      let written = 0;
+      while (written < encoded.length && written < destination.length) {
+        let width = 1;
+        const lead = encoded[written];
+        if (lead >= 0xf0) width = 4;
+        else if (lead >= 0xe0) width = 3;
+        else if (lead >= 0xc0) width = 2;
+        if (written + width > destination.length) break;
+        for (let i = 0; i < width; i++) destination[written + i] = encoded[written + i];
+        written += width;
+      }
+      // `read` counts UTF-16 units consumed, which is what the standard asks
+      // for; recovering it exactly means re-walking the source.
+      let read = 0;
+      let produced = 0;
+      const str = String(source ?? "");
+      for (let i = 0; i < str.length && produced < written; i++) {
+        const cp = str.codePointAt(i);
+        const units = cp > 0xffff ? 2 : 1;
+        const width = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        if (produced + width > written) break;
+        produced += width;
+        read += units;
+        if (units === 2) i++;
+      }
+      return { read, written };
+    }
+  }
+  globalThis.TextEncoder = TextEncoder;
+}
+
+if (typeof globalThis.TextDecoder === "undefined") {
+  const UTF8_LABELS = new Set(["utf-8", "utf8", "unicode-1-1-utf-8"]);
+
+  class TextDecoder {
+    constructor(label = "utf-8", options = {}) {
+      const encoding = String(label).trim().toLowerCase();
+      if (!UTF8_LABELS.has(encoding)) {
+        throw new RangeError(
+          "TextDecoder on this platform decodes UTF-8 only; '" + label + "' is not supported",
+        );
+      }
+      this._fatal = !!options.fatal;
+      this._ignoreBOM = !!options.ignoreBOM;
+    }
+
+    get encoding() { return "utf-8"; }
+    get fatal() { return this._fatal; }
+    get ignoreBOM() { return this._ignoreBOM; }
+
+    decode(input) {
+      if (input === undefined || input === null) return "";
+
+      let bytes;
+      if (input instanceof Uint8Array) {
+        bytes = input;
+      } else if (input instanceof ArrayBuffer) {
+        bytes = new Uint8Array(input);
+      } else if (ArrayBuffer.isView(input)) {
+        bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      } else {
+        throw new TypeError("TextDecoder.decode expects a BufferSource");
+      }
+
+      let i = 0;
+      // A byte order mark is metadata, not text, and is dropped unless the
+      // caller asked to see it.
+      if (
+        !this._ignoreBOM && bytes.length >= 3 &&
+        bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
+      ) {
+        i = 3;
+      }
+
+      let out = "";
+      while (i < bytes.length) {
+        const lead = bytes[i];
+        let cp;
+        let width;
+
+        if (lead < 0x80) { cp = lead; width = 1; }
+        else if (lead >= 0xc2 && lead <= 0xdf) { cp = lead & 0x1f; width = 2; }
+        else if (lead >= 0xe0 && lead <= 0xef) { cp = lead & 0x0f; width = 3; }
+        else if (lead >= 0xf0 && lead <= 0xf4) { cp = lead & 0x07; width = 4; }
+        else { cp = -1; width = 1; }
+
+        if (cp >= 0 && i + width <= bytes.length) {
+          for (let k = 1; k < width; k++) {
+            const cont = bytes[i + k];
+            if ((cont & 0xc0) !== 0x80) { cp = -1; break; }
+            cp = (cp << 6) | (cont & 0x3f);
+          }
+        } else if (cp >= 0) {
+          // Truncated at the end of the input.
+          cp = -1;
+        }
+
+        // Overlong forms, surrogates and anything past the last code point
+        // are all invalid however they were spelled.
+        if (
+          cp < 0 ||
+          (width === 3 && cp < 0x800) ||
+          (width === 4 && cp < 0x10000) ||
+          (cp >= 0xd800 && cp <= 0xdfff) ||
+          cp > 0x10ffff
+        ) {
+          if (this._fatal) {
+            throw new TypeError("TextDecoder: the input is not well-formed UTF-8");
+          }
+          out += "�";
+          i += 1;
+          continue;
+        }
+
+        out += String.fromCodePoint(cp);
+        i += width;
+      }
+      return out;
+    }
+  }
+  globalThis.TextDecoder = TextDecoder;
+}
+
+if (typeof globalThis.btoa === "undefined") {
+  const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  // btoa/atob work on binary strings - one character per byte - not on text.
+  // A character above U+00FF has no byte to stand for, and the standard
+  // throws rather than truncating it.
+  globalThis.btoa = function btoa(input) {
+    const str = String(input);
+    let out = "";
+    for (let i = 0; i < str.length; i += 3) {
+      const c0 = str.charCodeAt(i);
+      const c1 = i + 1 < str.length ? str.charCodeAt(i + 1) : 0;
+      const c2 = i + 2 < str.length ? str.charCodeAt(i + 2) : 0;
+      if (c0 > 0xff || c1 > 0xff || c2 > 0xff) {
+        throw new TypeError("btoa: the string contains characters outside the Latin-1 range");
+      }
+      const triple = (c0 << 16) | (c1 << 8) | c2;
+      out += B64[(triple >> 18) & 0x3f];
+      out += B64[(triple >> 12) & 0x3f];
+      out += i + 1 < str.length ? B64[(triple >> 6) & 0x3f] : "=";
+      out += i + 2 < str.length ? B64[triple & 0x3f] : "=";
+    }
+    return out;
+  };
+
+  globalThis.atob = function atob(input) {
+    // Whitespace is allowed anywhere and ignored; everything else must be
+    // base64 or the input is not what it claims to be.
+    const str = String(input).replace(/[ \t\n\f\r]/g, "");
+    if (str.length % 4 !== 0) {
+      throw new TypeError("atob: the input is not correctly encoded base64");
+    }
+    const body = str.replace(/=+$/, "");
+    let out = "";
+    let buffer = 0;
+    let bits = 0;
+    for (const ch of body) {
+      const value = B64.indexOf(ch);
+      if (value < 0) {
+        throw new TypeError("atob: the input is not correctly encoded base64");
+      }
+      buffer = (buffer << 6) | value;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out += String.fromCharCode((buffer >> bits) & 0xff);
+      }
+    }
+    return out;
+  };
+}
+
+// ---------------------------------------------------------
 // 1. WebSocket Support (Custom Bridge)
 // ---------------------------------------------------------
 
@@ -345,21 +579,99 @@ globalThis.WebSocketPair = WebSocketPair;
 // 2. Service Adapters (The Bridge)
 // ---------------------------------------------------------
 
+// The Cache API, which Edge Canon makes a basic feature every application may
+// assume (SPECIFICATION_BASIC.md section 7): put a Response away under a
+// request's URL, read it back, drop it. Reached two ways, both of them this
+// same store: `context.services.cache`, which is what the canon specifies, and
+// `globalThis.caches.default`, which is what a handler ported from Cloudflare
+// reaches for.
+//
+// Scope: one store per isolate, so an entry is visible to later requests for
+// the same application on the same node and to nothing else - not another
+// node, not the replacement isolate a new version is loaded into. A hit is an
+// optimisation; nothing may depend on one.
+
+// The key one of these calls is about. The canon's own examples pass all
+// three of these: a string, the `Request`, and a `URL` built from the
+// request's url. A URL has `href` and no `url`, so reading `.url` off one -
+// which is what this did - keyed every such entry under the string
+// "undefined", quietly collapsing every URL-keyed entry onto one.
+function cacheKeyOf(request) {
+  if (typeof request === "string") return request;
+  if (request) {
+    if (typeof request.url === "string") return request.url;   // Request
+    if (typeof request.href === "string") return request.href; // URL
+  }
+  throw new TypeError(
+    "cache: the key must be a Request, a URL or a string, got " + typeof request
+  );
+}
+
+// How long the response asked to stay fresh, in whole seconds, or 0 when it
+// named no lifetime and the store's default should apply.
+//
+// `s-maxage` wins over `max-age` where both are present: this is a shared
+// cache, and that is what the directive is for.
+function freshnessSeconds(response) {
+  const headers = response && response.headers;
+  const control = headers && typeof headers.get === "function"
+    ? headers.get("cache-control")
+    : null;
+  if (!control) return 0;
+
+  const shared = /(?:^|[,\s])s-maxage\s*=\s*"?(\d+)"?/i.exec(control);
+  const own = /(?:^|[,\s])max-age\s*=\s*"?(\d+)"?/i.exec(control);
+  const chosen = shared || own;
+  if (!chosen) return 0;
+
+  const seconds = Number(chosen[1]);
+  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+  // The op takes a u32; a longer lifetime than that is indistinguishable from
+  // "as long as this isolate lives" anyway.
+  return Math.min(Math.floor(seconds), 4294967295);
+}
+
+function refusesToBeStored(response) {
+  const headers = response && response.headers;
+  const control = headers && typeof headers.get === "function"
+    ? headers.get("cache-control")
+    : null;
+  if (!control) return null;
+  if (/(?:^|[,\s])no-store(?:\s*(?:,|$))/i.test(control)) return "no-store";
+  if (/(?:^|[,\s])private(?:\s*(?:,|$))/i.test(control)) return "private";
+  return null;
+}
+
 class Cache {
   async put(request, response) {
-    const url = typeof request === 'string' ? request : request.url;
-    // Clone response to avoid consuming the body if reused
-    const body = await response.clone().text(); 
+    const key = cacheKeyOf(request);
+
+    // A response that declares itself uncacheable is not stored, and the
+    // caller is told rather than left to believe it was. Cloudflare's Cache
+    // API refuses the same two directives, and silently keeping a `private`
+    // response in a cache every later request reads is how one user's data
+    // reaches another.
+    const refusal = refusesToBeStored(response);
+    if (refusal) {
+      throw new TypeError(
+        "cache.put: this response carries Cache-Control: " + refusal +
+          ", so it was not stored"
+      );
+    }
+
+    // Clone first: reading the body of the response the handler is about to
+    // return would leave the caller with an empty one.
+    const body = await response.clone().text();
     const meta = {
       status: response.status,
       headers: Object.fromEntries(response.headers.entries()),
       body: body
     };
-    await DenoCore.ops.op_cache_set(url, JSON.stringify(meta));
+    await DenoCore.ops.op_cache_set(key, JSON.stringify(meta), freshnessSeconds(response));
   }
   async match(request) {
-    const url = typeof request === 'string' ? request : request.url;
-    const val = await DenoCore.ops.op_cache_get(url);
+    const key = cacheKeyOf(request);
+    const val = await DenoCore.ops.op_cache_get(key);
     if (!val) return undefined;
     try {
       const meta = JSON.parse(val);
@@ -372,14 +684,17 @@ class Cache {
     }
   }
   async delete(request) {
-    const url = typeof request === 'string' ? request : request.url;
-    await DenoCore.ops.op_cache_delete(url);
-    return true; 
+    return await DenoCore.ops.op_cache_delete(cacheKeyOf(request));
   }
 }
 
+// One instance, reached under both names, so an application that writes
+// through `caches.default` and reads through `context.services.cache` sees
+// its own entry.
+const defaultCache = new Cache();
+
 globalThis.caches = {
-  default: new Cache()
+  default: defaultCache
 };
 
 class NativeKV {
@@ -476,8 +791,22 @@ class NativeDB {
     );
     return res.rows;
   }
-  async transaction(callback) {
-    // Not implemented in op layer yet
+  // Edge Canon's Database interface names a transaction, and this platform
+  // has no session-scoped one: deis-store serves each call on whichever
+  // pooled connection is free, so there is no place to hold an open BEGIN
+  // across the awaits inside a callback.
+  //
+  // It used to accept the callback, never call it, and resolve. An
+  // application whose two writes were "in a transaction" therefore performed
+  // neither of them and was told nothing - the worst of the three possible
+  // answers. This one is the least bad: the work does not happen, and the
+  // caller finds out on the spot.
+  async transaction(_callback) {
+    throw new Error(
+      "database.transaction is not available on this platform: deis-store has no " +
+        "session-scoped transaction. Run the statements with database.execute(), or " +
+        "write them so each one is safe on its own."
+    );
   }
 }
 
@@ -551,9 +880,16 @@ function redact(obj) {
 }
 
 // The half of the context that does not depend on there being a request:
-// the environment, the platform services and waitUntil. Shared by the fetch
-// path and the queue path so a queue handler reaches storage exactly the same
-// way a request handler does.
+// the environment, the platform services, `log` and waitUntil. Shared by the
+// fetch path, the queue path and the cron path so a queue or scheduled handler
+// reaches storage - and writes a log line - exactly the same way a request
+// handler does.
+//
+// `log` lives here rather than only in the entry module deis-build generates,
+// because that module wraps the request path alone. Edge Canon lists
+// `context.log.info/warn/error()` among the basic features and its own cron
+// example calls it, so a scheduled handler that found `context.log` undefined
+// would fail on the first line it wrote.
 function createServiceContext() {
   return {
     env: DenoCore.ops.op_get_env() || {},
@@ -562,6 +898,14 @@ function createServiceContext() {
       database: new NativeDB(),
       blob: new BlobStore(),
       queue: new Queue("default"),
+      // Basic feature: available to every application, declared by none.
+      cache: defaultCache,
+    },
+    log: {
+      debug: (...args) => console.debug(...args),
+      info: (...args) => console.info(...args),
+      warn: (...args) => console.warn(...args),
+      error: (...args) => console.error(...args),
     },
     waitUntil: (promise) => {
       if (!globalThis.__pending_wait_until) globalThis.__pending_wait_until = [];
@@ -605,19 +949,28 @@ globalThis.__deis_runtime_wait_until_all = async function() {
 //
 // The node polls deis-queue for the queues an app declared (see
 // runtime/queue_consumer.rs) and hands each batch here. The handler is the
-// module's `queue` export:
+// module's `queue` export, and it takes the three parameters Edge Canon
+// defines for it (SPECIFICATION_EXT.md section 3.2):
 //
-//   export async function queue(batch, context) { ... }
+//   export async function queue(batch, env, context) { ... }
+//
+// `env` is the same table as `context.env`, handed over separately because
+// that is the shape the canon fixes and the shape a handler ported from
+// another platform is written against. Passing only two arguments, as this
+// did, put the context where a handler expected `env` and left it reading
+// `context.services` off the environment table.
 //
 // `batch` is { queue, messages: [...] }; each message carries id, body,
-// attempts and timestamp, plus json() for a JSON body. Delivery is
-// at-least-once, so a handler MUST be idempotent: `attempts` above 1 means
-// this message has been delivered before.
+// attempts and timestamp, plus json() for a JSON body. `body` is the message
+// exactly as it was sent - text, not a parsed object - and `json()` is the
+// parse. Delivery is at-least-once, so a handler MUST be idempotent:
+// `attempts` above 1 means this message has been delivered before.
 //
 // A message counts as handled unless it says otherwise. `message.retry()`
-// marks one message for redelivery; a handler that throws marks the whole
-// batch. The returned `failed` list is what the node hands back to
-// deis-queue; everything else is acknowledged and never delivered again.
+// marks one message for redelivery and `message.ack()` takes that mark back;
+// a handler that throws marks the whole batch. The returned `failed` list is
+// what the node hands back to deis-queue; everything else is acknowledged and
+// never delivered again.
 globalThis.__deis_runtime_invoke_queue = async function(payload) {
   const messages = (payload && payload.messages) || [];
   const allIds = messages.map((m) => m.id);
@@ -651,8 +1004,10 @@ globalThis.__deis_runtime_invoke_queue = async function(payload) {
     retryAll() { for (const id of allIds) failed.add(id); },
   };
 
+  const context = createServiceContext();
+
   try {
-    await handler(batch, createServiceContext());
+    await handler(batch, context.env, context);
   } catch (e) {
     const errorText = e && e.stack ? e.stack : String(e);
     console.error("Queue handler error on '" + payload.queue + "':", errorText);
@@ -670,9 +1025,13 @@ globalThis.__deis_runtime_invoke_queue = async function(payload) {
 // plane keeps the schedule and, when one is due, picks a single healthy node
 // and calls its Trigger/OnScheduled. That lands here.
 //
-// The handler is the module's `scheduled` export:
+// The handler is the module's `scheduled` export, and it takes the three
+// parameters Edge Canon defines for it (SPECIFICATION_EXT.md section 3.1):
 //
-//   export async function scheduled(event, context) { ... }
+//   export async function scheduled(event, env, context) { ... }
+//
+// `env` is the same table as `context.env`; see the queue path above for why
+// it is handed over separately.
 //
 // `event` is { cron, scheduledTime, type }. A tick is fire-and-forget: it is
 // not retried and it is not made up later if it fails, so anything that must
@@ -698,8 +1057,10 @@ globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
     type: "scheduled",
   };
 
+  const context = createServiceContext();
+
   try {
-    await handler(event, createServiceContext());
+    await handler(event, context.env, context);
   } catch (e) {
     const errorText = e && e.stack ? e.stack : String(e);
     console.error("Scheduled handler error on '" + payload.cron + "':", errorText);

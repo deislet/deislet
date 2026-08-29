@@ -17,6 +17,5 @@ api_keys = []
 # TLS Configuration
 [tls]
 api_enabled = true
-ws_enabled = false
 cert_path = "cert.pem"
 key_path = "key.pem"

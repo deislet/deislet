@@ -4,7 +4,6 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use crate::app::{AppKey, ApplicationManager};
-use crate::config_store::{ConfigEntry, ConfigStore};
 use crate::deployment::{Applied, DeploymentManager, DeploymentOrder};
 use crate::health::NodeHealth;
 use crate::runtime::metrics::{recorder, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL};
@@ -15,7 +14,6 @@ use super::proto::*;
 /// Runtime management service implementation
 pub struct RuntimeManagementService {
     app_manager: Arc<ApplicationManager>,
-    config_store: Arc<ConfigStore>,
     deployer: Arc<DeploymentManager>,
     health: Arc<NodeHealth>,
     node_id: String,
@@ -27,7 +25,6 @@ pub struct RuntimeManagementService {
 impl RuntimeManagementService {
     pub fn new(
         app_manager: Arc<ApplicationManager>,
-        config_store: Arc<ConfigStore>,
         deployer: Arc<DeploymentManager>,
         health: Arc<NodeHealth>,
         node_id: String,
@@ -35,7 +32,6 @@ impl RuntimeManagementService {
     ) -> Self {
         Self {
             app_manager,
-            config_store,
             deployer,
             health,
             node_id,
@@ -57,57 +53,38 @@ impl RuntimeManagementService {
 
 #[tonic::async_trait]
 impl RuntimeManagement for RuntimeManagementService {
+    /// Refused, not stored.
+    ///
+    /// A node's configuration comes from two places, and neither of them is
+    /// this RPC: the file it is started with (`deis-runtime.toml`) and the
+    /// assignment list it fetches from the control plane, which carries the
+    /// per-environment variables and secrets with each deployment. What this
+    /// method used to do was write the payload into a local table that nothing
+    /// on this node ever read back, then answer "Config applied successfully" -
+    /// so a caller was told its configuration had taken effect when it had
+    /// changed nothing at all. The request also carries no identifier, so
+    /// every application-scoped push landed on one row keyed "global",
+    /// overwriting the one before it.
+    ///
+    /// `Unimplemented` for the same reason `UpdateApp` is: a caller that still
+    /// sends configuration here has to see that nothing was applied.
     async fn push_config(
         &self,
         request: Request<PushConfigRequest>,
     ) -> Result<Response<PushConfigResponse>, Status> {
         let req = request.into_inner();
-        info!(
-            "Received config push: type={:?}, version={}, force={}",
-            req.config_type, req.version, req.force
+        warn!(
+            config_type = req.config_type,
+            version = req.version,
+            force = req.force,
+            "Refusing a PushConfig: this node takes its configuration from its own file and \
+             from the deployments the control plane assigns it. Nothing was stored and nothing \
+             changed"
         );
-
-        // Convert configuration type
-        let config_type = match super::proto::ConfigType::try_from(req.config_type) {
-            Ok(super::proto::ConfigType::Global) => crate::config_store::ConfigType::Global,
-            Ok(super::proto::ConfigType::App) => crate::config_store::ConfigType::App,
-            Ok(super::proto::ConfigType::Resource) => crate::config_store::ConfigType::Resource,
-            _ => {
-                return Ok(Response::new(PushConfigResponse {
-                    success: false,
-                    message: "Invalid config type".to_string(),
-                    applied_version: 0,
-                }));
-            }
-        };
-
-        // Create configuration entry
-        let entry = ConfigEntry::new(
-            "global".to_string(), // TODO: Determine ID based on config_type
-            config_type,
-            req.version,
-            req.config_json,
-        );
-
-        // Save configuration
-        match self.config_store.save_config(entry).await {
-            Ok(_) => {
-                info!("Config saved successfully, version: {}", req.version);
-                Ok(Response::new(PushConfigResponse {
-                    success: true,
-                    message: "Config applied successfully".to_string(),
-                    applied_version: req.version,
-                }))
-            }
-            Err(e) => {
-                warn!("Failed to save config: {}", e);
-                Ok(Response::new(PushConfigResponse {
-                    success: false,
-                    message: format!("Failed to save config: {}", e),
-                    applied_version: 0,
-                }))
-            }
-        }
+        Err(Status::unimplemented(
+            "PushConfig is not supported: a node reads its own configuration file and receives \
+             per-environment variables and secrets with each deployment",
+        ))
     }
 
     /// Take delivery of one deployment.
@@ -165,6 +142,29 @@ impl RuntimeManagement for RuntimeManagementService {
                 message: "Already running this version".to_string(),
                 version_id: req.version_id,
             })),
+            // A push is never superseded: only a reconciliation carries a
+            // stamp saying how old its instruction is, and `apply` has none.
+            // Matched rather than caught by a wildcard so that a future path
+            // returning it here has to be thought about instead of silently
+            // reported as a successful deployment.
+            Ok(Applied::Superseded { running_version_id }) => {
+                let kept = running_version_id.unwrap_or_else(|| self.running_version(&key));
+                error!(
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
+                    version_id = %req.version_id,
+                    kept_version = %kept,
+                    "A pushed deployment came back as superseded, which only a reconciliation \
+                     can be; this node did not switch to version {} and the control plane is \
+                     told the push failed",
+                    req.version_id
+                );
+                Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: "deployment was superseded by a newer change on this node".to_string(),
+                    version_id: kept,
+                }))
+            }
             Err(e) => {
                 let kept = self.running_version(&key);
                 error!(
@@ -355,22 +355,32 @@ impl RuntimeManagement for RuntimeManagementService {
         }))
     }
 
+    /// Refused: this node runs no commands.
+    ///
+    /// There is no command surface here at all - no shutdown, no restart, no
+    /// status verb. The operations a caller might want are already RPCs of
+    /// their own on this service (`GetStatus`, `HealthCheck`,
+    /// `ApplyDeployment`, `UnloadApp`), and process control belongs to
+    /// whatever supervises the node.
+    ///
+    /// `Unimplemented` for the same reason as `UpdateApp` and `PushConfig`
+    /// above: an answer of `success: false` reads as "this command failed",
+    /// which invites a retry of something that will never work, and buries
+    /// the difference between a command that ran and lost and a command that
+    /// was never going to run.
     async fn execute_command(
         &self,
         request: Request<ExecuteCommandRequest>,
     ) -> Result<Response<ExecuteCommandResponse>, Status> {
         let req = request.into_inner();
         warn!(
-            "Execute command received (not implemented): {}",
-            req.command
+            command = %req.command,
+            "Refusing an ExecuteCommand: this node has no command surface. Nothing ran"
         );
-
-        // TODO: Implement command execution logic
-        Ok(Response::new(ExecuteCommandResponse {
-            success: false,
-            output: String::new(),
-            error: "Command execution not implemented".to_string(),
-        }))
+        Err(Status::unimplemented(
+            "ExecuteCommand is not supported: this node exposes GetStatus, HealthCheck, \
+             ApplyDeployment and UnloadApp, and nothing that runs a command string",
+        ))
     }
 
     async fn start_inspect(
@@ -384,10 +394,15 @@ impl RuntimeManagement for RuntimeManagementService {
             req.ttl_seconds as u64
         };
 
-        // The request names no environment, so it means the one a caller means
-        // when it does not say: production. Inspecting a preview needs an
-        // environment on this RPC, which the proto cannot express yet.
-        let key = AppKey::production(req.app_id.clone());
+        // A node runs every environment of an application at once, so the
+        // request has to say which one to attach to. An empty field means the
+        // one a caller means when it says nothing - the default environment -
+        // which keeps older callers working unchanged.
+        let key = if req.environment.trim().is_empty() {
+            AppKey::production(req.app_id.clone())
+        } else {
+            AppKey::new(req.app_id.clone(), req.environment.clone())
+        };
         info!(
             app_id = %key.app_id(),
             environment = %key.environment(),

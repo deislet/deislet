@@ -214,7 +214,7 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use deis-build::{Compiler, CompilerOptions};
+use deis_build::{Compiler, CompilerOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -236,7 +236,8 @@ See [Library Usage Guide](./library-usage.md) for details.
 
 ## Next Steps
 
-- 📖 Read [Architecture](./architecture.md) to understand how Build works
+- 📖 Read [the deislet target](./deislet-target.md) for what a bundle contains,
+  and [architecture.zh.md](../../../docs/architecture.zh.md) for the platform
 - 📖 Check [Output Modes](./output-modes.md) to learn about Files/Memory/Both modes
 - 📖 Read [Basic Services](./basic-services.md) to learn about KV and Cache usage
 - 📖 Review [Edge Canon Specification](https://github.com/deislet/edge-canon)

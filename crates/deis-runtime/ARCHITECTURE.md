@@ -1,51 +1,63 @@
-# Runtime Architecture (2026 Edition)
+# deis-runtime architecture
 
 > This document covers deis-runtime internals only. For the platform-wide design —
 > data model, deployment and versioning, static asset handling, and the deis-store
-> storage component deis-runtime will depend on — see
-> [`docs/architecture.zh.md`](../../docs/architecture.zh.md).
+> storage component deis-runtime calls into — see
+> [`docs/architecture.zh.md`](../../docs/architecture.zh.md). What an
+> application can actually reach from inside an isolate is in
+> [README.md](README.md).
 >
-> The Log Service shown below is deis-telemetry, and both halves exist:
-> `src/logging/shipper.rs` pushes logs and `src/runtime/metrics.rs` pushes
-> metrics.
+> Both halves of the telemetry link exist: `src/logging/shipper.rs` pushes logs
+> and `src/runtime/metrics.rs` pushes metrics.
 
-## 🎯 Design Goals
+## 🎯 Design Goal
 
-Transform Runtime from a **Dependent Agent** to an **Autonomous Edge Runtime**. It is designed to be robust, self-sufficient, and compliant with the **Edge Canon** specification.
+A node that keeps serving when the control plane does not answer. It holds its
+own state, recovers what it was running from its own disk, and reports its
+health honestly rather than stopping; it does not require the control plane to
+be reachable in order to serve a request that is already deployed.
 
-## 📊 Architectural Shift
+That is a different claim from "it never dials out", which is what an earlier
+version of this document said and is no longer true.
 
-### Legacy Model (Dependent)
+## 📊 Which way each connection goes
+
 ```
-┌─────────────┐          ┌──────────────┐
-│   Runtime     │─────────▶│  Control  │
-│  (Client)   │  Connect │   (Server)   │
-└─────────────┘          └──────────────┘
-     ❌ Fails if control is down
-     ❌ Config pull dependent
-     ❌ Logs lost on crash
+                     deis-control
+                          │
+   ┌──── node dials out ──┴── control dials in ────┐
+   │                                               │
+   │  PUT   registration   (HTTP, node credential) │  ApplyDeployment
+   │  GET   assignments    (HTTP, node credential) │  UnloadApp / GetStatus
+   │  GET   bundle_url     (HTTP, streamed to disk)│  HealthCheck / StartInspect
+   │                                               │  Trigger.OnScheduled
+   ▼                                               ▼
+┌──────────────────────────────────────────────────────┐
+│                     deis-runtime                     │
+│  ┌────────────┐  ┌────────────┐  ┌────────────────┐  │
+│  │ Config     │  │ Log buffer │  │ Isolate pool   │  │
+│  │ (SQLite)   │  │ (ring)     │  │ 1 per (app,env)│  │
+│  └────────────┘  └─────┬──────┘  └────────────────┘  │
+└────────────────────────┼─────────────────────────────┘
+                         │ batched, async, drop-oldest
+                         ▼                    ▼ polled under a lease
+                  deis-telemetry          deis-queue
+                                              ▲
+                                      ctx.services.* → deis-store
 ```
 
-### Current Model (Autonomous)
-```
-┌─────────────┐          ┌──────────────┐
-│   Runtime     │◀─────────│  Control  │
-│  (Server)   │  Push    │   (Client)   │
-│             │          └──────────────┘
-│ ┌─────────┐ │
-│ │ Local   │ │          ┌──────────────┐
-│ │ Store   │ │──────Async─▶│  Log Service │
-│ └─────────┘ │   Push    │   (Optional) │
-│             │          └──────────────┘
-│ ┌─────────┐ │
-│ │ Log     │ │
-│ │ Buffer  │ │
-│ └─────────┘ │
-└─────────────┘
-    ✅ Survives network partitions
-    ✅ Zero-copy config reads
-    ✅ Non-blocking log shipping
-```
+Three of those arrows are the node dialling out and were added after the
+"autonomous" design: the registration and assignment calls, the log and metric
+shipping, and the queue polling. What survived is the property that mattered —
+once the pull has happened, local SQLite and the bundles on disk are enough to
+keep serving.
+
+- ✅ Survives a control plane that is down or unreachable (reports UNHEALTHY,
+  retries with backoff, keeps serving what it recovered)
+- ✅ Lock-free configuration reads
+- ✅ Log shipping never blocks application code
+- ⚠️ Bundles on disk carry no secrets, so an application that declares one runs
+  without it until the control plane delivers again
 
 ## 🔧 Core Components
 
@@ -73,12 +85,20 @@ Transform Runtime from a **Dependent Agent** to an **Autonomous Edge Runtime**. 
     - `GetStatus`: Real-time health and stats.
 
 ### 4. Runtime Isolation (`src/runtime/`)
-- **Engine**: V8 Isolate (via `deno_core`).
-- **Standard**: **Edge Canon Compliant**.
-    - Supports `export default function handler(context)`.
-    - Prohibits legacy Cloudflare-style signatures.
+- **Engine**: V8 Isolate (via `deno_core`), one per `(app, environment)`, each
+  on its own OS thread.
+- **Handler shape**: `export default function handler(context)`. The legacy
+  Cloudflare `fetch(request, env, ctx)` signature is not accepted.
+- **Not** Edge Canon compliant, and not WinterCG compatible. `context`,
+  routing, assets, KV, SQL, blob, queue, cron and the Cache API are all there,
+  but most Web API globals — `fetch` among them — are absent from the isolate's
+  `globalThis`. The verified list is in [README.md](README.md); the accounting
+  against the canon's matrix is section 12 of
+  [`docs/architecture.zh.md`](../../docs/architecture.zh.md).
 - **Sandboxing**:
-    - Memory limits per isolate.
+    - V8 heap ceiling per isolate, when the application sets one.
+    - Wall-clock timeout and an op-dispatch rate limit; there is no CPU time
+      limit and no egress policy.
     - Permission-based capability access (Network, Env).
 
 ## 🚀 Lifecycle
@@ -88,12 +108,20 @@ Transform Runtime from a **Dependent Agent** to an **Autonomous Edge Runtime**. 
 2. **Init Subsystems**: Start Log Buffer, Config Store.
 3. **Serve**: Open HTTP/gRPC port, reporting *not ready*, so the control plane
    can reach this node while it is still working out what to run.
-4. **Register**: Tell the control plane this node exists.
-5. **Reconcile**: Fetch the assignment list, load every version in it, and stop
-   anything running that it does not name. Only then report ready. A control
-   plane that cannot be reached falls back to re-deploying whatever is in this
-   node's own bundle directory, and the node reports *degraded* for as long as
-   that is what it is serving.
+4. **Register**: `PUT` this node's registration
+   (`deis_wire::conventions::NODE_REGISTRATION_ROUTE`), with the node
+   credential. It is a statement of what this node is, so a node that lost
+   contact and came back simply says it again.
+5. **Reconcile**: Fetch the assignment list and load every version in it. Only
+   then report ready. Stopping is deliberately slower than starting: an
+   environment is unloaded only when the control plane says the answer is
+   complete **and** two consecutive complete answers both fail to mention it.
+   One answer is not evidence, because a control plane that read an empty
+   catalog looks exactly like one that was told to delete everything, and the
+   cost of believing it is a whole node going dark. An incomplete answer
+   neither counts nor resets the count. A control plane that cannot be reached
+   falls back to re-deploying whatever is in this node's own bundle directory,
+   and the node reports *degraded* for as long as that is what it is serving.
 6. **Background**: Start Log Shipper, Metric Shipper, queue pollers, and the
    reconcile timer.
 
@@ -108,18 +136,36 @@ Transform Runtime from a **Dependent Agent** to an **Autonomous Edge Runtime**. 
 
 ## 📝 Configuration (`deis-runtime.toml`)
 
-```toml
-# Unified Service Port
-http_port = 8000
+The file is found through `DEIS_RUNTIME_CONFIG`, or as `./deis-runtime.toml`;
+there is no `--config` flag. Every key is documented inline in the checked-in
+[`deis-runtime.toml`](deis-runtime.toml), which is the authority — the sketch
+below is only the shape:
 
-[logging]
-enabled = true
+```toml
+http_port = 8000            # HTTP traffic and the gRPC management plane share it
+data_dir = "./data"         # this node's SQLite database and local state
+
+[default_execution_limits]
+timeout_ms = 30000
+rate_limit_ops_per_sec = 1000.0
+
+[logging]                   # shipping to deis-telemetry
+enabled = false
+# endpoint = "http://127.0.0.1:8092"
 buffer_size = 10000
-flush_interval = 5
+flush_interval_secs = 5
 batch_size = 100
 
-[storage]
-path = "./data/deis-runtime.db"
+[control]                   # how this node reaches deis-control
+# endpoint = "http://127.0.0.1:8080"
+# secret = "one of the control plane's node_preshared_keys"
+reconcile_interval_secs = 60
+
+[bundles]                   # downloaded application bundles
+max_bytes = 268435456
+
+[assets]                    # static files served before any isolate
+max_bytes = 134217728
 ```
 
 ## 📦 Key Dependencies
@@ -136,4 +182,5 @@ path = "./data/deis-runtime.db"
 
 ---
 
-**Philosophy**: Runtime is an appliance. It works out of the box, stores its own state, and doesn't panic when the internet goes down.
+**Philosophy**: a node is an appliance. It works out of the box, stores its own
+state, and does not panic when the control plane goes away.

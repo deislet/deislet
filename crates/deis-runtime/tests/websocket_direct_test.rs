@@ -86,8 +86,6 @@ async fn test_websocket_direct_bridging() {
         .expect("Missing WebSocket ID header")
         .clone();
 
-    println!("✅ Handshake successful, ws_id: {}", ws_id);
-
     // 4. Setup Bridge Channels
     // Channel for JS -> Rust messages
     let (js_to_client_tx, mut js_to_client_rx) = mpsc::unbounded_channel();
@@ -115,7 +113,6 @@ async fn test_websocket_direct_bridging() {
     match received {
         WsServerMessage::Text(text) => {
             assert_eq!(text, format!("Echo: {}", test_msg));
-            println!("✅ Received Echo: {}", text);
         }
         _ => panic!("Expected Text message, got {:?}", received),
     }

@@ -4,14 +4,15 @@
 //! deis-runtime loads one ESM module per app, keeps its default export, and
 //! calls it once per request with a context it builds itself
 //! (`crates/deis-runtime/src/runtime/js/runtime.js`). That context carries
-//! `request`, `env`, `services` and `waitUntil`, and nothing about *which*
-//! handler should run - the runtime has no idea an app has more than one.
+//! `request`, `env`, `services` (kv, database, blob, queue and cache), `log`
+//! and `waitUntil`, and nothing about *which* handler should run - the runtime
+//! has no idea an app has more than one.
 //!
 //! So the module generated here is what makes a file tree behave like an app:
 //! it picks the handler whose pattern fits the path, fills in the placeholder
-//! values, adds the convenience fields edge-canon promises (`path`, `method`,
-//! `query`, `cookies`, `log`) on top of what the runtime supplied, and answers
-//! 404 when nothing matched.
+//! values, adds the request-shaped conveniences edge-canon promises (`path`,
+//! `method`, `query`, `cookies`) on top of what the runtime supplied, and
+//! answers 404 when nothing matched.
 //!
 //! It fills `context.params` itself rather than trusting the runtime's copy,
 //! and the reason is not that the runtime matches less than this module does.
@@ -22,9 +23,9 @@
 //! promise, while `functions/api/[[catch]].ts` says the handler expects to
 //! read the tail as `params.catch` as well. This module still has the file
 //! name, so it publishes the capture under both spellings - and it has to
-//! build a context anyway for `path`, `method`, `query`, `cookies` and `log`,
-//! which the runtime does not supply at all. So it rebuilds `params` with the
-//! rest rather than merging into a half-filled copy.
+//! build a context anyway for `path`, `method`, `query` and `cookies`, which
+//! the runtime does not supply at all. So it rebuilds `params` with the rest
+//! rather than merging into a half-filled copy.
 
 use crate::routing::RoutePlan;
 
@@ -157,10 +158,16 @@ function pathnameOf(request) {
 }
 
 // The context the handler sees: everything deis-runtime supplied - env,
-// services, waitUntil - plus the request-shaped conveniences edge-canon
+// services, log, waitUntil - plus the request-shaped conveniences edge-canon
 // promises. `params` is overwritten with this module's own match: it is the
 // only one that also knows the name the catch-all was written with in the
 // file tree, so `params.catch` works alongside `params['*']`.
+//
+// `log` is rebuilt here even though the runtime now puts one on every context
+// it makes. A bundle outlives the build that produced it and a node is
+// upgraded on its operator's schedule, so this module has to work on a
+// runtime older than itself; the two definitions are the same four calls into
+// the same console.
 function buildContext(context, params, pathname) {
   const request = context.request;
   const search = request && request.url ? String(request.url).split('?')[1] : '';
@@ -246,17 +253,28 @@ pub fn generate_entry_module(plan: &RoutePlan) -> String {
     // `user_module.queue`); an app that declares a queue in its manifest and
     // exports nothing here has its whole batch handed back and eventually
     // dead-lettered, which is why the build says so.
+    //
+    // Each is re-exported through a wrapper that names its parameters rather
+    // than aliased straight across, so the generated module states the
+    // signature Edge Canon fixes for it - `(batch, env, context)` and
+    // `(event, env, context)` (SPECIFICATION_EXT.md sections 3.1 and 3.2) -
+    // and so a handler written to the canon and one read out of this bundle
+    // agree on which argument is which.
     if let Some(import) = &plan.queue {
         code.push_str(&format!(
-            "\n// Queue consumer: deis-runtime calls this with a whole batch.\nimport \
-             queueHandler from {};\nexport const queue = queueHandler;\n",
+            "\n// Queue consumer. deis-runtime hands it a whole leased batch, the\n// \
+             environment table, and the same context a request handler gets.\nimport \
+             queueHandler from {};\nexport const queue = (batch, env, context) =>\n  \
+             queueHandler(batch, env, context);\n",
             js_string(import)
         ));
     }
     if let Some(import) = &plan.scheduled {
         code.push_str(&format!(
-            "\n// Cron handler: the control plane triggers this on schedule.\nimport \
-             scheduledHandler from {};\nexport const scheduled = scheduledHandler;\n",
+            "\n// Cron handler. The control plane picks one node per due expression and\n// \
+             triggers it there; a tick is fire-and-forget and is never made up later.\nimport \
+             scheduledHandler from {};\nexport const scheduled = (event, env, context) =>\n  \
+             scheduledHandler(event, env, context);\n",
             js_string(import)
         ));
     }
@@ -347,7 +365,23 @@ mod tests {
             ..Default::default()
         });
         assert!(code.contains("import queueHandler from \"../src/_queue.ts\";"));
-        assert!(code.contains("export const queue = queueHandler;"));
+        assert!(code.contains("export const queue = "));
+    }
+
+    #[test]
+    fn a_queue_handler_is_handed_the_three_arguments_the_canon_defines() {
+        // edge-canon SPECIFICATION_EXT.md section 3.2:
+        // `queue(batch, env, context)`. The runtime used to call it with two,
+        // so a handler written to the canon read `context.services` off the
+        // environment table. The wrapper names the three so the generated
+        // module states the contract rather than aliasing it away.
+        let code = generate_entry_module(&RoutePlan {
+            routes: Vec::new(),
+            queue: Some("../src/_queue.ts".to_string()),
+            ..Default::default()
+        });
+        assert!(code.contains("export const queue = (batch, env, context) =>"));
+        assert!(code.contains("queueHandler(batch, env, context);"));
     }
 
     #[test]
@@ -357,7 +391,20 @@ mod tests {
             scheduled: Some("../src/_scheduled.ts".to_string()),
             ..Default::default()
         });
-        assert!(code.contains("export const scheduled = scheduledHandler;"));
+        assert!(code.contains("export const scheduled = "));
+    }
+
+    #[test]
+    fn a_scheduled_handler_is_handed_the_three_arguments_the_canon_defines() {
+        // edge-canon SPECIFICATION_EXT.md section 3.1:
+        // `scheduled(event, env, context)`.
+        let code = generate_entry_module(&RoutePlan {
+            routes: Vec::new(),
+            scheduled: Some("../src/_scheduled.ts".to_string()),
+            ..Default::default()
+        });
+        assert!(code.contains("export const scheduled = (event, env, context) =>"));
+        assert!(code.contains("scheduledHandler(event, env, context);"));
     }
 
     #[test]

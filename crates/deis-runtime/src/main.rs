@@ -6,7 +6,6 @@ use tracing_subscriber::prelude::*;
 use deis_runtime::app::ApplicationManager;
 use deis_runtime::app_repo::AppRepo;
 use deis_runtime::config::RuntimeConfig;
-use deis_runtime::config_store::ConfigStore;
 use deis_runtime::deployment::{
     AssignmentClient, DeploymentManager, NodeRegistrar, NodeRegistration,
 };
@@ -54,10 +53,6 @@ async fn main() -> Result<()> {
     let db_path = data_dir.join("deis-runtime.db");
     let db_path = db_path.to_string_lossy().to_string();
     info!("Using single database: {}", db_path);
-
-    // Initialize config store
-    let config_store = Arc::new(ConfigStore::new(&db_path).await?);
-    info!("Config store initialized");
 
     // The module file store the isolates' module loader reads from. Only the
     // runtime pool needs it, so it is handed to the application manager and
@@ -164,7 +159,6 @@ async fn main() -> Result<()> {
     // signal has arrived and the in-flight requests have drained.
     dispatcher::start_server(ServerOptions {
         app_manager: app_manager.clone(),
-        config_store,
         deployer,
         health,
         node_id,

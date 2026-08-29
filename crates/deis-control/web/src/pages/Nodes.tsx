@@ -1,4 +1,4 @@
-import { useNodes, useRuntimeNodes } from '@/hooks/useApi'
+import { useSessions, useFleet } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -38,13 +38,13 @@ function getStateBadgeVariant(state: string) {
 }
 
 export function Nodes() {
-  const { nodes, loading, error, refetch } = useNodes()
+  const { sessions, loading, error, refetch } = useSessions()
   const {
-    runtimeNodes,
-    loading: runtimeLoading,
-    error: runtimeError,
-    refetch: refetchRuntime,
-  } = useRuntimeNodes()
+    fleet,
+    loading: fleetLoading,
+    error: fleetError,
+    refetch: refetchFleet,
+  } = useFleet()
   const [restartingNode, setRestartingNode] = useState<string | null>(null)
   const [nodeToRestart, setNodeToRestart] = useState<{ id: string; type: string } | null>(null)
 
@@ -59,25 +59,27 @@ export function Nodes() {
     setNodeToRestart(null)
 
     try {
+      // `restart` is one of the named command types the control plane
+      // deserializes, and a node treats it as the zero-downtime upgrade this
+      // dialog describes. The body is `{ command_type, data }`: it used to be
+      // sent as `{ command_type: 'custom', command_data: ... }`, which the
+      // server rejected with 422 before the command reached any node.
       const result = await api.executeCommand(nodeToRestart.id, {
-        command_type: 'custom',
-        command_data: 'graceful_restart',
+        command_type: 'restart',
       })
 
-      toast.success('Graceful restart initiated', {
-        description: `Node ${nodeToRestart.type} is restarting. Command ID: ${result.command_id}`,
+      // Only now, with the control plane's own answer in hand. The command
+      // is accepted, not finished: the node reports the outcome separately,
+      // which is what the Commands page follows.
+      toast.success('Restart accepted by the control plane', {
+        description: `Sent to ${nodeToRestart.type}. Command ID: ${result.command_id}`,
       })
-
-      // Give the node a moment to act on the restart before refetching,
-      // otherwise the list still shows the pre-restart state
-      setTimeout(() => {
-        refetch()
-        setRestartingNode(null)
-      }, 2000)
+      await refetch()
     } catch (err) {
-      toast.error('Failed to restart node', {
+      toast.error('The control plane refused the restart', {
         description: err instanceof Error ? err.message : 'Unknown error',
       })
+    } finally {
       setRestartingNode(null)
     }
   }
@@ -87,18 +89,20 @@ export function Nodes() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold">Nodes</h1>
-          <p className="text-muted-foreground">Manage connected node nodes</p>
+          <p className="text-muted-foreground">
+            Two lists, on purpose: who is connected, and who can be given work
+          </p>
         </div>
         <Button
           variant="outline"
           size="sm"
           onClick={() => {
             refetch()
-            refetchRuntime()
+            refetchFleet()
           }}
-          disabled={loading || runtimeLoading}
+          disabled={loading || fleetLoading}
         >
-          <RefreshCw className={`h-4 w-4 mr-2 ${loading || runtimeLoading ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`h-4 w-4 mr-2 ${loading || fleetLoading ? 'animate-spin' : ''}`} />
           Refresh
         </Button>
       </div>
@@ -111,19 +115,37 @@ export function Nodes() {
         </Card>
       )}
 
-      {loading && nodes.length === 0 ? (
-        <div className="flex items-center justify-center h-64">
-          <p className="text-muted-foreground">Loading nodes...</p>
+      {/*
+        Every node holding a control channel open to this control plane. A
+        command or a configuration push travels down one of these, so a node
+        that is not here cannot be sent either. In practice deis-proxy is
+        what appears in this list.
+      */}
+      <div className="space-y-2">
+        <div>
+          <h2 className="text-xl font-semibold">Control channels</h2>
+          <p className="text-sm text-muted-foreground">
+            Nodes connected to the control plane right now; commands and configuration go down
+            these
+          </p>
         </div>
-      ) : nodes.length === 0 ? (
+
+      {loading && sessions.length === 0 ? (
+        <div className="flex items-center justify-center h-64">
+          <p className="text-muted-foreground">Loading control channels...</p>
+        </div>
+      ) : sessions.length === 0 ? (
         <Card>
           <CardContent className="pt-6">
-            <p className="text-center text-muted-foreground">No nodes connected</p>
+            <p className="text-center text-muted-foreground">
+              No node is holding a control channel open, so no command or configuration push can
+              reach anything from here.
+            </p>
           </CardContent>
         </Card>
       ) : (
         <div className="grid gap-4">
-          {nodes.map((node) => (
+          {sessions.map((node) => (
             <Card key={node.id}>
               <CardHeader className="pb-2">
                 <div className="flex items-center justify-between">
@@ -165,19 +187,17 @@ export function Nodes() {
                     <p className="text-muted-foreground">Last Heartbeat</p>
                     <p>{formatDate(node.last_heartbeat)}</p>
                   </div>
-                  <div>
-                    <p className="text-muted-foreground">Power Reserve</p>
-                    <p>{node.power_reserve}</p>
-                  </div>
                 </div>
               </CardContent>
             </Card>
           ))}
         </div>
       )}
+      </div>
 
       {/*
-        The runtime fleet is a different list from the one above: these are the
+        The runtime fleet is a different list from the one above, and the two
+        have no rows in common in a normal deployment: these are the
         deis-runtime nodes the control plane dials to apply a deployment, probe
         health and fire cron. A node appears here either because the control
         plane's configuration file names it or because it registered itself,
@@ -191,21 +211,21 @@ export function Nodes() {
           </p>
         </div>
 
-        {runtimeError && (
+        {fleetError && (
           <Card className="border-destructive">
             <CardContent className="pt-6">
-              <p className="text-destructive">{runtimeError}</p>
+              <p className="text-destructive">{fleetError}</p>
             </CardContent>
           </Card>
         )}
 
-        {runtimeLoading && runtimeNodes.length === 0 ? (
+        {fleetLoading && fleet.length === 0 ? (
           <Card>
             <CardContent className="pt-6">
-              <p className="text-center text-muted-foreground">Loading runtime nodes...</p>
+              <p className="text-center text-muted-foreground">Loading the runtime fleet...</p>
             </CardContent>
           </Card>
-        ) : runtimeNodes.length === 0 ? (
+        ) : fleet.length === 0 ? (
           <Card>
             <CardContent className="pt-6">
               <p className="text-center text-muted-foreground">
@@ -216,7 +236,7 @@ export function Nodes() {
           </Card>
         ) : (
           <div className="grid gap-4">
-            {runtimeNodes.map((node) => (
+            {fleet.map((node) => (
               <Card key={node.id}>
                 <CardHeader className="pb-2">
                   <div className="flex items-center justify-between">

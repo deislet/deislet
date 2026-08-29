@@ -221,9 +221,15 @@ CREATE TABLE secrets (
 节点启动时先拉一次清单（原则 8）：
 
 ```
-GET /api/nodes/{node_id}/assignments
+GET  deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE   // "/api/nodes/:id/assignments"
 → [ { app_id, version_id, environment, bundle_url, bundle_sha, env } ]
 ```
+
+**路径写常量，不写字面量。** 服务端注册路由用 `NODE_ASSIGNMENTS_ROUTE` /
+`NODE_REGISTRATION_ROUTE`（axum 的 `:id` 模板），客户端拼具体节点的路径用
+`node_assignments_path(id)` / `node_registration_path(id)`。上面注释里那串是给读的人
+看的，会不会过期以 `crates/deis-wire/src/conventions.rs` 为准——本文档此前把登记接口
+写成 `POST .../register`，而代码里一直是 `PUT .../registration`，正是这类抄写造成的。
 
 `env` 与 `ApplyDeployment.env` 是同一张表（manifest 变量 + 当场解密的密钥 + 存储地址），因为**重启回来的节点必须拿到和推送时一样的环境**：只发指针的话，声明了密钥的应用会带着空密钥跑，声明了存储的应用连 deis-store 的地址都没有，而后者的唯一症状是每次 `ctx.services.*` 调用失败。某个环境的密钥解不开时，该行被整条剔出清单并打 error，而不是发一份残缺环境下去。
 
@@ -405,7 +411,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 
 - **队列租约令牌与死信 RPC**：`Pull` 现在返回 `lease_token`，`Ack` / `Nack` 必须原样带回，租约过期后旧消费者的 Ack 不再作数；死信有 `ListDeadLetters` / `ReplayDeadLetters` 两个 RPC。
 - **控制面的数据库访问**：全部走 `Database::with_connection`，rusqlite 在 `spawn_blocking` 上跑，不再在异步线程上执行同步 SQL。
-- **节点自己向控制面登记**：`POST /api/nodes/{id}/register`，凭据与 assignments 同一套。登记只决定「收不收推送、会不会被选去跑 cron」，不登记的节点照样自取并服务。
+- **节点自己向控制面登记**：路径是 `deis_wire::conventions::NODE_REGISTRATION_ROUTE`（客户端侧 `node_registration_path(id)`），方法是 `PUT`——登记是在陈述「这个节点是什么」，掉线又回来原样再说一遍即可；同一路径上的 `DELETE` 是主动离场。凭据与 assignments 同一套。登记只决定「收不收推送、会不会被选去跑 cron」，不登记的节点照样自取并服务。
 - **KV 的 metadata 能读回来了**：`GetResponse` 带 `metadata`，`ListRequest` 有 `include_metadata`，JS 侧的 `getWithMetadata()` 就是读它。
 - **`ScheduledEvent` 带上了 `environment`**：控制面按 `(应用, 环境)` 调度，节点也按这对值找处理函数；空值仍按 `production` 解释，与 HTTP 数据面同一条规则。
 - **换版先装好再切**：`RuntimePool::stage_app` 在另一条线程上把新版本建好预热，`activate` 才切流量，旧版本全程在应答，没有不可用窗口。
@@ -417,7 +423,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 - **控制面的 `routes` 表没人消费**：表、REST（`GET /api/routes`）都有，deis-proxy 仍只按域名或 `x-deis-app-id` 选应用，`path_prefix` 不影响任何请求的去向。预览子域（`<env>.<app>.<zone>`）也卡在这条链路上。
 - **只有 deis-runtime 在往 deis-telemetry 投递**：deis-proxy / deis-store / deis-queue / deis-control 都还只写自己的 stdout。
 - **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent` 已经有了）。队列消费目前由节点自己按 `(应用, 环境)` 轮询，不走这个消息，所以还没被踩到。
-- **Web 标准的全局大半没装上，`fetch` 也在其中**：扩展注册了，但它们的 JS 模块只 `export`，没有谁把它们挂到 `globalThis` 上。探针实测（2026-08-29）：有 `Headers` / `Request` / `Response` / `URL` / `URLSearchParams` / `EventTarget` / `setTimeout` / `queueMicrotask` / `console` / `caches`；没有 `fetch` / `crypto` / `TextEncoder` / `TextDecoder` / `atob` / `btoa` / `AbortController` / `ReadableStream` / `Blob` / `FormData` / `URLPattern` / `WebSocket` / `BroadcastChannel` / `structuredClone` / `performance`。edge-canon 把 `fetch` 列为基础特性，这是最直接的一处不达标。缺的是一个真正跑 JS 的一致性测试——列一份全局清单，在 Isolate 里逐个 `typeof`，缺哪个红哪个。
+- **Web 标准的全局大半没装上，`fetch` 也在其中**：扩展注册了，但它们的 JS 模块只 `export`，没有谁把它们挂到 `globalThis` 上（Deno 自己是在 `99_main.js` 里挂的，那个文件不在这里）。探针实测（2026-08-29，在真 Isolate 里逐个 `typeof globalThis[name]`）：**有** `Headers` / `Request` / `Response` / `URL` / `URLSearchParams` / `EventTarget` / `setTimeout` / `clearTimeout` / `queueMicrotask` / `console` / `caches` / `WebSocketPair` / `WebSocketServer`；**没有** `fetch` / `crypto` / `TextEncoder` / `TextDecoder` / `atob` / `btoa` / `AbortController` / `AbortSignal` / `ReadableStream` / `WritableStream` / `TransformStream` / `Blob` / `File` / `FormData` / `URLPattern` / `WebSocket` / `BroadcastChannel` / `structuredClone` / `Event` / `setInterval` / `clearInterval` / `performance` / `DOMException` / `MessageChannel` / `MessagePort` / `CompressionStream` / `DecompressionStream` / `EventSource` / `FileReader` / `navigator` / `reportError`。「有」的那一列里，`console` 与 `queueMicrotask` 来自 deno_core 自己的 `01_core.js`，其余全部是 `src/runtime/js/runtime.js` 自带的最小实现，不是 Deno 的——所以 `Response.json()` 这个静态方法和实例上的 `arrayBuffer()` 也都没有。edge-canon 把 `fetch` 列为基础特性，这是最直接的一处不达标。缺的是一个真正跑 JS 的一致性测试——列一份全局清单，在 Isolate 里逐个 `typeof`，缺哪个红哪个。
 - **`TriggerResponse` 没有「处理函数已被调用」这一位**，只能靠 `deis_runtime::trigger::HANDLER_FAILED_PREFIX` 这个错误前缀表达，控制面据此不再换节点重试。
 - **请求与响应体是 `String`**：`JsRequest.body` / `JsResponse.body` 都是文本，二进制主体过不了 Isolate 边界。
 - **执行超时管不住卡在 await 上的处理函数**：30 秒墙钟只约束「正在跑 JS」的那部分，一个卡在慢存储上的 handler 能无限占住它那条运行时线程。

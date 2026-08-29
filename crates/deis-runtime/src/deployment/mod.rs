@@ -33,6 +33,7 @@ mod store;
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,8 +46,8 @@ use crate::assets::{AssetBundle, AssetError};
 use crate::config::RuntimeConfig;
 
 pub use assignments::{
-    reconcile_once, run_control_loop, Assignment, AssignmentClient, AssignmentError,
-    AssignmentList, SyncOutcome,
+    run_control_loop, Assignment, AssignmentClient, AssignmentError, AssignmentList, Reconciler,
+    SyncOutcome,
 };
 pub use credential::NodeCredential;
 pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle};
@@ -139,6 +140,15 @@ pub enum Applied {
     /// path can produce this; a push always reloads, because a secret may have
     /// changed under a version that did not move.
     AlreadyRunning,
+    /// The order was older than what this node has already done to this
+    /// environment, so it was not applied. Only a reconciliation can produce
+    /// this: it acts on a list that was true at the moment it was asked for,
+    /// and a push that landed since then is the newer instruction.
+    Superseded {
+        /// The version the newer instruction left running here, if any. `None`
+        /// means the newer instruction was an unload.
+        running_version_id: Option<String>,
+    },
 }
 
 /// Fetches, verifies and installs deployments.
@@ -153,6 +163,20 @@ pub struct DeploymentManager {
     /// different app, or another environment of the same app - still run side
     /// by side. Startup and a control-plane push race exactly here.
     locks: DashMap<AppKey, Arc<tokio::sync::Mutex<()>>>,
+    /// Counts every change this node has made to what it runs, in the order
+    /// the changes happened.
+    ///
+    /// It exists because nothing else on this node can order two instructions
+    /// in time. A version id is a random uuid minted by the control plane, and
+    /// a rollback deliberately points an environment back at an older version,
+    /// so neither comparing two version ids nor merely noticing that they
+    /// differ says which of them is the later instruction. What this node can
+    /// order is when each instruction reached it, and that is this counter.
+    changes: AtomicU64,
+    /// The stamp of the last change to each (app, environment), so a caller
+    /// holding a stamp from before it asked the control plane anything can ask
+    /// whether this environment moved since.
+    last_change: DashMap<AppKey, u64>,
 }
 
 impl DeploymentManager {
@@ -173,6 +197,8 @@ impl DeploymentManager {
             cache_control: Arc::from(config.assets.cache_control.as_str()),
             max_asset_bytes: config.assets.max_bytes,
             locks: DashMap::new(),
+            changes: AtomicU64::new(0),
+            last_change: DashMap::new(),
         })
     }
 
@@ -197,6 +223,32 @@ impl DeploymentManager {
         self.app_manager.installed_versions()
     }
 
+    /// The stamp to read *before* asking the control plane what to run.
+    ///
+    /// Everything this node does to itself after this point is newer than the
+    /// answer that question returns, however long the request takes, so the
+    /// answer must not be allowed to undo it. See [`Self::changed_since`].
+    pub fn change_stamp(&self) -> u64 {
+        self.changes.load(Ordering::SeqCst)
+    }
+
+    /// Whether this node changed what it runs for `key` after `stamp` was
+    /// taken - installed a version, or stopped serving one.
+    pub fn changed_since(&self, key: &AppKey, stamp: u64) -> bool {
+        self.last_change
+            .get(key)
+            .is_some_and(|last| *last.value() > stamp)
+    }
+
+    /// Record that `key` just changed, and stamp it.
+    ///
+    /// Called from inside the per-key lock, after the change has taken effect,
+    /// so a stamp is never visible before the change it describes.
+    fn record_change(&self, key: &AppKey) {
+        let stamp = self.changes.fetch_add(1, Ordering::SeqCst) + 1;
+        self.last_change.insert(key.clone(), stamp);
+    }
+
     fn lock_for(&self, key: &AppKey) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .entry(key.clone())
@@ -215,7 +267,21 @@ impl DeploymentManager {
         self.install(order, false).await
     }
 
-    /// Apply a deployment from the startup assignment list.
+    /// Apply a deployment from an assignment list.
+    ///
+    /// `as_of` is [`Self::change_stamp`] read *before* the list was asked for,
+    /// which is what dates the list. An assignment list describes what the
+    /// control plane wanted at that moment; a push that landed while the
+    /// request was in flight is a later instruction about the same
+    /// environment, and applying the list on top of it would silently roll the
+    /// push back. So an environment this node changed after `as_of` is left
+    /// exactly as that newer change left it, and the next pass - which reads a
+    /// stamp taken after it - reconciles against the real state.
+    ///
+    /// Ordering by stamp rather than by version id is not a shortcut: version
+    /// ids are random uuids and a rollback points an environment at an older
+    /// one, so "the version differs" says nothing about which instruction came
+    /// first.
     ///
     /// Skips an app that is already running the same version *with an
     /// environment the control plane confirmed*, because that can only mean a
@@ -233,10 +299,30 @@ impl DeploymentManager {
     pub async fn apply_from_assignment(
         &self,
         order: DeploymentOrder,
+        as_of: u64,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
         let lock = self.lock_for(&key);
         let _guard = lock.lock().await;
+
+        if self.changed_since(&key, as_of) {
+            let running_version_id = self
+                .app_manager
+                .installed_version(&key)
+                .map(|current| current.version_id);
+            info!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                assigned_version_id = %order.version_id,
+                running_version_id = %running_version_id.as_deref().unwrap_or("<none>"),
+                "Not applying assigned version {} of {}: this node changed that environment \
+                 after the assignment list was asked for, so the list is the older instruction \
+                 of the two. The newer one stands and the next reconcile checks against it",
+                order.version_id,
+                key
+            );
+            return Ok(Applied::Superseded { running_version_id });
+        }
 
         if let Some(current) = self.app_manager.installed_version(&key) {
             if current.version_id == order.version_id {
@@ -357,7 +443,13 @@ impl DeploymentManager {
             let lock = self.lock_for(key);
             let _guard = lock.lock().await;
             match self.app_manager.unload_app(key).await {
-                Ok(()) => unloaded.push(key.environment().to_string()),
+                Ok(()) => {
+                    // Same reason as the stamp at the end of `install`: this
+                    // is a change to what the node runs, and a list fetched
+                    // before it must not put the application back.
+                    self.record_change(key);
+                    unloaded.push(key.environment().to_string());
+                }
                 Err(e) => failures.push(format!("{key}: {e}")),
             }
             // The lock stays in the map on purpose. Removing it while holding
@@ -586,6 +678,11 @@ impl DeploymentManager {
                 .await;
         }
         self.store.prune(&key, &order.version_id).await;
+
+        // Stamped after the swap, so a reconciliation that reads the stamp
+        // before it asks the control plane anything can tell that this
+        // environment moved under it.
+        self.record_change(&key);
 
         Ok(Applied::Installed { reused_bundle })
     }

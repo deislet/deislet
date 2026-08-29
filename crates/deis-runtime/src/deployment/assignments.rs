@@ -12,9 +12,27 @@
 //! the whole truth rather than as a set of additions: an environment this node
 //! runs and the list does not name stops here. That is the only way a deletion
 //! ever reaches a node that was unreachable when it happened, because a
-//! deletion has nothing left to push. The control plane says on each answer
-//! whether it *is* the whole truth ([`AssignmentList::complete`]); an answer
-//! that cannot promise it is loaded from and never removed on.
+//! deletion has nothing left to push.
+//!
+//! Stopping something is the one thing a node cannot take back cheaply, so it
+//! takes two independent pieces of evidence, not one:
+//!
+//!   - the control plane must say the answer *is* the whole truth
+//!     ([`AssignmentList::complete`]). An answer that cannot promise it is
+//!     loaded from and never removed on.
+//!   - two consecutive complete answers must both omit the environment. The
+//!     `complete` flag means only that nothing was dropped while the answer
+//!     was assembled; it is not a check that the catalog behind it was
+//!     readable, so a single short answer is exactly what a control-plane
+//!     fault looks like. Making the same absence appear twice costs a deleted
+//!     application one more reconcile interval on this node - a push carries
+//!     the ordinary case anyway - and stops one bad answer from taking a whole
+//!     node's applications down. See [`Reconciler`].
+//!
+//! And the answer is dated, because it takes time to arrive: the node reads a
+//! change stamp (`DeploymentManager::change_stamp`) before it asks, and
+//! anything it did to itself after that stamp - a push that landed while the
+//! request was in flight - is the newer instruction and is left alone.
 //!
 //! The bundle itself is never in the list: each line is a pointer - app,
 //! version, environment, URL, digest - plus the environment map that a push
@@ -24,7 +42,7 @@
 //! on its manifest's own variables until the next push, which is what this
 //! path used to do for every app and is said out loud when it happens.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -266,136 +284,243 @@ pub struct SyncOutcome {
     /// still serving, which is the half of a reconciliation that leaves the
     /// node further from the list than it started.
     pub unload_failed: usize,
+    /// Environments this pass deliberately left alone because this node
+    /// changed them after the list was asked for. The list is the older of the
+    /// two instructions, so acting on it would roll a push back.
+    pub superseded: usize,
+    /// Environments the list did not name for the first time. Nothing was
+    /// stopped for them: removal needs the same absence in the next complete
+    /// answer too.
+    pub removal_pending: usize,
 }
 
-/// Fetch the assignment list and make this node match it.
+/// Keeps this node running what the control plane says it should, one pass at
+/// a time.
 ///
-/// The answer is the whole truth, not a set of additions: an environment this
-/// node runs and the list does not name is stopped here. Both halves matter
-/// and only one of them used to happen. An application deleted from the
-/// catalog, an environment torn down, a node taken out of an application's
-/// placement - none of those reach a node as an instruction, because the
-/// control plane's record of them is a row that no longer exists. A node that
-/// only ever added would keep serving them, with their secrets, until somebody
-/// restarted the process.
+/// A pass is [`Reconciler::once`]. It is a method on a value rather than a
+/// free function because one thing has to be remembered between passes and
+/// cannot be recovered from the node's own state: which environments the
+/// *previous* complete answer already failed to name.
 ///
-/// It is also what makes the answer safe to act on repeatedly: running this
-/// on a node that is already correct changes nothing and says nothing.
-pub async fn reconcile_once(
-    client: &AssignmentClient,
-    deployer: &DeploymentManager,
-) -> Result<SyncOutcome, AssignmentError> {
-    let AssignmentList {
-        assignments,
-        complete,
-        withheld,
-    } = client.fetch().await?;
+/// That memory is what makes removal safe. `complete` on an answer means the
+/// control plane dropped nothing while assembling it; it is not a check that
+/// the catalog behind it was readable, so a control plane that reads an empty
+/// or half-populated catalog produces a short answer that says `true`. Acting
+/// on one such answer would take every application off this node at once.
+/// Requiring two consecutive complete answers to agree on an absence turns a
+/// transient control-plane fault into a delay instead of an outage: the second
+/// answer disagrees and nothing is stopped. A real deletion is not transient,
+/// so it simply arrives one reconcile interval later - and the ordinary
+/// deletion is pushed to the node directly anyway; reconciliation is the
+/// backstop for a node that was unreachable when that push went out.
+///
+/// Loading is not held back like this. Everything an answer *does* name is
+/// real whatever else went wrong, so a version in the list is installed on the
+/// first pass that names it.
+pub struct Reconciler<'a> {
+    client: &'a AssignmentClient,
+    deployer: &'a DeploymentManager,
+    /// Environments the previous *complete* answer did not name while this
+    /// node was running them. An incomplete answer neither adds to this nor
+    /// clears it: it is not evidence about absence in either direction.
+    absent_before: HashSet<AppKey>,
+}
 
-    let assigned: HashMap<AppKey, String> = assignments
-        .iter()
-        .map(|assignment| {
-            (
-                AppKey::new(&assignment.app_id, &assignment.environment),
-                assignment.version_id.clone(),
-            )
-        })
-        .collect();
-    let running = deployer.running();
-    report_drift(&assigned, &running, complete);
-
-    let mut outcome = SyncOutcome {
-        assigned: assignments.len(),
-        ..Default::default()
-    };
-
-    for assignment in assignments {
-        let app_id = assignment.app_id.clone();
-        let environment = assignment.environment.clone();
-        let version_id = assignment.version_id.clone();
-        match deployer
-            .apply_from_assignment(assignment.into_order())
-            .await
-        {
-            Ok(Applied::Installed { reused_bundle }) => {
-                outcome.installed += 1;
-                info!(
-                    app_id = %app_id,
-                    environment = %environment,
-                    version_id = %version_id,
-                    reused_bundle,
-                    "Loaded an assigned version"
-                );
-            }
-            Ok(Applied::AlreadyRunning) => outcome.unchanged += 1,
-            Err(e) => {
-                outcome.failed += 1;
-                error!(
-                    app_id = %app_id,
-                    environment = %environment,
-                    version_id = %version_id,
-                    error = %e,
-                    "Could not load assigned version {} of {} environment {}; that environment \
-                     is not serving on this node",
-                    version_id,
-                    app_id,
-                    environment
-                );
-            }
+impl<'a> Reconciler<'a> {
+    pub fn new(client: &'a AssignmentClient, deployer: &'a DeploymentManager) -> Self {
+        Self {
+            client,
+            deployer,
+            absent_before: HashSet::new(),
         }
     }
 
-    if !complete {
-        // The control plane says it could not describe every assignment it
-        // holds, so absence from this list is not an instruction: an
-        // application missing because the control plane failed to build its
-        // row looks exactly like one that was deleted. Loading is still
-        // right - everything listed is real.
-        warn!(
-            url = client.url(),
+    /// Fetch the assignment list and make this node match it.
+    ///
+    /// The answer is the whole truth, not a set of additions: an environment
+    /// this node runs and the list does not name is stopped here - once a
+    /// second complete answer has said the same thing. Both halves matter and
+    /// only one of them used to happen. An application deleted from the
+    /// catalog, an environment torn down, a node taken out of an application's
+    /// placement - none of those reach a node as an instruction, because the
+    /// control plane's record of them is a row that no longer exists. A node
+    /// that only ever added would keep serving them, with their secrets, until
+    /// somebody restarted the process.
+    ///
+    /// It is also what makes the answer safe to act on repeatedly: running
+    /// this on a node that is already correct changes nothing and says
+    /// nothing.
+    pub async fn once(&mut self) -> Result<SyncOutcome, AssignmentError> {
+        // Both of these are read *before* the question is asked, because they
+        // are what dates the answer. A push that lands while the request is in
+        // flight is a later instruction about the same environment; reading
+        // the node's state afterwards would show that push as drift from a
+        // list that predates it, and the pass would roll it back.
+        let as_of = self.deployer.change_stamp();
+        let running = self.deployer.running();
+
+        let AssignmentList {
+            assignments,
+            complete,
             withheld,
-            listed = outcome.assigned,
-            "The control plane marked this assignment list incomplete ({} assignment(s) it \
-             could not describe), so nothing is stopped on the strength of it. This node loads \
-             what is listed and keeps everything else running; anything that should have been \
-             stopped stays up until the control plane can answer in full",
-            withheld
-        );
-        return Ok(outcome);
-    }
+        } = self.client.fetch().await?;
 
-    for (key, installed) in running {
-        if assigned.contains_key(&key) {
-            continue;
+        let assigned: HashMap<AppKey, String> = assignments
+            .iter()
+            .map(|assignment| {
+                (
+                    AppKey::new(&assignment.app_id, &assignment.environment),
+                    assignment.version_id.clone(),
+                )
+            })
+            .collect();
+        report_drift(&assigned, &running, complete, &self.absent_before);
+
+        let mut outcome = SyncOutcome {
+            assigned: assignments.len(),
+            ..Default::default()
+        };
+
+        for assignment in assignments {
+            let app_id = assignment.app_id.clone();
+            let environment = assignment.environment.clone();
+            let version_id = assignment.version_id.clone();
+            match self
+                .deployer
+                .apply_from_assignment(assignment.into_order(), as_of)
+                .await
+            {
+                Ok(Applied::Installed { reused_bundle }) => {
+                    outcome.installed += 1;
+                    info!(
+                        app_id = %app_id,
+                        environment = %environment,
+                        version_id = %version_id,
+                        reused_bundle,
+                        "Loaded an assigned version"
+                    );
+                }
+                Ok(Applied::AlreadyRunning) => outcome.unchanged += 1,
+                // Said in full by `apply_from_assignment`, which is the side
+                // that knows what is running instead.
+                Ok(Applied::Superseded { .. }) => outcome.superseded += 1,
+                Err(e) => {
+                    outcome.failed += 1;
+                    error!(
+                        app_id = %app_id,
+                        environment = %environment,
+                        version_id = %version_id,
+                        error = %e,
+                        "Could not load assigned version {} of {} environment {}; that \
+                         environment is not serving on this node",
+                        version_id,
+                        app_id,
+                        environment
+                    );
+                }
+            }
         }
-        match deployer.unload(key.app_id(), Some(key.environment())).await {
-            Ok(_) => {
-                outcome.unloaded += 1;
+
+        if !complete {
+            // The control plane says it could not describe every assignment it
+            // holds, so absence from this list is not an instruction: an
+            // application missing because the control plane failed to build its
+            // row looks exactly like one that was deleted. Loading is still
+            // right - everything listed is real. `absent_before` is left as it
+            // was: this answer is not evidence about absence either way, so it
+            // neither confirms a candidate nor clears one.
+            warn!(
+                url = self.client.url(),
+                withheld,
+                listed = outcome.assigned,
+                "The control plane marked this assignment list incomplete ({} assignment(s) it \
+                 could not describe), so nothing is stopped on the strength of it. This node \
+                 loads what is listed and keeps everything else running; anything that should \
+                 have been stopped stays up until the control plane can answer in full",
+                withheld
+            );
+            return Ok(outcome);
+        }
+
+        let mut absent_now: HashSet<AppKey> = HashSet::new();
+        for (key, installed) in running {
+            if assigned.contains_key(&key) {
+                continue;
+            }
+
+            if self.deployer.changed_since(&key, as_of) {
+                // Something happened to this environment on this node after
+                // the list was asked for - a push, or an unload. That is the
+                // newer instruction, so this list has nothing to say about it,
+                // and it does not count as an absence either: the next pass
+                // reads a stamp taken after the change and judges it fresh.
+                outcome.superseded += 1;
+                info!(
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
+                    "Not stopping {} even though the assignment list does not name it: this node \
+                     changed that environment after the list was asked for, so the list is the \
+                     older instruction of the two",
+                    key
+                );
+                continue;
+            }
+
+            if !self.absent_before.contains(&key) {
+                // One complete answer is not enough to stop code that is
+                // serving. See the type's own documentation for why.
+                absent_now.insert(key.clone());
+                outcome.removal_pending += 1;
                 info!(
                     app_id = %key.app_id(),
                     environment = %key.environment(),
                     version_id = %installed.version_id,
-                    "Stopped serving {} here: the control plane's assignment list no longer \
-                     names it, so this node was running a version nobody asked it for. Its \
-                     bundles were removed, so a restart will not bring it back",
+                    "The control plane's assignment list no longer names {}, and this is the \
+                     first complete answer to leave it out. It keeps serving; if the next \
+                     complete answer leaves it out as well, this node stops it then",
                     key
                 );
+                continue;
             }
-            Err(e) => {
-                outcome.unload_failed += 1;
-                error!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %installed.version_id,
-                    error = %e,
-                    "{} is no longer assigned to this node and could not be stopped; it keeps \
-                     serving, with its secrets, until this node is restarted",
-                    key
-                );
+
+            match self
+                .deployer
+                .unload(key.app_id(), Some(key.environment()))
+                .await
+            {
+                Ok(_) => {
+                    outcome.unloaded += 1;
+                    info!(
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        version_id = %installed.version_id,
+                        "Stopped serving {} here: two complete assignment lists in a row left it \
+                         out, so this node was running a version nobody asked it for. Its \
+                         bundles were removed, so a restart will not bring it back",
+                        key
+                    );
+                }
+                Err(e) => {
+                    outcome.unload_failed += 1;
+                    // Still confirmed absent, so the next pass retries the
+                    // unload rather than starting the two-answer count over.
+                    absent_now.insert(key.clone());
+                    error!(
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        version_id = %installed.version_id,
+                        error = %e,
+                        "{} is no longer assigned to this node and could not be stopped; it keeps \
+                         serving, with its secrets, until this node is restarted",
+                        key
+                    );
+                }
             }
         }
-    }
+        self.absent_before = absent_now;
 
-    Ok(outcome)
+        Ok(outcome)
+    }
 }
 
 /// Say what the control plane's answer changes, before anything acts on it.
@@ -404,10 +529,17 @@ pub async fn reconcile_once(
 /// timer is a node whose behaviour nobody can reconstruct afterwards. Silence
 /// when nothing changed, which is the normal case: the interesting line is the
 /// one that appears.
+///
+/// The line says what this pass is about to do, not what the list implies:
+/// an environment the list leaves out stops only once a second complete answer
+/// has left it out too, so the first sighting is reported separately from the
+/// stop. `absent_before` is what tells the two apart - it holds the
+/// environments a previous complete answer already failed to name.
 fn report_drift(
     assigned: &HashMap<AppKey, String>,
     running: &[(AppKey, InstalledVersion)],
     complete: bool,
+    absent_before: &HashSet<AppKey>,
 ) {
     let running_versions: HashMap<&AppKey, &str> = running
         .iter()
@@ -426,20 +558,26 @@ fn report_drift(
         }
     }
 
-    // Only when the answer is the whole truth. On an incomplete one nothing
-    // is removed, so listing candidates would report a change that is not
-    // going to happen.
-    let removed: Vec<String> = if complete {
-        running
-            .iter()
-            .filter(|(key, _)| !assigned.contains_key(key))
-            .map(|(key, installed)| format!("{key}={}", installed.version_id))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Only when the answer is the whole truth. On an incomplete one nothing is
+    // removed and no absence is counted, so listing either would report a
+    // change that is not going to happen.
+    let mut removing: Vec<String> = Vec::new();
+    let mut unnamed_once: Vec<String> = Vec::new();
+    if complete {
+        for (key, installed) in running {
+            if assigned.contains_key(key) {
+                continue;
+            }
+            let line = format!("{key}={}", installed.version_id);
+            if absent_before.contains(key) {
+                removing.push(line);
+            } else {
+                unnamed_once.push(line);
+            }
+        }
+    }
 
-    if added.is_empty() && changed.is_empty() && removed.is_empty() {
+    if added.is_empty() && changed.is_empty() && removing.is_empty() && unnamed_once.is_empty() {
         debug!(
             assigned = assigned.len(),
             "This node already runs exactly what the control plane assigns it"
@@ -449,30 +587,37 @@ fn report_drift(
 
     added.sort();
     changed.sort();
-    let mut removed = removed;
-    removed.sort();
+    removing.sort();
+    unnamed_once.sort();
 
     info!(
         added = ?added,
         changed = ?changed,
-        removed = ?removed,
-        "The control plane's assignment list differs from what this node runs: {} to load, {} \
-         to move to another version, {} to stop because the list no longer names them",
+        removing = ?removing,
+        unnamed_once = ?unnamed_once,
+        "The control plane's assignment list differs from what this node runs: {} to load, {} to \
+         move to another version, {} to stop because a second complete answer in a row does not \
+         name them, {} left out for the first time and therefore kept running for now",
         added.len(),
         changed.len(),
-        removed.len()
+        removing.len(),
+        unnamed_once.len()
     );
 
-    if !removed.is_empty() && assigned.is_empty() {
+    let absent = removing.len() + unnamed_once.len();
+    if absent > 0 && assigned.is_empty() {
         // The shape of a control plane that lost its catalog rather than of
-        // somebody deleting things: acting on it takes every application off
-        // this node at once.
+        // somebody deleting things. Nothing stops on this answer alone, which
+        // is the point - but if the next answer says the same, it will.
         warn!(
-            removed = removed.len(),
-            "The control plane assigns this node nothing at all while it runs {} environment(s); \
-             every one of them is about to stop serving here. If that was not intended, the \
-             control plane's catalog is what to look at",
-            removed.len()
+            absent,
+            stopping = removing.len(),
+            "The control plane assigns this node nothing at all while it runs {} environment(s). \
+             {} of them stop serving here on this pass and the rest stop if the next complete \
+             answer is the same. If that was not intended, the control plane's catalog is what \
+             to look at",
+            absent,
+            removing.len()
         );
     }
 }
@@ -508,6 +653,23 @@ impl RegistrationState {
             Self::Pending | Self::NotSupported => None,
         }
     }
+
+    /// `nap`, shortened so the loop wakes in time to refresh the registration.
+    ///
+    /// Every sleep in the loop goes through this. The intervals it shortens
+    /// are not the control plane's to know - a reconcile interval is
+    /// configured here, a retry backoff is computed here - while the lease is
+    /// the control plane's alone, so nothing but this stops the two from
+    /// disagreeing. A node that oversleeps its lease is dropped from the fleet
+    /// while still answering every request perfectly: it stops receiving
+    /// deployment pushes and stops being picked for cron, and nothing about it
+    /// looks wrong.
+    fn cap(&self, nap: Duration) -> Duration {
+        match self.time_until_refresh(Instant::now()) {
+            Some(until) => nap.min(until),
+            None => nap,
+        }
+    }
 }
 
 /// Keep this node matching what the control plane says, for as long as the
@@ -530,7 +692,14 @@ impl RegistrationState {
 ///
 /// A pass that cannot reach the control plane backs off and puts registration
 /// back to pending: contact was lost, so nothing this node said before can be
-/// assumed to still be known on the other side.
+/// assumed to still be known on the other side. A pass that *did* reach it and
+/// still could not put the node right backs off on its own, separate ladder -
+/// the control plane answered, so the node is not cut off, and climbing the
+/// unreachable ladder for a local problem would make a node that is merely
+/// degraded wait as long as one that is isolated.
+///
+/// No sleep in this loop ever runs past the moment the registration has to be
+/// refreshed; every one of them goes through [`RegistrationState::cap`].
 pub async fn run_control_loop(
     client: Option<AssignmentClient>,
     registrar: Option<NodeRegistrar>,
@@ -554,20 +723,27 @@ pub async fn run_control_loop(
 
     let mut recovered_locally = false;
     let mut ready_once = false;
-    let mut attempt: u32 = 0;
+    // Consecutive passes that could not reach the control plane.
+    let mut unreachable: u32 = 0;
+    // Consecutive passes that reached it and still left this node not running
+    // what it was told to. Separate from `unreachable` because the two say
+    // different things and have different cures.
+    let mut degraded: u32 = 0;
     let mut registration = RegistrationState::Pending;
+    let mut reconciler = Reconciler::new(&client, &deployer);
 
     loop {
-        if attempt > 0 {
-            tokio::time::sleep(retry_delay(retry_interval, attempt)).await;
+        if unreachable > 0 {
+            let nap = registration.cap(retry_delay(retry_interval, unreachable));
+            tokio::time::sleep(nap).await;
         }
-        attempt += 1;
+        unreachable += 1;
 
         if let Some(registrar) = &registrar {
             registration = announce(registrar, registration).await;
         }
 
-        match reconcile_once(&client, &deployer).await {
+        match reconciler.once().await {
             Ok(outcome) => {
                 let serving = outcome.installed + outcome.unchanged;
                 if outcome.failed > 0 || outcome.unload_failed > 0 {
@@ -581,12 +757,24 @@ pub async fn run_control_loop(
                         ),
                         serving,
                     );
-                    // Straight back round with the backoff: something is wrong
-                    // and waiting a whole reconcile interval to try again
-                    // leaves the node wrong for that long.
+                    // The unreachable ladder does not apply here: leaving it
+                    // climbing would make a node that is merely degraded back
+                    // off as though it had lost contact.
+                    unreachable = 0;
+                    degraded = degraded.saturating_add(1);
+                    // Back round sooner than a whole reconcile interval -
+                    // something is wrong and waiting that long leaves the node
+                    // wrong for that long - but backing off, so an application
+                    // whose bundle will never load does not produce an error
+                    // every retry interval for ever. Capped, because a
+                    // degraded node is still a registered one and must not
+                    // sleep past its lease.
+                    let nap = registration.cap(retry_delay(retry_interval, degraded));
+                    tokio::time::sleep(nap).await;
                     continue;
                 }
 
+                degraded = 0;
                 health.mark_ready(serving);
                 if !ready_once {
                     ready_once = true;
@@ -598,17 +786,13 @@ pub async fn run_control_loop(
                         reconcile_interval.as_secs()
                     );
                 }
-                attempt = 0;
+                unreachable = 0;
                 // Never sleep past the moment the registration has to be
                 // refreshed. reconcile_interval is configurable and the
                 // control plane's TTL is not this node's to choose, so a
                 // 5 minute reconcile interval against a 90 second TTL would
                 // otherwise drop this node out of the fleet between passes.
-                let nap = match registration.time_until_refresh(Instant::now()) {
-                    Some(until) => reconcile_interval.min(until),
-                    None => reconcile_interval,
-                };
-                tokio::time::sleep(nap).await;
+                tokio::time::sleep(registration.cap(reconcile_interval)).await;
             }
             Err(e) => {
                 // Contact is lost, so whatever the control plane knew about

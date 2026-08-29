@@ -181,23 +181,40 @@ export default function handler(context: any): Response {
         // Half a batch failing must be expressible: acknowledging everything
         // would lose the failure, failing everything would redo work that
         // already succeeded.
+        // The signature is the canon's `queue(batch, env, context)`
+        // (SPECIFICATION_EXT.md section 3.2): the bindings table arrives in
+        // the second position and the platform context in the third. A
+        // handler written to the canon must not have to guess.
         let code = r#"
             export default function handler() { return new Response("unused"); }
-            export async function queue(batch, context) {
+            export async function queue(batch, env, context) {
+                if (env.QUEUE_GREETING !== "hello") {
+                    throw new Error("env is not in the env position: " + JSON.stringify(env));
+                }
+                if (typeof context.services.kv !== "object") {
+                    throw new Error("context is not in the context position");
+                }
+                if (typeof context.log.info !== "function") {
+                    throw new Error("context.log is missing on a queue invocation");
+                }
                 globalThis.seen = batch.messages.map((m) => m.id + ":" + m.body + ":" + m.attempts);
                 globalThis.queueName = batch.queue;
-                globalThis.hasServices = typeof context.services.kv === "object";
                 for (const message of batch.messages) {
                     if (message.body.includes("poison")) message.retry();
                 }
             }
         "#;
 
+        let spec = IsolateSpec {
+            env: HashMap::from([("QUEUE_GREETING".to_string(), "hello".to_string())]),
+            ..IsolateSpec::default()
+        };
+
         let mut runtime = AppRuntime::new(
             "queue_ok_app".to_string(),
             code.to_string(),
             None,
-            IsolateSpec::default(),
+            spec,
             &ServiceWiring::default(),
         )
         .unwrap();
@@ -303,20 +320,30 @@ export default function handler(context: any): Response {
         // The control plane owns the schedule and calls one node per tick;
         // the handler has to be told which expression fired, because an app
         // may declare several and do different work for each.
+        // Signature per the canon: `scheduled(event, env, context)`.
         let code = r#"
             export default function handler() { return new Response("unused"); }
-            export async function scheduled(event, context) {
+            export async function scheduled(event, env, context) {
                 if (event.cron !== "0 */6 * * *") throw new Error("wrong expression: " + event.cron);
                 if (event.scheduledTime !== 1700000000000) throw new Error("wrong time");
+                if (env.CRON_GREETING !== "hello") {
+                    throw new Error("env is not in the env position: " + JSON.stringify(env));
+                }
                 if (typeof context.services.kv !== "object") throw new Error("no services");
+                if (typeof context.log.info !== "function") throw new Error("no context.log");
             }
         "#;
+
+        let spec = IsolateSpec {
+            env: HashMap::from([("CRON_GREETING".to_string(), "hello".to_string())]),
+            ..IsolateSpec::default()
+        };
 
         let mut runtime = AppRuntime::new(
             "cron_app".to_string(),
             code.to_string(),
             None,
-            IsolateSpec::default(),
+            spec,
             &ServiceWiring::default(),
         )
         .unwrap();
@@ -865,62 +892,12 @@ export default function handler(context: any): Response {
         }
     }
 
-    /// A running deis-store, stopped when the value is dropped.
-    ///
-    /// The KV tests below are the only place in this crate where an
-    /// application's own JavaScript reaches a real store, which is what makes
-    /// them worth the process: the chain they prove - manifest, address, op,
-    /// client, wire - has a seam in every link.
-    struct TestStore {
-        _data: tempfile::TempDir,
-        endpoint: String,
-        shutdown: Option<oneshot::Sender<()>>,
-    }
-
-    impl TestStore {
-        async fn start() -> Self {
-            let data = tempfile::TempDir::new().expect("temp dir");
-            let config = deis_store::config::Config {
-                listen: "127.0.0.1:0".to_string(),
-                data_dir: data.path().to_path_buf(),
-                ..deis_store::config::Config::default()
-            };
-            let listener = deis_store::server::bind(&config).await.expect("bind");
-            let addr = listener.local_addr().expect("local addr");
-            let (shutdown, rx) = oneshot::channel();
-            tokio::spawn(async move {
-                deis_store::server::serve(config, listener, async {
-                    let _ = rx.await;
-                })
-                .await
-                .expect("serve");
-            });
-            Self {
-                _data: data,
-                endpoint: format!("http://{addr}"),
-                shutdown: Some(shutdown),
-            }
-        }
-
-        fn kv_wiring(&self) -> ServiceWiring {
-            ServiceWiring {
-                declaration: ServiceDeclaration::from_names(["kv"]),
-                endpoints: ServiceEndpoints {
-                    store: Some(self.endpoint.clone()),
-                    queue: None,
-                },
-                consumers: Vec::new(),
-            }
-        }
-    }
-
-    impl Drop for TestStore {
-        fn drop(&mut self) {
-            if let Some(shutdown) = self.shutdown.take() {
-                let _ = shutdown.send(());
-            }
-        }
-    }
+    /// The store harness lives in `runtime::test_store` because more than one
+    /// module here needs it: an application's own JavaScript reaching a real
+    /// store (below) and the SQL client's own round trip (`db_client`) prove
+    /// different seams of the same chain - manifest, address, op, client,
+    /// wire - and neither is provable without the real server.
+    use crate::runtime::test_store::TestStore;
 
     /// Run one request against an app with the given wiring and hand back the
     /// response body.
@@ -1174,46 +1151,6 @@ export default function handler(context: any): Response {
         let (status, _headers, body) = result_data;
         assert_eq!(status, 200);
         assert_eq!(body, Some("Hello from test".to_string()));
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_execute_fetch_with_kv() {
-        let code = r#"
-            export default async function handler(ctx) {
-                    await ctx.services.kv.put("test", "value123");
-                    const val = await ctx.services.kv.get("test");
-                    return new Response(val);
-            }
-        "#;
-
-        let mut runtime = AppRuntime::new(
-            "test_app".to_string(),
-            code.to_string(),
-            None,
-            IsolateSpec::default(),
-            &ServiceWiring::default(),
-        )
-        .unwrap();
-
-        runtime.init_module().await.unwrap();
-
-        let (tx, rx) = oneshot::channel();
-        let result = runtime
-            .execute_fetch(
-                "http://localhost/".to_string(),
-                "GET".to_string(),
-                HashMap::new(),
-                None,
-                tx,
-            )
-            .await;
-
-        assert!(result.is_ok());
-
-        let result_data = rx.await.unwrap().unwrap();
-        let (_status, _headers, body) = result_data;
-        assert_eq!(body, Some("value123".to_string()));
     }
 
     #[tokio::test]
@@ -1555,5 +1492,361 @@ export default function handler(context: any): Response {
             .find(|e| e.message == "careful")
             .expect("console.warn should have been buffered");
         assert_eq!(warning.level, LogLevel::Warn);
+    }
+    // --- the global surface ---------------------------------------------
+    //
+    // This runtime boots the bare `deno_core` engine, which brings only
+    // `console` and `queueMicrotask`; every other global below is written out
+    // by hand in `runtime/js/runtime.js`. That makes the inventory easy to
+    // change by accident in either direction - a global quietly added, or one
+    // lost in a refactor - and until this test existed nothing noticed.
+    //
+    // Both halves are asserted on purpose. The present list is what the
+    // platform promises; the absent list is what `crates/deis-runtime/README.md`
+    // and edge-canon's `PLATFORM_MATRIX.md` say a handler cannot use. Adding a
+    // global therefore fails this test until those documents move with it,
+    // which is the only thing keeping them honest.
+
+    /// Names SPECIFICATION_BASIC.md section 8.1 requires that this platform
+    /// does provide.
+    const CANON_GLOBALS_PRESENT: &[&str] = &[
+        "Request",
+        "Response",
+        "Headers",
+        "URL",
+        "URLSearchParams",
+        "TextEncoder",
+        "TextDecoder",
+        "btoa",
+        "atob",
+        "setTimeout",
+        "clearTimeout",
+    ];
+
+    /// Names section 8.1 requires that this platform does NOT provide. Every
+    /// one of these is a documented gap, not an oversight to paper over: a
+    /// handler calling one gets a ReferenceError.
+    const CANON_GLOBALS_ABSENT: &[&str] = &[
+        "fetch",
+        "crypto",
+        "ReadableStream",
+        "WritableStream",
+        "TransformStream",
+        "setInterval",
+        "clearInterval",
+    ];
+
+    /// Beyond the canon's list: platform extras this runtime does provide.
+    const EXTRA_GLOBALS_PRESENT: &[&str] = &[
+        "console",
+        "queueMicrotask",
+        "EventTarget",
+        "caches",
+        "WebSocketPair",
+        "WebSocketServer",
+    ];
+
+    /// Beyond the canon's list: things a handler ported from another platform
+    /// is likely to reach for and will not find here.
+    const EXTRA_GLOBALS_ABSENT: &[&str] = &[
+        "Deno",
+        "AbortController",
+        "AbortSignal",
+        "Blob",
+        "File",
+        "FormData",
+        "URLPattern",
+        "WebSocket",
+        "BroadcastChannel",
+        "structuredClone",
+        "Event",
+        "performance",
+        "navigator",
+        "addEventListener",
+    ];
+
+    #[tokio::test]
+    async fn the_isolate_global_surface_is_the_one_the_documents_describe() {
+        let names: Vec<&str> = CANON_GLOBALS_PRESENT
+            .iter()
+            .chain(CANON_GLOBALS_ABSENT)
+            .chain(EXTRA_GLOBALS_PRESENT)
+            .chain(EXTRA_GLOBALS_ABSENT)
+            .copied()
+            .collect();
+        let list = names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let code = format!(
+            "export default function handler() {{ const names = [{list}]; const out = {{}}; \
+             for (const n of names) out[n] = typeof globalThis[n] !== \"undefined\"; \
+             return new Response(JSON.stringify(out)); }}"
+        );
+
+        let mut runtime = AppRuntime::new(
+            "globals_app".to_string(),
+            code,
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (_status, _headers, body) = rx.await.unwrap().unwrap();
+        let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+
+        for name in CANON_GLOBALS_PRESENT.iter().chain(EXTRA_GLOBALS_PRESENT) {
+            assert_eq!(
+                seen[*name], true,
+                "`{name}` is documented as available and is not defined in the isolate"
+            );
+        }
+        for name in CANON_GLOBALS_ABSENT.iter().chain(EXTRA_GLOBALS_ABSENT) {
+            assert_eq!(
+                seen[*name], false,
+                "`{name}` is now defined in the isolate; add it to the present list here and \
+                 to crates/deis-runtime/README.md and edge-canon's PLATFORM_MATRIX.md"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn utf8_round_trips_through_the_encoding_globals() {
+        // Not a formality: `request.arrayBuffer()`, `blob.put` with a string,
+        // `blob.get(...).text()` and binary WebSocket frames all call these,
+        // and every one of them threw ReferenceError while they were missing.
+        let code = r#"
+            export default function handler() {
+                const enc = new TextEncoder();
+                const dec = new TextDecoder();
+                const text = "canon é €€ 🚀";
+
+                const bytes = enc.encode(text);
+                const out = {
+                    encoding: enc.encoding,
+                    isUint8Array: bytes instanceof Uint8Array,
+                    // The euro sign is three bytes and the rocket four, so a
+                    // per-character count would be wrong here and this would
+                    // say so.
+                    byteLength: bytes.length,
+                    roundTrip: dec.decode(bytes) === text,
+                    decodesArrayBuffer: dec.decode(bytes.buffer) === text,
+                    emptyIsEmptyString: dec.decode(new Uint8Array([])) === "",
+                    // A byte order mark is metadata, not the first character.
+                    bomStripped: dec.decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x68, 0x69])) === "hi",
+                    // A truncated sequence becomes U+FFFD rather than throwing
+                    // or silently producing a wrong character.
+                    invalidReplaced: dec.decode(new Uint8Array([0x68, 0xff, 0x69])) === "h�i",
+                    base64: btoa("Hello World"),
+                    base64RoundTrip: atob(btoa("Hello World")) === "Hello World",
+                };
+
+                try {
+                    new TextDecoder("iso-8859-1");
+                    out.rejectsOtherEncodings = false;
+                } catch (e) {
+                    out.rejectsOtherEncodings = e instanceof RangeError;
+                }
+
+                try {
+                    btoa("é€");
+                    out.btoaRejectsNonLatin1 = false;
+                } catch (e) {
+                    out.btoaRejectsNonLatin1 = e instanceof TypeError;
+                }
+
+                try {
+                    atob("not base64!");
+                    out.atobRejectsGarbage = false;
+                } catch (e) {
+                    out.atobRejectsGarbage = e instanceof TypeError;
+                }
+
+                return new Response(JSON.stringify(out));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "encoding_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+
+        assert_eq!(seen["encoding"], "utf-8");
+        assert_eq!(seen["isUint8Array"], true);
+        // "canon " 6 + "é" 2 + " " 1 + two euro signs 6 + " " 1 + rocket 4 = 20.
+        assert_eq!(seen["byteLength"], 20);
+        assert_eq!(seen["roundTrip"], true, "{seen}");
+        assert_eq!(seen["decodesArrayBuffer"], true);
+        assert_eq!(seen["emptyIsEmptyString"], true);
+        assert_eq!(seen["bomStripped"], true);
+        assert_eq!(seen["invalidReplaced"], true);
+        assert_eq!(seen["base64"], "SGVsbG8gV29ybGQ=");
+        assert_eq!(seen["base64RoundTrip"], true);
+        assert_eq!(seen["rejectsOtherEncodings"], true);
+        assert_eq!(seen["btoaRejectsNonLatin1"], true);
+        assert_eq!(seen["atobRejectsGarbage"], true);
+    }
+
+    #[tokio::test]
+    async fn a_request_body_can_be_read_as_bytes() {
+        // `arrayBuffer()` is how a handler gets at a body that is not text.
+        // It went through TextEncoder, so it threw ReferenceError on every
+        // call until the encoders above existed - and no test covered it.
+        let code = r#"
+            export default async function handler(context) {
+                const buf = await context.request.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                return new Response(JSON.stringify({
+                    byteLength: buf.byteLength,
+                    first: bytes[0],
+                    text: new TextDecoder().decode(bytes),
+                }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "array_buffer_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "POST".to_string(),
+                HashMap::new(),
+                Some("héllo".to_string()),
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+        assert_eq!(seen["byteLength"], 6);
+        assert_eq!(seen["first"], 104);
+        assert_eq!(seen["text"], "héllo");
+    }
+
+    #[tokio::test]
+    async fn an_app_stores_and_reads_bytes_through_its_blob_binding() {
+        // Object storage had two independent breaks and no test on the path,
+        // so the platform matrix called it working for a long time while a
+        // single `blob.put(key, "text")` threw. One break was in the op - the
+        // bytes went through `#[serde]`, which rejects a Uint8Array outright -
+        // and the other was in the JS, which reached for TextEncoder and
+        // TextDecoder that this runtime did not define.
+        let store = TestStore::start().await;
+
+        let wiring = ServiceWiring {
+            declaration: ServiceDeclaration::from_names(["blob"]),
+            endpoints: ServiceEndpoints {
+                store: Some(store.endpoint.clone()),
+                queue: None,
+            },
+            consumers: Vec::new(),
+        };
+
+        let code = r#"
+            export default async function handler(ctx) {
+                const blob = ctx.services.blob;
+
+                // A string, which has to be encoded on the way in.
+                await blob.put("greeting.txt", "hello é€🚀");
+                const text = await blob.get("greeting.txt");
+
+                // Raw bytes, which must survive unchanged.
+                const raw = new Uint8Array([0, 1, 2, 253, 254, 255]);
+                await blob.put("raw.bin", raw);
+                const back = await blob.get("raw.bin");
+                const bytes = new Uint8Array(await back.arrayBuffer());
+
+                const missing = await blob.get("never-written");
+
+                await blob.delete("greeting.txt");
+                const deleted = await blob.get("greeting.txt");
+
+                return new Response(JSON.stringify({
+                    text: await text.text(),
+                    roundTripBytes: Array.from(bytes),
+                    missingIsNull: missing === null,
+                    deletedIsNull: deleted === null,
+                }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "e2e_blob_app.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &wiring,
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        drop(store);
+
+        assert_eq!(status, 200, "body: {body:?}");
+        let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+        assert_eq!(seen["text"], "hello é€🚀");
+        assert_eq!(
+            seen["roundTripBytes"],
+            serde_json::json!([0, 1, 2, 253, 254, 255])
+        );
+        assert_eq!(seen["missingIsNull"], true);
+        assert_eq!(seen["deletedIsNull"], true);
     }
 }

@@ -3,7 +3,6 @@
 pub mod handlers;
 
 use crate::app::ApplicationManager;
-use crate::config_store::ConfigStore;
 use crate::deployment::DeploymentManager;
 use crate::health::NodeHealth;
 use crate::management::ManagementServer;
@@ -30,7 +29,6 @@ pub struct AppState {
 /// into another same-typed argument at a call site.
 pub struct ServerOptions {
     pub app_manager: Arc<ApplicationManager>,
-    pub config_store: Arc<ConfigStore>,
     /// Takes delivery of deployments pushed to this node.
     pub deployer: Arc<DeploymentManager>,
     /// Readiness, which the `HealthCheck` RPC reports.
@@ -107,7 +105,6 @@ async fn shutdown_signal() -> &'static str {
 pub async fn start_server(options: ServerOptions) -> Result<()> {
     let ServerOptions {
         app_manager,
-        config_store,
         deployer,
         health,
         node_id,
@@ -123,7 +120,6 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     // Create gRPC services
     let management_service = ManagementServer::create_service(
         app_manager.clone(),
-        config_store,
         deployer,
         health,
         node_id,

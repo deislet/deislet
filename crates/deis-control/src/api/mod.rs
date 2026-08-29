@@ -22,7 +22,6 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{error, info, warn};
 
 use crate::{
-    broadcast::EventBroadcaster,
     catalog::{BundleStore, CatalogStore, SecretsBackend},
     command::CommandExecutor,
     config::ControlConfig,
@@ -38,14 +37,13 @@ use crate::{
 pub struct AppState {
     pub sessions: Arc<SessionManager>,
     pub database: Option<Arc<Database>>,
-    pub broadcaster: Arc<EventBroadcaster>,
 }
 
 pub struct ApiRouter {
     pub router: Router,
     pub auth_config: middleware::AuthConfig,
     /// The node channel's credential, reported at startup next to the API
-    /// key so an operator sees both states rather than only the one that
+    /// key so an operator sees both, rather than only the one that
     /// `api_auth_enabled` controls.
     pub node_auth: middleware::NodeAuthConfig,
     pub tls_enabled: bool,
@@ -57,7 +55,6 @@ pub struct ApiRouter {
 pub fn build_api_router(
     sessions: Arc<SessionManager>,
     database: Arc<Database>,
-    broadcaster: Arc<EventBroadcaster>,
     config_manager: Arc<ConfigManager>,
     command_executor: Arc<CommandExecutor>,
     metrics_collector: Arc<MetricsCollector>,
@@ -67,7 +64,6 @@ pub fn build_api_router(
     let app_state = AppState {
         sessions: Arc::clone(&sessions),
         database: Some(Arc::clone(&database)),
-        broadcaster: Arc::clone(&broadcaster),
     };
 
     let configs_state = configs::ConfigsState {
@@ -91,18 +87,28 @@ pub fn build_api_router(
         deis_runtime: Arc::clone(&deis_runtime_manager),
     };
 
+    // One credential object for the whole node channel: the assignment
+    // list, the bundle download and the registration endpoint must accept
+    // exactly the same keys, and building it three times would let them
+    // drift.
+    let node_auth = middleware::NodeAuthConfig::from_control_config(&config);
+
     let catalog_state = build_catalog_state(
         Arc::clone(&database),
         Arc::clone(&deis_runtime_manager),
+        node_auth.clone(),
         &config,
     );
 
     let auth_config = middleware::AuthConfig::from_control_config(&config);
 
     let protected_routes = Router::new()
-        .route("/api/nodes", get(nodes::list_nodes))
-        .route("/api/nodes/:id", get(nodes::get_node))
-        .route("/api/nodes/:id/heartbeats", get(nodes::get_heartbeats))
+        // Not "/api/nodes": that prefix belongs to the endpoints nodes
+        // themselves call. These three are about the control channels open
+        // to this process - see `api::nodes`.
+        .route("/api/sessions", get(nodes::list_sessions))
+        .route("/api/sessions/:id", get(nodes::get_session))
+        .route("/api/sessions/:id/heartbeats", get(nodes::get_heartbeats))
         .with_state(app_state.clone())
         .route("/api/configs", get(configs::list_all_configs))
         .route("/api/configs/stats", get(configs::get_config_stats))
@@ -165,7 +171,7 @@ pub fn build_api_router(
         .route("/api/metrics", get(metrics::export_prometheus))
         .route("/api/metrics/summary", get(metrics::get_metrics_summary))
         .with_state(metrics_state)
-        .route("/api/runtime", get(apps::list_nodes))
+        .route("/api/runtime", get(apps::list_fleet))
         .route("/api/runtime/:node/status", get(apps::node_status))
         .route("/api/runtime/:node/apps/:app_id", delete(apps::unload_app))
         .with_state(apps_state)
@@ -184,7 +190,7 @@ pub fn build_api_router(
     let node_routes = catalog::node_router(catalog_state).merge(registration::node_router(
         registration::RegistrationState {
             nodes: Arc::clone(&deis_runtime_manager),
-            node_auth: middleware::NodeAuthConfig::from_control_config(&config),
+            node_auth: node_auth.clone(),
         },
     ));
 
@@ -211,7 +217,7 @@ pub fn build_api_router(
     ApiRouter {
         router: app,
         auth_config,
-        node_auth: middleware::NodeAuthConfig::from_control_config(&config),
+        node_auth,
         tls_enabled,
     }
 }
@@ -224,6 +230,7 @@ pub fn build_api_router(
 fn build_catalog_state(
     database: Arc<Database>,
     nodes: Arc<RuntimeNodeManager>,
+    node_auth: middleware::NodeAuthConfig,
     config: &ControlConfig,
 ) -> catalog::CatalogState {
     let bundles = BundleStore::new(config.bundle_dir.clone());
@@ -277,17 +284,15 @@ fn build_catalog_state(
         );
     }
 
-    let node_auth = middleware::NodeAuthConfig::from_control_config(config);
-    match (&secrets, node_auth.is_configured()) {
-        (SecretsBackend::Ready(_), false) => error!(
-            "node_preshared_keys is empty while a secret master key is configured: the endpoints that serve nodes are reachable by anyone who can reach this port, so the assignment list refuses to carry decrypted secrets and every application that has one will not run on any node until a node key is set"
-        ),
-        (_, false) => warn!(
-            "node_preshared_keys is empty: anyone who can reach this port can read which applications and versions this platform runs and download their bundles. Set a node key on the control plane and on every node"
-        ),
-        (_, true) => info!(
-            "The endpoints that serve nodes require one of the configured node_preshared_keys, whatever api_auth_enabled says; they are the only path on which secret values leave this process"
-        ),
+    if node_auth.key_count() == 0 {
+        error!(
+            "No node credential: the endpoints that serve nodes answer 503 to everyone, so no node can register, fetch its assignments or download a bundle, and nothing this platform holds will run. Set node_preshared_keys, or start through the binary, which mints a key when the file names none"
+        );
+    } else {
+        info!(
+            node_keys = node_auth.key_count(),
+            "The endpoints that serve nodes require one of the node keys, whatever api_auth_enabled says; they are the only path on which secret values leave this process"
+        );
     }
 
     let store = Arc::new(CatalogStore::new(database));
@@ -386,7 +391,6 @@ pub fn log_api_ready(
     grpc_shared: bool,
 ) {
     let scheme = if tls_enabled { "https" } else { "http" };
-    let ws_scheme = if tls_enabled { "wss" } else { "ws" };
 
     info!("====================================");
     if grpc_shared {
@@ -396,7 +400,6 @@ pub fn log_api_ready(
     }
     info!("📡 API: {}://localhost:{}", scheme, port);
     info!("📊 Health: {}://localhost:{}/health", scheme, port);
-    info!("🔌 WebSocket: {}://localhost:{}/api/ws", ws_scheme, port);
     info!(
         "{} TLS: {}",
         if tls_enabled { "🔒" } else { "⚠️" },
@@ -414,35 +417,45 @@ pub fn log_api_ready(
     // Said separately because it is a separate credential: this one is not
     // governed by api_auth_enabled, and it is the one that guards secrets.
     info!(
-        "{} Node endpoints (assignments, bundle download): {}",
-        if node_auth.is_configured() {
+        "{} Node endpoints (registration, assignments, bundle download): {}",
+        if node_auth.key_count() > 0 {
             "🔐"
         } else {
-            "⚠️"
+            "⛔"
         },
-        if node_auth.is_configured() {
+        if node_auth.key_count() > 0 {
             "authenticated with node_preshared_keys"
         } else {
-            "OPEN - no node_preshared_keys configured, so no secret is served to any node"
+            "SHUT - no node key at all, so every caller gets 503 and no node can join or load anything"
         }
     );
     info!("====================================");
 }
 
-/// Start HTTP API server
+/// Start HTTP API server.
+///
+/// Takes the configuration by value because it completes it: a control plane
+/// that is about to serve must have a node credential, so one is minted here
+/// when the file names none. Anything that serves and cannot do that would
+/// leave the node endpoints answering 503.
 // Each argument is a distinct shared component; bundling them into a struct
 // would only move the same list into a builder without simplifying call sites.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_api_server(
     sessions: Arc<SessionManager>,
     database: Arc<Database>,
-    broadcaster: Arc<EventBroadcaster>,
     config_manager: Arc<ConfigManager>,
     command_executor: Arc<CommandExecutor>,
     metrics_collector: Arc<MetricsCollector>,
-    config: Arc<ControlConfig>,
+    mut config: ControlConfig,
     port: u16,
 ) -> anyhow::Result<()> {
+    if let crate::config::NodeCredentialSource::Generated(_) = config.ensure_node_credential() {
+        warn!(
+            "No node_preshared_keys configured, so a node credential was generated for this run; nothing can register or fetch assignments without it"
+        );
+    }
+    let config = Arc::new(config);
     let tls_config = config.tls.clone();
     let deis_runtime_manager = Arc::new(crate::runtime_client::RuntimeNodeManager::new_with_ttl(
         config.deis_runtime_nodes.clone(),
@@ -457,7 +470,6 @@ pub async fn start_api_server(
     let api = build_api_router(
         sessions,
         database,
-        broadcaster,
         config_manager,
         command_executor,
         metrics_collector,

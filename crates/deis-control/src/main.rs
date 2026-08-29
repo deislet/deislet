@@ -67,6 +67,24 @@ async fn main() -> Result<(), anyhow::Error> {
         config.port = port;
     }
 
+    // Before anything is served: this control plane must have a credential
+    // that tells a node from any other caller. Without one, registering a
+    // node - and thereby becoming a delivery target that is handed every
+    // environment's decrypted secrets - would be open to whoever can reach
+    // the port. A missing key is filled in here rather than left empty, and
+    // the value is printed once because it exists nowhere else.
+    if let deis_control::config::NodeCredentialSource::Generated(key) =
+        config.ensure_node_credential()
+    {
+        warn!(
+            "No node_preshared_keys in the configuration, so one was generated for this run:\n\
+             \n    node_preshared_keys = [\"{key}\"]\n\
+             \nPut that line in the control plane's configuration file and the same value in \
+             every node's [control] secret. Until then it changes on every restart, and a node \
+             holding the old value gets 401 and keeps serving whatever it already had."
+        );
+    }
+
     let bind_addr = config.bind_addr.clone();
     let port = config.port;
 
@@ -89,7 +107,6 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_shutdown(shutdown.clone());
 
     let sessions = server.sessions();
-    let broadcaster = server.broadcaster();
     let db = server.database().expect("Database not initialized");
 
     let config_manager = Arc::new(deis_control::ConfigManager::new(
@@ -97,10 +114,10 @@ async fn main() -> Result<(), anyhow::Error> {
         Arc::clone(&sessions),
     ));
 
-    let command_executor = Arc::new(
-        deis_control::CommandExecutor::new(Arc::clone(&sessions), Arc::clone(&db))
-            .with_broadcaster(Arc::clone(&broadcaster)),
-    );
+    let command_executor = Arc::new(deis_control::CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&db),
+    ));
 
     let server = server.with_command_executor(Arc::clone(&command_executor));
 
@@ -165,7 +182,6 @@ async fn main() -> Result<(), anyhow::Error> {
     let api = deis_control::api::build_api_router(
         sessions,
         db,
-        broadcaster,
         config_manager,
         command_executor,
         metrics_collector,

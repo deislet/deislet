@@ -293,64 +293,61 @@ impl DbClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_store::TestStore;
 
-    /// These tests need a live deis-store; they stay #[ignore] until an
-    /// integration environment provides one.
-    ///
-    /// The address below is a deliberate placeholder, not configuration:
-    /// port 1 is reserved and nothing listens there, so a run that forgets
-    /// the #[ignore] fails as a connection error instead of quietly talking
-    /// to whatever happens to be on a real port. deis-store's actual default
-    /// is 127.0.0.1:8090.
     #[tokio::test]
-    #[ignore]
-    async fn test_db_client_connect() {
+    async fn connecting_to_nothing_is_an_error_rather_than_a_client_that_fails_later() {
+        // Port 1 is reserved and nothing listens there, so this cannot
+        // accidentally reach a real store on a developer's machine.
         let result = DbClient::connect("http://127.0.0.1:1", "test_app.production").await;
-        // Should return connection error if service is not running
-        // Only testing client code compilation and basic logic here
-        assert!(result.is_err() || result.is_ok());
+        assert!(
+            result.is_err(),
+            "a client built against an address nobody answers must fail here, not on first use"
+        );
     }
 
     #[tokio::test]
-    #[ignore]
-    async fn test_db_client_operations() {
-        // This test requires a real deis-control server
-        let client = DbClient::connect("http://127.0.0.1:1", "test_app.production")
+    async fn the_sql_surface_round_trips_against_a_real_store() {
+        // Every statement below crosses the gRPC boundary into deis-store and
+        // back. Asserting the client's own code alone would prove nothing:
+        // the contract - parameter encoding, the row/column shape, the batch
+        // atomicity, prepared-statement handles - is owned by the other side.
+        let store = TestStore::start().await;
+        let client = DbClient::connect(&store.endpoint, "db_client_test.production")
             .await
-            .expect("Failed to connect");
+            .expect("the store is listening");
 
-        // Create table
         client
             .execute(
                 "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)".to_string(),
                 None,
             )
             .await
-            .expect("Failed to create table");
+            .expect("create table");
 
-        // Insert
         let (rows_affected, insert_id) = client
             .execute(
                 "INSERT INTO users (name) VALUES (?)".to_string(),
                 Some("[\"Alice\"]".to_string()),
             )
             .await
-            .expect("Failed to insert");
+            .expect("insert");
         assert_eq!(rows_affected, 1);
-        assert!(insert_id.is_some());
+        assert!(
+            insert_id.is_some(),
+            "an autoincrement insert reports its id"
+        );
 
-        // Query
         let (rows, columns) = client
             .query(
                 "SELECT * FROM users WHERE name = ?".to_string(),
                 Some("[\"Alice\"]".to_string()),
             )
             .await
-            .expect("Failed to query");
-        assert!(columns.contains(&"name".to_string()));
-        assert!(rows.contains("Alice"));
+            .expect("query");
+        assert!(columns.contains(&"name".to_string()), "{columns:?}");
+        assert!(rows.contains("Alice"), "{rows}");
 
-        // Batch
         let batch_results = client
             .batch(vec![
                 (
@@ -363,26 +360,64 @@ mod tests {
                 ),
             ])
             .await
-            .expect("Failed to batch");
+            .expect("batch");
         assert_eq!(batch_results.len(), 2);
 
-        // Prepare
         let stmt_id = client
             .prepare("SELECT * FROM users WHERE id = ?".to_string())
             .await
-            .expect("Failed to prepare");
-
-        // Execute prepared
+            .expect("prepare");
         let (rows, _) = client
             .query_prepared(stmt_id, Some("[1]".to_string()))
             .await
-            .expect("Failed to query prepared");
-        assert!(rows.contains("Alice"));
+            .expect("query prepared");
+        assert!(rows.contains("Alice"), "{rows}");
 
-        // Cleanup
         client
             .execute("DROP TABLE users".to_string(), None)
             .await
-            .expect("Failed to drop table");
+            .expect("drop table");
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_fails_partway_leaves_nothing_behind() {
+        // This is the one property `database.transaction` would have offered
+        // and does not: deis-store runs a batch atomically, so a statement
+        // that fails takes the earlier ones in the same batch with it.
+        let store = TestStore::start().await;
+        let client = DbClient::connect(&store.endpoint, "db_batch_test.production")
+            .await
+            .expect("the store is listening");
+
+        client
+            .execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)".to_string(),
+                None,
+            )
+            .await
+            .expect("create table");
+
+        let failed = client
+            .batch(vec![
+                (
+                    "INSERT INTO t (v) VALUES (?)".to_string(),
+                    Some("[\"first\"]".to_string()),
+                ),
+                (
+                    "INSERT INTO nonexistent_table (v) VALUES (1)".to_string(),
+                    None,
+                ),
+            ])
+            .await;
+        assert!(failed.is_err(), "a batch with a bad statement must fail");
+
+        let (rows, _) = client
+            .query("SELECT v FROM t".to_string(), None)
+            .await
+            .expect("query");
+        assert!(
+            !rows.contains("first"),
+            "the successful half of a failed batch must have been rolled back: {rows}"
+        );
     }
 }

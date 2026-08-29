@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ControlConfig::new(
         "test-deis_runtime-node".to_string(),
         TEST_SECRET.to_string(),
-        "ws://127.0.0.1:9001".to_string(),
+        "http://127.0.0.1:9001".to_string(),
     );
 
     let node_info = NodeInfo::new_single_port(

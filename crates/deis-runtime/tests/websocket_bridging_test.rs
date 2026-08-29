@@ -1,149 +1,176 @@
-// WebSocket message bridging integration test
+//! WebSocket bridging, end to end through the dispatcher.
+//!
+//! `websocket_direct_test` drives the Rust-to-JS bridge by calling
+//! `AppRuntime` directly, which leaves the half in between untested: the
+//! dispatcher has to notice that the app answered 101, read the connection id
+//! out of the response, take over the socket, and wire the two directions
+//! together. This test goes over a real TCP socket with a real WebSocket
+//! client, so every one of those steps has to work for it to pass.
+//!
+//! It binds port 0 and serves the router itself. An earlier version of this
+//! file posted to a hard-coded `localhost:8000`, printed "Server not running,
+//! skipping test" and returned - so it passed whether the code worked, was
+//! broken, or was not running at all, and the endpoint it posted to had since
+//! been removed from the dispatcher anyway.
 
+use axum::routing::any;
+use axum::Router;
+use deis_runtime::app::{AppKey, ApplicationManager};
+use deis_runtime::dispatcher::{handlers, AppState};
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-#[tokio::test]
-async fn test_websocket_echo_bridging() {
-    println!("\n🧪 Testing WebSocket message bridging functionality");
-
-    // Deploy WebSocket echo app
-    let code = r#"
-        globalThis.default = {
-          async fetch(request) {
-            if (request.headers.Upgrade === "websocket") {
-              const pair = new WebSocketPair();
-              const server = pair.server;
-              const client = pair.client;
-
-              server.accept();
-
-              server.onopen = (event) => {
-                console.log("WebSocket opened");
-                server.send("Welcome to echo server!");
-              };
-
-              server.onmessage = (event) => {
-                console.log("Received:", event.data);
+/// An edge-canon WebSocket echo server: upgrade, accept, echo every message
+/// back with a prefix so a reply cannot be confused with what was sent.
+const ECHO_APP: &str = r#"
+    export default async function handler(context) {
+        if (context.request.headers.get("upgrade") === "websocket") {
+            const pair = new WebSocketPair();
+            const client = pair[0];
+            const server = pair[1];
+            server.accept();
+            server.addEventListener("message", (event) => {
                 server.send("Echo: " + event.data);
-              };
+            });
+            return new Response(null, { status: 101, webSocket: client });
+        }
+        return new Response("WebSocket Echo App");
+    }
+"#;
 
-              server.onclose = (event) => {
-                console.log("WebSocket closed");
-              };
+#[tokio::test]
+async fn a_websocket_message_crosses_the_dispatcher_in_both_directions() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-              return new Response(null, {
-                status: 101,
-                webSocket: client,
-              });
+    let app_manager = Arc::new(ApplicationManager::new());
+    let state = AppState {
+        app_manager: app_manager.clone(),
+    };
+    app_manager
+        .load_app(
+            AppKey::production("ws_bridge_app"),
+            ECHO_APP.to_string(),
+            Default::default(),
+            None,
+        )
+        .await
+        .expect("the echo app loads");
+
+    let router = Router::new()
+        .route("/*path", any(handlers::handle_request))
+        .route("/", any(handlers::handle_request))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port to serve on");
+    let addr = listener.local_addr().expect("the address it bound");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    // The app is addressed the way deis-proxy addresses it: by header, not by
+    // path. Without it the dispatcher answers 400 and never reaches an
+    // isolate, which is the same contract the HTTP end-to-end test relies on.
+    let mut request = format!("ws://{addr}/")
+        .into_client_request()
+        .expect("a websocket request");
+    request.headers_mut().insert(
+        "x-deis-app-id",
+        "ws_bridge_app".parse().expect("a header value"),
+    );
+
+    let (mut socket, response) = connect_async(request)
+        .await
+        .expect("the dispatcher completes the upgrade");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SWITCHING_PROTOCOLS,
+        "an upgrade that did not switch protocols is not a bridge"
+    );
+
+    for sent in ["Hello WebSocket!", "Second message!"] {
+        socket
+            .send(Message::Text(sent.to_string()))
+            .await
+            .expect("the client can send");
+
+        let echoed = loop {
+            let message = socket
+                .next()
+                .await
+                .expect("the bridge stays open")
+                .expect("a readable frame");
+            match message {
+                Message::Text(text) => break text,
+                // A pong or a ping is not the answer, but it is not a failure
+                // either; keep reading rather than asserting on frame order.
+                Message::Ping(_) | Message::Pong(_) => continue,
+                other => panic!("expected the echo, got {other:?}"),
             }
-
-            return new Response("WebSocket Echo App");
-          },
         };
-    "#;
+        assert_eq!(
+            echoed,
+            format!("Echo: {sent}"),
+            "the message did not survive the round trip through the isolate"
+        );
+    }
 
-    // Deploy app
-    let client = reqwest::Client::new();
-    let response = client
-        .post("http://localhost:8000/api/apps")
-        .json(&serde_json::json!({
-            "id": "ws-bridge-test",
-            "code": code
-        }))
+    socket
+        .send(Message::Close(None))
+        .await
+        .expect("the client can close");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn a_plain_request_to_a_websocket_app_is_answered_as_http() {
+    // The same handler serves both, so the upgrade branch must not swallow an
+    // ordinary request - and the dispatcher must not treat every response
+    // from an app that *can* upgrade as one.
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let app_manager = Arc::new(ApplicationManager::new());
+    let state = AppState {
+        app_manager: app_manager.clone(),
+    };
+    app_manager
+        .load_app(
+            AppKey::production("ws_bridge_app"),
+            ECHO_APP.to_string(),
+            Default::default(),
+            None,
+        )
+        .await
+        .expect("the echo app loads");
+
+    let router = Router::new()
+        .route("/*path", any(handlers::handle_request))
+        .route("/", any(handlers::handle_request))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port to serve on");
+    let addr = listener.local_addr().expect("the address it bound");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/"))
+        .header("x-deis-app-id", "ws_bridge_app")
         .send()
-        .await;
+        .await
+        .expect("the dispatcher answers");
 
-    if let Err(e) = response {
-        println!("⚠️  Server not running, skipping test: {}", e);
-        return;
-    }
+    assert!(response.status().is_success());
+    assert_eq!(response.text().await.expect("a body"), "WebSocket Echo App");
 
-    let response = response.unwrap();
-    if !response.status().is_success() {
-        println!("⚠️  App deployment failed, skipping test");
-        return;
-    }
-
-    println!("✅ App deployed successfully");
-
-    // Connect WebSocket
-    let url = "ws://localhost:8000/apps/ws-bridge-test";
-    println!("🔗 Connecting to: {}", url);
-
-    match connect_async(url).await {
-        Ok((mut ws_stream, _)) => {
-            println!("✅ WebSocket connection established");
-
-            // Receive welcome message
-            if let Some(Ok(Message::Text(welcome))) = ws_stream.next().await {
-                println!("📥 Received: {}", welcome);
-                assert!(
-                    welcome.contains("Welcome"),
-                    "Should receive welcome message"
-                );
-            } else {
-                panic!("Did not receive welcome message");
-            }
-
-            // Send test message 1
-            let test_msg1 = "Hello WebSocket!";
-            println!("📤 Sending: {}", test_msg1);
-            ws_stream
-                .send(Message::Text(test_msg1.to_string()))
-                .await
-                .expect("Failed to send message");
-
-            // Receive echo
-            if let Some(Ok(Message::Text(echo1))) = ws_stream.next().await {
-                println!("📥 Received: {}", echo1);
-                assert!(echo1.contains("Echo:"), "Should receive echo reply");
-                assert!(
-                    echo1.contains(test_msg1),
-                    "Reply should contain original message"
-                );
-            } else {
-                panic!("Did not receive echo reply");
-            }
-
-            // Send test message 2
-            let test_msg2 = "Second message!";
-            println!("📤 Sending: {}", test_msg2);
-            ws_stream
-                .send(Message::Text(test_msg2.to_string()))
-                .await
-                .expect("Failed to send message");
-
-            // Receive echo
-            if let Some(Ok(Message::Text(echo2))) = ws_stream.next().await {
-                println!("📥 Received: {}", echo2);
-                assert!(echo2.contains("Echo:"), "Should receive echo reply");
-                assert!(
-                    echo2.contains(test_msg2),
-                    "Reply should contain original message"
-                );
-            } else {
-                panic!("Did not receive echo reply");
-            }
-
-            // Close connection
-            println!("🔌 Closing connection");
-            ws_stream
-                .send(Message::Close(None))
-                .await
-                .expect("Failed to close connection");
-
-            println!("✅ WebSocket message bridging test successful!");
-        }
-        Err(e) => {
-            println!("⚠️  WebSocket connection failed: {}", e);
-            println!("This may be because the server is not running or the app was not deployed correctly");
-        }
-    }
-
-    // Cleanup: delete app
-    let _ = client
-        .delete("http://localhost:8000/api/apps/ws-bridge-test")
-        .send()
-        .await;
+    server.abort();
+    let _ = server.await;
 }

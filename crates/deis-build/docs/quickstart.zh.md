@@ -214,7 +214,7 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use deis-build::{Compiler, CompilerOptions};
+use deis_build::{Compiler, CompilerOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -236,7 +236,8 @@ async fn main() -> anyhow::Result<()> {
 
 ## 下一步
 
-- 📖 阅读 [架构设计](./architecture.md) 了解 Build 工作原理
+- 📖 阅读 [适配器规范](./adapter-specs.zh.md) 了解各平台产出什么，
+  平台整体设计在 [architecture.zh.md](../../../docs/architecture.zh.md)
 - 📖 查看 [输出模式](./output-modes.md) 了解 Files/Memory/Both 模式
 - 📖 阅读 [基础服务](./basic-services.md) 了解 KV 和 Cache 使用
 - 📖 查看 [Edge Canon 规范](https://github.com/deislet/edge-canon)

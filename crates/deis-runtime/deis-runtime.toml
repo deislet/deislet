@@ -69,10 +69,13 @@ max_pending_entries = 10000
 # How this node reaches the control plane: it announces itself, asks what it
 # should be running, and keeps matching the answer.
 #
-# On startup it POSTs to <endpoint>/api/nodes/<node_id>/register so the control
-# plane knows this node exists without an operator editing anything on that
-# side, then calls GET <endpoint>/api/nodes/<node_id>/assignments, downloads and
-# loads every version named there, and only then reports healthy. After that it
+# On startup it sends PUT <endpoint>/api/nodes/<node_id>/registration so the
+# control plane knows this node exists without an operator editing anything on
+# that side, then calls GET <endpoint>/api/nodes/<node_id>/assignments, downloads
+# and loads every version named there, and only then reports healthy. Neither
+# path is spelled out in the code: both come from
+# deis_wire::conventions::{node_registration_path, node_assignments_path}, so
+# the two sides cannot drift apart. After that it
 # re-asks on a timer (reconcile_interval_secs). With no endpoint set the node
 # never asks anyone: it runs what is already in its bundle directory plus
 # whatever is pushed to it, and reports healthy immediately.

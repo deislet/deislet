@@ -1,218 +1,126 @@
-# Contributing to Deis
+# Contributing
 
-感谢您对 Deis 的贡献兴趣!本文档提供了项目开发指南。
+This is the only contributing document in the repository. It sits next to
+`deis` because that is where it grew, but it applies to the whole workspace.
 
-## 开发环境设置
+It replaces a document that described a pnpm monorepo with `packages/types`,
+`packages/cli` and Vitest. None of that has ever existed here: this is a Cargo
+workspace, and the only npm project in it is the control plane's web console.
 
-### 前置要求
+## What you need
 
-- Node.js >= 18.0.0
-- pnpm >= 8.0.0
+- Rust 1.85 or later. Crates in this workspace are a mix of edition 2021 and
+  edition 2024, and 1.85 is the first release that understands the latter.
+- Node.js 18 or later — the compiler shells out to it for bundling, and the
+  control plane's console is built with it.
 
-### 安装依赖
-
-```bash
-git clone https://github.com/deislet/deis.git
-cd deis
-pnpm install
-```
-
-### 构建项目
+## First build
 
 ```bash
-# 构建所有包
-pnpm build
+# The console is embedded in deis-control at compile time and its output is
+# gitignored, so this comes first or `cargo build` fails.
+cd crates/deis-control/web && npm ci && npm run build && cd -
 
-# 监听模式 (开发时使用)
-pnpm dev
+cargo build --workspace
 ```
 
-### 运行测试
+## The loop
+
+Work one package at a time. `--workspace` builds a V8 engine you probably did
+not touch.
 
 ```bash
-# 运行所有测试
-pnpm test
-
-# 运行 lint
-pnpm lint
+cargo build   -p <package>
+cargo test    -p <package>
+cargo clippy  -p <package> --all-targets -- -D warnings
+cargo fmt     -p <package>
 ```
 
-## 项目结构
+Zero clippy warnings in what you touched, and `cargo fmt` before you commit.
 
-```
-deis/
-├── packages/
-│   ├── types/       # 类型定义
-│   ├── cli/         # CLI 工具
-│   ├── compiler/    # 编译器
-│   └── adapters/    # 平台适配器
-├── cli-compiler-requirements.md
-└── README.md
+For anything that crosses component boundaries, run the real thing:
+
+```bash
+scripts/demo.sh start
+scripts/demo.sh verify
+scripts/demo.sh stop
 ```
 
-## 开发工作流
+## Rules that are not negotiable
 
-### 1. 添加新功能
+**Every behavioural change gets a test.** A change nothing can fail on is a
+change nobody will notice breaking.
 
-1. 创建功能分支:
-   ```bash
-   git checkout -b feature/my-feature
-   ```
+**Code is English.** Comments, identifiers, log messages, commit messages —
+all English, in every `.rs`, `.js`, `.ts`, `.toml` and `.proto`. Markdown may
+be Chinese; name those files `*.zh.md`.
 
-2. 实现功能并添加测试
+**Documents must be true or gone.** If you change behaviour, change the
+document that describes it in the same commit. If a document is a snapshot of
+a moment rather than a statement of a contract, delete it — a stale status
+document is worse than no document, because it is read as current. Two waves
+of this project have been lost to exactly that.
 
-3. 运行测试和 lint:
-   ```bash
-   pnpm test
-   pnpm lint
-   ```
+**Never copy a shared constant into prose or into a second crate.** Header
+names, route paths, tenant separators, message ceilings all live in
+`deis_wire::conventions`. Nothing checks that two crates spell an HTTP path the
+same way: a node once asked for `/register` while the control plane served
+`/registration`, both compiled, and the symptom was a fleet with no nodes in
+it.
 
-4. 提交更改:
-   ```bash
-   git commit -m "feat: add my feature"
-   ```
+**Names mean one thing each.**
 
-5. 推送并创建 Pull Request
+| Word | Means | Never means |
+|---|---|---|
+| worker | a Cloudflare Worker | a node, a thread, a process |
+| node | a registered `deis-runtime` process | a Worker |
+| control | the control plane, `deis-control` | supervisor, master |
+| env | an application's variables (`context.env`) | environment; that flag is always `-e, --environment` |
 
-### 2. 修复 Bug
+## Adding a build target
 
-1. 创建 bugfix 分支:
-   ```bash
-   git checkout -b fix/bug-description
-   ```
+The adapters live in `crates/deis-build-adapter-<vendor>`, and the crate name
+is the `--vendor` value verbatim — `--vendor cloudflare` is served by
+`deis-build-adapter-cloudflare`. A `VENDOR` constant in each one, and a test
+that compares it with `CARGO_PKG_NAME`, is what keeps that from drifting.
+`deis-build`'s dispatch matches on those constants rather than on literals.
 
-2. 修复 bug 并添加回归测试
+To add one:
 
-3. 提交:
-   ```bash
-   git commit -m "fix: description of bug fix"
-   ```
+1. Create `crates/deis-build-adapter-<vendor>` with `pub const VENDOR` and the
+   naming test.
+2. Implement `generate(routes, config) -> AdapterArtifacts`.
+3. Add the variant to `Platform` in `deis-build-core`, along with its honest
+   capability set — a feature the platform cannot do must be `false`, so the
+   build fails rather than the request.
+4. Add the arm to `deis-build`'s dispatch and the re-export in its `lib.rs`.
+5. Write a `spec_compliance` test against the vendor's real documented shape.
 
-### 3. 添加新平台支持
+## Commits
 
-参考 `packages/adapters/src/cloudflare/` 的实现模式:
+[Conventional Commits](https://www.conventionalcommits.org/), in English,
+short but specific:
 
-1. 在 `packages/adapters/src/` 下创建新目录
-2. 实现 KV、Database 等适配器
-3. 实现 Context Builder
-4. 在 Transformer 中添加入口点生成
-5. 添加集成测试
-
-## 代码规范
-
-### TypeScript
-
-- 使用严格模式 (`strict: true`)
-- 所有公共 API 必须有完整的类型定义
-- 避免使用 `any`,使用 `unknown` 代替
-- 使用 ESM 模块系统
-
-### 命名规范
-
-- 文件名: kebab-case (例如: `kv-adapter.ts`)
-- 类名: PascalCase (例如: `Compiler`)
-- 函数名: camelCase (例如: `createKVAdapter`)
-- 常量: UPPER_SNAKE_CASE (例如: `DEFAULT_PORT`)
-
-### 注释
-
-- 所有公共 API 必须有 JSDoc 注释
-- 复杂逻辑添加行内注释
-- 使用 TODO 标记待办事项
-
-示例:
-```typescript
-/**
- * Create KV adapter for Cloudflare Workers KV
- * @param namespace - Cloudflare KV namespace binding
- * @returns Unified KVStore interface
- */
-export function createKVAdapter(namespace: any): KVStore {
-  // Implementation
-}
+```
+feat(control): deliver decrypted secrets with the assignment list
+fix(runtime): stop a queue poller when its application is unloaded
+docs: make the written record match the code
 ```
 
-## 提交规范
+Do not reference tooling, assistants or generators anywhere — commit messages,
+comments, or documents.
 
-遵循 [Conventional Commits](https://www.conventionalcommits.org/):
+## Pull requests
 
-- `feat:` 新功能
-- `fix:` Bug 修复
-- `docs:` 文档更新
-- `style:` 代码格式调整
-- `refactor:` 重构
-- `test:` 测试相关
-- `chore:` 构建/工具相关
+A clear description, the linked issue, tests for the behaviour changed, and a
+green `cargo clippy -D warnings` and `cargo test` for every package touched.
 
-示例:
-```
-feat(compiler): add support for middleware
-fix(cli): resolve init command path issue
-docs: update architecture documentation
-```
+## Reporting a problem
 
-## 测试指南
+What you did, what you expected, what happened, and the versions of Rust and
+Node. If it involves the platform running, `.demo/logs/` from
+`scripts/demo.sh` is usually the fastest evidence.
 
-### 单元测试
+## License
 
-使用 Vitest:
-
-```typescript
-import { describe, it, expect } from 'vitest';
-import { Parser } from './parser';
-
-describe('Parser', () => {
-  it('should extract exports correctly', () => {
-    const parser = new Parser();
-    const result = parser.parse(code, 'test.ts');
-    expect(result.exports.hasDefault).toBe(true);
-  });
-});
-```
-
-### 集成测试
-
-测试完整的编译流程:
-
-```typescript
-describe('Compiler Integration', () => {
-  it('should compile project successfully', async () => {
-    const compiler = new Compiler();
-    const result = await compiler.compile({
-      projectDir: './fixtures/test-project',
-      vendors: ['cloudflare']
-    });
-    expect(result.success).toBe(true);
-  });
-});
-```
-
-## Pull Request 流程
-
-1. Fork 项目
-2. 创建功能分支
-3. 提交更改
-4. 推送到 fork
-5. 创建 Pull Request
-
-### PR 要求
-
-- 清晰的描述
-- 相关的 issue 链接
-- 测试覆盖
-- 通过 CI 检查
-- 代码审查通过
-
-## 问题反馈
-
-使用 GitHub Issues 报告问题,请包含:
-
-- 问题描述
-- 重现步骤
-- 期望行为
-- 实际行为
-- 环境信息 (Node 版本, OS 等)
-
-## 许可证
-
-通过贡献代码,您同意您的贡献将在 MIT 许可证下发布。
+Contributions are released under Apache-2.0, the licence of this repository.

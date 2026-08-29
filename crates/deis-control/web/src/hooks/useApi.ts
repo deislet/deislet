@@ -1,6 +1,53 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { api } from '@/lib/api'
+import type { Command } from '@/lib/api'
 
-interface NodeSummary {
+// Every request below goes through `api.request` rather than a bare `fetch`.
+// These hooks used to call `fetch` directly, which meant they sent no
+// `X-API-Key`: with `api_auth_enabled = true` the whole dashboard answered 401
+// on every poll, and lib/api.ts's 401 handler bounced the user back to a login
+// page that was itself polling. One request layer, one place that carries the
+// key and handles a 401.
+
+/**
+ * Read a list out of a response that may be either `{ <key>: [...] }` or a
+ * bare array. Both shapes are in use across these endpoints, and a mismatch
+ * used to surface as an empty page rather than an error.
+ */
+function listFrom<T>(data: unknown, key: string): T[] {
+  if (Array.isArray(data)) return data as T[]
+  if (data && typeof data === 'object') {
+    const value = (data as Record<string, unknown>)[key]
+    if (Array.isArray(value)) return value as T[]
+  }
+  return []
+}
+
+/**
+ * Same idea for an object-valued response: `{ <key>: {...} }` or the object
+ * itself.
+ */
+function objectFrom(data: unknown, key: string): Record<string, unknown> {
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const record = data as Record<string, unknown>
+    const value = record[key]
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value as Record<string, unknown>
+    }
+    return record
+  }
+  return {}
+}
+
+/**
+ * One node holding a control channel open to the control plane, as
+ * `/api/sessions` reports it.
+ *
+ * A heartbeat on this channel says the node is there and nothing else, which
+ * is why there is no load figure here: the wire's heartbeat message is a
+ * status string.
+ */
+interface SessionSummary {
   id: string
   instance_id: string
   node_role: string
@@ -9,21 +56,20 @@ interface NodeSummary {
   state: string
   connected_at: string
   last_heartbeat: string
-  power_reserve: number
 }
 
 
 /**
  * One deis-runtime node, as `/api/runtime` reports it.
  *
- * These are not the same objects as `NodeSummary` above: those are the
+ * These are not the same objects as `SessionSummary` above: those are the
  * processes holding a deis-wire control channel open, while these are the
  * runtime nodes the control plane dials over gRPC to deploy versions, probe
  * health and fire cron. A node gets on this list either because it is named
  * in the control plane's configuration file or because it registered itself,
  * which is what `source` says.
  */
-interface RuntimeNodeSummary {
+interface FleetNode {
   id: string
   addr: string
   source: 'configured' | 'registered'
@@ -72,10 +118,8 @@ export function useMetrics() {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const res = await fetch('/api/metrics/summary')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setMetrics(data.metrics || data)
+      const data = await api.request<unknown>('/api/metrics/summary')
+      setMetrics(objectFrom(data, 'metrics') as unknown as MetricsSummary)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch metrics')
@@ -96,26 +140,29 @@ export function useMetrics() {
   return { metrics, loading, error, refetch: fetchMetrics }
 }
 
-export function useNodes() {
-  const [nodes, setNodes] = useState<NodeSummary[]>([])
+/**
+ * The control channels open to the control plane: every node that
+ * authenticated, registered and is heartbeating right now. Commands and
+ * configuration pushes travel down these, and nothing else can receive one.
+ */
+export function useSessions() {
+  const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const initialLoadRef = useRef(true)
 
-  const fetchNodes = useCallback(async () => {
+  const fetchSessions = useCallback(async () => {
     try {
       // Only show the loading state on the first fetch, so background refreshes
       // do not blank out data the user is already reading
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const res = await fetch('/api/nodes')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setNodes(data.nodes || (Array.isArray(data) ? data : []))
+      const data = await api.request<unknown>('/api/sessions')
+      setSessions(listFrom<SessionSummary>(data, 'sessions'))
       setError(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch nodes')
+      setError(err instanceof Error ? err.message : 'Failed to fetch control channels')
     } finally {
       if (initialLoadRef.current) {
         setLoading(false)
@@ -125,12 +172,12 @@ export function useNodes() {
   }, [])
 
   useEffect(() => {
-    fetchNodes()
-    const interval = setInterval(fetchNodes, 5000)
+    fetchSessions()
+    const interval = setInterval(fetchSessions, 5000)
     return () => clearInterval(interval)
-  }, [fetchNodes])
+  }, [fetchSessions])
 
-  return { nodes, loading, error, refetch: fetchNodes }
+  return { sessions, loading, error, refetch: fetchSessions }
 }
 
 /**
@@ -138,8 +185,8 @@ export function useNodes() {
  * occurrence, whether it came from the configuration file or registered
  * itself.
  */
-export function useRuntimeNodes() {
-  const [nodes, setNodes] = useState<RuntimeNodeSummary[]>([])
+export function useFleet() {
+  const [nodes, setNodes] = useState<FleetNode[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const initialLoadRef = useRef(true)
@@ -149,13 +196,11 @@ export function useRuntimeNodes() {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const res = await fetch('/api/runtime')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setNodes(data.nodes || (Array.isArray(data) ? data : []))
+      const data = await api.request<unknown>('/api/runtime')
+      setNodes(listFrom<FleetNode>(data, 'nodes'))
       setError(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch runtime nodes')
+      setError(err instanceof Error ? err.message : 'Failed to fetch the runtime fleet')
     } finally {
       if (initialLoadRef.current) {
         setLoading(false)
@@ -170,11 +215,11 @@ export function useRuntimeNodes() {
     return () => clearInterval(interval)
   }, [fetchNodes])
 
-  return { runtimeNodes: nodes, loading, error, refetch: fetchNodes }
+  return { fleet: nodes, loading, error, refetch: fetchNodes }
 }
 
 export function useCommands(nodeId?: string) {
-  const [commands, setCommands] = useState<any[]>([])
+  const [commands, setCommands] = useState<Command[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const initialLoadRef = useRef(true)
@@ -185,10 +230,8 @@ export function useCommands(nodeId?: string) {
         setLoading(true)
       }
       const url = nodeId ? `/api/commands/node/${nodeId}` : '/api/commands'
-      const res = await fetch(url)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setCommands(data.commands || (Array.isArray(data) ? data : []))
+      const data = await api.request<unknown>(url)
+      setCommands(listFrom<Command>(data, 'commands'))
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch commands')
@@ -206,22 +249,30 @@ export function useCommands(nodeId?: string) {
     return () => clearInterval(interval)
   }, [fetchCommands])
 
-  const executeCommand = async (nodeId: string, commandType: string, commandData?: any) => {
-    const res = await fetch(`/api/commands/execute/${nodeId}`, {
+  // The server's body is `{ command_type, data }`. `command_type` is a
+  // tagged enum: the named commands are plain strings and anything else is
+  // `{ custom: "<name>" }`, so a free-typed command travels as the latter or
+  // the whole request comes back 422 without ever reaching a node.
+  const executeCommand = async (nodeId: string, commandType: string, data?: unknown) => {
+    const named = [
+      'shutdown',
+      'restart',
+      'reload',
+      'get_status',
+      'get_metrics',
+      'execute_scheduled',
+    ]
+    const command_type = named.includes(commandType) ? commandType : { custom: commandType }
+    const result = await api.request<unknown>(`/api/commands/execute/${nodeId}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command_type: commandType, command_data: commandData }),
+      body: JSON.stringify({ command_type, data }),
     })
-    if (!res.ok) throw new Error('Failed to execute command')
     await fetchCommands()
-    return await res.json()
+    return result
   }
 
   const cancelCommand = async (commandId: string) => {
-    const res = await fetch(`/api/commands/cancel/${commandId}`, {
-      method: 'POST',
-    })
-    if (!res.ok) throw new Error('Failed to cancel command')
+    await api.request(`/api/commands/cancel/${commandId}`, { method: 'POST' })
     await fetchCommands()
   }
 
@@ -239,10 +290,8 @@ export function useEvents() {
       if (initialLoadRef.current) {
         setLoading(true)
       }
-      const res = await fetch('/api/events')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setEvents(data.events || (Array.isArray(data) ? data : []))
+      const data = await api.request<unknown>('/api/events')
+      setEvents(listFrom<Event>(data, 'events'))
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch events')
@@ -275,10 +324,8 @@ export function useConfigs(nodeId?: string) {
         setLoading(true)
       }
       const url = nodeId ? `/api/configs/${nodeId}` : '/api/configs'
-      const res = await fetch(url)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setConfigs(data.data || data || {})
+      const data = await api.request<unknown>(url)
+      setConfigs(objectFrom(data, 'data'))
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch configs')
@@ -296,12 +343,10 @@ export function useConfigs(nodeId?: string) {
   }, [fetchConfigs])
 
   const updateConfig = async (nodeId: string, configs: Record<string, unknown>) => {
-    const res = await fetch(`/api/configs/${nodeId}`, {
+    await api.request(`/api/configs/${nodeId}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ configs }),
     })
-    if (!res.ok) throw new Error('Failed to update config')
     await fetchConfigs()
   }
 

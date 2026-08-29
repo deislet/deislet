@@ -68,4 +68,61 @@ impl From<crate::catalog::CatalogError> for ApiError {
     }
 }
 
+/// Map configuration-push failures onto HTTP status classes.
+///
+/// The same reasoning as the command mapping below: a push travels down a
+/// control channel the node is holding open, so a node that is not connected,
+/// or a configuration key that was never stored, is the caller naming
+/// something that is not there rather than a fault in this process. Both used
+/// to come back as 500.
+impl From<crate::config_manager::PushError> for ApiError {
+    fn from(err: crate::config_manager::PushError) -> Self {
+        use crate::config_manager::PushError;
+        let message = err.to_string();
+        match err {
+            PushError::NodeNotFound(_) => ApiError::NotFound(format!(
+                "{message} - no node by that name is holding a control channel open, so nothing \
+                 can be pushed to it. A deis-runtime node never holds one: its configuration \
+                 travels with its deployment"
+            )),
+            PushError::ConfigNotFound(_) => ApiError::NotFound(message),
+            // The channel was there when the send began and went away
+            // underneath; the caller can retry, this instance cannot fix it.
+            PushError::SendError(_) => ApiError::ServiceUnavailable(message),
+            PushError::SerializationError(_) => ApiError::InternalError(message),
+        }
+    }
+}
+
+/// Map command failures onto HTTP status classes.
+///
+/// The one that matters is `NodeNotFound`: a command can only travel down a
+/// control channel the node is holding open, so asking to command a node
+/// that is not connected is the caller naming something that is not there.
+/// Reporting that as a 500 blamed the control plane for a fact about the
+/// fleet, and the dashboard showed it as a server failure.
+impl From<crate::command::ExecuteError> for ApiError {
+    fn from(err: crate::command::ExecuteError) -> Self {
+        use crate::command::ExecuteError;
+        let message = err.to_string();
+        match err {
+            ExecuteError::NodeNotFound(_) => ApiError::NotFound(format!(
+                "{message} - no node by that name is holding a control channel open, so nothing can be sent to it"
+            )),
+            ExecuteError::CommandNotFound => ApiError::NotFound(message),
+            ExecuteError::InvalidTimeout => ApiError::BadRequest(message),
+            ExecuteError::DatabaseError(_) => ApiError::DatabaseError(message),
+            // The node was there when the send began and its channel went
+            // away underneath: the caller can retry, this instance cannot
+            // fix it.
+            ExecuteError::SendError(_) | ExecuteError::ChannelClosed => {
+                ApiError::ServiceUnavailable(message)
+            }
+            ExecuteError::SerializationError(_) | ExecuteError::Timeout => {
+                ApiError::InternalError(message)
+            }
+        }
+    }
+}
+
 pub type ApiResult<T> = Result<T, ApiError>;

@@ -5,11 +5,17 @@
 //! * [`AuthConfig`] is the dashboard and human API key. It is governed by
 //!   `api_auth_enabled`, which defaults to off.
 //! * [`NodeAuthConfig`] is the credential a runtime node already shares with
-//!   the control plane to register (`node_preshared_keys`). It guards the two
+//!   the control plane to register (`node_preshared_keys`). It guards the
 //!   endpoints that exist for nodes, and `api_auth_enabled` has no say over
 //!   it: one of those endpoints hands out decrypted secrets, and a flag whose
 //!   purpose is to make a dashboard convenient must not be able to switch
 //!   authentication off on that channel.
+//!
+//! Neither credential has an "unconfigured means open" state. For the node
+//! channel that is the whole point: an empty key list refuses every caller,
+//! and [`crate::config::ControlConfig::ensure_node_credential`] mints a key
+//! before the server starts so the refusal is not what an operator meets on
+//! a first run.
 
 use axum::{
     Json,
@@ -20,7 +26,7 @@ use axum::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::config::ControlConfig;
 
@@ -41,17 +47,18 @@ impl AuthConfig {
 }
 
 /// The credential a runtime node presents on the endpoints that serve nodes:
-/// `GET /api/nodes/:id/assignments` and the bundle download.
+/// `PUT /api/nodes/:id/registration`, `GET /api/nodes/:id/assignments` and
+/// the bundle download.
 ///
 /// It is `node_preshared_keys` - the same list a node authenticates against
-/// when it registers over gRPC (see [`crate::handler::MessageHandler`]), so a
-/// node has one credential and not two.
+/// when it opens its gRPC control channel - so a node has one credential and
+/// not two.
 ///
-/// An empty list means this control plane has no node credential at all. The
-/// node endpoints then still answer, because a fleet configured that way is
-/// how the platform has always run, but the assignment list refuses to carry
-/// decrypted secrets over a channel where nobody can prove anything - see
-/// [`Self::is_configured`] and `api::catalog::assignments`.
+/// An empty list is not a mode. It means this process has no way to tell a
+/// node from anyone else, so [`node_auth`] answers every caller with 503 and
+/// nothing behind it runs. The binary never gets there:
+/// [`crate::config::ControlConfig::ensure_node_credential`] mints a key at
+/// startup when the file names none.
 #[derive(Clone)]
 pub struct NodeAuthConfig {
     keys: Arc<Vec<String>>,
@@ -68,12 +75,11 @@ impl NodeAuthConfig {
         }
     }
 
-    /// Whether a caller of a node endpoint can prove it is a node.
-    ///
-    /// False means every caller on that channel is anonymous, which is what
-    /// decides that no secret value may travel over it.
-    pub fn is_configured(&self) -> bool {
-        !self.keys.is_empty()
+    /// How many keys this channel accepts. Zero means the channel is shut,
+    /// not that it is open; it is reported at startup so an operator sees
+    /// which of the two credentials is which.
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
     }
 
     /// Whether this credential is one of the configured node keys.
@@ -86,8 +92,9 @@ impl NodeAuthConfig {
 /// not depend on how many leading bytes matched.
 ///
 /// The difference is small over a LAN, but it costs nothing to remove, and
-/// these two values are the whole authorisation of the node channel.
-fn secret_eq(a: &str, b: &str) -> bool {
+/// these two values are the whole authorisation of the node channel - the
+/// gRPC handshake included, which is why this is not private to this module.
+pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -121,17 +128,30 @@ fn presented_credentials(headers: &HeaderMap) -> Vec<&str> {
 /// key requirement off must not thereby publish the platform's secrets to
 /// anyone who can reach this port.
 ///
-/// With no `node_preshared_keys` configured there is nothing to check, so the
-/// request passes and the handler withholds secret values instead; refusing
-/// outright would take down every node of a fleet that never had a key.
+/// With no key configured there is nothing a caller could present, so the
+/// channel is shut rather than opened. Passing the request through instead
+/// would mean anyone who can reach this port can register a node - and a node
+/// on the fleet list is a delivery target that is handed every environment's
+/// decrypted secrets on its first assignment fetch.
 pub async fn node_auth(
     node_auth: axum::extract::State<NodeAuthConfig>,
     headers: HeaderMap,
     request: Request,
     next: Next,
 ) -> Response {
-    if !node_auth.is_configured() {
-        return next.run(request).await;
+    if node_auth.key_count() == 0 {
+        error!(
+            path = %request.uri().path(),
+            "Refused a call to a node endpoint because this control plane has no node credential at all; no node can register, fetch assignments or download a bundle until node_preshared_keys names one"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "No node credential configured",
+                "details": "This control plane has no node_preshared_keys, so it cannot tell a node from any other caller and serves none of them. Set node_preshared_keys on the control plane and on every node."
+            })),
+        )
+            .into_response();
     }
 
     if presented_credentials(&headers)
@@ -451,7 +471,7 @@ mod tests {
             ..Default::default()
         };
         let node_auth_config = NodeAuthConfig::from_control_config(&config);
-        assert!(node_auth_config.is_configured());
+        assert_eq!(node_auth_config.key_count(), 1);
 
         let app = Router::new()
             .route("/api/nodes/a/assignments", get(assignments))
@@ -508,41 +528,58 @@ mod tests {
         }
     }
 
-    /// With no node key configured the endpoint still answers - the
-    /// handler is what withholds the secrets - or every node of a fleet
-    /// that never had a key would stop being able to load anything.
+    /// "Unconfigured" must not mean "unguarded". With no node key the
+    /// channel is shut, not open: registering a node this way would put a
+    /// machine of the caller's choosing on the fleet list, and the fleet
+    /// list is what receives deployments, cron fires and decrypted secrets.
     #[tokio::test]
-    async fn a_control_plane_without_a_node_key_still_serves_the_node_endpoints() {
+    async fn a_control_plane_without_a_node_key_serves_no_node_endpoint_at_all() {
         use axum::Router;
-        use axum::routing::get;
+        use axum::routing::{get, put};
 
-        async fn assignments() -> &'static str {
+        async fn ok() -> &'static str {
             "OK"
         }
 
         let node_auth_config = NodeAuthConfig::new(vec!["   ".to_string()]);
-        assert!(
-            !node_auth_config.is_configured(),
+        assert_eq!(
+            node_auth_config.key_count(),
+            0,
             "a blank entry in the file is not a credential"
         );
 
         let app = Router::new()
-            .route("/api/nodes/a/assignments", get(assignments))
+            .route("/api/nodes/a/assignments", get(ok))
+            .route("/api/nodes/a/registration", put(ok))
             .layer(axum::middleware::from_fn_with_state(
                 node_auth_config,
                 node_auth,
             ));
 
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/nodes/a/assignments")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        for (method, uri) in [
+            ("GET", "/api/nodes/a/assignments"),
+            ("PUT", "/api/nodes/a/registration"),
+        ] {
+            // Anonymous, and with a guess at a credential: neither gets in,
+            // and the answer says the control plane is the thing that is
+            // misconfigured rather than the caller.
+            for credential in [None, Some("anything")] {
+                let mut builder = HttpRequest::builder().method(method).uri(uri);
+                if let Some(credential) = credential {
+                    builder = builder.header("Authorization", format!("Bearer {credential}"));
+                }
+                let response = app
+                    .clone()
+                    .oneshot(builder.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{method} {uri} was served without any node credential being configured"
+                );
+            }
+        }
     }
 
     #[test]

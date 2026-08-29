@@ -4,7 +4,6 @@ use tonic::transport::Server;
 use tracing::info;
 
 use crate::api::grpc::GrpcControlService;
-use crate::broadcast::EventBroadcaster;
 use crate::command::CommandExecutor;
 use crate::config::ControlConfig;
 use crate::database::Database;
@@ -16,7 +15,6 @@ pub struct ControlServer {
     config: Arc<ControlConfig>,
     sessions: Arc<SessionManager>,
     database: Option<Arc<Database>>,
-    broadcaster: Arc<EventBroadcaster>,
     command_executor: Option<Arc<CommandExecutor>>,
     /// Handed to every node control channel so a stop closes them.
     ///
@@ -32,7 +30,6 @@ impl ControlServer {
             config: Arc::new(config),
             sessions: Arc::new(SessionManager::new()),
             database: None,
-            broadcaster: Arc::new(EventBroadcaster::new()),
             command_executor: None,
             shutdown: Shutdown::new(),
         }
@@ -66,10 +63,6 @@ impl ControlServer {
         Arc::clone(&self.sessions)
     }
 
-    pub fn broadcaster(&self) -> Arc<EventBroadcaster> {
-        Arc::clone(&self.broadcaster)
-    }
-
     pub fn database(&self) -> Option<Arc<Database>> {
         self.database.as_ref().map(Arc::clone)
     }
@@ -77,10 +70,9 @@ impl ControlServer {
     pub fn build_grpc_service(&self) -> ControlServiceServer<GrpcControlService> {
         let sessions = Arc::clone(&self.sessions);
         let config = Arc::clone(&self.config);
-        let broadcaster = Arc::clone(&self.broadcaster);
 
-        let mut grpc_service = GrpcControlService::new(config, sessions, broadcaster)
-            .with_shutdown(self.shutdown.clone());
+        let mut grpc_service =
+            GrpcControlService::new(config, sessions).with_shutdown(self.shutdown.clone());
 
         if let Some(db) = &self.database {
             grpc_service = grpc_service.with_database(db.clone());

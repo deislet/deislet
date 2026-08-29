@@ -222,9 +222,10 @@ export default async (context) => {
         assert_eq!(info.route, "/");
     }
 
-    // TODO: Service detection tests - needs further investigation of SWC AST visitor patterns
-    // The parser correctly handles exports, imports, and routing (13 tests pass)
-    // Service detection is a nice-to-have optimization feature for now
+    // Not covered here: service detection from the AST. Exports, imports and
+    // routing are, and those are what the build depends on - which services an
+    // application uses is read from `.config.json`, not inferred from its code,
+    // so nothing downstream relies on the detection these tests would cover.
 
     #[test]
     fn test_detect_imports() {

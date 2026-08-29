@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::broadcast::{BroadcastEvent, EventBroadcaster};
 use crate::database::{Database, DatabaseError};
 use crate::session::SessionManager;
 use deis_wire::pb::{ConfigUpdate, ControlMessage, control_message::Payload};
@@ -31,9 +30,6 @@ pub struct ConfigManager {
 
     /// Session manager (used to push configurations to nodes)
     sessions: Arc<SessionManager>,
-
-    /// Event broadcaster (optional)
-    broadcaster: Option<Arc<EventBroadcaster>>,
 }
 
 impl ConfigManager {
@@ -44,14 +40,7 @@ impl ConfigManager {
             versions: Arc::new(RwLock::new(HashMap::new())),
             database,
             sessions,
-            broadcaster: None,
         }
-    }
-
-    /// Set event broadcaster
-    pub fn with_broadcaster(mut self, broadcaster: Arc<EventBroadcaster>) -> Self {
-        self.broadcaster = Some(broadcaster);
-        self
     }
 
     /// Load all configurations from database
@@ -136,22 +125,12 @@ impl ConfigManager {
             "Configuration updated"
         );
 
-        // Broadcast configuration update event
-        if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.broadcast(BroadcastEvent::ConfigUpdated {
-                node_id: node_id.to_string(),
-                config_keys,
-                version_timestamp: now,
-                timestamp: Utc::now(),
-            });
-        }
-
         Ok(now)
     }
 
     /// Push a single configuration item to node
     ///
-    /// Send configuration update message to specified node via WebSocket
+    /// Sends the update down the node's open gRPC control channel.
     pub async fn push_config_to_node(
         &self,
         node_id: &str,
@@ -203,31 +182,37 @@ impl ConfigManager {
         Ok(())
     }
 
-    /// Push all configurations to node
+    /// Push every stored configuration item to one node.
     ///
-    /// Push all configuration items for node one by one
+    /// Whether the node is reachable is decided once, up front, rather than
+    /// per key. Without that check this returned `Ok(0)` for a node that was
+    /// not connected at all, and the endpoint answered `200 Pushed 0 configs
+    /// successfully` - a caller was told its push had succeeded when not one
+    /// byte had left the process.
+    ///
+    /// A failure part-way through is still reported: the send can only fail
+    /// once the channel has gone away underneath, and stopping there says so
+    /// rather than reporting a count that hides it.
     pub async fn push_all_configs_to_node(&self, node_id: &str) -> Result<usize, PushError> {
-        // Get all configurations
         let configs = self
             .get_node_config(node_id)
             .ok_or_else(|| PushError::ConfigNotFound(node_id.to_string()))?;
 
-        let mut count = 0;
-        for config_key in configs.keys() {
-            match self.push_config_to_node(node_id, config_key).await {
-                Ok(_) => count += 1,
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to push config {} to node {}: {}",
-                        config_key,
-                        node_id,
-                        e
-                    );
-                }
-            }
+        if self.sessions.get_node(node_id).is_none() {
+            return Err(PushError::NodeNotFound(node_id.to_string()));
         }
 
-        tracing::info!("Pushed {} configs to node {}", count, node_id);
+        let mut count = 0;
+        for config_key in configs.keys() {
+            self.push_config_to_node(node_id, config_key).await?;
+            count += 1;
+        }
+
+        tracing::info!(
+            node_id = %node_id,
+            count,
+            "Pushed every stored configuration item to the node"
+        );
         Ok(count)
     }
 

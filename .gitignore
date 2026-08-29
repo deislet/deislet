@@ -30,3 +30,12 @@ examples/*
 *.db
 *.log
 sites.db
+
+# Build products of the JavaScript projects in this tree.
+# crates/deis-control/web/dist is one of these: the control-plane binary embeds
+# it with rust-embed, so `npm run build` in crates/deis-control/web has to run
+# before the crate is built for release. Its build.rs creates the directory when
+# it is missing, so the crate still compiles - the binary then serves the whole
+# API and answers 404 for the dashboard pages, and says so with a build warning.
+node_modules/
+dist/

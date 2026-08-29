@@ -352,6 +352,11 @@ impl AppRuntime {
             let env_store: EnvStore = Rc::new(RefCell::new(env));
             state.put(env_store);
 
+            // The Cache API's store. Edge Canon makes it a basic feature, so
+            // it is built for every isolate whether or not the application
+            // declares anything, and it lives and dies with this isolate.
+            // 10 000 responses, and ten minutes of freshness for a response
+            // that named no `max-age` of its own.
             let cache_store: CacheStore = create_cache_store(10_000, 600);
             state.put(cache_store);
 

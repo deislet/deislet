@@ -251,9 +251,16 @@ mod tests {
         let _ = manager.unload_app(&key("s2")).await;
     }
 
+    /// KV through the manager, not through `AppRuntime` directly.
+    ///
+    /// This was `#[ignore]`d with the note "KV now requires remote gRPC",
+    /// which was true and left the path untested: the manager has no wiring
+    /// parameter, so the store's address has to ride in the deployment's env
+    /// map exactly the way the control plane sends it, and nothing checked
+    /// that the pool still lifted it back out on the way to the isolate.
     #[tokio::test]
-    #[ignore] // KV now requires remote gRPC
     async fn test_app_with_kv() {
+        let store = crate::runtime::test_store::TestStore::start().await;
         let manager = TEST_MANAGER.lock().unwrap();
 
         let code = r#"
@@ -274,8 +281,12 @@ mod tests {
             }
         "#;
 
+        let config = AppConfig {
+            env: store.kv_env(),
+            ..AppConfig::default()
+        };
         manager
-            .load_app(key("kvtest"), code.to_string(), AppConfig::default(), None)
+            .load_app(key("kvtest"), code.to_string(), config, None)
             .await
             .unwrap();
 

@@ -8,7 +8,16 @@
 // the messages this function did not mark for retry. Delivery is at-least-once
 // and a redelivery is indistinguishable from the first attempt, so the work
 // below is idempotent: writing the same key twice leaves the same value.
-export default async function queue(batch: any, context: any): Promise<void> {
+//
+// The signature is the one Edge Canon fixes for a queue consumer
+// (SPECIFICATION_EXT.md section 3.2): `queue(batch, env, context)`. The
+// bindings table is the second parameter and the platform context the third;
+// taking only two would read `context.services` off the environment table.
+export default async function queue(
+  batch: any,
+  _env: any,
+  context: any,
+): Promise<void> {
   for (const message of batch.messages) {
     let job: any;
     try {

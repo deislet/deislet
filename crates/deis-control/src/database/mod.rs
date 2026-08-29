@@ -78,13 +78,17 @@ pub struct EventEntry {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Heartbeat entry
+/// Heartbeat entry.
+///
+/// A heartbeat says the node is there and, when the transport can measure
+/// it, how long the round trip took. It carries no load metric: the wire's
+/// `Heartbeat` message is a status string, so anything else this row claimed
+/// would be invented here rather than reported by the node.
 #[derive(Debug, Clone)]
 pub struct HeartbeatEntry {
     pub node_id: String,
     pub instance_id: String,
     pub timestamp: DateTime<Utc>,
-    pub power_reserve: u8,
     pub latency_ms: Option<i64>,
 }
 
@@ -269,8 +273,8 @@ impl Database {
             conn.execute(
                 r#"
                 INSERT OR REPLACE INTO nodes
-                (id, instance_id, node_role, version, host, ports, state, connected_at, last_heartbeat, power_reserve, metadata)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                (id, instance_id, node_role, version, host, ports, state, connected_at, last_heartbeat, metadata)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 "#,
                 params![
                     node_id,
@@ -282,7 +286,6 @@ impl Database {
                     state_str,
                     connected_at,
                     last_heartbeat,
-                    0,  // power_reserve - will be updated from heartbeats
                     None::<String>,  // metadata
                 ],
             )?;
@@ -317,26 +320,24 @@ impl Database {
         self.with_connection(move |conn| {
             conn.execute(
                 r#"
-                INSERT INTO heartbeats (node_id, instance_id, timestamp, power_reserve, latency_ms)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                INSERT INTO heartbeats (node_id, instance_id, timestamp, latency_ms)
+                VALUES (?1, ?2, ?3, ?4)
                 "#,
                 params![
                     &entry.node_id,
                     &entry.instance_id,
                     entry.timestamp.to_rfc3339(),
-                    entry.power_reserve as i64,
                     entry.latency_ms,
                 ],
             )?;
 
-            // Update node's last_heartbeat and power_reserve
+            // Keep the node row's idea of when it was last heard from in
+            // step with the history, so a query that reads only the node
+            // row does not report a node as silent while heartbeats are
+            // still arriving.
             conn.execute(
-                "UPDATE nodes SET last_heartbeat = ?1, power_reserve = ?2 WHERE id = ?3",
-                params![
-                    entry.timestamp.to_rfc3339(),
-                    entry.power_reserve as i64,
-                    &entry.node_id
-                ],
+                "UPDATE nodes SET last_heartbeat = ?1 WHERE id = ?2",
+                params![entry.timestamp.to_rfc3339(), &entry.node_id],
             )?;
             Ok(())
         })
@@ -453,7 +454,7 @@ impl Database {
         self.with_connection(move |conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT node_id, instance_id, timestamp, power_reserve, latency_ms
+                SELECT node_id, instance_id, timestamp, latency_ms
                 FROM heartbeats
                 WHERE node_id = ?1
                 ORDER BY timestamp DESC
@@ -471,8 +472,7 @@ impl Database {
                     node_id: row.get(0)?,
                     instance_id: row.get(1)?,
                     timestamp,
-                    power_reserve: row.get::<_, i64>(3)? as u8,
-                    latency_ms: row.get(4)?,
+                    latency_ms: row.get(3)?,
                 })
             })?;
 
@@ -1144,7 +1144,6 @@ mod tests {
             node_id: "node-1".to_string(),
             instance_id: "instance-1".to_string(),
             timestamp: Utc::now(),
-            power_reserve: 85,
             latency_ms: Some(10),
         };
 
@@ -1163,7 +1162,7 @@ mod tests {
         // Verify we can retrieve it
         let heartbeats = db.get_recent_heartbeats("node-1", 10).await.unwrap();
         assert_eq!(heartbeats.len(), 1);
-        assert_eq!(heartbeats[0].power_reserve, 85);
+        assert_eq!(heartbeats[0].latency_ms, Some(10));
     }
 
     #[tokio::test]

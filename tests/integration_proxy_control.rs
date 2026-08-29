@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ControlConfig::new(
         "deis-proxy-test-node".to_string(),
         TEST_SECRET.to_string(),
-        "ws://127.0.0.1:9001".to_string(),
+        "http://127.0.0.1:9001".to_string(),
     );
 
     println!("[1] Creating Proxy control client...");

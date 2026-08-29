@@ -1,144 +1,127 @@
-# Wire
+# deis-wire — the wire between the control plane and its nodes
 
-[![Crates.io](https://img.shields.io/crates/v/deis-wire.svg)](https://crates.io/crates/deis-wire)
-[![Documentation](https://docs.rs/deis-wire/badge.svg)](https://docs.rs/deis-wire)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+Two things live here, and they have different audiences:
 
-Wire is a Rust SDK for gRPC-based communication between Control control and Node servers (Runtime/Proxy). It provides secure, real-time bidirectional streaming communication using Protocol Buffers.
+1. **The node link.** The gRPC protocol (`proto/control.proto`, package
+   `deis.control`), the message models, and [`WireClient`] — the client side a
+   node uses to dial deis-control, authenticate, register, heartbeat, and take
+   commands. `deis-proxy` is what uses this today.
+2. **[`conventions`]** — the handful of names every component in the platform
+   must spell identically. This is why deis-store, deis-queue and
+   deis-telemetry depend on this crate at all: they carry no control-plane
+   concepts and use nothing but that module.
 
-## Features
+Chinese: [README.zh.md](README.zh.md).
 
-- 🚀 **gRPC Communication**: Real-time bidirectional streaming via HTTP/2 (Tonic)
-- 🔐 **Secure Authentication**: Token-based authentication
-- 💓 **Heartbeat Monitoring**: Automatic heartbeat sending and connection monitoring
-- 📡 **Command Processing**: Command processing from control
-- 🎯 **Type Safety**: Strongly-typed Protocol Buffers messages
-- ⚡ **Async Support**: Fully asynchronous API built on Tokio
+## conventions — the part most components need
 
-## Protocol Buffers Architecture
+These are plain constants and small functions on purpose. Six independent
+binaries have to agree, and a disagreement here does not fail to compile; it
+fails at runtime, days later, as a request rejected for the wrong reason or a
+fleet that never learns about its own nodes.
 
-Wire uses Protocol Buffers for message definition (`control.proto`).
+| Name | What it fixes |
+|---|---|
+| `APP_ID_HEADER` (`x-deis-app-id`) | which application an inbound request is for |
+| `ENVIRONMENT_HEADER` (`x-deis-environment`) | which environment of it; absent means `DEFAULT_ENVIRONMENT` |
+| `DEFAULT_ENVIRONMENT` (`production`) | so a caller that predates environments still lands somewhere sensible |
+| `TENANT_HEADER` (`x-deis-tenant`) | the storage tenant — a *different* header, because it carries a different thing |
+| `tenant_id(app, env)` / `split_tenant` / `is_valid_tenant_part` | `demo.production`; the character set has no `.`, `/` or `\`, so no legal pair can express a parent directory |
+| `MAX_GRPC_MESSAGE_BYTES` (16 MB) | one ceiling, both directions, every service |
+| `STREAM_CHUNK_BYTES` (1 MB) | blob upload and download chunking |
+| `STORE_ENDPOINT_ENV` / `QUEUE_ENDPOINT_ENV` | reserved env keys carrying the storage addresses, lifted out before an application sees them |
+| `NODE_REGISTRATION_ROUTE` / `NODE_ASSIGNMENTS_ROUTE` | the axum `:id` route templates |
+| `node_registration_path(id)` / `node_assignments_path(id)` | the client-side halves |
+| `ASSIGNMENTS_COMPLETE_HEADER` / `ASSIGNMENTS_WITHHELD_HEADER` | whether an assignment list is the whole truth for that node |
 
-### Core Message Types
+The route constants exist because they once did not: a node asked for
+`/register` while the control plane served `/registration`, both sides
+compiled, and the only symptom was a fleet with no nodes in it.
 
-- **AuthenticateRequest**: Authentication with control
-- **RegisterRequest**: Node registration
-- **Heartbeat**: Periodic health checks
-- **CommandRequest**: Command execution requests
-- **CommandResponse**: Command execution results
-- **SystemConfig/AppConfigs**: Configuration updates
+## The node link
 
-## Installation
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-deis-wire = "0.1.0"
-```
-
-## Quick Start
-
-### Basic Usage
+Transport is gRPC over HTTP/2 (Tonic). It is **not** WebSocket — earlier
+versions of this file said it was, and the client's own doc comments still
+mention "WebSocket connection" in one or two places.
 
 ```rust
-use deis-wire::{WireClient, ControlConfig, NodeInfo, NodeRole};
+use deis_wire::{ControlConfig, NodeInfo, NodeRole, WireClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure control connection
     let config = ControlConfig::new(
         "node-001".to_string(),
         "a1b2c3d4e5f67890123456789012345678901234567890123456789012345678".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://127.0.0.1:8085".to_string(),
     );
-    
-    // Configure node information
+
     let node_info = NodeInfo::new(
-        NodeRole::Runtime("1.0.0".to_string()),
+        NodeRole::Proxy("1.0.0".to_string()),
         "127.0.0.1".to_string(),
-        vec![3000],
+        vec![8087],
     );
-    
-    // Create client
+
     let mut client = WireClient::new(config, node_info);
-    
-    // Establish connection
-    client.connect().await?;
-    
-    // Authenticate with control
+
+    client.connect().await?;        // opens the bidirectional stream
     client.authenticate().await?;
-    
-    // Register node
     client.register().await?;
-    
-    // Send heartbeat
-    client.send_heartbeat().await?;
-    
-    // Run main client loop (handles heartbeats and incoming messages)
-    client.run().await?;
-    
+    client.run().await?;            // heartbeats and inbound messages
+
     Ok(())
 }
 ```
 
-### Using Messages
+`ControlConfig::addr` is passed to Tonic as given, so use `http://` (or
+`https://`). Anything that is not `https` connects in plain text, which is why
+the `ws://` still hardcoded in `tests/integration_*_control.rs` happens to
+work; it is a leftover, not a supported form.
 
-```rust
-use deis_wire::pb::{ControlMessage, Heartbeat, control_message::Payload};
+### Authentication, stated precisely
 
-// Create heartbeat message
-let heartbeat = Heartbeat {
-    status: "active".to_string(),
-};
+The node sends `sha256(secret ‖ node_id ‖ timestamp)` along with the timestamp;
+the control plane recomputes it and rejects anything more than 300 seconds old.
 
-let msg = ControlMessage {
-    payload: Some(Payload::Heartbeat(heartbeat)),
-};
+That is a secret-prefix SHA-256 construction. It is **not** HMAC-SHA256, even
+though the comment next to it in `src/models/auth.rs` says "HMAC" and the
+documentation used to repeat that. The distinction matters to anyone reasoning
+about length-extension resistance, and changing it is a protocol change on both
+sides.
 
-// Send message (if using lower-level API)
-// client.send_message(msg.payload.unwrap()).await?;
+### Message types
+
+Core: `AuthMessage`, `RegisterMessage`, `HeartbeatMessage`, `CommandMessage`,
+`CommandResponseMessage`, `StatusUpdateMessage`, with `HeartbeatAckMessage` and
+the two response messages coming back.
+
+Per-role extensions live in `models::messages::{control, deis_proxy,
+deis_runtime}`. Adding your own message type is documented in
+[docs/extensible-messages.md](docs/extensible-messages.md).
+
+The protobuf definitions are in [`proto/control.proto`](proto/control.proto)
+and are compiled by `build.rs` into `deis_wire::pb`.
+
+## Layout
+
+```
+deis-wire/
+├── proto/control.proto     # the gRPC service and its messages
+├── src/
+│   ├── conventions.rs      # what every component must spell identically
+│   ├── client.rs           # WireClient
+│   ├── config/             # ControlConfig, NodeInfo, NodeRole
+│   ├── models/             # auth, register, heartbeat, instance, messages
+│   └── error.rs
+└── docs/extensible-messages.md
 ```
 
-## API Reference
+## Development
 
-### Main Types
-
-- `WireClient`: Main client for control communication
-- `ControlConfig`: Control connection configuration
-- `NodeInfo`: Node instance information
-- `NodeRole`: Node type (Runtime or Proxy)
-- `Message`: Trait for all message types
-- `WireMessage<M>`: Universal message wrapper
-- `MessageBuilder`: Convenient message creation
-
-### Main Methods
-
-- `connect()`: Establish gRPC connection
-- `authenticate()`: Authenticate with control
-- `register()`: Register node with control
-- `send_heartbeat()`: Send heartbeat message
-- `run()`: Start main client loop
-- `disconnect()`: Disconnect from control
-
-### Configuration
-
-`ControlConfig` supports the following configuration options:
-
-- `associated_id`: Node instance ID
-- `secret`: 64-character hexadecimal PSK key
-- `addr`: Control gRPC endpoint (http:// or https://)
-
-### Message System
-
-- Protocol Buffers based
-- Strongly typed
-- Streaming support
-
-## Examples
-
-See the `examples/` directory (if available) for more detailed usage examples.
+```bash
+cargo test -p deis-wire
+cargo clippy -p deis-wire --all-targets
+```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
+Apache-2.0. See [LICENSE](LICENSE).

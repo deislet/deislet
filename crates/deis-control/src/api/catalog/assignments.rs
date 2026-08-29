@@ -27,9 +27,10 @@
 //! two places where they appear in the clear (the other is the
 //! `ApplyDeployment` push), which is why the route is mounted with its own
 //! node authentication in [`super::node_router`] instead of behind the
-//! dashboard's API key, and why a control plane with no node credential at
-//! all serves no environment that has a secret rather than serving its
-//! values to whoever asked.
+//! dashboard's API key. There is no anonymous case to handle here: a control
+//! plane with no node credential answers 503 on this route before the handler
+//! is reached (`api::middleware::node_auth`), so everything below is talking
+//! to a caller that proved it holds a node key.
 
 use std::collections::BTreeMap;
 
@@ -104,10 +105,7 @@ pub struct AssignmentView {
 /// GET /api/nodes/:id/assignments
 ///
 /// Authenticated as a node by [`super::node_router`], whatever
-/// `api_auth_enabled` says. When this control plane has no node credential
-/// configured at all, every caller is anonymous, so any assignment whose
-/// environment holds secrets is left out of the answer entirely rather than
-/// handed to whoever asked.
+/// `api_auth_enabled` says.
 pub async fn for_node(
     State(state): State<CatalogState>,
     Path(node_id): Path<String>,
@@ -125,23 +123,6 @@ pub async fn for_node(
         // does not run it, which is the same outcome a refused deployment
         // has, rather than running it with a hole in its environment.
         let env = match state.deliverer.assignment_payload(assignment, &base).await {
-            Ok(payload) if payload.secret_count() > 0 && !state.node_auth.is_configured() => {
-                // Nobody on this channel can prove they are a node, so the
-                // only safe answer about an environment with secrets is
-                // none at all. Dropping the row costs this application its
-                // place on the fleet; serving it would publish the values
-                // to anyone who can reach this port, and that cannot be
-                // taken back.
-                error!(
-                    node = %node_id,
-                    app_id = %assignment.app_id,
-                    environment = %assignment.environment,
-                    secrets = payload.secret_count(),
-                    "This control plane has no node_preshared_keys, so the assignment list is unauthenticated and must not carry decrypted secrets; this application is left out, the list is marked incomplete so no node removes anything because of it, and this application will not run on any node until a node key is configured"
-                );
-                withheld += 1;
-                continue;
-            }
             Ok(payload) => payload.env_for_wire(),
             Err(e) => {
                 error!(
@@ -191,13 +172,6 @@ pub async fn for_node(
         HeaderValue::from_str(&withheld.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
-
-    if !state.node_auth.is_configured() {
-        warn!(
-            node = %node_id,
-            "Served an assignment list over an unauthenticated channel: node_preshared_keys is empty, so anyone who can reach this port can read which applications and versions this platform runs"
-        );
-    }
 
     if !complete {
         warn!(

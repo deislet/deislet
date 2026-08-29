@@ -48,7 +48,8 @@ flowchart TB
     subgraph tool["工具链 · 开发者本地"]
         direction LR
         deis["<b>deis</b> · CLI
-        init / dev / validate / build（deploy 仍走 REST）"]
+        项目侧：init / dev / validate / build
+        平台侧：deploy / versions / rollback / status / secret / logs / tail"]
         deis-build["<b>deis-build</b> · 编译器
         SWC 解析 + rolldown 打包 + 平台能力校验
         四个目标：cloudflare / deno / tencent / deislet"]
@@ -107,13 +108,15 @@ flowchart TB
 
     classDef done fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
     classDef gap fill:#fff3e0,stroke:#e65100,stroke-width:2px,stroke-dasharray:4 3,color:#e65100
-    class deis-proxy,deis-runtime,deis-control,deis-build,deis-store,deis-queue,deis-telemetry done
-    class coraza,capkit,deis gap
+    class deis,deis-proxy,deis-runtime,deis-control,deis-build,deis-store,deis-queue,deis-telemetry done
+    class coraza,capkit gap
 ```
 
-绿色是已经跑通的；虚线橙色是还没接进来的：coraza 与 capkit 尚未接入。
-`deis` 已经补全（deploy / versions / rollback / status / secret / logs / tail），
-`scripts/demo.sh` 的部署动作也改走 CLI，不再手打 REST。
+绿色是已经跑通的；虚线橙色是还没接进来的：只剩 coraza 与 capkit 两个外部件。
+
+`deis` 也是绿的：它已经补全到平台侧（deploy / versions / rollback / status /
+secret / logs / tail），`scripts/demo.sh` 的部署动作全部走 CLI，脚本里没有一处
+对控制面 REST 的 `curl`。
 
 ### deis-runtime 的定位变化
 
@@ -224,18 +227,19 @@ deis-runtime 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪�
 sequenceDiagram
     autonumber
     actor Dev as 开发者
-    participant CLI as deis / curl
+    participant CLI as deis
     participant R as deis-control
     participant X as deis-runtime ×N
 
-    Dev->>CLI: deis build --vendor deislet
+    Dev->>CLI: deis deploy
     CLI->>CLI: 编译打包（函数 + 路由表 + 静态资产 → bundle.zip）
-    Dev->>R: POST /api/apps
-    Dev->>R: POST /api/apps/{app}/versions（上传 zip）
+    CLI->>R: POST /api/apps（不存在才建）
+    CLI->>R: POST /api/apps/{app}/versions（上传 zip）
     R->>R: 算 sha256，建 VERSION v(N+1)
-    Dev->>R: POST /api/apps/{app}/environments
-    Dev->>R: PUT .../secrets/{name}（加密落库）
-    Dev->>R: POST .../deployments（指针指向 v(N+1)）
+    CLI->>R: POST /api/apps/{app}/environments（不存在才建）
+    CLI->>R: POST .../deployments（指针指向 v(N+1)）
+    Dev->>CLI: deis secret set NAME（值从 stdin 进）
+    CLI->>R: PUT .../secrets/{name}（加密落库）
 
     par 广播到已注册节点
         R->>X: ApplyDeployment（app / version / environment / bundle_url / bundle_sha / env）
@@ -243,16 +247,18 @@ sequenceDiagram
         X->>X: 校验 sha256 → 解包 → 建 Isolate → 切换
         X-->>R: ack
     end
-    R-->>Dev: 响应里的 delivery 段说明哪些节点落到了、哪些没有
+    R-->>CLI: 响应里的 delivery 段说明哪些节点落到了、哪些没有
+    CLI-->>Dev: 没落到的节点单独红色列出，命令以非零退出
 
     Note over Dev,X: —— 节点重启 ——
-    X->>R: GET /api/nodes/{id}/assignments（带节点凭据）
+    X->>R: GET 清单（NODE_ASSIGNMENTS_ROUTE，带节点凭据）
     R-->>X: 每个 (应用, 环境) 的版本 + bundle_url + 环境表（含解密后的密钥）
     X->>R: 逐个自取、校验、加载
     X->>X: 全部装好之后才报 healthy
 
     Note over Dev,X: —— 回滚 ——
-    Dev->>R: POST .../rollback
+    Dev->>CLI: deis rollback
+    CLI->>R: POST .../rollback
     R->>R: 再插一行 DEPLOYMENT 指向 v(N)
     R->>X: ApplyDeployment(v(N))
     Note over X: 包通常已在本地，秒级完成
@@ -325,8 +331,9 @@ sequenceDiagram
     end
 
     rect rgb(232, 245, 233)
-    Note over X,R: ② deis-runtime 启动自举
-    X->>R: GET /api/nodes/{id}/assignments（带 [control] secret）
+    Note over X,R: ② deis-runtime 启动自举（两条路径都带 [control] secret）
+    X->>R: PUT 登记（NODE_REGISTRATION_ROUTE）
+    X->>R: GET 清单（NODE_ASSIGNMENTS_ROUTE）
     R-->>X: 清单（app, environment, version, bundle_url, bundle_sha, env）
     loop 逐个自取
         X->>R: HTTP GET bundle_url，校验 sha256
@@ -378,8 +385,19 @@ sequenceDiagram
 `TriggerResponse` 里没有「处理函数已被调用」这一位。
 
 **节点注册**：节点凭 `node_preshared_keys` 里的凭据向控制面登记自己，登记过期就要
-再来一次。注册不是拿活的方式——没注册的节点照样自取并服务它拉到的每个应用，只是收不到
-推送、也不会被选中跑 cron。
+再来一次。方法是 `PUT`：登记是在陈述「这个节点是什么」，不是请求创建一条记录，所以
+掉线又回来的节点原样再说一遍就行；同一条路径上的 `DELETE` 是节点主动离场。注册不是
+拿活的方式——没注册的节点照样自取并服务它拉到的每个应用，只是收不到推送、也不会被
+选中跑 cron。
+
+**这两条路径不在文档里写死。** 它们是
+`deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`
+（服务端注册路由用的 `:id` 模板）与 `node_registration_path` /
+`node_assignments_path`（客户端拼一个具体节点的路径）。放进 deis-wire 是因为没有
+任何东西会检查两个 crate 有没有把同一条 HTTP 路径拼成一样：节点请求 `/register`
+而控制面提供 `/registration`，两边都编译得过，唯一的症状是一支永远学不会自己有哪些
+节点的机队——这件事已经发生过一次。上面时序图里的中文标注是为了看得懂，真值以那两个
+常量为准。
 
 ---
 
@@ -599,9 +617,9 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 - 面板和 CLI 只能写和删，不能读回。
 - 某个环境的密钥解不开时，该行被整条剔出 assignments 并打 error，而不是发一份残缺
   环境下去。
-- **因此** `GET /api/nodes/{id}/assignments` 与 bundle 下载挂在独立的 `node_auth`
-  上，凭据是 `node_preshared_keys`，不受面板的 `api_auth_enabled` 影响，也不接受
-  面板 API Key。这条路会把全部环境的明文密钥当 JSON 返回，早前它只挂在默认关闭的
+- **因此** 清单接口（`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`）与 bundle
+  下载挂在独立的 `node_auth` 上，凭据是 `node_preshared_keys`，不受面板的
+  `api_auth_enabled` 影响，也不接受面板 API Key。这条路会把全部环境的明文密钥当 JSON 返回，早前它只挂在默认关闭的
   面板鉴权上，等于任何能连到控制面 HTTP 端口的人 curl 一次就能拿走整个平台的密钥。
 
 ---
@@ -617,7 +635,11 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 - **硬上限**。应用覆盖目前能突破平台默认，没有一个「怎么覆盖都不能超过」的天花板。
 - **CPU 时间**。30 秒是墙钟，而且只约束「正在跑 JS」的那部分：一个卡在慢存储 await
   上的处理函数能无限占住它那条运行时线程，超时管不到它。
-- **出网控制**。函数能 `fetch` 到任意地址，包括内网。至少要能配黑名单（默认禁内网段）。
+- **出网控制**。今天没有一条应用能自己发起的出网路径：`fetch` 根本不在 Isolate 的
+  `globalThis` 上（§12 探针实测），应用能打出去的只有 `ctx.services.*`，而那几个
+  地址是控制面随下发给定的、应用改不动。所以这一格现在不是漏洞而是空白——`fetch`
+  一旦装上，函数就能打到任意地址（包括内网），到那时至少要能配黑名单（默认禁内网
+  段）。**顺序上，出网控制要和 `fetch` 一起做，不能等它先上线再补。**
 
 ---
 
@@ -629,9 +651,9 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 | **一 · B** | `Platform::Deislet` 与适配器：产出含函数入口、路由表、资产清单的应用包；`ctx.params` 随之成立 | **完成** |
 | **二** | 版本、环境与部署模型：建表、ApplyDeployment 指针下发、节点自举拉取与自取包 | **完成** |
 | **三** | 静态资产：包内带资产、节点资产优先命中 | **完成**（deis-proxy 的路径级路由与资产缓存、自动子域仍缺，见 §4） |
-| **四** | 可观测：deis-telemetry；节点侧日志与指标投递；真实状态上报 | **完成**（面板展示与 `deis tail` 仍缺） |
+| **四** | 可观测：deis-telemetry；节点侧日志与指标投递；真实状态上报 | **完成**（`deis logs` / `deis tail` 已有；控制面面板的日志视图仍缺） |
 | **五** | cron 修正、secrets、限额两层化 | **完成**；出网控制与硬上限仍缺（见 §9） |
-| **六** | `deis` CLI 闭环：deploy / rollback / versions / tail / dev 接真运行时 | **进行中** |
+| **六** | `deis` CLI 闭环：deploy / rollback / versions / tail / dev 接真运行时 | **完成**（`deis dev` 起的是真的 deis-runtime，走的是控制面同一个 `ApplyDeployment`） |
 
 ---
 
@@ -641,8 +663,9 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 
 - 证书自动签发（ACME）。自动子域需要泛域名证书，届时一并考虑。`examples/pingap` 有
   现成模块可参考。
-- `deis dev` 怎么执行用户代码。现在返回假响应。三条路：起本地 deis-runtime、调 deno
-  CLI、把 deno_core 嵌进 deis。
+- （已定）`deis dev` 怎么执行用户代码：起一个本地 `deis-runtime`，用控制面同一个
+  `ApplyDeployment` 把包交给它。另外两条路——调 deno CLI、把 deno_core 嵌进 deis
+  ——都不再考虑，因为它们跑的都不是线上那个引擎。
 - deis-telemetry 的日志保留时长与总量上限的默认值。
 - 出网控制用黑名单还是白名单。
 - deis-store 的备份周期与保留策略。
@@ -658,10 +681,10 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
   `crates/deis-runtime/src/management/`。
 - **请求与响应体是 `String`**：`JsRequest.body` / `JsResponse.body` 都是文本，二进制
   主体过不了 Isolate 边界。
-- **Web 标准的全局大半没装上，`fetch` 也在其中**：探针实测确认 `fetch`、`crypto`、
-  `TextEncoder`、`atob`/`btoa`、`AbortController`、`ReadableStream`、`WebSocket`、
-  `structuredClone` 等都不在 Isolate 的 `globalThis` 上（§12），而且没有任何一致性
-  测试能发现这件事。edge-canon 把 `fetch` 列进基础特性，这是最直接的一处不达标。
+- **Web 标准的全局大半没装上，`fetch` 也在其中**：`fetch`、`crypto`、
+  `AbortController`、`ReadableStream`、客户端 `WebSocket`、`structuredClone` 等都不在
+  Isolate 的 `globalThis` 上（§12）。edge-canon 把 `fetch` 列进基础特性，这是最直接的
+  一处不达标。清单本身现在有一致性测试守着（§12），所以少的是实现，不再是发现手段。
 - **执行超时管不住卡在 await 上的处理函数**（§9）。
 - **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent`
   已经有了）。队列消费目前由节点自己按 `(应用, 环境)` 轮询，不经过这个消息，所以还没
@@ -670,11 +693,12 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 
 **涉及对外承诺**
 
-- **WebSocket 的边缘链路从未验证**。节点这一端是通的：`dispatcher` 用 axum 的
-  `WebSocketUpgrade` 接住升级，应用返回 101 并带 `X-Runtime-WebSocket-ID`，桥接就建
-  起来；`websocket_direct_test.rs` 在进程内验过 Isolate 侧那一半。但
-  `websocket_bridging_test.rs` 在 localhost:8000 没有服务时**直接 return 并算通过**，
-  所以它证明不了 HTTP 升级这一段；deis-proxy → deis-runtime 那一跳也从没端到端测过。
+- **WebSocket 经 deis-proxy 的那一跳从未验证**。节点这一端现在有证据：
+  `websocket_direct_test.rs` 在进程内验 Isolate 侧那一半，`websocket_bridging_test.rs`
+  自己 bind 一个端口起 router，用真 WebSocket 客户端带 `x-deis-app-id` 连上去，断言
+  101 与两轮 echo 往返（此前它是 POST 到写死的 localhost:8000，没服务就打印
+  "Server not running, skipping test" 然后 return 当通过，而那个端点 dispatcher 早已
+  不提供）。仍然没测的是 deis-proxy → deis-runtime 这一跳，以及二进制帧那条路。
 - **deis-control 面板认证是 API Key 且默认关闭**（`api_auth_enabled` 默认 false），
   没有用户与角色概念。节点通道另有独立鉴权，不受它影响（§8）。
 
@@ -702,7 +726,7 @@ SSR。
 | 环境变量 | 成立 | 控制面下发的 `env` 表注入 `context.env`，平台保留键先被取走 |
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
 | KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务 |
-| Cache API | 成立 | moka 进程内缓存，`globalThis.caches` 已挂（探针实测为 `object`）。语义上是单节点缓存 |
+| Cache API | 成立 | 标准入口是 `context.services.cache`，`globalThis.caches.default` 指向同一个实例；后端是 moka 进程内缓存，`Cache-Control` 的 `max-age` / `s-maxage` 决定过期。语义上是单 Isolate 缓存：换节点、换版本都读不到 |
 | 生命周期 `waitUntil` | 成立 | `runtime.js` 的 `__deis_runtime_wait_until_all` |
 | 结构化日志 | 成立 | 环形缓冲 + `LogShipper` → deis-telemetry，`Query` 能查回来 |
 | Web 标准 | **比看上去少得多** | 见下方「Web 标准这一格的实情」 |
@@ -726,7 +750,12 @@ SSR。
 
 | 有 | 没有 |
 |---|---|
-| `Headers`、`Request`、`Response`、`URL`、`URLSearchParams`、`EventTarget`、`setTimeout` / `clearTimeout`、`queueMicrotask`、`console`、`caches`、`WebSocketPair` / `WebSocketServer` | `fetch`、`crypto`、`TextEncoder` / `TextDecoder`、`atob` / `btoa`、`AbortController`、`ReadableStream`、`Blob`、`FormData`、`URLPattern`、客户端 `WebSocket`、`BroadcastChannel`、`MessageChannel`、`structuredClone`、`performance` |
+| `Headers`、`Request`、`Response`、`URL`、`URLSearchParams`、`EventTarget`、`setTimeout` / `clearTimeout`、`queueMicrotask`、`console`、`caches`、`WebSocketPair` / `WebSocketServer`、`TextEncoder` / `TextDecoder`、`atob` / `btoa` | `fetch`、`crypto`、`AbortController` / `AbortSignal`、`ReadableStream` / `WritableStream` / `TransformStream`、`Blob` / `File`、`FormData`、`URLPattern`、客户端 `WebSocket`、`BroadcastChannel`、`MessageChannel` / `MessagePort`、`structuredClone`、`Event`、`setInterval` / `clearInterval`、`performance`、`DOMException`、`CompressionStream` / `DecompressionStream`、`EventSource`、`FileReader`、`navigator`、`reportError` |
+
+左边这一列的来路也要说清楚：`console` 与 `queueMicrotask` 是 deno_core 自己的
+`01_core.js` 挂的，其余全部是 `src/runtime/js/runtime.js` 里手写的最小实现（`caches`
+是进程内的 moka，`WebSocketPair` / `WebSocketServer` 是节点侧的桥接）。也就是说，
+连「有」的那几个也不是 Deno 那一套。
 
 `Response` 上也没有 `Response.json()` 这个静态方法，实例上没有 `arrayBuffer()`。
 
@@ -734,16 +763,24 @@ SSR。
 这一条尤其要紧：edge-canon 把 `fetch()` 列进基础特性，而处理函数里调它会直接
 `ReferenceError`。
 
-仓库里也确实没有任何测试或示例用到过右边那一列中的任何一个，所以这件事至今没有
-被任何一条红测试暴露出来。**该补的是一个真正跑 JS 的一致性测试**——按 edge-canon
-的基础特性列一份全局清单，在 Isolate 里逐个 `typeof`，缺哪个红哪个。
+这份清单现在有测试守着。`crates/deis-runtime/src/runtime/isolate_test.rs` 里的
+`the_isolate_global_surface_is_the_one_the_documents_describe` 在真 Isolate 里
+把上下两列逐个 `typeof`，**两个方向都断言**：该有的少一个红，不该有的多一个也红。
+所以往 `globalThis` 上加或减一个全局，都会先把这条测试打红，逼着本节和
+`crates/deis-runtime/README.md` 跟着改。此前这一格的每次结论都来自一次性探针，
+验完就撤，没有任何东西能在下一次误加误删时报警——那正是它和文档反复走样的原因。
+
+`TextEncoder` / `TextDecoder` / `atob` / `btoa` 是 2026-08-29 补上的，只做 UTF-8。
+补它们不是为了把格子填满：运行时自己有四处代码在调它们（`request.arrayBuffer()`、
+二进制请求体、`blob.put(key, "字符串")`、`blob.get(key).text()`，以及 WebSocket
+的二进制帧解码），在它们缺席的那段时间里这几条路一律 `ReferenceError`。
 
 ### 扩展特性
 
 | 特性 | 实况 | 依据 |
 |---|---|---|
 | SQL 数据库 | 成立 | deis-store 的 `Database` 服务，每租户一个 SQLite 文件；节点按 manifest 建 `DbClient` |
-| 对象存储 | 成立 | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘 |
+| 对象存储 | 成立 | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；Isolate 侧 `context.services.blob` 收字符串 / `ArrayBuffer` / `ArrayBufferView`，有顶着真 deis-store 的端到端测试 |
 | 消息队列 | 成立 | deis-queue 的 `Send`/`Pull`/`Ack`/`Nack` + 节点的 `queue_consumer` 轮询任务 |
 | 定时任务 | 成立 | 控制面按 `(app, environment)` 调度 → 节点 `Trigger.OnScheduled` → 跑 `scheduled` 导出 |
 | 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match` |

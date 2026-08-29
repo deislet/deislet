@@ -14,7 +14,7 @@
 - [Commands API](#commands-api)
 - [Events API](#events-api)
 - [Metrics API](#metrics-api)
-- [WebSocket API](#websocket-api)
+- [There is no WebSocket API](#there-is-no-websocket-api)
 - [Error Responses](#error-responses)
 
 ---
@@ -44,13 +44,13 @@ api_keys = [
 **Method 1: Authorization Header (Recommended)**
 ```bash
 curl -H "Authorization: Bearer your-secret-api-key-1" \
-     http://localhost:8080/api/nodes
+     http://localhost:8080/api/sessions
 ```
 
 **Method 2: X-API-Key Header**
 ```bash
 curl -H "X-API-Key: your-secret-api-key-1" \
-     http://localhost:8080/api/nodes
+     http://localhost:8080/api/sessions
 ```
 
 ### Public Endpoints
@@ -61,18 +61,21 @@ The following endpoints do not require an API key:
 
 ### Node Endpoints Use a Different Credential
 
-Two endpoints exist for runtime nodes rather than for people:
+These endpoints exist for runtime nodes rather than for people:
 
 ```
-GET /api/nodes/{node_id}/assignments
-GET /api/apps/{app_id}/versions/{version_id}/bundle
+PUT    /api/nodes/{node_id}/registration
+DELETE /api/nodes/{node_id}/registration
+GET    /api/nodes/{node_id}/assignments
+GET    /api/apps/{app_id}/versions/{version_id}/bundle
 ```
 
 They are authenticated with `node_preshared_keys` - the same credential a
-node uses to register over gRPC - and **`api_auth_enabled` has no effect on
-them**. The reason is the first one: its response carries every
-environment's decrypted secret values, so a setting whose purpose is to
-make a dashboard convenient must not be able to leave that channel open.
+node uses on its gRPC control channel - and **`api_auth_enabled` has no
+effect on them**. Two reasons: the assignment list carries every
+environment's decrypted secret values, and registration decides which
+machines are delivery targets in the first place. A setting whose purpose is
+to make a dashboard convenient must not be able to open either.
 
 ```bash
 curl -H "Authorization: Bearer <one of node_preshared_keys>" \
@@ -82,11 +85,13 @@ curl -H "Authorization: Bearer <one of node_preshared_keys>" \
 An API key is not accepted here: the dashboard and the CLI are deliberately
 unable to read a secret back.
 
-With no `node_preshared_keys` configured at all, both endpoints still
-answer - nobody could authenticate anyway - but the assignment list then
-leaves out every application that has a secret, and says so with an
-`ERROR` log line naming the application. Configure a node key to run
-applications with secrets.
+There is no unconfigured state. With no `node_preshared_keys` this control
+plane cannot tell a node from any other caller, so it serves none of them:
+every one of these endpoints answers `503 Service Unavailable` and no node
+can register, fetch assignments or download a bundle. Rather than start that
+way, the binary generates a key at startup and prints it once in a `WARN`
+line; it is a different key after the next restart, so put it in the
+configuration file and in every node's `[control] secret`.
 
 ### Security Recommendations
 
@@ -98,27 +103,38 @@ applications with secrets.
 
 ---
 
-## Nodes API
+## Control channels API
 
-Manage connected nodes.
+The nodes currently holding a gRPC control channel open to this process:
+they authenticated, registered, and are heartbeating. A command or a
+configuration push travels down one of these, so a node that is not on this
+list cannot be sent either. In practice deis-proxy is what appears here.
 
-### List All Nodes
+This is **not** the runtime fleet. The fleet - the nodes that receive
+deployments and run cron occurrences - is `GET /api/runtime`, and it is built
+from the configuration file plus self-registrations rather than from open
+channels. The two lists overlap in nothing but the word "node", which is why
+these routes are under `/api/sessions`: `/api/nodes` belongs to the endpoints
+nodes themselves call.
+
+### List Open Control Channels
 
 ```http
-GET /api/nodes
+GET /api/sessions
 ```
 
 **Response Example**:
 ```json
 {
-  "nodes": [
+  "sessions": [
     {
-      "node_id": "deis-runtime-1",
-      "instance_id": "deis-runtime-1-abc123",
-      "node_role": "deis-runtime:1.0.0",
+      "id": "deis-proxy-1",
+      "instance_id": "deis-proxy-1-abc123",
+      "node_role": "deis_proxy:1.0.0",
       "state": "Active",
       "host": "192.168.1.100",
       "ports": [8080],
+      "connected_at": "2026-01-11T10:00:00Z",
       "last_heartbeat": "2026-01-11T10:30:00Z"
     }
   ],
@@ -126,10 +142,10 @@ GET /api/nodes
 }
 ```
 
-### Get Node Details
+### Get One Control Channel
 
 ```http
-GET /api/nodes/:id
+GET /api/sessions/:id
 ```
 
 **Path Parameters**:
@@ -138,9 +154,9 @@ GET /api/nodes/:id
 **Response Example**:
 ```json
 {
-  "node_id": "deis-runtime-1",
-  "instance_id": "deis-runtime-1-abc123",
-  "node_role": "deis-runtime:1.0.0",
+  "id": "deis-proxy-1",
+  "instance_id": "deis-proxy-1-abc123",
+  "node_role": "deis_proxy:1.0.0",
   "state": "Active",
   "host": "192.168.1.100",
   "ports": [8080],
@@ -152,7 +168,7 @@ GET /api/nodes/:id
 ### Get Node Heartbeat History
 
 ```http
-GET /api/nodes/:id/heartbeats?limit=10
+GET /api/sessions/:id/heartbeats?limit=10
 ```
 
 **Path Parameters**:
@@ -161,19 +177,19 @@ GET /api/nodes/:id/heartbeats?limit=10
 **Query Parameters**:
 - `limit`: Return count (Default: 100)
 
+A heartbeat says the node was there at that moment and nothing else. It
+carries no load figure: the wire's `Heartbeat` message is a status string, so
+any number here would have been invented by the control plane rather than
+reported by the node.
+
 **Response Example**:
 ```json
-{
-  "node_id": "deis-runtime-1",
-  "heartbeats": [
-    {
-      "timestamp": "2026-01-11T10:30:00Z",
-      "power_reserve": 85,
-      "latency_ms": null
-    }
-  ],
-  "count": 1
-}
+[
+  {
+    "timestamp": "2026-01-11T10:30:00Z",
+    "latency_ms": null
+  }
+]
 ```
 
 ---
@@ -449,8 +465,7 @@ empty one.
 That is why this endpoint authenticates the caller as a node with
 `node_preshared_keys`, whatever `api_auth_enabled` says; see
 [Authentication](#node-endpoints-use-a-different-credential). An
-environment whose secrets will not decrypt, or whose secrets may not be
-served because no node key is configured, is left out of the list entirely
+environment whose secrets will not decrypt is left out of the list entirely
 rather than sent with a hole in it - the node then does not run it, and an
 `ERROR` line says which application and why.
 
@@ -462,7 +477,20 @@ configured, otherwise from the `Host` header of the request.
 
 ## Configs API
 
-Manage node configurations.
+Key-value settings the control plane holds on behalf of a node, and pushes to
+it down its open gRPC control channel.
+
+**Which nodes these reach**: the same set as the Commands API - a node holding
+a control channel, which today means a `deis-proxy`. It is a `deis-proxy` that
+consumes a pushed `ConfigUpdate` (its application list, one application, or a
+system overlay). A `deis-runtime` node takes nothing from here: its per-app
+configuration, environment variables and secrets travel with the deployment
+(see [Node Assignments](#node-assignments)), and its own settings come from
+its `deis-runtime.toml`.
+
+Storing and reading configuration through the endpoints below works for any
+node id. Only the two `push` endpoints need an open channel, and they answer
+`404` when there is none.
 
 ### List All Configurations
 
@@ -476,7 +504,7 @@ GET /api/configs
   "success": true,
   "count": 2,
   "data": {
-    "deis-runtime-1": {
+    "deis-proxy-1": {
       "app.max_instances": 10,
       "gateway.cors_enabled": true
     },
@@ -512,7 +540,7 @@ GET /api/configs/:node_id
 ```json
 {
   "success": true,
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "count": 2,
   "data": {
     "app.max_instances": 10,
@@ -531,7 +559,7 @@ GET /api/configs/:node_id/:config_key
 ```json
 {
   "success": true,
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "config_key": "app.max_instances",
   "value": 10
 }
@@ -558,7 +586,7 @@ Content-Type: application/json
 ```json
 {
   "success": true,
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "version_timestamp": "2026-01-11T10:35:00Z",
   "updated_keys": ["app.max_instances", "app.timeout_seconds"],
   "message": "Configs updated successfully"
@@ -575,7 +603,7 @@ DELETE /api/configs/:node_id
 ```json
 {
   "success": true,
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "message": "All configs deleted successfully"
 }
 ```
@@ -590,7 +618,7 @@ DELETE /api/configs/:node_id/:config_key
 ```json
 {
   "success": true,
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "config_key": "app.max_instances",
   "message": "Config deleted successfully"
 }
@@ -602,13 +630,14 @@ DELETE /api/configs/:node_id/:config_key
 POST /api/configs/push/:node_id
 ```
 
-Push all configurations to the specified node (via WebSocket).
+Push all configurations to the specified node, down its open gRPC control
+channel.
 
 **Response Example**:
 ```json
 {
   "success": true,
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "pushed_count": 2,
   "message": "Pushed 2 configs successfully"
 }
@@ -624,7 +653,7 @@ POST /api/configs/push/:node_id/:config_key
 ```json
 {
   "success": true,
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "config_key": "app.max_instances",
   "message": "Config pushed successfully"
 }
@@ -650,7 +679,7 @@ GET /api/commands
   "commands": [
     {
       "id": "550e8400-e29b-41d4-a716-446655440000",
-      "node_id": "deis-runtime-1",
+      "node_id": "deis-proxy-1",
       "command_type": "get_status",
       "status": "Completed",
       "created_at": "2026-01-11T10:00:00Z"
@@ -674,21 +703,36 @@ Content-Type: application/json
 }
 ```
 
-**Supported Command Types**:
-- `shutdown` - Shutdown node
-- `restart` - Restart node
-- `reload` - Reload configuration
-- `get_status` - Get status
-- `get_metrics` - Get metrics
-- `execute_scheduled` - Execute scheduled task
-- `custom` - Custom command
+**Which nodes can receive one**: only a node holding a control channel open
+to this control plane, which today means a `deis-proxy`. A `deis-runtime` node
+registers over HTTP and pulls its assignments; it never opens that channel, so
+a command addressed to one answers `404` with `node not connected` rather than
+being queued for a node that will never read it. What a runtime node does is
+driven by `GET /api/runtime` and the deployment endpoints instead.
+
+**Command types the control plane will accept**, and what the receiving node
+does with each:
+
+| `command_type` | On a deis-proxy node |
+|---|---|
+| `shutdown` | Graceful shutdown |
+| `restart` | Zero-downtime upgrade (the running process is replaced without dropping connections) |
+| `reload` | Same as `restart` |
+| `get_status` | Returns the process's status |
+| `get_metrics` | **Refused** — answers `metrics are not implemented`. Use `GET /api/metrics` on the control plane |
+| `execute_scheduled` | **Refused** — answers `unknown command`. Cron is fired by the scheduler over the runtime trigger RPC, not as a node command |
+| `{"custom": "<name>"}` | **Refused** unless `<name>` is `graceful_restart`, which is a synonym for `restart`. Anything else answers `unknown command` |
+
+`command_type` is a tagged enum: the six named commands are plain strings, and
+a custom one is the object `{"custom": "<name>"}`. Sending `"custom"` as a bare
+string is a `422` and never reaches a node.
 
 **Response Example**:
 ```json
 {
   "success": true,
   "command_id": "550e8400-e29b-41d4-a716-446655440000",
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "command_type": "get_status",
   "message": "Command submitted successfully"
 }
@@ -707,7 +751,7 @@ GET /api/commands/status/:command_id
   "command_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
-    "node_id": "deis-runtime-1",
+    "node_id": "deis-proxy-1",
     "command_type": "get_status",
     "status": "Completed",
     "created_at": "2026-01-11T10:00:00Z",
@@ -727,7 +771,7 @@ GET /api/commands/node/:node_id
 ```json
 {
   "success": true,
-  "node_id": "deis-runtime-1",
+  "node_id": "deis-proxy-1",
   "count": 3,
   "commands": [...]
 }
@@ -890,39 +934,18 @@ deis_control_heartbeats_total 500
 
 ---
 
-## WebSocket API
+## There is no WebSocket API
 
-Real-time event push (Frontend).
+This document used to describe `ws://localhost:8080/api/ws`, and the startup
+banner used to print that URL. The route never existed: the only thing behind
+it was an in-process broadcaster with no consumer, because the dashboard
+polls. Both the banner line and the broadcaster are gone.
 
-### Connect WebSocket
+What is served instead:
 
-```
-ws://localhost:8080/api/ws
-```
-
-**Received Message Format**:
-```json
-{
-  "event_type": "NodeConnected",
-  "data": {
-    "node_id": "deis-runtime-1",
-    "instance_id": "deis-runtime-1-abc123",
-    "node_role": "deis-runtime:1.0.0",
-    "host": "192.168.1.100",
-    "ports": [8080],
-    "timestamp": "2026-01-11T10:00:00Z"
-  }
-}
-```
-
-**Event Types**:
-- `NodeConnected` - Node connected
-- `NodeDisconnected` - Node disconnected
-- `NodeStateChanged` - Node state changed
-- `HeartbeatReceived` - Heartbeat received
-- `ConfigUpdated` - Configuration updated
-- `CommandSent` - Command sent
-- `CommandCompleted` - Command completed
+- state changes are recorded as events and read back from `GET /api/events`;
+- the dashboard polls `/api/sessions`, `/api/runtime`, `/api/commands`,
+  `/api/events` and `/api/metrics/summary` on a timer.
 
 ---
 
@@ -972,20 +995,25 @@ All API errors use a unified format:
 
 ### Full Workflow Example
 
+Configuration and commands reach a node over its gRPC control channel, so the
+node ids below are a `deis-proxy`. A `deis-runtime` node holds no such channel
+and answers `404` to both - it is driven by `GET /api/runtime` and the
+deployment endpoints instead.
+
 ```bash
-# 1. List all nodes
-curl http://localhost:8080/api/nodes
+# 1. List the nodes holding a control channel
+curl http://localhost:8080/api/sessions
 
 # 2. Update configuration
-curl -X POST http://localhost:8080/api/configs/deis-runtime-1 \
+curl -X POST http://localhost:8080/api/configs/deis-proxy-1 \
   -H "Content-Type: application/json" \
   -d '{"configs": {"app.max_instances": 20}}'
 
 # 3. Push configuration to node
-curl -X POST http://localhost:8080/api/configs/push/deis-runtime-1
+curl -X POST http://localhost:8080/api/configs/push/deis-proxy-1
 
 # 4. Execute command
-curl -X POST http://localhost:8080/api/commands/execute/deis-runtime-1 \
+curl -X POST http://localhost:8080/api/commands/execute/deis-proxy-1 \
   -H "Content-Type: application/json" \
   -d '{"command_type": "reload", "data": null}'
 
@@ -1020,8 +1048,20 @@ curl http://localhost:8080/api/metrics
   in-flight REST requests and node gRPC calls are drained before the process
   leaves
 
+### Unreleased (continued)
+- The node channel has no unconfigured state: with no `node_preshared_keys`
+  the endpoints that serve nodes answer 503 to everyone rather than letting
+  anyone register a node, and the binary generates a key at startup when the
+  configuration file names none
+- `GET /api/nodes`, `/api/nodes/:id` and `/api/nodes/:id/heartbeats` are now
+  `GET /api/sessions`, `/api/sessions/:id` and `/api/sessions/:id/heartbeats`;
+  `/api/nodes` is reserved for the endpoints nodes themselves call
+- `power_reserve` is gone from every response and from the database: nothing
+  ever measured it
+- The `/api/ws` WebSocket endpoint documented below never existed and its
+  description is gone with the broadcaster behind it
+
 ### v0.1.0 (2026-01-11)
 - Initial release
 - Implemented Nodes, Configs, Commands, Events, and Metrics APIs
-- WebSocket real-time event push
 - Prometheus metrics export

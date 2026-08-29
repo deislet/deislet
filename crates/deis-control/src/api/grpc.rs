@@ -11,7 +11,6 @@ use deis_wire::pb::{
     AuthResponse, ControlMessage, Heartbeat, RegisterResponse, control_message::Payload,
 };
 
-use crate::broadcast::EventBroadcaster;
 use crate::command::CommandExecutor;
 use crate::config::ControlConfig;
 use crate::database::Database;
@@ -24,7 +23,6 @@ pub struct GrpcControlService {
     config: Arc<ControlConfig>,
     sessions: Arc<SessionManager>,
     database: Option<Arc<Database>>,
-    broadcaster: Arc<EventBroadcaster>,
     command_executor: Option<Arc<CommandExecutor>>,
     /// Ends every open node channel when the process stops. A default
     /// [`Shutdown`] is never triggered, so a caller that does not wire one
@@ -33,15 +31,10 @@ pub struct GrpcControlService {
 }
 
 impl GrpcControlService {
-    pub fn new(
-        config: Arc<ControlConfig>,
-        sessions: Arc<SessionManager>,
-        broadcaster: Arc<EventBroadcaster>,
-    ) -> Self {
+    pub fn new(config: Arc<ControlConfig>, sessions: Arc<SessionManager>) -> Self {
         Self {
             config,
             sessions,
-            broadcaster,
             database: None,
             command_executor: None,
             shutdown: Shutdown::new(),
@@ -82,12 +75,10 @@ impl ControlService for GrpcControlService {
         let sessions = self.sessions.clone();
         let config = self.config.clone();
         let database = self.database.clone();
-        let broadcaster = self.broadcaster.clone();
         let command_executor = self.command_executor.clone();
 
         // Create a MessageHandler instance
-        let mut handler = MessageHandler::new(config.clone(), sessions.clone())
-            .with_broadcaster(broadcaster.clone());
+        let mut handler = MessageHandler::new(config.clone(), sessions.clone());
 
         if let Some(db) = &database {
             handler = handler.with_database(db.clone());
@@ -200,18 +191,34 @@ async fn handle_payload(
 ) {
     match payload {
         Payload::Authenticate(req) => {
+            // An empty key list is not "no check required": it means this
+            // control plane cannot tell a node from anyone else, so it
+            // admits neither. The binary never starts in that state - see
+            // `ControlConfig::ensure_node_credential` - and a caller that
+            // assembles the service by hand gets a closed channel rather
+            // than an open one.
             let preshared_keys = &handler.config().node_preshared_keys;
-            let valid = preshared_keys.is_empty() || preshared_keys.contains(&req.secret);
+            let valid = preshared_keys
+                .iter()
+                .any(|key| crate::api::middleware::secret_eq(key, &req.secret));
             *authenticated = valid;
 
             let message = if valid {
                 format!("Authenticated: {}", req.instance_id)
+            } else if preshared_keys.is_empty() {
+                "This control plane has no node_preshared_keys configured, so it accepts no node"
+                    .to_string()
             } else {
                 "Invalid secret".to_string()
             };
 
             if valid {
                 info!("gRPC auth success for {}", req.instance_id);
+            } else if preshared_keys.is_empty() {
+                error!(
+                    instance = %req.instance_id,
+                    "Refused a node control channel because node_preshared_keys is empty; no node can attach until one is configured"
+                );
             } else {
                 warn!("gRPC auth failed for {}: invalid secret", req.instance_id);
             }
@@ -267,34 +274,21 @@ async fn handle_payload(
         }
         Payload::Heartbeat(_req) => {
             if let Some(session) = current_session {
-                // Map proto heartbeat to internal struct
-                // Proto: status (string)
-                // Internal: power_reserve (u8)
-                // We need to decide mapping. For now hardcode or parse
-                let power_reserve = 100; // Placeholder
-
+                // The wire's `Heartbeat` carries a status string and nothing
+                // else, so this records that the node was heard from and
+                // claims nothing about its load.
                 let internal_req = crate::message::HeartbeatRequest {
                     id: session.node_id.clone(),
-                    power_reserve,
                 };
 
                 let _ack = handler.handle_heartbeat(internal_req, session).await;
-                // No explicit HeartbeatAck in proto stream for now (based on my design choice in client)
-                // Or I can send one if client expects it. WireClient expects it!
-                // Wait, WireClient implementation:
-                // let response_json = self.receive_message().await?;
-                // Yes, it waits for response.
 
-                // I didn't add HeartbeatAck to proto messages explicitly in oneof?
-                // `ControlMessage` oneof payload: `Heartbeat heartbeat` (client->server).
-                // Server->Client?
-                // Proto definitions:
-                // message Heartbeat { status = 1; }
-                // Use Heartbeat as response too? Or create Ack.
-                // In my proto definition:
-                // oneof payload { ... Heartbeat heartbeat = 3; ... }
-                // So I can send Heartbeat back.
-
+                // The reply is the same `Heartbeat` message with `status:
+                // "ack"`, because `control.proto`'s oneof has no separate
+                // acknowledgement variant to send. The node does not wait for
+                // it - `WireClient::send_heartbeat` sends and returns - so it
+                // is a courtesy rather than a handshake, and losing it costs
+                // nothing.
                 let reply = Payload::Heartbeat(Heartbeat {
                     status: "ack".to_string(),
                 });
@@ -380,9 +374,11 @@ mod tests {
     async fn a_stop_closes_an_open_node_channel_instead_of_waiting_it_out() {
         let shutdown = Shutdown::new();
         let service = GrpcControlService::new(
-            Arc::new(ControlConfig::default()),
+            Arc::new(ControlConfig {
+                node_preshared_keys: vec!["node-psk".to_string()],
+                ..ControlConfig::default()
+            }),
             Arc::new(SessionManager::new()),
-            Arc::new(EventBroadcaster::new()),
         )
         .with_shutdown(shutdown.clone());
 
@@ -408,7 +404,7 @@ mod tests {
             .send(ControlMessage {
                 payload: Some(ClientPayload::Authenticate(AuthenticateRequest {
                     instance_id: "node-a".to_string(),
-                    secret: String::new(),
+                    secret: "node-psk".to_string(),
                 })),
             })
             .await
@@ -422,7 +418,10 @@ mod tests {
 
         // The channel is live: the node got its answer and is now waiting.
         let first = inbound.next().await.expect("a reply is due").unwrap();
-        assert!(matches!(first.payload, Some(Payload::AuthResponse(_))));
+        match first.payload {
+            Some(Payload::AuthResponse(response)) => assert!(response.success),
+            other => panic!("expected an auth response, got {other:?}"),
+        }
 
         // The node has said nothing further and is holding its half open, as a
         // real node does between commands. Whatever happens next comes from
@@ -440,5 +439,56 @@ mod tests {
             closed.is_none(),
             "the channel ended with a message instead of ending: {closed:?}"
         );
+    }
+
+    /// The gRPC half of "unconfigured is not unguarded": with no node key
+    /// this control plane cannot tell a node from anyone else, so it admits
+    /// neither instead of admitting everyone.
+    #[tokio::test]
+    async fn a_control_plane_without_a_node_key_admits_no_node_channel() {
+        let service = GrpcControlService::new(
+            Arc::new(ControlConfig::default()),
+            Arc::new(SessionManager::new()),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        let mut client = ControlServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("the test server must accept a connection");
+
+        let (node_tx, node_rx) = mpsc::channel(4);
+        node_tx
+            .send(ControlMessage {
+                payload: Some(ClientPayload::Authenticate(AuthenticateRequest {
+                    instance_id: "node-a".to_string(),
+                    secret: String::new(),
+                })),
+            })
+            .await
+            .unwrap();
+
+        let mut inbound = client
+            .establish_channel(ReceiverStream::new(node_rx))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first = inbound.next().await.expect("a reply is due").unwrap();
+        match first.payload {
+            Some(Payload::AuthResponse(response)) => assert!(
+                !response.success,
+                "an empty key list must refuse, not wave everyone through"
+            ),
+            other => panic!("expected an auth response, got {other:?}"),
+        }
     }
 }

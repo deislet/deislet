@@ -64,6 +64,12 @@ struct ControlPlane {
     /// assignments it says it left out. Real deis-control sends both headers
     /// on every answer.
     completeness: Arc<parking_lot::Mutex<(bool, u32)>>,
+    /// One permit per time the assignments route has been entered, so a test
+    /// can wait for the request to be in flight without a timer.
+    asked: Arc<tokio::sync::Semaphore>,
+    /// The assignments route answers only while this is true. Starts true, so
+    /// a test that does not care about the timing never notices it.
+    open: tokio::sync::watch::Sender<bool>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -76,6 +82,8 @@ struct PlaneState {
     /// When set, both routes answer 401 unless the request presents it, the
     /// way deis-control does once `node_preshared_keys` is configured.
     required_key: Option<String>,
+    asked: Arc<tokio::sync::Semaphore>,
+    open: tokio::sync::watch::Receiver<bool>,
 }
 
 impl PlaneState {
@@ -133,12 +141,16 @@ impl ControlPlane {
 
         let assignments = Arc::new(parking_lot::Mutex::new(assignments));
         let completeness = Arc::new(parking_lot::Mutex::new((true, 0u32)));
+        let asked = Arc::new(tokio::sync::Semaphore::new(0));
+        let (open, open_rx) = tokio::sync::watch::channel(true);
         let state = PlaneState {
             assignments: assignments.clone(),
             completeness: completeness.clone(),
             bundle: Arc::new(bundle),
             status,
             required_key,
+            asked: asked.clone(),
+            open: open_rx,
         };
         let router = Router::new()
             .route(
@@ -149,6 +161,13 @@ impl ControlPlane {
                      headers: axum::http::HeaderMap| async move {
                         if !state.authorised(&headers) {
                             return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        state.asked.add_permits(1);
+                        let mut open = state.open.clone();
+                        while !*open.borrow_and_update() {
+                            if open.changed().await.is_err() {
+                                break;
+                            }
                         }
                         if state.status != StatusCode::OK {
                             return state.status.into_response();
@@ -192,6 +211,8 @@ impl ControlPlane {
             base,
             assignments,
             completeness,
+            asked,
+            open,
             _task: task,
         }
     }
@@ -211,6 +232,29 @@ impl ControlPlane {
     /// say.
     fn answers_incompletely(&self, withheld: u32) {
         *self.completeness.lock() = (false, withheld);
+    }
+
+    /// Answer completely again, as a control plane does once whatever stopped
+    /// it describing an assignment is fixed.
+    fn answers_completely(&self) {
+        *self.completeness.lock() = (true, 0);
+    }
+
+    /// Hold the assignments answer open until [`Self::answers_now`], so a test
+    /// can make something happen on the node while the request is in flight.
+    fn holds_its_answer(&self) {
+        self.open.send(false).unwrap();
+    }
+
+    /// Wait until the assignments route has been entered. No timer: the route
+    /// hands out a permit as it is entered.
+    async fn was_asked(&self) {
+        self.asked.acquire().await.unwrap().forget();
+    }
+
+    /// Release an answer held by [`Self::holds_its_answer`].
+    fn answers_now(&self) {
+        self.open.send(true).unwrap();
     }
 
     /// One assignment line pointing at this plane's own bundle route.
@@ -266,9 +310,8 @@ async fn a_node_loads_everything_the_control_plane_assigned_it() {
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let outcome = reconcile_once(&client(plane.base(), "node-a"), &deployer)
-        .await
-        .unwrap();
+    let client = client(plane.base(), "node-a");
+    let outcome = Reconciler::new(&client, &deployer).once().await.unwrap();
 
     assert_eq!(outcome.assigned, 1);
     assert_eq!(outcome.installed, 1);
@@ -341,9 +384,8 @@ async fn an_empty_assignment_list_is_a_valid_answer() {
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
-    let outcome = reconcile_once(&client(plane.base(), "node-a"), &deployer)
-        .await
-        .unwrap();
+    let client = client(plane.base(), "node-a");
+    let outcome = Reconciler::new(&client, &deployer).once().await.unwrap();
 
     assert_eq!(outcome, SyncOutcome::default());
 }
@@ -362,9 +404,8 @@ async fn one_unusable_assignment_does_not_stop_the_others() {
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let outcome = reconcile_once(&client(plane.base(), "node-a"), &deployer)
-        .await
-        .unwrap();
+    let client = client(plane.base(), "node-a");
+    let outcome = Reconciler::new(&client, &deployer).once().await.unwrap();
 
     assert_eq!(outcome.failed, 1);
     assert_eq!(outcome.installed, 1);
@@ -383,7 +424,9 @@ async fn a_control_plane_that_refuses_is_reported_rather_than_treated_as_empty()
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
-    let err = reconcile_once(&client(plane.base(), "node-a"), &deployer)
+    let client = client(plane.base(), "node-a");
+    let err = Reconciler::new(&client, &deployer)
+        .once()
         .await
         .unwrap_err();
 
@@ -399,7 +442,9 @@ async fn a_control_plane_that_is_not_there_is_a_transport_failure() {
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
 
-    let err = reconcile_once(&client("http://127.0.0.1:0", "node-a"), &deployer)
+    let unreachable = client("http://127.0.0.1:0", "node-a");
+    let err = Reconciler::new(&unreachable, &deployer)
+        .once()
         .await
         .unwrap_err();
 
@@ -488,7 +533,10 @@ async fn a_node_presents_its_key_to_the_control_plane() {
         Some(NodeCredential::new("node-key", Some(plane.base()))),
     )
     .unwrap();
-    let outcome = reconcile_once(&authenticated, &deployer).await.unwrap();
+    let outcome = Reconciler::new(&authenticated, &deployer)
+        .once()
+        .await
+        .unwrap();
 
     assert_eq!(outcome.assigned, 1);
     assert_eq!(
@@ -518,8 +566,9 @@ async fn an_environment_the_control_plane_no_longer_assigns_stops_serving() {
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
     let client = client(plane.base(), "node-a");
+    let mut reconciler = Reconciler::new(&client, &deployer);
 
-    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    let outcome = reconciler.once().await.unwrap();
     assert_eq!(outcome.installed, 1);
     assert!(apps
         .installed_version(&AppKey::production("demo"))
@@ -527,7 +576,18 @@ async fn an_environment_the_control_plane_no_longer_assigns_stops_serving() {
 
     plane.now_assigns(serde_json::json!([]));
 
-    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    // The first complete answer that leaves it out is not enough on its own:
+    // a control plane that read a broken catalog produces exactly this answer.
+    let outcome = reconciler.once().await.unwrap();
+    assert_eq!(outcome.assigned, 0);
+    assert_eq!(outcome.removal_pending, 1);
+    assert_eq!(outcome.unloaded, 0);
+    assert!(apps
+        .installed_version(&AppKey::production("demo"))
+        .is_some());
+
+    // The second one says the same thing, so this is not a blip.
+    let outcome = reconciler.once().await.unwrap();
     assert_eq!(outcome.assigned, 0);
     assert_eq!(outcome.unloaded, 1);
     assert_eq!(outcome.unload_failed, 0);
@@ -535,6 +595,46 @@ async fn an_environment_the_control_plane_no_longer_assigns_stops_serving() {
         apps.installed_version(&AppKey::production("demo"))
             .is_none(),
         "the node kept serving an application the control plane no longer assigns it"
+    );
+}
+
+#[tokio::test]
+async fn one_short_answer_alone_never_stops_an_application() {
+    // `complete` says only that the control plane dropped nothing while it
+    // assembled the answer. It is not a check that the catalog behind it was
+    // readable, so a control plane that read an empty catalog sends an empty
+    // list marked complete - and acting on that one answer takes every
+    // application off this node at once. The second answer is what tells the
+    // two apart, and a fault that has passed disagrees with the first.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+    let mut reconciler = Reconciler::new(&client, &deployer);
+
+    reconciler.once().await.unwrap();
+    let assigned = plane.assignments.lock().clone();
+
+    plane.now_assigns(serde_json::json!([]));
+    let outcome = reconciler.once().await.unwrap();
+    assert_eq!(outcome.removal_pending, 1);
+    assert_eq!(outcome.unloaded, 0);
+
+    plane.now_assigns(assigned);
+    let outcome = reconciler.once().await.unwrap();
+    assert_eq!(
+        outcome.unloaded, 0,
+        "the fault passed, so nothing should ever have been stopped for it"
+    );
+    assert_eq!(outcome.unchanged, 1);
+    assert!(
+        apps.installed_version(&AppKey::production("demo"))
+            .is_some(),
+        "one bad answer from the control plane became an outage on this node"
     );
 }
 
@@ -553,8 +653,9 @@ async fn removing_a_preview_leaves_production_serving() {
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
     let client = client(plane.base(), "node-a");
+    let mut reconciler = Reconciler::new(&client, &deployer);
 
-    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    let outcome = reconciler.once().await.unwrap();
     assert_eq!(outcome.installed, 2, "both environments should have loaded");
 
     plane.now_assigns(serde_json::json!([plane.line(
@@ -564,7 +665,8 @@ async fn removing_a_preview_leaves_production_serving() {
         &sha
     )]));
 
-    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    reconciler.once().await.unwrap();
+    let outcome = reconciler.once().await.unwrap();
     assert_eq!(outcome.unloaded, 1);
     assert!(
         apps.installed_version(&AppKey::new("demo", "preview-7"))
@@ -591,8 +693,9 @@ async fn reconciling_a_node_that_already_matches_changes_nothing() {
     let deployer = deployer(dir.path(), apps.clone()).await;
     let client = client(plane.base(), "node-a");
 
-    reconcile_once(&client, &deployer).await.unwrap();
-    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    let mut reconciler = Reconciler::new(&client, &deployer);
+    reconciler.once().await.unwrap();
+    let outcome = reconciler.once().await.unwrap();
 
     assert_eq!(
         outcome,
@@ -618,7 +721,8 @@ async fn a_new_version_in_the_list_replaces_the_running_one() {
     let deployer = deployer(dir.path(), apps.clone()).await;
     let client = client(plane.base(), "node-a");
 
-    reconcile_once(&client, &deployer).await.unwrap();
+    let mut reconciler = Reconciler::new(&client, &deployer);
+    reconciler.once().await.unwrap();
     assert_eq!(
         apps.installed_version(&AppKey::production("demo"))
             .unwrap()
@@ -633,7 +737,7 @@ async fn a_new_version_in_the_list_replaces_the_running_one() {
         &sha
     )]));
 
-    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    let outcome = reconciler.once().await.unwrap();
     assert_eq!(outcome.installed, 1);
     assert_eq!(outcome.unloaded, 0, "a version change is not an unload");
     assert_eq!(
@@ -660,7 +764,8 @@ async fn an_incomplete_answer_loads_but_never_removes() {
     let deployer = deployer(dir.path(), apps.clone()).await;
     let client = client(plane.base(), "node-a");
 
-    reconcile_once(&client, &deployer).await.unwrap();
+    let mut reconciler = Reconciler::new(&client, &deployer);
+    reconciler.once().await.unwrap();
     assert!(apps
         .installed_version(&AppKey::production("demo"))
         .is_some());
@@ -668,13 +773,56 @@ async fn an_incomplete_answer_loads_but_never_removes() {
     plane.now_assigns(serde_json::json!([]));
     plane.answers_incompletely(1);
 
-    let outcome = reconcile_once(&client, &deployer).await.unwrap();
-    assert_eq!(outcome.unloaded, 0);
+    for _ in 0..3 {
+        let outcome = reconciler.once().await.unwrap();
+        assert_eq!(outcome.unloaded, 0);
+        assert_eq!(
+            outcome.removal_pending, 0,
+            "an incomplete answer says nothing about absence, so it must not count"
+        );
+    }
     assert!(
         apps.installed_version(&AppKey::production("demo"))
             .is_some(),
         "an incomplete answer must not be treated as an instruction to unload"
     );
+}
+
+#[tokio::test]
+async fn an_incomplete_answer_neither_counts_towards_a_removal_nor_undoes_one() {
+    // An incomplete answer is not evidence about absence in either direction,
+    // so it must not be the second of the two answers that stops something,
+    // and it must not reset a count that a complete answer already started.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+    let mut reconciler = Reconciler::new(&client, &deployer);
+
+    reconciler.once().await.unwrap();
+
+    // One complete answer leaves it out: the count has started.
+    plane.now_assigns(serde_json::json!([]));
+    assert_eq!(reconciler.once().await.unwrap().removal_pending, 1);
+
+    // An incomplete answer in between must not be the second one.
+    plane.answers_incompletely(1);
+    let outcome = reconciler.once().await.unwrap();
+    assert_eq!(outcome.unloaded, 0);
+    assert!(apps
+        .installed_version(&AppKey::production("demo"))
+        .is_some());
+
+    // The next complete answer is, and the count was not thrown away.
+    plane.answers_completely();
+    assert_eq!(reconciler.once().await.unwrap().unloaded, 1);
+    assert!(apps
+        .installed_version(&AppKey::production("demo"))
+        .is_none());
 }
 
 #[tokio::test]
@@ -792,7 +940,22 @@ fn the_loop_never_sleeps_past_the_moment_it_must_re_register() {
         .time_until_refresh(Instant::now())
         .expect("a registered node has a deadline");
     assert!(until <= Duration::from_secs(30));
-    assert!(Duration::from_secs(300).min(until) <= Duration::from_secs(30));
+    assert!(state.cap(Duration::from_secs(300)) <= Duration::from_secs(30));
+
+    // A backoff is capped by the same deadline. This is the one that used to
+    // get through: a node that is merely degraded climbs a retry ladder, and
+    // at the ceiling that ladder is minutes long - longer than the lease.
+    assert!(
+        state.cap(retry_delay(Duration::from_secs(15), 40)) <= Duration::from_secs(30),
+        "a degraded node must not back off past its own registration lease"
+    );
+
+    // A deadline already passed shortens the sleep to nothing, so the next
+    // pass re-registers immediately rather than sleeping through the lapse.
+    let lapsed = RegistrationState::Done {
+        refresh_at: Instant::now() - Duration::from_secs(1),
+    };
+    assert_eq!(lapsed.cap(Duration::from_secs(300)), Duration::ZERO);
 
     // Nothing to refresh yet, and nothing to refresh ever: neither shortens
     // the reconcile interval.
@@ -803,5 +966,121 @@ fn the_loop_never_sleeps_past_the_moment_it_must_re_register() {
     assert_eq!(
         RegistrationState::NotSupported.time_until_refresh(Instant::now()),
         None
+    );
+    assert_eq!(
+        RegistrationState::Pending.cap(Duration::from_secs(300)),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        RegistrationState::NotSupported.cap(Duration::from_secs(300)),
+        Duration::from_secs(300)
+    );
+}
+
+#[tokio::test]
+async fn a_push_that_lands_while_the_list_is_in_flight_is_not_rolled_back() {
+    // The list describes what the control plane wanted at the moment it was
+    // asked. A push that lands while the request is in flight is the later
+    // instruction about the same environment, and the node cannot tell which
+    // is newer by looking at the version ids: they are opaque, and a rollback
+    // deliberately points an environment at an older one. So the node dates
+    // the list instead, and refuses to apply it over anything it did to
+    // itself since.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+    let mut reconciler = Reconciler::new(&client, &deployer);
+
+    reconciler.once().await.unwrap();
+    assert_eq!(
+        apps.installed_version(&AppKey::production("demo"))
+            .unwrap()
+            .version_id,
+        "v1"
+    );
+
+    // The control plane still answers "v1"; the push says "v2" and lands
+    // while that answer is being held open.
+    plane.holds_its_answer();
+    let (outcome, ()) = tokio::join!(async { reconciler.once().await.unwrap() }, async {
+        plane.was_asked().await;
+        deployer
+            .apply(DeploymentOrder {
+                app_id: "demo".to_string(),
+                version_id: "v2".to_string(),
+                environment: "production".to_string(),
+                bundle_url: format!("{}/bundle", plane.base()),
+                bundle_sha: sha.clone(),
+                env: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        plane.answers_now();
+    });
+
+    assert_eq!(outcome.superseded, 1);
+    assert_eq!(outcome.installed, 0);
+    assert_eq!(
+        apps.installed_version(&AppKey::production("demo"))
+            .unwrap()
+            .version_id,
+        "v2",
+        "the reconcile undid a push that landed after the list it acted on"
+    );
+}
+
+#[tokio::test]
+async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() {
+    // The same race on the other half of a reconciliation, which is the half
+    // that cannot be taken back. This environment is already a confirmed
+    // removal candidate, so the pass about to run would stop it - and a push
+    // lands on it while the answer is in flight. The list predates that push,
+    // so it has nothing to say about the environment any more.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+    let mut reconciler = Reconciler::new(&client, &deployer);
+
+    reconciler.once().await.unwrap();
+
+    // One complete answer leaving it out: the next one would stop it.
+    plane.now_assigns(serde_json::json!([]));
+    assert_eq!(reconciler.once().await.unwrap().removal_pending, 1);
+
+    plane.holds_its_answer();
+    let (outcome, ()) = tokio::join!(async { reconciler.once().await.unwrap() }, async {
+        plane.was_asked().await;
+        deployer
+            .apply(DeploymentOrder {
+                app_id: "demo".to_string(),
+                version_id: "v2".to_string(),
+                environment: "production".to_string(),
+                bundle_url: format!("{}/bundle", plane.base()),
+                bundle_sha: sha.clone(),
+                env: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        plane.answers_now();
+    });
+
+    assert_eq!(outcome.unloaded, 0);
+    assert_eq!(outcome.superseded, 1);
+    assert_eq!(
+        apps.installed_version(&AppKey::production("demo"))
+            .unwrap()
+            .version_id,
+        "v2",
+        "a reconcile stopped an application a push had just installed"
     );
 }

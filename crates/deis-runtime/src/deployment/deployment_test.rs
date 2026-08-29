@@ -393,13 +393,83 @@ async fn an_assignment_skips_an_app_already_on_that_version() {
 
     // Startup must not undo a push that landed while it was still working
     // through its list - that push is newer, and it is the one that carried
-    // the secrets.
+    // the secrets. Here the list was asked for *after* the push, so nothing
+    // dates it out; what makes this a no-op is that the version has not moved
+    // and the environment is confirmed.
+    let as_of = deployer.change_stamp();
     let applied = deployer
-        .apply_from_assignment(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .apply_from_assignment(
+            order("demo", "v1", control.url("v1"), &bundle.sha256, &[]),
+            as_of,
+        )
         .await
         .unwrap();
 
     assert_eq!(applied, Applied::AlreadyRunning);
+}
+
+#[tokio::test]
+async fn an_assignment_older_than_a_push_does_not_roll_it_back() {
+    // The version ids cannot settle this on their own: they are opaque, and a
+    // rollback deliberately points an environment back at an older one, so
+    // "the assigned version differs from the running one" says nothing about
+    // which instruction is the later of the two. What the node can order is
+    // when each one reached it, which is what the change stamp is.
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let control = ControlPlane::serving(HashMap::from([
+        ("v1".to_string(), bundle.bytes.clone()),
+        ("v2".to_string(), bundle.bytes.clone()),
+    ]))
+    .await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+
+    deployer
+        .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .await
+        .unwrap();
+
+    // The list is dated here - before the push that moves this environment to
+    // v2 - and only reaches the node afterwards.
+    let as_of = deployer.change_stamp();
+    deployer
+        .apply(order("demo", "v2", control.url("v2"), &bundle.sha256, &[]))
+        .await
+        .unwrap();
+
+    let applied = deployer
+        .apply_from_assignment(
+            order("demo", "v1", control.url("v1"), &bundle.sha256, &[]),
+            as_of,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        applied,
+        Applied::Superseded {
+            running_version_id: Some("v2".to_string())
+        }
+    );
+    assert_eq!(
+        apps.installed_version(&demo()).unwrap().version_id,
+        "v2",
+        "an assignment list older than the push rolled the push back"
+    );
+
+    // A list dated after the push is not stale, and does move the environment
+    // back to v1 - which is what an intentional rollback looks like.
+    let as_of = deployer.change_stamp();
+    deployer
+        .apply_from_assignment(
+            order("demo", "v1", control.url("v1"), &bundle.sha256, &[]),
+            as_of,
+        )
+        .await
+        .unwrap();
+    assert_eq!(apps.installed_version(&demo()).unwrap().version_id, "v1");
 }
 
 #[tokio::test]
@@ -852,14 +922,18 @@ async fn a_version_recovered_from_disk_is_reinstalled_when_the_real_one_arrives(
     assert_eq!(secret_seen(&apps, &demo()).await, "");
 
     // The control plane comes back and hands out the same version id.
+    let as_of = deployer.change_stamp();
     let applied = deployer
-        .apply_from_assignment(order(
-            "demo",
-            "v1",
-            control.url("v1"),
-            &bundle.sha256,
-            &[("API_KEY", "from the control plane")],
-        ))
+        .apply_from_assignment(
+            order(
+                "demo",
+                "v1",
+                control.url("v1"),
+                &bundle.sha256,
+                &[("API_KEY", "from the control plane")],
+            ),
+            as_of,
+        )
         .await
         .unwrap();
 

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["kookyleo <kookyleo@gmail.com>"]
 license = "Apache-2.0"
-repository = "https://github.com/deislet/deis-build"
-homepage = "https://github.com/deislet/deis-build"
+repository = "https://github.com/deislet/deislet"
+homepage = "https://github.com/deislet/deislet"
 description = "Core types and traits for deis-build - Universal Edge Function Compiler"
 
 [dependencies]

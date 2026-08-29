@@ -91,7 +91,6 @@ pub struct RegisterResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub id: String,
-    pub power_reserve: u8,
 }
 
 /// Heartbeat acknowledgment - matches deis-wire SDK format

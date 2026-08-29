@@ -271,6 +271,59 @@ mod tests {
         assert!(best_match(&["/users/:id".to_string()], "/posts/1").is_none());
     }
 
+    /// The rule this module matches with is the same one deis-build ordered
+    /// the generated entry module's table with, because both are
+    /// `deis_bundle::routing`. This is the check that they agree: given the
+    /// table deis-build would emit, the pattern picked here is the first row
+    /// of that table that fits.
+    ///
+    /// It is the anti-regression test for a defect that has now happened
+    /// twice - a second copy of the ordering living in this file. A copy that
+    /// agrees on the day it is written is still the defect; what it grows
+    /// into is a request reaching a handler the build did not intend, with no
+    /// error anywhere to say so.
+    #[test]
+    fn the_pattern_picked_here_is_the_first_row_of_the_table_the_build_emits() {
+        let mut table: Vec<String> = [
+            "/:org/settings",
+            "/admin/:page",
+            "/admin/*",
+            "/api/health",
+            "/api/:id",
+            "/api/*",
+            "/users/:id/posts/:post",
+            "/*",
+            "/",
+        ]
+        .iter()
+        .map(|pattern| pattern.to_string())
+        .collect();
+        deis_bundle::routing::sort_by_specificity(&mut table, |pattern| pattern.as_str());
+
+        for path in [
+            "/",
+            "/admin/settings",
+            "/admin/a/b",
+            "/api/health",
+            "/api/42",
+            "/api/a/b",
+            "/users/7/posts/9",
+            "/anything",
+            "/deep/er/still",
+        ] {
+            let (picked, _) = best_match(&table, path).expect("something matches every path here");
+            let first_row = table
+                .iter()
+                .position(|pattern| match_route(pattern, path).is_some())
+                .expect("the same something");
+            assert_eq!(
+                picked, first_row,
+                "path {path}: this module picked {:?}, the build's table would run {:?}",
+                table[picked], table[first_row]
+            );
+        }
+    }
+
     #[test]
     fn test_path_from_url_strips_scheme_host_query_fragment() {
         assert_eq!(

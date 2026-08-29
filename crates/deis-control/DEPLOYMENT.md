@@ -13,7 +13,7 @@
 - **CPU**: 2+ cores
 - **Memory**: 2GB+ (depending on the number of Nodes)
 - **Disk**: 10GB+ (for database and logs)
-- **Network**: Network environment capable of accessing Node nodes
+- **Network**: able to reach every node it manages, and reachable by them
 
 ### Software Dependencies
 
@@ -133,8 +133,7 @@ services:
   deis-control:
     build: .
     ports:
-      - "8080:8080"  # WebSocket
-      - "8080:8080"  # HTTP + gRPC
+      - "8080:8080"  # HTTP API + the node gRPC channel, one port
     volumes:
       - deis-control-data:/var/lib/deis-control
       - ./config.toml:/etc/deis-control/config.toml:ro
@@ -186,7 +185,6 @@ sudo certbot certonly --standalone -d deis-control.yourdomain.com
 # Configuration file
 [tls]
 api_enabled = true
-ws_enabled = false
 cert_path = "/etc/letsencrypt/live/deis-control.yourdomain.com/fullchain.pem"
 key_path = "/etc/letsencrypt/live/deis-control.yourdomain.com/privkey.pem"
 ```
@@ -227,18 +225,12 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-
-        # WebSocket support
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
     }
 
-    # Node WebSocket
-    location /ws {
-        proxy_pass http://localhost:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+    # The node control channel is gRPC over HTTP/2 on the same port, not a
+    # WebSocket upgrade: it needs h2c end to end.
+    location /deis.control.ControlService/ {
+        grpc_pass grpc://localhost:8080;
     }
 
     # Frontend static files
@@ -342,8 +334,7 @@ sudo journalctl -u deis-control -f
 
 ```bash
 # UFW (Ubuntu)
-sudo ufw allow 8080/tcp  # WebSocket
-sudo ufw allow 8080/tcp  # HTTP API
+sudo ufw allow 8080/tcp  # HTTP API + the node gRPC channel
 sudo ufw allow 443/tcp   # HTTPS (if using Nginx)
 sudo ufw enable
 

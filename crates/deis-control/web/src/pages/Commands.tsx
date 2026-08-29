@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNodes, useCommands } from '@/hooks/useApi'
+import { useSessions, useCommands } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -45,8 +45,10 @@ function getCommandStatusBadgeVariant(status: string) {
 }
 
 interface ExecuteCommandDialogProps {
-  nodes: any[]
-  onExecute: (nodeId: string, commandType: string, commandData?: any) => Promise<void>
+  /// Only a node holding a control channel open can be sent a command, so
+  /// this is the control-channel list and not the runtime fleet.
+  nodes: { id: string; node_role: string }[]
+  onExecute: (nodeId: string, commandType: string, data?: unknown) => Promise<void>
 }
 
 function ExecuteCommandDialog({ nodes, onExecute }: ExecuteCommandDialogProps) {
@@ -151,12 +153,12 @@ function ExecuteCommandDialog({ nodes, onExecute }: ExecuteCommandDialogProps) {
 }
 
 export function Commands() {
-  const { nodes } = useNodes()
+  const { sessions } = useSessions()
   const { commands, loading, error, refetch, executeCommand, cancelCommand } = useCommands()
   const [cancelling, setCancelling] = useState<string | null>(null)
 
-  const handleExecuteCommand = async (nodeId: string, commandType: string, commandData?: any) => {
-    await executeCommand(nodeId, commandType, commandData)
+  const handleExecuteCommand = async (nodeId: string, commandType: string, data?: unknown) => {
+    await executeCommand(nodeId, commandType, data)
   }
 
   const handleCancelCommand = async (commandId: string) => {
@@ -182,7 +184,7 @@ export function Commands() {
             <RefreshCw className={`h-4 w-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
             Refresh
           </Button>
-          <ExecuteCommandDialog nodes={nodes} onExecute={handleExecuteCommand} />
+          <ExecuteCommandDialog nodes={sessions} onExecute={handleExecuteCommand} />
         </div>
       </div>
 

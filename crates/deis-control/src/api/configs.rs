@@ -145,8 +145,7 @@ pub async fn push_config(
     state
         .config_manager
         .push_config_to_node(&node_id, &config_key)
-        .await
-        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+        .await?;
 
     Ok(Json(json!({
         "success": true,
@@ -164,8 +163,7 @@ pub async fn push_all_configs(
     let count = state
         .config_manager
         .push_all_configs_to_node(&node_id)
-        .await
-        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+        .await?;
 
     Ok(Json(json!({
         "success": true,
