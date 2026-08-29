@@ -5,9 +5,12 @@ package deis.queue;
 // A durable message queue with lease-based consumption.
 //
 // The tenant is not a field on any message here: it travels out of band in
-// the `x-deis-app-id` gRPC metadata header, the same header deis-proxy stamps
-// on the HTTP data path. A call that arrives without it is refused rather
-// than served from some default namespace.
+// the `x-deis-tenant` gRPC metadata header, whose value is one application in
+// one environment ("demo.production"). That is deliberately not the
+// `x-deis-app-id` header deis-proxy stamps on the HTTP data path, which names
+// the application alone: a preview deployment must not be able to consume
+// what production enqueued. A call that arrives without the tenant header is
+// refused rather than served from some default namespace.
 //
 // DELIVERY IS AT-LEAST-ONCE. A message handed out by Pull stays in the queue
 // until it is acknowledged; a consumer that crashes, is restarted, or simply
@@ -19,7 +22,15 @@ package deis.queue;
 // Consumption is a pull: the runtime asks for work on its own schedule. The
 // queue never pushes to a node, because pushing would require the queue to
 // know which node runs which app, and it deliberately knows nothing but the
-// app id.
+// tenant.
+//
+// A LEASE IS PROVED, NOT CLAIMED. Every message handed out by Pull carries a
+// lease token, and Ack and Nack take that token beside the id. The token
+// changes on every delivery, so a consumer whose lease has lapsed - and whose
+// message has since been handed to somebody else - can no longer delete or
+// release the row: its token names the previous delivery, not the current
+// one. Without that, a slow consumer finishing late would silently destroy
+// work another consumer was in the middle of doing.
 service Queue {
   // Enqueue one message. It is visible to the next Pull immediately.
   rpc Send(SendRequest) returns (SendResponse);
@@ -45,6 +56,17 @@ service Queue {
   // A message whose attempts have reached the queue's ceiling is dead
   // lettered here instead of being made visible again.
   rpc Nack(NackRequest) returns (NackResponse);
+
+  // Read the dead letter table: what used up its delivery attempts and is
+  // waiting for a person to decide what to do with it.
+  //
+  // This is an operator's view, not a consumer's. Nothing here is delivered
+  // to anybody, and reading it changes nothing.
+  rpc ListDeadLetters(ListDeadLettersRequest) returns (ListDeadLettersResponse);
+
+  // Put named dead letters back on their queue, with a fresh set of delivery
+  // attempts. For after the cause has been fixed.
+  rpc ReplayDeadLetters(ReplayDeadLettersRequest) returns (ReplayDeadLettersResponse);
 }
 
 message SendRequest {
@@ -106,6 +128,24 @@ message QueueMessage {
   int64 lease_expires_at = 4;
   // Unix second the message was enqueued.
   int64 created_at = 5;
+  // Proof that this delivery is the current one, to be handed back with the
+  // id in Ack or Nack.
+  //
+  // A fresh token is issued on every delivery, so the one in this message is
+  // worthless the moment the lease lapses and the message goes to somebody
+  // else. Treat it as opaque; its only meaning is "this is the delivery I was
+  // given".
+  string lease_token = 6;
+}
+
+// One message a consumer is answering for, and its proof of holding it.
+message MessageHandle {
+  // `QueueMessage.id`.
+  string id = 1;
+  // `QueueMessage.lease_token`, exactly as it was received. A handle with an
+  // empty token is refused rather than treated as a match: an unproved claim
+  // on a message is the thing this field exists to stop.
+  string lease_token = 2;
 }
 
 message PullResponse {
@@ -116,9 +156,13 @@ message PullResponse {
 
 message AckRequest {
   string queue_name = 1;
-  // Ids from a previous Pull. Unknown ids are ignored, so acknowledging the
-  // same message twice is harmless.
-  repeated string message_ids = 2;
+  // Field 2 was `repeated string message_ids`: a bare list of ids, with
+  // nothing to show the caller still held the lease it was answering for.
+  reserved 2;
+  reserved "message_ids";
+  // Handles from a previous Pull. A handle whose message is no longer there
+  // is ignored, so acknowledging the same message twice is harmless.
+  repeated MessageHandle messages = 3;
 }
 
 message AckResponse {
@@ -126,22 +170,27 @@ message AckResponse {
   // for means those messages were already acknowledged, or their lease had
   // lapsed and they were dead lettered in the meantime.
   int32 acknowledged = 1;
+  // How many handles named a message that is still queued but under a newer
+  // lease: this consumer's lease had lapsed and the message has been handed
+  // to somebody else, which means it is being processed twice right now. The
+  // rows were left alone. Worth acting on - it means the lease is shorter
+  // than the handler actually takes.
+  int32 stale_leases = 2;
 }
 
 message NackRequest {
   string queue_name = 1;
-  // Ids from a previous Pull. Unknown ids are ignored.
-  //
-  // There is no lease token, so a message is identified only by its id: a
-  // consumer whose lease already lapsed, and whose message has since been
-  // handed to somebody else, still acts on the row. Answer promptly, and
-  // above all pick a lease longer than the handler can run for.
-  repeated string message_ids = 2;
+  // Field 2 was `repeated string message_ids`; see AckRequest.
+  reserved 2;
+  reserved "message_ids";
   // Wait this many seconds before the message is handed out again. Zero
   // makes it visible immediately, which will usually mean the same consumer
   // picks it straight back up; use a delay for a failure worth backing off
   // from. The server caps it.
   int32 delay_seconds = 3;
+  // Handles from a previous Pull. A handle whose message is no longer there
+  // is ignored.
+  repeated MessageHandle messages = 4;
 }
 
 message NackResponse {
@@ -151,4 +200,65 @@ message NackResponse {
   // letter table instead. These will never be delivered again and need an
   // operator to look at them.
   int32 dead_lettered = 2;
+  // Handles whose lease had already lapsed and whose message now belongs to
+  // another consumer; see AckResponse.stale_leases. Those rows were left
+  // alone rather than released out from under whoever holds them now.
+  int32 stale_leases = 3;
+}
+
+message ListDeadLettersRequest {
+  // Which queue to read. Empty means every queue of this tenant, which is
+  // the view to start from when the question is "what is stuck?".
+  string queue_name = 1;
+  // Most messages to return. Zero or less means the server's default; the
+  // server also caps it, and stops early when the bodies would make a
+  // response too large to send.
+  int32 limit = 2;
+  // `next_cursor` from a previous page. Empty starts at the oldest death.
+  string cursor = 3;
+}
+
+// One message that used up its delivery attempts.
+message DeadLetterMessage {
+  string queue_name = 1;
+  // The id it had while it was queued, and the id ReplayDeadLetters takes.
+  string id = 2;
+  // Bytes, not a string: a body that is not valid UTF-8 is exactly the kind
+  // of message that ends up here, and an operator has to be able to look at
+  // it to work out why.
+  bytes body = 3;
+  // How many times it was delivered before it was given up on.
+  int32 attempts = 4;
+  // Unix second it was first enqueued.
+  int64 created_at = 5;
+  // Unix second it was moved to the dead letter table.
+  int64 died_at = 6;
+}
+
+message ListDeadLettersResponse {
+  // Oldest death first, so a page boundary is stable while new dead letters
+  // arrive.
+  repeated DeadLetterMessage messages = 1;
+  // Pass to the next call to continue. Empty means this was the last page.
+  string next_cursor = 2;
+}
+
+message ReplayDeadLettersRequest {
+  string queue_name = 1;
+  // Ids from ListDeadLetters. Naming them is required rather than optional:
+  // replaying a whole queue of poison messages by accident is a mistake with
+  // no undo, so the caller says which ones it means.
+  repeated string message_ids = 2;
+  // Wait this many seconds before the replayed messages become visible. Zero
+  // makes them ready at once. The server caps it, as it does a Nack delay.
+  int32 delay_seconds = 3;
+}
+
+message ReplayDeadLettersResponse {
+  // Messages put back on the queue, each with its attempt count reset, so a
+  // replayed message gets the same allowance as a new one.
+  int32 replayed = 1;
+  // Ids that were not in the dead letter table: already replayed, already
+  // pruned by the retention sweep, or never there.
+  int32 not_found = 2;
 }

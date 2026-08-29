@@ -7,7 +7,9 @@ use deis_runtime::app::ApplicationManager;
 use deis_runtime::app_repo::AppRepo;
 use deis_runtime::config::RuntimeConfig;
 use deis_runtime::config_store::ConfigStore;
-use deis_runtime::deployment::{AssignmentClient, DeploymentManager};
+use deis_runtime::deployment::{
+    AssignmentClient, DeploymentManager, NodeRegistrar, NodeRegistration,
+};
 use deis_runtime::dispatcher::{self, ServerOptions};
 use deis_runtime::health::NodeHealth;
 use deis_runtime::logging::{LogBuffer, LogShipper, RuntimeLayer, ShipperConfig};
@@ -112,12 +114,13 @@ async fn main() -> Result<()> {
         );
     }
 
+    let request_timeout = std::time::Duration::from_secs(config.control.request_timeout_secs);
     let assignment_client = match config.control.endpoint.as_deref() {
         Some(endpoint) => Some(
             AssignmentClient::new(
                 endpoint,
                 &node_id,
-                std::time::Duration::from_secs(config.control.request_timeout_secs),
+                request_timeout,
                 config.control.credential(),
             )
             .context("building the control plane client")?,
@@ -125,11 +128,30 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    let startup_sync = tokio::spawn(deis_runtime::deployment::run_startup_sync(
+    // Without an endpoint there is nobody to register with, which is the
+    // standalone case; the loop below says so and reports the node ready.
+    let registrar = match config.control.endpoint.as_deref() {
+        Some(endpoint) => Some(
+            NodeRegistrar::new(
+                endpoint,
+                NodeRegistration::of_this_node(node_id.clone(), port),
+                request_timeout,
+                config.control.credential(),
+            )
+            .context("building the node registration client")?,
+        ),
+        None => None,
+    };
+
+    // Runs for the life of the process: it registers this node, keeps it
+    // matching the control plane's assignment list, and reports readiness.
+    let control_loop = tokio::spawn(deis_runtime::deployment::run_control_loop(
         assignment_client,
+        registrar,
         deployer.clone(),
         health.clone(),
         std::time::Duration::from_secs(config.control.retry_interval_secs),
+        std::time::Duration::from_secs(config.control.reconcile_interval_secs),
     ));
 
     info!("====================================");
@@ -152,10 +174,11 @@ async fn main() -> Result<()> {
     })
     .await?;
 
-    // The sync task retries forever while the control plane is unreachable, so
-    // it is aborted rather than awaited; the node is on its way out and the
+    // The control loop runs for the life of the process - it reconciles on a
+    // timer and retries forever while the control plane is unreachable - so it
+    // is aborted rather than awaited; the node is on its way out and the
     // partial state it would produce goes away with the process.
-    startup_sync.abort();
+    control_loop.abort();
 
     // Hand over whatever is still buffered before the process goes away; once
     // it exits, anything left in memory is gone for good.

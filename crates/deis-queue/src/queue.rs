@@ -13,6 +13,20 @@
 //! consumer crashing costs nothing - the row was never moved anywhere, so
 //! when the clock passes `visible_at` it is simply ready again.
 //!
+//! Beside `visible_at` the row carries a `lease_token`, rewritten on every
+//! delivery, and `Ack` and `Nack` match on it as well as on the id. That is
+//! what stops the failure an id-only handle cannot see: a consumer whose
+//! lease lapsed while it was still working finishes, acknowledges, and
+//! deletes a message that has since been handed to somebody else - who is
+//! part-way through the same work and will never be allowed to finish it.
+//! With the token, the late acknowledgement matches nothing, is counted as a
+//! stale lease and logged, and the current holder keeps its message.
+//!
+//! Note what the token does *not* do. A lease that lapses with nobody else
+//! having taken the message still has the same token, so a late
+//! acknowledgement of work genuinely done is honoured rather than rejected -
+//! the fence closes only when the message actually belongs to someone else.
+//!
 //! Every read-then-write here runs in one `IMMEDIATE` transaction. `Pull` is
 //! the reason: two consumers polling the same queue at the same moment both
 //! read the same candidate rows, and whichever writes second must wait rather
@@ -22,8 +36,10 @@ use crate::Clock;
 use crate::MAX_GRPC_MESSAGE_BYTES;
 use crate::error::{QueueError, QueueResult};
 use crate::proto::queue::{
-    AckRequest, AckResponse, NackRequest, NackResponse, PullRequest, PullResponse, QueueMessage,
-    SendBatchRequest, SendBatchResponse, SendRequest, SendResponse, queue_server::Queue,
+    AckRequest, AckResponse, DeadLetterMessage, ListDeadLettersRequest, ListDeadLettersResponse,
+    NackRequest, NackResponse, PullRequest, PullResponse, QueueMessage, ReplayDeadLettersRequest,
+    ReplayDeadLettersResponse, SendBatchRequest, SendBatchResponse, SendRequest, SendResponse,
+    queue_server::Queue,
 };
 use crate::sqlite::{PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
@@ -33,6 +49,14 @@ use tonic::{Request, Response, Status};
 /// Longest accepted queue name. A name lives in a primary key and in log
 /// lines; past this it is an accident, not a design.
 const MAX_QUEUE_NAME_LEN: usize = 128;
+
+/// Dead letters returned by `ListDeadLetters` when the caller asks for no
+/// particular number. Small: an operator reads these, and a page is meant to
+/// be looked at rather than scrolled past.
+const DEFAULT_DEAD_LETTER_PAGE: i32 = 50;
+
+/// Hard ceiling on one dead letter page, whatever the caller asks for.
+const MAX_DEAD_LETTER_PAGE: i32 = 500;
 
 /// Ceiling on the bodies one `PullResponse` may carry.
 ///
@@ -99,6 +123,26 @@ pub struct LeasedMessage {
     /// Unix second this lease lapses.
     pub lease_expires_at: i64,
     pub created_at: i64,
+    /// Proof that this delivery is the current one. Reissued on every
+    /// delivery, and required by `Ack` and `Nack`; see the module docs.
+    pub lease_token: String,
+}
+
+/// One message a consumer is answering for, and its proof of holding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageHandle {
+    pub id: String,
+    pub lease_token: String,
+}
+
+/// What one `Ack` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AckOutcome {
+    /// Messages deleted.
+    pub acknowledged: usize,
+    /// Handles whose message is still queued under a *newer* lease. Those
+    /// rows were left alone: the message belongs to another consumer now.
+    pub stale_leases: usize,
 }
 
 /// A message that used up its attempts.
@@ -119,6 +163,18 @@ pub struct NackOutcome {
     pub released: usize,
     /// Messages moved to the dead letter table instead.
     pub dead_lettered: usize,
+    /// Handles whose message is still queued under a newer lease; see
+    /// [`AckOutcome::stale_leases`].
+    pub stale_leases: usize,
+}
+
+/// What one `ReplayDeadLetters` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReplayOutcome {
+    /// Messages put back on the queue with their attempts reset.
+    pub replayed: usize,
+    /// Ids that were not in the dead letter table at all.
+    pub not_found: usize,
 }
 
 /// The queue service, backed by one shared SQLite file.
@@ -179,13 +235,16 @@ impl QueueService {
             }
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS messages (
-                     tenant     TEXT    NOT NULL,
-                     queue      TEXT    NOT NULL,
-                     id         TEXT    NOT NULL,
-                     body       BLOB    NOT NULL,
-                     attempts   INTEGER NOT NULL DEFAULT 0,
-                     visible_at INTEGER NOT NULL,
-                     created_at INTEGER NOT NULL,
+                     tenant      TEXT    NOT NULL,
+                     queue       TEXT    NOT NULL,
+                     id          TEXT    NOT NULL,
+                     body        BLOB    NOT NULL,
+                     attempts    INTEGER NOT NULL DEFAULT 0,
+                     visible_at  INTEGER NOT NULL,
+                     created_at  INTEGER NOT NULL,
+                     -- Rewritten on every delivery; empty while the message
+                     -- is waiting, because nobody holds it.
+                     lease_token TEXT    NOT NULL DEFAULT '',
                      PRIMARY KEY (tenant, queue, id)
                  );
                  -- The one index Pull needs: it looks up a single tenant's
@@ -205,6 +264,7 @@ impl QueueService {
                  CREATE INDEX IF NOT EXISTS dead_letter_died_at
                      ON dead_letter(died_at);",
             )?;
+            add_lease_token_column(conn)?;
             Ok(())
         })
         .await?;
@@ -301,8 +361,13 @@ impl QueueService {
     /// One transaction does three things, in this order: retire anything that
     /// came back visible with its attempts already used up, pick the messages
     /// that have been ready longest, and push their visibility past the lease
-    /// while counting the delivery. Splitting those apart would let a second
-    /// consumer see a message this call has already claimed.
+    /// while counting the delivery and issuing a fresh lease token. Splitting
+    /// those apart would let a second consumer see a message this call has
+    /// already claimed.
+    ///
+    /// The token is what [`Self::ack`] and [`Self::nack`] check: it is new on
+    /// every delivery, so the previous holder of a message cannot act on it
+    /// once it has moved on.
     pub async fn pull(
         &self,
         tenant: &TenantId,
@@ -344,6 +409,9 @@ impl QueueService {
                       ORDER BY visible_at ASC, rowid ASC
                       LIMIT ?4",
                 )?;
+                // A token per message, not per pull: the row is what a later
+                // Ack names, so the proof has to live on the row.
+                let token = || uuid::Uuid::new_v4().to_string();
                 let mut rows =
                     select.query(rusqlite::params![tenant_id, table_queue, now, wanted])?;
 
@@ -371,6 +439,7 @@ impl QueueService {
                         attempts: row.get::<_, i32>(2)? + 1,
                         lease_expires_at,
                         created_at: row.get(3)?,
+                        lease_token: token(),
                     });
                 }
                 drop(rows);
@@ -378,7 +447,7 @@ impl QueueService {
 
                 let mut lease_stmt = tx.prepare(
                     "UPDATE messages
-                        SET visible_at = ?4, attempts = attempts + 1
+                        SET visible_at = ?4, attempts = attempts + 1, lease_token = ?5
                       WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
                 )?;
                 for message in &leased {
@@ -386,7 +455,8 @@ impl QueueService {
                         tenant_id,
                         table_queue,
                         message.id,
-                        lease_expires_at
+                        lease_expires_at,
+                        message.lease_token
                     ])?;
                 }
                 drop(lease_stmt);
@@ -411,48 +481,84 @@ impl QueueService {
         Ok(leased)
     }
 
-    /// Delete handled messages. Ids that are not there are ignored, so a
-    /// repeated acknowledgement is harmless. Returns how many rows went away.
+    /// Delete handled messages.
+    ///
+    /// A handle whose message is not there is ignored, so a repeated
+    /// acknowledgement is harmless. A handle whose token no longer matches
+    /// the row is *not* acted on: the message has moved on since this
+    /// consumer was given it - handed to another consumer, or put back on the
+    /// queue - so deleting it would throw away work somebody else is in the
+    /// middle of, or work that is queued to be done.
     pub async fn ack(
         &self,
         tenant: &TenantId,
         queue: &str,
-        ids: Vec<String>,
-    ) -> QueueResult<usize> {
+        handles: Vec<MessageHandle>,
+    ) -> QueueResult<AckOutcome> {
         let queue = self.check_queue(queue)?;
-        if ids.is_empty() {
-            return Ok(0);
+        if handles.is_empty() {
+            return Ok(AckOutcome::default());
         }
-        self.check_id_count(&queue, ids.len())?;
+        self.check_handles(&queue, &handles)?;
         let tenant_id = tenant.as_str().to_string();
         let table_queue = queue.clone();
-        let asked = ids.len();
+        let asked = handles.len();
 
-        let removed = self
+        let (removed, stale) = self
             .pool
             .with_tx(move |tx| {
-                let mut delete = tx
-                    .prepare("DELETE FROM messages WHERE tenant = ?1 AND queue = ?2 AND id = ?3")?;
+                let mut delete = tx.prepare(
+                    "DELETE FROM messages
+                      WHERE tenant = ?1 AND queue = ?2 AND id = ?3 AND lease_token = ?4",
+                )?;
+                let mut still_queued = tx.prepare(
+                    "SELECT 1 FROM messages WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
+                )?;
                 let mut removed = 0usize;
-                for id in &ids {
-                    removed += delete.execute(rusqlite::params![tenant_id, table_queue, id])?;
+                let mut stale = Vec::new();
+                for handle in &handles {
+                    let deleted = delete.execute(rusqlite::params![
+                        tenant_id,
+                        table_queue,
+                        handle.id,
+                        handle.lease_token
+                    ])?;
+                    if deleted > 0 {
+                        removed += 1;
+                        continue;
+                    }
+                    // Nothing deleted has two very different causes, and the
+                    // difference is worth one extra lookup: the message is
+                    // gone (already acknowledged - ordinary), or it is still
+                    // there under a newer lease (this consumer lost it and is
+                    // duplicating work - worth an operator's attention).
+                    let present: Option<i64> = still_queued
+                        .query_row(
+                            rusqlite::params![tenant_id, table_queue, handle.id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if present.is_some() {
+                        stale.push(handle.id.clone());
+                    }
                 }
-                Ok(removed)
+                Ok((removed, stale))
             })
             .await?;
 
-        if removed < asked {
-            // Not an error: the usual causes are a retried ack and a lease
-            // that lapsed while the handler was still running, and neither
-            // needs an operator. It is worth seeing, because the second one
-            // means the message is being handled twice.
-            tracing::info!(
+        for id in &stale {
+            warn_stale_lease(tenant, &queue, id, "acknowledge");
+        }
+        if removed + stale.len() < asked {
+            // Not an error: the usual cause is a retried acknowledgement of a
+            // message that is already gone.
+            tracing::debug!(
                 tenant = %tenant,
                 queue = %queue,
                 acknowledged = removed,
                 asked,
-                "some acknowledged ids were no longer queued; they were already acknowledged, or \
-                 their lease lapsed and they have been handed to another consumer"
+                "some acknowledged messages were no longer queued; they had already been \
+                 acknowledged, or they were dead lettered in the meantime"
             );
         } else {
             tracing::debug!(
@@ -462,24 +568,31 @@ impl QueueService {
                 "acknowledged"
             );
         }
-        Ok(removed)
+        Ok(AckOutcome {
+            acknowledged: removed,
+            stale_leases: stale.len(),
+        })
     }
 
     /// Hand messages back unhandled. Each becomes visible again after
     /// `delay_seconds`, unless it has used up its attempts, in which case it
     /// is dead lettered instead.
+    ///
+    /// The lease token is checked exactly as it is in [`Self::ack`]: a
+    /// consumer whose lease lapsed must not shorten, or end, the lease of
+    /// whoever holds the message now.
     pub async fn nack(
         &self,
         tenant: &TenantId,
         queue: &str,
-        ids: Vec<String>,
+        handles: Vec<MessageHandle>,
         delay_seconds: Option<i32>,
     ) -> QueueResult<NackOutcome> {
         let queue = self.check_queue(queue)?;
-        if ids.is_empty() {
+        if handles.is_empty() {
             return Ok(NackOutcome::default());
         }
-        self.check_id_count(&queue, ids.len())?;
+        self.check_handles(&queue, &handles)?;
         let delay = self.clamp_delay(delay_seconds);
         let now = self.clock.now();
         let visible_at = now.saturating_add(delay);
@@ -487,38 +600,50 @@ impl QueueService {
         let tenant_id = tenant.as_str().to_string();
         let table_queue = queue.clone();
 
-        let (released, dead) = self
+        let (released, dead, stale) = self
             .pool
             .with_tx(move |tx| {
                 let mut released = 0usize;
                 let mut dead: Vec<(String, i32)> = Vec::new();
-                for id in &ids {
-                    // An id that is not there is skipped, not an error: it
-                    // was already acknowledged, or its lease lapsed and it
-                    // has moved on without this consumer.
-                    let attempts: Option<i32> = tx
+                let mut stale: Vec<String> = Vec::new();
+                for handle in &handles {
+                    // One lookup answers both questions: is this message
+                    // still queued, and is this consumer still the one
+                    // holding it.
+                    let row: Option<(i32, String)> = tx
                         .query_row(
-                            "SELECT attempts FROM messages
+                            "SELECT attempts, lease_token FROM messages
                               WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
-                            rusqlite::params![tenant_id, table_queue, id],
-                            |row| row.get(0),
+                            rusqlite::params![tenant_id, table_queue, handle.id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
                         )
                         .optional()?;
-                    let Some(attempts) = attempts else { continue };
+                    // An id that is not there is skipped, not an error: it
+                    // was already acknowledged, or it has been dead lettered.
+                    let Some((attempts, token)) = row else {
+                        continue;
+                    };
+                    if token != handle.lease_token {
+                        stale.push(handle.id.clone());
+                        continue;
+                    }
 
                     if attempts >= ceiling {
-                        move_to_dead_letter(tx, &tenant_id, &table_queue, id, now)?;
-                        dead.push((id.clone(), attempts));
+                        move_to_dead_letter(tx, &tenant_id, &table_queue, &handle.id, now)?;
+                        dead.push((handle.id.clone(), attempts));
                     } else {
+                        // The token goes back to empty along with the
+                        // visibility: the message is nobody's again, and the
+                        // handle just used cannot be used a second time.
                         tx.execute(
-                            "UPDATE messages SET visible_at = ?4
+                            "UPDATE messages SET visible_at = ?4, lease_token = ''
                               WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
-                            rusqlite::params![tenant_id, table_queue, id, visible_at],
+                            rusqlite::params![tenant_id, table_queue, handle.id, visible_at],
                         )?;
                         released += 1;
                     }
                 }
-                Ok((released, dead))
+                Ok((released, dead, stale))
             })
             .await?;
 
@@ -532,53 +657,260 @@ impl QueueService {
                 "the consumer reported it failed",
             );
         }
+        for id in &stale {
+            warn_stale_lease(tenant, &queue, id, "return");
+        }
         tracing::debug!(
             tenant = %tenant,
             queue = %queue,
             released,
             dead_lettered = dead.len(),
+            stale_leases = stale.len(),
             delay_seconds = delay,
             "returned messages"
         );
         Ok(NackOutcome {
             released,
             dead_lettered: dead.len(),
+            stale_leases: stale.len(),
         })
     }
 
-    /// Every dead letter of one tenant's queue, oldest death first. There
-    /// is no RPC for this yet: dead letters are read by an operator against
-    /// the database, and this is what the tests read them with.
+    /// Every dead letter of one tenant's queue, oldest death first.
+    ///
+    /// Unpaged, so only the tests use it; [`Self::list_dead_letters`] is what
+    /// the RPC answers from and it is bounded in both count and bytes.
+    #[cfg(test)]
     pub async fn dead_letters(
         &self,
         tenant: &TenantId,
         queue: &str,
     ) -> QueueResult<Vec<DeadLetter>> {
-        let queue = self.check_queue(queue)?;
+        let (page, _) = self
+            .list_dead_letters(tenant, Some(queue), Some(MAX_DEAD_LETTER_PAGE), None)
+            .await?;
+        Ok(page)
+    }
+
+    /// One page of dead letters, oldest death first.
+    ///
+    /// `queue` of `None` reads every queue of this tenant, which is the view
+    /// an operator starts from: the question is usually "what is stuck?", not
+    /// "what is stuck in this one queue".
+    ///
+    /// Ordering by `(died_at, id)` is what makes the cursor stable. Dead
+    /// letters only ever arrive at the *end* of that order, so a page
+    /// boundary cannot shift under a reader the way it would if new rows
+    /// could appear before it.
+    pub async fn list_dead_letters(
+        &self,
+        tenant: &TenantId,
+        queue: Option<&str>,
+        limit: Option<i32>,
+        cursor: Option<&str>,
+    ) -> QueueResult<(Vec<DeadLetter>, Option<String>)> {
+        let queue = queue.map(|q| self.check_queue(q)).transpose()?;
+        let limit = clamp_dead_letter_page(limit);
+        let after = cursor.map(parse_dead_letter_cursor).transpose()?;
         let tenant_id = tenant.as_str().to_string();
-        self.pool
+        let budget = self.limits.max_pull_response_bytes;
+
+        let (page, stopped_at_budget) = self
+            .pool
             .with_conn(move |conn| {
+                // One statement whatever was asked for: a NULL parameter
+                // switches its own filter off. Building the SQL by
+                // concatenation instead would mean the placeholder numbers
+                // and the bound values have to be kept in step by hand, and
+                // getting that wrong is a query that reads the wrong rows
+                // rather than one that fails to compile.
+                //
+                // `(died_at, id)` is compared as a pair, so a page never
+                // repeats or skips a row when several died in the same
+                // second.
                 let mut stmt = conn.prepare(
                     "SELECT queue, id, body, attempts, created_at, died_at
                        FROM dead_letter
-                      WHERE tenant = ?1 AND queue = ?2
-                      ORDER BY died_at ASC, id ASC",
+                      WHERE tenant = ?1
+                        AND (?3 IS NULL OR queue = ?3)
+                        AND (?4 IS NULL
+                             OR died_at > ?4
+                             OR (died_at = ?4 AND id > ?5))
+                      ORDER BY died_at ASC, id ASC
+                      LIMIT ?2",
                 )?;
-                let mut rows = stmt.query(rusqlite::params![tenant_id, queue])?;
-                let mut out = Vec::new();
+                let (after_died_at, after_id) = match &after {
+                    Some((died_at, id)) => (Some(*died_at), Some(id.as_str())),
+                    None => (None, None),
+                };
+                let mut rows = stmt.query(rusqlite::params![
+                    tenant_id,
+                    limit,
+                    queue,
+                    after_died_at,
+                    after_id
+                ])?;
+
+                let mut page = Vec::new();
+                let mut used = 0usize;
+                let mut stopped_at_budget = false;
                 while let Some(row) = rows.next()? {
-                    out.push(DeadLetter {
+                    let body: Vec<u8> = row.get(2)?;
+                    // The first message always fits, so a single body larger
+                    // than the budget is still readable rather than making
+                    // the whole page unanswerable.
+                    if !page.is_empty() && used + body.len() > budget {
+                        stopped_at_budget = true;
+                        break;
+                    }
+                    used += body.len();
+                    page.push(DeadLetter {
                         queue: row.get(0)?,
                         id: row.get(1)?,
-                        body: row.get(2)?,
+                        body,
                         attempts: row.get(3)?,
                         created_at: row.get(4)?,
                         died_at: row.get(5)?,
                     });
                 }
-                Ok(out)
+                Ok((page, stopped_at_budget))
             })
-            .await
+            .await?;
+
+        // A page that was cut short may have more behind it, and *both* ways
+        // of being cut short count. Offering a cursor only when the count
+        // filled up would hide every dead letter behind a page the byte
+        // budget ended early - which is exactly what a queue of large bodies
+        // produces.
+        let next_cursor = match page.last() {
+            Some(last) if stopped_at_budget || page.len() as i32 == limit => {
+                Some(format_dead_letter_cursor(last.died_at, &last.id))
+            }
+            _ => None,
+        };
+        tracing::debug!(
+            tenant = %tenant,
+            returned = page.len(),
+            more = next_cursor.is_some(),
+            "listed dead letters"
+        );
+        Ok((page, next_cursor))
+    }
+
+    /// Put named dead letters back on their queue with their attempts reset.
+    ///
+    /// The attempt count starts again from zero on purpose: a replay happens
+    /// after the cause has been fixed, and a message that came back with its
+    /// attempts already spent would be dead lettered again by its very first
+    /// failure - or, with a ceiling of one, without being delivered at all.
+    ///
+    /// `created_at` is *not* reset. It says when the work was first asked
+    /// for, and a replayed message is the same work, not new work.
+    ///
+    /// One transaction: either every named message is back on the queue or
+    /// none of them is, so a replay that fails half way does not leave an
+    /// operator guessing which half went.
+    pub async fn replay_dead_letters(
+        &self,
+        tenant: &TenantId,
+        queue: &str,
+        ids: Vec<String>,
+        delay_seconds: Option<i32>,
+    ) -> QueueResult<ReplayOutcome> {
+        let queue = self.check_queue(queue)?;
+        if ids.is_empty() {
+            tracing::warn!(
+                tenant = %tenant,
+                queue = %queue,
+                "replay named no messages, refusing it; list the dead letters and name the ones \
+                 to put back, because replaying a queue full of poison messages cannot be undone"
+            );
+            return Err(QueueError::InvalidArgument(
+                "replay names no messages; list the dead letters and name the ones to put back"
+                    .to_string(),
+            ));
+        }
+        if ids.len() > self.limits.max_batch_messages {
+            tracing::warn!(
+                tenant = %tenant,
+                queue = %queue,
+                messages = ids.len(),
+                limit = self.limits.max_batch_messages,
+                "refusing an oversized replay; nothing was put back, because one transaction that \
+                 large would hold the write lock against every producer"
+            );
+            return Err(QueueError::TooLarge(format!(
+                "replay names {} messages, limit is {}",
+                ids.len(),
+                self.limits.max_batch_messages
+            )));
+        }
+        let delay = self.clamp_delay(delay_seconds);
+        let now = self.clock.now();
+        let visible_at = now.saturating_add(delay);
+        let tenant_id = tenant.as_str().to_string();
+        let table_queue = queue.clone();
+        let asked = ids.len();
+
+        let replayed = self
+            .pool
+            .with_tx(move |tx| {
+                let mut restore = tx.prepare(
+                    "INSERT INTO messages
+                            (tenant, queue, id, body, attempts, visible_at, created_at, lease_token)
+                          SELECT tenant, queue, id, body, 0, ?4, created_at, ''
+                            FROM dead_letter
+                           WHERE tenant = ?1 AND queue = ?2 AND id = ?3
+                     ON CONFLICT(tenant, queue, id) DO UPDATE SET
+                            attempts    = 0,
+                            visible_at  = excluded.visible_at,
+                            lease_token = ''",
+                )?;
+                let mut discard = tx.prepare(
+                    "DELETE FROM dead_letter WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
+                )?;
+                let mut replayed = 0usize;
+                for id in &ids {
+                    let restored = restore.execute(rusqlite::params![
+                        tenant_id,
+                        table_queue,
+                        id,
+                        visible_at
+                    ])?;
+                    if restored == 0 {
+                        continue;
+                    }
+                    discard.execute(rusqlite::params![tenant_id, table_queue, id])?;
+                    replayed += 1;
+                }
+                Ok(replayed)
+            })
+            .await?;
+
+        let not_found = asked - replayed;
+        tracing::info!(
+            tenant = %tenant,
+            queue = %queue,
+            replayed,
+            not_found,
+            delay_seconds = delay,
+            "replayed dead letters; they are queued again with a fresh set of delivery attempts, \
+             so whatever made them fail will be tried again"
+        );
+        if not_found > 0 {
+            tracing::warn!(
+                tenant = %tenant,
+                queue = %queue,
+                not_found,
+                "some replayed ids were not in the dead letter table; they had already been \
+                 replayed, or the retention sweep had deleted them, and those messages are not \
+                 back on the queue"
+            );
+        }
+        Ok(ReplayOutcome {
+            replayed,
+            not_found,
+        })
     }
 
     /// Delete dead letters older than the configured retention, across all
@@ -652,23 +984,52 @@ impl QueueService {
         Ok(())
     }
 
-    /// Bound how many ids one Ack or Nack may name. The ids come from a pull,
-    /// so a call naming more than a pull could ever return is a caller bug,
-    /// and serving it would let one request hold the write lock for as long
-    /// as it liked.
-    fn check_id_count(&self, queue: &str, count: usize) -> QueueResult<()> {
+    /// Check the handles one Ack or Nack names.
+    ///
+    /// Two things. How many: the handles come from a pull, so a call naming
+    /// more than a pull could ever return is a caller bug, and serving it
+    /// would let one request hold the write lock for as long as it liked.
+    /// And whether each one actually proves anything: a handle with no lease
+    /// token is refused rather than quietly matched, because an unproved
+    /// claim on a message is exactly what the token exists to stop. The whole
+    /// call is refused rather than the one handle skipped - a caller sending
+    /// tokenless handles has a bug, and half-applying its request would hide
+    /// it.
+    fn check_handles(&self, queue: &str, handles: &[MessageHandle]) -> QueueResult<()> {
         let limit = self.limits.max_pull_messages as usize;
-        if count > limit {
+        if handles.len() > limit {
             tracing::warn!(
                 queue = %queue,
-                ids = count,
+                messages = handles.len(),
                 limit,
                 "refusing a call that names more messages than one pull can return; none of them \
                  were acknowledged or returned"
             );
             return Err(QueueError::TooLarge(format!(
-                "call names {count} messages, limit is {limit}"
+                "call names {} messages, limit is {limit}",
+                handles.len()
             )));
+        }
+        for handle in handles {
+            if handle.id.is_empty() {
+                return Err(QueueError::InvalidArgument(
+                    "a message handle carries no id".to_string(),
+                ));
+            }
+            if handle.lease_token.is_empty() {
+                tracing::warn!(
+                    queue = %queue,
+                    message_id = %handle.id,
+                    "refusing a call whose handle carries no lease token; nothing was \
+                     acknowledged or returned. The token comes back with every pulled message and \
+                     is what proves the caller still holds the message it is answering for"
+                );
+                return Err(QueueError::InvalidArgument(format!(
+                    "the handle for {} carries no lease token; pass back the lease_token the \
+                     message was delivered with",
+                    handle.id
+                )));
+            }
         }
         Ok(())
     }
@@ -734,6 +1095,35 @@ impl QueueService {
     }
 }
 
+/// Add the `lease_token` column to a `messages` table written before it
+/// existed.
+///
+/// The rows are otherwise fine - a queue.sqlite from the tenant era holds
+/// messages that still have to be delivered - so this widens the table rather
+/// than refusing it. Existing rows get the empty token, which is what a
+/// message that nobody holds carries anyway, so the first `Pull` issues a
+/// real one. `CREATE TABLE IF NOT EXISTS` above cannot do this: it does
+/// nothing at all when the table is already there.
+fn add_lease_token_column(conn: &rusqlite::Connection) -> QueueResult<()> {
+    let mut present = false;
+    conn.pragma(None, "table_info", "messages", |row| {
+        let column: String = row.get(1)?;
+        if column == "lease_token" {
+            present = true;
+        }
+        Ok(())
+    })?;
+    if present {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE messages ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''")?;
+    tracing::info!(
+        "added the lease_token column to an existing queue database; messages already in it keep \
+         their place in line and are given a token by their next delivery"
+    );
+    Ok(())
+}
+
 /// Move every ready message that has already used its attempts into the dead
 /// letter table. Returns the ids and attempt counts, for the caller to log.
 fn retire_exhausted(
@@ -785,6 +1175,63 @@ fn move_to_dead_letter(
         rusqlite::params![tenant, queue, id],
     )?;
     Ok(())
+}
+
+/// Bound one dead letter page.
+fn clamp_dead_letter_page(requested: Option<i32>) -> i32 {
+    match requested {
+        None => DEFAULT_DEAD_LETTER_PAGE,
+        Some(n) if n <= 0 => DEFAULT_DEAD_LETTER_PAGE,
+        Some(n) if n > MAX_DEAD_LETTER_PAGE => MAX_DEAD_LETTER_PAGE,
+        Some(n) => n,
+    }
+}
+
+/// The cursor is the `(died_at, id)` of the last row of a page: the exact
+/// pair the ordering is on, so resuming after it can neither repeat nor skip
+/// a row.
+fn format_dead_letter_cursor(died_at: i64, id: &str) -> String {
+    format!("{died_at}:{id}")
+}
+
+/// Read a cursor back.
+///
+/// A malformed one is refused rather than ignored. Silently restarting at the
+/// beginning would hand a paging operator the first page over and over, which
+/// looks like a queue that never empties.
+fn parse_dead_letter_cursor(cursor: &str) -> QueueResult<(i64, String)> {
+    let refuse = || {
+        QueueError::InvalidArgument(format!(
+            "{cursor:?} is not a dead letter cursor; pass back the next_cursor from the previous \
+             page, or nothing to start at the beginning"
+        ))
+    };
+    let (died_at, id) = cursor.split_once(':').ok_or_else(refuse)?;
+    let died_at: i64 = died_at.parse().map_err(|_| refuse())?;
+    if id.is_empty() {
+        return Err(refuse());
+    }
+    Ok((died_at, id.to_string()))
+}
+
+/// One line per message a consumer tried to answer for after losing it.
+///
+/// Warn, not error: nothing is broken and nothing is lost - the queue did
+/// exactly what it should. It is worth an operator's attention because of
+/// what it says about timing: the handler outlived its lease, so either the
+/// message is being processed twice right now (somebody else took it) or it
+/// is queued to be processed again (it was given back). Either way the lease
+/// is shorter than the handler actually takes.
+fn warn_stale_lease(tenant: &TenantId, queue: &str, id: &str, action: &str) {
+    tracing::warn!(
+        tenant = %tenant,
+        queue = %queue,
+        message_id = %id,
+        "a consumer tried to {action} a message it no longer holds - its lease lapsed and the \
+         message has since been handed to another consumer or put back on the queue. The request \
+         was ignored, so whoever holds it now keeps it, and the work this consumer just finished \
+         will be done again. Raise the lease above the handler's worst-case run time"
+    );
 }
 
 /// One line per dead lettered message, saying what stops now.
@@ -859,6 +1306,7 @@ impl Queue for QueueService {
                     attempts: message.attempts,
                     lease_expires_at: message.lease_expires_at,
                     created_at: message.created_at,
+                    lease_token: message.lease_token,
                 }),
                 Err(e) => {
                     // queue.proto types the body as a string, so bytes that
@@ -886,9 +1334,12 @@ impl Queue for QueueService {
     async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
         let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        let acknowledged = self.ack(&tenant, &req.queue_name, req.message_ids).await?;
+        let outcome = self
+            .ack(&tenant, &req.queue_name, handles_of(req.messages))
+            .await?;
         Ok(Response::new(AckResponse {
-            acknowledged: acknowledged as i32,
+            acknowledged: outcome.acknowledged as i32,
+            stale_leases: outcome.stale_leases as i32,
         }))
     }
 
@@ -899,14 +1350,83 @@ impl Queue for QueueService {
             .nack(
                 &tenant,
                 &req.queue_name,
-                req.message_ids,
+                handles_of(req.messages),
                 Some(req.delay_seconds),
             )
             .await?;
         Ok(Response::new(NackResponse {
             released: outcome.released as i32,
             dead_lettered: outcome.dead_lettered as i32,
+            stale_leases: outcome.stale_leases as i32,
         }))
+    }
+
+    async fn list_dead_letters(
+        &self,
+        request: Request<ListDeadLettersRequest>,
+    ) -> Result<Response<ListDeadLettersResponse>, Status> {
+        let tenant = tenant_of(&request)?;
+        let req = request.into_inner();
+        // An empty queue name means every queue: proto3 cannot tell "not set"
+        // from "empty string" for a plain field, and an empty queue name is
+        // refused everywhere else anyway, so there is no ambiguity to lose.
+        let queue = Some(req.queue_name.as_str()).filter(|q| !q.is_empty());
+        let cursor = Some(req.cursor.as_str()).filter(|c| !c.is_empty());
+        let (page, next_cursor) = self
+            .list_dead_letters(&tenant, queue, Some(req.limit), cursor)
+            .await?;
+        Ok(Response::new(ListDeadLettersResponse {
+            messages: page.into_iter().map(DeadLetterMessage::from).collect(),
+            next_cursor: next_cursor.unwrap_or_default(),
+        }))
+    }
+
+    async fn replay_dead_letters(
+        &self,
+        request: Request<ReplayDeadLettersRequest>,
+    ) -> Result<Response<ReplayDeadLettersResponse>, Status> {
+        let tenant = tenant_of(&request)?;
+        let req = request.into_inner();
+        let outcome = self
+            .replay_dead_letters(
+                &tenant,
+                &req.queue_name,
+                req.message_ids,
+                Some(req.delay_seconds),
+            )
+            .await?;
+        Ok(Response::new(ReplayDeadLettersResponse {
+            replayed: outcome.replayed as i32,
+            not_found: outcome.not_found as i32,
+        }))
+    }
+}
+
+/// Turn the wire handles into the storage layer's. Kept separate so the
+/// storage layer never sees a protobuf type.
+fn handles_of(messages: Vec<crate::proto::queue::MessageHandle>) -> Vec<MessageHandle> {
+    messages
+        .into_iter()
+        .map(|handle| MessageHandle {
+            id: handle.id,
+            lease_token: handle.lease_token,
+        })
+        .collect()
+}
+
+impl From<DeadLetter> for DeadLetterMessage {
+    fn from(dead: DeadLetter) -> Self {
+        Self {
+            queue_name: dead.queue,
+            id: dead.id,
+            // Bytes rather than a string: a body that is not valid UTF-8 is
+            // exactly the kind of message that ends up dead lettered, and an
+            // operator has to be able to see it.
+            body: dead.body,
+            attempts: dead.attempts,
+            created_at: dead.created_at,
+            died_at: dead.died_at,
+        }
     }
 }
 
@@ -954,6 +1474,29 @@ mod tests {
             .collect()
     }
 
+    /// What a consumer answers with: the id it was handed and the token
+    /// proving this is the delivery it is answering for.
+    fn handle(message: &LeasedMessage) -> MessageHandle {
+        MessageHandle {
+            id: message.id.clone(),
+            lease_token: message.lease_token.clone(),
+        }
+    }
+
+    /// The handles for a whole leased batch.
+    fn handles(messages: &[LeasedMessage]) -> Vec<MessageHandle> {
+        messages.iter().map(handle).collect()
+    }
+
+    /// A handle for a message this caller was never given: the shape of a
+    /// consumer that kept an id but not the lease.
+    fn forged(id: &str) -> MessageHandle {
+        MessageHandle {
+            id: id.to_string(),
+            lease_token: "not-the-current-lease".to_string(),
+        }
+    }
+
     /// Stamp the tenant the way deis-runtime does, for the tests that go
     /// through the gRPC surface rather than the queue methods.
     fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
@@ -977,8 +1520,18 @@ mod tests {
         assert_eq!(leased[0].attempts, 1, "the first delivery counts as one");
         assert_eq!(leased[0].created_at, T0);
         assert_eq!(leased[0].lease_expires_at, T0 + 30);
+        assert!(
+            !leased[0].lease_token.is_empty(),
+            "every delivery has to carry the proof Ack will ask for"
+        );
 
-        assert_eq!(f.service.ack(&a, "jobs", vec![id]).await.unwrap(), 1);
+        assert_eq!(
+            f.service.ack(&a, "jobs", handles(&leased)).await.unwrap(),
+            AckOutcome {
+                acknowledged: 1,
+                stale_leases: 0
+            }
+        );
         // Even far past the lease, an acknowledged message is gone.
         f.clock.advance(10_000);
         assert!(
@@ -1026,18 +1579,19 @@ mod tests {
         let f = fixture().await;
         let a = tenant("app-one.production");
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
-        f.service.pull(&a, "jobs", None, None).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
 
         let outcome = f
             .service
-            .nack(&a, "jobs", vec![id.clone()], Some(45))
+            .nack(&a, "jobs", handles(&leased), Some(45))
             .await
             .unwrap();
         assert_eq!(
             outcome,
             NackOutcome {
                 released: 1,
-                dead_lettered: 0
+                dead_lettered: 0,
+                stale_leases: 0
             }
         );
 
@@ -1060,9 +1614,12 @@ mod tests {
     async fn a_nack_without_a_delay_makes_the_message_ready_at_once() {
         let f = fixture().await;
         let a = tenant("app-one.production");
-        let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
-        f.service.pull(&a, "jobs", None, None).await.unwrap();
-        f.service.nack(&a, "jobs", vec![id], None).await.unwrap();
+        f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        f.service
+            .nack(&a, "jobs", handles(&leased), None)
+            .await
+            .unwrap();
         assert_eq!(
             f.service.pull(&a, "jobs", None, None).await.unwrap().len(),
             1
@@ -1089,7 +1646,7 @@ mod tests {
             assert_eq!(leased[0].attempts, attempt);
             let outcome = f
                 .service
-                .nack(&a, "jobs", vec![id.clone()], None)
+                .nack(&a, "jobs", handles(&leased), None)
                 .await
                 .unwrap();
             if attempt < 3 {
@@ -1099,7 +1656,8 @@ mod tests {
                     outcome,
                     NackOutcome {
                         released: 0,
-                        dead_lettered: 1
+                        dead_lettered: 1,
+                        stale_leases: 0
                     },
                     "the last attempt must retire the message"
                 );
@@ -1158,6 +1716,527 @@ mod tests {
         assert_eq!(dead[0].attempts, 2);
     }
 
+    /// The failure the lease token exists for.
+    ///
+    /// A consumer takes a message, runs long, and its lease lapses. Another
+    /// consumer picks the message up and starts the same work. Then the first
+    /// one finishes and acknowledges. Identified by id alone, that
+    /// acknowledgement deletes the message the second consumer is holding:
+    /// the work is thrown away half-done, and nothing anywhere says so.
+    #[tokio::test]
+    async fn a_lapsed_consumer_cannot_acknowledge_a_message_now_held_by_another() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+        let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+
+        let slow = f.service.pull(&a, "jobs", None, Some(30)).await.unwrap();
+        assert_eq!(slow.len(), 1);
+
+        // The lease lapses and somebody else takes the message.
+        f.clock.advance(31);
+        let holder = f.service.pull(&a, "jobs", None, Some(30)).await.unwrap();
+        assert_eq!(holder.len(), 1);
+        assert_eq!(holder[0].id, id);
+        assert_ne!(
+            holder[0].lease_token, slow[0].lease_token,
+            "a redelivery has to issue a new token, or the old holder still proves nothing"
+        );
+
+        // The slow consumer finishes and acknowledges what it was given.
+        let outcome = f.service.ack(&a, "jobs", handles(&slow)).await.unwrap();
+        assert_eq!(
+            outcome,
+            AckOutcome {
+                acknowledged: 0,
+                stale_leases: 1
+            },
+            "a lapsed consumer must not delete a message somebody else is working on"
+        );
+
+        // The current holder still has it, and can still finish it.
+        assert_eq!(
+            f.service.ack(&a, "jobs", handles(&holder)).await.unwrap(),
+            AckOutcome {
+                acknowledged: 1,
+                stale_leases: 0
+            }
+        );
+    }
+
+    /// The same fence on the other call: a lapsed consumer must not push back
+    /// the visibility of a message that is being worked on right now, nor
+    /// dead letter it.
+    #[tokio::test]
+    async fn a_lapsed_consumer_cannot_return_a_message_now_held_by_another() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+        f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+
+        let slow = f.service.pull(&a, "jobs", None, Some(30)).await.unwrap();
+        f.clock.advance(31);
+        let holder = f.service.pull(&a, "jobs", None, Some(30)).await.unwrap();
+
+        let outcome = f
+            .service
+            .nack(&a, "jobs", handles(&slow), Some(600))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NackOutcome {
+                released: 0,
+                dead_lettered: 0,
+                stale_leases: 1
+            }
+        );
+        // The lease the current holder was given is untouched: the message is
+        // still invisible to everyone else, and still theirs to acknowledge.
+        assert!(
+            f.service
+                .pull(&a, "jobs", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            f.service.ack(&a, "jobs", handles(&holder)).await.unwrap(),
+            AckOutcome {
+                acknowledged: 1,
+                stale_leases: 0
+            }
+        );
+    }
+
+    /// A lapsed lease that nobody else took is not a fence: the consumer did
+    /// the work, and refusing its acknowledgement would only cause the
+    /// message to be handled a second time for nothing.
+    #[tokio::test]
+    async fn a_late_acknowledgement_still_counts_when_nobody_else_took_the_message() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+        f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, Some(30)).await.unwrap();
+
+        f.clock.advance(120);
+        assert_eq!(
+            f.service.ack(&a, "jobs", handles(&leased)).await.unwrap(),
+            AckOutcome {
+                acknowledged: 1,
+                stale_leases: 0
+            }
+        );
+        assert!(
+            f.service
+                .pull(&a, "jobs", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A returned message belongs to nobody, so the handle that returned it
+    /// must not work a second time either.
+    #[tokio::test]
+    async fn a_handle_is_spent_once_the_message_has_been_returned() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+        f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        f.service
+            .nack(&a, "jobs", handles(&leased), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.service.ack(&a, "jobs", handles(&leased)).await.unwrap(),
+            AckOutcome {
+                acknowledged: 0,
+                stale_leases: 1
+            },
+            "the handle used to return the message must not then delete it"
+        );
+        assert_eq!(
+            f.service.pull(&a, "jobs", None, None).await.unwrap().len(),
+            1,
+            "the message must still be there to be delivered again"
+        );
+    }
+
+    /// A handle with no token proves nothing, so it is refused rather than
+    /// quietly matched - and the whole call is refused, because a caller
+    /// sending one has a bug that half-applying would hide.
+    #[tokio::test]
+    async fn a_handle_without_a_lease_token_is_refused() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+        f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+
+        let tokenless = MessageHandle {
+            id: leased[0].id.clone(),
+            lease_token: String::new(),
+        };
+        assert!(matches!(
+            f.service.ack(&a, "jobs", vec![tokenless.clone()]).await,
+            Err(QueueError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            f.service.nack(&a, "jobs", vec![tokenless], None).await,
+            Err(QueueError::InvalidArgument(_))
+        ));
+        // Nothing was acted on, so the message is still leased to whoever
+        // holds it.
+        assert_eq!(
+            f.service.ack(&a, "jobs", handles(&leased)).await.unwrap(),
+            AckOutcome {
+                acknowledged: 1,
+                stale_leases: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_letters_can_be_listed_and_replayed_back_onto_their_queue() {
+        let f = fixture_with(QueueLimits {
+            max_attempts: 1,
+            ..QueueLimits::default()
+        })
+        .await;
+        let a = tenant("app-one.production");
+        let id = f
+            .service
+            .send(&a, "jobs", b"needs a fix".to_vec())
+            .await
+            .unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        f.service
+            .nack(&a, "jobs", handles(&leased), None)
+            .await
+            .unwrap();
+
+        let (page, cursor) = f
+            .service
+            .list_dead_letters(&a, Some("jobs"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, id);
+        assert_eq!(page[0].queue, "jobs");
+        assert_eq!(page[0].body, b"needs a fix");
+        assert_eq!(page[0].attempts, 1);
+        assert_eq!(page[0].created_at, T0);
+        assert!(cursor.is_none(), "one page held everything");
+
+        // The cause is fixed; put it back.
+        f.clock.advance(60);
+        let outcome = f
+            .service
+            .replay_dead_letters(&a, "jobs", vec![id.clone()], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReplayOutcome {
+                replayed: 1,
+                not_found: 0
+            }
+        );
+        assert!(
+            f.service.dead_letters(&a, "jobs").await.unwrap().is_empty(),
+            "a replayed message must leave the dead letter table"
+        );
+
+        let back = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].id, id);
+        assert_eq!(
+            back[0].attempts, 1,
+            "a replay hands the message a fresh allowance, or the very first failure retires it \
+             again"
+        );
+        assert_eq!(
+            back[0].created_at, T0,
+            "a replayed message is the same work, so it keeps the time it was first asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replay_delay_holds_the_message_back() {
+        let f = fixture_with(QueueLimits {
+            max_attempts: 1,
+            ..QueueLimits::default()
+        })
+        .await;
+        let a = tenant("app-one.production");
+        let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        f.service
+            .nack(&a, "jobs", handles(&leased), None)
+            .await
+            .unwrap();
+
+        f.service
+            .replay_dead_letters(&a, "jobs", vec![id], Some(45))
+            .await
+            .unwrap();
+        assert!(
+            f.service
+                .pull(&a, "jobs", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        f.clock.advance(45);
+        assert_eq!(
+            f.service.pull(&a, "jobs", None, None).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replay_of_something_that_is_not_dead_lettered_changes_nothing() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+        let live = f.service.send(&a, "jobs", b"live".to_vec()).await.unwrap();
+
+        let outcome = f
+            .service
+            .replay_dead_letters(&a, "jobs", vec![live.clone(), "never".to_string()], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReplayOutcome {
+                replayed: 0,
+                not_found: 2
+            },
+            "a live message is not a dead letter, and must not be touched by a replay"
+        );
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].id, live);
+        assert_eq!(leased[0].attempts, 1);
+    }
+
+    /// Replaying everything by accident cannot be undone, so the call names
+    /// what it means.
+    #[tokio::test]
+    async fn a_replay_that_names_nothing_is_refused() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+        assert!(matches!(
+            f.service
+                .replay_dead_letters(&a, "jobs", Vec::new(), None)
+                .await,
+            Err(QueueError::InvalidArgument(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dead_letters_page_and_can_be_read_across_every_queue_at_once() {
+        let f = fixture_with(QueueLimits {
+            max_attempts: 1,
+            ..QueueLimits::default()
+        })
+        .await;
+        let a = tenant("app-one.production");
+        let other = tenant("app-two.production");
+
+        // Four in one queue and one in another, each dying a second apart so
+        // the order is unambiguous.
+        let mut expected = Vec::new();
+        for (queue, body) in [
+            ("jobs", "one"),
+            ("jobs", "two"),
+            ("emails", "three"),
+            ("jobs", "four"),
+        ] {
+            let id = f
+                .service
+                .send(&a, queue, body.as_bytes().to_vec())
+                .await
+                .unwrap();
+            let leased = f.service.pull(&a, queue, None, None).await.unwrap();
+            f.service
+                .nack(&a, queue, handles(&leased), None)
+                .await
+                .unwrap();
+            expected.push(id);
+            f.clock.advance(1);
+        }
+        // Another tenant's dead letter must never appear in this listing.
+        f.service
+            .send(&other, "jobs", b"theirs".to_vec())
+            .await
+            .unwrap();
+        let theirs = f.service.pull(&other, "jobs", None, None).await.unwrap();
+        f.service
+            .nack(&other, "jobs", handles(&theirs), None)
+            .await
+            .unwrap();
+
+        // Every queue of this tenant, two at a time.
+        let (first, cursor) = f
+            .service
+            .list_dead_letters(&a, None, Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        let cursor = cursor.expect("a full page must offer a way to continue");
+        let (second, cursor) = f
+            .service
+            .list_dead_letters(&a, None, Some(2), Some(&cursor))
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        let (third, last) = f
+            .service
+            .list_dead_letters(&a, None, Some(2), cursor.as_deref())
+            .await
+            .unwrap();
+        assert!(third.is_empty());
+        assert!(last.is_none());
+
+        let seen: Vec<String> = first
+            .iter()
+            .chain(second.iter())
+            .map(|dead| dead.id.clone())
+            .collect();
+        assert_eq!(seen, expected, "oldest death first, across queues");
+
+        // Narrowed to one queue, the other queue's message is not there.
+        let (jobs, _) = f
+            .service
+            .list_dead_letters(&a, Some("jobs"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert!(jobs.iter().all(|dead| dead.queue == "jobs"));
+    }
+
+    /// A page cut short by the response size budget still has to say there is
+    /// more. Without a cursor there, every dead letter behind the first big
+    /// body would be unreachable through the API.
+    #[tokio::test]
+    async fn a_page_the_byte_budget_cut_short_still_offers_a_cursor() {
+        let f = fixture_with(QueueLimits {
+            max_attempts: 1,
+            max_body_bytes: 512,
+            // Room for one body and not two, so the second message is always
+            // pushed to the next page.
+            max_pull_response_bytes: 600,
+            ..QueueLimits::default()
+        })
+        .await;
+        let a = tenant("app-one.production");
+
+        for _ in 0..3 {
+            f.service.send(&a, "jobs", vec![b'x'; 512]).await.unwrap();
+            let leased = f.service.pull(&a, "jobs", Some(1), None).await.unwrap();
+            f.service
+                .nack(&a, "jobs", handles(&leased), None)
+                .await
+                .unwrap();
+            f.clock.advance(1);
+        }
+
+        // Asked for fifty, given one - and told there is more.
+        let mut seen = 0;
+        let mut cursor = None;
+        for _ in 0..4 {
+            let (page, next) = f
+                .service
+                .list_dead_letters(&a, Some("jobs"), None, cursor.as_deref())
+                .await
+                .unwrap();
+            seen += page.len();
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, 3,
+            "every dead letter must be reachable by paging, not only the ones that fit in one \
+             response"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_dead_letter_cursor_is_refused_rather_than_restarting_the_listing() {
+        let f = fixture().await;
+        let a = tenant("app-one.production");
+        for bad in ["nonsense", "12345", ":", "abc:def"] {
+            assert!(
+                matches!(
+                    f.service.list_dead_letters(&a, None, None, Some(bad)).await,
+                    Err(QueueError::InvalidArgument(_))
+                ),
+                "{bad} should be refused, not silently restarted at the first page"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_letter_cursor_round_trips() {
+        let cursor = format_dead_letter_cursor(1_700_000_000, "an-id");
+        assert_eq!(
+            parse_dead_letter_cursor(&cursor).unwrap(),
+            (1_700_000_000, "an-id".to_string())
+        );
+        assert_eq!(clamp_dead_letter_page(None), DEFAULT_DEAD_LETTER_PAGE);
+        assert_eq!(clamp_dead_letter_page(Some(0)), DEFAULT_DEAD_LETTER_PAGE);
+        assert_eq!(clamp_dead_letter_page(Some(10)), 10);
+        assert_eq!(clamp_dead_letter_page(Some(100_000)), MAX_DEAD_LETTER_PAGE);
+    }
+
+    /// A queue.sqlite written before the lease token existed holds messages
+    /// that still have to be delivered. Refusing it would strand them; adding
+    /// the column keeps them in line and gives them a token on their next
+    /// delivery.
+    #[tokio::test]
+    async fn a_database_written_before_lease_tokens_is_widened_rather_than_refused() {
+        let dir = TempDir::new().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                 tenant     TEXT    NOT NULL,
+                 queue      TEXT    NOT NULL,
+                 id         TEXT    NOT NULL,
+                 body       BLOB    NOT NULL,
+                 attempts   INTEGER NOT NULL DEFAULT 0,
+                 visible_at INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY (tenant, queue, id)
+             );
+             INSERT INTO messages (tenant, queue, id, body, attempts, visible_at, created_at)
+                  VALUES ('app-one.production', 'jobs', 'waiting', CAST('work' AS BLOB), 0, 1, 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let clock = Clock::fixed(T0);
+        let service = QueueService::open_with_clock(dir.path(), 4, QueueLimits::default(), clock)
+            .await
+            .expect("an existing queue must open, not be refused");
+        let a = tenant("app-one.production");
+
+        let leased = service.pull(&a, "jobs", None, None).await.unwrap();
+        assert_eq!(leased.len(), 1, "the waiting message must still be there");
+        assert_eq!(leased[0].id, "waiting");
+        assert!(
+            !leased[0].lease_token.is_empty(),
+            "its first delivery under the new schema issues a token"
+        );
+        assert_eq!(
+            service.ack(&a, "jobs", handles(&leased)).await.unwrap(),
+            AckOutcome {
+                acknowledged: 1,
+                stale_leases: 0
+            }
+        );
+    }
+
     #[tokio::test]
     async fn tenants_cannot_see_each_other() {
         let f = fixture().await;
@@ -1172,14 +2251,18 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Nor can one tenant acknowledge another's message away.
+        // Nor can one tenant acknowledge another's message away, even
+        // holding its id.
         assert_eq!(
-            f.service.ack(&two, "jobs", vec![id.clone()]).await.unwrap(),
-            0
+            f.service
+                .ack(&two, "jobs", vec![forged(&id)])
+                .await
+                .unwrap(),
+            AckOutcome::default()
         );
         assert_eq!(
             f.service
-                .nack(&two, "jobs", vec![id.clone()], None)
+                .nack(&two, "jobs", vec![forged(&id)], None)
                 .await
                 .unwrap(),
             NackOutcome::default()
@@ -1374,15 +2457,26 @@ mod tests {
     async fn acknowledging_an_unknown_id_is_harmless() {
         let f = fixture().await;
         let a = tenant("app-one.production");
-        let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
-        f.service.pull(&a, "jobs", None, None).await.unwrap();
+        f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
         assert_eq!(
-            f.service.ack(&a, "jobs", vec![id.clone()]).await.unwrap(),
-            1
+            f.service.ack(&a, "jobs", handles(&leased)).await.unwrap(),
+            AckOutcome {
+                acknowledged: 1,
+                stale_leases: 0
+            }
         );
-        // A retried acknowledgement removes nothing and does not fail.
-        assert_eq!(f.service.ack(&a, "jobs", vec![id]).await.unwrap(), 0);
-        assert_eq!(f.service.ack(&a, "jobs", Vec::new()).await.unwrap(), 0);
+        // A retried acknowledgement removes nothing and does not fail. It is
+        // not a stale lease either: the message is gone, not somebody
+        // else's.
+        assert_eq!(
+            f.service.ack(&a, "jobs", handles(&leased)).await.unwrap(),
+            AckOutcome::default()
+        );
+        assert_eq!(
+            f.service.ack(&a, "jobs", Vec::new()).await.unwrap(),
+            AckOutcome::default()
+        );
     }
 
     #[tokio::test]
@@ -1393,13 +2487,13 @@ mod tests {
         })
         .await;
         let a = tenant("app-one.production");
-        let ids: Vec<String> = (0..3).map(|i| format!("id-{i}")).collect();
+        let named: Vec<MessageHandle> = (0..3).map(|i| forged(&format!("id-{i}"))).collect();
         assert!(matches!(
-            f.service.ack(&a, "jobs", ids.clone()).await,
+            f.service.ack(&a, "jobs", named.clone()).await,
             Err(QueueError::TooLarge(_))
         ));
         assert!(matches!(
-            f.service.nack(&a, "jobs", ids, None).await,
+            f.service.nack(&a, "jobs", named, None).await,
             Err(QueueError::TooLarge(_))
         ));
     }
@@ -1443,9 +2537,12 @@ mod tests {
         })
         .await;
         let a = tenant("app-one.production");
-        let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
-        f.service.pull(&a, "jobs", None, None).await.unwrap();
-        f.service.nack(&a, "jobs", vec![id], None).await.unwrap();
+        f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        f.service
+            .nack(&a, "jobs", handles(&leased), None)
+            .await
+            .unwrap();
         assert_eq!(f.service.dead_letters(&a, "jobs").await.unwrap().len(), 1);
 
         f.clock.advance(599);
@@ -1466,9 +2563,12 @@ mod tests {
         })
         .await;
         let a = tenant("app-one.production");
-        let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
-        f.service.pull(&a, "jobs", None, None).await.unwrap();
-        f.service.nack(&a, "jobs", vec![id], None).await.unwrap();
+        f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
+        f.service
+            .nack(&a, "jobs", handles(&leased), None)
+            .await
+            .unwrap();
 
         f.clock.advance(10_000_000);
         assert_eq!(f.service.sweep_dead_letters().await.unwrap(), 0);
@@ -1561,6 +2661,7 @@ mod tests {
         assert_eq!(pulled.messages[0].body, "work");
         assert_eq!(pulled.messages[0].attempts, 1);
         assert_eq!(pulled.messages[0].lease_expires_at, T0 + 30);
+        assert!(!pulled.messages[0].lease_token.is_empty());
 
         let acked = Queue::ack(
             &f.service,
@@ -1568,7 +2669,10 @@ mod tests {
                 "app-one.production",
                 AckRequest {
                     queue_name: "jobs".to_string(),
-                    message_ids: vec![sent.message_id],
+                    messages: vec![crate::proto::queue::MessageHandle {
+                        id: sent.message_id,
+                        lease_token: pulled.messages[0].lease_token.clone(),
+                    }],
                 },
             ),
         )
@@ -1576,6 +2680,7 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(acked.acknowledged, 1);
+        assert_eq!(acked.stale_leases, 0);
     }
 
     /// A body that is not UTF-8 cannot be put on the wire at all, and the

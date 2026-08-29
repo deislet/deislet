@@ -3,8 +3,18 @@ use colored::Colorize;
 use std::fs;
 use std::path::Path;
 
-// TODO: template selection is not implemented yet; only the default template is generated
-pub async fn execute(name: String, _template: String) -> Result<()> {
+/// The only template that exists. Named so that asking for another one is
+/// refused with a list rather than silently answered with this one.
+const DEFAULT_TEMPLATE: &str = "default";
+
+pub async fn execute(name: String, template: String) -> Result<()> {
+    if template != DEFAULT_TEMPLATE {
+        anyhow::bail!(
+            "there is no {template:?} template. The only one is {DEFAULT_TEMPLATE:?}, which is \
+             what you get without --template."
+        );
+    }
+
     println!("{}", "Creating project...".green().bold());
 
     let project_dir = Path::new(&name);

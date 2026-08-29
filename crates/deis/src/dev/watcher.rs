@@ -1,144 +1,124 @@
-use anyhow::Result;
-use colored::Colorize;
-use deis_build::ProjectConfig;
-use deis_build::parser::TypeScriptParser;
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
-use tracing::{info, warn};
-use walkdir::WalkDir;
+//! Noticing that the project changed.
+//!
+//! The watcher reports *that* something changed, not what: `deis dev`
+//! answers every change the same way - build the bundle again and hand it to
+//! the node - so classifying files here would only be a second place for the
+//! rules about which files matter to disagree with the compiler's.
 
-#[derive(Clone)]
-pub struct RouteInfo {
-    pub path: String,
-    pub file_path: PathBuf,
-    pub method: String,
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::sync::mpsc::{Receiver, channel};
+
+/// The one file in the project root worth watching.
+///
+/// The root is watched without recursion and filtered down to this, because
+/// the build output directory is also in the root: rebuilding because the
+/// build wrote something would rebuild forever.
+const ROOT_FILE: &str = ".config.json";
+
+/// Holds the watcher alive. Dropping it stops the notifications.
+pub struct Changes {
+    _watcher: RecommendedWatcher,
+    pub rx: Receiver<PathBuf>,
 }
 
-pub async fn start_file_watcher(
-    function_root: PathBuf,
-    config: ProjectConfig,
-    routes: Arc<RwLock<Vec<RouteInfo>>>,
-) -> Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+/// Watch the source directories in `roots`, plus `.config.json` in
+/// `project_dir`, and report changed files.
+pub fn watch(project_dir: &Path, roots: &[PathBuf]) -> Result<Changes> {
+    let (tx, rx) = channel(256);
+    let project_dir = project_dir.to_path_buf();
+    let watched_root = project_dir.clone();
 
-    // Create watcher
     let mut watcher = RecommendedWatcher::new(
-        move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                // Only process file modifications and creations
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        let _ = tx.blocking_send(event);
-                    }
-                    _ => {}
+        move |event: Result<Event, notify::Error>| {
+            let Ok(event) = event else { return };
+            if !matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            ) {
+                return;
+            }
+            for path in event.paths {
+                if interesting(&path, &watched_root) {
+                    // A full channel means a rebuild is already queued, which
+                    // is exactly what this event would have asked for.
+                    let _ = tx.try_send(path);
                 }
             }
         },
-        Config::default().with_poll_interval(Duration::from_millis(500)),
-    )?;
+        Config::default(),
+    )
+    .context("starting the file watcher")?;
 
-    // Watch the functions directory
-    watcher.watch(&function_root, RecursiveMode::Recursive)?;
+    watcher
+        .watch(&project_dir, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watching {}", project_dir.display()))?;
 
-    info!("👀 Watching {} for changes...", function_root.display());
-
-    // Keep watcher alive and handle events
-    tokio::spawn(async move {
-        let _watcher = watcher; // Keep watcher alive
-
-        while let Some(event) = rx.recv().await {
-            // Check if any of the paths are handler files
-            let has_handler_change = event.paths.iter().any(|p| {
-                if let Some(ext) = p.extension() {
-                    matches!(ext.to_str(), Some("ts" | "js" | "tsx" | "jsx"))
-                } else {
-                    false
-                }
-            });
-
-            if has_handler_change {
-                // Debounce - wait a bit for multiple rapid changes
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                // Clear any queued events
-                while rx.try_recv().is_ok() {}
-
-                // Reload routes
-                match discover_routes(&config) {
-                    Ok(new_routes) => {
-                        let mut routes_lock = routes.write().await;
-                        let old_count = routes_lock.len();
-                        *routes_lock = new_routes.clone();
-                        let new_count = routes_lock.len();
-
-                        println!(
-                            "\n{} {}",
-                            "🔄 Routes reloaded:".bright_green().bold(),
-                            format!("{} routes (was {})", new_count, old_count).cyan()
-                        );
-
-                        // Print changed routes
-                        for route in new_routes.iter().take(5) {
-                            println!("   {} {}", "→".dimmed(), route.path.green());
-                        }
-                        if new_routes.len() > 5 {
-                            println!("   {} and {} more...", "→".dimmed(), new_routes.len() - 5);
-                        }
-                        println!();
-                    }
-                    Err(e) => {
-                        warn!("❌ Failed to reload routes: {}", e);
-                    }
-                }
-            }
+    for root in roots {
+        if root.exists() {
+            watcher
+                .watch(root, RecursiveMode::Recursive)
+                .with_context(|| format!("watching {}", root.display()))?;
         }
-    });
+    }
 
-    Ok(())
+    Ok(Changes {
+        _watcher: watcher,
+        rx,
+    })
 }
 
-pub fn discover_routes(config: &ProjectConfig) -> Result<Vec<RouteInfo>> {
-    let mut routes = Vec::new();
-    let function_root = Path::new(&config.function_root);
+/// Whether a path is worth a rebuild.
+fn interesting(path: &Path, project_dir: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
 
-    if !function_root.exists() {
-        return Err(anyhow::anyhow!(
-            "Functions directory not found: {}",
-            function_root.display()
-        ));
+    // Anything directly in the project root is either the build output or
+    // configuration, so only the one file that changes what gets built is
+    // taken; `dist/` landing here is how a rebuild loop would start.
+    if path.parent() == Some(project_dir) {
+        return name == ROOT_FILE;
     }
 
-    let parser = TypeScriptParser::new();
+    // Editors write a swarm of temporary files next to the one being saved.
+    // Rebuilding on those means rebuilding several times per keystroke.
+    !(name.starts_with('.')
+        || name.ends_with('~')
+        || name.ends_with(".swp")
+        || name.ends_with(".swx")
+        || name.ends_with(".tmp"))
+}
 
-    for entry in WalkDir::new(function_root) {
-        let entry = entry?;
-        if entry.file_type().is_file() {
-            let path = entry.path();
-            if let Some(ext) = path.extension()
-                && (ext == "ts" || ext == "js" || ext == "tsx" || ext == "jsx")
-                && let Ok(code) = std::fs::read_to_string(path)
-                && let Ok(handler_info) = parser.parse(&code, path.to_str().unwrap_or(""))
-                && handler_info.has_default_export
-            {
-                let route = handler_info.route.clone();
-                routes.push(RouteInfo {
-                    path: route,
-                    file_path: path.to_path_buf(),
-                    method: "ALL".to_string(),
-                });
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_and_asset_changes_both_count() {
+        let root = Path::new("/p");
+        assert!(interesting(Path::new("/p/functions/index.ts"), root));
+        assert!(interesting(Path::new("/p/public/logo.svg"), root));
+        assert!(interesting(Path::new("/p/public/css/app.css"), root));
     }
 
-    // Sort routes by specificity (more specific routes first)
-    routes.sort_by(|a, b| {
-        let a_parts = a.path.split('/').count();
-        let b_parts = b.path.split('/').count();
-        b_parts.cmp(&a_parts)
-    });
+    /// The build writes into the project root, so anything the build itself
+    /// touches has to be ignored or every rebuild schedules the next one.
+    #[test]
+    fn the_build_output_in_the_project_root_never_triggers_a_rebuild() {
+        let root = Path::new("/p");
+        assert!(!interesting(Path::new("/p/dist"), root));
+        assert!(!interesting(Path::new("/p/node_modules"), root));
+        assert!(interesting(Path::new("/p/.config.json"), root));
+    }
 
-    Ok(routes)
+    #[test]
+    fn an_editors_scratch_files_do_not_trigger_a_rebuild() {
+        let root = Path::new("/p");
+        assert!(!interesting(Path::new("/p/functions/.index.ts.swp"), root));
+        assert!(!interesting(Path::new("/p/functions/index.ts~"), root));
+        assert!(!interesting(Path::new("/p/functions/index.ts.tmp"), root));
+    }
 }

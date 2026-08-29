@@ -132,7 +132,10 @@ pub fn node_router(state: CatalogState) -> Router {
         // The path parameter is named `:id` to match the node routes it
         // shares a prefix with; the router rejects two names in the same
         // position.
-        .route("/api/nodes/:id/assignments", get(assignments::for_node))
+        .route(
+            deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE,
+            get(assignments::for_node),
+        )
         .route(
             "/api/apps/:app_id/versions/:version_id/bundle",
             get(versions::download_bundle),
@@ -248,6 +251,56 @@ pub(crate) mod tests {
             Body::from(body.to_string())
         };
         call(router, method, uri, body, "application/json").await
+    }
+
+    /// GET as a node, keeping the response headers.
+    ///
+    /// The assignment list says whether it is the whole truth in a header,
+    /// and that bit is what decides whether a node may unload anything, so
+    /// it has to be asserted on rather than dropped with the rest.
+    async fn get_as_node_full(
+        router: &Router,
+        uri: &str,
+        credential: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(credential) = credential {
+            builder = builder.header("Authorization", format!("Bearer {credential}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_BUNDLE_BYTES)
+            .await
+            .unwrap();
+        (
+            status,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// What the assignment list said about its own completeness: the flag,
+    /// and how many rows it could not describe.
+    fn completeness(headers: &axum::http::HeaderMap) -> (bool, usize) {
+        let complete = headers
+            .get(assignments::ASSIGNMENTS_COMPLETE_HEADER)
+            .expect("the list must always say whether it is complete")
+            .to_str()
+            .unwrap()
+            == "true";
+        let withheld = headers
+            .get(assignments::ASSIGNMENTS_WITHHELD_HEADER)
+            .expect("the list must always say how much it left out")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (complete, withheld)
     }
 
     /// GET with an optional node credential, in the header a node sends.
@@ -368,7 +421,8 @@ pub(crate) mod tests {
         deployed_app(router, "with-secret", Some(("API_KEY", "super-secret"))).await;
         deployed_app(router, "plain", None).await;
 
-        let (status, body) = get_as_node(router, "/api/nodes/node-a/assignments", None).await;
+        let (status, headers, body) =
+            get_as_node_full(router, "/api/nodes/node-a/assignments", None).await;
         assert_eq!(status, StatusCode::OK, "the channel itself still answers");
         assert!(!body.to_string().contains("super-secret"), "got {body}");
 
@@ -383,6 +437,59 @@ pub(crate) mod tests {
             ["plain"],
             "the application with a secret is withheld; the one without still runs"
         );
+
+        // A short list must not be read as an instruction to unload. The
+        // application with the secret may well be running on this node right
+        // now, and taking it off because this control plane cannot describe
+        // it today would turn a configuration problem into an outage.
+        assert_eq!(completeness(&headers), (false, 1));
+    }
+
+    /// The other half of deletion. Push cannot reach a node that is down, so
+    /// the assignment list has to be usable as the full expected set: what is
+    /// not in it is not supposed to be running. That only holds when the list
+    /// says it is complete, which is what a node keys its removals off.
+    #[tokio::test]
+    async fn the_assignment_list_is_authoritative_so_a_deleted_app_leaves_the_node() {
+        let h = harness_with(true, vec!["node-psk".to_string()]).await;
+        let router = &h.router;
+        deployed_app(router, "demo", Some(("API_KEY", "super-secret"))).await;
+        deployed_app(router, "other", None).await;
+
+        let (status, headers, body) =
+            get_as_node_full(router, "/api/nodes/node-a/assignments", Some("node-psk")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 2);
+        assert_eq!(
+            completeness(&headers),
+            (true, 0),
+            "every assignment could be described, so this answer is the whole expected set"
+        );
+
+        let (status, _) = json(router, "DELETE", "/api/apps/demo", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The deleted application is simply absent, and the answer still
+        // claims to be complete - which is what turns that absence into
+        // "stop serving it" on a node that missed the unload push.
+        let (_, headers, body) =
+            get_as_node_full(router, "/api/nodes/node-a/assignments", Some("node-psk")).await;
+        let apps: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["app_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(apps, ["other"]);
+        assert_eq!(completeness(&headers), (true, 0));
+
+        // An empty list is an instruction too, not a "nothing to say".
+        let (status, _) = json(router, "DELETE", "/api/apps/other", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, headers, body) =
+            get_as_node_full(router, "/api/nodes/node-a/assignments", Some("node-psk")).await;
+        assert_eq!(body.as_array().unwrap().len(), 0);
+        assert_eq!(completeness(&headers), (true, 0));
     }
 
     /// The whole loop the acceptance criteria describe: create an app,

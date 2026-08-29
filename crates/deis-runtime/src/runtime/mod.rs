@@ -26,9 +26,9 @@ mod tls_ops;
 mod ws_server_ops;
 
 pub use bindings::{
-    wire_deployment_env, AppServices, QueueConsumerSpec, ServiceDeclaration, ServiceEndpoints,
-    ServiceKind, ServiceWiring, QUEUE_CONSUMERS_KEY, QUEUE_ENDPOINT_KEY, RESERVED_ENV_KEYS,
-    SERVICES_KEY, STORE_ENDPOINT_KEY,
+    strip_reserved_env, wire_deployment_env, AppServices, QueueConsumerSpec, ServiceDeclaration,
+    ServiceEndpoints, ServiceKind, ServiceWiring, QUEUE_CONSUMERS_KEY, QUEUE_ENDPOINT_KEY,
+    RESERVED_ENV_KEYS, SERVICES_KEY, STORE_ENDPOINT_KEY,
 };
 pub use blob_client::BlobClient;
 pub use blob_ops::init_blob_extension;
@@ -39,10 +39,10 @@ pub use db_ops::init_db_extension;
 pub use deno_telemetry_stub::init_deno_telemetry_extension;
 // pub use http_ops::init_http_extension;
 pub use isolate::IsolateSpec;
-pub use kv_client::KvClient;
+pub use kv_client::{KvClient, KvRead};
 pub use metrics::{MetricShipper, MetricShipperConfig, MetricsRegistry};
-pub use pool::RuntimePool;
-pub use queue_client::{LeasedMessage, NackOutcome, QueueClient};
+pub use pool::{RuntimePool, StagedVersion};
+pub use queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};
 pub use queue_consumer::{BatchOutcome, ConsumerSettings};
 pub use queue_ops::init_queue_extension;
 pub use runtime_init::{build_runtime_extensions, init_lazy_extensions};

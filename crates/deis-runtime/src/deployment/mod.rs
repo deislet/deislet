@@ -19,10 +19,16 @@
 //! Secrets arrive in `env` and stay in this process's memory: not in the
 //! bundle, not in the on-disk record, not in a log line, not in any answer the
 //! management API gives.
+//!
+//! The node's own side of the control-plane channel lives here too, because it
+//! is the same connection and the same credential: [`registration`] announces
+//! that this node exists and [`assignments`] asks what it should be running
+//! and keeps it matching the answer.
 
 mod assignments;
 mod credential;
 mod fetch;
+mod registration;
 mod store;
 
 use std::collections::HashMap;
@@ -39,10 +45,12 @@ use crate::assets::{AssetBundle, AssetError};
 use crate::config::RuntimeConfig;
 
 pub use assignments::{
-    run_startup_sync, sync_once, Assignment, AssignmentClient, AssignmentError, SyncOutcome,
+    reconcile_once, run_control_loop, Assignment, AssignmentClient, AssignmentError,
+    AssignmentList, SyncOutcome,
 };
 pub use credential::NodeCredential;
 pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle};
+pub use registration::{NodeRegistrar, NodeRegistration, Registered, RegistrationError};
 pub use store::{check_identifier, BundleStore, InstalledRecord, InvalidIdentifier};
 
 /// One deployment the node has been told to run.
@@ -176,6 +184,17 @@ impl DeploymentManager {
     /// environment of an application separately - which is how they run.
     pub fn installed_app_count(&self) -> usize {
         self.app_manager.installed_versions().len()
+    }
+
+    /// Every (app, environment) this node runs a deployed version of, and
+    /// which version.
+    ///
+    /// This is the "before" half of a reconciliation: what the node is doing,
+    /// against what the control plane says it should be. The built-in
+    /// `_system` app is not here - it has no deployed version - so nothing
+    /// that reconciles against an assignment list can stop it.
+    pub fn running(&self) -> Vec<(AppKey, crate::app::InstalledVersion)> {
+        self.app_manager.installed_versions()
     }
 
     fn lock_for(&self, key: &AppKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -460,6 +479,26 @@ impl DeploymentManager {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        // A bundle may not name a reserved platform key. deis-control drops
+        // these when it assembles a delivery, but a bundle recovered from this
+        // node's own disk never went through it, and a value left here would
+        // be read below as the address to build this app's storage clients
+        // against - letting the application pick where its own data goes.
+        // The values are dropped unlogged: they are the app's own text and one
+        // of these names can just as well hold a secret.
+        let declared_reserved = crate::runtime::strip_reserved_env(&mut env);
+        if !declared_reserved.is_empty() {
+            warn!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                version_id = %order.version_id,
+                keys = ?declared_reserved,
+                "This bundle's manifest declares {} variable(s) named like reserved platform \
+                 keys; they are dropped, so the application never sees them and cannot point \
+                 its storage clients at a host of its own choosing",
+                declared_reserved.len()
+            );
+        }
         let declared_secrets = manifest.secrets.len();
         env.extend(order.env);
 

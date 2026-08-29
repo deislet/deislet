@@ -11,9 +11,11 @@ package deis.blob;
 // service message ceiling and must not rely on chunk boundaries carrying
 // meaning.
 //
-// The tenant is carried out of band, in the `x-deis-app-id` gRPC metadata
-// header, exactly like the HTTP data path. The service knows nothing beyond
-// that id: no versions, no environments, no deployments.
+// The tenant is carried out of band, in the `x-deis-tenant` gRPC metadata
+// header, whose value is one application in one environment
+// ("demo.production"). It is deliberately not the `x-deis-app-id` header of
+// the HTTP data path, which names the application alone. The service knows
+// nothing beyond that one id: no versions, no environments, no deployments.
 service BlobStore {
   // Stream an object body out. The first response carries `info`, every
   // response after it carries one `chunk`, in order. An unknown key fails

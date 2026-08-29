@@ -57,17 +57,31 @@ const MAX_KEY_LEN: usize = 1024;
 /// rather than let the object pile up in memory.
 const CHANNEL_DEPTH: usize = 4;
 
-/// What an upload is held to: how big it may get, and how long it may say
-/// nothing before the store gives up on it.
+/// What an object transfer is held to: how big an upload may get, and how
+/// long either direction may make no progress before the store gives up on
+/// it.
+///
+/// Both directions need a time bound and they need it for the same reason.
+/// An upload that stops sending holds a task, a file descriptor and a
+/// full-size temporary file; a download whose client stops reading holds a
+/// task and an open content file on a channel that will never drain. Neither
+/// costs unbounded *memory* - the channel is four chunks deep - but both cost
+/// a descriptor and a task with no end, which is what a peer that vanished
+/// without closing its connection leaves behind.
 #[derive(Debug, Clone, Copy)]
-pub struct UploadLimits {
+pub struct BlobLimits {
     /// Largest object `Put` will accept. An upload that goes over is refused
     /// and its temporary file removed.
     pub max_object_bytes: u64,
-    /// Longest silence between two body chunks. `None` waits forever, which
-    /// lets one stalled client hold a task, a file descriptor and a temporary
-    /// file for the life of the process.
-    pub idle_timeout: Option<Duration>,
+    /// Longest silence between two inbound body chunks. `None` waits forever,
+    /// which lets one stalled client hold a task, a file descriptor and a
+    /// temporary file for the life of the process.
+    pub upload_idle_timeout: Option<Duration>,
+    /// Longest a `Get` may wait for the client to take the chunk it is
+    /// holding. `None` waits forever, which lets one client that opened a
+    /// download and stopped reading hold a task and an open file until the
+    /// process restarts.
+    pub download_idle_timeout: Option<Duration>,
 }
 
 /// A test-only pause point: a closure returning the future the store awaits
@@ -83,7 +97,7 @@ pub struct BlobService {
     /// `<data_dir>/blob`
     root: PathBuf,
     pool: SqlitePool,
-    limits: UploadLimits,
+    limits: BlobLimits,
     /// Serialises the two critical sections that share one content file.
     content_locks: ContentLocks,
     /// Test-only pause fired after the "the content is already here" check,
@@ -99,7 +113,7 @@ impl BlobService {
     pub async fn open(
         data_dir: &Path,
         connections: usize,
-        limits: UploadLimits,
+        limits: BlobLimits,
     ) -> StoreResult<Self> {
         let root = data_dir.join("blob");
         std::fs::create_dir_all(&root)?;
@@ -139,20 +153,24 @@ impl BlobService {
             dedup_pause: None,
         };
         service.discard_incoming();
-        match limits.idle_timeout {
-            Some(idle) => tracing::info!(
-                root = %service.root.display(),
-                max_object_bytes = limits.max_object_bytes,
-                upload_idle_timeout_secs = idle.as_secs(),
-                "blob store ready"
-            ),
-            None => tracing::warn!(
-                root = %service.root.display(),
-                max_object_bytes = limits.max_object_bytes,
-                "blob store ready with no upload idle timeout; a client that stops sending \
-                 mid-object holds a task, a file descriptor and a temporary file until the \
-                 process restarts"
-            ),
+        tracing::info!(
+            root = %service.root.display(),
+            max_object_bytes = limits.max_object_bytes,
+            upload_idle_timeout_secs = limits.upload_idle_timeout.map(|d| d.as_secs()),
+            download_idle_timeout_secs = limits.download_idle_timeout.map(|d| d.as_secs()),
+            "blob store ready"
+        );
+        if limits.upload_idle_timeout.is_none() {
+            tracing::warn!(
+                "no upload idle timeout; a client that stops sending mid-object holds a task, a \
+                 file descriptor and a temporary file until the process restarts"
+            );
+        }
+        if limits.download_idle_timeout.is_none() {
+            tracing::warn!(
+                "no download idle timeout; a client that opens a Get and stops reading holds a \
+                 task and an open content file until the process restarts"
+            );
         }
         Ok(service)
     }
@@ -317,8 +335,9 @@ impl BlobService {
     /// Write `body` into `temp`, returning its digest and length.
     ///
     /// A client that stops sending without closing the stream is given
-    /// `idle_timeout` and then dropped: waiting forever would pin a task, a
-    /// file descriptor and a full temporary file per stalled connection.
+    /// `upload_idle_timeout` and then dropped: waiting forever would pin a
+    /// task, a file descriptor and a full temporary file per stalled
+    /// connection.
     async fn receive<S>(
         &self,
         tenant: &TenantId,
@@ -336,7 +355,7 @@ impl BlobService {
         let mut size: u64 = 0;
 
         loop {
-            let next = match self.limits.idle_timeout {
+            let next = match self.limits.upload_idle_timeout {
                 Some(idle) => match tokio::time::timeout(idle, body.next()).await {
                     Ok(next) => next,
                     Err(_) => {
@@ -750,7 +769,7 @@ impl BlobStore for BlobService {
             tracing::debug!(tenant = %tenant, key = %key, "blob get found no such object");
             StoreError::NotFound(format!("object {key} does not exist"))
         })?;
-        let mut file = self.open_content(&tenant, &meta).await?;
+        let file = self.open_content(&tenant, &meta).await?;
         tracing::debug!(
             tenant = %tenant,
             key = %key,
@@ -760,65 +779,8 @@ impl BlobStore for BlobService {
 
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_DEPTH);
         let info = BlobInfo::from(meta.clone());
-        tokio::spawn(async move {
-            // The header first, so the client knows the size and type before
-            // a single byte of body arrives.
-            if tx
-                .send(Ok(GetResponse {
-                    payload: Some(get_response::Payload::Info(info)),
-                }))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
-            let mut sent: u64 = 0;
-            loop {
-                match file.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        sent += n as u64;
-                        if tx
-                            .send(Ok(GetResponse {
-                                payload: Some(get_response::Payload::Chunk(buf[..n].to_vec())),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            tracing::debug!(
-                                key = %meta.key,
-                                sent,
-                                "client stopped reading before the object ended"
-                            );
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            key = %meta.key,
-                            sent,
-                            error = %e,
-                            "read failed midway through an object; the client receives a truncated \
-                             stream terminated by an error"
-                        );
-                        let _ = tx
-                            .send(Err(Status::internal(format!("read failed: {e}"))))
-                            .await;
-                        return;
-                    }
-                }
-            }
-            if sent != meta.size {
-                tracing::warn!(
-                    key = %meta.key,
-                    expected = meta.size,
-                    sent,
-                    "object on disk is a different length than its metadata says; the client got \
-                     the file as it is now"
-                );
-            }
-        });
+        let idle = self.limits.download_idle_timeout;
+        tokio::spawn(async move { run_download(tx, file, info, idle, tenant, meta).await });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
@@ -915,6 +877,171 @@ impl BlobStore for BlobService {
     }
 }
 
+/// Stream one object out, and terminate the stream properly if the client
+/// stops taking it.
+///
+/// One channel slot is reserved before anything is written, so an abandoned
+/// download can always be closed with a status. Without the reservation,
+/// giving up would drop the sender, gRPC would close the stream with OK, and
+/// a client that resumed reading would see a truncated object that looks
+/// complete.
+async fn run_download(
+    tx: tokio::sync::mpsc::Sender<Result<GetResponse, Status>>,
+    mut file: tokio::fs::File,
+    header: BlobInfo,
+    idle: Option<Duration>,
+    tenant: TenantId,
+    meta: ObjectMeta,
+) {
+    let Ok(abandoned) = tx.reserve().await else {
+        tracing::debug!(
+            tenant = %tenant,
+            key = %meta.key,
+            "client dropped the download before any of it was sent"
+        );
+        return;
+    };
+    if let Handoff::Stalled { sent } =
+        stream_object(&tx, &mut file, header, idle, &tenant, &meta).await
+    {
+        let idle_secs = idle.map(|d| d.as_secs()).unwrap_or_default();
+        tracing::warn!(
+            tenant = %tenant,
+            key = %meta.key,
+            sent,
+            size = meta.size,
+            idle_timeout_secs = idle_secs,
+            "client stopped reading a download for the idle timeout; abandoning it and releasing \
+             the open content file, and the stream ends in an error so the partial body is never \
+             mistaken for the whole object"
+        );
+        // The slot was reserved before anything was written, so this cannot
+        // fail for lack of room; the message is queued whether or not the
+        // client ever comes back to read it.
+        abandoned.send(Err(Status::deadline_exceeded(format!(
+            "download of {} abandoned: the client took nothing for {idle_secs} seconds",
+            meta.key
+        ))));
+    }
+}
+
+/// How one outbound message, or one whole download, ended.
+enum Handoff {
+    /// Everything asked for was handed over.
+    Done,
+    /// The client dropped the download. Nothing is owed to it and nothing is
+    /// left to clean up.
+    Closed,
+    /// The client took nothing for the idle timeout. `sent` is how far the
+    /// body had got, for the log line.
+    Stalled { sent: u64 },
+}
+
+/// Push one object's header and body into `tx`, stopping early if the client
+/// stops taking them.
+///
+/// The store will not hold an open content file and a task for a client that
+/// has gone quiet: the channel is four chunks deep, so a client that stops
+/// reading parks this task on a full channel with no time bound at all. That
+/// is the same failure the upload direction already refuses, and it is
+/// refused here the same way.
+async fn stream_object(
+    tx: &tokio::sync::mpsc::Sender<Result<GetResponse, Status>>,
+    file: &mut tokio::fs::File,
+    header: BlobInfo,
+    idle: Option<Duration>,
+    tenant: &TenantId,
+    meta: &ObjectMeta,
+) -> Handoff {
+    // The header first, so the client knows the size and type before a single
+    // byte of body arrives.
+    let message = GetResponse {
+        payload: Some(get_response::Payload::Info(header)),
+    };
+    match hand_over(tx, message, idle, 0).await {
+        Handoff::Done => {}
+        other => return other,
+    }
+
+    let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut sent: u64 = 0;
+    loop {
+        match file.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                sent += n as u64;
+                let message = GetResponse {
+                    payload: Some(get_response::Payload::Chunk(buf[..n].to_vec())),
+                };
+                match hand_over(tx, message, idle, sent).await {
+                    Handoff::Done => {}
+                    Handoff::Closed => {
+                        tracing::debug!(
+                            tenant = %tenant,
+                            key = %meta.key,
+                            sent,
+                            "client stopped reading before the object ended"
+                        );
+                        return Handoff::Closed;
+                    }
+                    stalled => return stalled,
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    tenant = %tenant,
+                    key = %meta.key,
+                    sent,
+                    error = %e,
+                    "read failed midway through an object; the client receives a truncated stream \
+                     terminated by an error"
+                );
+                let _ = tx
+                    .send(Err(Status::internal(format!("read failed: {e}"))))
+                    .await;
+                return Handoff::Closed;
+            }
+        }
+    }
+
+    if sent != meta.size {
+        tracing::warn!(
+            tenant = %tenant,
+            key = %meta.key,
+            expected = meta.size,
+            sent,
+            "object on disk is a different length than its metadata says; the client got the file \
+             as it is now"
+        );
+    }
+    Handoff::Done
+}
+
+/// Hand one message to the client, waiting at most `idle` for it to be taken.
+async fn hand_over(
+    tx: &tokio::sync::mpsc::Sender<Result<GetResponse, Status>>,
+    message: GetResponse,
+    idle: Option<Duration>,
+    sent: u64,
+) -> Handoff {
+    use tokio::sync::mpsc::error::SendTimeoutError;
+
+    let outcome = match idle {
+        Some(idle) => tx.send_timeout(Ok(message), idle).await,
+        // No timeout configured: the operator has accepted that one quiet
+        // client can hold this task and an open file for good.
+        None => tx
+            .send(Ok(message))
+            .await
+            .map_err(|e| SendTimeoutError::Closed(e.0)),
+    };
+    match outcome {
+        Ok(()) => Handoff::Done,
+        Err(SendTimeoutError::Closed(_)) => Handoff::Closed,
+        Err(SendTimeoutError::Timeout(_)) => Handoff::Stalled { sent },
+    }
+}
+
 /// Adapt the inbound `Put` stream to bare chunks on its own task, rejecting a
 /// second header. Turning it into a channel keeps the storage layer free of
 /// protobuf types and gives the upload natural backpressure.
@@ -975,10 +1102,11 @@ mod tests {
     const NUDGES: usize = 4096;
 
     /// Limits for a test that is not about limits.
-    fn limits(max_object_bytes: u64) -> UploadLimits {
-        UploadLimits {
+    fn limits(max_object_bytes: u64) -> BlobLimits {
+        BlobLimits {
             max_object_bytes,
-            idle_timeout: Some(Duration::from_secs(60)),
+            upload_idle_timeout: Some(Duration::from_secs(60)),
+            download_idle_timeout: Some(Duration::from_secs(60)),
         }
     }
 
@@ -1155,9 +1283,10 @@ mod tests {
         let svc = BlobService::open(
             dir.path(),
             4,
-            UploadLimits {
+            BlobLimits {
                 max_object_bytes: TEST_LIMIT,
-                idle_timeout: Some(Duration::from_secs(60)),
+                upload_idle_timeout: Some(Duration::from_secs(60)),
+                download_idle_timeout: Some(Duration::from_secs(60)),
             },
         )
         .await
@@ -1196,9 +1325,10 @@ mod tests {
         let svc = BlobService::open(
             dir.path(),
             4,
-            UploadLimits {
+            BlobLimits {
                 max_object_bytes: TEST_LIMIT,
-                idle_timeout: None,
+                upload_idle_timeout: None,
+                download_idle_timeout: None,
             },
         )
         .await
@@ -1410,6 +1540,162 @@ mod tests {
             0,
             "the uploads that deduplicated left their temporary files behind"
         );
+    }
+
+    /// A download whose client stops reading used to pin a task and an open
+    /// content file with no time bound at all: the send channel is four
+    /// chunks deep, so once it filled, the sending task simply waited until
+    /// the connection actually dropped. The upload direction was given a
+    /// timeout; this is the same protection for the other direction.
+    ///
+    /// Zero seconds is used as the idle bound so the test turns on the
+    /// channel being full rather than on any real time passing: a send that
+    /// cannot be taken immediately is abandoned immediately.
+    #[tokio::test]
+    async fn a_download_nobody_reads_is_abandoned_and_ends_in_an_error() {
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        // More chunks than the channel can hold, so the sender is guaranteed
+        // to reach a send that the receiver has not made room for.
+        let body = vec![b'x'; STREAM_CHUNK_BYTES * (CHANNEL_DEPTH + 2)];
+        let meta = svc
+            .store_object(&a, "big", None, chunks(vec![body.clone()]))
+            .await
+            .unwrap();
+        let file = svc.open_content(&a, &meta).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_DEPTH);
+        // Awaited rather than spawned: it returns when the store has given
+        // up, so nothing here has to guess when that happened.
+        run_download(
+            tx,
+            file,
+            BlobInfo::from(meta.clone()),
+            Some(Duration::ZERO),
+            a.clone(),
+            meta.clone(),
+        )
+        .await;
+
+        // What the client would read: the header, whatever body fitted, and
+        // then a status saying the download was abandoned - never a clean end
+        // that would pass for the whole object.
+        let mut received: u64 = 0;
+        let mut ended_in_error = None;
+        while let Some(message) = rx.recv().await {
+            match message {
+                Ok(GetResponse {
+                    payload: Some(get_response::Payload::Chunk(chunk)),
+                }) => received += chunk.len() as u64,
+                Ok(_) => {}
+                Err(status) => ended_in_error = Some(status),
+            }
+        }
+        let status = ended_in_error.expect(
+            "the stream ended cleanly after being abandoned; a client would read the partial body \
+             as the whole object",
+        );
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            received < meta.size,
+            "the whole object was sent, so nothing was abandoned"
+        );
+    }
+
+    /// The same path when the client is reading: nothing may be cut short
+    /// just because a timeout exists.
+    #[tokio::test]
+    async fn a_download_that_is_read_completes_under_the_same_timeout() {
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        let body = vec![b'y'; STREAM_CHUNK_BYTES * (CHANNEL_DEPTH + 2)];
+        let meta = svc
+            .store_object(&a, "big", None, chunks(vec![body.clone()]))
+            .await
+            .unwrap();
+        let file = svc.open_content(&a, &meta).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<GetResponse, Status>>(CHANNEL_DEPTH);
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(message) = rx.recv().await {
+                if let GetResponse {
+                    payload: Some(get_response::Payload::Chunk(chunk)),
+                } = message.expect("a download that is being read must not fail")
+                {
+                    received.extend_from_slice(&chunk);
+                }
+            }
+            received
+        });
+        run_download(
+            tx,
+            file,
+            BlobInfo::from(meta.clone()),
+            Some(Duration::from_secs(60)),
+            a.clone(),
+            meta,
+        )
+        .await;
+        assert_eq!(reader.await.unwrap(), body);
+    }
+
+    /// A client that hangs up is not the same as one that stopped reading:
+    /// there is nobody left to tell, so the download just stops.
+    #[tokio::test]
+    async fn a_download_whose_client_hung_up_stops_without_a_status() {
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        let meta = svc
+            .store_object(&a, "k", None, chunks(vec![b"bytes".to_vec()]))
+            .await
+            .unwrap();
+        let file = svc.open_content(&a, &meta).await.unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_DEPTH);
+        drop(rx);
+        // Returns rather than waiting for anything: the reservation fails the
+        // moment the receiver is gone.
+        run_download(
+            tx,
+            file,
+            BlobInfo::from(meta.clone()),
+            Some(Duration::from_secs(60)),
+            a.clone(),
+            meta,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hand_over_reports_what_the_client_did() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<GetResponse, Status>>(1);
+        let message = || GetResponse {
+            payload: Some(get_response::Payload::Chunk(b"chunk".to_vec())),
+        };
+
+        // Room in the channel: taken straight away.
+        assert!(matches!(
+            hand_over(&tx, message(), Some(Duration::ZERO), 0).await,
+            Handoff::Done
+        ));
+        // Full channel and no patience left: abandoned rather than parked.
+        assert!(matches!(
+            hand_over(&tx, message(), Some(Duration::ZERO), 5).await,
+            Handoff::Stalled { sent: 5 }
+        ));
+        // Room again once the client reads.
+        rx.recv().await.unwrap().unwrap();
+        assert!(matches!(
+            hand_over(&tx, message(), Some(Duration::ZERO), 0).await,
+            Handoff::Done
+        ));
+        // Client gone: nothing to abandon and nothing to report to it.
+        drop(rx);
+        assert!(matches!(
+            hand_over(&tx, message(), Some(Duration::ZERO), 0).await,
+            Handoff::Closed
+        ));
     }
 
     #[test]

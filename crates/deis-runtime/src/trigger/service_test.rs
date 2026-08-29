@@ -38,11 +38,23 @@ async fn service_running(
 }
 
 fn tick(app_id: &str) -> Request<ScheduledEvent> {
+    tick_for(app_id, "production")
+}
+
+/// A tick for one named environment of an application, the way the control
+/// plane sends it now that it keys schedules by (app, environment).
+fn tick_for(app_id: &str, environment: &str) -> Request<ScheduledEvent> {
     Request::new(ScheduledEvent {
         app_id: app_id.to_string(),
         scheduled_time: 1_700_000_000_000,
         cron: "* * * * *".to_string(),
+        environment: environment.to_string(),
     })
+}
+
+/// A tick from a caller that predates `ScheduledEvent.environment`.
+fn tick_without_an_environment(app_id: &str) -> Request<ScheduledEvent> {
+    tick_for(app_id, "")
 }
 
 #[tokio::test]
@@ -146,4 +158,88 @@ async fn a_handler_that_succeeds_ends_the_search() {
     assert!(response.error.is_empty());
 
     let _ = apps.unload_app(&AppKey::production("cron-ok")).await;
+}
+
+#[tokio::test]
+async fn a_preview_tick_runs_the_preview_handler_and_not_productions() {
+    let _turn = test_host::take();
+    // Both environments of one application are loaded here, which is the
+    // normal state of a node. Before ScheduledEvent carried an environment,
+    // every tick landed on production: a preview's schedule ran production's
+    // code with production's secrets, and nothing said so.
+    let apps = test_host::host();
+    let production = AppKey::new("cron-two-envs", "production");
+    let preview = AppKey::new("cron-two-envs", "preview-7");
+    apps.load_app(
+        production.clone(),
+        r#"
+            export default function handler() { return new Response("unused"); }
+            export async function scheduled() { return; }
+        "#
+        .to_string(),
+        AppConfig::default(),
+        None,
+    )
+    .await
+    .expect("production loads");
+    apps.load_app(
+        preview.clone(),
+        r#"
+            export default function handler() { return new Response("unused"); }
+            export async function scheduled() { throw new Error("this is the preview"); }
+        "#
+        .to_string(),
+        AppConfig::default(),
+        None,
+    )
+    .await
+    .expect("the preview loads");
+
+    let service = TriggerServiceImpl::new(apps.clone());
+
+    let response = service
+        .on_scheduled(tick_for("cron-two-envs", "preview-7"))
+        .await
+        .expect("the RPC itself succeeds")
+        .into_inner();
+    assert!(!response.success);
+    assert!(
+        response.error.contains("this is the preview"),
+        "the preview's tick ran some other environment's handler: {}",
+        response.error
+    );
+
+    let response = service
+        .on_scheduled(tick_for("cron-two-envs", "production"))
+        .await
+        .expect("the RPC itself succeeds")
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+
+    let _ = apps.unload_app(&preview).await;
+    let _ = apps.unload_app(&production).await;
+}
+
+#[tokio::test]
+async fn a_tick_with_no_environment_still_means_production() {
+    // A control plane older than the field must keep working rather than
+    // having every tick fail on an environment named "".
+    let _turn = test_host::take();
+    let code = r#"
+        export default function handler() { return new Response("unused"); }
+        export async function scheduled() { return; }
+    "#;
+    let (apps, service) = service_running("cron-default-env", code).await;
+
+    let response = service
+        .on_scheduled(tick_without_an_environment("cron-default-env"))
+        .await
+        .expect("the RPC itself succeeds")
+        .into_inner();
+
+    assert!(response.success, "{}", response.error);
+
+    let _ = apps
+        .unload_app(&AppKey::production("cron-default-env"))
+        .await;
 }

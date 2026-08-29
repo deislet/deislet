@@ -17,10 +17,19 @@ pub struct ControlConfig {
     /// TLS configuration (optional)
     #[serde(default)]
     pub tls: Option<TlsConfig>,
-    /// Runtime nodes managed through their gRPC management plane.
+    /// Runtime nodes this control plane knows about before any of them has
+    /// said anything - the fallback, not the only source.
     ///
-    /// Runtime instances are autonomous and do not register themselves;
-    /// the control reaches out to the endpoints listed here instead.
+    /// A node registers itself with `PUT /api/nodes/{id}/registration` and
+    /// is then eligible for deployment pushes and cron fires like any other,
+    /// so a machine can join a running platform without this file being
+    /// edited.
+    ///
+    /// What the list is still for: a control plane and its nodes started
+    /// together by one script, where the control plane may need to reach a
+    /// node before that node has managed to call in, and a node that must
+    /// stay a delivery target even while it is down (an entry from here never
+    /// expires, a registration does).
     #[serde(default)]
     pub deis_runtime_nodes: Vec<RuntimeNodeConfig>,
     /// Interval in seconds between deis-runtime node health polls (default: 15)
@@ -80,6 +89,27 @@ pub struct ControlConfig {
     /// cost of one catalog read per tick.
     #[serde(default = "default_cron_tick_seconds")]
     pub cron_tick_seconds: u64,
+    /// Seconds a self-registered node stays on the fleet list without
+    /// refreshing its registration (default: 90).
+    ///
+    /// A node refreshes every third of this, so two lost refreshes - a dropped
+    /// request, a restart of this process - do not cost a healthy node its
+    /// place. When it does expire, the node stops receiving deployment pushes
+    /// and cron fires; it is not told, and it comes back on its own the next
+    /// time it registers.
+    ///
+    /// Nodes listed in `deis_runtime_nodes` are not subject to this: the file
+    /// says they exist.
+    #[serde(default = "default_node_registration_ttl")]
+    pub node_registration_ttl_secs: u64,
+}
+
+/// Default lifetime of a node registration, in seconds.
+///
+/// Public because the fleet is built with it in places that have no
+/// configuration to read - tests, and any caller that has no opinion.
+pub fn default_node_registration_ttl() -> u64 {
+    90
 }
 
 fn default_cron_tick_seconds() -> u64 {
@@ -135,6 +165,7 @@ impl Default for ControlConfig {
             store_endpoint: None,
             queue_endpoint: None,
             cron_tick_seconds: default_cron_tick_seconds(),
+            node_registration_ttl_secs: default_node_registration_ttl(),
         }
     }
 }

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "The Deislet developer CLI: build, deploy, inspect and roll back applications"
 
 [[bin]]
 name = "deis"
@@ -11,21 +12,41 @@ path = "src/main.rs"
 
 [dependencies]
 deis-build = { path = "../deis-build" }
+# The bundle format is read back here so a deploy can name the app and the
+# digest it is about to upload; never re-parsed by hand.
+deis-bundle = { path = "../deis-bundle" }
+# Shared conventions: the default environment name and what an application or
+# environment name is allowed to contain.
+deis-wire = { workspace = true }
 
 clap = { version = "4.4", features = ["derive", "cargo"] }
 colored = "2.1"
-indicatif = "0.17"
-dialoguer = "0.11"
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.35", features = ["full"] }
-tracing = "0.1"
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+chrono = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = "0.1"
+tokio = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = "0.3"
 axum = "0.7"
-tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
-hyper = "1.0"
 notify = "6.1"
 walkdir = "2.4"
 url = "2.5"
+
+# Used by src/quiet.rs to keep `--json` output free of build progress.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

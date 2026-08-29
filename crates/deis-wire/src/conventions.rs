@@ -118,6 +118,60 @@ pub const STORE_ENDPOINT_ENV: &str = "DEIS_STORE_ENDPOINT";
 /// `http://127.0.0.1:8091`. Same contract as [`STORE_ENDPOINT_ENV`].
 pub const QUEUE_ENDPOINT_ENV: &str = "DEIS_QUEUE_ENDPOINT";
 
+// ---- the node-facing control plane ------------------------------------
+//
+// These four names are the contract between deis-control (which serves them)
+// and deis-runtime (which calls them). They live here, and not in either
+// crate, because nothing checks that two crates spell an HTTP path the same
+// way: a node that asked for `/register` while the control plane served
+// `/registration` compiled perfectly, and the only symptom was a fleet that
+// never learned about its own nodes.
+
+/// Route template for a node's registration, in the `:id` form an axum
+/// `Router` takes.
+///
+/// The client half is [`node_registration_path`]. They are separate because a
+/// server registers one route for every node while a client addresses one.
+pub const NODE_REGISTRATION_ROUTE: &str = "/api/nodes/:id/registration";
+
+/// Route template for a node's assignment list. See
+/// [`NODE_REGISTRATION_ROUTE`].
+pub const NODE_ASSIGNMENTS_ROUTE: &str = "/api/nodes/:id/assignments";
+
+/// Path a node registers itself at, and refreshes that registration at.
+///
+/// `PUT` is the method: a registration states what a node is rather than
+/// asking to create something, so a node that lost contact and came back
+/// says it again. `DELETE` on the same path is a node leaving on purpose.
+///
+/// `node_id` must already be percent-encoded - an id containing `/` would
+/// otherwise address a different path than the one it registered under.
+pub fn node_registration_path(encoded_node_id: &str) -> String {
+    format!("/api/nodes/{encoded_node_id}/registration")
+}
+
+/// Path a node fetches its assignment list from. Same encoding rule as
+/// [`node_registration_path`].
+pub fn node_assignments_path(encoded_node_id: &str) -> String {
+    format!("/api/nodes/{encoded_node_id}/assignments")
+}
+
+/// Response header on an assignment list saying whether the list is the whole
+/// truth for that node.
+///
+/// `true` means the array is everything this node should run, so anything it
+/// is running that is absent from the list must be stopped - that is how a
+/// deleted application goes away on a node the delete never reached. Any other
+/// value, **including the header being missing**, means the control plane
+/// could not describe part of the answer, and the node may only add. Treating
+/// a short list as complete would turn one undecryptable secret into a healthy
+/// application being stopped.
+pub const ASSIGNMENTS_COMPLETE_HEADER: &str = "x-deis-assignments-complete";
+
+/// Response header counting the assignments the control plane could not
+/// describe, and so left out. Non-zero always accompanies a `complete: false`.
+pub const ASSIGNMENTS_WITHHELD_HEADER: &str = "x-deis-assignments-withheld";
+
 /// A single chunk plus its framing must never approach the ceiling, otherwise
 /// streaming would start failing on the transport instead of being bounded by
 /// our own logic. Checked at compile time so it cannot drift.

@@ -326,9 +326,16 @@ mod tests {
         .unwrap();
 
         let tenant = TenantId::parse("app-one.production").unwrap();
-        let id = queue.send(&tenant, "jobs", b"work".to_vec()).await.unwrap();
-        queue.pull(&tenant, "jobs", None, None).await.unwrap();
-        queue.nack(&tenant, "jobs", vec![id], None).await.unwrap();
+        queue.send(&tenant, "jobs", b"work".to_vec()).await.unwrap();
+        let leased = queue.pull(&tenant, "jobs", None, None).await.unwrap();
+        let handles = leased
+            .iter()
+            .map(|message| crate::queue::MessageHandle {
+                id: message.id.clone(),
+                lease_token: message.lease_token.clone(),
+            })
+            .collect();
+        queue.nack(&tenant, "jobs", handles, None).await.unwrap();
         assert_eq!(queue.dead_letters(&tenant, "jobs").await.unwrap().len(), 1);
 
         let sweeper = spawn_dead_letter_sweeper(queue.clone(), 1).expect("retention is on");

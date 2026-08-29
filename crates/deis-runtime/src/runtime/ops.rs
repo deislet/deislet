@@ -4,7 +4,7 @@
 use super::kv_client::KvClient;
 use deno_core::{extension, op2, OpState};
 use deno_error::JsErrorBox;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -64,14 +64,25 @@ pub struct KvSetOptions {
     pub ttl_seconds: Option<i64>,
 
     /// Opaque string kept alongside the value. Stored and returned untouched
-    /// by deis-store.
-    ///
-    /// It cannot be read back yet: `GetResponse` carries only the value and
-    /// `ListResponse` only the keys, so there is nowhere for the store to
-    /// return it. Writing it is still worth doing -- the data is kept -- but
-    /// an app cannot see it again until deis-store's proto grows the field.
+    /// by deis-store, and read back through
+    /// [`op_kv_get_with_metadata`].
     #[serde(default)]
     pub metadata: Option<String>,
+}
+
+/// What `ctx.services.kv.getWithMetadata` hands back to JavaScript.
+///
+/// A missing key is `null` on the JavaScript side, not a record with a null
+/// value: "no such key" and "a key whose metadata is null" are different
+/// answers and an app branches on them differently.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReadResult {
+    pub value: String,
+    /// Exactly the string the last write stored, or null if it stored none.
+    pub metadata: Option<String>,
+    /// Absolute unix second this entry lapses at; null means it never does.
+    pub expiration: Option<i64>,
 }
 
 /// KV Set operation
@@ -105,6 +116,40 @@ async fn op_kv_set(
         .set_with_options(key, value, options.ttl_seconds, options.metadata)
         .await
         .map_err(|e| service_call_failed("kv.put", e))
+}
+
+/// KV Get returning the metadata and expiry stored with the value.
+///
+/// The same single `Get` call as [`op_kv_get`]; deis-store returns all three
+/// fields either way, so this costs no extra round trip. It exists separately
+/// because a value-only read is the common one and should not have to unpack a
+/// record.
+#[op2(async)]
+#[serde]
+async fn op_kv_get_with_metadata(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+) -> Result<Option<KvReadResult>, JsErrorBox> {
+    let client_opt = {
+        let state_borrow = state.borrow();
+        state_borrow.try_borrow::<KvClient>().cloned()
+    };
+
+    let Some(client) = client_opt else {
+        return Err(service_unavailable("kv"));
+    };
+
+    client
+        .get_with_metadata(key)
+        .await
+        .map(|read| {
+            read.map(|read| KvReadResult {
+                value: read.value,
+                metadata: read.metadata,
+                expiration: read.expiration,
+            })
+        })
+        .map_err(|e| service_call_failed("kv.getWithMetadata", e))
 }
 
 /// KV Delete operation
@@ -208,6 +253,7 @@ extension!(
     deis_runtime_ops,
     ops = [
         op_kv_get,
+        op_kv_get_with_metadata,
         op_kv_set,
         op_kv_delete,
         op_kv_list,

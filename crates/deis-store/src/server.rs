@@ -37,7 +37,7 @@ impl Stores {
         let blob = BlobService::open(
             &config.data_dir,
             config.shared_connections,
-            config.upload_limits(),
+            config.blob_limits(),
         )
         .await
         .context("cannot open the blob store")?;
@@ -205,6 +205,7 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
         max_message_size = MAX_GRPC_MESSAGE_BYTES,
         max_object_bytes = config.max_object_bytes,
         upload_idle_timeout_secs = config.upload_idle_timeout_secs,
+        download_idle_timeout_secs = config.download_idle_timeout_secs,
         kv_sweep_interval_secs = config.kv_sweep_interval_secs,
         "deis-store serving KvStore, Database and BlobStore"
     );

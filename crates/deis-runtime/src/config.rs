@@ -189,6 +189,20 @@ pub struct ControlPlaneConfig {
     /// The node keeps serving what it has while it retries.
     #[serde(default = "default_control_retry_interval_secs")]
     pub retry_interval_secs: u64,
+
+    /// Seconds between reconciliations once the node is up.
+    ///
+    /// The node asks the same question it asked at startup and treats the
+    /// answer as the whole truth: it loads what it is not running and unloads
+    /// what it no longer is assigned. Without this the two only ever agree by
+    /// accident - a push that a node missed while it was restarting, or an
+    /// application deleted while it was unreachable, leaves that node serving
+    /// something nobody asked for until somebody notices.
+    ///
+    /// Longer means drift lives longer; shorter means one more request per
+    /// node per interval, which is a single small JSON response.
+    #[serde(default = "default_control_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
 }
 
 fn default_control_request_timeout_secs() -> u64 {
@@ -197,6 +211,10 @@ fn default_control_request_timeout_secs() -> u64 {
 
 fn default_control_retry_interval_secs() -> u64 {
     15
+}
+
+fn default_control_reconcile_interval_secs() -> u64 {
+    60
 }
 
 /// Hand-written so dumping the configuration - in a startup line, in an error
@@ -208,6 +226,7 @@ impl std::fmt::Debug for ControlPlaneConfig {
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .field("request_timeout_secs", &self.request_timeout_secs)
             .field("retry_interval_secs", &self.retry_interval_secs)
+            .field("reconcile_interval_secs", &self.reconcile_interval_secs)
             .finish()
     }
 }
@@ -219,6 +238,7 @@ impl Default for ControlPlaneConfig {
             secret: None,
             request_timeout_secs: default_control_request_timeout_secs(),
             retry_interval_secs: default_control_retry_interval_secs(),
+            reconcile_interval_secs: default_control_reconcile_interval_secs(),
         }
     }
 }
@@ -555,6 +575,14 @@ impl RuntimeConfig {
             )?;
         }
 
+        if let Some(value) = env_var("DEIS_RUNTIME_CONTROL_RECONCILE_INTERVAL_SECS") {
+            self.control.reconcile_interval_secs = parse_env(
+                &value,
+                "DEIS_RUNTIME_CONTROL_RECONCILE_INTERVAL_SECS",
+                "a whole number of seconds",
+            )?;
+        }
+
         if let Some(value) = env_var("DEIS_RUNTIME_BUNDLES_DIR") {
             self.bundles.dir = Some(PathBuf::from(value));
         }
@@ -715,6 +743,14 @@ impl ControlPlaneConfig {
             return Err(anyhow!(
                 "control.retry_interval_secs must be greater than 0; 0 spins the retry loop on a \
                  hot loop against the control plane"
+            ));
+        }
+
+        if self.reconcile_interval_secs == 0 {
+            return Err(anyhow!(
+                "control.reconcile_interval_secs must be greater than 0; 0 would re-ask for the \
+                 assignment list without pausing, which is a hot loop against the control plane \
+                 and re-installs every deployment as fast as it can"
             ));
         }
 

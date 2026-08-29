@@ -8,10 +8,15 @@
 //! It also does not authenticate its callers: the tenant header is taken at
 //! face value, which is why it listens on loopback by default. See the crate
 //! docs for what would have to exist before it can be bound anywhere else.
+//!
+//! Beside serving, the binary is also how a data directory is backed up and
+//! put back: `snapshot` and `restore`. Those are subcommands rather than RPCs
+//! because they write local files an operator names, and because they have to
+//! work when the service is not running - see [`deis_store::snapshot`].
 
-use anyhow::Result;
-use clap::Parser;
-use deis_store::{config::Config, server};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use deis_store::{config::Config, server, snapshot};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -23,8 +28,52 @@ struct Cli {
     /// Path to the TOML configuration file. Every key is optional and
     /// `deis-store.example.toml` lists them all with their defaults; a
     /// missing file starts the service on those defaults.
+    ///
+    /// The subcommands read it too, so a snapshot or a restore acts on the
+    /// same data directory the service serves.
     #[arg(short, long, default_value = "deis-store.toml")]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Serve KvStore, Database and BlobStore. This is what running the
+    /// binary with no subcommand does.
+    Serve,
+    /// Write a consistent, restorable copy of the data directory.
+    ///
+    /// Safe to run while the service is serving: every database is copied
+    /// under one read transaction and the blob metadata is copied before the
+    /// content it names, so the copy never refers to bytes it does not hold.
+    /// Copying the data directory with `cp -r` instead is *not* safe - SQLite
+    /// runs in WAL mode here, so a plain copy can restore as a database
+    /// missing its last commits, or as a corrupt one, with no warning.
+    Snapshot {
+        /// Directory to write the snapshot into. It must not already exist,
+        /// or must be empty: a snapshot written over an older one is neither
+        /// of them.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Put a snapshot back.
+    ///
+    /// Stop the service first and move the old data directory aside: the
+    /// restore refuses to write into a directory that already holds
+    /// anything, which is also what keeps it from being poured over live
+    /// data. Every object is verified against the digest it is named by on
+    /// the way in.
+    Restore {
+        /// The snapshot directory, as written by `snapshot`.
+        #[arg(long)]
+        from: PathBuf,
+        /// Where to put it. Defaults to `data_dir` from the configuration
+        /// file, so a restore lands where the service will look for it; name
+        /// something else to stage a restore and inspect it first.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -37,7 +86,82 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = Config::load(&cli.config)?;
-    let listener = server::bind(&config).await?;
 
+    match cli.command {
+        None | Some(Command::Serve) => serve(config).await,
+        // Blocking work on the runtime's own thread. These are one-shot
+        // operator commands with nothing else running beside them, so there
+        // is no worker to starve.
+        Some(Command::Snapshot { out }) => take_snapshot(&config, &out),
+        Some(Command::Restore { from, into }) => restore_snapshot(&config, &from, into),
+    }
+}
+
+async fn serve(config: Config) -> Result<()> {
+    let listener = server::bind(&config).await?;
     server::serve(config, listener, server::shutdown_signal()).await
+}
+
+fn take_snapshot(config: &Config, out: &std::path::Path) -> Result<()> {
+    let manifest = snapshot::take(&config.data_dir, out).with_context(|| {
+        format!(
+            "cannot snapshot {} into {}",
+            config.data_dir.display(),
+            out.display()
+        )
+    })?;
+    // Printed as well as logged: this is a command a person ran and is
+    // watching, and the restore line is the thing they will need later.
+    println!(
+        "snapshot written to {}\n  databases: {}\n  objects:   {} ({} bytes)\n  restore:   {}",
+        out.display(),
+        manifest.databases.len(),
+        manifest.objects,
+        manifest.object_bytes,
+        manifest.restore_with
+    );
+    if manifest.dropped_objects > 0 {
+        println!(
+            "  note:      {} object(s) were deleted from the live store while this ran and are \
+             not in the snapshot",
+            manifest.dropped_objects
+        );
+    }
+    if !manifest.damaged_objects.is_empty() {
+        println!(
+            "  warning:   {} content file(s) in the live store do not match their digest; see \
+             {} for the list",
+            manifest.damaged_objects.len(),
+            snapshot::MANIFEST_NAME
+        );
+    }
+    Ok(())
+}
+
+fn restore_snapshot(config: &Config, from: &std::path::Path, into: Option<PathBuf>) -> Result<()> {
+    let target = into.unwrap_or_else(|| config.data_dir.clone());
+    let report = snapshot::restore(from, &target).with_context(|| {
+        format!(
+            "cannot restore {} into {}",
+            from.display(),
+            target.display()
+        )
+    })?;
+    println!(
+        "restored {} into {}\n  databases: {}\n  objects:   {} ({} bytes)",
+        from.display(),
+        target.display(),
+        report.databases,
+        report.objects,
+        report.object_bytes
+    );
+    if report.damaged_objects > 0 {
+        println!(
+            "  warning:   {} object(s) were already damaged when the snapshot was taken and are \
+             restored as they were",
+            report.damaged_objects
+        );
+    }
+    println!("Start deis-store against {} now.", target.display());
+    Ok(())
 }

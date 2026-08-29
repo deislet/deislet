@@ -43,9 +43,12 @@ Usage:
 
 Actions:
   start   Build everything, bring the six components up, and deploy the
-          example app the way a developer would: build a bundle, create the
-          app and its environment, upload the bundle as a version, point the
-          environment at it. The node fetches the bundle itself.
+          example app the way a developer would - through the `deis` CLI:
+          `deis deploy` builds the bundle, creates the app and its
+          environment, uploads the bundle as an immutable version and points
+          the environment at it, then `deis secret set` adds a secret. The
+          node fetches the bundle itself. Nothing here calls the control
+          plane's REST API by hand.
   verify  Exercise the running demo end to end and report each check.
   stop    Stop every component and wait until each has really exited.
   status  Print pids, ports and what is deployed.
@@ -95,7 +98,8 @@ reset_previous_run() {
     "${DEMO_DIR}/deis-runtime-data" \
     "${DEMO_DIR}/bundles" \
     "${DEMO_DIR}/deis-control.db" \
-    "${DEMO_DIR}/deis-proxy.db"
+    "${DEMO_DIR}/deis-proxy.db" \
+    "${DEMO_DIR}/deis-config"
 }
 
 # `ss` is asked first on purpose: it lists every listening socket on the host,
@@ -294,6 +298,8 @@ NODE_ID=$NODE_ID
 APP_SRC_DIR=$APP_SRC_DIR
 APP_V1_ID=${APP_V1_ID:-}
 APP_V2_ID=${APP_V2_ID:-}
+APP_V1_NUMBER=${APP_V1_NUMBER:-}
+APP_V2_NUMBER=${APP_V2_NUMBER:-}
 DEMO_SECRET_VALUE=$DEMO_SECRET_VALUE
 EOF
 }
@@ -406,44 +412,57 @@ EOF
 # downloads the bundle over HTTP, checks its sha256 and loads it. The bundle
 # itself never travels inside a gRPC message.
 
-# Print the control plane's base URL for curl.
+# Print the control plane's base URL.
 control_url() {
   echo "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 }
 
-# curl against the control API, failing loudly with the body it got back.
+# Run the developer CLI the way a developer would.
 #
-# Every call here is a step that the next one depends on, so a failure has to
-# stop the run rather than let the demo continue in a half-deployed state.
-api() {
-  local method=$1
-  local path=$2
-  shift 2
-
-  local body_file="${LOG_DIR}/api-last.json"
-  local code
-  code=$(curl -s -o "$body_file" -w '%{http_code}' -X "$method" "$@" \
-    "$(control_url)${path}" || echo 000)
-
-  case "$code" in
-    2*)
-      cat "$body_file"
-      return 0
-      ;;
-    *)
-      echo "❌ ${method} ${path} answered HTTP ${code}" >&2
-      sed 's/^/     /' "$body_file" >&2
-      return 1
-      ;;
-  esac
+# Every deployment step below goes through this rather than through curl
+# against the REST API, and that is the point: `deis` is what a person has.
+# A demo that reached past it into the API would prove the control plane
+# works while leaving the only interface anybody actually types untested --
+# and the first person to try would be the one to find out.
+#
+# The platform's address is handed over in the environment rather than in a
+# deis.toml, because the demo picks its ports at start time and a file
+# committed to the repo cannot know them.
+#
+# DEIS_CONFIG_HOME is the load-bearing one. Without it the CLI reads, and
+# `deis config set` would write, the developer's own
+# ~/.config/deis/credentials.toml. A demo run must never touch the credential
+# someone uses against a real control plane, so it gets a config home of its
+# own inside the demo directory.
+#
+# The settings are collected into an array rather than written as a command
+# prefix so that check_cli_tail can `exec` the binary directly inside its
+# coprocess. A `deis tail` that has to be interrupted must be the process
+# that receives the signal; a shell wrapping it would swallow the Ctrl-C the
+# CLI is written to handle.
+deis_cli_env() {
+  DEIS_CLI_ENV=(
+    "DEIS_CONTROL_ENDPOINT=$(control_url)"
+    "DEIS_TELEMETRY_ENDPOINT=http://127.0.0.1:${DEIS_TELEMETRY_PORT}"
+    "DEIS_APP=${APP_ID}"
+    "DEIS_ENVIRONMENT=${ENV_NAME}"
+    "DEIS_CONFIG_HOME=${DEMO_DIR}/deis-config"
+  )
 }
 
-# Build the example app for this platform and echo the bundle's path.
+deis_cli() {
+  deis_cli_env
+  env "${DEIS_CLI_ENV[@]}" "${BIN_DIR}/deis" "$@"
+}
+
+# Lay down a copy of the example app's sources and echo the directory.
 #
-# The build runs in a copy under the demo directory rather than in the repo:
-# a build writes dist/ into the project it is given, and the second version
-# rewrites two of the source files.
-build_example_app() {
+# The copy lives under the demo directory rather than in the repo because a
+# build writes dist/ into the project it is given, and because the second
+# version rewrites two of the source files. Nothing is compiled here: the
+# build is `deis deploy`'s first step, so that a project which does not
+# compile creates no app, no environment and no version.
+prepare_app_source() {
   local label=$1
   local dest="${DEMO_DIR}/app-${label}"
 
@@ -459,48 +478,46 @@ build_example_app() {
     sed -i "s/data-label=\"v1\"/data-label=\"${label}\"/" "$dest/public/index.html"
   fi
 
-  if ! (cd "$dest" && "${BIN_DIR}/deis" build --vendor deislet) \
-    > "${LOG_DIR}/build-app-${label}.log" 2>&1; then
-    echo "❌ Building the example app (${label}) failed; see ${LOG_DIR}/build-app-${label}.log" >&2
-    tail -n 20 "${LOG_DIR}/build-app-${label}.log" | sed 's/^/     /' >&2
+  echo "$dest"
+}
+
+# `deis deploy` from a prepared source tree, with the report kept for `verify`.
+#
+# The command is run from inside the project directory because that is where
+# a developer runs it: `deis deploy` reads .config.json from the working
+# directory, builds the bundle, creates the application and the environment
+# if they are new, uploads the bundle as an immutable version and moves the
+# environment's pointer to it. One command covers what used to be four REST
+# calls here.
+#
+# --json is asked for so `verify` can check the report later rather than
+# scrape human output. It is written under LOG_DIR on purpose: that is the
+# tree check_secret_delivery sweeps for the plaintext secret, so a report
+# that ever echoed one would fail that check instead of going unnoticed.
+#
+# A non-zero exit means at least one node did not take the deployment. That
+# node is still serving the previous version, which is exactly the failure a
+# green deploy must not hide, so it stops the run.
+cli_deploy() {
+  local dir=$1
+  local environment=$2
+  local report=$3
+  shift 3
+
+  local json="${LOG_DIR}/${report}.json"
+  local errors="${LOG_DIR}/${report}.log"
+
+  if ! (cd "$dir" && deis_cli deploy -e "$environment" --json "$@") \
+    > "$json" 2> "$errors"; then
+    echo "❌ deis deploy -e ${environment} failed; see ${errors}" >&2
+    tail -n 20 "$errors" | sed 's/^/     /' >&2
     return 1
   fi
-
-  echo "${dest}/dist/deislet/bundle.zip"
 }
 
-# Upload one bundle as a version and echo its id.
-upload_version() {
-  local bundle=$1
-  api POST "/api/apps/${APP_ID}/versions" \
-    -H 'content-type: application/zip' \
-    --data-binary "@${bundle}" | jq -r '.version.id'
-}
-
-# Point an environment at a version, and say where it landed. The environment
-# defaults to production; the preview deployment passes its own.
-deploy_version() {
-  local version_id=$1
-  local note=$2
-  local environment=${3:-$ENV_NAME}
-  local response
-  response=$(api POST "/api/apps/${APP_ID}/environments/${environment}/deployments" \
-    -H 'content-type: application/json' \
-    -d "{\"version_id\":\"${version_id}\",\"note\":\"${note}\"}") || return 1
-
-  local delivered failed
-  delivered=$(echo "$response" | jq -r '.delivery.delivered | length')
-  failed=$(echo "$response" | jq -r '.delivery.failed | length')
-
-  if [ "$delivered" -ge 1 ]; then
-    echo "   ✓ ${note}: ${delivered} node(s) are serving ${version_id} for ${environment}"
-    return 0
-  fi
-
-  echo "❌ ${note}: no node took ${version_id}; the fleet keeps serving what it had" >&2
-  echo "$response" | jq -r '.delivery.failed[]? | "     " + .node + ": " + .error' >&2
-  echo "$response" | jq -r '.delivery.skipped? // empty | "     skipped: " + .' >&2
-  return 1
+# Everything `verify` needs to know about a deploy report, read once.
+report_field() {
+  jq -r "$2 // empty" < "${LOG_DIR}/$1.json" 2>/dev/null || true
 }
 
 deploy_example_app() {
@@ -509,52 +526,49 @@ deploy_example_app() {
     return 0
   fi
 
-  echo "🚀 Building and deploying the example app"
+  echo "🚀 Deploying the example app with the deis CLI"
 
-  local bundle_v1
-  bundle_v1=$(build_example_app v1) || return 1
-  echo "   ✓ Built $(basename "$bundle_v1") ($(wc -c < "$bundle_v1") bytes)"
+  local src_v1
+  src_v1=$(prepare_app_source v1) || return 1
 
-  api POST /api/apps -H 'content-type: application/json' \
-    -d "{\"id\":\"${APP_ID}\"}" > /dev/null || return 1
-  echo "   ✓ Application ${APP_ID} created"
+  # One command: build, create the application, create the environment,
+  # upload the version, point production at it, and wait for the nodes to
+  # say they took it.
+  cli_deploy "$src_v1" "$ENV_NAME" cli-deploy-v1 || return 1
+  APP_V1_ID=$(report_field cli-deploy-v1 '.version.id')
+  APP_V1_NUMBER=$(report_field cli-deploy-v1 '.version.number')
+  echo "   ✓ deis deploy: version ${APP_V1_NUMBER} (${APP_V1_ID}) is serving ${ENV_NAME} on $(report_field cli-deploy-v1 '.delivery.delivered | length') node(s)"
 
-  APP_V1_ID=$(upload_version "$bundle_v1") || return 1
-  echo "   ✓ Uploaded version ${APP_V1_ID}"
+  # The value is piped in rather than passed as an argument, which is what
+  # the CLI recommends and what keeps it out of the shell history and out of
+  # every other user's `ps` output. A secret is not part of the immutable
+  # bundle, so this produces no new version; the control plane re-delivers
+  # the running one with the new environment attached, and `deis secret set`
+  # fails if a node does not take that.
+  if ! printf '%s' "$DEMO_SECRET_VALUE" \
+    | deis_cli secret set DEMO_SECRET -e "$ENV_NAME" --json \
+      > "${LOG_DIR}/cli-secret-set.json" 2> "${LOG_DIR}/cli-secret-set.log"; then
+    echo "❌ deis secret set DEMO_SECRET failed; see ${LOG_DIR}/cli-secret-set.log" >&2
+    tail -n 20 "${LOG_DIR}/cli-secret-set.log" | sed 's/^/     /' >&2
+    return 1
+  fi
+  echo "   ✓ deis secret set: DEMO_SECRET stored and re-delivered to the running version"
 
-  api POST "/api/apps/${APP_ID}/environments" -H 'content-type: application/json' \
-    -d "{\"name\":\"${ENV_NAME}\"}" > /dev/null || return 1
-  echo "   ✓ Environment ${ENV_NAME} created"
-
-  # Stored encrypted, decrypted only at the moment of delivery, and never
-  # returned by any read endpoint. The app only reports whether it arrived.
-  api PUT "/api/apps/${APP_ID}/environments/${ENV_NAME}/secrets/DEMO_SECRET" \
-    -H 'content-type: application/json' \
-    -d "{\"value\":\"${DEMO_SECRET_VALUE}\"}" > /dev/null || return 1
-  echo "   ✓ Secret DEMO_SECRET stored"
-
-  deploy_version "$APP_V1_ID" "deployed v1" || return 1
-
-  # The second version exists so `verify` has something to roll back from,
-  # and so the preview environment below can be on a different version than
-  # production.
-  local bundle_v2
-  bundle_v2=$(build_example_app v2) || return 1
-  APP_V2_ID=$(upload_version "$bundle_v2") || return 1
-  echo "   ✓ Uploaded version ${APP_V2_ID}"
-
-  # A preview of the same application, on the same node, pointed at v2 while
-  # production stays on v1. Before an application was identified by (app,
-  # environment), this second deployment overwrote the first on the node --
-  # same slot, so production silently started serving the preview's code, the
-  # preview's environment map and the preview's secrets. `verify` checks both
-  # halves of the fix: each environment serves its own version, and neither
-  # can see the other's KV.
-  api POST "/api/apps/${APP_ID}/environments" -H 'content-type: application/json' \
-    -d "{\"name\":\"${PREVIEW_ENV_NAME}\"}" > /dev/null || return 1
-  echo "   ✓ Environment ${PREVIEW_ENV_NAME} created"
-
-  deploy_version "$APP_V2_ID" "deployed v2 to ${PREVIEW_ENV_NAME}" "$PREVIEW_ENV_NAME" || return 1
+  # A preview of the same application, on the same node, deployed to a
+  # different version than production. Before an application was identified
+  # by (app, environment), this second deployment overwrote the first on the
+  # node -- same slot, so production silently started serving the preview's
+  # code, the preview's environment map and the preview's secrets. `verify`
+  # checks both halves of the fix: each environment serves its own version,
+  # and neither can see the other's KV.
+  #
+  # It is also the second version production rolls back from later.
+  local src_v2
+  src_v2=$(prepare_app_source v2) || return 1
+  cli_deploy "$src_v2" "$PREVIEW_ENV_NAME" cli-deploy-v2-preview || return 1
+  APP_V2_ID=$(report_field cli-deploy-v2-preview '.version.id')
+  APP_V2_NUMBER=$(report_field cli-deploy-v2-preview '.version.number')
+  echo "   ✓ deis deploy -e ${PREVIEW_ENV_NAME}: version ${APP_V2_NUMBER} (${APP_V2_ID}) is serving ${PREVIEW_ENV_NAME}"
 
   echo "   Send requests with: curl -H 'x-deis-app-id: ${APP_ID}' http://127.0.0.1:${DEIS_RUNTIME_PORT}/"
 }
@@ -1041,10 +1055,12 @@ check_secret_delivery() {
   fi
 
   # The value is decrypted only in memory, at the moment of delivery. Nothing
-  # on either side's disk may contain it - and that includes api-last.json,
-  # the file the api() helper saves every control plane API response to: a
-  # read endpoint that echoes the plaintext secret back is exactly the leak
-  # this check exists to catch, so no path under LOG_DIR is excluded.
+  # on either side's disk may contain it - and that includes the CLI's own
+  # --json reports, which are written under LOG_DIR precisely so this sweep
+  # covers them. `deis secret set` and `deis secret list` both answer with a
+  # document about the secret; one of them printing the value back is exactly
+  # the leak this check exists to catch, so no path under LOG_DIR is
+  # excluded.
   # `|| true` at the end: this whole pipeline finding nothing is the passing
   # case, and under `set -euo pipefail` a grep that matches nothing would
   # end the run instead.
@@ -1235,61 +1251,74 @@ check_environment_kv_isolation() {
 
 # Which version an environment is on right now, straight from the control
 # plane rather than inferred from a response.
+# Which version an environment is running, according to the control plane,
+# read through the CLI rather than the REST API.
 deployed_version() {
-  api GET "/api/apps/${APP_ID}/environments/${ENV_NAME}/deployment" 2>/dev/null \
-    | jq -r '.version.id // empty'
+  local environment=${1:-$ENV_NAME}
+  deis_cli status --json 2>/dev/null \
+    | jq -r --arg env "$environment" \
+      '.environments[] | select(.name == $env) | .version_id // empty' \
+    2>/dev/null || true
+}
+
+# The static label the served asset carries, which rides inside the version
+# bundle rather than being produced by a handler.
+asset_label() {
+  curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
+    | grep -o 'data-label="[^"]*"' || true
 }
 
 check_rollback() {
   if [ -z "${APP_V2_ID:-}" ]; then
-    fail_check "rollback puts the previous version back" \
+    fail_check "deis rollback puts the previous version back" \
       "no second version was uploaded, so there is nothing to roll back from"
     return
   fi
 
-  local before
+  local before label_before asset_before
   before=$(app_request "${LOG_DIR}/verify-rollback-before.headers" "/hello/world")
-  local label_before
   label_before=$(echo "$before" | jq -r '.label // empty' || true)
-  local asset_before
-  asset_before=$(curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
-    | grep -o 'data-label="[^"]*"' || true)
+  asset_before=$(asset_label)
 
-  if ! deploy_version "$APP_V2_ID" "deployed v2 for the rollback check" > /dev/null; then
-    fail_check "rollback puts the previous version back" "v2 could not be deployed"
+  # Deploy the preview's version to production, from the same source tree
+  # the preview was built from. --no-build reuses the bundle that build left
+  # behind, so this is the identical artefact rather than a rebuild that
+  # merely ought to match.
+  if ! cli_deploy "${DEMO_DIR}/app-v2" "$ENV_NAME" cli-rollback-v2 --no-build; then
+    fail_check "deis rollback puts the previous version back" \
+      "deis deploy could not put v2 on ${ENV_NAME}; see ${LOG_DIR}/cli-rollback-v2.log"
     return
   fi
 
-  local after
+  local after label_after asset_v2
   after=$(app_request "${LOG_DIR}/verify-rollback-v2.headers" "/hello/world")
-  local label_after
   label_after=$(echo "$after" | jq -r '.label // empty' || true)
-  local asset_v2
-  asset_v2=$(curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
-    | grep -o 'data-label="[^"]*"' || true)
+  asset_v2=$(asset_label)
 
   if [ "$label_after" = "$label_before" ]; then
-    fail_check "rollback puts the previous version back" \
+    fail_check "deis rollback puts the previous version back" \
       "deploying v2 did not change the response: still ${label_after}"
     return
   fi
 
-  local response
-  response=$(api POST "/api/apps/${APP_ID}/environments/${ENV_NAME}/rollback" \
-    -H 'content-type: application/json' -d '{}') || {
-    fail_check "rollback puts the previous version back" "the rollback call failed"
+  # No --to: the point of the command is that a person under pressure does
+  # not have to know a version number to undo the last deployment.
+  if ! deis_cli rollback -e "$ENV_NAME" --json \
+    > "${LOG_DIR}/cli-rollback.json" 2> "${LOG_DIR}/cli-rollback.log"; then
+    fail_check "deis rollback puts the previous version back" \
+      "the rollback command failed: $(tail -n 3 "${LOG_DIR}/cli-rollback.log" | tr '\n' ' ')"
     return
-  }
-  local rolled_to
-  rolled_to=$(echo "$response" | jq -r '.version.id' || true)
+  fi
 
-  local back
+  local rolled_from rolled_to rolled_to_number
+  rolled_from=$(jq -r '.from.id // empty' < "${LOG_DIR}/cli-rollback.json" || true)
+  rolled_to=$(jq -r '.to.id // empty' < "${LOG_DIR}/cli-rollback.json" || true)
+  rolled_to_number=$(jq -r '.to.number // empty' < "${LOG_DIR}/cli-rollback.json" || true)
+
+  local back label_back asset_back
   back=$(app_request "${LOG_DIR}/verify-rollback-after.headers" "/hello/world")
-  local label_back
   label_back=$(echo "$back" | jq -r '.label // empty' || true)
-  local asset_back
-  asset_back=$(curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
-    | grep -o 'data-label="[^"]*"' || true)
+  asset_back=$(asset_label)
 
   # Assets ride inside the version bundle (see "asset-first serving" in
   # implementation-plan.zh.md, principle 5), so a rollback that put the code
@@ -1297,12 +1326,13 @@ check_rollback() {
   # deploying v2 must have changed the served asset, and rolling back must
   # have restored the original one.
   if [ "$label_back" = "$label_before" ] && [ "$rolled_to" = "$APP_V1_ID" ] \
+    && [ "$rolled_from" = "$APP_V2_ID" ] \
     && [ -n "$asset_v2" ] && [ "$asset_v2" != "$asset_before" ] \
     && [ "$asset_back" = "$asset_before" ]; then
-    pass_check "rollback puts the previous version back" \
-      "${label_before} -> ${label_after} -> ${label_back}; the static asset went ${asset_before} -> ${asset_v2} -> ${asset_back} with it"
+    pass_check "deis rollback puts the previous version back" \
+      "deis rollback moved ${ENV_NAME} to version ${rolled_to_number}; the handler answered ${label_before} -> ${label_after} -> ${label_back} and the static asset went ${asset_before} -> ${asset_v2} -> ${asset_back} with it"
   else
-    fail_check "rollback puts the previous version back" \
+    fail_check "deis rollback puts the previous version back" \
       "expected label ${label_before} and asset ${asset_before} from ${APP_V1_ID}, got label ${label_back} and asset ${asset_back} from ${rolled_to} (v2 served asset ${asset_v2})"
   fi
 }
@@ -1348,6 +1378,289 @@ check_telemetry_logs() {
   fi
 }
 
+# --- what the CLI itself proves -------------------------------------------
+#
+# The checks below are about `deis` rather than about the platform. They
+# exist because the CLI is the only interface a developer has: the control
+# plane can be perfectly correct while the one command anybody types is
+# broken, and nothing else in this file would notice.
+
+check_cli_deploy() {
+  local report="${LOG_DIR}/cli-deploy-v1.json"
+  local title="deis deploy takes a project from source to serving"
+
+  if [ ! -s "$report" ]; then
+    fail_check "$title" \
+      "no deploy report at ${report}, so start did not go through the CLI"
+    return
+  fi
+
+  local app_created env_created version_created number sha delivered nodes
+  app_created=$(jq -r '.app_created' < "$report" 2>/dev/null || true)
+  env_created=$(jq -r '.environment_created' < "$report" 2>/dev/null || true)
+  version_created=$(jq -r '.version_created' < "$report" 2>/dev/null || true)
+  number=$(jq -r '.version.number // empty' < "$report" 2>/dev/null || true)
+  sha=$(jq -r '.version.sha256 // empty' < "$report" 2>/dev/null | cut -c1-12 || true)
+  delivered=$(jq -r '.delivery.delivered | length' < "$report" 2>/dev/null || echo 0)
+  nodes=$(jq -r '.delivery.delivered | join(", ")' < "$report" 2>/dev/null || true)
+
+  # The report says what the CLI did; the request says the result is real.
+  # Both halves are needed: a deploy that recorded a version nothing serves
+  # is the failure a report on its own would hide.
+  local headers="${LOG_DIR}/verify-cli-deploy.headers"
+  local body status label
+  body=$(app_request "$headers" "/hello/world")
+  status=$(http_status "$headers")
+  label=$(echo "$body" | jq -r '.label // empty' 2>/dev/null || true)
+
+  if [ "$app_created" = "true" ] && [ "$env_created" = "true" ] \
+    && [ "$version_created" = "true" ] && [ "${delivered:-0}" -ge 1 ] \
+    && [ "$status" = "200" ] && [ "$label" = "v1" ]; then
+    pass_check "$title" \
+      "one \`deis deploy\` in the project directory built the bundle, created application ${APP_ID}, created environment ${ENV_NAME}, uploaded version ${number} (sha256 ${sha}) and ${delivered} node(s) took it (${nodes}); GET /hello/world now answers ${status} from ${label}. No REST call was made by hand"
+  else
+    fail_check "$title" \
+      "report says app_created=${app_created} environment_created=${env_created} version_created=${version_created} delivered=${delivered}; the app answers ${status} from label '${label}' (expected 200 from v1)"
+  fi
+}
+
+check_cli_versions() {
+  local out="${LOG_DIR}/cli-versions.json"
+  local title="deis versions lists what was deployed and marks the live one"
+
+  if ! deis_cli versions --json > "$out" 2> "${LOG_DIR}/cli-versions.log"; then
+    fail_check "$title" \
+      "the command failed: $(tail -n 3 "${LOG_DIR}/cli-versions.log" | tr '\n' ' ')"
+    return
+  fi
+
+  local total live_number live_id preview_number listed
+  total=$(jq -r '.total // 0' < "$out" 2>/dev/null || echo 0)
+  # The live one is not a separate field: a version is marked live by the
+  # environments listed against it, which is the honest way round - a version
+  # is not "current", an environment points at one.
+  live_number=$(jq -r --arg env "$ENV_NAME" \
+    '.versions[] | select(.environments | index($env)) | .number' < "$out" 2>/dev/null || true)
+  live_id=$(jq -r --arg env "$ENV_NAME" \
+    '.versions[] | select(.environments | index($env)) | .id' < "$out" 2>/dev/null || true)
+  preview_number=$(jq -r --arg env "$PREVIEW_ENV_NAME" \
+    '.versions[] | select(.environments | index($env)) | .number' < "$out" 2>/dev/null || true)
+  listed=$(jq -r '[.versions[] | "\(.number)->[\(.environments | join(","))]"] | join(" ")' \
+    < "$out" 2>/dev/null || true)
+
+  local expected
+  expected=$(deployed_version "$ENV_NAME")
+
+  if [ "${total:-0}" -ge 2 ] && [ -n "$live_number" ] && [ "$live_id" = "$expected" ] \
+    && [ -n "$preview_number" ] && [ "$live_number" != "$preview_number" ]; then
+    pass_check "$title" \
+      "${total} versions listed; ${listed}. Version ${live_number} is marked as the one ${ENV_NAME} runs and its id matches what the control plane reports (${live_id})"
+  else
+    fail_check "$title" \
+      "total=${total}, ${ENV_NAME} marked on version '${live_number}' (id ${live_id}, control plane says ${expected}), ${PREVIEW_ENV_NAME} marked on '${preview_number}'; listing was: ${listed}"
+  fi
+}
+
+check_cli_secret_list() {
+  local json="${LOG_DIR}/cli-secret-list.json"
+  local text="${LOG_DIR}/cli-secret-list.txt"
+  local title="deis secret list shows the name and never the value"
+
+  if ! deis_cli secret list -e "$ENV_NAME" --json > "$json" 2> "${LOG_DIR}/cli-secret-list.log"; then
+    fail_check "$title" \
+      "the command failed: $(tail -n 3 "${LOG_DIR}/cli-secret-list.log" | tr '\n' ' ')"
+    return
+  fi
+  # The human form is checked too. It is the one somebody will actually read,
+  # and it is a different code path from --json, so a value could leak in one
+  # while the other stayed clean.
+  deis_cli secret list -e "$ENV_NAME" > "$text" 2>&1 || true
+
+  local names
+  names=$(jq -r '.secrets[].name' < "$json" 2>/dev/null | tr '\n' ' ' || true)
+
+  if ! echo "$names" | grep -q "DEMO_SECRET"; then
+    fail_check "$title" "DEMO_SECRET is not listed; names were: ${names:-none}"
+    return
+  fi
+
+  # Both outputs are also swept by check_secret_delivery, which greps every
+  # file under LOG_DIR. Asserting it here as well keeps the failure readable:
+  # this check names the command that leaked, the sweep only names the file.
+  if grep -q "$DEMO_SECRET_VALUE" "$json" "$text" 2>/dev/null; then
+    fail_check "$title" \
+      "the value came back in the output of \`deis secret list\`"
+    return
+  fi
+
+  pass_check "$title" \
+    "names listed: ${names}- and neither the JSON nor the human output contains the value. There is no command that prints one: the control plane has no endpoint that returns it"
+}
+
+check_cli_status() {
+  local out="${LOG_DIR}/cli-status.json"
+  local title="deis status reports the node actually serving"
+
+  if ! deis_cli status --json > "$out" 2> "${LOG_DIR}/cli-status.log"; then
+    fail_check "$title" \
+      "the command failed: $(tail -n 3 "${LOG_DIR}/cli-status.log" | tr '\n' ' ')"
+    return
+  fi
+
+  local healthy reachable serving envs prod_number
+  healthy=$(jq -r --arg id "$NODE_ID" \
+    '.nodes[] | select(.id == $id) | .healthy' < "$out" 2>/dev/null || true)
+  reachable=$(jq -r --arg id "$NODE_ID" \
+    '.nodes[] | select(.id == $id) | .reachable' < "$out" 2>/dev/null || true)
+  # `serving` is what the node itself answered when asked, not what the
+  # catalog intended. That distinction is the whole value of the command:
+  # the catalog says what should be running, the node says what is.
+  serving=$(jq -r --arg id "$NODE_ID" \
+    '.nodes[] | select(.id == $id) | .serving // [] | map(.environment) | sort | join(", ")' \
+    < "$out" 2>/dev/null || true)
+  envs=$(jq -r '[.environments[] | "\(.name)=v\(.version_number // "none")"] | join(" ")' \
+    < "$out" 2>/dev/null || true)
+  prod_number=$(jq -r --arg env "$ENV_NAME" \
+    '.environments[] | select(.name == $env) | .version_number // empty' < "$out" 2>/dev/null || true)
+
+  if [ "$healthy" = "true" ] && [ "$reachable" = "true" ] \
+    && echo "$serving" | grep -q "$ENV_NAME" \
+    && echo "$serving" | grep -q "$PREVIEW_ENV_NAME" \
+    && [ -n "$prod_number" ]; then
+    pass_check "$title" \
+      "node ${NODE_ID} is healthy and answered when asked; it reports serving ${APP_ID} in: ${serving}. The catalog side reads ${envs}"
+  else
+    fail_check "$title" \
+      "node ${NODE_ID}: healthy=${healthy} reachable=${reachable} serving='${serving}' (expected both ${ENV_NAME} and ${PREVIEW_ENV_NAME}); environments read ${envs}"
+  fi
+}
+
+# The node told the control plane it exists, on the path the control plane
+# actually serves.
+#
+# This is a seam no compiler watches: deis-runtime builds the URL and
+# deis-control serves it, in two crates that do not depend on each other. They
+# were once out of step - the node called `POST .../register` while the control
+# plane served `PUT .../registration` - and nothing failed visibly, because a
+# node that cannot register still fetches its own assignments and still serves
+# every request. What was lost was the control plane knowing about nodes
+# nobody had written into its configuration file.
+check_node_registration() {
+  local title="the node registers itself with the control plane"
+  local fleet="${LOG_DIR}/verify-fleet.json"
+
+  # No CLI command covers the fleet, so this reads the control plane's own
+  # view of it. That is an operator question, not a deployment step.
+  curl -s "$(control_url)/api/runtime" > "$fleet" 2>/dev/null || true
+
+  local registered addr configured_addr
+  registered=$(jq -r --arg id "$NODE_ID" \
+    '.nodes[] | select(.id == $id) | .registered_at // empty' < "$fleet" 2>/dev/null || true)
+  addr=$(jq -r --arg id "$NODE_ID" \
+    '.nodes[] | select(.id == $id) | .addr // empty' < "$fleet" 2>/dev/null || true)
+  configured_addr="http://127.0.0.1:${DEIS_RUNTIME_PORT}"
+
+  # The give-away for the old mismatch: the node says so once and gives up.
+  if grep -q "no node registration endpoint" "${LOG_DIR}/deis-runtime.log" 2>/dev/null; then
+    fail_check "$title" \
+      "the node reports that this control plane has no registration endpoint, so the two halves disagree about the path or the method"
+    return
+  fi
+
+  if [ -z "$registered" ]; then
+    fail_check "$title" \
+      "the control plane has no registration timestamp for ${NODE_ID}; the fleet reads: $(head -c 300 "$fleet")"
+    return
+  fi
+
+  # A node reports the address it derives from its own hostname; the operator
+  # who wrote the file knows what routes from the control plane. The file
+  # wins, or a node whose hostname does not resolve here would replace a
+  # working address with a broken one and every push to it would start failing.
+  if [ "$addr" != "$configured_addr" ]; then
+    fail_check "$title" \
+      "the node's self-reported address replaced the one in deis_runtime_nodes: ${configured_addr} became ${addr}, so every deployment push and cron fire now goes somewhere the operator did not choose"
+    return
+  fi
+
+  pass_check "$title" \
+    "${NODE_ID} registered at ${registered} on PUT /api/nodes/${NODE_ID}/registration, and the address from deis_runtime_nodes (${addr}) survived its self-report"
+}
+
+check_cli_tail() {
+  local out="${LOG_DIR}/verify-cli-tail.log"
+  local title="deis tail streams a line from a request made after it started"
+  : > "$out"
+
+  # A name nothing else produces, so the line that arrives can only have come
+  # from the request made below - after the stream was already open. Grepping
+  # for a word the app logs on every request would pass on a line from an
+  # hour ago and prove nothing about following.
+  local probe="tail-probe-$$-${RANDOM}"
+
+  # The CLI's output is read through a pipe rather than tailed out of a file,
+  # so waiting for a line is a blocking read that returns the moment one
+  # arrives. `exec` means the pid below is the CLI itself and not a shell
+  # around it, which matters when it is interrupted at the end.
+  deis_cli_env
+  coproc DEIS_TAIL { exec env "${DEIS_CLI_ENV[@]}" "${BIN_DIR}/deis" tail -e "$ENV_NAME" 2>&1; }
+  local tail_pid=$DEIS_TAIL_PID
+
+  # Wait until the stream is really open before producing anything to see.
+  #
+  # `deis tail` prints this banner only after the Tail call has returned, and
+  # deis-telemetry registers the subscriber inside that handler before it
+  # answers - so the banner is proof that a line produced from now on reaches
+  # this stream. Doing it the other way round is the classic flake: the
+  # request is logged, flushed and broadcast while nobody is listening, and a
+  # tail that correctly shows only new lines looks broken.
+  local line opened=0
+  while IFS= read -r -t 30 -u "${DEIS_TAIL[0]}" line; do
+    printf '%s\n' "$line" >> "$out"
+    case "$line" in
+      *"following new lines only"*)
+        opened=1
+        break
+        ;;
+    esac
+  done
+
+  if [ "$opened" -ne 1 ]; then
+    kill "$tail_pid" 2>/dev/null || true
+    wait "$tail_pid" 2>/dev/null || true
+    fail_check "$title" \
+      "the stream never opened; deis tail said: $(tr '\n' ' ' < "$out" | head -c 300)"
+    return
+  fi
+
+  app_request "${LOG_DIR}/verify-cli-tail.headers" "/hello/${probe}" > /dev/null
+
+  local seen=0
+  while IFS= read -r -t 60 -u "${DEIS_TAIL[0]}" line; do
+    printf '%s\n' "$line" >> "$out"
+    case "$line" in
+      *"greeted ${probe}"*)
+        seen=1
+        break
+        ;;
+    esac
+  done
+
+  # SIGINT, not SIGKILL: `deis tail` races Ctrl-C against the stream so that
+  # it unwinds normally and closes the connection. That is the path a person
+  # takes to stop it, so it is the one worth exercising.
+  kill -INT "$tail_pid" 2>/dev/null || true
+  wait "$tail_pid" 2>/dev/null || true
+
+  if [ "$seen" -eq 1 ]; then
+    pass_check "$title" \
+      "GET /hello/${probe} was made after the stream opened, and deis tail printed: $(grep -m 1 "greeted ${probe}" "$out" | sed 's/[[:space:]][[:space:]]*/ /g')"
+  else
+    fail_check "$title" \
+      "the stream opened but nothing mentioning ${probe} arrived within 60s; see ${out}"
+  fi
+}
+
 verify_demo() {
   load_state
   require_command curl
@@ -1355,11 +1668,20 @@ verify_demo() {
 
   echo "🔎 Verifying the demo end to end"
   echo
+  # The CLI checks come first because everything after them rests on what
+  # `deis deploy` put there. If the deploy report is wrong, saying so before
+  # eleven other checks fail for the same reason saves reading all eleven.
+  echo "-- the CLI deploys --"
+  check_cli_deploy
+  check_cli_versions
   echo "-- asset-first serving --"
   check_static_asset
   echo "-- routing --"
   check_route_parameter
   echo "-- secrets --"
+  # The list runs before the sweep: it writes its own output under LOG_DIR,
+  # and the sweep is what would catch a value in it.
+  check_cli_secret_list
   check_secret_delivery
   echo "-- storage --"
   check_kv_roundtrip
@@ -1371,9 +1693,15 @@ verify_demo() {
   check_second_environment
   check_environment_kv_isolation
   echo "-- versions --"
+  # This one moves production to v2 and back, so it runs after every check
+  # that expects production to be on v1.
   check_rollback
   echo "-- observability --"
   check_telemetry_logs
+  check_cli_tail
+  echo "-- the fleet --"
+  check_node_registration
+  check_cli_status
 
   echo
   echo "${CHECKS_PASSED} passed, ${CHECKS_FAILED} failed"

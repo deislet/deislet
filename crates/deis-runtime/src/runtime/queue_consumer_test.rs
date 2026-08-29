@@ -2,7 +2,7 @@
 mod tests {
     use super::super::*;
     use crate::runtime::metrics::{MetricsRegistry, QUEUE_MESSAGES_TOTAL, QUEUE_POLL_ERRORS_TOTAL};
-    use crate::runtime::queue_client::{LeasedMessage, NackOutcome};
+    use crate::runtime::queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome};
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
 
@@ -16,6 +16,9 @@ mod tests {
             attempts: 1,
             lease_expires_at: 0,
             created_at: 0,
+            // A real deis-queue issues a fresh one per delivery; the tests
+            // only need it to be the token that comes back with the id.
+            lease_token: format!("lease-of-{id}"),
         }
     }
 
@@ -33,6 +36,11 @@ mod tests {
     struct Journal {
         acked: Vec<String>,
         nacked: Vec<String>,
+        /// The lease tokens the consumer presented with the ids above. An
+        /// answer that arrived without one would be refused by a real
+        /// deis-queue and the message redelivered.
+        ack_tokens: Vec<String>,
+        nack_tokens: Vec<String>,
         nack_delay: u32,
     }
 
@@ -98,29 +106,48 @@ mod tests {
         fn ack_messages<'a>(
             &'a self,
             _queue: &'a str,
-            message_ids: Vec<String>,
-        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<i32>> {
-            let count = message_ids.len() as i32;
-            self.journal.lock().unwrap().acked.extend(message_ids);
-            Box::pin(async move { Ok(count) })
+            handles: Vec<MessageHandle>,
+        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<AckOutcome>> {
+            let count = handles.len() as i32;
+            {
+                let mut journal = self.journal.lock().unwrap();
+                journal
+                    .ack_tokens
+                    .extend(handles.iter().map(|handle| handle.lease_token.clone()));
+                journal
+                    .acked
+                    .extend(handles.into_iter().map(|handle| handle.id));
+            }
+            Box::pin(async move {
+                Ok(AckOutcome {
+                    acknowledged: count,
+                    stale_leases: 0,
+                })
+            })
         }
 
         fn nack_messages<'a>(
             &'a self,
             _queue: &'a str,
-            message_ids: Vec<String>,
+            handles: Vec<MessageHandle>,
             delay_seconds: u32,
         ) -> futures_util::future::BoxFuture<'a, anyhow::Result<NackOutcome>> {
-            let count = message_ids.len() as i32;
+            let count = handles.len() as i32;
             {
                 let mut journal = self.journal.lock().unwrap();
-                journal.nacked.extend(message_ids);
+                journal
+                    .nack_tokens
+                    .extend(handles.iter().map(|handle| handle.lease_token.clone()));
+                journal
+                    .nacked
+                    .extend(handles.into_iter().map(|handle| handle.id));
                 journal.nack_delay = delay_seconds;
             }
             Box::pin(async move {
                 Ok(NackOutcome {
                     released: count,
                     dead_lettered: 0,
+                    stale_leases: 0,
                 })
             })
         }

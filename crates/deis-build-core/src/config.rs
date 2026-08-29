@@ -10,8 +10,6 @@ pub struct ProjectConfig {
     #[serde(rename = "functionRoot", default = "default_function_root")]
     pub function_root: String,
     #[serde(default)]
-    pub routing: Option<RoutingConfig>,
-    #[serde(default)]
     pub environment: Option<EnvironmentConfig>,
     #[serde(default)]
     pub services: Option<ServicesConfig>,
@@ -35,16 +33,6 @@ pub struct ProjectConfig {
 
 fn default_function_root() -> String {
     "./functions".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingConfig {
-    #[serde(rename = "caseSensitive", default)]
-    pub case_sensitive: bool,
-    #[serde(rename = "trailingSlash", default)]
-    pub trailing_slash: Option<String>,
-    #[serde(default)]
-    pub routes: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +163,28 @@ mod tests {
             "runtime": "standard-v1",
             "language": "typescript"
         })
+    }
+
+    /// A project that still carries the old `routing` block keeps building.
+    ///
+    /// The block declared `caseSensitive`, `trailingSlash` and a `routes`
+    /// map, and not one of the three was ever read: URL patterns come from
+    /// the file tree (`deis_build_adapter_deislet::plan_routes`) and matching
+    /// is the runtime's, in `deis_bundle::routing`. Keeping the fields
+    /// suggested a project could change routing by editing them, which it
+    /// could not. Dropping them from the struct is deliberately not a parse
+    /// error - an unknown key is ignored - so nobody has to edit a config to
+    /// build again.
+    #[test]
+    fn a_config_with_the_removed_routing_block_still_parses() {
+        let mut json = minimal();
+        json["routing"] = serde_json::json!({
+            "caseSensitive": true,
+            "trailingSlash": "always",
+            "routes": { "/old": "./functions/old.ts" }
+        });
+        let config = parse(json);
+        assert_eq!(config.name, "demo");
     }
 
     #[test]

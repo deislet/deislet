@@ -20,8 +20,8 @@
 
 use deis_queue::config::Config;
 use deis_queue::proto::queue::{
-    AckRequest, NackRequest, PullRequest, QueueMessage, SendBatchRequest, SendRequest,
-    queue_client::QueueClient,
+    AckRequest, ListDeadLettersRequest, MessageHandle, NackRequest, PullRequest, QueueMessage,
+    ReplayDeadLettersRequest, SendBatchRequest, SendRequest, queue_client::QueueClient,
 };
 use deis_queue::tenant::TENANT_HEADER;
 use deis_queue::{MAX_GRPC_MESSAGE_BYTES, server};
@@ -172,31 +172,54 @@ async fn pull_until_delivered(
     }
 }
 
+/// What a consumer answers with: the id it was handed and the token proving
+/// this is the delivery it is answering for.
+fn handles(messages: &[QueueMessage]) -> Vec<MessageHandle> {
+    messages
+        .iter()
+        .map(|message| MessageHandle {
+            id: message.id.clone(),
+            lease_token: message.lease_token.clone(),
+        })
+        .collect()
+}
+
+/// A handle for a message this caller was never given: the shape of a
+/// consumer that kept an id but not the lease.
+fn forged(id: &str) -> MessageHandle {
+    MessageHandle {
+        id: id.to_string(),
+        lease_token: "not-the-current-lease".to_string(),
+    }
+}
+
+/// Acknowledge, returning (acknowledged, stale_leases).
 async fn ack(
     client: &mut QueueClient<Channel>,
     tenant: &str,
     queue: &str,
-    ids: Vec<String>,
-) -> i32 {
-    client
+    messages: Vec<MessageHandle>,
+) -> (i32, i32) {
+    let response = client
         .ack(as_tenant(
             tenant,
             AckRequest {
                 queue_name: queue.to_string(),
-                message_ids: ids,
+                messages,
             },
         ))
         .await
         .expect("ack should be accepted")
-        .into_inner()
-        .acknowledged
+        .into_inner();
+    (response.acknowledged, response.stale_leases)
 }
 
+/// Return unhandled, giving back (released, dead_lettered).
 async fn nack(
     client: &mut QueueClient<Channel>,
     tenant: &str,
     queue: &str,
-    ids: Vec<String>,
+    messages: Vec<MessageHandle>,
     delay_seconds: i32,
 ) -> (i32, i32) {
     let response = client
@@ -204,7 +227,7 @@ async fn nack(
             tenant,
             NackRequest {
                 queue_name: queue.to_string(),
-                message_ids: ids,
+                messages,
                 delay_seconds,
             },
         ))
@@ -231,9 +254,13 @@ async fn send_pull_ack_and_the_message_is_gone() {
         "the lease should run 30 seconds past now"
     );
 
+    assert!(
+        !leased[0].lease_token.is_empty(),
+        "every delivery must carry the proof Ack asks for"
+    );
     assert_eq!(
-        ack(&mut client, "app-one.production", "jobs", vec![id]).await,
-        1
+        ack(&mut client, "app-one.production", "jobs", handles(&leased)).await,
+        (1, 0)
     );
 
     // Nothing is left, and the empty answer comes back immediately rather
@@ -313,7 +340,7 @@ async fn a_nack_with_a_delay_holds_the_message_back_then_returns_it() {
             &mut client,
             "app-one.production",
             "jobs",
-            vec![id.clone()],
+            handles(&leased),
             3
         )
         .await,
@@ -337,7 +364,7 @@ async fn a_nack_with_a_delay_holds_the_message_back_then_returns_it() {
 async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one.production", "jobs", "poison").await;
+    let poisoned = send(&mut client, "app-one.production", "jobs", "poison").await;
 
     for attempt in 1..=MAX_ATTEMPTS {
         let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
@@ -347,7 +374,7 @@ async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
             &mut client,
             "app-one.production",
             "jobs",
-            vec![id.clone()],
+            handles(&leased),
             0,
         )
         .await;
@@ -369,6 +396,205 @@ async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
     let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, next);
+
+    // And the message that was given up on is readable rather than only
+    // reachable by opening the database by hand.
+    let dead = client
+        .list_dead_letters(as_tenant(
+            "app-one.production",
+            ListDeadLettersRequest {
+                queue_name: "jobs".to_string(),
+                limit: 0,
+                cursor: String::new(),
+            },
+        ))
+        .await
+        .expect("listing dead letters should be accepted")
+        .into_inner();
+    assert_eq!(dead.messages.len(), 1);
+    assert_eq!(dead.messages[0].id, poisoned);
+    assert_eq!(dead.messages[0].queue_name, "jobs");
+    assert_eq!(dead.messages[0].body, b"poison");
+    assert_eq!(dead.messages[0].attempts, MAX_ATTEMPTS);
+    assert!(dead.next_cursor.is_empty(), "one page held everything");
+}
+
+/// The fence, over a real socket: a consumer whose lease lapsed must not be
+/// able to delete a message that has since been handed to somebody else. Two
+/// clients, because that is the situation - one node running long while
+/// another picks the work up.
+#[tokio::test]
+async fn a_consumer_whose_lease_lapsed_cannot_acknowledge_what_another_now_holds() {
+    let harness = Harness::start().await;
+    let mut slow = harness.client().await;
+    let mut quick = harness.client().await;
+    let id = send(&mut slow, "app-one.production", "jobs", "work").await;
+
+    // A one-second lease, then wait for the message to actually come back:
+    // the event, not a guessed pause.
+    let taken = pull(&mut slow, "app-one.production", "jobs", 10, 1).await;
+    assert_eq!(taken.len(), 1);
+    let holder = pull_until_delivered(&mut quick, "app-one.production", "jobs").await;
+    assert_eq!(holder.len(), 1);
+    assert_eq!(holder[0].id, id);
+    assert_ne!(
+        holder[0].lease_token, taken[0].lease_token,
+        "a redelivery must issue a new token"
+    );
+
+    // The slow consumer finishes and acknowledges what it was given.
+    assert_eq!(
+        ack(&mut slow, "app-one.production", "jobs", handles(&taken)).await,
+        (0, 1),
+        "a lapsed lease must not delete a message somebody else is working on"
+    );
+    // The current holder still has it and can still finish it.
+    assert_eq!(
+        ack(&mut quick, "app-one.production", "jobs", handles(&holder)).await,
+        (1, 0)
+    );
+}
+
+#[tokio::test]
+async fn a_handle_without_a_lease_token_is_refused() {
+    let harness = Harness::start().await;
+    let mut client = harness.client().await;
+    let id = send(&mut client, "app-one.production", "jobs", "work").await;
+    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+
+    let tokenless = vec![MessageHandle {
+        id: id.clone(),
+        lease_token: String::new(),
+    }];
+    let status = client
+        .ack(as_tenant(
+            "app-one.production",
+            AckRequest {
+                queue_name: "jobs".to_string(),
+                messages: tokenless,
+            },
+        ))
+        .await
+        .expect_err("an unproved claim on a message must be refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    // Nothing was acted on, so the message is still the caller's to finish.
+    assert_eq!(
+        ack(&mut client, "app-one.production", "jobs", handles(&leased)).await,
+        (1, 0)
+    );
+}
+
+/// What an operator does after fixing the cause: read the dead letters, then
+/// put the ones that should run again back on the queue.
+#[tokio::test]
+async fn a_dead_letter_can_be_replayed_back_onto_its_queue() {
+    let harness = Harness::start().await;
+    let mut client = harness.client().await;
+    let id = send(&mut client, "app-one.production", "jobs", "needs a fix").await;
+
+    for _ in 1..=MAX_ATTEMPTS {
+        let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+        nack(
+            &mut client,
+            "app-one.production",
+            "jobs",
+            handles(&leased),
+            0,
+        )
+        .await;
+    }
+
+    let replayed = client
+        .replay_dead_letters(as_tenant(
+            "app-one.production",
+            ReplayDeadLettersRequest {
+                queue_name: "jobs".to_string(),
+                message_ids: vec![id.clone()],
+                delay_seconds: 0,
+            },
+        ))
+        .await
+        .expect("replay should be accepted")
+        .into_inner();
+    assert_eq!(replayed.replayed, 1);
+    assert_eq!(replayed.not_found, 0);
+
+    // Back on the queue, with a fresh allowance rather than the spent one.
+    let back = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].id, id);
+    assert_eq!(back[0].attempts, 1);
+
+    // And out of the dead letter table.
+    let dead = client
+        .list_dead_letters(as_tenant(
+            "app-one.production",
+            ListDeadLettersRequest {
+                queue_name: String::new(),
+                limit: 0,
+                cursor: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(dead.messages.is_empty());
+}
+
+/// One tenant's dead letters are not another's, and a replay cannot reach
+/// across either.
+#[tokio::test]
+async fn dead_letters_belong_to_one_tenant() {
+    let harness = Harness::start().await;
+    let mut client = harness.client().await;
+    let id = send(&mut client, "app-one.production", "jobs", "poison").await;
+    for _ in 1..=MAX_ATTEMPTS {
+        let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
+        nack(
+            &mut client,
+            "app-one.production",
+            "jobs",
+            handles(&leased),
+            0,
+        )
+        .await;
+    }
+
+    let theirs = client
+        .list_dead_letters(as_tenant(
+            "app-two.production",
+            ListDeadLettersRequest {
+                queue_name: String::new(),
+                limit: 0,
+                cursor: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        theirs.messages.is_empty(),
+        "another tenant's dead letters must not be readable here"
+    );
+
+    let replayed = client
+        .replay_dead_letters(as_tenant(
+            "app-two.production",
+            ReplayDeadLettersRequest {
+                queue_name: "jobs".to_string(),
+                message_ids: vec![id],
+                delay_seconds: 0,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (replayed.replayed, replayed.not_found),
+        (0, 1),
+        "one tenant must not be able to requeue another's dead letter"
+    );
 }
 
 #[tokio::test]
@@ -383,17 +609,17 @@ async fn one_tenant_cannot_see_or_touch_another_tenants_messages() {
             .await
             .is_empty()
     );
-    // Nor can the other tenant acknowledge or return it.
+    // Nor can the other tenant acknowledge or return it, even holding its id.
     assert_eq!(
-        ack(&mut client, "app-two.production", "jobs", vec![id.clone()]).await,
-        0
+        ack(&mut client, "app-two.production", "jobs", vec![forged(&id)]).await,
+        (0, 0)
     );
     assert_eq!(
         nack(
             &mut client,
             "app-two.production",
             "jobs",
-            vec![id.clone()],
+            vec![forged(&id)],
             0
         )
         .await,
@@ -489,26 +715,38 @@ async fn two_environments_of_one_application_share_no_queue() {
     let live = send(&mut client, &production, "jobs", "live-work").await;
     let draft = send(&mut client, &preview, "jobs", "draft-work").await;
 
-    let leased = pull(&mut client, &production, "jobs", 10, 30).await;
-    assert_eq!(leased.len(), 1, "production must see only its own message");
-    assert_eq!(leased[0].id, live);
-    assert_eq!(leased[0].body, "live-work");
-
-    let leased = pull(&mut client, &preview, "jobs", 10, 30).await;
-    assert_eq!(leased.len(), 1, "the preview must see only its own message");
-    assert_eq!(leased[0].id, draft);
-    assert_eq!(leased[0].body, "draft-work");
-
-    // Nor can one acknowledge the other's message, even holding its id.
+    let live_lease = pull(&mut client, &production, "jobs", 10, 30).await;
     assert_eq!(
-        ack(&mut client, &preview, "jobs", vec![live.clone()]).await,
-        0
+        live_lease.len(),
+        1,
+        "production must see only its own message"
     );
+    assert_eq!(live_lease[0].id, live);
+    assert_eq!(live_lease[0].body, "live-work");
+
+    let draft_lease = pull(&mut client, &preview, "jobs", 10, 30).await;
     assert_eq!(
-        nack(&mut client, &production, "jobs", vec![draft], 0).await,
+        draft_lease.len(),
+        1,
+        "the preview must see only its own message"
+    );
+    assert_eq!(draft_lease[0].id, draft);
+    assert_eq!(draft_lease[0].body, "draft-work");
+
+    // Nor can one acknowledge the other's message, even holding its id and
+    // the lease token it was handed.
+    assert_eq!(
+        ack(&mut client, &preview, "jobs", handles(&live_lease)).await,
         (0, 0)
     );
-    assert_eq!(ack(&mut client, &production, "jobs", vec![live]).await, 1);
+    assert_eq!(
+        nack(&mut client, &production, "jobs", handles(&draft_lease), 0).await,
+        (0, 0)
+    );
+    assert_eq!(
+        ack(&mut client, &production, "jobs", handles(&live_lease)).await,
+        (1, 0)
+    );
 }
 
 #[tokio::test]

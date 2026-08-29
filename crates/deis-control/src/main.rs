@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use structopt::StructOpt;
 use tonic::service::Routes;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(StructOpt, Debug)]
@@ -77,7 +77,16 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let api_config = Arc::new(config.clone());
 
-    let server = deis_control::ControlServer::new(config).with_database(Arc::clone(&database));
+    // One stop signal for the whole process, taken before anything is
+    // started so every part gets the same edge: the listener stops
+    // accepting, the node control channels are closed instead of being left
+    // open until the grace period runs out, the cron scheduler stops firing
+    // and the node health poller stops probing.
+    let shutdown = deis_control::shutdown::on_signal();
+
+    let server = deis_control::ControlServer::new(config)
+        .with_database(Arc::clone(&database))
+        .with_shutdown(shutdown.clone());
 
     let sessions = server.sessions();
     let broadcaster = server.broadcaster();
@@ -97,11 +106,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let metrics_collector = Arc::new(deis_control::MetricsCollector::new(Arc::clone(&sessions)));
 
-    let deis_runtime_manager = Arc::new(deis_control::RuntimeNodeManager::new(
+    // The configured list is the seed, not the whole fleet: nodes register
+    // themselves at `PUT /api/nodes/{id}/registration` and are added as they
+    // call in, which is what lets a machine join without this file being
+    // edited. A registration expires after this lifetime without a refresh.
+    let deis_runtime_manager = Arc::new(deis_control::RuntimeNodeManager::new_with_ttl(
         api_config.deis_runtime_nodes.clone(),
         api_config.deis_runtime_poll_interval,
+        api_config.node_registration_ttl_secs,
     ));
-    let runtime_poll_task = tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop());
+    let runtime_poll_task =
+        tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop(shutdown.clone()));
 
     // Cron tasks are derived from the catalog - the manifest of whatever
     // version each environment currently runs - and fired directly at one
@@ -111,7 +126,41 @@ async fn main() -> Result<(), anyhow::Error> {
         Arc::clone(&deis_runtime_manager),
         api_config.cron_tick_seconds,
     ));
-    let scheduler_task = Arc::clone(&scheduler).start().await;
+    let scheduler_task = Arc::clone(&scheduler).start(shutdown.clone()).await;
+
+    // Both loops stop on the signal by themselves; this waits for them to
+    // actually be out of a tick. Aborting instead would cut the cron
+    // scheduler between sending a trigger and recording that it ran, so the
+    // occurrence would have run on a node with nothing here remembering it
+    // and the next instance could fire it again. The wait is bounded, since
+    // a node that never answers must not hold this process open past what a
+    // supervisor allows before it sends SIGKILL.
+    let background = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown.wait().await;
+            let mut scheduler_task = scheduler_task;
+            let mut runtime_poll_task = runtime_poll_task;
+            let stopped = async {
+                let _ = tokio::join!(&mut scheduler_task, &mut runtime_poll_task);
+            };
+            if tokio::time::timeout(deis_control::shutdown::DRAIN_GRACE, stopped)
+                .await
+                .is_err()
+            {
+                scheduler_task.abort();
+                runtime_poll_task.abort();
+                warn!(
+                    grace_secs = deis_control::shutdown::DRAIN_GRACE.as_secs(),
+                    "A background loop was still inside a call to a node when the grace period ran out and was cut; if that was a cron trigger, the occurrence may have run on the node without this process recording it, so the next instance can fire the same occurrence again"
+                );
+            } else {
+                info!(
+                    "Cron scheduler and runtime node poller stopped cleanly; no scheduled trigger and no node health probe runs from this instance any more"
+                );
+            }
+        }
+    });
 
     let api = deis_control::api::build_api_router(
         sessions,
@@ -160,16 +209,29 @@ async fn main() -> Result<(), anyhow::Error> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     // The REST API and the node gRPC channel share this listener, so this
     // one call serves both and later drains both.
-    let served =
-        deis_control::api::serve(listener, app, tls, deis_control::shutdown::signal()).await;
+    let served = deis_control::api::serve(listener, app, tls, {
+        let shutdown = shutdown.clone();
+        async move { shutdown.wait().await }
+    })
+    .await;
 
-    // The servers are done; the background loops would otherwise keep
-    // ticking against a process that is on its way out.
-    scheduler_task.abort();
-    runtime_poll_task.abort();
-    info!(
-        "Cron scheduler and runtime node poller stopped; no scheduled trigger or node health probe runs from this instance any more"
-    );
+    // Serving is over, whether that was the stop signal or the server failing
+    // on its own. Announcing it here is what covers the second case: the
+    // background loops wait on this signal, so without it a failed listener
+    // would leave them ticking and this process hanging on the line below
+    // instead of exiting with the error. Idempotent when the signal already
+    // fired.
+    shutdown.trigger();
+
+    // The background loops were told to stop by the same signal and have had
+    // the whole drain to do it; this is where the process learns whether they
+    // managed it.
+    if let Err(e) = background.await {
+        warn!(
+            error = %e,
+            "The task supervising the background loops did not finish; whether the cron scheduler recorded its last trigger is unknown"
+        );
+    }
 
     served?;
     info!("Control stopped");

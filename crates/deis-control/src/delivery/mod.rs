@@ -694,7 +694,7 @@ impl DeploymentDeliverer {
                 unloaded = report.unloaded.len(),
                 nodes = ?report.failed.iter().map(|f| f.node.as_str()).collect::<Vec<_>>(),
                 errors = ?report.failed.iter().map(|f| f.error.as_str()).collect::<Vec<_>>(),
-                "These runtime nodes were not told to drop the deleted application and are still serving it, with its secrets still in memory; they will keep doing so until they are restarted, because a node only ever adds applications from its assignment list"
+                "These runtime nodes were not told to drop the deleted application and are still serving it, with its secrets still in memory; each one stops on its own the next time it reconciles against its assignment list, which no longer names the application, so the exposure lasts until that node's next reconcile - and until a restart for a node that does not reconcile at all"
             );
         }
 

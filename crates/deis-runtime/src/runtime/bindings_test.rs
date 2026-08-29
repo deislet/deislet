@@ -410,6 +410,91 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_cannot_leave_a_stale_service_list_behind() {
+        // The previous version of this app declared kv and consumed a queue.
+        // The new one declares neither. Writing without clearing first would
+        // leave both keys standing: the isolate would be handed a KV client
+        // for a service this bundle never asked for, and a poller would keep
+        // leasing messages that nothing in the new code handles.
+        let mut map = env(&[
+            ("DEIS_SERVICES", "kv,queue"),
+            ("DEIS_QUEUE_CONSUMERS", "jobs:3"),
+            ("DEIS_STORE_ENDPOINT", "http://store:8090"),
+            ("LOG_LEVEL", "info"),
+        ]);
+
+        wire_deployment_env(
+            &manifest(
+                r#"{
+                    "schema": 1,
+                    "app": "demo",
+                    "entry": "worker/index.js"
+                }"#,
+            ),
+            &mut map,
+        );
+
+        assert_eq!(map.get("DEIS_SERVICES"), None);
+        assert_eq!(map.get("DEIS_QUEUE_CONSUMERS"), None);
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+        assert!(wiring.declaration.is_empty());
+        assert!(wiring.consumers.is_empty());
+        // The address survives: it is the control plane's half of the
+        // wiring, and clearing it would unbind an app that still declares
+        // storage in a later deployment.
+        assert_eq!(wiring.endpoints.store.as_deref(), Some("http://store:8090"));
+        assert_eq!(map, env(&[("LOG_LEVEL", "info")]));
+    }
+
+    #[test]
+    fn a_bundle_cannot_choose_where_its_storage_client_connects() {
+        // The failure this guards: a manifest that declares
+        // DEIS_STORE_ENDPOINT itself, on a node whose delivery carried no
+        // address to overwrite it with. Nothing else in the chain would
+        // notice - the app loads, its calls succeed - and every read and
+        // write goes to a host the bundle picked.
+        let mut map = env(&[
+            ("DEIS_STORE_ENDPOINT", "http://attacker.example:8090"),
+            ("DEIS_QUEUE_ENDPOINT", "http://attacker.example:8091"),
+            ("LOG_LEVEL", "info"),
+        ]);
+        let dropped = strip_reserved_env(&mut map);
+
+        assert!(dropped.contains(&"DEIS_STORE_ENDPOINT"));
+        assert!(dropped.contains(&"DEIS_QUEUE_ENDPOINT"));
+
+        wire_deployment_env(
+            &manifest(
+                r#"{
+                    "schema": 1,
+                    "app": "demo",
+                    "entry": "worker/index.js",
+                    "services": { "kv": true }
+                }"#,
+            ),
+            &mut map,
+        );
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+        assert!(wiring.declaration.declares(ServiceKind::Kv));
+        assert_eq!(
+            wiring.endpoints.store, None,
+            "the bundle's own address must not become the store this app talks to"
+        );
+        assert_eq!(map, env(&[("LOG_LEVEL", "info")]));
+    }
+
+    #[test]
+    fn stripping_reserved_keys_leaves_the_applications_own_variables() {
+        let mut map = env(&[("DEIS_SERVICES", "kv"), ("DEIS_LOG_LEVEL", "debug")]);
+        let dropped = strip_reserved_env(&mut map);
+        assert_eq!(dropped, vec!["DEIS_SERVICES"]);
+        // A variable that merely starts with DEIS_ is the application's own.
+        assert_eq!(map, env(&[("DEIS_LOG_LEVEL", "debug")]));
+    }
+
+    #[test]
     fn every_reserved_key_is_one_the_reader_actually_removes() {
         // A key listed as reserved but not removed would reach the app as a
         // variable, which is exactly what the list exists to prevent.

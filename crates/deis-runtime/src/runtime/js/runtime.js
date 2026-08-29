@@ -386,17 +386,47 @@ class NativeKV {
   async get(key) {
     return await DenoCore.ops.op_kv_get(key);
   }
+  // getWithMetadata(key) -> { value, metadata, expiration } | null
+  //
+  // null means the key does not exist or has already lapsed. A key that was
+  // written without metadata comes back as a record whose metadata is null:
+  // "no such key" and "no metadata on this key" are different answers.
+  //
+  // metadata is JSON-decoded, which is the exact inverse of what put() stores,
+  // so an object goes in and the same object comes out. A value that does not
+  // parse is handed back as the raw string rather than throwing: metadata
+  // written before put() encoded strings as JSON is stored unquoted, and
+  // losing an app's own data to a parse error would be worse than handing it
+  // back as it was found.
+  //
+  // expiration is the absolute unix second the entry lapses at, or null when
+  // it never does.
+  async getWithMetadata(key) {
+    const read = await DenoCore.ops.op_kv_get_with_metadata(key);
+    if (!read) return null;
+    let metadata = null;
+    if (read.metadata !== undefined && read.metadata !== null) {
+      try {
+        metadata = JSON.parse(read.metadata);
+      } catch {
+        metadata = read.metadata;
+      }
+    }
+    return {
+      value: read.value,
+      metadata: metadata,
+      expiration: read.expiration === undefined ? null : read.expiration
+    };
+  }
   // put(key, value, { expirationTtl, metadata })
   //
   // expirationTtl is a lifetime in whole seconds, counted from the moment
   // deis-store accepts the write; leave it out and the entry never lapses.
-  // metadata is stored alongside the value and returned untouched.
   //
-  // NOTE: metadata can be written but not read back. deis-store's GetResponse
-  // carries only the value and ListResponse only the keys, so there is no
-  // getWithMetadata here - offering one that always answered null would be
-  // worse than not having it. Reading it back needs a field on those two
-  // messages, which is deis-store's to add.
+  // metadata is stored alongside the value and returned untouched by
+  // deis-store; getWithMetadata() reads it back. It is JSON-encoded here,
+  // strings included, so that decoding it there is a plain JSON.parse and an
+  // object, a number and a string all round-trip as themselves.
   async put(key, value, options) {
     const opts = options || {};
     let ttl = null;
@@ -412,9 +442,7 @@ class NativeKV {
 
     let metadata = null;
     if (opts.metadata !== undefined && opts.metadata !== null) {
-      metadata = typeof opts.metadata === "string"
-        ? opts.metadata
-        : JSON.stringify(opts.metadata);
+      metadata = JSON.stringify(opts.metadata);
     }
 
     await DenoCore.ops.op_kv_set(key, value, { ttlSeconds: ttl, metadata: metadata });

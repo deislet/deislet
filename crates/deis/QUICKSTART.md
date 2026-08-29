@@ -1,403 +1,263 @@
-# Deis 快速开始指南
+# Quick start
 
-本指南将帮助您在 5 分钟内创建并部署您的第一个 Edge Function。
+From nothing to an application serving traffic on your own platform, and
+back again when it goes wrong.
 
-## 前置要求
+## What you need
 
-- Rust 1.70+ ([安装 Rust](https://rustup.rs/))
-- Node.js 18+ (用于项目依赖管理)
+- Rust 1.85+ (edition 2024)
+- Node.js 18+ — the compiler shells out to it for bundling
 
-## 1. 安装 Deis
+Build the two binaries this guide uses:
 
 ```bash
-# 克隆项目
-git clone https://github.com/deislet/deis.git
-cd deis
-
-# 构建并安装
-cargo build --release
+cargo build -p deis -p deis-runtime
 cargo install --path crates/deis
-
-# 验证安装
-deis --version
 ```
 
-## 2. 创建新项目
+`deis dev` starts a real `deis-runtime`, so that binary has to exist. It is
+looked for next to `deis`, on `PATH`, in `$DEIS_RUNTIME_BIN`, or wherever
+`--runtime` says.
+
+## 1. Create a project
 
 ```bash
-# 初始化项目
-deis init my-first-app
-cd my-first-app
-
-# 查看项目结构
-tree
+deis init my-app
+cd my-app
 ```
 
-您将看到:
 ```
-my-first-app/
-├── functions/          # 边缘函数代码
-│   ├── index.ts       # 默认路由 (/)
-│   └── api/
-│       └── hello.ts   # API 端点 (/api/hello)
-├── .config.json       # 项目配置
-├── .env               # 环境变量
-├── package.json
-├── tsconfig.json
-└── README.md
+my-app/
+├── .config.json        # what to build, which services, which vendors
+├── functions/          # one file per route
+│   ├── index.ts        #   → /
+│   └── api/hello.ts    #   → /api/hello
+└── public/             # static assets, served before any isolate starts
 ```
 
-## 3. 查看示例代码
+A handler is a function of one `Context`:
 
-### functions/index.ts - 默认路由
 ```typescript
+// functions/users/[id].ts  →  /users/:id
 export default async function handler(context: Context): Promise<Response> {
-  return new Response('Hello from Edge Function!', {
-    headers: { 'Content-Type': 'text/plain' }
+  const id = context.params.id;
+  const stored = await context.services.kv.get(`user:${id}`);
+  if (!stored) return new Response("Not found", { status: 404 });
+  return new Response(stored, {
+    headers: { "content-type": "application/json; charset=utf-8" },
   });
 }
 ```
 
-### functions/api/hello.ts - API 端点
-```typescript
-export default async function handler(context: Context): Promise<Response> {
-  const { query } = context;
-  const name = query.name || 'World';
+Two file names under `functions/` are not routes but handlers the platform
+calls itself: `_scheduled.ts` (cron) and `_queue.ts` (queue messages).
 
-  const response = {
-    message: `Hello, ${name}!`,
-    timestamp: new Date().toISOString(),
-    path: context.path
-  };
-
-  return new Response(JSON.stringify(response, null, 2), {
-    headers: { 'Content-Type': 'application/json' }
-  });
-}
-```
-
-## 4. 验证项目
+## 2. Run it locally
 
 ```bash
-# 验证代码是否符合规范
-deis validate
-
-# 输出:
-# ✓ Validation passed
-# ✓ Project structure valid
-# ✓ .config.json valid
-# ✓ All handlers valid
-```
-
-## 5. 构建项目
-
-```bash
-# 构建所有平台
-deis build
-
-# 或只构建特定平台
-deis build --vendor cloudflare
-```
-
-您将在 `dist/` 目录看到构建产物:
-```
-dist/
-├── cloudflare/
-│   ├── index.ts           # 路由器入口
-│   ├── wrangler.toml      # Cloudflare 配置
-│   ├── src/               # 转换后的 handlers
-│   └── adapters/          # 平台适配器
-├── deno/
-│   └── ...
-└── tencent/
-    └── ...
-```
-
-## 6. 查看生成的代码
-
-### dist/cloudflare/index.ts - 自动生成的路由器
-```typescript
-import handler0 from './src/index';
-import handler1 from './src/api/hello';
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (matchRoute(url.pathname, '/')) {
-      return handler0.fetch(request, env, ctx);
-    }
-    if (matchRoute(url.pathname, '/api/hello')) {
-      return handler1.fetch(request, env, ctx);
-    }
-
-    return new Response('Not Found', { status: 404 });
-  }
-};
-```
-
-### dist/cloudflare/src/index.ts - 转换后的 handler
-```typescript
-import { createContextBuilder } from '../adapters/context-builder';
-
-// 原始 handler 代码保持不变
-export default async function handler(context: Context): Promise<Response> {
-  return new Response('Hello from Edge Function!', {
-    headers: { 'Content-Type': 'text/plain' }
-  });
-}
-
-// Cloudflare Workers 包装
-export default {
-  async fetch(request, env, ctx) {
-    const buildContext = createContextBuilder(env, ctx);
-    const context = buildContext(request, '/');
-    return await handler(context);
-  }
-};
-```
-
-## 7. 部署到 Cloudflare Workers
-
-```bash
-# 配置 Cloudflare 凭证
-deis config set cloudflare.api-token YOUR_API_TOKEN
-
-# 部署到 staging 环境
-deis deploy --vendor cloudflare --env staging
-
-# 部署到 production 环境
-deis deploy --vendor cloudflare --env production
-```
-
-或者手动使用 wrangler:
-```bash
-cd dist/cloudflare
-npx wrangler deploy
-```
-
-## 8. 添加 KV Store 功能
-
-### 修改 .config.json
-```json
-{
-  "services": {
-    "kv": { "enabled": true },
-    "database": { "enabled": false }
-  }
-}
-```
-
-### 创建 functions/api/count.ts
-```typescript
-export default async function handler(context: Context): Promise<Response> {
-  const { kv } = context.services;
-
-  // 获取当前计数
-  const count = await kv.getJSON<number>('visit_count') || 0;
-
-  // 增加计数
-  const newCount = count + 1;
-  await kv.putJSON('visit_count', newCount);
-
-  return new Response(JSON.stringify({
-    count: newCount,
-    message: 'Visit count updated'
-  }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
-}
-```
-
-### 重新构建
-```bash
-deis build --vendor cloudflare
-```
-
-## 9. 添加动态路由
-
-### 创建 functions/api/users/[id].ts
-```typescript
-export default async function handler(context: Context): Promise<Response> {
-  const { params } = context;
-  const userId = params.id;
-
-  // 模拟从数据库获取用户
-  const user = {
-    id: userId,
-    name: `User ${userId}`,
-    email: `user${userId}@example.com`
-  };
-
-  return new Response(JSON.stringify(user), {
-    headers: { 'Content-Type': 'application/json' }
-  });
-}
-```
-
-这将自动映射到路由: `/api/users/:id`
-
-访问: `https://your-worker.workers.dev/api/users/123`
-
-## 10. 本地开发 (即将推出)
-
-```bash
-# 启动本地开发服务器
 deis dev
-
-# 服务器将在 http://localhost:8000 启动
-# 支持热重载和 Mock 服务
 ```
 
-## 常见任务
+This builds the bundle and hands it to a real `deis-runtime` — the same
+binary that serves production, loaded through the same call the control plane
+makes. Routing, the asset index, `context.params` and `context.env` are the
+production ones.
 
-### 验证代码规范
-```bash
-deis validate --strict
+```
+Serving
+  →  http://127.0.0.1:8000
+  application  my-app environment development
+  loaded       3 route(s), 2 asset(s), sha256 84d8408fe6c2
+  node         http://127.0.0.1:41539 (real deis-runtime)
 ```
 
-### 构建特定平台
+Editing a file rebuilds and reloads. A build that fails is reported and the
+previous one keeps serving.
+
+The banner also says what is *not* there. Storage is a separate process, so
+until you point at one, `ctx.services.*` fails the same way it would on a
+misconfigured node:
+
 ```bash
-deis build --vendor cloudflare
-deis build --vendor deno
+cargo build -p deis-store -p deis-queue
+deis-store  --config deis-store.toml  &     # listens on 8090
+deis-queue  --config deis-queue.toml  &     # listens on 8091
+
+deis dev --store http://127.0.0.1:8090 --queue http://127.0.0.1:8091 \
+         -s API_KEY=local-value
+```
+
+`-s/--secret NAME=VALUE` stands in for a value the control plane would have
+decrypted and delivered. Nothing triggers cron locally; call the handler
+directly to test it.
+
+## 3. Point at a platform
+
+You need a running `deis-control`, and a `deis-telemetry` for logs.
+`scripts/demo.sh start` in the repository root brings up a whole one — six
+processes with an example application already deployed — if you just want
+something to aim at.
+
+```bash
+deis config set control.endpoint   http://127.0.0.1:8085
+deis config set telemetry.endpoint http://127.0.0.1:8092
+deis config set control.token      <token>     # only if the API is guarded
+```
+
+The first two go into `deis.toml` next to your project. **Commit that file.**
+The token does not go in it — `deis config set control.token` writes it to
+`~/.config/deis/credentials.toml` with `0600` permissions, keyed by the
+control plane it belongs to. `deis` refuses to use a token it finds in
+`deis.toml` at all, and tells you to rotate it.
+
+```bash
+deis config list
+```
+
+shows every setting, where it came from and which environment variable
+overrides it — never the token itself.
+
+## 4. Deploy
+
+```bash
+deis deploy
+```
+
+```
+Deploying my-app to production
+  control plane  http://127.0.0.1:8085
+  ✓ built dist/deislet/bundle.zip (2.7 KB, sha256 a9a8013decdf)
+  ✓ created application my-app
+  ✓ created environment production
+  ✓ uploaded 2.7 KB as version 1
+
+  ✓ production now runs version 1 (sha256 a9a8013decdf)
+      ✓ node-01
+      ✓ node-02
+```
+
+One command: build, create the application and environment if they do not
+exist, upload the bundle as an immutable version, point the environment at
+it, and push it to the fleet.
+
+A node that did not take the version is printed as `✗` and the command exits
+non-zero. That node is still serving what it had, and it is the whole reason
+this is worth reading rather than skipping.
+
+```bash
+curl http://127.0.0.1:8087/users/42        # through deis-proxy
+```
+
+## 5. A second environment
+
+An environment has its own version pointer, its own secrets and its own
+storage tenant, so a preview cannot overwrite production's data.
+
+```bash
+deis deploy -e preview
+deis status
+```
+
+```
+Environments
+ENVIRONMENT  VERSION  DIGEST        DEPLOYED             AGE     NOTE
+preview      2        84d8408fe6c2  2026-08-29 15:31:39  0s ago  -
+production   1        a9a8013decdf  2026-08-29 15:30:38  1m ago  -
+
+Nodes
+NODE     ADDRESS                HEALTH   ENVIRONMENT  STATE    REQUESTS  ERRORS
+node-01  http://10.0.0.1:8086   healthy  production   running  1204      0
+node-01  http://10.0.0.1:8086   healthy  preview      running  17        0
+```
+
+Environment names may not contain a dot: the storage tenant is
+`<app>.<environment>`, so `pr-42.1` would split into three parts and every
+`kv`, `database`, `blob` and `queue` call of that application would fail —
+while the application itself loaded and served traffic. Write `pr-42-1`.
+`deis` refuses the name up front rather than letting you find that out later.
+
+## 6. Secrets
+
+```bash
+printf %s "$STRIPE_KEY" | deis secret set STRIPE_KEY
+deis secret list
+```
+
+The value is read from stdin when it is not given as an argument, which keeps
+it out of the shell history. It arrives in the handler as
+`context.env.STRIPE_KEY`.
+
+`list` shows names and times. Nothing prints a value — the control plane has
+no endpoint that returns one. A secret creates no version, so the running one
+is delivered again with the new value, and the output says which nodes took
+that.
+
+## 7. When it goes wrong
+
+```bash
+deis logs --since 15m -l error
+deis tail -e preview
+```
+
+```bash
+deis versions
+```
+
+```
+VERSION  DIGEST        CREATED              AGE     ENVIRONMENTS
+3        84d8408fe6c2  2026-08-29 15:31:39  2m ago  preview, production
+2        a9a8013decdf  2026-08-29 15:30:38  3m ago  -
+1        ec8f5586843b  2026-08-29 15:30:24  3m ago  -
+```
+
+```bash
+deis rollback              # back to the previous version this environment ran
+deis rollback --to 1       # or to a number
+```
+
+```
+  ✓ production moved from version 3 to version 2 (sha256 a9a8013decdf)
+      ✓ node-01
+      ✓ node-02
+```
+
+A rollback is a pointer move, so it takes about as long as the push. Nothing
+is deleted, so the rollback is itself reversible — and the static assets go
+back with the code, because they travel inside the version.
+
+## 8. Somebody else's platform
+
+The same source compiles for the vendors:
+
+```bash
+deis build --vendor cloudflare      # then: wrangler deploy
+deis build --vendor deno            # then: deployctl deploy
 deis build --vendor tencent
 ```
 
-### 查看部署历史
+`deis deploy` does not push to any of them, on purpose: each owns its own
+credentials and deployment model, and their tools already do it properly.
+
+## Scripting
+
+Every command that answers with data takes `--json`, and prints one document
+on stdout and nothing else:
+
 ```bash
-deis deployments list
+deis versions --json | jq '.versions[0].number'
+deis status --json   | jq '.nodes[] | select(.reachable | not) | .id'
+deis deploy --json   | jq -e '.delivery.failed | length == 0'
 ```
 
-### 回滚部署
+`deis tail --json` prints one object per line instead, because a stream has
+no end:
+
 ```bash
-deis rollback --deployment <deployment-id>
+deis tail --json | jq -r 'select(.level == "ERROR") | .message'
 ```
 
-## 最佳实践
+## Where to look next
 
-### 1. 保持代码平台无关
-
-✅ **正确**:
-```typescript
-const apiKey = context.env.API_KEY;
-const kv = context.services.kv;
-```
-
-❌ **错误**:
-```typescript
-if (typeof Deno !== 'undefined') { }
-const kv = env.MY_KV;  // 直接访问平台 binding
-```
-
-### 2. 使用统一的服务接口
-
-```typescript
-// KV Store
-await context.services.kv.put('key', 'value');
-const value = await context.services.kv.get('key');
-
-// Database
-const result = await context.services.database.query(
-  'SELECT * FROM users WHERE id = ?',
-  [userId]
-);
-```
-
-### 3. 结构化日志
-
-```typescript
-context.log.info('Processing request', { userId, action: 'login' });
-context.log.error('Failed to process', { error: error.message });
-```
-
-### 4. 使用环境变量
-
-```typescript
-const apiEndpoint = context.env.API_ENDPOINT;
-const logLevel = context.env.LOG_LEVEL;
-```
-
-## 项目配置详解
-
-### .config.json
-```json
-{
-  "version": "1.0",
-  "name": "my-app",
-  "runtime": "standard-v1",
-  "language": "typescript",
-  "functionRoot": "./functions",
-
-  "environment": {
-    "variables": {
-      "LOG_LEVEL": "info",
-      "API_BASE": "https://api.example.com"
-    },
-    "secrets": ["API_KEY", "DB_PASSWORD"]
-  },
-
-  "services": {
-    "kv": { "enabled": true },
-    "database": { "enabled": false }
-  },
-
-  "vendors": {
-    "cloudflare": { "enabled": true },
-    "deno": { "enabled": true },
-    "tencent": { "enabled": false }
-  },
-
-  "build": {
-    "outDir": "./dist",
-    "minify": true,
-    "sourcemap": true
-  }
-}
-```
-
-## 故障排除
-
-### 验证失败
-```bash
-# 查看详细错误
-deis validate --strict
-
-# 常见错误:
-# - 平台类型检测: typeof Deno
-# - 直接访问 context.raw
-# - 使用平台特定 API
-```
-
-### 构建失败
-```bash
-# 检查 TypeScript 语法
-npx tsc --noEmit
-
-# 查看详细构建日志
-deis build --vendor all
-```
-
-### 部署失败
-```bash
-# 验证配置
-deis config get cloudflare.api-token
-
-# 手动部署
-cd dist/cloudflare
-npx wrangler deploy
-```
-
-## 下一步
-
-- 阅读 [完整文档](./README.md)
-- 查看 [示例项目](./examples/)
-- 浏览 [API 参考](./docs/api.md)
-- 加入 [社区讨论](https://github.com/deislet/deis/discussions)
-
-## 获取帮助
-
-- [GitHub Issues](https://github.com/deislet/deis/issues)
-- [讨论区](https://github.com/deislet/deis/discussions)
-- [规范文档](https://github.com/deislet/spec)
-
-祝您使用愉快! 🚀
+- [`README.md`](README.md) — every command and flag
+- [`docs/architecture.zh.md`](../../docs/architecture.zh.md) — why the system is split this way
+- [`DEMO.md`](../../DEMO.md) — the end-to-end demonstration and what it verifies

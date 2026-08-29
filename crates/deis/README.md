@@ -1,228 +1,221 @@
-# Deis - Universal Edge Function CLI & Compiler
+# deis — the Deislet developer CLI
 
-> 一次编写,随处部署 | Write Once, Deploy Anywhere
+`deis` is the command a person uses. It has two halves, and keeping them
+apart is the point:
 
-Deis 是一个用于 Edge Function 开发和部署的统一工具链,支持多个 serverless 平台。
+- **The project on disk.** `deis init`, `deis dev`, `deis validate` and
+  `deis build` need no platform at all. `deis build --vendor cloudflare|deno|tencent`
+  produces what that vendor's own tooling deploys; this CLI never pushes to
+  them.
+- **A Deislet platform.** `deis deploy`, `deis versions`, `deis rollback`,
+  `deis status`, `deis secret`, `deis logs` and `deis tail` talk to a
+  `deis-control` and, for logs, a `deis-telemetry`.
 
-## 特性
+`deis deploy` targets **this** platform only. There is deliberately no
+`--vendor` on it: it could never have pushed to Cloudflare or Deno, and a
+flag suggesting otherwise is worse than no flag.
 
-- **统一规范**: 基于 [deislet/spec](https://github.com/deislet/spec) 的标准化 Edge Function 接口
-- **多平台支持**: 一键部署到 Cloudflare Workers、Deno Deploy、Tencent EdgeOne 等平台
-- **平台无关**: 禁止平台特定代码,编译器自动适配各平台实现
-- **完整工具链**: 提供 init、dev、build、validate、deploy 等完整命令
-- **类型安全**: 完整的 TypeScript 类型定义
-- **高性能**: Rust 实现,快速的编译和验证
+Compilation, validation and vendor code generation all live in `deis-build`;
+this crate is its command-line shell plus everything above.
 
-## 架构
-
-```
-deis/
-└── crates/
-    └── deis/           # CLI 可执行文件 (init / dev / validate / build / deploy / config)
-```
-
-解析、验证、编译和平台适配器代码生成全部由同一 workspace 的 `deis-build` 提供，deis 只是它的命令行外壳，另加本地开发服务器（Mock KV + 热重载）。
-
-## 技术思路
-
-### 1. 规范层
-定义一套"通用 Serverless Function 项目规范":
-- 统一的项目结构 (`functions/` 目录)
-- 标准化的 handler 格式 (Context 接口)
-- API 输入输出约定
-- 环境变量和服务规范
-
-### 2. 适配层
-针对每个 vendor 实现适配器:
-- **核心 handler 适配**: 将通用 Context 映射到平台特定实现
-- **服务适配**: KV Store、Database、Cache 等服务的统一接口
-- **配置生成**: 自动生成平台配置文件 (wrangler.toml, deno.json 等)
-
-### 3. CLI 工具层
-- 项目管理: `init`、`install`
-- 本地开发: `dev` (开发服务器 + 热重载)
-- 代码验证: `validate` (检查规范违规)
-- 构建打包: `build` (生成各平台产物)
-- 部署发布: `deploy` (一键部署到多平台)
-
-## 快速开始
-
-### 安装
+## Install
 
 ```bash
-# 克隆项目
-git clone https://github.com/deislet/deis.git
-cd deis
-
-# 构建 (需要 Rust 1.70+)
-cargo build --release
-
-# 安装到系统
+cargo build -p deis -p deis-runtime      # deis dev starts the second one
 cargo install --path crates/deis
 ```
 
-### 使用
+`deis dev` needs the `deis-runtime` binary. It is looked for, in order: the
+`--runtime` flag, `$DEIS_RUNTIME_BIN`, next to the `deis` binary itself, then
+`PATH`.
+
+## Configuration
+
+Three places, in this order of precedence:
+
+1. a flag on the command (`--app`, `-e/--environment`);
+2. an environment variable;
+3. the project file `deis.toml`, which belongs in the repository.
+
+```toml
+# deis.toml — commit this. It holds addresses, never a credential.
+[control]
+endpoint = "http://127.0.0.1:8085"
+
+[telemetry]
+endpoint = "http://127.0.0.1:8092"
+
+[defaults]
+app = "shop"           # falls back to "name" in .config.json
+environment = "production"
+```
+
+| Setting | Variable |
+|---|---|
+| `control.endpoint` | `DEIS_CONTROL_ENDPOINT` |
+| `control.token` | `DEIS_CONTROL_TOKEN` |
+| `telemetry.endpoint` | `DEIS_TELEMETRY_ENDPOINT` |
+| `defaults.app` | `DEIS_APP` |
+| `defaults.environment` | `DEIS_ENVIRONMENT` |
+
+### The credential never goes in the project
+
+A token committed once is a token that has to be rotated, so `deis` will not
+write one into a file inside the project — and refuses to *use* one it finds
+in `deis.toml`, telling you to rotate it instead.
 
 ```bash
-# 初始化新项目
-deis init my-edge-app
-cd my-edge-app
+deis config set control.token <value>
+```
 
-# 安装依赖
-npm install
+writes it to `~/.config/deis/credentials.toml` (or `$XDG_CONFIG_HOME/deis/`,
+or `$DEIS_CONFIG_HOME`) with `0600` permissions, keyed by the control-plane
+address, so one machine can hold credentials for a staging and a production
+platform at once. `deis config list` shows every setting, where it came from,
+and which variable overrides it — it never prints the token itself.
 
-# 启动开发服务器
-deis dev
+## Commands
 
-# 验证项目规范
-deis validate
+Human output by default. `--json` is accepted by every command that answers
+with data, and prints one JSON document on stdout and nothing else.
+`deis tail --json` prints one JSON object per line, because its output has no
+end.
 
-# 构建所有平台
-deis build
+The environment is `-e, --environment` everywhere, never `--env`: "env" in
+this codebase already means an application's variables (`context.env`).
 
-# 部署到生产环境
+### `deis init [NAME]`
+
+Create a project: `functions/`, `public/`, `.config.json`.
+
+### `deis dev`
+
+Run the project locally **in a real `deis-runtime`**. The bundle is built, a
+node is started, and the bundle is handed to it with the same
+`ApplyDeployment` call the control plane makes — so routing, the asset index,
+`context.params` and `context.env` behave exactly as they will in production.
+Requests to `--port` are forwarded to that node with the two headers
+`deis-proxy` would have stamped on.
+
+```bash
+deis dev                                   # http://127.0.0.1:8000
+deis dev -p 3000 --store http://127.0.0.1:8090 --queue http://127.0.0.1:8091
+deis dev -s API_KEY=local-value            # stands in for a platform secret
+deis dev --no-watch --debug
+```
+
+What is genuinely absent locally is named in the banner rather than faked:
+without `--store` and `--queue` there is no KV, database, blob or queue, and
+`ctx.services.*` fails exactly as it would on a node that was never given
+their addresses. Nothing fires cron locally either — scheduling is the
+control plane's job.
+
+The local environment name defaults to `development`, not `production`, so a
+`--store` pointed at a real `deis-store` cannot write into the production
+tenant by accident.
+
+### `deis validate [--strict]`
+
+Check the project against the specification.
+
+### `deis build [--vendor …]`
+
+Compile. `--vendor deislet` produces `dist/deislet/bundle.zip`, the bundle a
+version is made of; the other vendors produce their own output for their own
+tooling.
+
+### `deis deploy`
+
+Build, create the application and environment if they are absent, upload the
+bundle as an immutable version, and point the environment at it.
+
+```bash
 deis deploy
+deis deploy -e preview --note "trying the new cache"
+deis deploy --no-build            # use the bundle the last build left
+deis deploy --bundle path/to/bundle.zip
 ```
 
-## CLI 命令
+It prints the version number, the digest, and which nodes took it. **A node
+that did not take it is printed and fails the command**: the pointer moved,
+but that node is still serving what it had, and a green deploy that half the
+fleet ignored is exactly the failure this is for.
 
-### `init [project-name]`
-初始化一个新的 Edge Function 项目,生成标准项目结构。
+A byte-identical bundle reuses the existing version instead of burning a new
+number, and says so.
 
-### `dev [--port PORT]`
-启动本地开发服务器,支持热重载和服务模拟。
+### `deis versions [--limit N]`
 
-### `validate [--strict]`
-验证项目是否符合规范,检查平台特定代码等违规情况。
+Every version of the application: number, digest, when it was created, and
+which environments currently point at it.
 
-### `build [--vendor cloudflare|deno|tencent|all]`
-构建项目,生成各平台的编译产物到 `dist/` 目录。
+### `deis rollback [--to N]`
 
-### `deploy [--vendor all] [--env staging|production]`
-编译并部署项目到指定平台。
+Move an environment's pointer back — to a version number, or with no `--to`
+to the previous distinct version it ran. Prints what it moved **from** and
+**to**, and where the change landed. Nothing is deleted, so the rollback is
+itself reversible.
 
-### `config set/get <key> <value>`
-管理 CLI 配置 (平台认证、部署参数等)。
+### `deis status`
 
-## 项目示例
+What each environment runs (from the catalog: version, digest, when, note)
+and which nodes are serving it (asked of the nodes themselves: environment,
+state, request and error counts). Printed as two tables because they are two
+different claims, and a node that never took the last deployment is where
+they disagree.
 
-```typescript
-// functions/api/users.ts
-import type { Context } from '@deis/types';
+### `deis secret set|list|rm`
 
-export default async function handler(context: Context): Promise<Response> {
-  const { kv } = context.services;
-  const userId = context.params.id;
-
-  // 使用统一的 KV 接口 (自动适配各平台)
-  const user = await kv.getJSON(`user:${userId}`);
-
-  if (!user) {
-    return new Response('User not found', { status: 404 });
-  }
-
-  return new Response(JSON.stringify(user), {
-    headers: { 'Content-Type': 'application/json' }
-  });
-}
+```bash
+deis secret set API_KEY                    # value read from stdin
+printf %s "$VALUE" | deis secret set API_KEY
+deis secret set API_KEY value -e preview
+deis secret list
+deis secret rm API_KEY
 ```
 
-## 核心概念
+`list` shows names and times. There is no command that prints a value — the
+control plane has no endpoint that returns one. A secret is not part of the
+bundle, so changing one creates no version; the running one is delivered
+again with the new value, and where that landed is printed.
 
-### Context 对象
-统一的运行时上下文,包含:
-- `request`: 原始 Request 对象
-- `env`: 环境变量
-- `params`: 路由参数
-- `query`: 查询参数
-- `services`: 统一服务接口 (KV, Database, Cache)
-- `log`: 结构化日志
-- `waitUntil`: 后台任务注册
+### `deis logs` and `deis tail`
 
-### 平台适配
-编译器自动将统一的 handler 代码转换为各平台实现:
-
-```typescript
-// 源码 (平台无关)
-const kv = context.services.kv;
-await kv.put('key', 'value');
-
-// Cloudflare Workers (自动生成)
-const kv = createKVAdapter(env.KV_STORE);
-await kv.put('key', 'value');
-
-// Deno Deploy (自动生成)
-const kv = createKVAdapter(await Deno.openKv());
-await kv.put('key', 'value');
+```bash
+deis logs --since 2h -l warn
+deis logs --since 2026-08-29T10:00:00Z --until 2026-08-29T11:00:00Z
+deis logs --trace-id 4f2c… --limit 500
+deis tail -e preview
+deis tail --all-environments --json
 ```
 
-## 规范检查
+`--since`/`--until` take a duration back from now (`30s`, `15m`, `2h`, `3d`)
+or an RFC 3339 instant. Entries print oldest first, the way a log reads.
 
-编译器会检测并禁止以下模式:
+`deis-telemetry` stores an application's lines under one `app_id` with the
+environment as a field, on purpose, so `-e` is a filter this CLI applies;
+`--all-environments` turns it off. Lines from components that are not serving
+one particular environment are always kept — they are usually the ones that
+explain why an application is not running.
 
-❌ **平台类型检测**
-```typescript
-if (typeof Deno !== 'undefined') { }  // Error!
-```
+Neither command needs a control plane configured: reading logs is not a
+control-plane operation.
 
-❌ **条件导入**
-```typescript
-const mod = await import(condition ? 'a' : 'b');  // Error!
-```
+`Ctrl-C` ends a tail cleanly.
 
-❌ **直接访问 context.raw**
-```typescript
-const cfEnv = context.raw.cloudflare.env;  // Error!
-```
+### `deis config set|get|unset|list`
 
-❌ **平台特定 API**
-```typescript
-Deno.env.get('VAR');  // Error! 使用 context.env
-```
+See **Configuration** above.
 
-✅ **正确的方式**
-```typescript
-const apiKey = context.env.API_KEY;
-const kv = context.services.kv;
-```
+## Exit codes
 
-## 开发状态
+`0` on success, `1` on failure. Every error says what to do next, not only
+what failed. A deploy or a secret change that some node did not take exits
+non-zero even though the catalog was updated.
 
-这是一个 **Rust 实现**版本,包含:
+## Related
 
-- ✅ 单一 CLI crate，编译链路复用 `deis-build`
-- ✅ CLI 工具 (使用 clap)
-- ✅ TypeScript/JavaScript 解析器 (使用 SWC)
-- ✅ 代码验证器 (平台特定代码检测)
-- ✅ 代码转换器框架
-- ✅ Cloudflare/Deno/Tencent 适配器代码生成
-- 🚧 本地开发服务器 (待实现)
-- 🚧 完整的代码转换和打包 (待完善)
-- 🚧 实际部署集成 (待实现)
-- 🚧 测试套件 (待添加)
-
-**技术栈**: Rust + SWC (JavaScript/TypeScript 解析器)
-
-## 路线图
-
-- [ ] 完整的本地开发服务器实现
-- [ ] 完善代码转换和优化
-- [ ] 实现各平台的实际部署集成
-- [ ] 添加完整的测试套件
-- [ ] 支持更多平台 (Vercel Edge, Netlify Edge)
-- [ ] 插件系统
-- [ ] 中间件支持
-- [ ] 性能监控和分析
-
-## 参考文档
-
-- [Edge Function 规范](https://github.com/deislet/spec)
-- [CLI 和编译器需求](./cli-compiler-requirements.md)
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request!
-
-## 许可证
-
-MIT License
+- [`docs/architecture.zh.md`](../../docs/architecture.zh.md) — why the system is split this way
+- [`docs/implementation-plan.zh.md`](../../docs/implementation-plan.zh.md) — the data model, bundle format and proto contracts
+- [`deis-build`](../deis-build/README.md) — the compiler this CLI drives
+- [Edge Canon](https://github.com/deislet/edge-canon) — the specification an application is written against

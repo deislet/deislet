@@ -51,3 +51,11 @@ max_object_bytes = 536870912
 # sending mid-object holds a task, a file descriptor and a full-size temporary
 # file until the process restarts.
 upload_idle_timeout_secs = 60
+
+# Seconds a blob download may wait for the client to take the chunk the store
+# is holding before the store abandons it. Set to 0 to wait forever - then one
+# client that opens a Get and stops reading holds a task and an open content
+# file until the process restarts. An abandoned download ends in a
+# DeadlineExceeded status rather than a clean end, so a partial body is never
+# mistaken for the whole object.
+download_idle_timeout_secs = 60

@@ -1,4 +1,4 @@
-import { useNodes } from '@/hooks/useApi'
+import { useNodes, useRuntimeNodes } from '@/hooks/useApi'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -19,6 +19,10 @@ function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleString()
 }
 
+function formatOptionalDate(dateStr: string | null) {
+  return dateStr ? formatDate(dateStr) : '—'
+}
+
 function getStateBadgeVariant(state: string) {
   switch (state) {
     case 'Active':
@@ -35,6 +39,12 @@ function getStateBadgeVariant(state: string) {
 
 export function Nodes() {
   const { nodes, loading, error, refetch } = useNodes()
+  const {
+    runtimeNodes,
+    loading: runtimeLoading,
+    error: runtimeError,
+    refetch: refetchRuntime,
+  } = useRuntimeNodes()
   const [restartingNode, setRestartingNode] = useState<string | null>(null)
   const [nodeToRestart, setNodeToRestart] = useState<{ id: string; type: string } | null>(null)
 
@@ -79,8 +89,16 @@ export function Nodes() {
           <h1 className="text-3xl font-bold">Nodes</h1>
           <p className="text-muted-foreground">Manage connected node nodes</p>
         </div>
-        <Button variant="outline" size="sm" onClick={refetch} disabled={loading}>
-          <RefreshCw className={`h-4 w-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            refetch()
+            refetchRuntime()
+          }}
+          disabled={loading || runtimeLoading}
+        >
+          <RefreshCw className={`h-4 w-4 mr-2 ${loading || runtimeLoading ? 'animate-spin' : ''}`} />
           Refresh
         </Button>
       </div>
@@ -157,6 +175,90 @@ export function Nodes() {
           ))}
         </div>
       )}
+
+      {/*
+        The runtime fleet is a different list from the one above: these are the
+        deis-runtime nodes the control plane dials to apply a deployment, probe
+        health and fire cron. A node appears here either because the control
+        plane's configuration file names it or because it registered itself,
+        and once it is here it is eligible for both, whichever way it arrived.
+      */}
+      <div className="space-y-2">
+        <div>
+          <h2 className="text-xl font-semibold">Runtime fleet</h2>
+          <p className="text-sm text-muted-foreground">
+            Nodes that receive deployments and run cron occurrences
+          </p>
+        </div>
+
+        {runtimeError && (
+          <Card className="border-destructive">
+            <CardContent className="pt-6">
+              <p className="text-destructive">{runtimeError}</p>
+            </CardContent>
+          </Card>
+        )}
+
+        {runtimeLoading && runtimeNodes.length === 0 ? (
+          <Card>
+            <CardContent className="pt-6">
+              <p className="text-center text-muted-foreground">Loading runtime nodes...</p>
+            </CardContent>
+          </Card>
+        ) : runtimeNodes.length === 0 ? (
+          <Card>
+            <CardContent className="pt-6">
+              <p className="text-center text-muted-foreground">
+                No runtime node is known. Deployments and cron occurrences have nowhere to go until
+                one registers or the control plane's configuration names one.
+              </p>
+            </CardContent>
+          </Card>
+        ) : (
+          <div className="grid gap-4">
+            {runtimeNodes.map((node) => (
+              <Card key={node.id}>
+                <CardHeader className="pb-2">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-lg font-mono">{node.id}</CardTitle>
+                    <div className="flex items-center gap-2">
+                      <Badge variant={node.source === 'registered' ? 'outline' : 'secondary'}>
+                        {node.source === 'registered' ? 'self-registered' : 'from config'}
+                      </Badge>
+                      <Badge variant={node.healthy ? 'success' : 'destructive'}>
+                        {node.healthy ? 'Healthy' : 'Unreachable'}
+                      </Badge>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid gap-2 text-sm md:grid-cols-2 lg:grid-cols-4">
+                    <div>
+                      <p className="text-muted-foreground">Address</p>
+                      <p className="font-mono text-xs">{node.addr}</p>
+                    </div>
+                    <div>
+                      <p className="text-muted-foreground">Version</p>
+                      <p>{node.version ?? '—'}</p>
+                    </div>
+                    <div>
+                      <p className="text-muted-foreground">Last checked</p>
+                      <p>{formatOptionalDate(node.last_checked)}</p>
+                    </div>
+                    <div>
+                      <p className="text-muted-foreground">Last registered</p>
+                      <p>{formatOptionalDate(node.last_registered_at)}</p>
+                    </div>
+                  </div>
+                  {node.last_error && (
+                    <p className="mt-3 text-xs text-destructive">{node.last_error}</p>
+                  )}
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* Restart Confirmation Dialog */}
       <Dialog open={!!nodeToRestart} onOpenChange={(open: boolean) => !open && setNodeToRestart(null)}>

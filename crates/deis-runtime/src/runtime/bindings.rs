@@ -551,6 +551,27 @@ impl AppServices {
     }
 }
 
+/// Remove any reserved platform key from a map that an application authored.
+///
+/// Returns the keys that were present, so the caller can say which application
+/// did it. The *values* are deliberately not returned and must not be logged:
+/// they are the application's own text, and a key spelled like one of these
+/// can just as easily hold a secret.
+///
+/// Call it on the manifest's own `env` before merging in what the control
+/// plane sent. Without it, a bundle that declares `DEIS_STORE_ENDPOINT` picks
+/// where its own KV, SQL and blob clients connect whenever the platform has no
+/// address of its own to overwrite it with -- deis-control closes exactly this
+/// hole when it assembles a delivery, and a node that takes deployments from
+/// anywhere else (a direct `ApplyDeployment`, a bundle recovered from its own
+/// disk) has to close it too.
+pub fn strip_reserved_env(env: &mut HashMap<String, String>) -> Vec<&'static str> {
+    RESERVED_ENV_KEYS
+        .into_iter()
+        .filter(|key| env.remove(*key).is_some())
+        .collect()
+}
+
 /// Fill in the platform wiring for a deployment that is about to be loaded.
 ///
 /// Call this on the env map that arrived with the deployment, passing the
@@ -562,13 +583,27 @@ impl AppServices {
 /// - the **declaration** and the **queue consumers** exist only in the
 ///   manifest, which the node has because it just unpacked the bundle.
 ///
+/// Every reserved key is *cleared* and only then written back, the way
+/// deis-control does when it assembles a delivery. Writing without clearing
+/// leaves whatever the map already held under a key this manifest has nothing
+/// to say about, and each of the four fails differently: a stale
+/// `DEIS_SERVICES` builds a storage client for a service the new version no
+/// longer declares; a stale `DEIS_QUEUE_CONSUMERS` starts pollers that lease
+/// messages nothing will handle; and a stale endpoint -- which an application
+/// can put there itself by naming a variable after one -- points its storage
+/// client at a host the application chose rather than the one the platform
+/// runs.
+///
 /// Afterwards the map is what `IsolateSpec::env` should carry: the runtime
 /// lifts the reserved keys back out before the app sees it.
 pub fn wire_deployment_env(manifest: &deis_bundle::Manifest, env: &mut HashMap<String, String>) {
+    // Read before the clear: the addresses are the one half of the wiring
+    // this node cannot recompute from the manifest.
     let endpoints = ServiceEndpoints {
         store: non_empty(env.get(STORE_ENDPOINT_KEY).cloned()),
         queue: non_empty(env.get(QUEUE_ENDPOINT_KEY).cloned()),
     };
+    strip_reserved_env(env);
     ServiceWiring::from_manifest(manifest, endpoints).write_to_env(env);
 }
 

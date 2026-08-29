@@ -8,6 +8,7 @@ pub mod grpc;
 pub mod metrics;
 pub mod middleware;
 pub mod nodes;
+pub mod registration;
 pub mod static_files;
 
 use axum::{
@@ -176,10 +177,16 @@ pub fn build_api_router(
             middleware::api_key_auth,
         ));
 
-    // The two endpoints nodes call carry their own authentication and must
-    // not be layered with the API key middleware: `api_auth_enabled` is a
-    // dashboard setting, and one of these two hands out decrypted secrets.
-    let node_routes = catalog::node_router(catalog_state);
+    // The endpoints nodes call carry their own authentication and must not be
+    // layered with the API key middleware: `api_auth_enabled` is a dashboard
+    // setting, and one of these hands out decrypted secrets while another
+    // decides which machines are delivery targets at all.
+    let node_routes = catalog::node_router(catalog_state).merge(registration::node_router(
+        registration::RegistrationState {
+            nodes: Arc::clone(&deis_runtime_manager),
+            node_auth: middleware::NodeAuthConfig::from_control_config(&config),
+        },
+    ));
 
     let app = Router::new()
         .route("/", get(static_files::serve_index))
@@ -437,11 +444,16 @@ pub async fn start_api_server(
     port: u16,
 ) -> anyhow::Result<()> {
     let tls_config = config.tls.clone();
-    let deis_runtime_manager = Arc::new(crate::runtime_client::RuntimeNodeManager::new(
+    let deis_runtime_manager = Arc::new(crate::runtime_client::RuntimeNodeManager::new_with_ttl(
         config.deis_runtime_nodes.clone(),
         config.deis_runtime_poll_interval,
+        config.node_registration_ttl_secs,
     ));
-    tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop());
+    // One stop signal for the server and the health poller, so the poller
+    // stops probing at the same moment the listener stops accepting rather
+    // than being cut off mid-probe by an abort.
+    let shutdown = crate::shutdown::on_signal();
+    tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop(shutdown.clone()));
     let api = build_api_router(
         sessions,
         database,
@@ -474,7 +486,13 @@ pub async fn start_api_server(
     };
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    serve(listener, api.router, tls, crate::shutdown::signal()).await?;
+    serve(
+        listener,
+        api.router,
+        tls,
+        async move { shutdown.wait().await },
+    )
+    .await?;
 
     Ok(())
 }

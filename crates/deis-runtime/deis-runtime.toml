@@ -66,17 +66,23 @@ max_retries = 3
 # batch_size.
 max_pending_entries = 10000
 
-# How this node reaches the control plane to ask what it should be running.
+# How this node reaches the control plane: it announces itself, asks what it
+# should be running, and keeps matching the answer.
 #
-# On startup it calls GET <endpoint>/api/nodes/<node_id>/assignments, downloads
-# and loads every version named there, and only then reports healthy. With no
-# endpoint set the node never asks anyone: it runs what is already in its bundle
-# directory plus whatever is pushed to it, and reports healthy immediately.
+# On startup it POSTs to <endpoint>/api/nodes/<node_id>/register so the control
+# plane knows this node exists without an operator editing anything on that
+# side, then calls GET <endpoint>/api/nodes/<node_id>/assignments, downloads and
+# loads every version named there, and only then reports healthy. After that it
+# re-asks on a timer (reconcile_interval_secs). With no endpoint set the node
+# never asks anyone: it runs what is already in its bundle directory plus
+# whatever is pushed to it, and reports healthy immediately.
 #
 # A node that cannot reach the control plane keeps serving what it recovered
 # from its own disk, says so at error level, reports UNHEALTHY, and retries with
 # a growing delay. Bundles on disk carry no secrets, so an app that declares any
-# runs without them until the control plane redelivers.
+# runs without them until the control plane redelivers. Once contact comes back
+# it registers again, because a control plane that restarted may have forgotten
+# it.
 [control]
 # endpoint = "http://127.0.0.1:8080"
 
@@ -93,6 +99,15 @@ request_timeout_secs = 30
 # Seconds before the first retry after a failure. Later retries back off from
 # here, up to twenty times this value.
 retry_interval_secs = 15
+
+# Seconds between reconciliations once the node is up. Each one re-asks for the
+# assignment list and treats it as the whole truth: versions this node is not
+# running are loaded, and environments the list no longer names stop serving
+# here and have their bundles removed. Without it, an application deleted from
+# the catalog while this node was unreachable would keep serving - with its
+# secrets - until the process was restarted. A pass that finds nothing to change
+# does nothing and logs nothing.
+reconcile_interval_secs = 60
 
 # Downloaded application bundles.
 [bundles]

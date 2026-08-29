@@ -12,9 +12,11 @@ heartbeat_timeout = 90
 
 # Node pre-shared keys.
 #
-# One credential, used on both channels a runtime node talks to:
-#   - the gRPC registration handshake, and
-#   - the two HTTP endpoints that exist for nodes,
+# One credential, used on every channel a runtime node talks to:
+#   - the gRPC registration handshake,
+#   - PUT/DELETE /api/nodes/{node_id}/registration, by which a node puts
+#     itself on the fleet list, and
+#   - the two HTTP endpoints it reads from,
 #     GET /api/nodes/{node_id}/assignments and the bundle download.
 #
 # The assignment list answers with every environment's DECRYPTED secrets,
@@ -23,9 +25,10 @@ heartbeat_timeout = 90
 # api_auth_enabled says below, and an API key is not accepted on them.
 #
 # Leave this empty and there is no node credential at all: the endpoints
-# still answer (nobody could authenticate anyway), but the assignment list
-# then leaves out every application that has a secret, and says so in an
-# ERROR line. Set a key here and the same value on every node.
+# still answer (nobody could authenticate anyway), so anyone who can reach
+# this port can add a delivery target, and the assignment list defends
+# itself by leaving out every application that has a secret and saying so in
+# an ERROR line. Set a key here and the same value on every node.
 #
 #   openssl rand -hex 32
 node_preshared_keys = [
@@ -41,7 +44,7 @@ node_preshared_keys = [
 # Covers the dashboard and the human API: with it on, every endpoint except
 # /health and /api/metrics requires one of the api_keys below.
 #
-# It does NOT cover the two node endpoints, which always use
+# It does NOT cover the node endpoints, which always use
 # node_preshared_keys - see above. Turning this off makes a dashboard
 # convenient; it must never be able to publish the platform's secrets.
 api_auth_enabled = true
@@ -54,6 +57,39 @@ api_keys = [
     "deis-control-admin-key-1234567890abcdef",      # Admin key
     "deis-control-readonly-key-fedcba0987654321",   # Read-only key (reserved for future use)
 ]
+
+# ========================================
+# Which runtime nodes exist
+# ========================================
+
+# A node normally puts itself on the fleet list: it calls
+#   PUT /api/nodes/{node_id}/registration  {"address": "http://host:8086"}
+# with a node_preshared_keys value, and from then on it receives deployment
+# pushes and is eligible to run cron occurrences. So this list is a
+# fallback, not the source of truth, and a machine can join a running
+# platform without this file being edited.
+#
+# What the list is still for: a control plane and its nodes started together
+# by one script, where the control plane may have to reach a node before
+# that node has managed to call in - and a node that must stay a delivery
+# target even while it is down, because an entry from here never expires
+# while a registration does.
+#
+# [[deis_runtime_nodes]]
+# id = "node-a"
+# addr = "http://127.0.0.1:8086"
+
+# Seconds between health probes of every known node (default: 15). The same
+# tick drops registrations nobody refreshed.
+# deis_runtime_poll_interval = 15
+
+# Seconds a self-registered node stays on the fleet list without refreshing
+# its registration (default: 90). A node refreshes every third of this, so
+# two lost refreshes do not cost a healthy node its place. When it does
+# expire the node stops receiving deployment pushes and cron fires, is not
+# told, and comes back on its own the next time it registers. Nodes listed
+# above are not subject to it.
+# node_registration_ttl_secs = 90
 
 # ========================================
 # Product model: bundles and secrets
@@ -147,10 +183,12 @@ bundle_dir = "data/bundles"
 # Endpoints that do not require an API key:
 # - /health - Health check
 # - /api/metrics - Prometheus Metrics
-# - the two node endpoints, which require a node_preshared_keys value
+# - the node endpoints, which require a node_preshared_keys value
 #   instead:
-#     GET /api/nodes/{node_id}/assignments
-#     GET /api/apps/{app_id}/versions/{version_id}/bundle
+#     PUT    /api/nodes/{node_id}/registration
+#     DELETE /api/nodes/{node_id}/registration
+#     GET    /api/nodes/{node_id}/assignments
+#     GET    /api/apps/{app_id}/versions/{version_id}/bundle
 
 # ========================================
 # Security recommendations

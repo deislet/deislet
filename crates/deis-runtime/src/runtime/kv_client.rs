@@ -19,6 +19,20 @@ pub mod proto {
 
 use proto::{kv_store_client::KvStoreClient, *};
 
+/// One key as the store holds it: the value plus what was written alongside
+/// it.
+///
+/// `metadata` is whatever the last write attached, returned untouched --
+/// deis-store never parses it. `expiration` is the absolute unix second the
+/// entry lapses at, or `None` for an entry that never does; the store enforces
+/// expiry on every read, so an entry returned here was live as of that read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvRead {
+    pub value: String,
+    pub metadata: Option<String>,
+    pub expiration: Option<i64>,
+}
+
 /// KV Store client wrapper
 ///
 /// Wrapped in Arc<Mutex> to support sharing and internal mutability across async operations
@@ -98,6 +112,22 @@ impl KvClient {
     /// - Some(value): Value found
     /// - None: Key does not exist
     pub async fn get(&self, key: String) -> Result<Option<String>> {
+        Ok(self.get_with_metadata(key).await?.map(|read| read.value))
+    }
+
+    /// Get a value together with the metadata and expiry stored with it.
+    ///
+    /// Backs `ctx.services.kv.getWithMetadata`. It is a separate method rather
+    /// than a wider return type on [`Self::get`] because the two answer
+    /// different questions and the plain read is the hot one; both are the
+    /// same single `Get` call, so asking for metadata costs no extra round
+    /// trip.
+    ///
+    /// `None` means the key does not exist or has lapsed. A key that exists
+    /// with no metadata comes back as `Some` with `metadata: None`: an app
+    /// that stored no metadata and an app whose key is gone are not the same
+    /// situation, and `value` is what separates them.
+    pub async fn get_with_metadata(&self, key: String) -> Result<Option<KvRead>> {
         let request = self.tenant.stamp(GetRequest { key: key.clone() });
 
         tracing::debug!("KV Get: {}", key);
@@ -106,7 +136,11 @@ impl KvClient {
         let response = client.get(request).await?;
         let get_response = response.into_inner();
 
-        Ok(get_response.value)
+        Ok(get_response.value.map(|value| KvRead {
+            value,
+            metadata: get_response.metadata,
+            expiration: get_response.expires_at,
+        }))
     }
 
     /// Set a value that never lapses and carries no metadata.
@@ -190,6 +224,11 @@ impl KvClient {
             prefix: prefix.clone(),
             limit,
             cursor: None,
+            // Names only. Asking for metadata moves the page into
+            // `entries` and leaves `keys` empty, which is a different
+            // answer than this method promises; nothing in the runtime
+            // exposes a per-key listing yet.
+            include_metadata: None,
         });
 
         tracing::debug!("KV List: prefix={}, limit={:?}", prefix, limit);
@@ -301,12 +340,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_reaches_the_store_but_has_no_way_back() {
-        // The store accepts and keeps it; there is no field on GetResponse or
-        // ListResponse to return it, so an app can write metadata and never
-        // see it again. Adding that field is deis-store's to do -- this test
-        // pins the half that does work, so the gap is a missing read path and
-        // not a silently dropped write.
+    async fn metadata_written_with_a_value_comes_back_with_it() {
+        // The write half has worked since wave A; until deis-store's
+        // GetResponse grew the field there was nowhere for it to come back,
+        // so an app could attach metadata and never see it again. This is the
+        // round trip, over a real socket, because the two halves are owned by
+        // different crates.
         let store = Store::start().await;
         let client = store.client("demo.production").await;
 
@@ -320,9 +359,74 @@ mod tests {
             .await
             .expect("write with metadata");
 
+        let read = client
+            .get_with_metadata("avatar".to_string())
+            .await
+            .expect("read back")
+            .expect("the key exists");
+        assert_eq!(read.value, "png-bytes");
         assert_eq!(
-            client.get("avatar".to_string()).await.expect("read back"),
-            Some("png-bytes".to_string())
+            read.metadata.as_deref(),
+            Some(r#"{"contentType":"image/png"}"#)
+        );
+        assert_eq!(read.expiration, None, "this write carried no lifetime");
+    }
+
+    #[tokio::test]
+    async fn a_key_with_no_metadata_is_not_the_same_as_a_missing_key() {
+        // An app branches on these differently: one means "nothing stored
+        // here", the other means "stored, and the writer attached nothing".
+        let store = Store::start().await;
+        let client = store.client("demo.production").await;
+
+        client
+            .set("plain".to_string(), "value".to_string())
+            .await
+            .expect("plain write");
+
+        let read = client
+            .get_with_metadata("plain".to_string())
+            .await
+            .expect("read back")
+            .expect("the key exists");
+        assert_eq!(read.value, "value");
+        assert_eq!(read.metadata, None);
+
+        assert_eq!(
+            client
+                .get_with_metadata("absent".to_string())
+                .await
+                .expect("read a key that was never written"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifetime_comes_back_as_the_second_the_entry_lapses_at() {
+        // The caller asked for a *lifetime* and cannot otherwise tell how much
+        // of it is left; the store answers with the absolute moment instead of
+        // making every reader subtract.
+        let store = Store::start().await;
+        let client = store.client("demo.production").await;
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_secs() as i64;
+        client
+            .set_with_options("session".to_string(), "abc".to_string(), Some(3600), None)
+            .await
+            .expect("write with a lifetime");
+
+        let read = client
+            .get_with_metadata("session".to_string())
+            .await
+            .expect("read back")
+            .expect("the key exists");
+        let expiration = read.expiration.expect("an entry with a lifetime lapses");
+        assert!(
+            expiration >= before + 3600 && expiration <= before + 3600 + 5,
+            "expiration {expiration} is not about an hour after {before}"
         );
     }
 

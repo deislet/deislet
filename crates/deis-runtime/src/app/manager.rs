@@ -30,8 +30,10 @@ pub struct VersionRecord {
     /// "already running" - see `DeploymentManager::apply_from_assignment`.
     pub env_confirmed: bool,
     pub entry_point: String,
-    /// Bundled module source. Kept so that a failed replacement can put the
-    /// previous version back without another download.
+    /// Bundled module source. Kept because an isolate is built from it, and
+    /// a version change builds a second one while this record is still the
+    /// one serving; without it the code would have to be fetched again to
+    /// stage a replacement.
     code: String,
     config: AppConfig,
     pub assets: Arc<AssetBundle>,
@@ -270,13 +272,18 @@ impl ApplicationManager {
     /// The caller has already proven the bundle: digest checked, manifest
     /// parsed, entry point present, assets read. What is left is the one step
     /// that can still fail on code the node has never executed - creating the
-    /// isolate - and the pool only offers unload-then-load, so there is a
-    /// window where the app is not loaded.
+    /// isolate - and that step happens *beside* the running version, not in
+    /// place of it: the new isolate is built on a runtime thread of its own
+    /// and only then made the one that serves
+    /// ([`RuntimePool::stage_app`] followed by [`RuntimePool::activate`]).
     ///
-    /// That window is why the previous version is kept in memory: if the new
-    /// code will not load, the old code goes straight back in. An app is only
-    /// left down when its previous version also refuses to load, which means
-    /// the isolate host itself is in trouble, not the deployment.
+    /// So a request during a version change gets the old version or the new
+    /// one and never a gap, however long the new isolate takes to build. The
+    /// cost is that the application briefly holds two threads and two
+    /// isolates.
+    ///
+    /// A new version that will not build leaves the old one serving and
+    /// untouched -- nothing was taken away, so there is nothing to put back.
     pub async fn install_version(&self, install: VersionInstall) -> Result<()> {
         let VersionInstall {
             key,
@@ -288,29 +295,6 @@ impl ApplicationManager {
             assets,
         } = install;
 
-        let previous = self.versions.get(&key).map(|entry| entry.value().clone());
-        let was_loaded = self.apps.contains_key(&key);
-
-        if was_loaded {
-            if let Err(e) = self.runtime_pool.unload_app(&key.tenant_id()).await {
-                // Nothing has been swapped yet, so the app keeps serving the
-                // version it already had.
-                tracing::error!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %version_id,
-                    error = %e,
-                    "Could not retire the running isolate, so version {} was not \
-                     installed; {} keeps serving the version it was already on",
-                    version_id,
-                    key
-                );
-                return Err(anyhow!(
-                    "could not unload the running version of {key}: {e}"
-                ));
-            }
-        }
-
         let record = Arc::new(VersionRecord {
             version_id: version_id.clone(),
             env_confirmed,
@@ -320,47 +304,103 @@ impl ApplicationManager {
             assets: assets.clone(),
         });
 
-        match self.load_record(&key, &record).await {
-            Ok(()) => {
-                let now = SystemTime::now();
-                self.apps.insert(
-                    key.clone(),
-                    App {
-                        id: key.app_id().to_string(),
-                        environment: key.environment().to_string(),
-                        state: AppState::Running,
-                        config,
-                        created_at: now,
-                        updated_at: now,
-                        error: None,
-                    },
-                );
-                self.versions.insert(key.clone(), record);
-                tracing::info!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %version_id,
-                    env_confirmed,
-                    assets = assets.len(),
-                    asset_bytes = assets.total_bytes(),
-                    "App {} is now serving version {} of environment {}",
-                    key.app_id(),
-                    version_id,
-                    key.environment()
-                );
-                Ok(())
-            }
+        let previous = self.versions.get(&key).map(|entry| entry.value().clone());
+        let spec = self.spec_for(&key, &record);
+
+        let staged = match self
+            .runtime_pool
+            .stage_app(key.tenant_id(), record.code.clone(), spec)
+            .await
+        {
+            Ok(staged) => staged,
             Err(e) => {
-                self.apps.remove(&key);
-                self.restore(&key, previous, &version_id, &e).await;
-                Err(e)
+                match &previous {
+                    Some(previous) => tracing::error!(
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        version_id = %version_id,
+                        serving_version = %previous.version_id,
+                        error = %e,
+                        "Version {} of {} would not build; it was built beside the running \
+                         isolate and never reached traffic, so {} keeps serving version {} and \
+                         no request was affected. The deployment did not take",
+                        version_id,
+                        key,
+                        key,
+                        previous.version_id
+                    ),
+                    None => tracing::error!(
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        version_id = %version_id,
+                        error = %e,
+                        "Version {} of {} would not build and it had no earlier version to fall \
+                         back to; it is not serving and requests for it will fail until a \
+                         working version is deployed",
+                        version_id,
+                        key
+                    ),
+                }
+                return Err(anyhow!(
+                    "version {version_id} of {key} would not build: {e}"
+                ));
             }
+        };
+
+        if let Err(e) = self.runtime_pool.activate(staged).await {
+            // The only way here is the application having been unloaded while
+            // the new isolate was being built, which discarded it.
+            self.apps.remove(&key);
+            self.versions.remove(&key);
+            tracing::error!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                version_id = %version_id,
+                error = %e,
+                "Version {} of {} was built but could not be made the one that serves; {} is \
+                 not running on this node",
+                version_id,
+                key,
+                key
+            );
+            return Err(anyhow!(
+                "version {version_id} of {key} could not be activated: {e}"
+            ));
         }
+
+        let now = SystemTime::now();
+        self.apps.insert(
+            key.clone(),
+            App {
+                id: key.app_id().to_string(),
+                environment: key.environment().to_string(),
+                state: AppState::Running,
+                config,
+                created_at: now,
+                updated_at: now,
+                error: None,
+            },
+        );
+        self.versions.insert(key.clone(), record);
+        tracing::info!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            version_id = %version_id,
+            replaced_version = previous.as_ref().map(|p| p.version_id.as_str()),
+            env_confirmed,
+            assets = assets.len(),
+            asset_bytes = assets.total_bytes(),
+            "App {} is now serving version {} of environment {}",
+            key.app_id(),
+            version_id,
+            key.environment()
+        );
+        Ok(())
     }
 
-    /// Load one version's code into the pool.
-    async fn load_record(&self, key: &AppKey, record: &VersionRecord) -> Result<()> {
-        let spec = IsolateSpec {
+    /// How one version's code is to be built into an isolate.
+    fn spec_for(&self, key: &AppKey, record: &VersionRecord) -> IsolateSpec {
+        IsolateSpec {
             entry_point: Some(record.entry_point.clone()),
             env: record.config.env.clone(),
             permissions: record.config.permissions.clone(),
@@ -372,82 +412,6 @@ impl ApplicationManager {
                 .and_then(|l| l.resource_table_max),
             route_patterns: record.config.routes.clone(),
             limits: self.effective_limits(key, record.config.limits.as_ref()),
-        };
-        self.runtime_pool
-            .load_app(key.tenant_id(), record.code.clone(), spec)
-            .await
-    }
-
-    /// Put the previous version back after a failed install.
-    async fn restore(
-        &self,
-        key: &AppKey,
-        previous: Option<Arc<VersionRecord>>,
-        attempted_version: &str,
-        cause: &anyhow::Error,
-    ) {
-        let Some(previous) = previous else {
-            self.versions.remove(key);
-            tracing::error!(
-                app_id = %key.app_id(),
-                environment = %key.environment(),
-                version_id = %attempted_version,
-                error = %cause,
-                "Version {} of {} would not load and it had no earlier version to \
-                 fall back to; it is not serving and requests for it will fail until a \
-                 working version is deployed",
-                attempted_version,
-                key
-            );
-            return;
-        };
-
-        match self.load_record(key, &previous).await {
-            Ok(()) => {
-                let now = SystemTime::now();
-                self.apps.insert(
-                    key.clone(),
-                    App {
-                        id: key.app_id().to_string(),
-                        environment: key.environment().to_string(),
-                        state: AppState::Running,
-                        config: previous.config.clone(),
-                        created_at: now,
-                        updated_at: now,
-                        error: None,
-                    },
-                );
-                self.versions.insert(key.clone(), previous.clone());
-                tracing::warn!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %attempted_version,
-                    restored_version = %previous.version_id,
-                    error = %cause,
-                    "Version {} of {} would not load; the node put version {} back and \
-                     is serving it, so traffic is unaffected but the deployment did not take",
-                    attempted_version,
-                    key,
-                    previous.version_id
-                );
-            }
-            Err(restore_error) => {
-                self.versions.remove(key);
-                tracing::error!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %attempted_version,
-                    restored_version = %previous.version_id,
-                    error = %cause,
-                    restore_error = %restore_error,
-                    "Version {} of {} would not load and neither would the version it \
-                     replaced; {} is not serving on this node and needs a working version \
-                     deployed or the node restarted",
-                    attempted_version,
-                    key,
-                    key
-                );
-            }
         }
     }
 

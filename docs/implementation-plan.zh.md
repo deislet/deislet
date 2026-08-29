@@ -1,8 +1,13 @@
 # Deislet 实现规格
 
-> v1.0 · 2026-08-29
+> v1.1 · 2026-08-29
 > 配套 [`architecture.zh.md`](architecture.zh.md)。那份讲「为什么这么分」，这份讲「照着写什么」。
 > 多个实现者并行时，**以本文的数据模型、包格式、proto 契约为准**，不要各自发明。
+
+**波次 A 与波次 B 已经合入。** §2 到 §7 描述的东西现在都存在于代码里，所以它们从
+「要写什么」变成了「已经是什么」——契约照旧有效，改动前要先看这里。波次 C（`deis`
+CLI 闭环）也已合入：`deploy` / `versions` / `rollback` / `status` / `secret` /
+`logs` / `tail` 都是真命令，`dev` 起的是真运行时。每节末尾有一行「现状」说明落地到哪一步。
 
 ---
 
@@ -32,21 +37,33 @@ deis init  →  写代码  →  deis dev  →  deis deploy
 
 配套的定时任务与队列消费同样要能跑通：cron 到点触发一次执行；队列有消息时应用的消费函数被调用。
 
+**现状**：整条线通了，而且是**通过 `deis` 走通的**。`scripts/demo.sh` 的部署动作
+现在全部经由 CLI——`deis deploy` 从源码到服务、`deis secret set` 存密钥并重新下发、
+`deis rollback` 回退指针——不再手打控制面的 REST。这一点是刻意的：`deis` 是开发者
+唯一拿得到的界面，演示脚本要是绕过它去调 API，就只证明了控制面是对的，而把唯一有人
+真正敲的那个入口留在没人验过的状态。
+
+演示逐项验证十八条性质：CLI 部署与版本列表、资产 + ETag/304、路由占位符、
+密钥只见名不见值且不落盘、KV 往返、队列产销、cron 单节点执行、双环境并行、
+双环境 KV 互不可见、回滚（代码与静态资产一起回）、日志可查、`deis tail` 跟到
+开流之后才产生的那一行、节点自注册、`deis status` 报出真正在服务的节点。
+
 ---
 
 ## 1. 组件与进程
 
-| 组件 | 二进制 | 现状 | 本轮 |
+| 组件 | 二进制 | 波次 A 之前 | 现在 |
 |---|---|---|---|
-| `deis-proxy` | `deis-proxy` | 完成度高 | 小改 |
-| `deis-runtime` | `deis-runtime` | 执行链路完整，无资产、无绑定注入、无队列消费 | 大改 |
-| `deis-control` | `deis-control` | 节点管理完整，**产品模型为零** | 大改 |
-| `deis-build` | `deis-build` | 三个第三方目标可用 | 加 deislet 目标 |
-| `deis` | `deis` | init/build/validate 可用，deploy 是桩 | 打通闭环 |
-| `deis-wire` | — | 协议与模型完整 | 小改 |
-| `deis-store` | `deis-store` | **不存在** | 新建 |
-| `deis-queue` | `deis-queue` | **不存在** | 新建 |
-| `deis-telemetry` | `deis-telemetry` | **不存在** | 新建 |
+| `deis-proxy` | `deis-proxy` | 完成度高 | 加了 `x-deis-environment` 盖章；路径级路由与资产缓存仍缺 |
+| `deis-runtime` | `deis-runtime` | 执行链路完整，无资产、无绑定注入、无队列消费 | 资产优先、`context.params`、存储绑定、队列消费、cron 处理、日志与指标投递都已接上 |
+| `deis-control` | `deis-control` | 节点管理完整，**产品模型为零** | catalog（应用/版本/环境/部署/路由/密钥）+ 节点自取通道 + cron 调度 |
+| `deis-build` | `deis-build` | 三个第三方目标可用 | 四个目标，deislet 产出 `bundle.zip` |
+| `deis` | `deis` | init/build/validate 可用，deploy 是桩 | 完整：deploy / versions / rollback / status / secret / logs / tail / config，`dev` 起真运行时 |
+| `deis-wire` | — | 协议与模型完整 | 加了 `conventions`：头名、租户 id、消息上限、保留键 |
+| `deis-bundle` | — | **不存在** | 新建：包格式的唯一定义，编译器/控制面/节点三方共用 |
+| `deis-store` | `deis-store` | **不存在** | 有：KV / Database / Blob 三套 gRPC |
+| `deis-queue` | `deis-queue` | **不存在** | 有：Send / Pull / Ack / Nack / 死信 |
+| `deis-telemetry` | `deis-telemetry` | **不存在** | 有：PushLogs / Query / Tail / PushMetrics / Prometheus |
 
 三个新组件各自独立进程、独立数据目录、独立端口。它们都是「哑」服务：只认**一个**租户维度，不认版本、不认部署、不回调任何人。
 
@@ -100,6 +117,11 @@ assets/                  # 静态资产，原样保留目录结构
   - `functions/_scheduled.ts` → `export const scheduled`，控制面到点触发（`§7`）
   它们不进 `manifest.routes`，也不占用任何 URL。声明了 `queues` / `cron` 却没有对应文件时构建只告警不拦截，但告警会说清后果（消息领走后无人处理、最终进死信；到点触发打在空处）。函数根下其它以下划线开头的文件既不是路由也不会被调用，构建同样告警。
 - 包的 sha256 就是版本标识的一部分；同样的输入应产出同样的包（构建可复现）。
+
+**现状**：这个格式由 `crates/deis-bundle` 唯一定义（`Manifest` / `AssetIndex` /
+`read_manifest`），编译器、控制面、节点三方共用同一份解析代码，不再各写一份。
+`crates/deis-build/tests/deislet_bundle.rs` 端到端验证：布局、路由表、平台处理函数
+（`_queue` / `_scheduled`）不占 URL、资产元数据完整、同样输入产出同样字节。
 
 ---
 
@@ -169,6 +191,14 @@ CREATE TABLE secrets (
 
 主密钥从 `deis-control` 配置的 `secret_key_file` 读取（32 字节），不进数据库、不进日志。
 
+**现状**：全部建好，见 `crates/deis-control/src/database/schema.rs` 与
+`crates/deis-control/src/catalog/`。REST 在 `api/catalog/`：应用、版本（上传/下载）、
+环境、部署、回滚、路由、密钥。
+
+**一处例外**：`routes` 表建了、REST 有了，但**没有任何消费方**——deis-proxy 至今
+只按域名或 `x-deis-app-id` 选应用，不读 `path_prefix`。表里存进去的路径前缀现在
+不影响任何请求的去向。
+
 ---
 
 ## 4. 部署下发：小消息通知 + 大数据自取
@@ -212,13 +242,24 @@ GET /api/nodes/{node_id}/assignments
 
 这四个键在进 Isolate 之前被**取出**而不是读取，所以应用的 `ctx.env` 里只剩它自己的变量；应用也无法用同名变量把存储客户端指到别处（拼装 payload 时平台值最后写入，覆盖 manifest 里的同名变量并告警）。
 
-`DeployApp` 删除。gRPC 消息上限统一提到 16 MB（服务端 `max_decoding_message_size`、客户端 `max_encoding_message_size` 都要设），给 manifest 和批量消息留余量。
+`DeployApp` 已删除。gRPC 消息上限统一提到 16 MB（`deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES`，服务端 `max_decoding_message_size`、客户端 `max_encoding_message_size` 两侧都设），给 manifest 和批量消息留余量。
+
+**现状**：两步都通了。节点侧在 `crates/deis-runtime/src/deployment/`：
+`assignments.rs` 拉清单并向控制面登记自己，`fetch.rs` 流式取包校验 sha256。
+节点没登记也照样自取并服务它拉到的应用，只是收不到推送、也不会被选去跑 cron。
+
+**留着的一处旧毛病**：`management.proto` 的 `UpdateApp` 仍带 `bytes package_data`，
+与被删的 `DeployApp` 同源。RPC 本身已改成 `Unimplemented` 并在错误信息里指向
+`ApplyDeployment`，但那个字段还在消息里；删它要同时改 proto 与
+`crates/deis-runtime/src/management/`。
 
 ---
 
 ## 5. 三个新组件
 
 deis-store 与 deis-queue 按**租户**隔离数据，租户 id 是 `conventions::tenant_id(app, environment)` 的结果（`demo.production`），由调用方在 `x-deis-tenant` 头里带来；deis-telemetry 按应用聚合。三个都用 SQLite 起步（内部规模足够，且省去外部依赖）。
+
+**现状**：三个组件都已建好并在 `scripts/demo.sh` 里被真实调用。
 
 下文表结构里的 `tenant` 列就是这个字符串。服务端不拆它、也不暴露拆开后的两半——存储是按租户存的，不是按应用存的，代码里不该有任何地方能因为「前缀一样」把两个租户当成一个。缺头、非可打印 ASCII、或 `split_tenant` 拒绝（裸 app id、三段、空段、含 `.` `/` `\` 或半边超 64 字节）一律回 `PermissionDenied`，绝不退回某个默认命名空间。
 
@@ -232,17 +273,14 @@ deis-store 与 deis-queue 按**租户**隔离数据，租户 id 是 `conventions
 
 ### 5.2 deis-queue
 
-复用 `queue.proto` 的 `Send` / `SendBatch`，新增消费端：
+`queue.proto` 现在是 `Send` / `SendBatch` / `Pull` / `Ack` / `Nack` /
+`ListDeadLetters` / `ReplayDeadLetters`。
 
-```protobuf
-rpc Pull(PullRequest) returns (PullResponse);   // 租约式领取
-rpc Ack(AckRequest) returns (AckResponse);
-rpc Nack(NackRequest) returns (NackResponse);   // 可带重投延迟
-```
+表 `messages(tenant, queue, id, body BLOB, attempts, visible_at, lease_token, created_at)`。`Pull` 取 `visible_at <= now` 的前 N 条，把 `visible_at` 推后一个租约期、`attempts + 1`，并换一个新的 `lease_token` 一起返回。`Ack` / `Nack` 必须原样带回那个令牌，所以租约过期、消息已经被别人领走之后，先前那个消费者的 Ack 不作数——不然它会把别人正在处理的那条销掉。`attempts` 超阈值移入死信表，`ListDeadLetters` 能看、`ReplayDeadLetters` 能放回。
 
-表 `messages(tenant, queue, id, body BLOB, attempts, visible_at, created_at)`。`Pull` 取 `visible_at <= now` 的前 N 条，把 `visible_at` 推后一个租约期并 `attempts + 1`。`attempts` 超阈值移入 `dead_letter`。
-
-运行时侧：对 manifest 里声明了 `queues` 的应用，各起一个轮询任务，拉到消息就调应用的队列处理函数，成功 `Ack`、失败 `Nack`。
+运行时侧：对 manifest 里声明了 `queues` 的应用，各起一个轮询任务
+（`crates/deis-runtime/src/runtime/queue_consumer.rs`），拉到消息就调应用的 `queue`
+导出，成功 `Ack`、失败 `Nack`。
 
 **不要**做成 deis-queue 主动推给节点——那需要队列知道哪个节点跑哪个应用，破坏「哑服务」边界。
 
@@ -257,7 +295,13 @@ rpc PushMetrics(PushMetricsRequest) returns (PushMetricsResponse);
 rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 ```
 
-日志表按天分区，保留期可配。指标存时序表，同时通过 HTTP `/metrics` 导出 Prometheus 格式。
+日志表按天分区，保留期可配。指标存时序表，同时通过独立 HTTP 端口的 `/metrics` 导出 Prometheus 格式。
+
+**现状**：五个 RPC 与 Prometheus 端口都有。**投递方只有 deis-runtime 一个**——
+deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout，所以
+访问量与耗时这两个本该由 deis-proxy 提供的主要数字，现在只能从节点侧推算，
+而被 deis-proxy 挡在门外的请求在这里完全看不见。`Tail` 与 `Query` 已经有 CLI 消费方
+（`deis tail` / `deis logs`），不必再用 grpcurl。
 
 **必须保持「哑」**：deis-telemetry 不判断健康、不发告警、不回调控制面。控制面要做决策时主动来查。存活判断走直连健康检查，不依赖它——否则观测组件挂了会连带判所有节点死亡。
 
@@ -283,13 +327,22 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 - 到点时挑一个健康节点，调它的 `Trigger.OnScheduled(app_id, cron, scheduled_time)`
 - 一次触发只跑一个节点（不是广播），失败换一个节点重试
 
+**现状**：已经这么做了。补一条当时没写进来的区分：**只有「这台跑不了」才换节点**。
+处理函数自己抛异常时不换——同一段代码在别处会以同样方式失败，而它在失败前可能已经
+产生了副作用（发过队列、写过库），每换一个节点就重放一次。节点用
+`deis_runtime::trigger::HANDLER_FAILED_PREFIX` 这个错误前缀表达这一区分，因为
+`TriggerResponse` 里没有「处理函数已被调用」这一位；补那一位是干净的做法。
+
 ---
 
 ## 8. 波次与验收
 
 每一波结束时都必须：全仓 `cargo clippy` 零警告、`cargo test --workspace` 全绿、`scripts/demo.sh` 端到端通过。
 
-### 波次 A（并行）
+波次 A 与 B 已经合入，下面两张表保留原样，作为「当时要做什么」的记录；
+每一波之后的小节写的是它实际落成什么样、留下了什么。
+
+### 波次 A（并行，已完成）
 
 | 编号 | 内容 | 验收 |
 |---|---|---|
@@ -298,7 +351,7 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 | A3 | `deis-telemetry` 新 crate：接收 + 存储 + Query + Tail + 指标 | 起进程后能收日志、能按 app 查回来、Tail 能持续推 |
 | A4 | 小修：gRPC 消息上限 16 MB、`context.params` 打通、限额可配置 | 单测覆盖；params 在 e2e 里能取到值 |
 
-### 波次 B（依赖 A）
+### 波次 B（依赖 A，已完成）
 
 | 编号 | 内容 | 依赖 |
 |---|---|---|
@@ -324,16 +377,9 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 
 合入时补齐的三处：`wire_deployment_env` 此前无人调用（存储绑定全部落空）；`MetricShipper` 无人启动；节点的 `Trigger.OnScheduled` 是个只回 success 的桩，控制面每次触发都被当成成功。
 
-`PLATFORM_MATRIX` 对应更新：deislet 的 SQL / Blob / Queue / Cron 从「暂缺」转正，能力表里已无 pending 项；剩下不支持的（Durable Objects、Node 内置、SSR/ISR、Workers AI、BroadcastChannel）是形态上就没有，构建直接失败而不是告警。
+`PLATFORM_MATRIX` 对应更新：deislet 的 SQL / Blob / Queue / Cron 从「暂缺」转正，能力表里已无 pending 项；剩下不支持的（Durable Objects、Node 内置、SSR/ISR、Workers AI、BroadcastChannel）是形态上就没有，按「直接失败」而不是「告警」处理。
 
-仍然开着的（不阻塞本波验收）：
-
-- **KV 的 metadata 只能写不能读**：`GetResponse` 只有 value、`ListResponse` 只有 keys，需要 deis-store 加字段；在那之前不提供 `getWithMetadata`。
-- **队列没有租约令牌**：租约过期的消费者仍能 Ack/Nack 已经交给别人的那条消息；死信表也没有对外 RPC。
-- **控制面另外 28 个数据库方法**仍在异步线程上跑 rusqlite 并跨 await 持锁。
-- **`UpdateApp` 仍带 `bytes package_data`**，和被删掉的 `DeployApp` 是同一个毛病；RPC 本身已改为 `Unimplemented` 并指向 `ApplyDeployment`。
-- **节点仍不向控制面注册自己**：原则 8 的「拉」通了，但控制面认识哪些节点仍只来自配置文件。
-- **`RuntimePool` 没有「先装好再切」的接口**：换版期间有一个等于 Isolate 构建耗时的不可用窗口。
+> 事后更正（2026-08-29）：上面那句「构建直接失败」说满了。`detect_required_features` 只认 `.config.json` 里的 `services.{database,blob,queue}`、`queues`、`cron` 和 `runtime` 里的 `node` 字样；SSR、ISR、Durable Objects、BroadcastChannel、Workers AI 在配置里没有可声明的地方，编译器检不出来，代码里用了它们是运行时才炸。
 
 ### 波次 B 复审修复（2026-08-29）
 
@@ -353,22 +399,55 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 
 `scripts/demo.sh` 相应扩了两项验证（同一应用的生产与预览各跑各的版本；两个环境的 KV 互不可见），并且 `start` 会清掉上一轮的数据目录——deis-store / deis-queue 现在拒绝在租户契约之前写下的目录上启动。
 
-仍然开着的：
+### 波次 B 之后已经补掉的
 
-- **`trigger.proto` 的 `ScheduledEvent` / `QueueEvent` 没有 `environment` 字段**，所以到点触发只能指名应用，节点按 `production` 处理。控制面在注册非生产环境的 schedule 时打 warn，节点在收到时打对称的 warn。
+复审当时列为「仍然开着」的几条，后来已经关掉，这里记一笔免得再当成待办：
+
+- **队列租约令牌与死信 RPC**：`Pull` 现在返回 `lease_token`，`Ack` / `Nack` 必须原样带回，租约过期后旧消费者的 Ack 不再作数；死信有 `ListDeadLetters` / `ReplayDeadLetters` 两个 RPC。
+- **控制面的数据库访问**：全部走 `Database::with_connection`，rusqlite 在 `spawn_blocking` 上跑，不再在异步线程上执行同步 SQL。
+- **节点自己向控制面登记**：`POST /api/nodes/{id}/register`，凭据与 assignments 同一套。登记只决定「收不收推送、会不会被选去跑 cron」，不登记的节点照样自取并服务。
+- **KV 的 metadata 能读回来了**：`GetResponse` 带 `metadata`，`ListRequest` 有 `include_metadata`，JS 侧的 `getWithMetadata()` 就是读它。
+- **`ScheduledEvent` 带上了 `environment`**：控制面按 `(应用, 环境)` 调度，节点也按这对值找处理函数；空值仍按 `production` 解释，与 HTTP 数据面同一条规则。
+- **换版先装好再切**：`RuntimePool::stage_app` 在另一条线程上把新版本建好预热，`activate` 才切流量，旧版本全程在应答，没有不可用窗口。
+- **deis-store 有一致性快照**：`deis-store snapshot` / `restore` 两个子命令。这些 SQLite 都开着 WAL，`cp -r` 拷出来的目录可能缺最近的提交或直接损坏，而且打开时不报错。
+
+### 仍然开着的
+
+- **`UpdateApp` 仍带 `bytes package_data`**，与被删的 `DeployApp` 同源。RPC 已是 `Unimplemented`，字段还在；删它要同时改 `crates/deis-runtime/proto/management.proto` 与 `crates/deis-runtime/src/management/{service.rs,service_test.rs}`。
+- **控制面的 `routes` 表没人消费**：表、REST（`GET /api/routes`）都有，deis-proxy 仍只按域名或 `x-deis-app-id` 选应用，`path_prefix` 不影响任何请求的去向。预览子域（`<env>.<app>.<zone>`）也卡在这条链路上。
+- **只有 deis-runtime 在往 deis-telemetry 投递**：deis-proxy / deis-store / deis-queue / deis-control 都还只写自己的 stdout。
+- **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent` 已经有了）。队列消费目前由节点自己按 `(应用, 环境)` 轮询，不走这个消息，所以还没被踩到。
+- **Web 标准的全局大半没装上，`fetch` 也在其中**：扩展注册了，但它们的 JS 模块只 `export`，没有谁把它们挂到 `globalThis` 上。探针实测（2026-08-29）：有 `Headers` / `Request` / `Response` / `URL` / `URLSearchParams` / `EventTarget` / `setTimeout` / `queueMicrotask` / `console` / `caches`；没有 `fetch` / `crypto` / `TextEncoder` / `TextDecoder` / `atob` / `btoa` / `AbortController` / `ReadableStream` / `Blob` / `FormData` / `URLPattern` / `WebSocket` / `BroadcastChannel` / `structuredClone` / `performance`。edge-canon 把 `fetch` 列为基础特性，这是最直接的一处不达标。缺的是一个真正跑 JS 的一致性测试——列一份全局清单，在 Isolate 里逐个 `typeof`，缺哪个红哪个。
 - **`TriggerResponse` 没有「处理函数已被调用」这一位**，只能靠 `deis_runtime::trigger::HANDLER_FAILED_PREFIX` 这个错误前缀表达，控制面据此不再换节点重试。
-- **`StartInspectRequest` 已加 `environment`**，但调试通道本身还只覆盖到单个环境的用法。
+- **请求与响应体是 `String`**：`JsRequest.body` / `JsResponse.body` 都是文本，二进制主体过不了 Isolate 边界。
 - **执行超时管不住卡在 await 上的处理函数**：30 秒墙钟只约束「正在跑 JS」的那部分，一个卡在慢存储上的 handler 能无限占住它那条运行时线程。
+- **`StartInspectRequest` 已加 `environment`**，但调试通道本身还只覆盖到单个环境的用法。
 
 ### 波次 C
 
-| 编号 | 内容 |
-|---|---|
-| C1 | `deis` CLI 闭环：`deploy` / `rollback` / `versions` / `tail` / `dev` 接真运行时（`deis build` 已可产出 deislet 包，其余仍走 REST） |
-| C2 | ~~端到端演示扩展~~：`scripts/demo.sh` 已在波次 B 收尾时完成 |
-| C3 | 文档与能力矩阵回填（`PLATFORM_MATRIX.md` 的 ⚠️ 逐项转正） |
+| 编号 | 内容 | 状态 |
+|---|---|---|
+| C1 | `deis` CLI 闭环：`deploy` / `rollback` / `versions` / `status` / `secret` / `logs` / `tail`，`dev` 接真运行时 | 完成 |
+| C2 | ~~端到端演示扩展~~：`scripts/demo.sh` 已在波次 B 收尾时完成 | 完成 |
+| C3 | 文档与能力矩阵回填 | 完成：README、`architecture.zh.md`、本文与 `edge-canon/PLATFORM_MATRIX.md` 已按代码逐项核对 |
+| C4 | `scripts/demo.sh` 的部署动作改走 CLI，并补上 CLI 自身的验收 | 完成：deploy / secret set / rollback 不再打 REST，新增 6 条检查（部署、版本、密钥列名、tail、status、节点注册） |
 
----
+### 清掉的历史遗留（同一轮）
+
+- `crates/deis-build/.github/` —— 编译器还是独立仓库时留下的 workflow。嵌套的
+  `.github` 在 GitHub 上不生效，已删除。**本仓库现在没有任何 CI workflow**，要补
+  就在仓库根新建 `.github/workflows/`，并注意旧文件里那个 windows/macOS 矩阵不能
+  照搬到工作区：deis-proxy 依赖 pingora，Windows 上构不出来。
+- `ProjectConfig.routing` —— `caseSensitive` / `trailingSlash` / `routes` 三个字段
+  一个都没人读：URL 模式来自文件树（`plan_routes`），匹配是运行时的
+  （`deis_bundle::routing`）。整块删掉；老项目里留着这段配置也照样能构建，
+  未知键会被忽略。
+- `deis-build` 的 Memory 输出模式 —— 原先它对每个 vendor 都不可用：用户代码从不落盘，
+  打包器解析不到生成的 router 里那句 `../src/<handler>`，deislet 报错、cloudflare 与
+  tencent 产出一个引用未定义 `handler0` 的包。现在 Memory 模式把整棵树写进一个
+  临时目录，打包完连目录一起删；deislet 仍然拒绝 Memory 模式（它的产物是磁盘上的
+  归档，没有目录就没有路径可交）。顺带修掉：打包器此前用 `bundle()`，会把 chunk
+  写到**进程工作目录**下的 `dist/`，与项目的输出目录无关。
 
 ## 9. 边界约定（并行实现时不要越界）
 

@@ -139,10 +139,18 @@ impl CronScheduler {
 
     /// Start the tick loop.
     ///
-    /// The returned handle is the only way to stop it: it runs forever
-    /// otherwise, and a tick that fires while the process is draining
-    /// would push work at nodes this instance is about to stop talking to.
-    pub async fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    /// It stops when `shutdown` is triggered, and the returned handle is what
+    /// the caller waits on to know that it has. The stop is cooperative on
+    /// purpose: this loop calls nodes, and aborting the task can land between
+    /// sending a trigger and reading its answer - the occurrence then runs on
+    /// a node while this process records nothing about it, so the next
+    /// instance can fire it again. Waiting for the loop to reach the top of a
+    /// tick costs at most one in-flight trigger's deadline and leaves the
+    /// records straight.
+    pub async fn start(
+        self: Arc<Self>,
+        shutdown: crate::shutdown::Shutdown,
+    ) -> tokio::task::JoinHandle<()> {
         // Load once before the first tick so a task that is due right away
         // is not delayed by a whole interval.
         self.refresh().await;
@@ -152,9 +160,18 @@ impl CronScheduler {
             let mut ticker = interval(scheduler.tick_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = shutdown.wait() => {
+                        info!(
+                            tasks = scheduler.task_count(),
+                            "Cron scheduler stopped for shutdown; no occurrence fires from this instance any more, and an occurrence that comes due while nothing is running is skipped rather than made up later"
+                        );
+                        return;
+                    }
+                    _ = ticker.tick() => {}
+                }
                 scheduler.refresh().await;
-                scheduler.fire_due(Utc::now()).await;
+                scheduler.fire_due(Utc::now(), &shutdown).await;
             }
         });
 
@@ -328,7 +345,12 @@ impl CronScheduler {
     }
 
     /// Fire everything that came due, one node per occurrence.
-    async fn fire_due(&self, now: DateTime<Utc>) {
+    ///
+    /// `shutdown` is checked between occurrences, not inside one: a trigger
+    /// that is already in flight is seen through to its answer so the run is
+    /// recorded, while the occurrences behind it are left for the next
+    /// instance to find due.
+    async fn fire_due(&self, now: DateTime<Utc>, shutdown: &crate::shutdown::Shutdown) {
         // Collect first, then call. Holding a DashMap guard across an await
         // would block every other reader of the shard for the length of a
         // gRPC call.
@@ -361,7 +383,16 @@ impl CronScheduler {
             return;
         }
 
-        for item in due {
+        let total = due.len();
+        for (fired, item) in due.into_iter().enumerate() {
+            if shutdown.is_triggered() {
+                warn!(
+                    fired,
+                    skipped = total - fired,
+                    "Shutdown was signalled part-way through this tick; the remaining occurrences do not run here and are not made up later - the next instance fires them only if they are still due when it ticks"
+                );
+                return;
+            }
             let node = self.trigger_once(&item, now).await;
             self.record_run(&item, now, node);
         }
@@ -412,7 +443,7 @@ impl CronScheduler {
         for node in &candidates {
             let error = match self
                 .nodes
-                .trigger_scheduled(node, &key.app_id, cron_expr, *scheduled)
+                .trigger_scheduled(node, &key.app_id, &key.environment, cron_expr, *scheduled)
                 .await
             {
                 Ok(resp) if resp.success => {
@@ -521,23 +552,6 @@ fn new_task(
         last_run: None,
         last_node: None,
     };
-
-    // Said once, when the task is registered, rather than on every fire.
-    // A schedule is keyed by (app, environment) here, but `ScheduledEvent`
-    // carries only the app id, so a node receiving this fire runs the
-    // default environment of that app - the wrong code with the wrong
-    // secrets when the schedule belongs to a preview. Carrying the
-    // environment needs a field on trigger.proto; until then the operator
-    // has to be told which schedules are affected.
-    if task.environment != deis_wire::conventions::DEFAULT_ENVIRONMENT {
-        warn!(
-            app_id = %task.app_id,
-            environment = %task.environment,
-            cron = %task.cron_expr,
-            default_environment = deis_wire::conventions::DEFAULT_ENVIRONMENT,
-            "This schedule belongs to a preview environment, but a scheduled trigger can only name the application; every occurrence will run the default environment's handler, with that environment's version and secrets"
-        );
-    }
 
     match task.cron_expr.parse::<Cron>() {
         Ok(cron) => match cron.next_after(now) {
@@ -709,7 +723,9 @@ mod tests {
         assert!(tasks.iter().all(|t| t.unusable.is_some()));
 
         // Nothing is due, because nothing has a next occurrence.
-        scheduler.fire_due(Utc::now()).await;
+        scheduler
+            .fire_due(Utc::now(), &crate::shutdown::Shutdown::new())
+            .await;
         assert!(
             scheduler
                 .tasks_for("demo", "production")
@@ -746,7 +762,9 @@ mod tests {
         let was_due = now - chrono::Duration::minutes(1);
         make_due(&scheduler, was_due);
 
-        scheduler.fire_due(now).await;
+        scheduler
+            .fire_due(now, &crate::shutdown::Shutdown::new())
+            .await;
 
         let task = &scheduler.tasks_for("demo", "production")[0];
         // The occurrence is recorded at the time it was due, not at the
@@ -789,7 +807,9 @@ mod tests {
         let was_due = now - chrono::Duration::minutes(1);
         make_due(&scheduler, was_due);
 
-        scheduler.fire_due(now).await;
+        scheduler
+            .fire_due(now, &crate::shutdown::Shutdown::new())
+            .await;
 
         for task in scheduler.tasks_for("demo", "production") {
             assert_eq!(
@@ -806,7 +826,9 @@ mod tests {
         }
 
         // A second tick with nothing newly due must fire nothing at all.
-        scheduler.fire_due(now).await;
+        scheduler
+            .fire_due(now, &crate::shutdown::Shutdown::new())
+            .await;
         for task in scheduler.tasks_for("demo", "production") {
             assert_eq!(task.last_run, Some(was_due));
         }

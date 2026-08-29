@@ -1,14 +1,16 @@
 # Runtime 技术方案说明
 
-## ✅ 当前状态：生产就绪
+## ✅ 当前状态
 
-**项目已完成核心功能开发，所有测试通过，可用于生产环境。**
+**核心链路已通，全部测试通过。**
 
-- ✅ 21/21 单元测试通过
-- ✅ 6/6 集成测试通过
-- ✅ Release 构建成功
+- ✅ 单元测试与集成测试全绿（`cargo test -p deis-runtime`）
+- ✅ `cargo clippy -p deis-runtime --all-targets` 零警告
 - ✅ V8 HandleScope 问题已解决
-- ✅ deno_core 0.367 完全适配
+- ✅ 适配 deno_core 0.380
+
+具体数字不写死在这里：测试会一直加，写死的数字过两周就是错的，跑一次命令
+比读一句过期的话准。
 
 ---
 
@@ -16,40 +18,48 @@
 
 ### 最终架构
 
-**采用 Runtime 线程池** - 充分利用多核 CPU：
+**一条 OS 线程只放一个 isolate** —— 这不是调度偏好，是 V8 的硬要求：
+`v8::OwnedIsolate` 在创建时进入自己那个 isolate、销毁时退出，所以同一条线程上
+建第二个会把第一个盖住；先建的那个再被用到就 panic，线程当场死掉，它上面的应用
+一起停。类型上用 `Option<HostedApp>`（不是 map）把这条钉死。
 
 ```
 ┌─────────────────────────────────────────┐
 │   Axum HTTP Server (多线程)              │
 └────────┬────────────────────────────────┘
          │
-         ├─► [mpsc channel] ─► Runtime Thread 0 (CPU 0)
-         │                     ├─ App A (V8 isolate)
-         │                     └─ App B (V8 isolate)
+         ├─► [mpsc channel] ─► Runtime Thread 0 ── App A（唯一的 V8 isolate）
          │
-         ├─► [mpsc channel] ─► Runtime Thread 1 (CPU 1)
-         │                     ├─ App C (V8 isolate)
-         │                     └─ App D (V8 isolate)
+         ├─► [mpsc channel] ─► Runtime Thread 1 ── App B
          │
-         └─► [mpsc channel] ─► Runtime Thread N (CPU N)
-                               └─ App E (V8 isolate)
+         ├─► [mpsc channel] ─► Runtime Thread 2 ── App B 的新版本（在装，还没接流量）
+         │
+         └─► [mpsc channel] ─► Runtime Thread N ── 空闲，等下一个应用
 ```
 
 ### 实现要点
 
-- **线程池**: 创建 N 个 runtime 线程（默认 = CPU 核心数）
-- **单线程 Runtime**: 每个线程运行独立的 `tokio::runtime::Builder::new_current_thread()`
-- **负载均衡**: 应用通过最少应用数策略分配到不同线程
-- **V8 隔离**: 每个应用在一个线程内，保证 V8 isolate 的单线程要求
+- **线程池**: 启动时先起 N 条（默认 = CPU 核心数）。N 是「先起多少」不是上限：
+  应用比线程多就再起一条，应用卸载后线程留着给下一个用。
+- **单线程 Runtime**: 每条线程跑独立的 `tokio::runtime::Builder::new_current_thread()`
+- **应用与线程一一对应**: 一条线程最多一个应用，一个应用只在一条线程上
 - **Channel 通信**: HTTP 请求通过 `oneshot` channel 路由到对应线程
+- **换版本先装后切**: 新 isolate 装在另一条线程上，装好了再把「谁在服务」这一项
+  原子地换过去，最后退役旧的。所以换版期间请求要么落到旧版、要么落到新版，
+  没有空窗；代价是这段时间该应用同时占两条线程、两个 isolate。
 
 ### 核心代码
 
 ```rust
 // src/runtime/pool.rs
-pub struct RuntimePool {
+struct Placement {
     threads: Vec<RuntimeThread>,
-    app_assignments: Arc<RwLock<HashMap<String, usize>>>,
+    /// 正在服务：请求按这里分发
+    of_app: HashMap<String, usize>,
+    /// 正在装新版本：占着线程，但收不到请求
+    staging: HashMap<String, usize>,
+    /// 已被换下、isolate 还没析构：不能算空闲
+    retiring: HashSet<usize>,
 }
 
 // 每个线程独立的 current_thread runtime
@@ -67,10 +77,10 @@ thread::spawn(move || {
 
 ### 优势
 
-- ✅ **多核利用**: 充分利用多核 CPU，每个核心运行独立的 runtime
-- ✅ **V8 兼容**: 每个线程内 V8 仍然是单线程（符合 V8 设计）
-- ✅ **负载均衡**: 应用智能分配，避免单线程瓶颈
-- ✅ **水平扩展**: 线程数可配置，适应不同硬件
+- ✅ **多核利用**: 不同应用在不同核心上并行
+- ✅ **V8 兼容**: 一条线程一个 isolate，正是 V8 的模型
+- ✅ **故障隔离**: 一个应用把自己的线程搞死，不牵连别的应用
+- ✅ **换版无空窗**: 先装后切，旧版一直答到切换那一刻
 - ✅ **应用隔离**: 每个应用在独立的 V8 isolate
 
 ### 多核利用说明
@@ -83,10 +93,10 @@ thread::spawn(move || {
 | **单个应用的多个并发请求** | ⚠️ **受限** | 同一应用的请求串行执行（在同一线程） |
 | **应用内部的异步操作** | ✅ **高效** | 单线程 tokio 处理 I/O 并发 |
 
-**扩展方案**：支持应用多实例部署
-- 同一应用可部署多个实例到不同线程
-- 通过 LoadBalancer 层在实例间分发请求
-- 进一步提升单应用的并发处理能力
+**扩展方案**：同一应用起多个 isolate，各占一条线程，请求在它们之间分发。
+现在没有做——一条线程一个 isolate 的约束还在，多开的是线程数不是每线程的
+isolate 数；`Placement` 现在按租户（应用 + 环境）只记一条，要多实例得先把它
+改成一对多。
 
 ---
 

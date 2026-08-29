@@ -30,9 +30,9 @@ use proto::{queue_client::QueueClient as GrpcQueueClient, *};
 /// to name generated types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeasedMessage {
-    /// Handle for [`QueueClient::ack`] and [`QueueClient::nack`]. Stable
-    /// across redeliveries, so it is also the key an idempotent handler can
-    /// deduplicate on.
+    /// The message's identity, stable across redeliveries, so it is the key an
+    /// idempotent handler can deduplicate on. It is *not* on its own enough to
+    /// answer for the message; see [`Self::handle`].
     pub id: String,
     pub body: String,
     /// Deliveries so far, including this one; starts at 1.
@@ -42,6 +42,27 @@ pub struct LeasedMessage {
     pub lease_expires_at: i64,
     /// Unix second the message was enqueued.
     pub created_at: i64,
+    /// Proof that this delivery is the current one, issued fresh by deis-queue
+    /// every time the message is handed out. Opaque here; the only thing this
+    /// crate does with it is hand it back.
+    pub lease_token: String,
+}
+
+impl LeasedMessage {
+    /// What [`QueueClient::ack`] and [`QueueClient::nack`] take.
+    ///
+    /// The id alone is not enough on purpose. A consumer whose lease lapsed
+    /// while it was still working has had its message handed to somebody else;
+    /// answering by id would then delete or release a delivery that another
+    /// consumer is in the middle of, destroying work with nothing to show for
+    /// it. The token names *this* delivery, so a late answer is refused
+    /// instead.
+    pub fn handle(&self) -> MessageHandle {
+        MessageHandle {
+            id: self.id.clone(),
+            lease_token: self.lease_token.clone(),
+        }
+    }
 }
 
 impl From<QueueMessage> for LeasedMessage {
@@ -52,8 +73,39 @@ impl From<QueueMessage> for LeasedMessage {
             attempts: message.attempts,
             lease_expires_at: message.lease_expires_at,
             created_at: message.created_at,
+            lease_token: message.lease_token,
         }
     }
+}
+
+/// One message a consumer is answering for, and its proof of holding it.
+///
+/// Mirrors [`proto::MessageHandle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageHandle {
+    pub id: String,
+    pub lease_token: String,
+}
+
+impl From<MessageHandle> for proto::MessageHandle {
+    fn from(handle: MessageHandle) -> Self {
+        Self {
+            id: handle.id,
+            lease_token: handle.lease_token,
+        }
+    }
+}
+
+/// What a [`QueueClient::ack`] did with the messages reported as handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckOutcome {
+    /// Messages deleted; they are never delivered again.
+    pub acknowledged: i32,
+    /// Messages whose lease had already lapsed and which now belong to another
+    /// consumer. They were left alone, so the same work is being done twice
+    /// right now: this consumer finished it, and whoever holds the message now
+    /// is doing it again.
+    pub stale_leases: i32,
 }
 
 /// What a [`QueueClient::nack`] did with the messages handed back.
@@ -64,6 +116,8 @@ pub struct NackOutcome {
     /// Messages that had used up their attempts and were moved to the dead
     /// letter table. These are never delivered again and need an operator.
     pub dead_lettered: i32,
+    /// Messages whose lease had already lapsed; see [`AckOutcome::stale_leases`].
+    pub stale_leases: i32,
 }
 
 #[derive(Clone)]
@@ -185,16 +239,22 @@ impl QueueClient {
     }
 
     /// Report messages as handled; they are deleted and never delivered
-    /// again. Returns how many were actually removed -- a lower number means
-    /// some lease had already lapsed and the message went back into the
-    /// queue or to the dead letter table.
-    pub async fn ack(&self, queue_name: &str, message_ids: Vec<String>) -> Result<i32> {
-        if message_ids.is_empty() {
-            return Ok(0);
+    /// again.
+    ///
+    /// Takes handles rather than ids: the lease token in each one is what
+    /// proves this consumer still holds the delivery it is answering for. A
+    /// handle whose lease has lapsed is counted in
+    /// [`AckOutcome::stale_leases`] and its row is left alone.
+    pub async fn ack(&self, queue_name: &str, handles: Vec<MessageHandle>) -> Result<AckOutcome> {
+        if handles.is_empty() {
+            return Ok(AckOutcome {
+                acknowledged: 0,
+                stale_leases: 0,
+            });
         }
         let request = self.tenant.stamp(AckRequest {
             queue_name: queue_name.to_string(),
-            message_ids,
+            messages: handles.into_iter().map(Into::into).collect(),
         });
 
         let mut client = self.client.lock().await;
@@ -202,8 +262,12 @@ impl QueueClient {
             .ack(request)
             .await
             .with_context(|| format!("acknowledging messages on queue {queue_name:?}"))?;
+        let inner = response.into_inner();
 
-        Ok(response.into_inner().acknowledged)
+        Ok(AckOutcome {
+            acknowledged: inner.acknowledged,
+            stale_leases: inner.stale_leases,
+        })
     }
 
     /// Hand messages back unhandled, visible again after `delay_seconds`.
@@ -213,18 +277,19 @@ impl QueueClient {
     pub async fn nack(
         &self,
         queue_name: &str,
-        message_ids: Vec<String>,
+        handles: Vec<MessageHandle>,
         delay_seconds: u32,
     ) -> Result<NackOutcome> {
-        if message_ids.is_empty() {
+        if handles.is_empty() {
             return Ok(NackOutcome {
                 released: 0,
                 dead_lettered: 0,
+                stale_leases: 0,
             });
         }
         let request = self.tenant.stamp(NackRequest {
             queue_name: queue_name.to_string(),
-            message_ids,
+            messages: handles.into_iter().map(Into::into).collect(),
             delay_seconds: delay_seconds.min(i32::MAX as u32) as i32,
         });
 
@@ -238,6 +303,7 @@ impl QueueClient {
         Ok(NackOutcome {
             released: inner.released,
             dead_lettered: inner.dead_lettered,
+            stale_leases: inner.stale_leases,
         })
     }
 }

@@ -552,7 +552,10 @@ async fn an_app_that_declares_no_service_is_told_so_rather_than_given_one() {
 }
 
 #[tokio::test]
-async fn a_version_that_will_not_load_puts_the_previous_one_back() {
+async fn a_version_that_will_not_load_never_interrupts_the_one_serving() {
+    // The new isolate is built on a runtime thread of its own, beside the one
+    // answering requests, so a bundle that cannot be built never reaches
+    // traffic and there is nothing to put back.
     let dir = tempfile::tempdir().unwrap();
     let working = bundle("demo", ECHO_HANDLER, &[("index.html", "v1")], &[]);
     let broken = bundle("demo", BROKEN_HANDLER, &[], &[]);
@@ -578,7 +581,7 @@ async fn a_version_that_will_not_load_puts_the_previous_one_back() {
     assert_eq!(
         apps.installed_version(&demo()).unwrap().version_id,
         "v1",
-        "a deploy that could not load took the working app down with it"
+        "a deploy that could not build took the working app down with it"
     );
     let (status, _headers, _body) = apps
         .execute_app(
@@ -590,7 +593,7 @@ async fn a_version_that_will_not_load_puts_the_previous_one_back() {
         )
         .await
         .unwrap();
-    assert_eq!(status, 200, "the restored version is not serving");
+    assert_eq!(status, 200, "the working version stopped serving");
 }
 
 #[tokio::test]

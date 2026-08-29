@@ -9,6 +9,7 @@ use crate::command::CommandExecutor;
 use crate::config::ControlConfig;
 use crate::database::Database;
 use crate::session::SessionManager;
+use crate::shutdown::Shutdown;
 use deis_wire::pb::control_service_server::ControlServiceServer;
 
 pub struct ControlServer {
@@ -17,6 +18,12 @@ pub struct ControlServer {
     database: Option<Arc<Database>>,
     broadcaster: Arc<EventBroadcaster>,
     command_executor: Option<Arc<CommandExecutor>>,
+    /// Handed to every node control channel so a stop closes them.
+    ///
+    /// Left un-triggered when the caller never supplies one, which is the
+    /// same behaviour as before this existed: the channels stay open for as
+    /// long as the nodes keep them open.
+    shutdown: Shutdown,
 }
 
 impl ControlServer {
@@ -27,7 +34,22 @@ impl ControlServer {
             database: None,
             broadcaster: Arc::new(EventBroadcaster::new()),
             command_executor: None,
+            shutdown: Shutdown::new(),
         }
+    }
+
+    /// Make the node control channels end when the process stops.
+    ///
+    /// Every connected node holds one `EstablishChannel` stream open for its
+    /// whole lifetime, and a stream that ends only when the node goes away
+    /// keeps the connection open through the entire drain window - so a
+    /// control plane with nodes attached always sat out its full grace period
+    /// and was then cut anyway. With this the streams are ended from here,
+    /// the connections close, and the drain finishes as soon as the real
+    /// in-flight requests do.
+    pub fn with_shutdown(mut self, shutdown: Shutdown) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     pub fn with_database(mut self, database: Arc<Database>) -> Self {
@@ -57,7 +79,8 @@ impl ControlServer {
         let config = Arc::clone(&self.config);
         let broadcaster = Arc::clone(&self.broadcaster);
 
-        let mut grpc_service = GrpcControlService::new(config, sessions, broadcaster);
+        let mut grpc_service = GrpcControlService::new(config, sessions, broadcaster)
+            .with_shutdown(self.shutdown.clone());
 
         if let Some(db) = &self.database {
             grpc_service = grpc_service.with_database(db.clone());

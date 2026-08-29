@@ -30,6 +30,15 @@ message GetRequest {
 message GetResponse {
   // If found, value is present; otherwise it is absent
   optional string value = 1;
+  // Whatever the last Set stored in `SetRequest.metadata`, returned
+  // untouched. Absent when the key has none, and absent when the key does
+  // not exist at all - `value` is what says which of the two happened.
+  optional string metadata = 2;
+  // Absolute unix second at which this entry lapses; absent means it never
+  // does. Reported because the caller asked for a *lifetime* and cannot
+  // otherwise tell how much of it is left; the store still enforces expiry
+  // on every read, so a key returned here is live at the moment of the read.
+  optional int64 expires_at = 3;
 }
 
 // Set request
@@ -67,13 +76,35 @@ message ListRequest {
   // Optional pagination parameters
   optional int32 limit = 2;
   optional string cursor = 3;
+  // Ask for each key's metadata and expiry alongside its name.
+  //
+  // Absent or false gives the plain listing: `keys` is filled and `entries`
+  // is empty, exactly as before this field existed. True swaps them: the
+  // page arrives in `entries` and `keys` is left empty. The two are never
+  // both filled, because a page may hold thousands of keys and sending each
+  // name twice would double a response that is already the largest thing
+  // this service sends.
+  optional bool include_metadata = 4;
+}
+
+// One listed key with what the store knows about it.
+message KvEntry {
+  string key = 1;
+  // As stored by SetRequest.metadata; absent when the key has none.
+  optional string metadata = 2;
+  // Absolute unix second at which the entry lapses; absent means never.
+  optional int64 expires_at = 3;
 }
 
 // List response
 message ListResponse {
+  // Filled when the request did not ask for metadata; empty when it did.
   repeated string keys = 1;
   // Cursor for the next page (if any)
   optional string next_cursor = 2;
+  // Filled when the request asked for metadata; empty when it did not. Same
+  // order and same page as `keys` would have carried.
+  repeated KvEntry entries = 3;
 }
 
 // Has request

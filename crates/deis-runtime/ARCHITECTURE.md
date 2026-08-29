@@ -5,8 +5,9 @@
 > storage component deis-runtime will depend on — see
 > [`docs/architecture.zh.md`](../../docs/architecture.zh.md).
 >
-> Note: the Log Service shown below is designed but not yet implemented on
-> either side.
+> The Log Service shown below is deis-telemetry, and both halves exist:
+> `src/logging/shipper.rs` pushes logs and `src/runtime/metrics.rs` pushes
+> metrics.
 
 ## 🎯 Design Goals
 
@@ -65,7 +66,10 @@ Transform Runtime from a **Dependent Agent** to an **Autonomous Edge Runtime**. 
 - **Port Sharing**: Multiplexes standard HTTP traffic and gRPC management on the same port.
 - **Capabilities**:
     - `PushConfig`: Update system/app config.
-    - `DeployApp`: Hot-swap application code.
+    - `ApplyDeployment`: Point this node at a version - app, environment,
+      bundle URL, digest, environment map - which it then fetches itself. The
+      bundle never travels in the call; `DeployApp`, which put a whole zip in
+      one gRPC message, is gone.
     - `GetStatus`: Real-time health and stats.
 
 ### 4. Runtime Isolation (`src/runtime/`)
@@ -82,15 +86,22 @@ Transform Runtime from a **Dependent Agent** to an **Autonomous Edge Runtime**. 
 ### Startup Sequence
 1. **Bootstrap**: Load local config from SQLite.
 2. **Init Subsystems**: Start Log Buffer, Config Store.
-3. **Hydrate**: Re-deploy previously running apps from local store.
-4. **Serve**: Open HTTP/gRPC port.
-5. **Background**: Start Log Shipper and housekeeping tasks.
+3. **Serve**: Open HTTP/gRPC port, reporting *not ready*, so the control plane
+   can reach this node while it is still working out what to run.
+4. **Register**: Tell the control plane this node exists.
+5. **Reconcile**: Fetch the assignment list, load every version in it, and stop
+   anything running that it does not name. Only then report ready. A control
+   plane that cannot be reached falls back to re-deploying whatever is in this
+   node's own bundle directory, and the node reports *degraded* for as long as
+   that is what it is serving.
+6. **Background**: Start Log Shipper, Metric Shipper, queue pollers, and the
+   reconcile timer.
 
 ### Request Flow
 1. **Ingress**: Request hits Hyper/Axum server.
 2. **Routing**: Dispatcher matches Host/Path to AppID.
 3. **Execution**:
-    - Retrieve V8 Isolate from Pool.
+    - Retrieve V8 Isolate from Pool (one per OS thread, never two).
     - Create `Context` object.
     - Invoke `handler(context)`.
 4. **Response**: Serialize V8 value to HTTP Response.

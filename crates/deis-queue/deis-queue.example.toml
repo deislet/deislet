@@ -55,7 +55,11 @@ max_attempts = 5
 # How long a dead lettered message is kept, in seconds. Zero keeps it forever,
 # which is the default: dead letters exist to be looked at, and deleting them
 # on a timer would quietly destroy the evidence of why a queue failed. The cost
-# is that the table grows until an operator prunes it.
+# is that the table grows until this retention is turned on.
+#
+# Reading them does not need this file: ListDeadLetters pages through them and
+# ReplayDeadLetters puts named ones back on their queue with a fresh set of
+# delivery attempts, for after the cause has been fixed.
 dead_letter_retention_secs = 0
 
 # How often expired dead letters are deleted. Only consulted when

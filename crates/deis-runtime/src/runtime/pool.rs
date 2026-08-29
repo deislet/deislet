@@ -492,17 +492,72 @@ pub struct RuntimePool {
 /// new application is a single atomic step: with the two apart, two
 /// deployments arriving together could both read "thread 3 is free" and both
 /// be sent there, and the second isolate would break the first.
+///
+/// A thread is spoken for if it appears in *any* of the three collections
+/// below, and [`Self::idle_thread`] is the one place that decides. Each names
+/// a different moment in a thread's life, and a thread in any of them holds a
+/// live isolate:
+///
+/// * `of_app` - serving. Requests are dispatched here.
+/// * `staging` - building a replacement that is not serving yet.
+/// * `retiring` - swapped out, its isolate not dropped yet.
 struct Placement {
     threads: Vec<RuntimeThread>,
     /// `<app>.<environment>` tenant -> index into `threads`.
     of_app: HashMap<String, usize>,
+    /// Tenant -> the thread building a replacement isolate for it. The entry
+    /// exists from the moment the thread is claimed, so a replacement being
+    /// built cannot be handed the thread the application is still serving on,
+    /// and two replacements cannot be built at once.
+    staging: HashMap<String, usize>,
+    /// Threads whose isolate has been swapped out and is being dropped. They
+    /// are not idle yet: handing one out while its old isolate is alive would
+    /// put two isolates on it.
+    retiring: std::collections::HashSet<usize>,
 }
 
 impl Placement {
     /// A thread with no application on it, if there is one.
     fn idle_thread(&self) -> Option<usize> {
-        let taken: std::collections::HashSet<usize> = self.of_app.values().copied().collect();
+        let mut taken: std::collections::HashSet<usize> = self.of_app.values().copied().collect();
+        taken.extend(self.staging.values().copied());
+        taken.extend(self.retiring.iter().copied());
         (0..self.threads.len()).find(|id| !taken.contains(id))
+    }
+}
+
+/// A replacement isolate that is built and warm but is not serving yet.
+///
+/// It holds a runtime thread of its own from the moment it is staged, which is
+/// what lets the version it replaces keep answering requests the whole time it
+/// is being built. Hand it to [`RuntimePool::activate`] to make it the one
+/// that serves, or to [`RuntimePool::discard`] to throw it away; dropping the
+/// value itself does neither, and would strand the thread.
+#[must_use = "a staged version holds a runtime thread until it is activated or discarded"]
+pub struct StagedVersion {
+    tenant: String,
+    thread_id: usize,
+    sender: mpsc::Sender<RuntimeMessage>,
+    /// Which storage services this version declared and where they live; the
+    /// queue pollers are started from it at activation, not before, so a
+    /// version that never activates never leases a message.
+    wiring: ServiceWiring,
+    execution_timeout: Duration,
+}
+
+impl StagedVersion {
+    /// The `<app>.<environment>` this replacement is for.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+}
+
+impl std::fmt::Debug for StagedVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedVersion")
+            .field("tenant", &self.tenant)
+            .field("thread_id", &self.thread_id)
+            .finish()
     }
 }
 
@@ -529,24 +584,42 @@ impl RuntimePool {
             placement: RwLock::new(Placement {
                 threads,
                 of_app: HashMap::new(),
+                staging: HashMap::new(),
+                retiring: std::collections::HashSet::new(),
             }),
             app_repo,
             consumers: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Reserve a thread for a newly loading application, starting one if every
-    /// existing thread already hosts an application.
+    /// Reserve a thread to build an isolate on, starting one if every existing
+    /// thread is already spoken for.
     ///
-    /// The reservation is recorded before the isolate is built, so a second
-    /// load arriving at the same moment cannot be sent to the same thread;
-    /// [`Self::release`] undoes it if the load fails.
+    /// The reservation goes into `staging` before the isolate is built, so a
+    /// second load arriving at the same moment cannot be sent to the same
+    /// thread, and - the part that matters for a version change - the thread
+    /// the application is still *serving* on is never the one the replacement
+    /// is built on. [`Self::release_staging`] undoes it if the build fails.
+    ///
+    /// `replacing` says whether the tenant may already be serving here. False
+    /// is the plain load: an application that is already placed is a caller
+    /// mistake and is refused rather than silently swapped.
     ///
     /// Returns the thread's index (for logs) and a handle to post to it.
-    async fn claim_thread(&self, tenant: &str) -> Result<(usize, mpsc::Sender<RuntimeMessage>)> {
+    async fn claim_thread(
+        &self,
+        tenant: &str,
+        replacing: bool,
+    ) -> Result<(usize, mpsc::Sender<RuntimeMessage>)> {
         let mut placement = self.placement.write().await;
-        if placement.of_app.contains_key(tenant) {
+        if !replacing && placement.of_app.contains_key(tenant) {
             return Err(anyhow::anyhow!("App already exists"));
+        }
+        if placement.staging.contains_key(tenant) {
+            return Err(anyhow::anyhow!(
+                "a replacement isolate for {tenant} is already being built; the version change \
+                 that started it has to finish or be discarded first"
+            ));
         }
 
         let id = match placement.idle_thread() {
@@ -571,13 +644,61 @@ impl RuntimePool {
             }
         };
 
-        placement.of_app.insert(tenant.to_string(), id);
+        placement.staging.insert(tenant.to_string(), id);
         Ok((id, placement.threads[id].sender.clone()))
+    }
+
+    /// Give up a staging reservation whose isolate was never built.
+    async fn release_staging(&self, tenant: &str) {
+        self.placement.write().await.staging.remove(tenant);
     }
 
     /// Give up an application's thread, leaving it idle for the next load.
     async fn release(&self, tenant: &str) {
         self.placement.write().await.of_app.remove(tenant);
+    }
+
+    /// Drop the isolate a retiring thread still holds and give the thread back.
+    ///
+    /// The thread stays out of circulation until this returns, so nothing can
+    /// build a second isolate on it while the first is alive. If the unload
+    /// cannot be delivered the thread is released anyway with the reason
+    /// logged: a load that lands on it later drops the stale isolate itself,
+    /// whereas keeping the thread reserved forever would leak one per failure.
+    async fn retire_thread(
+        &self,
+        tenant: &str,
+        thread_id: usize,
+        sender: mpsc::Sender<RuntimeMessage>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let outcome = match sender
+            .send(RuntimeMessage::UnloadApp {
+                app_id: tenant.to_string(),
+                response: tx,
+            })
+            .await
+        {
+            Ok(()) => rx
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the runtime thread dropped the request"))),
+            Err(_) => Err(anyhow::anyhow!("the runtime thread has stopped")),
+        };
+
+        if let Err(e) = outcome {
+            tracing::warn!(
+                thread_id,
+                app_id = tenant,
+                error = %e,
+                "The previous isolate of {} could not be retired from thread {}; it is left in \
+                 place and the thread is put back in circulation, so the next application \
+                 loaded there drops it. Nothing is serving from it in the meantime",
+                tenant,
+                thread_id
+            );
+        }
+
+        self.placement.write().await.retiring.remove(&thread_id);
     }
 
     /// Post a message to the thread hosting `app_id`.
@@ -604,19 +725,63 @@ impl RuntimePool {
     /// what reaches the isolate as `ctx.env` is only the application's own
     /// variables, and the app's queue consumers are started from the same
     /// information.
-    pub async fn load_app(
+    pub async fn load_app(&self, tenant: String, code: String, spec: IsolateSpec) -> Result<()> {
+        // `replacing: false` - an application that is already placed here is a
+        // caller mistake, not a version change. Changing versions goes through
+        // [`Self::stage_app`], which keeps the old one answering.
+        let staged = self.build(tenant, code, spec, false).await?;
+        self.activate(staged).await
+    }
+
+    /// Build a replacement isolate for an application that is already serving,
+    /// without touching the one that is.
+    ///
+    /// This is the first half of a version change. The new isolate is built on
+    /// a thread of its own and is not reachable: [`Self::dispatch`] still sends
+    /// every request to the version that is serving, and no queue poller is
+    /// started for the new one. Building can take as long as it takes -- a
+    /// module that has to be transpiled and evaluated is the slow part of a
+    /// deployment -- and the application answers normally throughout.
+    ///
+    /// Hand the result to [`Self::activate`] to swap, or to [`Self::discard`]
+    /// to throw it away. Until one of those happens the application holds two
+    /// runtime threads and two isolates, which is the memory cost of not
+    /// having a gap.
+    ///
+    /// A build that fails leaves the running version untouched and returns the
+    /// error: the caller has taken nothing away, so there is nothing to put
+    /// back.
+    pub async fn stage_app(
+        &self,
+        tenant: String,
+        code: String,
+        spec: IsolateSpec,
+    ) -> Result<StagedVersion> {
+        self.build(tenant, code, spec, true).await
+    }
+
+    /// Build an isolate on a thread of its own and hand back the claim on it.
+    async fn build(
         &self,
         tenant: String,
         code: String,
         mut spec: IsolateSpec,
-    ) -> Result<()> {
+        replacing: bool,
+    ) -> Result<StagedVersion> {
         let wiring = ServiceWiring::take_from_env(&mut spec.env);
         let execution_timeout = Duration::from_millis(spec.limits.timeout_ms);
 
         // Reserved before the isolate is built, so no second load can be sent
         // to the same thread while this one is starting.
-        let (thread_id, sender) = self.claim_thread(&tenant).await?;
-        tracing::info!("Assigning app {} to thread {}", tenant, thread_id);
+        let (thread_id, sender) = self.claim_thread(&tenant, replacing).await?;
+        tracing::info!(
+            thread_id,
+            app_id = %tenant,
+            replacing,
+            "Building the isolate of {} on thread {}",
+            tenant,
+            thread_id
+        );
 
         let (tx, rx) = oneshot::channel();
         let sent = sender.try_send(RuntimeMessage::LoadApp {
@@ -644,18 +809,167 @@ impl RuntimePool {
         };
 
         match result {
-            Ok(()) => {
-                self.start_consumers(&tenant, sender, &wiring, execution_timeout)
-                    .await;
-                Ok(())
-            }
+            Ok(()) => Ok(StagedVersion {
+                tenant,
+                thread_id,
+                sender,
+                wiring,
+                execution_timeout,
+            }),
             Err(e) => {
                 // The thread is free again; leaving it reserved would strand
                 // it, and the next application would start a thread for
                 // nothing.
-                self.release(&tenant).await;
+                self.release_staging(&tenant).await;
                 Err(e)
             }
+        }
+    }
+
+    /// Make a staged isolate the one that serves.
+    ///
+    /// The swap is one write under the placement lock, so a request either
+    /// reaches the version that was serving or the one that now is; there is
+    /// no moment in between where the application is not placed. A request
+    /// already handed to the old thread finishes there -- a runtime thread
+    /// runs one message to completion before the next -- so the retirement
+    /// posted afterwards cannot cut it short.
+    ///
+    /// The old version's queue pollers are stopped, and the new one's started,
+    /// around the swap: the stop waits for a batch in flight to finish and be
+    /// acknowledged, so no message is leased for an isolate that is about to
+    /// go away.
+    ///
+    /// It then waits for the old isolate to be dropped before returning, which
+    /// means it waits for whatever that isolate was in the middle of - up to
+    /// one execution timeout. Traffic is not waiting: the new version has been
+    /// answering since the swap. What waits is the deployment call, and the
+    /// alternative is handing the thread out while a live isolate is still on
+    /// it, which is the one thing this pool must never do.
+    ///
+    /// Fails only if the staged version is no longer this application's: the
+    /// application was unloaded while it was being built, which already
+    /// discarded it.
+    pub async fn activate(&self, staged: StagedVersion) -> Result<()> {
+        let StagedVersion {
+            tenant,
+            thread_id,
+            sender,
+            wiring,
+            execution_timeout,
+        } = staged;
+
+        let previous = {
+            let mut placement = self.placement.write().await;
+            match placement.staging.get(&tenant) {
+                Some(id) if *id == thread_id => {
+                    placement.staging.remove(&tenant);
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "the staged isolate of {tenant} on thread {thread_id} is no longer this \
+                         application's; it was unloaded while the new version was being built, \
+                         and the new version was discarded with it"
+                    ))
+                }
+            }
+            let previous = placement.of_app.insert(tenant.clone(), thread_id);
+            if let Some(previous_id) = previous {
+                // Out of circulation until its isolate is gone.
+                placement.retiring.insert(previous_id);
+            }
+            previous.map(|id| (id, placement.threads[id].sender.clone()))
+        };
+
+        // Stop before the old isolate goes away, so a batch already leased is
+        // handed to the isolate that can still handle it.
+        self.stop_consumers(&tenant).await;
+        self.start_consumers(&tenant, sender, &wiring, execution_timeout)
+            .await;
+
+        match previous {
+            Some((previous_id, previous_sender)) => {
+                tracing::info!(
+                    app_id = %tenant,
+                    from_thread = previous_id,
+                    to_thread = thread_id,
+                    "{} now serves from the isolate on thread {}; the one on thread {} answered \
+                     every request until this moment and is being retired",
+                    tenant,
+                    thread_id,
+                    previous_id
+                );
+                self.retire_thread(&tenant, previous_id, previous_sender)
+                    .await;
+            }
+            None => tracing::info!(
+                app_id = %tenant,
+                thread_id,
+                "Assigning app {} to thread {}",
+                tenant,
+                thread_id
+            ),
+        }
+
+        Ok(())
+    }
+
+    /// Throw away a staged isolate that will not be activated.
+    ///
+    /// The version that is serving is not touched -- it never stopped -- and
+    /// the thread the replacement was built on goes back into circulation.
+    pub async fn discard(&self, staged: StagedVersion) {
+        let StagedVersion {
+            tenant,
+            thread_id,
+            sender,
+            ..
+        } = staged;
+
+        {
+            let mut placement = self.placement.write().await;
+            if placement.staging.get(&tenant) == Some(&thread_id) {
+                placement.staging.remove(&tenant);
+            }
+            placement.retiring.insert(thread_id);
+        }
+
+        tracing::info!(
+            app_id = %tenant,
+            thread_id,
+            "Discarding the staged isolate of {} on thread {}; whatever was serving keeps \
+             serving",
+            tenant,
+            thread_id
+        );
+        self.retire_thread(&tenant, thread_id, sender).await;
+    }
+
+    /// Throw away a replacement that is still being built for `tenant`, if
+    /// there is one.
+    ///
+    /// Called when the application is unloaded: the staged isolate is for an
+    /// application that will not be there to receive it, and leaving it would
+    /// hold a runtime thread for the life of the process.
+    async fn discard_staged_for(&self, tenant: &str) {
+        let staged = {
+            let mut placement = self.placement.write().await;
+            placement.staging.remove(tenant).map(|id| {
+                placement.retiring.insert(id);
+                (id, placement.threads[id].sender.clone())
+            })
+        };
+
+        if let Some((thread_id, sender)) = staged {
+            tracing::info!(
+                app_id = tenant,
+                thread_id,
+                "{} is being unloaded while a replacement version was still being built on \
+                 thread {}; that replacement is thrown away",
+                tenant,
+                thread_id
+            );
+            self.retire_thread(tenant, thread_id, sender).await;
         }
     }
 
@@ -763,6 +1077,11 @@ impl RuntimePool {
         // for an app that can no longer handle it.
         self.stop_consumers(app_id).await;
 
+        // A replacement that was still being built is for an application that
+        // is going away; it would otherwise hold a runtime thread until the
+        // process ends.
+        self.discard_staged_for(app_id).await;
+
         let (tx, rx) = oneshot::channel();
         self.dispatch(
             app_id,
@@ -837,6 +1156,11 @@ impl RuntimePool {
 
         thread_apps.insert("total_threads".to_string(), placement.threads.len());
         thread_apps.insert("total_apps".to_string(), placement.of_app.len());
+        // A non-zero count here means a version change is in flight: the
+        // application is holding two threads, one serving and one being built
+        // or dropped. Standing at non-zero is the signal that a swap wedged.
+        thread_apps.insert("staging_apps".to_string(), placement.staging.len());
+        thread_apps.insert("retiring_threads".to_string(), placement.retiring.len());
 
         thread_apps
     }
@@ -1316,6 +1640,174 @@ mod tests {
 
         // Unloading an app with no running poller is still clean.
         pool.unload_app("queueless_app").await.expect("unload");
+    }
+
+    /// The version-change property, stated as the thing that used to be
+    /// false: while the replacement is being built, the application is still
+    /// answering, and with the *old* code.
+    #[tokio::test]
+    async fn the_running_version_answers_while_its_replacement_is_built() {
+        let pool = pool();
+
+        let v1 = r#"export default function handler() { return new Response("v1"); }"#;
+        let v2 = r#"export default function handler() { return new Response("v2"); }"#;
+        let app = "swap_app.production";
+
+        pool.load_app(app.to_string(), v1.to_string(), IsolateSpec::default())
+            .await
+            .expect("load v1");
+
+        let staged = pool
+            .stage_app(app.to_string(), v2.to_string(), IsolateSpec::default())
+            .await
+            .expect("stage v2");
+
+        // v2 exists, is warm, and is not reachable: before staging, the pool
+        // could only unload then load, so this is the moment where the app
+        // used to be gone.
+        let (status, _, body) = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("the app is still serving while its replacement is built");
+        assert_eq!(status, 200);
+        assert_eq!(body.as_deref(), Some("v1"));
+
+        let stats = pool.get_stats().await;
+        assert_eq!(
+            stats.get("staging_apps"),
+            Some(&1),
+            "a staged replacement must be visible as one"
+        );
+
+        pool.activate(staged).await.expect("activate v2");
+
+        let (_, _, body) = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("the app serves after the swap");
+        assert_eq!(
+            body.as_deref(),
+            Some("v2"),
+            "the swap did not make the new version the one that serves"
+        );
+
+        let stats = pool.get_stats().await;
+        assert_eq!(stats.get("staging_apps"), Some(&0));
+        assert_eq!(
+            stats.get("retiring_threads"),
+            Some(&0),
+            "the thread the old isolate was on was never given back"
+        );
+
+        pool.unload_app(app).await.expect("unload");
+    }
+
+    #[tokio::test]
+    async fn a_replacement_that_will_not_build_leaves_the_old_one_serving() {
+        let pool = pool();
+
+        let good = r#"export default function handler() { return new Response("good"); }"#;
+        let broken = "this is not JavaScript ((((";
+        let app = "broken_swap_app.production";
+
+        pool.load_app(app.to_string(), good.to_string(), IsolateSpec::default())
+            .await
+            .expect("load the working version");
+
+        let error = pool
+            .stage_app(app.to_string(), broken.to_string(), IsolateSpec::default())
+            .await
+            .expect_err("code that does not parse cannot be staged");
+
+        let (status, _, body) = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the working version stopped serving after {error}: {e}"));
+        assert_eq!(status, 200);
+        assert_eq!(body.as_deref(), Some("good"));
+
+        // The thread the failed build reserved is back in circulation.
+        assert_eq!(pool.get_stats().await.get("staging_apps"), Some(&0));
+
+        pool.unload_app(app).await.expect("unload");
+    }
+
+    #[tokio::test]
+    async fn two_replacements_cannot_be_built_for_one_app_at_once() {
+        // Both would end up activating, and the second swap would retire an
+        // isolate the first had already retired.
+        let pool = pool();
+
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+        let app = "double_stage_app.production";
+
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("load");
+        let staged = pool
+            .stage_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("stage the first replacement");
+
+        let error = pool
+            .stage_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect_err("a second replacement is refused while the first is in flight");
+        assert!(error.to_string().contains("already being built"), "{error}");
+
+        pool.discard(staged).await;
+        pool.unload_app(app).await.expect("unload");
+    }
+
+    #[tokio::test]
+    async fn unloading_an_app_throws_away_a_replacement_still_being_built() {
+        // Otherwise the staged isolate holds a runtime thread for the life of
+        // the process, for an application that is no longer on this node.
+        let pool = pool();
+
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+        let app = "abandoned_stage_app.production";
+
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("load");
+        let staged = pool
+            .stage_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("stage a replacement");
+
+        pool.unload_app(app).await.expect("unload");
+
+        let stats = pool.get_stats().await;
+        assert_eq!(stats.get("staging_apps"), Some(&0));
+        assert_eq!(stats.get("retiring_threads"), Some(&0));
+
+        // Activating it now is refused rather than resurrecting an app the
+        // node was told to stop running.
+        let error = pool
+            .activate(staged)
+            .await
+            .expect_err("the staged version went with the application");
+        assert!(error.to_string().contains("no longer"), "{error}");
+        assert!(!pool.list_apps().await.contains(&app.to_string()));
     }
 
     #[tokio::test]

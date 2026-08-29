@@ -183,11 +183,14 @@ impl Database {
             connection: Arc::new(Mutex::new(connection)),
         };
 
-        // Create tables
-        {
-            let conn = db.connection.lock().await;
-            schema::create_tables(&conn)?;
-        }
+        // Through the same path as every other query, so the one place that
+        // runs SQLite is the one place that runs SQLite - schema creation on
+        // a cold, large database is not instant either.
+        db.with_connection(|conn| {
+            schema::create_tables(conn)?;
+            Ok::<(), DatabaseError>(())
+        })
+        .await?;
 
         Ok(db)
     }
@@ -240,48 +243,52 @@ impl Database {
         }
     }
 
-    /// Save or update node information
+    /// Save or update node information.
+    ///
+    /// The session's own state and last-heartbeat are read here, before the
+    /// query, because both live behind their own async locks: awaiting them
+    /// inside the closure is impossible (it runs on a blocking thread) and
+    /// awaiting them while holding the connection would park a database
+    /// writer behind an unrelated lock.
     pub async fn save_node(&self, session: &NodeSession) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
-
         let node_role = match &session.node_role {
             NodeRole::Runtime(v) => format!("deis_runtime:{}", v),
             NodeRole::Proxy(v) => format!("deis_proxy:{}", v),
         };
 
         let ports_json = serde_json::to_string(&session.ports)?;
-        let state = session.get_state().await;
-        let state_str = match state {
-            NodeState::Connected => "Connected",
-            NodeState::Registered => "Registered",
-            NodeState::Active => "Active",
-            NodeState::Disconnected => "Disconnected",
-        };
+        let state_str = state_name(&session.get_state().await).to_string();
+        let last_heartbeat = session.last_heartbeat.lock().await.to_rfc3339();
 
-        let last_heartbeat = *session.last_heartbeat.lock().await;
+        let node_id = session.node_id.clone();
+        let instance_id = session.instance_id.clone();
+        let host = session.host.clone();
+        let connected_at = session.connected_at.to_rfc3339();
 
-        conn.execute(
-            r#"
-            INSERT OR REPLACE INTO nodes
-            (id, instance_id, node_role, version, host, ports, state, connected_at, last_heartbeat, power_reserve, metadata)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            "#,
-            params![
-                &session.node_id,
-                &session.instance_id,
-                node_role,
-                "",  // version extracted from node_role
-                &session.host,
-                ports_json,
-                state_str,
-                session.connected_at.to_rfc3339(),
-                last_heartbeat.to_rfc3339(),
-                0,  // power_reserve - will be updated from heartbeats
-                None::<String>,  // metadata
-            ],
-        )?;
-
-        Ok(())
+        self.with_connection(move |conn| {
+            conn.execute(
+                r#"
+                INSERT OR REPLACE INTO nodes
+                (id, instance_id, node_role, version, host, ports, state, connected_at, last_heartbeat, power_reserve, metadata)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    node_id,
+                    instance_id,
+                    node_role,
+                    "",  // version extracted from node_role
+                    host,
+                    ports_json,
+                    state_str,
+                    connected_at,
+                    last_heartbeat,
+                    0,  // power_reserve - will be updated from heartbeats
+                    None::<String>,  // metadata
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Update node state
@@ -290,80 +297,80 @@ impl Database {
         node_id: &str,
         state: NodeState,
     ) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.to_string();
+        let state_str = state_name(&state);
 
-        let state_str = match state {
-            NodeState::Connected => "Connected",
-            NodeState::Registered => "Registered",
-            NodeState::Active => "Active",
-            NodeState::Disconnected => "Disconnected",
-        };
-
-        conn.execute(
-            "UPDATE nodes SET state = ?1 WHERE id = ?2",
-            params![state_str, node_id],
-        )?;
-
-        Ok(())
+        self.with_connection(move |conn| {
+            conn.execute(
+                "UPDATE nodes SET state = ?1 WHERE id = ?2",
+                params![state_str, node_id],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Save heartbeat entry
     pub async fn save_heartbeat(&self, entry: &HeartbeatEntry) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
+        let entry = entry.clone();
 
-        conn.execute(
-            r#"
-            INSERT INTO heartbeats (node_id, instance_id, timestamp, power_reserve, latency_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            "#,
-            params![
-                &entry.node_id,
-                &entry.instance_id,
-                entry.timestamp.to_rfc3339(),
-                entry.power_reserve as i64,
-                entry.latency_ms,
-            ],
-        )?;
+        self.with_connection(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO heartbeats (node_id, instance_id, timestamp, power_reserve, latency_ms)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    &entry.node_id,
+                    &entry.instance_id,
+                    entry.timestamp.to_rfc3339(),
+                    entry.power_reserve as i64,
+                    entry.latency_ms,
+                ],
+            )?;
 
-        // Update node's last_heartbeat and power_reserve
-        conn.execute(
-            "UPDATE nodes SET last_heartbeat = ?1, power_reserve = ?2 WHERE id = ?3",
-            params![
-                entry.timestamp.to_rfc3339(),
-                entry.power_reserve as i64,
-                &entry.node_id
-            ],
-        )?;
-
-        Ok(())
+            // Update node's last_heartbeat and power_reserve
+            conn.execute(
+                "UPDATE nodes SET last_heartbeat = ?1, power_reserve = ?2 WHERE id = ?3",
+                params![
+                    entry.timestamp.to_rfc3339(),
+                    entry.power_reserve as i64,
+                    &entry.node_id
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Save command entry
     pub async fn save_command(&self, cmd: &CommandEntry) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
+        let cmd = cmd.clone();
 
-        conn.execute(
-            r#"
-            INSERT INTO commands
-            (id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            "#,
-            params![
-                &cmd.id,
-                &cmd.node_id,
-                &cmd.command_type,
-                serde_json::to_string(&cmd.command_data)?,
-                cmd.status.as_str(),
-                cmd.created_at.to_rfc3339(),
-                cmd.sent_at.map(|t| t.to_rfc3339()),
-                cmd.completed_at.map(|t| t.to_rfc3339()),
-                cmd.timeout_at.map(|t| t.to_rfc3339()),
-                cmd.response_data.as_ref().map(serde_json::to_string).transpose()?,
-                &cmd.error_message,
-            ],
-        )?;
-
-        Ok(())
+        self.with_connection(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO commands
+                (id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+                params![
+                    &cmd.id,
+                    &cmd.node_id,
+                    &cmd.command_type,
+                    serde_json::to_string(&cmd.command_data)?,
+                    cmd.status.as_str(),
+                    cmd.created_at.to_rfc3339(),
+                    cmd.sent_at.map(|t| t.to_rfc3339()),
+                    cmd.completed_at.map(|t| t.to_rfc3339()),
+                    cmd.timeout_at.map(|t| t.to_rfc3339()),
+                    cmd.response_data.as_ref().map(serde_json::to_string).transpose()?,
+                    &cmd.error_message,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Update command status
@@ -374,61 +381,65 @@ impl Database {
         response_data: Option<JsonValue>,
         error_message: Option<String>,
     ) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
+        let command_id = command_id.to_string();
 
-        let now = Utc::now().to_rfc3339();
-        let completed_at = match status {
-            CommandStatus::Completed | CommandStatus::Failed | CommandStatus::Timeout => {
-                Some(now.clone())
-            }
-            _ => None,
-        };
+        self.with_connection(move |conn| {
+            let now = Utc::now().to_rfc3339();
+            let completed_at = match status {
+                CommandStatus::Completed | CommandStatus::Failed | CommandStatus::Timeout => {
+                    Some(now.clone())
+                }
+                _ => None,
+            };
 
-        conn.execute(
-            r#"
-            UPDATE commands
-            SET status = ?1, completed_at = ?2, response_data = ?3, error_message = ?4
-            WHERE id = ?5
-            "#,
-            params![
-                status.as_str(),
-                completed_at,
-                response_data
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
-                error_message,
-                command_id,
-            ],
-        )?;
-
-        Ok(())
+            conn.execute(
+                r#"
+                UPDATE commands
+                SET status = ?1, completed_at = ?2, response_data = ?3, error_message = ?4
+                WHERE id = ?5
+                "#,
+                params![
+                    status.as_str(),
+                    completed_at,
+                    response_data
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    error_message,
+                    command_id,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Save event
     pub async fn save_event(&self, event: &Event) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
+        let event = event.clone();
 
-        conn.execute(
-            r#"
-            INSERT INTO events (event_type, node_id, severity, message, metadata, timestamp)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            "#,
-            params![
-                &event.event_type,
-                &event.node_id,
-                event.severity.as_str(),
-                &event.message,
-                event
-                    .metadata
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-
-        Ok(())
+        self.with_connection(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO events (event_type, node_id, severity, message, metadata, timestamp)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    &event.event_type,
+                    &event.node_id,
+                    event.severity.as_str(),
+                    &event.message,
+                    event
+                        .metadata
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Get recent heartbeats for a node
@@ -437,213 +448,203 @@ impl Database {
         node_id: &str,
         limit: usize,
     ) -> Result<Vec<HeartbeatEntry>, DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.to_string();
 
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT node_id, instance_id, timestamp, power_reserve, latency_ms
-            FROM heartbeats
-            WHERE node_id = ?1
-            ORDER BY timestamp DESC
-            LIMIT ?2
-            "#,
-        )?;
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT node_id, instance_id, timestamp, power_reserve, latency_ms
+                FROM heartbeats
+                WHERE node_id = ?1
+                ORDER BY timestamp DESC
+                LIMIT ?2
+                "#,
+            )?;
 
-        let rows = stmt.query_map(params![node_id, limit], |row| {
-            let timestamp_str: String = row.get(2)?;
-            let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .with_timezone(&Utc);
+            let rows = stmt.query_map(params![node_id, limit], |row| {
+                let timestamp_str: String = row.get(2)?;
+                let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                    .with_timezone(&Utc);
 
-            Ok(HeartbeatEntry {
-                node_id: row.get(0)?,
-                instance_id: row.get(1)?,
-                timestamp,
-                power_reserve: row.get::<_, i64>(3)? as u8,
-                latency_ms: row.get(4)?,
-            })
-        })?;
+                Ok(HeartbeatEntry {
+                    node_id: row.get(0)?,
+                    instance_id: row.get(1)?,
+                    timestamp,
+                    power_reserve: row.get::<_, i64>(3)? as u8,
+                    latency_ms: row.get(4)?,
+                })
+            })?;
 
-        let mut heartbeats = Vec::new();
-        for row in rows {
-            heartbeats.push(row?);
-        }
+            let mut heartbeats = Vec::new();
+            for row in rows {
+                heartbeats.push(row?);
+            }
 
-        Ok(heartbeats)
+            Ok(heartbeats)
+        })
+        .await
     }
 
     /// Clean old heartbeat records (keep last N per node)
     pub async fn cleanup_old_heartbeats(&self, keep_count: usize) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
-
-        conn.execute(
-            r#"
-            DELETE FROM heartbeats
-            WHERE id NOT IN (
-                SELECT id FROM heartbeats
-                ORDER BY timestamp DESC
-                LIMIT ?1
-            )
-            "#,
-            params![keep_count],
-        )?;
-
-        Ok(())
+        self.with_connection(move |conn| {
+            conn.execute(
+                r#"
+                DELETE FROM heartbeats
+                WHERE id NOT IN (
+                    SELECT id FROM heartbeats
+                    ORDER BY timestamp DESC
+                    LIMIT ?1
+                )
+                "#,
+                params![keep_count],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Load all configs from database
     pub async fn load_all_configs(&self) -> Result<Vec<ConfigEntry>, DatabaseError> {
-        let conn = self.connection.lock().await;
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT node_id, config_key, config_value, version_timestamp, created_at, updated_at
+                FROM configs
+                ORDER BY node_id, config_key
+                "#,
+            )?;
 
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT node_id, config_key, config_value, version_timestamp, created_at, updated_at
-            FROM configs
-            ORDER BY node_id, config_key
-            "#,
-        )?;
+            let rows = stmt.query_map([], |row| {
+                let version_timestamp_str: String = row.get(3)?;
+                let created_at_str: String = row.get(4)?;
+                let updated_at_str: String = row.get(5)?;
+                let config_value_str: String = row.get(2)?;
 
-        let rows = stmt.query_map([], |row| {
-            let version_timestamp_str: String = row.get(3)?;
-            let created_at_str: String = row.get(4)?;
-            let updated_at_str: String = row.get(5)?;
-            let config_value_str: String = row.get(2)?;
+                let version_timestamp = DateTime::parse_from_rfc3339(&version_timestamp_str)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                    .with_timezone(&Utc);
 
-            let version_timestamp = DateTime::parse_from_rfc3339(&version_timestamp_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .with_timezone(&Utc);
+                let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                    .with_timezone(&Utc);
 
-            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .with_timezone(&Utc);
+                let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                    .with_timezone(&Utc);
 
-            let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .with_timezone(&Utc);
+                let config_value: JsonValue = serde_json::from_str(&config_value_str)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-            let config_value: JsonValue = serde_json::from_str(&config_value_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                Ok(ConfigEntry {
+                    node_id: row.get(0)?,
+                    config_key: row.get(1)?,
+                    config_value,
+                    version_timestamp,
+                    created_at,
+                    updated_at,
+                })
+            })?;
 
-            Ok(ConfigEntry {
-                node_id: row.get(0)?,
-                config_key: row.get(1)?,
-                config_value,
-                version_timestamp,
-                created_at,
-                updated_at,
-            })
-        })?;
+            let mut configs = Vec::new();
+            for row in rows {
+                configs.push(row?);
+            }
 
-        let mut configs = Vec::new();
-        for row in rows {
-            configs.push(row?);
-        }
-
-        Ok(configs)
+            Ok(configs)
+        })
+        .await
     }
 
     /// Save configs for a node (replaces all existing configs)
+    ///
+    /// One transaction, unwound by rusqlite itself if anything in it fails:
+    /// the previous hand-rolled `BEGIN` / `ROLLBACK` pairs had to be repeated
+    /// at every early return, and a return that forgot one left the write open
+    /// on the process's single connection - every later query then ran inside
+    /// somebody else's half-finished transaction.
     pub async fn save_configs(
         &self,
         node_id: &str,
         configs: &std::collections::HashMap<String, JsonValue>,
         version_timestamp: DateTime<Utc>,
     ) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.to_string();
+        let configs = configs.clone();
 
-        // Begin transaction
-        conn.execute("BEGIN TRANSACTION", [])?;
+        self.with_connection(move |conn| {
+            let tx = conn.unchecked_transaction()?;
 
-        // Get existing config keys to determine if this is create or update
-        let existing_keys: std::collections::HashSet<String> = {
-            let mut stmt = match conn.prepare("SELECT config_key FROM configs WHERE node_id = ?1") {
-                Ok(s) => s,
-                Err(e) => {
-                    conn.execute("ROLLBACK", []).ok();
-                    return Err(e.into());
-                }
+            // Get existing config keys to determine if this is create or update
+            let existing_keys: std::collections::HashSet<String> = {
+                let mut stmt = tx.prepare("SELECT config_key FROM configs WHERE node_id = ?1")?;
+                let rows = stmt.query_map(params![node_id], |row| row.get::<_, String>(0))?;
+                rows.filter_map(|r| r.ok()).collect()
             };
 
-            let existing_keys_result =
-                stmt.query_map(params![node_id], |row| row.get::<_, String>(0));
-            match existing_keys_result {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(e) => {
-                    conn.execute("ROLLBACK", []).ok();
-                    return Err(e.into());
-                }
+            // Delete existing configs for this node
+            tx.execute("DELETE FROM configs WHERE node_id = ?1", params![node_id])?;
+
+            // Insert new configs and record history
+            let now = Utc::now();
+            for (key, value) in &configs {
+                let value_str = serde_json::to_string(value)?;
+
+                // Insert into configs table
+                tx.execute(
+                    r#"
+                    INSERT INTO configs (node_id, config_key, config_value, version_timestamp, created_at, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        node_id,
+                        key,
+                        value_str,
+                        version_timestamp.to_rfc3339(),
+                        now.to_rfc3339(),
+                        now.to_rfc3339(),
+                    ],
+                )?;
+
+                // Record in history (determine operation type)
+                let operation = if existing_keys.contains(key) {
+                    "update"
+                } else {
+                    "create"
+                };
+
+                tx.execute(
+                    r#"
+                    INSERT INTO config_history (node_id, config_key, config_value, version_timestamp, operation, created_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        node_id,
+                        key,
+                        value_str,
+                        version_timestamp.to_rfc3339(),
+                        operation,
+                        now.to_rfc3339(),
+                    ],
+                )?;
             }
-        };
 
-        // Delete existing configs for this node
-        if let Err(e) = conn.execute("DELETE FROM configs WHERE node_id = ?1", params![node_id]) {
-            conn.execute("ROLLBACK", []).ok();
-            return Err(e.into());
-        }
-
-        // Insert new configs and record history
-        let now = Utc::now();
-        for (key, value) in configs {
-            let value_str = serde_json::to_string(value)?;
-
-            // Insert into configs table
-            if let Err(e) = conn.execute(
-                r#"
-                INSERT INTO configs (node_id, config_key, config_value, version_timestamp, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                "#,
-                params![
-                    node_id,
-                    key,
-                    value_str,
-                    version_timestamp.to_rfc3339(),
-                    now.to_rfc3339(),
-                    now.to_rfc3339(),
-                ],
-            ) {
-                conn.execute("ROLLBACK", []).ok();
-                return Err(e.into());
-            }
-
-            // Record in history (determine operation type)
-            let operation = if existing_keys.contains(key) {
-                "update"
-            } else {
-                "create"
-            };
-
-            if let Err(e) = conn.execute(
-                r#"
-                INSERT INTO config_history (node_id, config_key, config_value, version_timestamp, operation, created_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                "#,
-                params![
-                    node_id,
-                    key,
-                    value_str,
-                    version_timestamp.to_rfc3339(),
-                    operation,
-                    now.to_rfc3339(),
-                ],
-            ) {
-                conn.execute("ROLLBACK", []).ok();
-                return Err(e.into());
-            }
-        }
-
-        // Commit transaction
-        conn.execute("COMMIT", [])?;
-
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     /// Delete all configs for a node
     pub async fn delete_node_configs(&self, node_id: &str) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.to_string();
 
-        conn.execute("DELETE FROM configs WHERE node_id = ?1", params![node_id])?;
-
-        Ok(())
+        self.with_connection(move |conn| {
+            conn.execute("DELETE FROM configs WHERE node_id = ?1", params![node_id])?;
+            Ok(())
+        })
+        .await
     }
 
     /// Delete a single config key for a node
@@ -652,64 +653,50 @@ impl Database {
         node_id: &str,
         config_key: &str,
     ) -> Result<(), DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.to_string();
+        let config_key = config_key.to_string();
 
-        // Begin transaction
-        conn.execute("BEGIN TRANSACTION", [])?;
+        self.with_connection(move |conn| {
+            let tx = conn.unchecked_transaction()?;
 
-        // Get the current config value before deleting (for history)
-        let mut stmt = match conn.prepare(
-            "SELECT config_value, version_timestamp FROM configs WHERE node_id = ?1 AND config_key = ?2"
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                conn.execute("ROLLBACK", []).ok();
-                return Err(e.into());
+            // Get the current config value before deleting (for history)
+            let config_data = {
+                let mut stmt = tx.prepare(
+                    "SELECT config_value, version_timestamp FROM configs WHERE node_id = ?1 AND config_key = ?2",
+                )?;
+                stmt.query_row(params![node_id, config_key], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .ok()
+            };
+
+            tx.execute(
+                "DELETE FROM configs WHERE node_id = ?1 AND config_key = ?2",
+                params![node_id, config_key],
+            )?;
+
+            // Record deletion in history if config existed
+            if let Some((config_value, version_timestamp)) = config_data {
+                tx.execute(
+                    r#"
+                    INSERT INTO config_history (node_id, config_key, config_value, version_timestamp, operation, created_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        node_id,
+                        config_key,
+                        config_value,
+                        version_timestamp,
+                        "delete",
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
             }
-        };
 
-        let config_data = stmt
-            .query_row(params![node_id, config_key], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok();
-        drop(stmt);
-
-        // Delete from configs table
-        if let Err(e) = conn.execute(
-            "DELETE FROM configs WHERE node_id = ?1 AND config_key = ?2",
-            params![node_id, config_key],
-        ) {
-            conn.execute("ROLLBACK", []).ok();
-            return Err(e.into());
-        }
-
-        // Record deletion in history if config existed
-        if let Some((config_value, version_timestamp)) = config_data {
-            let now = Utc::now();
-            if let Err(e) = conn.execute(
-                r#"
-                INSERT INTO config_history (node_id, config_key, config_value, version_timestamp, operation, created_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                "#,
-                params![
-                    node_id,
-                    config_key,
-                    config_value,
-                    version_timestamp,
-                    "delete",
-                    now.to_rfc3339(),
-                ],
-            ) {
-                conn.execute("ROLLBACK", []).ok();
-                return Err(e.into());
-            }
-        }
-
-        // Commit transaction
-        conn.execute("COMMIT", [])?;
-
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     /// Get config history for a node
@@ -720,51 +707,29 @@ impl Database {
         node_id: &str,
         limit: usize,
     ) -> Result<Vec<ConfigHistoryEntry>, DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.to_string();
 
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, node_id, config_key, config_value, version_timestamp, operation, created_at
-            FROM config_history
-            WHERE node_id = ?1
-            ORDER BY created_at DESC
-            LIMIT ?2
-            "#,
-        )?;
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, node_id, config_key, config_value, version_timestamp, operation, created_at
+                FROM config_history
+                WHERE node_id = ?1
+                ORDER BY created_at DESC
+                LIMIT ?2
+                "#,
+            )?;
 
-        let rows = stmt.query_map(params![node_id, limit], |row| {
-            let config_value_str: String = row.get(3)?;
-            let version_timestamp_str: String = row.get(4)?;
-            let created_at_str: String = row.get(6)?;
+            let rows = stmt.query_map(params![node_id, limit], map_config_history)?;
 
-            let config_value: JsonValue = serde_json::from_str(&config_value_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let mut history = Vec::new();
+            for row in rows {
+                history.push(row?);
+            }
 
-            let version_timestamp = DateTime::parse_from_rfc3339(&version_timestamp_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .with_timezone(&Utc);
-
-            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .with_timezone(&Utc);
-
-            Ok(ConfigHistoryEntry {
-                id: row.get(0)?,
-                node_id: row.get(1)?,
-                config_key: row.get(2)?,
-                config_value,
-                version_timestamp,
-                operation: row.get(5)?,
-                created_at,
-            })
-        })?;
-
-        let mut history = Vec::new();
-        for row in rows {
-            history.push(row?);
-        }
-
-        Ok(history)
+            Ok(history)
+        })
+        .await
     }
 
     /// Get config history for a specific config key
@@ -776,51 +741,30 @@ impl Database {
         config_key: &str,
         limit: usize,
     ) -> Result<Vec<ConfigHistoryEntry>, DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.to_string();
+        let config_key = config_key.to_string();
 
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, node_id, config_key, config_value, version_timestamp, operation, created_at
-            FROM config_history
-            WHERE node_id = ?1 AND config_key = ?2
-            ORDER BY created_at DESC
-            LIMIT ?3
-            "#,
-        )?;
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, node_id, config_key, config_value, version_timestamp, operation, created_at
+                FROM config_history
+                WHERE node_id = ?1 AND config_key = ?2
+                ORDER BY created_at DESC
+                LIMIT ?3
+                "#,
+            )?;
 
-        let rows = stmt.query_map(params![node_id, config_key, limit], |row| {
-            let config_value_str: String = row.get(3)?;
-            let version_timestamp_str: String = row.get(4)?;
-            let created_at_str: String = row.get(6)?;
+            let rows = stmt.query_map(params![node_id, config_key, limit], map_config_history)?;
 
-            let config_value: JsonValue = serde_json::from_str(&config_value_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let mut history = Vec::new();
+            for row in rows {
+                history.push(row?);
+            }
 
-            let version_timestamp = DateTime::parse_from_rfc3339(&version_timestamp_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .with_timezone(&Utc);
-
-            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .with_timezone(&Utc);
-
-            Ok(ConfigHistoryEntry {
-                id: row.get(0)?,
-                node_id: row.get(1)?,
-                config_key: row.get(2)?,
-                config_value,
-                version_timestamp,
-                operation: row.get(5)?,
-                created_at,
-            })
-        })?;
-
-        let mut history = Vec::new();
-        for row in rows {
-            history.push(row?);
-        }
-
-        Ok(history)
+            Ok(history)
+        })
+        .await
     }
 
     /// Get config value at a specific version timestamp
@@ -832,40 +776,46 @@ impl Database {
         config_key: &str,
         version_timestamp: DateTime<Utc>,
     ) -> Result<Option<JsonValue>, DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.to_string();
+        let config_key = config_key.to_string();
 
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT config_value
-            FROM config_history
-            WHERE node_id = ?1 AND config_key = ?2 AND version_timestamp <= ?3
-            ORDER BY version_timestamp DESC
-            LIMIT 1
-            "#,
-        )?;
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT config_value
+                FROM config_history
+                WHERE node_id = ?1 AND config_key = ?2 AND version_timestamp <= ?3
+                ORDER BY version_timestamp DESC
+                LIMIT 1
+                "#,
+            )?;
 
-        let result = stmt.query_row(
-            params![node_id, config_key, version_timestamp.to_rfc3339()],
-            |row| {
-                let config_value_str: String = row.get(0)?;
-                let config_value: JsonValue = serde_json::from_str(&config_value_str)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                Ok(config_value)
-            },
-        );
+            let result = stmt.query_row(
+                params![node_id, config_key, version_timestamp.to_rfc3339()],
+                |row| {
+                    let config_value_str: String = row.get(0)?;
+                    let config_value: JsonValue = serde_json::from_str(&config_value_str)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    Ok(config_value)
+                },
+            );
 
-        match result {
-            Ok(value) => Ok(Some(value)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+            match result {
+                Ok(value) => Ok(Some(value)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
 
     /// Count total events
     pub async fn count_events(&self) -> Result<usize, DatabaseError> {
-        let conn = self.connection.lock().await;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
-        Ok(count as usize)
+        self.with_connection(|conn| {
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+            Ok(count as usize)
+        })
+        .await
     }
 
     /// List events with filters
@@ -876,97 +826,105 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<EventEntry>, DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.map(str::to_string);
+        let severity = severity.map(str::to_string);
 
-        let mut sql = "SELECT event_type, node_id, severity, message, metadata, timestamp FROM events WHERE 1=1".to_string();
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        self.with_connection(move |conn| {
+            let mut sql = "SELECT event_type, node_id, severity, message, metadata, timestamp FROM events WHERE 1=1".to_string();
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-        if let Some(wid) = node_id {
-            sql.push_str(&format!(" AND node_id = ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(wid.to_string()));
-        }
-        if let Some(sev) = severity {
-            sql.push_str(&format!(" AND severity = ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(sev.to_string()));
-        }
-        sql.push_str(&format!(
-            " ORDER BY timestamp DESC LIMIT ?{} OFFSET ?{}",
-            params_vec.len() + 1,
-            params_vec.len() + 2
-        ));
-        params_vec.push(Box::new(limit as i64));
-        params_vec.push(Box::new(offset as i64));
+            if let Some(wid) = node_id {
+                sql.push_str(&format!(" AND node_id = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(wid));
+            }
+            if let Some(sev) = severity {
+                sql.push_str(&format!(" AND severity = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(sev));
+            }
+            sql.push_str(&format!(
+                " ORDER BY timestamp DESC LIMIT ?{} OFFSET ?{}",
+                params_vec.len() + 1,
+                params_vec.len() + 2
+            ));
+            params_vec.push(Box::new(limit as i64));
+            params_vec.push(Box::new(offset as i64));
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
 
-        let mut stmt = conn.prepare(&sql)?;
-        let events = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok(EventEntry {
-                event_type: row.get(0)?,
-                node_id: row.get(1)?,
-                severity: EventSeverity::from_str(&row.get::<_, String>(2)?)
-                    .unwrap_or(EventSeverity::Info),
-                message: row.get(3)?,
-                metadata: row
-                    .get::<_, Option<String>>(4)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(Utc::now),
-            })
-        })?;
+            let mut stmt = conn.prepare(&sql)?;
+            let events = stmt.query_map(params_refs.as_slice(), |row| {
+                Ok(EventEntry {
+                    event_type: row.get(0)?,
+                    node_id: row.get(1)?,
+                    severity: EventSeverity::from_str(&row.get::<_, String>(2)?)
+                        .unwrap_or(EventSeverity::Info),
+                    message: row.get(3)?,
+                    metadata: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(Utc::now),
+                })
+            })?;
 
-        events
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DatabaseError::from)
+            events
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::from)
+        })
+        .await
     }
 
     /// Get event statistics
     pub async fn get_event_stats(&self) -> Result<serde_json::Value, DatabaseError> {
-        let conn = self.connection.lock().await;
+        self.with_connection(|conn| {
+            // Total events
+            let total: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
 
-        // Total events
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+            // By severity
+            let mut severity_stmt =
+                conn.prepare("SELECT severity, COUNT(*) FROM events GROUP BY severity")?;
+            let severity_counts = severity_stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
 
-        // By severity
-        let mut severity_stmt =
-            conn.prepare("SELECT severity, COUNT(*) FROM events GROUP BY severity")?;
-        let severity_counts = severity_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
+            let mut severity_map = serde_json::Map::new();
+            for result in severity_counts {
+                let (severity, count) = result?;
+                severity_map.insert(severity, serde_json::json!(count));
+            }
 
-        let mut severity_map = serde_json::Map::new();
-        for result in severity_counts {
-            let (severity, count) = result?;
-            severity_map.insert(severity, serde_json::json!(count));
-        }
+            // By event type
+            let mut type_stmt = conn.prepare("SELECT event_type, COUNT(*) FROM events GROUP BY event_type ORDER BY COUNT(*) DESC LIMIT 10")?;
+            let type_counts = type_stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
 
-        // By event type
-        let mut type_stmt = conn.prepare("SELECT event_type, COUNT(*) FROM events GROUP BY event_type ORDER BY COUNT(*) DESC LIMIT 10")?;
-        let type_counts = type_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
+            let mut type_map = serde_json::Map::new();
+            for result in type_counts {
+                let (event_type, count) = result?;
+                type_map.insert(event_type, serde_json::json!(count));
+            }
 
-        let mut type_map = serde_json::Map::new();
-        for result in type_counts {
-            let (event_type, count) = result?;
-            type_map.insert(event_type, serde_json::json!(count));
-        }
-
-        Ok(serde_json::json!({
-            "total": total,
-            "by_severity": severity_map,
-            "by_type": type_map
-        }))
+            Ok(serde_json::json!({
+                "total": total,
+                "by_severity": severity_map,
+                "by_type": type_map
+            }))
+        })
+        .await
     }
 
     /// Count total commands
     pub async fn count_commands(&self) -> Result<usize, DatabaseError> {
-        let conn = self.connection.lock().await;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))?;
-        Ok(count as usize)
+        self.with_connection(|conn| {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))?;
+            Ok(count as usize)
+        })
+        .await
     }
 
     /// List commands with optional node_id filter
@@ -974,28 +932,30 @@ impl Database {
         &self,
         node_id: Option<&str>,
     ) -> Result<Vec<CommandEntry>, DatabaseError> {
-        let conn = self.connection.lock().await;
+        let node_id = node_id.map(str::to_string);
 
-        let mut sql = "SELECT id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message \
-                       FROM commands".to_string();
+        self.with_connection(move |conn| {
+            let mut sql = "SELECT id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message \
+                           FROM commands".to_string();
 
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(wid) = node_id {
-            sql.push_str(" WHERE node_id = ?1");
-            params_vec.push(Box::new(wid.to_string()));
-        }
-        sql.push_str(" ORDER BY created_at DESC");
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            if let Some(wid) = node_id {
+                sql.push_str(" WHERE node_id = ?1");
+                params_vec.push(Box::new(wid));
+            }
+            sql.push_str(" ORDER BY created_at DESC");
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
 
-        let mut stmt = conn.prepare(&sql)?;
-        let commands =
-            stmt.query_map(params_refs.as_slice(), |row| self.row_to_command_entry(row))?;
+            let mut stmt = conn.prepare(&sql)?;
+            let commands = stmt.query_map(params_refs.as_slice(), map_command_entry)?;
 
-        commands
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DatabaseError::from)
+            commands
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::from)
+        })
+        .await
     }
 
     /// Get a single command by ID
@@ -1003,63 +963,108 @@ impl Database {
         &self,
         command_id: &str,
     ) -> Result<Option<CommandEntry>, DatabaseError> {
-        let conn = self.connection.lock().await;
+        let command_id = command_id.to_string();
 
-        let mut stmt = conn.prepare(
-            "SELECT id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message \
-             FROM commands WHERE id = ?1"
-        )?;
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, node_id, command_type, command_data, status, created_at, sent_at, completed_at, timeout_at, response_data, error_message \
+                 FROM commands WHERE id = ?1"
+            )?;
 
-        let mut rows = stmt.query([command_id])?;
+            let mut rows = stmt.query([command_id])?;
 
-        if let Some(row) = rows.next()? {
-            Ok(Some(self.row_to_command_entry(row)?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    // Helper method to convert row to CommandEntry
-    fn row_to_command_entry(&self, row: &rusqlite::Row) -> Result<CommandEntry, rusqlite::Error> {
-        Ok(CommandEntry {
-            id: row.get(0)?,
-            node_id: row.get(1)?,
-            command_type: row.get(2)?,
-            command_data: row
-                .get::<_, Option<String>>(3)?
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(serde_json::json!({})),
-            status: CommandStatus::from_str(&row.get::<_, String>(4)?)
-                .unwrap_or(CommandStatus::Pending),
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
-            sent_at: row
-                .get::<_, Option<String>>(6)?
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
-            completed_at: row
-                .get::<_, Option<String>>(7)?
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
-            timeout_at: row
-                .get::<_, Option<String>>(8)?
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
-            response_data: row
-                .get::<_, Option<String>>(9)?
-                .and_then(|s| serde_json::from_str(&s).ok()),
-            error_message: row.get(10)?,
+            if let Some(row) = rows.next()? {
+                Ok(Some(map_command_entry(row)?))
+            } else {
+                Ok(None)
+            }
         })
+        .await
     }
 
     /// Count total heartbeats
     pub async fn count_heartbeats(&self) -> Result<usize, DatabaseError> {
-        let conn = self.connection.lock().await;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM heartbeats", [], |row| row.get(0))?;
-        Ok(count as usize)
+        self.with_connection(|conn| {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM heartbeats", [], |row| row.get(0))?;
+            Ok(count as usize)
+        })
+        .await
     }
+}
+
+/// How a node state is spelled in the `nodes` table.
+fn state_name(state: &NodeState) -> &'static str {
+    match state {
+        NodeState::Connected => "Connected",
+        NodeState::Registered => "Registered",
+        NodeState::Active => "Active",
+        NodeState::Disconnected => "Disconnected",
+    }
+}
+
+/// Free functions, not methods: the row mappers run inside closures that are
+/// moved to a blocking thread, so anything they capture would have to be
+/// `'static` - and `&self` is not.
+fn map_command_entry(row: &rusqlite::Row) -> Result<CommandEntry, rusqlite::Error> {
+    Ok(CommandEntry {
+        id: row.get(0)?,
+        node_id: row.get(1)?,
+        command_type: row.get(2)?,
+        command_data: row
+            .get::<_, Option<String>>(3)?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({})),
+        status: CommandStatus::from_str(&row.get::<_, String>(4)?)
+            .unwrap_or(CommandStatus::Pending),
+        created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now),
+        sent_at: row
+            .get::<_, Option<String>>(6)?
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
+        completed_at: row
+            .get::<_, Option<String>>(7)?
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
+        timeout_at: row
+            .get::<_, Option<String>>(8)?
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
+        response_data: row
+            .get::<_, Option<String>>(9)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        error_message: row.get(10)?,
+    })
+}
+
+fn map_config_history(row: &rusqlite::Row) -> Result<ConfigHistoryEntry, rusqlite::Error> {
+    let config_value_str: String = row.get(3)?;
+    let version_timestamp_str: String = row.get(4)?;
+    let created_at_str: String = row.get(6)?;
+
+    let config_value: JsonValue = serde_json::from_str(&config_value_str)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+    let version_timestamp = DateTime::parse_from_rfc3339(&version_timestamp_str)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .with_timezone(&Utc);
+
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .with_timezone(&Utc);
+
+    Ok(ConfigHistoryEntry {
+        id: row.get(0)?,
+        node_id: row.get(1)?,
+        config_key: row.get(2)?,
+        config_value,
+        version_timestamp,
+        operation: row.get(5)?,
+        created_at,
+    })
 }
 
 #[cfg(test)]

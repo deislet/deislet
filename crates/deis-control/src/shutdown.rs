@@ -66,3 +66,124 @@ fn report_interrupt(result: std::io::Result<()>) {
         ),
     }
 }
+
+/// A stop signal several parts of the process can wait on.
+///
+/// [`signal`] resolves once, in one place. Everything that has to react to a
+/// stop needs the same edge: the HTTP/gRPC server starts draining, the cron
+/// scheduler stops firing, the node health poller stops probing, and every
+/// open `EstablishChannel` stream is closed so the drain does not sit out its
+/// whole grace period waiting for streams that end only when a node goes away.
+///
+/// Cloning gives another view of the same signal; triggering it once wakes
+/// every waiter, and a waiter that arrives after the trigger returns
+/// immediately rather than waiting for a second edge that never comes.
+#[derive(Clone)]
+pub struct Shutdown {
+    /// `Arc` because `watch::Sender` is not itself clonable, and every holder
+    /// must be able to trigger as well as observe - the signal listener does
+    /// one, the servers do the other.
+    state: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Shutdown {
+    pub fn new() -> Self {
+        let (state, _) = tokio::sync::watch::channel(false);
+        Self {
+            state: std::sync::Arc::new(state),
+        }
+    }
+
+    /// Announce that the process is stopping. Idempotent.
+    pub fn trigger(&self) {
+        // `send_replace` rather than `send`, and the difference is not
+        // cosmetic: `send` refuses when no receiver exists at that instant and
+        // leaves the value untouched, so a stop announced before the loops had
+        // subscribed - or between two of the poller's `select` arms, which
+        // subscribes and drops a receiver per tick - would be dropped on the
+        // floor. Nothing would ever see it, and the process would keep firing
+        // cron and probing nodes until it was killed. `send_replace` always
+        // stores the value, so a waiter arriving afterwards still sees it.
+        self.state.send_replace(true);
+    }
+
+    /// Whether the stop has already been announced.
+    ///
+    /// Used by loops that must not begin another unit of work - a cron fire, a
+    /// health probe - after the signal, without having to be at an await point.
+    pub fn is_triggered(&self) -> bool {
+        *self.state.borrow()
+    }
+
+    /// Resolve when the stop is announced, immediately if it already was.
+    pub async fn wait(&self) {
+        let mut rx = self.state.subscribe();
+        loop {
+            let triggered = *rx.borrow_and_update();
+            if triggered {
+                return;
+            }
+            // The sender lives in this same struct, so `changed` can only
+            // fail if every sender was dropped, which means nothing will
+            // ever trigger: treat it as "stop waiting" rather than hang.
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A [`Shutdown`] wired to the process's stop signals.
+///
+/// The listener runs in its own task so the caller can hand clones of the
+/// handle to the servers and the background loops before any of them start.
+pub fn on_signal() -> Shutdown {
+    let shutdown = Shutdown::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            signal().await;
+            shutdown.trigger();
+        }
+    });
+    shutdown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A waiter that arrives after the trigger must not wait for a second
+    /// edge: the background loops subscribe at different moments, and one
+    /// that subscribed late would otherwise keep firing at nodes this
+    /// process is walking away from.
+    #[tokio::test]
+    async fn a_late_waiter_sees_a_stop_that_already_happened() {
+        let shutdown = Shutdown::new();
+        assert!(!shutdown.is_triggered());
+        shutdown.trigger();
+        assert!(shutdown.is_triggered());
+        shutdown.wait().await;
+    }
+
+    #[tokio::test]
+    async fn every_clone_is_woken_by_one_trigger() {
+        let shutdown = Shutdown::new();
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move { shutdown.wait().await })
+            })
+            .collect();
+        shutdown.trigger();
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+    }
+}

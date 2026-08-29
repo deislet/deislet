@@ -170,6 +170,9 @@ export default function handler(context: any): Response {
             attempts,
             lease_expires_at: 0,
             created_at: 1_700_000_000,
+            // Never handed to the application; the isolate is given the batch,
+            // not the lease.
+            lease_token: format!("lease-of-{id}"),
         }
     }
 
@@ -862,33 +865,179 @@ export default function handler(context: any): Response {
         }
     }
 
+    /// A running deis-store, stopped when the value is dropped.
+    ///
+    /// The KV tests below are the only place in this crate where an
+    /// application's own JavaScript reaches a real store, which is what makes
+    /// them worth the process: the chain they prove - manifest, address, op,
+    /// client, wire - has a seam in every link.
+    struct TestStore {
+        _data: tempfile::TempDir,
+        endpoint: String,
+        shutdown: Option<oneshot::Sender<()>>,
+    }
+
+    impl TestStore {
+        async fn start() -> Self {
+            let data = tempfile::TempDir::new().expect("temp dir");
+            let config = deis_store::config::Config {
+                listen: "127.0.0.1:0".to_string(),
+                data_dir: data.path().to_path_buf(),
+                ..deis_store::config::Config::default()
+            };
+            let listener = deis_store::server::bind(&config).await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let (shutdown, rx) = oneshot::channel();
+            tokio::spawn(async move {
+                deis_store::server::serve(config, listener, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve");
+            });
+            Self {
+                _data: data,
+                endpoint: format!("http://{addr}"),
+                shutdown: Some(shutdown),
+            }
+        }
+
+        fn kv_wiring(&self) -> ServiceWiring {
+            ServiceWiring {
+                declaration: ServiceDeclaration::from_names(["kv"]),
+                endpoints: ServiceEndpoints {
+                    store: Some(self.endpoint.clone()),
+                    queue: None,
+                },
+                consumers: Vec::new(),
+            }
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    /// Run one request against an app with the given wiring and hand back the
+    /// response body.
+    async fn body_of_one_request(app_id: &str, code: &str, wiring: &ServiceWiring) -> String {
+        let mut runtime = AppRuntime::new(
+            app_id.to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            wiring,
+        )
+        .expect("the isolate is built");
+        runtime.init_module().await.expect("the module loads");
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (status, _, body) = rx.await.expect("a response").expect("a response");
+        let body = body.unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
+    #[tokio::test]
+    async fn an_app_reads_back_the_metadata_it_wrote() {
+        // getWithMetadata did not exist until deis-store's GetResponse could
+        // carry the field: an app could attach metadata to a write and never
+        // see it again. The object goes out and the same object comes back,
+        // because put() JSON-encodes and this decodes.
+        let store = TestStore::start().await;
+        let code = r#"
+            export default async function handler(ctx) {
+                await ctx.services.kv.put("avatar", "png-bytes", {
+                    metadata: { contentType: "image/png", width: 64 },
+                });
+                await ctx.services.kv.put("plain", "no-metadata-here");
+                return new Response(JSON.stringify({
+                    withMetadata: await ctx.services.kv.getWithMetadata("avatar"),
+                    without: await ctx.services.kv.getWithMetadata("plain"),
+                    missing: await ctx.services.kv.getWithMetadata("never-written"),
+                }));
+            }
+        "#;
+
+        let body =
+            body_of_one_request("kv_metadata_app.production", code, &store.kv_wiring()).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+
+        assert_eq!(parsed["withMetadata"]["value"], "png-bytes");
+        assert_eq!(
+            parsed["withMetadata"]["metadata"]["contentType"],
+            "image/png"
+        );
+        assert_eq!(parsed["withMetadata"]["metadata"]["width"], 64);
+
+        // A key with no metadata is a record whose metadata is null; a key
+        // that does not exist is null itself. An app branches on those
+        // differently.
+        assert_eq!(parsed["without"]["value"], "no-metadata-here");
+        assert!(parsed["without"]["metadata"].is_null(), "{body}");
+        assert!(parsed["missing"].is_null(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_lifetime_comes_back_as_the_moment_the_entry_lapses() {
+        // The app asked for a lifetime and cannot otherwise tell how much of
+        // it is left.
+        let store = TestStore::start().await;
+        let code = r#"
+            export default async function handler(ctx) {
+                await ctx.services.kv.put("session", "abc", { expirationTtl: 3600 });
+                await ctx.services.kv.put("forever", "abc");
+                const leased = await ctx.services.kv.getWithMetadata("session");
+                const permanent = await ctx.services.kv.getWithMetadata("forever");
+                return new Response(JSON.stringify({
+                    expiration: leased.expiration,
+                    permanent: permanent.expiration,
+                    now: Math.floor(Date.now() / 1000),
+                }));
+            }
+        "#;
+
+        let body = body_of_one_request("kv_expiry_app.production", code, &store.kv_wiring()).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+
+        let expiration = parsed["expiration"].as_i64().expect("an expiry");
+        let now = parsed["now"].as_i64().expect("the app's clock");
+        assert!(
+            expiration >= now + 3595 && expiration <= now + 3605,
+            "an hour's lifetime should lapse about an hour from now: {body}"
+        );
+        assert!(
+            parsed["permanent"].is_null(),
+            "an entry written without a lifetime never lapses: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn an_app_reaches_a_real_store_through_its_binding() {
         // The whole chain in one test: the manifest declares kv, the control
         // plane's address reaches the isolate, the op finds a client, and the
         // write carries the lifetime and metadata the app asked for. Every
         // link of that was missing before wave B.
-        let data = tempfile::TempDir::new().expect("temp dir");
-        let config = deis_store::config::Config {
-            listen: "127.0.0.1:0".to_string(),
-            data_dir: data.path().to_path_buf(),
-            ..deis_store::config::Config::default()
-        };
-        let listener = deis_store::server::bind(&config).await.expect("bind");
-        let addr = listener.local_addr().expect("local addr");
-        let (shutdown, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            deis_store::server::serve(config, listener, async {
-                let _ = rx.await;
-            })
-            .await
-            .expect("serve");
-        });
+        let store = TestStore::start().await;
 
         let wiring = ServiceWiring {
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
-                store: Some(format!("http://{addr}")),
+                store: Some(store.endpoint.clone()),
                 queue: None,
             },
             consumers: Vec::new(),
@@ -928,7 +1077,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _, body) = rx2.await.unwrap().unwrap();
-        let _ = shutdown.send(());
+        drop(store);
 
         assert_eq!(status, 200, "body: {body:?}");
         let body = body.unwrap_or_default();

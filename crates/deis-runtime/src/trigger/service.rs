@@ -52,15 +52,22 @@ impl TriggerServiceImpl {
         AppKey::production(app_id)
     }
 
-    /// The same, plus a warning when the choice is actually being made.
+    /// Which running application a scheduled trigger is about.
     ///
-    /// The control plane keys its schedules by (app, environment) but
-    /// `ScheduledEvent` carries only the app, so a preview's cron arrives here
-    /// indistinguishable from production's and would run production's handler
-    /// with production's secrets. Saying so out loud is the honest half of the
-    /// fix; carrying the environment on the wire is the other half, and it
-    /// needs a field in trigger.proto.
-    fn scheduled_target(&self, app_id: &str, cron: &str) -> AppKey {
+    /// `ScheduledEvent` now carries the environment, because the control plane
+    /// keys its schedules by (app, environment) and a node runs production and
+    /// every preview of an app side by side. An empty field is a caller that
+    /// predates it and means the default environment - the same rule the HTTP
+    /// data path applies to a request with no environment header - and that is
+    /// the case worth warning about: if this node also runs other environments
+    /// of the app, the tick may belong to one of them and is about to run
+    /// production's code with production's secrets.
+    fn scheduled_target(&self, app_id: &str, environment: &str, cron: &str) -> AppKey {
+        let environment = environment.trim();
+        if !environment.is_empty() {
+            return AppKey::new(app_id, environment);
+        }
+
         let key = self.target(app_id);
         let others: Vec<String> = self
             .app_manager
@@ -74,10 +81,10 @@ impl TriggerServiceImpl {
                 app_id = %app_id,
                 cron = %cron,
                 other_environments = ?others,
-                "A scheduled trigger names an application but no environment, so it is being \
-                 run against {}. This node also runs {} other environment(s) of this app, and \
-                 a schedule that belongs to one of them is running the wrong code with the \
-                 wrong secrets until ScheduledEvent carries an environment",
+                "A scheduled trigger arrived with no environment, so it is being run against \
+                 {}. This node also runs {} other environment(s) of this app, and a schedule \
+                 that belongs to one of them is running the wrong code with the wrong secrets. \
+                 The caller is older than ScheduledEvent.environment and should be upgraded",
                 key,
                 others.len()
             );
@@ -123,9 +130,11 @@ impl Trigger for TriggerServiceImpl {
                 body: message.body,
                 attempts: message.attempts,
                 // This node never leased these messages, so it has no lease to
-                // report and nothing it could ack or nack. Whoever pushed them
-                // holds that and reads the answer below.
+                // report and nothing it could ack or nack: no expiry and no
+                // lease token. Whoever pushed them holds those and reads the
+                // answer below.
                 lease_expires_at: 0,
+                lease_token: String::new(),
                 created_at: message.timestamp,
             })
             .collect();
@@ -182,7 +191,7 @@ impl Trigger for TriggerServiceImpl {
         request: Request<ScheduledEvent>,
     ) -> Result<Response<TriggerResponse>, Status> {
         let req = request.into_inner();
-        let key = self.scheduled_target(&req.app_id, &req.cron);
+        let key = self.scheduled_target(&req.app_id, &req.environment, &req.cron);
         info!(
             app_id = %key.app_id(),
             environment = %key.environment(),

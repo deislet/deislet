@@ -10,6 +10,19 @@
 //! contract nodes are written against, and because per-node placement
 //! would change only this query.
 //!
+//! **The list is authoritative, not additive.** It names everything the node
+//! should be running, so a node that reconciles against it stops serving
+//! whatever is not in it. That is the half of deletion that push cannot do:
+//! the control plane pushes an unload when an application is deleted, and a
+//! node that was unreachable at that moment never hears it and serves the
+//! application for ever. Reconciliation closes that on its own, and the same
+//! mechanism repairs any other drift - a version applied on one node and not
+//! another, an app loaded by hand.
+//!
+//! The one thing that would make removal wrong is a list that is short for a
+//! reason of the control plane's own, so completeness is stated explicitly in
+//! [`ASSIGNMENTS_COMPLETE_HEADER`] rather than inferred from the array.
+//!
 //! **This response carries decrypted secret values.** It is one of exactly
 //! two places where they appear in the clear (the other is the
 //! `ApplyDeployment` push), which is why the route is mounted with its own
@@ -23,13 +36,37 @@ use std::collections::BTreeMap;
 use axum::{
     Json,
     extract::{Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue},
 };
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use super::CatalogState;
 use crate::api::error::ApiResult;
+
+/// Whether this answer is the whole truth about what the node should run.
+///
+/// `true` means the array below is the complete expected set, so a node
+/// reconciling against it must stop serving anything that is not in it - that
+/// is how a deleted application finally leaves a node that was unreachable
+/// when the unload was pushed.
+///
+/// `false` means at least one assignment exists that this answer could not
+/// describe (see [`ASSIGNMENTS_WITHHELD_HEADER`]). The node must still load
+/// what is listed, and must remove nothing on the strength of this answer: an
+/// application whose secrets happen not to decrypt today is a control-plane
+/// problem, and unloading it would turn that into an outage for code that is
+/// running perfectly well.
+///
+/// A header rather than a field because the body is the wire contract of
+/// docs/implementation-plan.zh.md section 4 - a bare array - and an older node
+/// that ignores this keeps working exactly as it did, additively.
+pub use deis_wire::conventions::ASSIGNMENTS_COMPLETE_HEADER;
+
+/// How many assignments were left out of this answer, and are therefore the
+/// reason [`ASSIGNMENTS_COMPLETE_HEADER`] says `false`. Present so a node can
+/// say in its own log how much it is missing.
+pub use deis_wire::conventions::ASSIGNMENTS_WITHHELD_HEADER;
 
 /// One line of the list, in exactly the shape the wire contract of
 /// docs/implementation-plan.zh.md section 4 specifies.
@@ -75,11 +112,12 @@ pub async fn for_node(
     State(state): State<CatalogState>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<Vec<AssignmentView>>> {
+) -> ApiResult<(HeaderMap, Json<Vec<AssignmentView>>)> {
     let assignments = state.store.list_assignments().await?;
     let base = state.deliverer.base_url(&headers);
 
     let mut views: Vec<AssignmentView> = Vec::with_capacity(assignments.len());
+    let mut withheld: usize = 0;
     for assignment in &assignments {
         // One environment whose secrets will not decrypt must not cost the
         // node every other application on the list, so it is dropped from
@@ -99,8 +137,9 @@ pub async fn for_node(
                     app_id = %assignment.app_id,
                     environment = %assignment.environment,
                     secrets = payload.secret_count(),
-                    "This control plane has no node_preshared_keys, so the assignment list is unauthenticated and must not carry decrypted secrets; this application is left out and will not run on any node until a node key is configured"
+                    "This control plane has no node_preshared_keys, so the assignment list is unauthenticated and must not carry decrypted secrets; this application is left out, the list is marked incomplete so no node removes anything because of it, and this application will not run on any node until a node key is configured"
                 );
+                withheld += 1;
                 continue;
             }
             Ok(payload) => payload.env_for_wire(),
@@ -111,8 +150,9 @@ pub async fn for_node(
                     environment = %assignment.environment,
                     version_id = %assignment.version_id,
                     error = %e,
-                    "Could not build the environment for this assignment, so it is left out of the list; the node will not run this application until the problem is fixed and it asks again"
+                    "Could not build the environment for this assignment, so it is left out of the list; the list is marked incomplete so a node reconciling against it does not unload an application that is running fine, and this node will not start this application until the problem is fixed and it asks again"
                 );
+                withheld += 1;
                 continue;
             }
         };
@@ -131,6 +171,27 @@ pub async fn for_node(
         });
     }
 
+    // The answer is authoritative only when every assignment in the catalog
+    // could be described. That is what lets a node use it to remove things:
+    // an application the catalog no longer names is simply absent here, and
+    // absence is an instruction. Absence caused by this control plane failing
+    // to build a row is not, which is the whole reason the two cases are told
+    // apart on the wire.
+    let complete = withheld == 0;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        ASSIGNMENTS_COMPLETE_HEADER,
+        HeaderValue::from_static(if complete { "true" } else { "false" }),
+    );
+    response_headers.insert(
+        ASSIGNMENTS_WITHHELD_HEADER,
+        // Only ASCII digits, so this cannot fail; a failure would still not
+        // be worth failing the request over, and an absent count reads as
+        // zero on a node that predates the header.
+        HeaderValue::from_str(&withheld.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+
     if !state.node_auth.is_configured() {
         warn!(
             node = %node_id,
@@ -138,17 +199,24 @@ pub async fn for_node(
         );
     }
 
-    if views.is_empty() {
+    if !complete {
+        warn!(
+            node = %node_id,
+            served = views.len(),
+            withheld,
+            "Served an incomplete assignment list; it is marked as such, so the node loads what is in it and removes nothing - an application it is still running that this control plane can no longer describe keeps serving instead of being unloaded on a mistake"
+        );
+    } else if views.is_empty() {
         info!(
             node = %node_id,
-            "Node asked for its assignments and there are none; it will report healthy with no app loaded"
+            "Node asked for its assignments and there are none; it will report healthy with no app loaded, and a node reconciling against this answer unloads whatever it was still serving"
         );
     } else {
         debug!(
             node = %node_id,
             assignments = views.len(),
-            "Served the assignment list"
+            "Served the authoritative assignment list"
         );
     }
-    Ok(Json(views))
+    Ok((response_headers, Json(views)))
 }

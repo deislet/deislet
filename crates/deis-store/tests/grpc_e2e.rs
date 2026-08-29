@@ -271,6 +271,7 @@ async fn kv_list_pages_by_prefix() {
                 prefix: "user:".to_string(),
                 limit: Some(2),
                 cursor: None,
+                include_metadata: None,
             },
         ))
         .await
@@ -286,6 +287,7 @@ async fn kv_list_pages_by_prefix() {
                 prefix: "user:".to_string(),
                 limit: Some(2),
                 cursor: page.next_cursor,
+                include_metadata: None,
             },
         ))
         .await
@@ -293,6 +295,82 @@ async fn kv_list_pages_by_prefix() {
         .into_inner();
     assert_eq!(rest.keys, vec!["user:3"]);
     assert_eq!(rest.next_cursor, None);
+}
+
+/// Metadata used to be write-only: `Set` took it, the column held it, and no
+/// RPC gave it back. Both ways of reading it are checked over a real socket,
+/// because the two shapes of `List` are a wire concern - one of them is what
+/// keeps a ten-thousand-key page from carrying every name twice.
+#[tokio::test]
+async fn kv_metadata_can_be_read_back_by_get_and_by_list() {
+    let harness = Harness::start().await;
+    let mut kv = harness.kv().await;
+
+    kv.set(as_tenant(
+        "app-one.production",
+        SetRequest {
+            key: "session:1".to_string(),
+            value: "token".to_string(),
+            ttl_seconds: Some(3600),
+            metadata: Some(r#"{"user":"7"}"#.to_string()),
+        },
+    ))
+    .await
+    .unwrap();
+
+    let got = kv
+        .get(as_tenant(
+            "app-one.production",
+            GetRequest {
+                key: "session:1".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.value.as_deref(), Some("token"));
+    assert_eq!(got.metadata.as_deref(), Some(r#"{"user":"7"}"#));
+    let expires_at = got.expires_at.expect("a lifetime was asked for");
+
+    // Asking for metadata gives entries and no bare key list; not asking
+    // gives exactly what every existing caller already reads.
+    let detailed = kv
+        .list(as_tenant(
+            "app-one.production",
+            ListRequest {
+                prefix: "session:".to_string(),
+                limit: None,
+                cursor: None,
+                include_metadata: Some(true),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(detailed.keys.is_empty());
+    assert_eq!(detailed.entries.len(), 1);
+    assert_eq!(detailed.entries[0].key, "session:1");
+    assert_eq!(
+        detailed.entries[0].metadata.as_deref(),
+        Some(r#"{"user":"7"}"#)
+    );
+    assert_eq!(detailed.entries[0].expires_at, Some(expires_at));
+
+    let plain = kv
+        .list(as_tenant(
+            "app-one.production",
+            ListRequest {
+                prefix: "session:".to_string(),
+                limit: None,
+                cursor: None,
+                include_metadata: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(plain.keys, vec!["session:1"]);
+    assert!(plain.entries.is_empty());
 }
 
 #[tokio::test]

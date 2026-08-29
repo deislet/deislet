@@ -13,6 +13,7 @@ use super::*;
 use crate::app::{AppKey, ApplicationManager};
 use crate::config::RuntimeConfig;
 use crate::deployment::sha256_hex;
+use crate::deployment::NodeRegistration;
 
 const HANDLER: &str = "export default function handler() { return new Response('ok'); }";
 
@@ -55,12 +56,21 @@ fn bundle(app: &str) -> (Vec<u8>, String) {
 /// download from.
 struct ControlPlane {
     base: String,
+    /// The list this plane serves. Behind a lock so a test can change what
+    /// the control plane says between two reconciliations, which is the whole
+    /// point of reconciling.
+    assignments: Arc<parking_lot::Mutex<serde_json::Value>>,
+    /// Whether the plane claims its answer is the whole truth, and how many
+    /// assignments it says it left out. Real deis-control sends both headers
+    /// on every answer.
+    completeness: Arc<parking_lot::Mutex<(bool, u32)>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
 struct PlaneState {
-    assignments: Arc<serde_json::Value>,
+    assignments: Arc<parking_lot::Mutex<serde_json::Value>>,
+    completeness: Arc<parking_lot::Mutex<(bool, u32)>>,
     bundle: Arc<Vec<u8>>,
     status: StatusCode,
     /// When set, both routes answer 401 unless the request presents it, the
@@ -121,8 +131,11 @@ impl ControlPlane {
                 .collect(),
         );
 
+        let assignments = Arc::new(parking_lot::Mutex::new(assignments));
+        let completeness = Arc::new(parking_lot::Mutex::new((true, 0u32)));
         let state = PlaneState {
-            assignments: Arc::new(assignments),
+            assignments: assignments.clone(),
+            completeness: completeness.clone(),
             bundle: Arc::new(bundle),
             status,
             required_key,
@@ -140,7 +153,18 @@ impl ControlPlane {
                         if state.status != StatusCode::OK {
                             return state.status.into_response();
                         }
-                        Json(state.assignments.as_ref().clone()).into_response()
+                        let (complete, withheld) = *state.completeness.lock();
+                        let mut response = Json(state.assignments.lock().clone()).into_response();
+                        let headers = response.headers_mut();
+                        headers.insert(
+                            "x-deis-assignments-complete",
+                            if complete { "true" } else { "false" }.parse().unwrap(),
+                        );
+                        headers.insert(
+                            "x-deis-assignments-withheld",
+                            withheld.to_string().parse().unwrap(),
+                        );
+                        response
                     },
                 ),
             )
@@ -164,11 +188,46 @@ impl ControlPlane {
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
-        Self { base, _task: task }
+        Self {
+            base,
+            assignments,
+            completeness,
+            _task: task,
+        }
     }
 
     fn base(&self) -> &str {
         &self.base
+    }
+
+    /// Replace the list this plane serves, as a deploy, a rollback or a
+    /// deletion in the catalog would.
+    fn now_assigns(&self, assignments: serde_json::Value) {
+        *self.assignments.lock() = assignments;
+    }
+
+    /// Say the next answer is missing `withheld` assignments this control
+    /// plane holds but could not describe - a secret that will not decrypt,
+    /// say.
+    fn answers_incompletely(&self, withheld: u32) {
+        *self.completeness.lock() = (false, withheld);
+    }
+
+    /// One assignment line pointing at this plane's own bundle route.
+    fn line(
+        &self,
+        app_id: &str,
+        environment: &str,
+        version_id: &str,
+        sha: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "app_id": app_id,
+            "version_id": version_id,
+            "environment": environment,
+            "bundle_url": format!("{}/bundle", self.base),
+            "bundle_sha": sha,
+        })
     }
 }
 
@@ -207,7 +266,7 @@ async fn a_node_loads_everything_the_control_plane_assigned_it() {
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let outcome = sync_once(&client(plane.base(), "node-a"), &deployer)
+    let outcome = reconcile_once(&client(plane.base(), "node-a"), &deployer)
         .await
         .unwrap();
 
@@ -282,7 +341,7 @@ async fn an_empty_assignment_list_is_a_valid_answer() {
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
-    let outcome = sync_once(&client(plane.base(), "node-a"), &deployer)
+    let outcome = reconcile_once(&client(plane.base(), "node-a"), &deployer)
         .await
         .unwrap();
 
@@ -303,7 +362,7 @@ async fn one_unusable_assignment_does_not_stop_the_others() {
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps.clone()).await;
-    let outcome = sync_once(&client(plane.base(), "node-a"), &deployer)
+    let outcome = reconcile_once(&client(plane.base(), "node-a"), &deployer)
         .await
         .unwrap();
 
@@ -324,7 +383,7 @@ async fn a_control_plane_that_refuses_is_reported_rather_than_treated_as_empty()
 
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
-    let err = sync_once(&client(plane.base(), "node-a"), &deployer)
+    let err = reconcile_once(&client(plane.base(), "node-a"), &deployer)
         .await
         .unwrap_err();
 
@@ -340,7 +399,7 @@ async fn a_control_plane_that_is_not_there_is_a_transport_failure() {
     let apps = Arc::new(ApplicationManager::new());
     let deployer = deployer(dir.path(), apps).await;
 
-    let err = sync_once(&client("http://127.0.0.1:0", "node-a"), &deployer)
+    let err = reconcile_once(&client("http://127.0.0.1:0", "node-a"), &deployer)
         .await
         .unwrap_err();
 
@@ -363,7 +422,15 @@ async fn without_a_control_plane_the_node_is_ready_on_what_it_has() {
     let deployer = deployer(dir.path(), apps).await;
     let health = crate::health::NodeHealth::starting();
 
-    run_startup_sync(None, deployer, health.clone(), Duration::from_secs(1)).await;
+    run_control_loop(
+        None,
+        None,
+        deployer,
+        health.clone(),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    )
+    .await;
 
     assert!(health.is_healthy());
 }
@@ -421,7 +488,7 @@ async fn a_node_presents_its_key_to_the_control_plane() {
         Some(NodeCredential::new("node-key", Some(plane.base()))),
     )
     .unwrap();
-    let outcome = sync_once(&authenticated, &deployer).await.unwrap();
+    let outcome = reconcile_once(&authenticated, &deployer).await.unwrap();
 
     assert_eq!(outcome.assigned, 1);
     assert_eq!(
@@ -433,5 +500,308 @@ async fn a_node_presents_its_key_to_the_control_plane() {
             .unwrap()
             .version_id,
         "v1"
+    );
+}
+
+#[tokio::test]
+async fn an_environment_the_control_plane_no_longer_assigns_stops_serving() {
+    // The failure this closes: an application deleted from the catalog, or a
+    // node taken out of its placement, reaches a node as *nothing at all* -
+    // the row that would have said so no longer exists. A node that only ever
+    // added kept serving it, with its secrets, until somebody restarted the
+    // process.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+
+    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    assert_eq!(outcome.installed, 1);
+    assert!(apps
+        .installed_version(&AppKey::production("demo"))
+        .is_some());
+
+    plane.now_assigns(serde_json::json!([]));
+
+    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    assert_eq!(outcome.assigned, 0);
+    assert_eq!(outcome.unloaded, 1);
+    assert_eq!(outcome.unload_failed, 0);
+    assert!(
+        apps.installed_version(&AppKey::production("demo"))
+            .is_none(),
+        "the node kept serving an application the control plane no longer assigns it"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_preview_leaves_production_serving() {
+    // Reconciliation is per (app, environment), because that is what runs.
+    // Taking a preview down must not touch the production copy beside it.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane = ControlPlane::serving(&[], bytes, &sha, StatusCode::OK).await;
+    plane.now_assigns(serde_json::json!([
+        plane.line("demo", "production", "v1", &sha),
+        plane.line("demo", "preview-7", "v1", &sha),
+    ]));
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+
+    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    assert_eq!(outcome.installed, 2, "both environments should have loaded");
+
+    plane.now_assigns(serde_json::json!([plane.line(
+        "demo",
+        "production",
+        "v1",
+        &sha
+    )]));
+
+    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    assert_eq!(outcome.unloaded, 1);
+    assert!(
+        apps.installed_version(&AppKey::new("demo", "preview-7"))
+            .is_none(),
+        "the preview is no longer assigned and must have stopped"
+    );
+    assert!(
+        apps.installed_version(&AppKey::production("demo"))
+            .is_some(),
+        "production was still assigned and must not have been touched"
+    );
+}
+
+#[tokio::test]
+async fn reconciling_a_node_that_already_matches_changes_nothing() {
+    // Run on a timer, so the normal case has to be free of side effects: no
+    // reload, no re-download, no restarted isolate.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+
+    reconcile_once(&client, &deployer).await.unwrap();
+    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        SyncOutcome {
+            assigned: 1,
+            unchanged: 1,
+            ..Default::default()
+        },
+        "a second pass over an unchanged list must be a no-op"
+    );
+}
+
+#[tokio::test]
+async fn a_new_version_in_the_list_replaces_the_running_one() {
+    // A push this node missed - it was restarting, or unreachable - only ever
+    // reaches it through a later reconciliation.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+
+    reconcile_once(&client, &deployer).await.unwrap();
+    assert_eq!(
+        apps.installed_version(&AppKey::production("demo"))
+            .unwrap()
+            .version_id,
+        "v1"
+    );
+
+    plane.now_assigns(serde_json::json!([plane.line(
+        "demo",
+        "production",
+        "v2",
+        &sha
+    )]));
+
+    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    assert_eq!(outcome.installed, 1);
+    assert_eq!(outcome.unloaded, 0, "a version change is not an unload");
+    assert_eq!(
+        apps.installed_version(&AppKey::production("demo"))
+            .unwrap()
+            .version_id,
+        "v2"
+    );
+}
+
+#[tokio::test]
+async fn an_incomplete_answer_loads_but_never_removes() {
+    // The dangerous case: a control plane that holds an assignment it cannot
+    // describe - a secret that will not decrypt, say - answers with a short
+    // list. Absence would otherwise read as "deleted", and a node acting on
+    // it would take down an application that is running perfectly well for a
+    // problem on the other side.
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane =
+        ControlPlane::serving(&[("demo", "v1", "/bundle")], bytes, &sha, StatusCode::OK).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let client = client(plane.base(), "node-a");
+
+    reconcile_once(&client, &deployer).await.unwrap();
+    assert!(apps
+        .installed_version(&AppKey::production("demo"))
+        .is_some());
+
+    plane.now_assigns(serde_json::json!([]));
+    plane.answers_incompletely(1);
+
+    let outcome = reconcile_once(&client, &deployer).await.unwrap();
+    assert_eq!(outcome.unloaded, 0);
+    assert!(
+        apps.installed_version(&AppKey::production("demo"))
+            .is_some(),
+        "an incomplete answer must not be treated as an instruction to unload"
+    );
+}
+
+#[tokio::test]
+async fn a_control_plane_that_cannot_say_is_treated_as_unable_to_say() {
+    // No header at all is a control plane older than the completeness
+    // contract. It cannot promise its list is the whole truth, so this node
+    // must not remove on the strength of it - the same fail-safe direction as
+    // an explicit "false".
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            Router::new().route(
+                "/api/nodes/:id/assignments",
+                get(|| async { Json(serde_json::json!([])) }),
+            ),
+        )
+        .await;
+    });
+
+    let list = client(&base, "node-a").fetch().await.unwrap();
+    assert!(
+        !list.complete,
+        "an answer with no completeness header cannot be acted on for removal"
+    );
+    assert_eq!(list.withheld, 0);
+    task.abort();
+}
+
+/// A stand-in control plane that only counts registrations, so a test can ask
+/// how many times a node said it was there.
+async fn counting_registrar() -> (NodeRegistrar, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::AtomicUsize;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route(
+            deis_wire::conventions::NODE_REGISTRATION_ROUTE,
+            axum::routing::put(|State(calls): State<Arc<AtomicUsize>>| async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(serde_json::json!({ "refresh_after_seconds": 30 }))
+            }),
+        )
+        .with_state(calls);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let registrar = NodeRegistrar::new(
+        &base,
+        NodeRegistration::of_this_node("node-a", 8123),
+        Duration::from_secs(5),
+        None,
+    )
+    .expect("the registrar is built");
+    (registrar, seen)
+}
+
+#[tokio::test]
+async fn a_registration_is_a_lease_the_node_keeps_renewing() {
+    // deis-control drops a node that has not registered again within its TTL,
+    // and a dropped node keeps serving every request perfectly while silently
+    // receiving no deployment pushes and no cron fires. So "already registered"
+    // must not mean "never say it again".
+    let (registrar, calls) = counting_registrar().await;
+
+    let first = announce(&registrar, RegistrationState::Pending).await;
+    let refresh_at = match first {
+        RegistrationState::Done { refresh_at } => refresh_at,
+        other => panic!("expected the registration to land, got {other:?}"),
+    };
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Still inside the lease: saying it again would be pure noise.
+    let again = announce(&registrar, first).await;
+    assert_eq!(again, first);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a node inside its lease must not re-register on every pass"
+    );
+
+    // Past it: the lease has to be renewed or the control plane forgets this
+    // node, and nothing about the node itself would look wrong.
+    let expired = RegistrationState::Done {
+        refresh_at: Instant::now() - Duration::from_secs(1),
+    };
+    let renewed = announce(&registrar, expired).await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "an expired lease has to be renewed, or this node drops out of the fleet"
+    );
+    match renewed {
+        RegistrationState::Done { refresh_at: next } => {
+            assert!(next > refresh_at, "the deadline has to move forward");
+        }
+        other => panic!("expected the renewal to land, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_loop_never_sleeps_past_the_moment_it_must_re_register() {
+    // reconcile_interval is configurable and the control plane's TTL is not
+    // this node's to choose. A 5 minute reconcile against a 90 second TTL
+    // would drop the node out of the fleet between passes.
+    let state = RegistrationState::Done {
+        refresh_at: Instant::now() + Duration::from_secs(30),
+    };
+    let until = state
+        .time_until_refresh(Instant::now())
+        .expect("a registered node has a deadline");
+    assert!(until <= Duration::from_secs(30));
+    assert!(Duration::from_secs(300).min(until) <= Duration::from_secs(30));
+
+    // Nothing to refresh yet, and nothing to refresh ever: neither shortens
+    // the reconcile interval.
+    assert_eq!(
+        RegistrationState::Pending.time_until_refresh(Instant::now()),
+        None
+    );
+    assert_eq!(
+        RegistrationState::NotSupported.time_until_refresh(Instant::now()),
+        None
     );
 }

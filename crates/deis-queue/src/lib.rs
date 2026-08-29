@@ -30,7 +30,17 @@
 //! message again once the lease lapses, so application handlers have to be
 //! idempotent. A message that keeps failing is moved to the dead letter table
 //! once its attempts reach the configured ceiling, where it stays for an
-//! operator instead of being retried forever.
+//! operator instead of being retried forever - `ListDeadLetters` reads that
+//! table and `ReplayDeadLetters` puts named messages back on their queue with
+//! a fresh set of attempts, once the cause has been fixed.
+//!
+//! A lease is *proved*, not claimed. Every delivery carries a lease token,
+//! and `Ack` and `Nack` take it beside the id. The token is reissued on every
+//! delivery, so a consumer that ran past its lease - and whose message has
+//! since gone to somebody else - can no longer delete or release it: the
+//! attempt is counted, logged, and ignored. Without that, a slow consumer
+//! finishing late would silently destroy work another consumer was part-way
+//! through.
 //!
 //! Nothing here streams and nothing here waits for work: every RPC is unary
 //! and answers from what is already in the table. That is on purpose. Wave A

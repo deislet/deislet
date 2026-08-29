@@ -22,7 +22,7 @@
 //! warns when the configured address is not loopback, and the warning is
 //! not to be silenced by widening the address.
 
-use crate::blob::UploadLimits;
+use crate::blob::BlobLimits;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -66,6 +66,14 @@ pub struct Config {
     /// life of the process.
     #[serde(default = "default_upload_idle_timeout_secs")]
     pub upload_idle_timeout_secs: u64,
+    /// How long a `BlobStore.Get` may wait for the client to take the chunk
+    /// it is holding before the store abandons the download. Zero waits
+    /// forever, which lets one client that opened a download and stopped
+    /// reading hold a task and an open content file for the life of the
+    /// process - the same failure the upload timeout above prevents, in the
+    /// other direction.
+    #[serde(default = "default_download_idle_timeout_secs")]
+    pub download_idle_timeout_secs: u64,
 }
 
 fn default_listen() -> String {
@@ -98,6 +106,22 @@ fn default_upload_idle_timeout_secs() -> u64 {
     60
 }
 
+/// The same reasoning in the other direction: a reader that is merely slow
+/// takes a chunk well inside a minute, so anything past that is a client that
+/// has stopped reading rather than one that is behind.
+fn default_download_idle_timeout_secs() -> u64 {
+    60
+}
+
+/// A configured number of seconds, or `None` for the zero that means "no
+/// bound at all".
+fn optional_seconds(secs: u64) -> Option<Duration> {
+    match secs {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -108,22 +132,21 @@ impl Default for Config {
             kv_sweep_interval_secs: default_sweep_interval_secs(),
             max_object_bytes: default_max_object_bytes(),
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
+            download_idle_timeout_secs: default_download_idle_timeout_secs(),
         }
     }
 }
 
 impl Config {
-    /// The ceilings blob uploads are held to.
-    pub fn upload_limits(&self) -> UploadLimits {
-        UploadLimits {
+    /// The ceilings blob transfers are held to, in both directions.
+    pub fn blob_limits(&self) -> BlobLimits {
+        BlobLimits {
             max_object_bytes: self.max_object_bytes,
             // Zero means "no timeout"; the blob store logs that at startup so
             // the choice is visible in the log of a service that then hangs
-            // on to stalled uploads.
-            idle_timeout: match self.upload_idle_timeout_secs {
-                0 => None,
-                secs => Some(Duration::from_secs(secs)),
-            },
+            // on to stalled transfers.
+            upload_idle_timeout: optional_seconds(self.upload_idle_timeout_secs),
+            download_idle_timeout: optional_seconds(self.download_idle_timeout_secs),
         }
     }
 
@@ -162,6 +185,10 @@ mod tests {
             parsed.upload_idle_timeout_secs,
             defaults.upload_idle_timeout_secs
         );
+        assert_eq!(
+            parsed.download_idle_timeout_secs,
+            defaults.download_idle_timeout_secs
+        );
     }
 
     #[test]
@@ -173,15 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_idle_timeout_means_no_timeout() {
+    fn a_zero_idle_timeout_means_no_timeout_in_either_direction() {
         let cfg = Config {
             upload_idle_timeout_secs: 0,
+            download_idle_timeout_secs: 0,
             ..Config::default()
         };
-        assert!(cfg.upload_limits().idle_timeout.is_none());
+        assert!(cfg.blob_limits().upload_idle_timeout.is_none());
+        assert!(cfg.blob_limits().download_idle_timeout.is_none());
         assert_eq!(
-            Config::default().upload_limits().idle_timeout,
+            Config::default().blob_limits().upload_idle_timeout,
             Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            Config::default().blob_limits().download_idle_timeout,
+            Some(Duration::from_secs(60)),
+            "a download that nobody reads must be given up on, like an upload that stops sending"
         );
     }
 
@@ -234,6 +268,10 @@ mod tests {
         assert_eq!(
             parsed.upload_idle_timeout_secs,
             defaults.upload_idle_timeout_secs
+        );
+        assert_eq!(
+            parsed.download_idle_timeout_secs,
+            defaults.download_idle_timeout_secs
         );
     }
 

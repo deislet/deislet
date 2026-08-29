@@ -18,6 +18,7 @@ use crate::database::Database;
 use crate::handler::MessageHandler;
 use crate::message::{NodeInfo, RegisterRequest as InternalRegisterRequest};
 use crate::session::{NodeSession, SessionManager};
+use crate::shutdown::Shutdown;
 
 pub struct GrpcControlService {
     config: Arc<ControlConfig>,
@@ -25,6 +26,10 @@ pub struct GrpcControlService {
     database: Option<Arc<Database>>,
     broadcaster: Arc<EventBroadcaster>,
     command_executor: Option<Arc<CommandExecutor>>,
+    /// Ends every open node channel when the process stops. A default
+    /// [`Shutdown`] is never triggered, so a caller that does not wire one
+    /// keeps the old behaviour of channels that live as long as the node.
+    shutdown: Shutdown,
 }
 
 impl GrpcControlService {
@@ -39,7 +44,15 @@ impl GrpcControlService {
             broadcaster,
             database: None,
             command_executor: None,
+            shutdown: Shutdown::new(),
         }
+    }
+
+    /// Close the node channels when this signal fires; see
+    /// [`crate::server::ControlServer::with_shutdown`].
+    pub fn with_shutdown(mut self, shutdown: Shutdown) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     pub fn with_database(mut self, database: Arc<Database>) -> Self {
@@ -84,48 +97,93 @@ impl ControlService for GrpcControlService {
         }
         let handler = Arc::new(handler); // Wrap in Arc to share if needed
 
-        // Spawn connection handling loop
-        tokio::spawn(async move {
-            let mut current_session: Option<Arc<NodeSession>> = None;
-            let mut authenticated = false;
+        let shutdown = self.shutdown.clone();
 
-            while let Some(result) = in_stream.next().await {
-                match result {
-                    Ok(msg) => {
-                        if let Some(payload) = msg.payload {
-                            handle_payload(
-                                payload,
-                                &tx,
-                                &sessions,
-                                &handler,
-                                &mut current_session,
-                                &mut authenticated,
-                            )
-                            .await;
+        // Spawn connection handling loop
+        tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                let mut current_session: Option<Arc<NodeSession>> = None;
+                let mut authenticated = false;
+                // Told apart in the log and in the recorded event, because
+                // the two mean opposite things to whoever reads them: a node
+                // that went away is a node to go looking for, while a channel
+                // this process closed on its way out is not.
+                let mut stopped_for_shutdown = false;
+
+                loop {
+                    let incoming = tokio::select! {
+                        // Stop reading as soon as the process is stopping.
+                        // The outgoing half is ended too (below), so the node
+                        // sees the channel close and reconnects to whichever
+                        // instance takes over instead of holding this one's
+                        // connection open for the whole drain window.
+                        _ = shutdown.wait() => {
+                            stopped_for_shutdown = true;
+                            None
+                        }
+                        incoming = in_stream.next() => incoming,
+                    };
+
+                    let Some(result) = incoming else { break };
+
+                    match result {
+                        Ok(msg) => {
+                            if let Some(payload) = msg.payload {
+                                handle_payload(
+                                    payload,
+                                    &tx,
+                                    &sessions,
+                                    &handler,
+                                    &mut current_session,
+                                    &mut authenticated,
+                                )
+                                .await;
+                            }
+                        }
+                        Err(e) => {
+                            error!("gRPC stream error: {}", e);
+                            break;
                         }
                     }
-                    Err(e) => {
-                        error!("gRPC stream error: {}", e);
-                        break;
-                    }
                 }
-            }
 
-            // Cleanup
-            if let Some(session) = current_session {
-                info!("Cleaning up session {} (gRPC)", session.instance_id);
+                // Cleanup
+                if let Some(session) = current_session {
+                    let reason = if stopped_for_shutdown {
+                        "Control plane shutting down"
+                    } else {
+                        "Connection closed"
+                    };
+                    if stopped_for_shutdown {
+                        info!(
+                            instance = %session.instance_id,
+                            "Closing this node's control channel because the control plane is stopping; the node takes no further command from this instance and reconnects on its own"
+                        );
+                    } else {
+                        info!("Cleaning up session {} (gRPC)", session.instance_id);
+                    }
 
-                // Call handler to handle disconnection event
-                handler
-                    .handle_disconnect(&session, "Connection closed")
-                    .await;
+                    // Call handler to handle disconnection event
+                    handler.handle_disconnect(&session, reason).await;
 
-                // Remove from session manager
-                sessions.remove(&session.id);
+                    // Remove from session manager
+                    sessions.remove(&session.id);
+                }
             }
         });
 
-        let out_stream = ReceiverStream::new(rx);
+        // Ending the outgoing half is what actually closes the connection:
+        // the node is waiting on this stream, and until it ends the HTTP/2
+        // connection stays open and the drain sits out its whole grace period
+        // before cutting it anyway.
+        //
+        // `take_until` is spelled out through futures' trait because the rest
+        // of this file reads the inbound stream through tokio-stream's, and
+        // importing both unqualified would make `next` ambiguous.
+        let out_stream = futures_util::StreamExt::take_until(ReceiverStream::new(rx), async move {
+            shutdown.wait().await
+        });
         Ok(Response::new(
             Box::pin(out_stream) as Self::EstablishChannelStream
         ))
@@ -300,5 +358,87 @@ async fn send_payload(tx: &mpsc::Sender<Result<ControlMessage, Status>>, payload
     };
     if let Err(e) = tx.send(Ok(msg)).await {
         error!("Failed to send gRPC message: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use deis_wire::pb::control_service_client::ControlServiceClient;
+    use deis_wire::pb::{AuthenticateRequest, control_message::Payload as ClientPayload};
+
+    /// A node keeps its `EstablishChannel` stream open for its whole life, so
+    /// nothing about the node ends it. Until the stop signal was wired into
+    /// this service, a control plane with nodes attached therefore sat out its
+    /// entire drain window on every restart and then cut the connections
+    /// anyway - the drain protected nothing and cost fifteen seconds.
+    ///
+    /// The test is the whole path on purpose: a real server, a real node
+    /// client, an open channel, then a stop.
+    #[tokio::test]
+    async fn a_stop_closes_an_open_node_channel_instead_of_waiting_it_out() {
+        let shutdown = Shutdown::new();
+        let service = GrpcControlService::new(
+            Arc::new(ControlConfig::default()),
+            Arc::new(SessionManager::new()),
+            Arc::new(EventBroadcaster::new()),
+        )
+        .with_shutdown(shutdown.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        let mut client = ControlServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("the test server must accept a node");
+
+        // The node's outgoing half stays open, exactly as a real node's does:
+        // it holds the sender and says nothing more until it has something to
+        // say.
+        let (node_tx, node_rx) = mpsc::channel(4);
+        node_tx
+            .send(ControlMessage {
+                payload: Some(ClientPayload::Authenticate(AuthenticateRequest {
+                    instance_id: "node-a".to_string(),
+                    secret: String::new(),
+                })),
+            })
+            .await
+            .unwrap();
+
+        let mut inbound = client
+            .establish_channel(ReceiverStream::new(node_rx))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // The channel is live: the node got its answer and is now waiting.
+        let first = inbound.next().await.expect("a reply is due").unwrap();
+        assert!(matches!(first.payload, Some(Payload::AuthResponse(_))));
+
+        // The node has said nothing further and is holding its half open, as a
+        // real node does between commands. Whatever happens next comes from
+        // this process, not from the node.
+        assert!(!node_tx.is_closed());
+
+        shutdown.trigger();
+
+        // The stream ends rather than hanging. Without the wiring this await
+        // would still be waiting when the grace period expired.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next())
+            .await
+            .expect("the node channel must be closed by the stop, not left to the drain deadline");
+        assert!(
+            closed.is_none(),
+            "the channel ended with a message instead of ending: {closed:?}"
+        );
     }
 }

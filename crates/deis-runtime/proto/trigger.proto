@@ -28,6 +28,19 @@ message ScheduledEvent {
   string app_id = 1;
   int64 scheduled_time = 2;
   string cron = 3;
+
+  // Which environment of that application the schedule belongs to.
+  //
+  // A node runs production and every preview of an app side by side, each
+  // with its own version, variables and secrets, so the application id alone
+  // does not name a handler. The control plane keys its schedules by
+  // (app, environment) and sends both halves here; without this field a
+  // preview's cron ran the production copy's handler, with production's
+  // secrets, and neither side could tell.
+  //
+  // Empty means the default environment ("production"), which is what a
+  // caller that predates this field means.
+  string environment = 4;
 }
 
 message TriggerResponse {

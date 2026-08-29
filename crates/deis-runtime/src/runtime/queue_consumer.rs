@@ -36,7 +36,7 @@ use futures_util::future::BoxFuture;
 use tokio::sync::oneshot;
 
 use super::metrics::{recorder, MetricsRegistry};
-use super::queue_client::{LeasedMessage, NackOutcome, QueueClient};
+use super::queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};
 
 /// What the app's queue handler did with a batch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,16 +81,18 @@ pub trait QueuePort: Send + Sync + 'static {
         lease_seconds: u32,
     ) -> BoxFuture<'a, anyhow::Result<Vec<LeasedMessage>>>;
 
+    /// Handles, not ids: answering for a message means proving the lease is
+    /// still this consumer's. See [`LeasedMessage::handle`].
     fn ack_messages<'a>(
         &'a self,
         queue: &'a str,
-        message_ids: Vec<String>,
-    ) -> BoxFuture<'a, anyhow::Result<i32>>;
+        handles: Vec<MessageHandle>,
+    ) -> BoxFuture<'a, anyhow::Result<AckOutcome>>;
 
     fn nack_messages<'a>(
         &'a self,
         queue: &'a str,
-        message_ids: Vec<String>,
+        handles: Vec<MessageHandle>,
         delay_seconds: u32,
     ) -> BoxFuture<'a, anyhow::Result<NackOutcome>>;
 }
@@ -108,18 +110,18 @@ impl QueuePort for QueueClient {
     fn ack_messages<'a>(
         &'a self,
         queue: &'a str,
-        message_ids: Vec<String>,
-    ) -> BoxFuture<'a, anyhow::Result<i32>> {
-        Box::pin(self.ack(queue, message_ids))
+        handles: Vec<MessageHandle>,
+    ) -> BoxFuture<'a, anyhow::Result<AckOutcome>> {
+        Box::pin(self.ack(queue, handles))
     }
 
     fn nack_messages<'a>(
         &'a self,
         queue: &'a str,
-        message_ids: Vec<String>,
+        handles: Vec<MessageHandle>,
         delay_seconds: u32,
     ) -> BoxFuture<'a, anyhow::Result<NackOutcome>> {
-        Box::pin(self.nack(queue, message_ids, delay_seconds))
+        Box::pin(self.nack(queue, handles, delay_seconds))
     }
 }
 
@@ -393,7 +395,6 @@ async fn handle_batch(
     messages: Vec<LeasedMessage>,
 ) {
     let delivered = messages.len();
-    let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
     let budget = handling_budget(&messages, settings, now_unix());
 
     let outcome = match tokio::time::timeout(budget, invoke(queue.to_string(), messages.clone()))
@@ -428,23 +429,26 @@ async fn handle_batch(
         }
     };
 
-    let failed: Vec<String> = ids
+    // Settled by handle, not by id: the lease token in each handle is what
+    // proves this consumer still holds the delivery it is answering for.
+    let failed: Vec<MessageHandle> = messages
         .iter()
-        .filter(|id| outcome.failed.contains(id))
-        .cloned()
+        .filter(|message| outcome.failed.contains(&message.id))
+        .map(LeasedMessage::handle)
         .collect();
-    let handled: Vec<String> = ids
+    let handled: Vec<MessageHandle> = messages
         .iter()
-        .filter(|id| !outcome.failed.contains(id))
-        .cloned()
+        .filter(|message| !outcome.failed.contains(&message.id))
+        .map(LeasedMessage::handle)
         .collect();
 
     metrics.record_queue_batch(app_id, queue, delivered as u64, failed.len() as u64);
 
     if !handled.is_empty() {
         let count = handled.len();
-        if let Err(e) = client.ack_messages(queue, handled).await {
-            tracing::warn!(
+        match client.ack_messages(queue, handled).await {
+            Ok(outcome) => report_stale_leases(app_id, queue, settings, outcome.stale_leases),
+            Err(e) => tracing::warn!(
                 app_id,
                 queue,
                 count,
@@ -454,7 +458,7 @@ async fn handle_batch(
                  must be idempotent",
                 count,
                 queue
-            );
+            ),
         }
     }
 
@@ -478,6 +482,7 @@ async fn handle_batch(
                         app_id
                     );
                 }
+                report_stale_leases(app_id, queue, settings, outcome.stale_leases);
             }
             Err(e) => tracing::warn!(
                 app_id,
@@ -491,6 +496,32 @@ async fn handle_batch(
             ),
         }
     }
+}
+
+/// Say when deis-queue refused an answer because the lease had already lapsed.
+///
+/// This is not a transient hiccup: the message has been handed to another
+/// consumer, so the work this node just finished is being done again right
+/// now, and the count is the number of messages that happened to. The cause is
+/// always the same one -- the handler takes longer than the lease -- so the
+/// line names the lease it was given.
+fn report_stale_leases(app_id: &str, queue: &str, settings: &ConsumerSettings, stale: i32) {
+    if stale <= 0 {
+        return;
+    }
+    tracing::warn!(
+        app_id,
+        queue,
+        stale_leases = stale,
+        lease_seconds = settings.lease_seconds,
+        "{} message(s) on queue {} were answered too late: their lease had lapsed and \
+         deis-queue had already given them to another consumer, so that work is being done \
+         twice. The {}s lease is shorter than this app's handler actually takes -- raise the \
+         app's execution timeout budget or make the batches smaller",
+        stale,
+        queue,
+        settings.lease_seconds
+    );
 }
 
 /// How much shorter than requested a granted lease may be before it is worth a

@@ -13,8 +13,8 @@
 
 use crate::error::{StoreError, StoreResult};
 use crate::proto::storage::{
-    DeleteRequest, DeleteResponse, GetRequest, GetResponse, HasRequest, HasResponse, ListRequest,
-    ListResponse, SetRequest, SetResponse, kv_store_server::KvStore,
+    DeleteRequest, DeleteResponse, GetRequest, GetResponse, HasRequest, HasResponse, KvEntry,
+    ListRequest, ListResponse, SetRequest, SetResponse, kv_store_server::KvStore,
 };
 use crate::sqlite::{PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
@@ -32,6 +32,44 @@ const DEFAULT_LIST_LIMIT: i32 = 1000;
 /// Hard ceiling on one `List` page, whatever the caller asks for. Keeps a
 /// single request from pulling an entire namespace into one gRPC message.
 const MAX_LIST_LIMIT: i32 = 10_000;
+
+/// One key's value and everything stored beside it.
+///
+/// The metadata and the expiry travel with the value rather than needing a
+/// second call: they were written by the same `Set`, they live in the same
+/// row, and a caller that had to fetch them separately would be reading the
+/// key twice to learn what one read already had in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvValue {
+    pub value: Vec<u8>,
+    /// Opaque string the caller stored; never parsed here.
+    pub metadata: Option<String>,
+    /// Absolute unix second the entry lapses, or `None` for one that never
+    /// does.
+    pub expires_at: Option<i64>,
+}
+
+/// One key in a listing, with what the store knows about it.
+///
+/// Listing carries the same two attributes for the same reason: an index
+/// that answers "which keys are there" but not "what is attached to them"
+/// forces one `Get` per key, which is the cost a listing exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvListing {
+    pub key: String,
+    pub metadata: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+impl From<KvListing> for KvEntry {
+    fn from(entry: KvListing) -> Self {
+        Self {
+            key: entry.key,
+            metadata: entry.metadata,
+            expires_at: entry.expires_at,
+        }
+    }
+}
 
 /// KV service backed by one shared SQLite file.
 #[derive(Clone)]
@@ -68,22 +106,34 @@ impl KvService {
     }
 
     /// Read one key, honouring expiry.
-    pub async fn get(&self, tenant: &TenantId, key: &str) -> StoreResult<Option<Vec<u8>>> {
+    ///
+    /// The metadata and the expiry come back with the value because they are
+    /// columns of the row already being read: fetching them costs nothing
+    /// here, while a caller that had to ask separately would pay for a second
+    /// round trip and could see the two halves disagree if the key was
+    /// rewritten in between.
+    pub async fn get(&self, tenant: &TenantId, key: &str) -> StoreResult<Option<KvValue>> {
         let key = check_key(key)?;
         let tenant_id = tenant.as_str().to_string();
         let now = unix_seconds();
         self.pool
             .with_conn(move |conn| {
-                let value: Option<Vec<u8>> = conn
+                let found = conn
                     .query_row(
-                        "SELECT value FROM kv
+                        "SELECT value, metadata, expires_at FROM kv
                           WHERE tenant = ?1 AND key = ?2
                             AND (expires_at IS NULL OR expires_at > ?3)",
                         rusqlite::params![tenant_id, key, now],
-                        |row| row.get(0),
+                        |row| {
+                            Ok(KvValue {
+                                value: row.get(0)?,
+                                metadata: row.get(1)?,
+                                expires_at: row.get(2)?,
+                            })
+                        },
                     )
                     .optional()?;
-                Ok(value)
+                Ok(found)
             })
             .await
     }
@@ -153,17 +203,23 @@ impl KvService {
             .await
     }
 
-    /// One page of keys under `prefix`, in key order.
+    /// One page of keys under `prefix`, in key order, each with its metadata
+    /// and expiry.
     ///
     /// Returns the page and, when the page was filled to the limit, the
     /// cursor to resume from.
+    ///
+    /// The two attributes are always read, because they are columns of rows
+    /// the scan already visits. What they cost is response *size*, and that
+    /// is decided one level up: `ListRequest.include_metadata` says whether
+    /// they go on the wire.
     pub async fn list(
         &self,
         tenant: &TenantId,
         prefix: &str,
         limit: Option<i32>,
         cursor: Option<String>,
-    ) -> StoreResult<(Vec<String>, Option<String>)> {
+    ) -> StoreResult<(Vec<KvListing>, Option<String>)> {
         let limit = clamp_limit(limit);
         let tenant_id = tenant.as_str().to_string();
         // The cursor is the last key of the previous page, so resume strictly
@@ -188,11 +244,11 @@ impl KvService {
         let upper = prefix_upper_bound(prefix);
         let now = unix_seconds();
 
-        let keys: Vec<String> = self
+        let entries: Vec<KvListing> = self
             .pool
             .with_conn(move |conn| {
                 let sql = format!(
-                    "SELECT key FROM kv
+                    "SELECT key, metadata, expires_at FROM kv
                       WHERE tenant = ?1
                         AND key {} ?2
                         {}
@@ -209,26 +265,35 @@ impl KvService {
                     }
                     None => stmt.query(rusqlite::params![tenant_id, lower, now, limit])?,
                 };
-                let mut keys = Vec::new();
+                let mut entries = Vec::new();
                 while let Some(row) = rows.next()? {
-                    keys.push(row.get::<_, String>(0)?);
+                    entries.push(KvListing {
+                        key: row.get(0)?,
+                        metadata: row.get(1)?,
+                        expires_at: row.get(2)?,
+                    });
                 }
-                Ok(keys)
+                Ok(entries)
             })
             .await?;
 
         // A full page means there may be more; a short page means there is
         // definitely nothing left.
-        let next_cursor = if keys.len() as i32 == limit {
-            keys.last().cloned()
+        let next_cursor = if entries.len() as i32 == limit {
+            entries.last().map(|entry| entry.key.clone())
         } else {
             None
         };
-        Ok((keys, next_cursor))
+        Ok((entries, next_cursor))
     }
 
-    /// The expiry and metadata stored for one key, ignoring whether it has
-    /// already lapsed. Only for tests: no RPC returns either field yet.
+    /// The expiry and metadata stored for one key, *ignoring* whether it has
+    /// already lapsed.
+    ///
+    /// Only for tests, and only for the one thing [`Self::get`] cannot show:
+    /// what is on disk behind an entry a reader is no longer allowed to see.
+    /// Every RPC filters on expiry, deliberately, so nothing outside these
+    /// tests may use this.
     #[cfg(test)]
     pub async fn stored_attributes(
         &self,
@@ -367,11 +432,19 @@ impl KvStore for KvService {
         let key = request.into_inner().key;
         tracing::trace!(tenant = %tenant, key = %key, "kv get");
 
-        let value = self.get(&tenant, &key).await?;
-        let value = match value {
-            None => None,
-            Some(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => Some(text),
+        let found = self.get(&tenant, &key).await?;
+        let response = match found {
+            None => GetResponse {
+                value: None,
+                metadata: None,
+                expires_at: None,
+            },
+            Some(entry) => match String::from_utf8(entry.value) {
+                Ok(text) => GetResponse {
+                    value: Some(text),
+                    metadata: entry.metadata,
+                    expires_at: entry.expires_at,
+                },
                 Err(e) => {
                     // storage.proto types the value as a string, so bytes
                     // that are not UTF-8 cannot be handed back at all.
@@ -388,7 +461,7 @@ impl KvStore for KvService {
                 }
             },
         };
-        Ok(Response::new(GetResponse { value }))
+        Ok(Response::new(response))
     }
 
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
@@ -432,17 +505,35 @@ impl KvStore for KvService {
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        let (keys, next_cursor) = self
+        let (page, next_cursor) = self
             .list(&tenant, &req.prefix, req.limit, req.cursor.clone())
             .await?;
+        let with_metadata = req.include_metadata.unwrap_or(false);
         tracing::debug!(
             tenant = %tenant,
             prefix = %req.prefix,
-            returned = keys.len(),
+            returned = page.len(),
             more = next_cursor.is_some(),
+            with_metadata,
             "kv list"
         );
-        Ok(Response::new(ListResponse { keys, next_cursor }))
+        // One shape or the other, never both: a page holds up to ten thousand
+        // keys, so sending every name twice would double the largest response
+        // this service produces.
+        let response = if with_metadata {
+            ListResponse {
+                keys: Vec::new(),
+                next_cursor,
+                entries: page.into_iter().map(KvEntry::from).collect(),
+            }
+        } else {
+            ListResponse {
+                keys: page.into_iter().map(|entry| entry.key).collect(),
+                next_cursor,
+                entries: Vec::new(),
+            }
+        };
+        Ok(Response::new(response))
     }
 
     async fn has(&self, request: Request<HasRequest>) -> Result<Response<HasResponse>, Status> {
@@ -480,6 +571,17 @@ mod tests {
         request
     }
 
+    /// Just the names of a listed page, for the tests that only care about
+    /// which keys came back.
+    fn names(page: &[KvListing]) -> Vec<String> {
+        page.iter().map(|entry| entry.key.clone()).collect()
+    }
+
+    /// The bytes behind a key, or `None` when it is not readable.
+    async fn value_of(svc: &KvService, tenant: &TenantId, key: &str) -> Option<Vec<u8>> {
+        svc.get(tenant, key).await.unwrap().map(|entry| entry.value)
+    }
+
     #[tokio::test]
     async fn round_trips_a_value() {
         let (_dir, svc) = service().await;
@@ -488,14 +590,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            svc.get(&a, "greeting").await.unwrap(),
+            value_of(&svc, &a, "greeting").await,
             Some(b"hello".to_vec())
         );
         assert!(svc.has(&a, "greeting").await.unwrap());
         assert!(svc.delete(&a, "greeting").await.unwrap());
-        assert_eq!(svc.get(&a, "greeting").await.unwrap(), None);
+        assert_eq!(value_of(&svc, &a, "greeting").await, None);
         // Deleting again is not an error, it just removes nothing.
         assert!(!svc.delete(&a, "greeting").await.unwrap());
+    }
+
+    /// The gap this closes: metadata used to be write-only. `Set` took it,
+    /// the column held it, and no RPC gave it back, so an application could
+    /// write a note about a value it could never read again.
+    #[tokio::test]
+    async fn get_returns_the_metadata_and_expiry_that_were_written() {
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        let before = unix_seconds();
+
+        let request = as_tenant(
+            "app-one.production",
+            SetRequest {
+                key: "session".to_string(),
+                value: "token".to_string(),
+                ttl_seconds: Some(3600),
+                metadata: Some(r#"{"user":"7"}"#.to_string()),
+            },
+        );
+        KvStore::set(&svc, request).await.unwrap();
+
+        let got = KvStore::get(
+            &svc,
+            as_tenant(
+                "app-one.production",
+                GetRequest {
+                    key: "session".to_string(),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(got.value.as_deref(), Some("token"));
+        assert_eq!(got.metadata.as_deref(), Some(r#"{"user":"7"}"#));
+        let expires_at = got.expires_at.expect("a lifetime was asked for");
+        assert!(
+            (before + 3600..=unix_seconds() + 3600).contains(&expires_at),
+            "expiry {expires_at} is not {before} + 3600"
+        );
+
+        // A key with neither attribute reports neither, and a key that is not
+        // there reports nothing at all - `value` is what tells the two apart.
+        svc.set(&a, "plain", b"v".to_vec(), None, None)
+            .await
+            .unwrap();
+        for (key, value) in [("plain", Some("v")), ("absent", None)] {
+            let got = KvStore::get(
+                &svc,
+                as_tenant(
+                    "app-one.production",
+                    GetRequest {
+                        key: key.to_string(),
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(got.value.as_deref(), value, "{key}");
+            assert_eq!(got.metadata, None, "{key}");
+            assert_eq!(got.expires_at, None, "{key}");
+        }
+    }
+
+    /// The other half of the same gap: a listing that only names keys forces
+    /// one `Get` per key, which is the cost a listing exists to avoid.
+    #[tokio::test]
+    async fn list_returns_metadata_only_when_it_is_asked_for() {
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        let expires_at = unix_seconds() + 600;
+        svc.set(
+            &a,
+            "user:1",
+            b"v".to_vec(),
+            Some("first".to_string()),
+            Some(expires_at),
+        )
+        .await
+        .unwrap();
+        svc.set(&a, "user:2", b"v".to_vec(), None, None)
+            .await
+            .unwrap();
+
+        let plain = KvStore::list(
+            &svc,
+            as_tenant(
+                "app-one.production",
+                ListRequest {
+                    prefix: "user:".to_string(),
+                    limit: None,
+                    cursor: None,
+                    include_metadata: None,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(plain.keys, vec!["user:1", "user:2"]);
+        assert!(
+            plain.entries.is_empty(),
+            "a caller that did not ask must not pay for the richer shape"
+        );
+
+        let detailed = KvStore::list(
+            &svc,
+            as_tenant(
+                "app-one.production",
+                ListRequest {
+                    prefix: "user:".to_string(),
+                    limit: None,
+                    cursor: None,
+                    include_metadata: Some(true),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            detailed.keys.is_empty(),
+            "the names must not be sent twice in one response"
+        );
+        assert_eq!(detailed.entries.len(), 2);
+        assert_eq!(detailed.entries[0].key, "user:1");
+        assert_eq!(detailed.entries[0].metadata.as_deref(), Some("first"));
+        assert_eq!(detailed.entries[0].expires_at, Some(expires_at));
+        assert_eq!(detailed.entries[1].key, "user:2");
+        assert_eq!(detailed.entries[1].metadata, None);
+        assert_eq!(detailed.entries[1].expires_at, None);
     }
 
     /// Nothing could ever set an expiry before `SetRequest` carried a
@@ -530,10 +765,7 @@ mod tests {
             "expiry {expires_at} is not {before} + 3600"
         );
         assert_eq!(metadata.as_deref(), Some(r#"{"kind":"session"}"#));
-        assert_eq!(
-            svc.get(&a, "session").await.unwrap(),
-            Some(b"token".to_vec())
-        );
+        assert_eq!(value_of(&svc, &a, "session").await, Some(b"token".to_vec()));
     }
 
     #[tokio::test]
@@ -598,9 +830,9 @@ mod tests {
         svc.set(&a, "k", b"second".to_vec(), None, None)
             .await
             .unwrap();
-        assert_eq!(svc.get(&a, "k").await.unwrap(), Some(b"second".to_vec()));
-        let (keys, _) = svc.list(&a, "", None, None).await.unwrap();
-        assert_eq!(keys, vec!["k".to_string()]);
+        assert_eq!(value_of(&svc, &a, "k").await, Some(b"second".to_vec()));
+        let (page, _) = svc.list(&a, "", None, None).await.unwrap();
+        assert_eq!(names(&page), vec!["k".to_string()]);
     }
 
     #[tokio::test]
@@ -611,10 +843,10 @@ mod tests {
         svc.set(&one, "secret", b"one".to_vec(), None, None)
             .await
             .unwrap();
-        assert_eq!(svc.get(&two, "secret").await.unwrap(), None);
+        assert_eq!(value_of(&svc, &two, "secret").await, None);
         assert!(!svc.has(&two, "secret").await.unwrap());
-        let (keys, _) = svc.list(&two, "", None, None).await.unwrap();
-        assert!(keys.is_empty());
+        let (page, _) = svc.list(&two, "", None, None).await.unwrap();
+        assert!(page.is_empty());
     }
 
     #[tokio::test]
@@ -624,8 +856,8 @@ mod tests {
         for key in ["user:1", "user:2", "user:3", "post:1", "usea", "usez"] {
             svc.set(&a, key, b"v".to_vec(), None, None).await.unwrap();
         }
-        let (keys, cursor) = svc.list(&a, "user:", None, None).await.unwrap();
-        assert_eq!(keys, vec!["user:1", "user:2", "user:3"]);
+        let (page, cursor) = svc.list(&a, "user:", None, None).await.unwrap();
+        assert_eq!(names(&page), vec!["user:1", "user:2", "user:3"]);
         assert!(cursor.is_none());
     }
 
@@ -639,11 +871,11 @@ mod tests {
                 .unwrap();
         }
         let (first, cursor) = svc.list(&a, "k", Some(2), None).await.unwrap();
-        assert_eq!(first, vec!["k0", "k1"]);
+        assert_eq!(names(&first), vec!["k0", "k1"]);
         let (second, cursor) = svc.list(&a, "k", Some(2), cursor).await.unwrap();
-        assert_eq!(second, vec!["k2", "k3"]);
+        assert_eq!(names(&second), vec!["k2", "k3"]);
         let (third, cursor) = svc.list(&a, "k", Some(2), cursor).await.unwrap();
-        assert_eq!(third, vec!["k4"]);
+        assert_eq!(names(&third), vec!["k4"]);
         assert!(cursor.is_none());
     }
 
@@ -655,11 +887,11 @@ mod tests {
             svc.set(&a, key, b"v".to_vec(), None, None).await.unwrap();
         }
         // "a" sorts before the prefix; the scan must still start at "user:".
-        let (keys, _) = svc
+        let (page, _) = svc
             .list(&a, "user:", None, Some("a".to_string()))
             .await
             .unwrap();
-        assert_eq!(keys, vec!["user:1", "user:2"]);
+        assert_eq!(names(&page), vec!["user:1", "user:2"]);
     }
 
     #[tokio::test]
@@ -675,10 +907,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(svc.get(&a, "stale").await.unwrap(), None);
+        assert_eq!(value_of(&svc, &a, "stale").await, None);
         assert!(!svc.has(&a, "stale").await.unwrap());
-        let (keys, _) = svc.list(&a, "", None, None).await.unwrap();
-        assert_eq!(keys, vec!["fresh".to_string()]);
+        let (page, _) = svc.list(&a, "", None, None).await.unwrap();
+        assert_eq!(names(&page), vec!["fresh".to_string()]);
 
         // Still on disk until the sweep runs.
         assert_eq!(svc.sweep_expired().await.unwrap(), 1);

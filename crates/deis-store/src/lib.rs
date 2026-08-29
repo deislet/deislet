@@ -32,6 +32,14 @@
 //! blob/<tenant>/<aa>/<bb>/<sha256>   object content, addressed by digest
 //! ```
 //!
+//! This directory is the only copy of every tenant's data, and it cannot be
+//! backed up by copying it: SQLite runs in WAL mode here, so a plain `cp -r`
+//! of a live store can restore as a database missing its last commits, or as
+//! a corrupt one, without a word of warning. [`snapshot`] is how it is copied
+//! and put back - `deis-store snapshot --out DIR` and `deis-store restore
+//! --from DIR` - and that module documents what a snapshot does and does not
+//! promise.
+//!
 //! The tenant id is a directory name and a database file name, which is why
 //! it is validated hard rather than sanitised: the character set has no `.`,
 //! `/` or `\` in either half, so no accepted value can name a parent
@@ -91,6 +99,7 @@ pub mod kv;
 pub mod legacy;
 pub mod proto;
 pub mod server;
+pub mod snapshot;
 pub mod sqlite;
 pub mod tenant;
 

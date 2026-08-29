@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 @theme {
-  /* 柔和浅色主题 - 降低对比度 */
+  /* Soft light theme - lowered contrast */
   --color-background: #f8f9fa;
   --color-foreground: #2d3748;
   --color-card: #ffffff;
@@ -36,7 +36,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    /* 柔和深色主题 */
+    /* Soft dark theme */
     --color-background: #1a202c;
     --color-foreground: #e2e8f0;
     --color-card: #2d3748;
