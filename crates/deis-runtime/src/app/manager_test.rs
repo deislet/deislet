@@ -380,9 +380,8 @@ mod tests {
     #[test]
     fn test_effective_limits_uses_platform_default_when_app_has_none() {
         let manager = ApplicationManager::with_threads(Some(1));
-        let (timeout_ms, rate_limit) = manager.effective_limits("app_a", None);
-        assert_eq!(timeout_ms, manager.default_limits.timeout_ms);
-        assert_eq!(rate_limit, manager.default_limits.rate_limit_ops_per_sec);
+        let effective = manager.effective_limits("app_a", None);
+        assert_eq!(effective, manager.default_limits);
     }
 
     #[test]
@@ -395,9 +394,9 @@ mod tests {
             timeout_ms: Some(5_000),
             rate_limit_ops_per_sec: Some(10.0),
         };
-        let (timeout_ms, rate_limit) = manager.effective_limits("app_b", Some(&limits));
-        assert_eq!(timeout_ms, 5_000);
-        assert_eq!(rate_limit, 10.0);
+        let effective = manager.effective_limits("app_b", Some(&limits));
+        assert_eq!(effective.timeout_ms, 5_000);
+        assert_eq!(effective.rate_limit_ops_per_sec, 10.0);
     }
 
     #[test]
@@ -412,8 +411,11 @@ mod tests {
             timeout_ms: Some(5_000),
             rate_limit_ops_per_sec: None,
         };
-        let (timeout_ms, rate_limit) = manager.effective_limits("app_c", Some(&limits));
-        assert_eq!(timeout_ms, 5_000);
-        assert_eq!(rate_limit, manager.default_limits.rate_limit_ops_per_sec);
+        let effective = manager.effective_limits("app_c", Some(&limits));
+        assert_eq!(effective.timeout_ms, 5_000);
+        assert_eq!(
+            effective.rate_limit_ops_per_sec,
+            manager.default_limits.rate_limit_ops_per_sec
+        );
     }
 }

@@ -24,7 +24,9 @@ pub async fn execute(vendors: Vec<String>, _watch: bool, minify: bool) -> Result
 
     println!("{}", "Building...".dimmed());
 
-    let result = compiler.compile(&project_dir, vendors.clone(), minify).await?;
+    let result = compiler
+        .compile(&project_dir, vendors.clone(), minify)
+        .await?;
 
     if result.success {
         println!("\n{}", "Build completed".green().bold());
@@ -36,16 +38,22 @@ pub async fn execute(vendors: Vec<String>, _watch: bool, minify: bool) -> Result
                     "[{}/{}] {}",
                     i + 1,
                     result.builds.len(),
-                    vendor.chars().next().unwrap().to_uppercase().to_string()
-                        + &vendor[1..]
+                    vendor.chars().next().unwrap().to_uppercase().to_string() + &vendor[1..]
                 )
                 .bold()
             );
-            println!("{}", format!("  ✓ Compiled {} file(s)", build.files.len()).green());
             println!(
                 "{}",
-                format!("  ✓ Output: {} ({:.2} KB)", build.output_path, build.size as f64 / 1024.0)
-                    .green()
+                format!("  ✓ Compiled {} file(s)", build.files.len()).green()
+            );
+            println!(
+                "{}",
+                format!(
+                    "  ✓ Output: {} ({:.2} KB)",
+                    build.output_path,
+                    build.size as f64 / 1024.0
+                )
+                .green()
             );
 
             if !build.warnings.is_empty() {
@@ -63,7 +71,10 @@ pub async fn execute(vendors: Vec<String>, _watch: bool, minify: bool) -> Result
             "\n{}",
             format!("✓ Build completed in {:.2}s", duration.as_secs_f64()).green()
         );
-        println!("{}", format!("  Total output: {:.2} KB", total_size as f64 / 1024.0).dimmed());
+        println!(
+            "{}",
+            format!("  Total output: {:.2} KB", total_size as f64 / 1024.0).dimmed()
+        );
     } else {
         println!("\n{}", "Build failed".red().bold());
 

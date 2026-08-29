@@ -1,4 +1,4 @@
-//! SQLite storage layer for the product model.
+//! SQLite storage layer for the catalog.
 //!
 //! Shares the one connection owned by [`crate::database::Database`], so it
 //! inherits the `PRAGMA foreign_keys = ON` set at init and never competes
@@ -22,7 +22,7 @@ use super::model::{
     validate_app_id, validate_environment_name, validate_host, validate_path_prefix,
     validate_secret_name,
 };
-use super::{ProductError, ProductResult};
+use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
 const APP_COLUMNS: &str = "id, created_at";
@@ -39,22 +39,28 @@ const ROUTE_COLUMNS: &str = "id, app_id, env_id, host, path_prefix, priority";
 /// order and keeps the pointer semantics correct under rapid changes.
 const DEPLOYMENT_ORDER: &str = "created_at DESC, rowid DESC";
 
-pub struct ProductStore {
+pub struct CatalogStore {
     db: Arc<Database>,
 }
 
-impl ProductStore {
+impl CatalogStore {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
     }
 
     /// Run a closure against the shared connection with the error type
-    /// pinned to `ProductError`. Without this the compiler cannot tell
-    /// whether a `?` on a rusqlite error should produce a `ProductError`
+    /// pinned to `CatalogError`. Without this the compiler cannot tell
+    /// whether a `?` on a rusqlite error should produce a `CatalogError`
     /// or a `DatabaseError`, and every call site would need an annotation.
-    async fn with_conn<T, F>(&self, f: F) -> ProductResult<T>
+    ///
+    /// The closure runs on a blocking thread (see
+    /// [`Database::with_connection`]), which is why it and its result must
+    /// be `Send + 'static`: every query here owns its parameters instead
+    /// of borrowing them from the caller.
+    async fn with_conn<T, F>(&self, f: F) -> CatalogResult<T>
     where
-        F: FnOnce(&Connection) -> ProductResult<T>,
+        F: FnOnce(&Connection) -> CatalogResult<T> + Send + 'static,
+        T: Send + 'static,
     {
         self.db.with_connection(f).await
     }
@@ -64,7 +70,7 @@ impl ProductStore {
     // ----------------------------------------------------------------
 
     /// Register a new app. The id is the app name and must be free.
-    pub async fn create_app(&self, id: &str) -> ProductResult<App> {
+    pub async fn create_app(&self, id: &str) -> CatalogResult<App> {
         validate_app_id(id)?;
         let id = id.to_string();
         let created_at = now_secs();
@@ -72,7 +78,7 @@ impl ProductStore {
         let app = self
             .with_conn(move |conn| {
                 if app_exists(conn, &id)? {
-                    return Err(ProductError::conflict(format!("app {id} already exists")));
+                    return Err(CatalogError::conflict(format!("app {id} already exists")));
                 }
                 conn.execute(
                     "INSERT INTO apps (id, created_at) VALUES (?1, ?2)",
@@ -86,7 +92,7 @@ impl ProductStore {
         Ok(app)
     }
 
-    pub async fn list_apps(&self) -> ProductResult<Vec<App>> {
+    pub async fn list_apps(&self) -> CatalogResult<Vec<App>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(&format!("SELECT {APP_COLUMNS} FROM apps ORDER BY id"))?;
             let rows = stmt.query_map([], map_app)?;
@@ -99,7 +105,7 @@ impl ProductStore {
         .await
     }
 
-    pub async fn get_app(&self, id: &str) -> ProductResult<App> {
+    pub async fn get_app(&self, id: &str) -> CatalogResult<App> {
         let id = id.to_string();
         self.with_conn(move |conn| load_app(conn, &id)).await
     }
@@ -110,7 +116,7 @@ impl ProductStore {
     /// app that no longer exists cannot keep an immutable history. The
     /// bundle files are reported back rather than deleted here, because
     /// the filesystem belongs to `BundleStore`.
-    pub async fn delete_app(&self, id: &str) -> ProductResult<DeletedApp> {
+    pub async fn delete_app(&self, id: &str) -> CatalogResult<DeletedApp> {
         let app_id = id.to_string();
         let removed = self
             .with_conn(move |conn| {
@@ -184,7 +190,7 @@ impl ProductStore {
         bundle_sha: &str,
         bundle_path: &str,
         manifest: &str,
-    ) -> ProductResult<(Version, bool)> {
+    ) -> CatalogResult<(Version, bool)> {
         let app_id = app_id.to_string();
         let bundle_sha = bundle_sha.to_string();
         let bundle_path = bundle_path.to_string();
@@ -263,7 +269,7 @@ impl ProductStore {
         Ok((version, created))
     }
 
-    pub async fn list_versions(&self, app_id: &str) -> ProductResult<Vec<Version>> {
+    pub async fn list_versions(&self, app_id: &str) -> CatalogResult<Vec<Version>> {
         let app_id = app_id.to_string();
         self.with_conn(move |conn| {
             load_app(conn, &app_id)?;
@@ -280,7 +286,7 @@ impl ProductStore {
         .await
     }
 
-    pub async fn get_version(&self, app_id: &str, version_id: &str) -> ProductResult<Version> {
+    pub async fn get_version(&self, app_id: &str, version_id: &str) -> CatalogResult<Version> {
         let app_id = app_id.to_string();
         let version_id = version_id.to_string();
         self.with_conn(move |conn| load_version(conn, &app_id, &version_id))
@@ -288,7 +294,7 @@ impl ProductStore {
     }
 
     /// Resolve the human-facing "v3" to a version row.
-    pub async fn get_version_by_number(&self, app_id: &str, number: i64) -> ProductResult<Version> {
+    pub async fn get_version_by_number(&self, app_id: &str, number: i64) -> CatalogResult<Version> {
         let app_id = app_id.to_string();
         self.with_conn(move |conn| {
             conn.query_row(
@@ -299,7 +305,7 @@ impl ProductStore {
                 map_version,
             )
             .optional()?
-            .ok_or_else(|| ProductError::not_found(format!("version {number} of app {app_id}")))
+            .ok_or_else(|| CatalogError::not_found(format!("version {number} of app {app_id}")))
         })
         .await
     }
@@ -308,7 +314,7 @@ impl ProductStore {
     // Environments
     // ----------------------------------------------------------------
 
-    pub async fn create_environment(&self, app_id: &str, name: &str) -> ProductResult<Environment> {
+    pub async fn create_environment(&self, app_id: &str, name: &str) -> CatalogResult<Environment> {
         validate_environment_name(name)?;
         let app_id = app_id.to_string();
         let name = name.to_string();
@@ -324,7 +330,7 @@ impl ProductStore {
                     )
                     .optional()?;
                 if exists.is_some() {
-                    return Err(ProductError::conflict(format!(
+                    return Err(CatalogError::conflict(format!(
                         "environment {name} of app {app_id} already exists"
                     )));
                 }
@@ -353,7 +359,7 @@ impl ProductStore {
         Ok(env)
     }
 
-    pub async fn list_environments(&self, app_id: &str) -> ProductResult<Vec<Environment>> {
+    pub async fn list_environments(&self, app_id: &str) -> CatalogResult<Vec<Environment>> {
         let app_id = app_id.to_string();
         self.with_conn(move |conn| {
             load_app(conn, &app_id)?;
@@ -370,7 +376,7 @@ impl ProductStore {
         .await
     }
 
-    pub async fn get_environment(&self, app_id: &str, name: &str) -> ProductResult<Environment> {
+    pub async fn get_environment(&self, app_id: &str, name: &str) -> CatalogResult<Environment> {
         let app_id = app_id.to_string();
         let name = name.to_string();
         self.with_conn(move |conn| load_environment(conn, &app_id, &name))
@@ -388,7 +394,7 @@ impl ProductStore {
         env: &Environment,
         version_id: &str,
         note: Option<String>,
-    ) -> ProductResult<Deployment> {
+    ) -> CatalogResult<Deployment> {
         let app_id = env.app_id.clone();
         let env_id = env.id.clone();
         let env_name = env.name.clone();
@@ -435,7 +441,7 @@ impl ProductStore {
     }
 
     /// The newest pointer row of an environment, i.e. what it runs now.
-    pub async fn current_deployment(&self, env_id: &str) -> ProductResult<Option<Deployment>> {
+    pub async fn current_deployment(&self, env_id: &str) -> CatalogResult<Option<Deployment>> {
         let env_id = env_id.to_string();
         self.with_conn(move |conn| current_deployment(conn, &env_id))
             .await
@@ -446,7 +452,7 @@ impl ProductStore {
         &self,
         env_id: &str,
         limit: usize,
-    ) -> ProductResult<Vec<Deployment>> {
+    ) -> CatalogResult<Vec<Deployment>> {
         let env_id = env_id.to_string();
         let limit = limit as i64;
         self.with_conn(move |conn| {
@@ -467,7 +473,7 @@ impl ProductStore {
     /// The version this environment ran before the current one, skipping
     /// repeated deploys of the same version. This is the default rollback
     /// target when the caller does not name one.
-    pub async fn previous_version(&self, env_id: &str) -> ProductResult<Option<String>> {
+    pub async fn previous_version(&self, env_id: &str) -> CatalogResult<Option<String>> {
         let env_id = env_id.to_string();
         self.with_conn(move |conn| {
             let current = match current_deployment(conn, &env_id)? {
@@ -500,7 +506,7 @@ impl ProductStore {
         host: Option<String>,
         path_prefix: &str,
         priority: i64,
-    ) -> ProductResult<Route> {
+    ) -> CatalogResult<Route> {
         if let Some(host) = host.as_deref() {
             validate_host(host)?;
         }
@@ -550,7 +556,7 @@ impl ProductStore {
         &self,
         app_id: Option<&str>,
         env_id: Option<&str>,
-    ) -> ProductResult<Vec<Route>> {
+    ) -> CatalogResult<Vec<Route>> {
         let app_id = app_id.map(|s| s.to_string());
         let env_id = env_id.map(|s| s.to_string());
         self.with_conn(move |conn| {
@@ -569,7 +575,7 @@ impl ProductStore {
         .await
     }
 
-    pub async fn get_route(&self, env_id: &str, route_id: &str) -> ProductResult<Route> {
+    pub async fn get_route(&self, env_id: &str, route_id: &str) -> CatalogResult<Route> {
         let env_id = env_id.to_string();
         let route_id = route_id.to_string();
         self.with_conn(move |conn| load_route(conn, &env_id, &route_id))
@@ -583,7 +589,7 @@ impl ProductStore {
         host: Option<String>,
         path_prefix: &str,
         priority: i64,
-    ) -> ProductResult<Route> {
+    ) -> CatalogResult<Route> {
         if let Some(host) = host.as_deref() {
             validate_host(host)?;
         }
@@ -620,7 +626,7 @@ impl ProductStore {
         Ok(route)
     }
 
-    pub async fn delete_route(&self, env_id: &str, route_id: &str) -> ProductResult<()> {
+    pub async fn delete_route(&self, env_id: &str, route_id: &str) -> CatalogResult<()> {
         let env_id_owned = env_id.to_string();
         let route_id_owned = route_id.to_string();
         self.with_conn(move |conn| {
@@ -650,7 +656,7 @@ impl ProductStore {
         env: &Environment,
         name: &str,
         ciphertext: Vec<u8>,
-    ) -> ProductResult<SecretMeta> {
+    ) -> CatalogResult<SecretMeta> {
         validate_secret_name(name)?;
         let app_id = env.app_id.clone();
         let env_id = env.id.clone();
@@ -695,7 +701,7 @@ impl ProductStore {
 
     /// Names and timestamps only. There is deliberately no API that reads
     /// a secret value back out.
-    pub async fn list_secrets(&self, env_id: &str) -> ProductResult<Vec<SecretMeta>> {
+    pub async fn list_secrets(&self, env_id: &str) -> CatalogResult<Vec<SecretMeta>> {
         let env_id = env_id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn
@@ -715,7 +721,7 @@ impl ProductStore {
         .await
     }
 
-    pub async fn delete_secret(&self, env: &Environment, name: &str) -> ProductResult<()> {
+    pub async fn delete_secret(&self, env: &Environment, name: &str) -> CatalogResult<()> {
         let env_id = env.id.clone();
         let name_owned = name.to_string();
         self.with_conn(move |conn| {
@@ -724,7 +730,7 @@ impl ProductStore {
                 params![env_id, name_owned],
             )?;
             if removed == 0 {
-                return Err(ProductError::not_found(format!(
+                return Err(CatalogError::not_found(format!(
                     "secret {name_owned} in environment {env_id}"
                 )));
             }
@@ -744,7 +750,7 @@ impl ProductStore {
     /// Ciphertexts for one environment, for building the `env` map that
     /// travels with a deployment. Decryption happens at the call site so
     /// plaintext lives as briefly as possible.
-    pub async fn secret_ciphertexts(&self, env_id: &str) -> ProductResult<Vec<(String, Vec<u8>)>> {
+    pub async fn secret_ciphertexts(&self, env_id: &str) -> CatalogResult<Vec<(String, Vec<u8>)>> {
         let env_id = env_id.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn
@@ -770,7 +776,7 @@ impl ProductStore {
     ///
     /// Every runtime node runs every app (full replication), so this list
     /// is the same for all nodes; the node id only shapes the log line.
-    pub async fn list_assignments(&self) -> ProductResult<Vec<Assignment>> {
+    pub async fn list_assignments(&self) -> CatalogResult<Vec<Assignment>> {
         let assignments = self
             .with_conn(|conn| {
                 let mut stmt = conn.prepare(
@@ -787,7 +793,7 @@ impl ProductStore {
                 let rows = stmt.query_map([], |row| {
                     Ok(Assignment {
                         app_id: row.get(0)?,
-                        env_id: row.get(1)?,
+                        environment_id: row.get(1)?,
                         environment: row.get(2)?,
                         version_id: row.get(3)?,
                         bundle_sha: row.get(4)?,
@@ -872,47 +878,47 @@ fn app_exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(found.is_some())
 }
 
-fn load_app(conn: &Connection, id: &str) -> ProductResult<App> {
+fn load_app(conn: &Connection, id: &str) -> CatalogResult<App> {
     conn.query_row(
         &format!("SELECT {APP_COLUMNS} FROM apps WHERE id = ?1"),
         params![id],
         map_app,
     )
     .optional()?
-    .ok_or_else(|| ProductError::not_found(format!("app {id}")))
+    .ok_or_else(|| CatalogError::not_found(format!("app {id}")))
 }
 
-fn load_version(conn: &Connection, app_id: &str, version_id: &str) -> ProductResult<Version> {
+fn load_version(conn: &Connection, app_id: &str, version_id: &str) -> CatalogResult<Version> {
     conn.query_row(
         &format!("SELECT {VERSION_COLUMNS} FROM versions WHERE app_id = ?1 AND id = ?2"),
         params![app_id, version_id],
         map_version,
     )
     .optional()?
-    .ok_or_else(|| ProductError::not_found(format!("version {version_id} of app {app_id}")))
+    .ok_or_else(|| CatalogError::not_found(format!("version {version_id} of app {app_id}")))
 }
 
-fn load_environment(conn: &Connection, app_id: &str, name: &str) -> ProductResult<Environment> {
+fn load_environment(conn: &Connection, app_id: &str, name: &str) -> CatalogResult<Environment> {
     conn.query_row(
         &format!("SELECT {ENVIRONMENT_COLUMNS} FROM environments WHERE app_id = ?1 AND name = ?2"),
         params![app_id, name],
         map_environment,
     )
     .optional()?
-    .ok_or_else(|| ProductError::not_found(format!("environment {name} of app {app_id}")))
+    .ok_or_else(|| CatalogError::not_found(format!("environment {name} of app {app_id}")))
 }
 
-fn load_route(conn: &Connection, env_id: &str, route_id: &str) -> ProductResult<Route> {
+fn load_route(conn: &Connection, env_id: &str, route_id: &str) -> CatalogResult<Route> {
     conn.query_row(
         &format!("SELECT {ROUTE_COLUMNS} FROM routes WHERE env_id = ?1 AND id = ?2"),
         params![env_id, route_id],
         map_route,
     )
     .optional()?
-    .ok_or_else(|| ProductError::not_found(format!("route {route_id} in environment {env_id}")))
+    .ok_or_else(|| CatalogError::not_found(format!("route {route_id} in environment {env_id}")))
 }
 
-fn current_deployment(conn: &Connection, env_id: &str) -> ProductResult<Option<Deployment>> {
+fn current_deployment(conn: &Connection, env_id: &str) -> CatalogResult<Option<Deployment>> {
     let deployment = conn
         .query_row(
             &format!(
@@ -931,17 +937,17 @@ mod tests {
     use super::*;
     use crate::database::Database;
 
-    async fn store() -> ProductStore {
+    async fn store() -> CatalogStore {
         let db = Arc::new(Database::init(":memory:").await.unwrap());
-        ProductStore::new(db)
+        CatalogStore::new(db)
     }
 
-    async fn app_with_env(store: &ProductStore, app_id: &str, env: &str) -> Environment {
+    async fn app_with_env(store: &CatalogStore, app_id: &str, env: &str) -> Environment {
         store.create_app(app_id).await.unwrap();
         store.create_environment(app_id, env).await.unwrap()
     }
 
-    async fn version(store: &ProductStore, app_id: &str, sha: &str) -> Version {
+    async fn version(store: &CatalogStore, app_id: &str, sha: &str) -> Version {
         let (version, created) = store
             .create_version(app_id, sha, &format!("/bundles/{app_id}/{sha}.zip"), "{}")
             .await
@@ -956,10 +962,10 @@ mod tests {
         store.create_app("demo").await.unwrap();
 
         let err = store.create_app("demo").await.unwrap_err();
-        assert!(matches!(err, ProductError::Conflict(_)), "got {err:?}");
+        assert!(matches!(err, CatalogError::Conflict(_)), "got {err:?}");
 
         let err = store.create_app("Bad Name").await.unwrap_err();
-        assert!(matches!(err, ProductError::Invalid(_)), "got {err:?}");
+        assert!(matches!(err, CatalogError::Invalid(_)), "got {err:?}");
 
         assert_eq!(store.list_apps().await.unwrap().len(), 1);
         assert!(store.get_app("missing").await.is_err());
@@ -1004,7 +1010,7 @@ mod tests {
             .create_version("ghost", "sha", "/bundles/ghost/sha.zip", "{}")
             .await
             .unwrap_err();
-        assert!(matches!(err, ProductError::NotFound(_)), "got {err:?}");
+        assert!(matches!(err, CatalogError::NotFound(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -1083,7 +1089,7 @@ mod tests {
         let foreign = version(&store, "other", "sha-x").await;
 
         let err = store.deploy(&env, &foreign.id, None).await.unwrap_err();
-        assert!(matches!(err, ProductError::NotFound(_)), "got {err:?}");
+        assert!(matches!(err, CatalogError::NotFound(_)), "got {err:?}");
         assert!(store.current_deployment(&env.id).await.unwrap().is_none());
     }
 
@@ -1099,7 +1105,10 @@ mod tests {
         store.deploy(&production, &v1.id, None).await.unwrap();
         let assignments = store.list_assignments().await.unwrap();
         assert_eq!(assignments.len(), 1);
+        // The name goes on the wire and the id stays here; swapping them
+        // would hand the node a uuid where it expects "production".
         assert_eq!(assignments[0].environment, "production");
+        assert_eq!(assignments[0].environment_id, production.id);
         assert_eq!(assignments[0].bundle_sha, "sha-1");
 
         store.deploy(&preview, &v2.id, None).await.unwrap();

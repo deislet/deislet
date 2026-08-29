@@ -1,17 +1,19 @@
-use std::sync::Arc;
-use std::time::Duration;
-use dashmap::DashMap;
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::sync::{oneshot, RwLock};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{RwLock, oneshot};
 use tokio::time::timeout;
+use uuid::Uuid;
 
-use crate::database::{Database, CommandStatus, CommandEntry};
+use crate::broadcast::{BroadcastEvent, EventBroadcaster};
+use crate::database::{CommandEntry, CommandStatus, Database};
 use crate::session::SessionManager;
-use crate::broadcast::{EventBroadcaster, BroadcastEvent};
-use deis_wire::pb::{ControlMessage, CommandRequest as ProtoCommandRequest, control_message::Payload};
+use deis_wire::pb::{
+    CommandRequest as ProtoCommandRequest, ControlMessage, control_message::Payload,
+};
 
 /// Command type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,10 +86,7 @@ pub struct CommandExecutor {
 
 impl CommandExecutor {
     /// Create command executor
-    pub fn new(
-        sessions: Arc<SessionManager>,
-        database: Arc<Database>,
-    ) -> Self {
+    pub fn new(sessions: Arc<SessionManager>, database: Arc<Database>) -> Self {
         Self {
             pending_commands: Arc::new(DashMap::new()),
             sessions,
@@ -111,11 +110,13 @@ impl CommandExecutor {
     ) -> Result<CommandResponse, ExecuteError> {
         let command_id = Uuid::new_v4();
         let now = Utc::now();
-        let timeout_at = now + chrono::Duration::from_std(timeout_duration)
-            .map_err(|_| ExecuteError::InvalidTimeout)?;
+        let timeout_at = now
+            + chrono::Duration::from_std(timeout_duration)
+                .map_err(|_| ExecuteError::InvalidTimeout)?;
 
         // Get node session
-        let session = self.sessions
+        let session = self
+            .sessions
             .get_node(node_id)
             .ok_or_else(|| ExecuteError::NodeNotFound(node_id.to_string()))?;
 
@@ -148,7 +149,9 @@ impl CommandExecutor {
             error_message: None,
         };
 
-        self.database.save_command(&command_entry).await
+        self.database
+            .save_command(&command_entry)
+            .await
             .map_err(|e| ExecuteError::DatabaseError(e.to_string()))?;
 
         // Save tracker
@@ -166,7 +169,9 @@ impl CommandExecutor {
         };
 
         // Send command
-        session.send(message).await
+        session
+            .send(message)
+            .await
             .map_err(|e| ExecuteError::SendError(e.to_string()))?;
 
         // Update status
@@ -175,12 +180,10 @@ impl CommandExecutor {
         }
 
         // Update database
-        self.database.update_command_status(
-            &command_id.to_string(),
-            CommandStatus::Sent,
-            None,
-            None,
-        ).await.ok();
+        self.database
+            .update_command_status(&command_id.to_string(), CommandStatus::Sent, None, None)
+            .await
+            .ok();
 
         // Broadcast event
         if let Some(broadcaster) = &self.broadcaster {
@@ -220,24 +223,30 @@ impl CommandExecutor {
             Ok(Err(_)) => {
                 // Channel closed
                 self.pending_commands.remove(&command_id);
-                self.database.update_command_status(
-                    &command_id.to_string(),
-                    CommandStatus::Failed,
-                    None,
-                    Some("Response channel closed".to_string()),
-                ).await.ok();
+                self.database
+                    .update_command_status(
+                        &command_id.to_string(),
+                        CommandStatus::Failed,
+                        None,
+                        Some("Response channel closed".to_string()),
+                    )
+                    .await
+                    .ok();
 
                 Err(ExecuteError::ChannelClosed)
             }
             Err(_) => {
                 // Timeout
                 self.pending_commands.remove(&command_id);
-                self.database.update_command_status(
-                    &command_id.to_string(),
-                    CommandStatus::Timeout,
-                    None,
-                    Some("Command timeout".to_string()),
-                ).await.ok();
+                self.database
+                    .update_command_status(
+                        &command_id.to_string(),
+                        CommandStatus::Timeout,
+                        None,
+                        Some("Command timeout".to_string()),
+                    )
+                    .await
+                    .ok();
 
                 Err(ExecuteError::Timeout)
             }
@@ -250,7 +259,9 @@ impl CommandExecutor {
         command_id: Uuid,
         response: CommandResponse,
     ) -> Result<(), HandleResponseError> {
-        let tracker = self.pending_commands.remove(&command_id)
+        let tracker = self
+            .pending_commands
+            .remove(&command_id)
             .ok_or(HandleResponseError::CommandNotFound)?
             .1;
 
@@ -262,12 +273,19 @@ impl CommandExecutor {
         };
 
         // Update database
-        self.database.update_command_status(
-            &command_id.to_string(),
-            status,
-            response.data.clone(),
-            if response.success { None } else { Some(response.message.clone()) },
-        ).await.map_err(|e| HandleResponseError::DatabaseError(e.to_string()))?;
+        self.database
+            .update_command_status(
+                &command_id.to_string(),
+                status,
+                response.data.clone(),
+                if response.success {
+                    None
+                } else {
+                    Some(response.message.clone())
+                },
+            )
+            .await
+            .map_err(|e| HandleResponseError::DatabaseError(e.to_string()))?;
 
         // Send response to waiting task
         if let Some(tx) = tracker.response_tx {
@@ -302,12 +320,15 @@ impl CommandExecutor {
 
         for id in expired_ids {
             self.pending_commands.remove(&id);
-            self.database.update_command_status(
-                &id.to_string(),
-                CommandStatus::Timeout,
-                None,
-                Some("Command expired".to_string()),
-            ).await.ok();
+            self.database
+                .update_command_status(
+                    &id.to_string(),
+                    CommandStatus::Timeout,
+                    None,
+                    Some("Command expired".to_string()),
+                )
+                .await
+                .ok();
         }
     }
 
@@ -320,11 +341,13 @@ impl CommandExecutor {
         let command_id = Uuid::new_v4();
         let now = Utc::now();
         let timeout_duration = Duration::from_secs(60); // Default 60 seconds timeout
-        let timeout_at = now + chrono::Duration::from_std(timeout_duration)
-            .map_err(|_| ExecuteError::InvalidTimeout)?;
+        let timeout_at = now
+            + chrono::Duration::from_std(timeout_duration)
+                .map_err(|_| ExecuteError::InvalidTimeout)?;
 
         // Get node session
-        let session = self.sessions
+        let session = self
+            .sessions
             .get_node(node_id)
             .ok_or_else(|| ExecuteError::NodeNotFound(node_id.to_string()))?;
 
@@ -354,7 +377,9 @@ impl CommandExecutor {
             error_message: None,
         };
 
-        self.database.save_command(&command_entry).await
+        self.database
+            .save_command(&command_entry)
+            .await
             .map_err(|e| ExecuteError::DatabaseError(e.to_string()))?;
 
         // Save tracker
@@ -372,7 +397,9 @@ impl CommandExecutor {
         };
 
         // Send command
-        session.send(message).await
+        session
+            .send(message)
+            .await
             .map_err(|e| ExecuteError::SendError(e.to_string()))?;
 
         // Update status
@@ -381,12 +408,10 @@ impl CommandExecutor {
         }
 
         // Update database
-        self.database.update_command_status(
-            &command_id.to_string(),
-            CommandStatus::Sent,
-            None,
-            None,
-        ).await.ok();
+        self.database
+            .update_command_status(&command_id.to_string(), CommandStatus::Sent, None, None)
+            .await
+            .ok();
 
         // Broadcast event
         if let Some(broadcaster) = &self.broadcaster {
@@ -430,15 +455,17 @@ impl CommandExecutor {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|entry| serde_json::json!({
-                "id": entry.id,
-                "node_id": entry.node_id,
-                "command_type": entry.command_type,
-                "status": entry.status.as_str(),
-                "created_at": entry.created_at,
-                "sent_at": entry.sent_at,
-                "completed_at": entry.completed_at,
-            }))
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "node_id": entry.node_id,
+                    "command_type": entry.command_type,
+                    "status": entry.status.as_str(),
+                    "created_at": entry.created_at,
+                    "sent_at": entry.sent_at,
+                    "completed_at": entry.completed_at,
+                })
+            })
             .collect()
     }
 
@@ -449,15 +476,17 @@ impl CommandExecutor {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|entry| serde_json::json!({
-                "id": entry.id,
-                "node_id": entry.node_id,
-                "command_type": entry.command_type,
-                "status": entry.status.as_str(),
-                "created_at": entry.created_at,
-                "sent_at": entry.sent_at,
-                "completed_at": entry.completed_at,
-            }))
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "node_id": entry.node_id,
+                    "command_type": entry.command_type,
+                    "status": entry.status.as_str(),
+                    "created_at": entry.created_at,
+                    "sent_at": entry.sent_at,
+                    "completed_at": entry.completed_at,
+                })
+            })
             .collect()
     }
 
@@ -595,7 +624,10 @@ mod tests {
         };
 
         // Handle response
-        executor.handle_response(command_id, response.clone()).await.unwrap();
+        executor
+            .handle_response(command_id, response.clone())
+            .await
+            .unwrap();
 
         // Verify: response sent via oneshot channel
         let received_response = rx.await.unwrap();
@@ -636,7 +668,10 @@ mod tests {
         };
 
         // Handle response
-        executor.handle_response(command_id, response.clone()).await.unwrap();
+        executor
+            .handle_response(command_id, response.clone())
+            .await
+            .unwrap();
 
         // Verify: response sent
         let received_response = rx.await.unwrap();

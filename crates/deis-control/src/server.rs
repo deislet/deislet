@@ -1,14 +1,14 @@
-use std::sync::Arc;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
 
-use crate::config::ControlConfig;
-use crate::session::SessionManager;
-use crate::database::Database;
+use crate::api::grpc::GrpcControlService;
 use crate::broadcast::EventBroadcaster;
 use crate::command::CommandExecutor;
-use crate::api::grpc::GrpcControlService;
+use crate::config::ControlConfig;
+use crate::database::Database;
+use crate::session::SessionManager;
 use deis_wire::pb::control_service_server::ControlServiceServer;
 
 pub struct ControlServer {
@@ -57,11 +57,7 @@ impl ControlServer {
         let config = Arc::clone(&self.config);
         let broadcaster = Arc::clone(&self.broadcaster);
 
-        let mut grpc_service = GrpcControlService::new(
-            config,
-            sessions,
-            broadcaster,
-        );
+        let mut grpc_service = GrpcControlService::new(config, sessions, broadcaster);
 
         if let Some(db) = &self.database {
             grpc_service = grpc_service.with_database(db.clone());

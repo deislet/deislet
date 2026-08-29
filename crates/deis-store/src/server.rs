@@ -37,7 +37,7 @@ impl Stores {
         let blob = BlobService::open(
             &config.data_dir,
             config.shared_connections,
-            config.max_object_bytes,
+            config.upload_limits(),
         )
         .await
         .context("cannot open the blob store")?;
@@ -85,18 +85,20 @@ pub async fn bind(config: &Config) -> Result<TcpListener> {
 /// Resolve when the process is asked to stop.
 ///
 /// Both signals are honoured, because both are used: an operator pressing
-/// Ctrl-C sends SIGINT, while systemd, Docker and Kubernetes stop a container
-/// with SIGTERM. Listening for SIGINT alone would leave this service killed
-/// outright by every supervisor there is, skipping the drain below, so
-/// in-flight KV writes, SQL transactions and blob uploads would be lost.
+/// Ctrl-C sends SIGINT, while a process supervisor (systemd, Docker,
+/// Kubernetes - not deis-control, which never stops this process) stops a
+/// container with SIGTERM. Listening for SIGINT alone would leave this
+/// service killed outright by every such supervisor, skipping the drain
+/// below, so in-flight KV writes, SQL transactions and blob uploads would be
+/// lost.
 pub async fn shutdown_signal() {
     let mut terminate = match signal(SignalKind::terminate()) {
         Ok(stream) => Some(stream),
         Err(e) => {
             tracing::error!(
                 error = %e,
-                "cannot listen for SIGTERM; a supervisor stopping this service will kill it \
-                 outright and in-flight requests will be lost"
+                "cannot listen for SIGTERM; a process supervisor stopping this service will \
+                 kill it outright and in-flight requests will be lost"
             );
             None
         }
@@ -202,9 +204,19 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
         data_dir = %config.data_dir.display(),
         max_message_size = MAX_GRPC_MESSAGE_BYTES,
         max_object_bytes = config.max_object_bytes,
+        upload_idle_timeout_secs = config.upload_idle_timeout_secs,
         kv_sweep_interval_secs = config.kv_sweep_interval_secs,
         "deis-store serving KvStore, Database and BlobStore"
     );
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "listening off the local host with no caller authentication; the tenant header is \
+             taken at face value, so anything that can route to this port can read, overwrite and \
+             delete any app's KV, SQL and blob data by naming its app id. Bind a loopback address \
+             unless caller identity has been added first"
+        );
+    }
 }
 
 #[cfg(test)]

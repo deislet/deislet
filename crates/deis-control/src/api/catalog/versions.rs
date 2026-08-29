@@ -13,9 +13,9 @@ use serde_json::Value;
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
-use super::ProductState;
+use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::product::Version;
+use crate::catalog::Version;
 
 /// Version as seen from outside. `bundle_path` is deliberately absent: it
 /// is a control-plane local path and no client has any use for it.
@@ -83,7 +83,7 @@ pub struct VersionsResponse {
 /// written, no row created - when the digest does not match, the manifest
 /// does not parse, or the manifest names a different app.
 pub async fn upload_version(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path(app_id): Path<String>,
     Query(query): Query<UploadQuery>,
     headers: axum::http::HeaderMap,
@@ -146,7 +146,7 @@ pub async fn upload_version(
 
 /// GET /api/apps/:app_id/versions
 pub async fn list_versions(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path(app_id): Path<String>,
 ) -> ApiResult<Json<VersionsResponse>> {
     let versions = state.store.list_versions(&app_id).await?;
@@ -159,7 +159,7 @@ pub async fn list_versions(
 
 /// GET /api/apps/:app_id/versions/:version_id
 pub async fn get_version(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, version_id)): Path<(String, String)>,
 ) -> ApiResult<Json<VersionView>> {
     let version = state.store.get_version(&app_id, &version_id).await?;
@@ -172,7 +172,7 @@ pub async fn get_version(
 /// assignment, so nodes fetch bundles here rather than receiving them
 /// inside a gRPC message.
 pub async fn download_bundle(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, version_id)): Path<(String, String)>,
 ) -> ApiResult<Response> {
     let version = state.store.get_version(&app_id, &version_id).await?;

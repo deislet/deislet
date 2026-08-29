@@ -93,6 +93,10 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 # Test dependencies
+# `test-util` gives tests a paused clock, so the log shipper's retry backoff can
+# be asserted without the test actually waiting those seconds. Resolver 2 keeps
+# the feature out of the normal build.
+tokio = { version = "1.48", features = ["test-util"] }
 # The blob client speaks a streaming contract owned by deis-store. Running it
 # against the real server in tests is what catches a change on that side; unit
 # tests on either half alone cannot.

@@ -25,17 +25,6 @@ impl LogLevel {
             LogLevel::Fatal => "fatal",
         }
     }
-
-    pub fn as_i32(&self) -> i32 {
-        match self {
-            LogLevel::Trace => 1,
-            LogLevel::Debug => 2,
-            LogLevel::Info => 3,
-            LogLevel::Warn => 4,
-            LogLevel::Error => 5,
-            LogLevel::Fatal => 6,
-        }
-    }
 }
 
 impl From<tracing::Level> for LogLevel {

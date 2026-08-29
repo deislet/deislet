@@ -7,15 +7,18 @@ use std::net::SocketAddr;
 
 use deis_telemetry::config::Config;
 use deis_telemetry::proto::log_service_client::LogServiceClient;
+use deis_telemetry::proto::metric_service_client::MetricServiceClient;
 use deis_telemetry::proto::{
-    HealthCheckRequest, LogEntry, MetricSample, PushLogsRequest, PushMetricsRequest,
-    QueryMetricsRequest, QueryRequest, TailRequest,
+    LogEntry, MetricSample, PushLogsRequest, PushMetricsRequest, QueryMetricsRequest, QueryRequest,
+    TailRequest,
 };
 use deis_telemetry::server::{self, RunningServer};
 use deis_telemetry::{MAX_GRPC_MESSAGE_BYTES, now_us};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tonic::transport::Channel;
+use tonic_health::pb::health_check_response::ServingStatus;
+use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
 
 /// Configuration for a throwaway instance: both listeners take an ephemeral
 /// port so tests can run side by side.
@@ -30,14 +33,23 @@ fn test_config(data_dir: &std::path::Path) -> Config {
     }
 }
 
-async fn connect(server: &RunningServer) -> LogServiceClient<Channel> {
+async fn channel(server: &RunningServer) -> Channel {
     let endpoint = format!("http://{}", server.grpc_addr);
-    let channel = Channel::from_shared(endpoint)
+    Channel::from_shared(endpoint)
         .expect("endpoint must be a valid URI")
         .connect()
         .await
-        .expect("the gRPC listener must accept the connection");
-    LogServiceClient::new(channel)
+        .expect("the gRPC listener must accept the connection")
+}
+
+async fn connect(server: &RunningServer) -> LogServiceClient<Channel> {
+    LogServiceClient::new(channel(server).await)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+}
+
+async fn connect_metrics(server: &RunningServer) -> MetricServiceClient<Channel> {
+    MetricServiceClient::new(channel(server).await)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
 }
@@ -46,7 +58,7 @@ fn entry(app_id: &str, level: i32, message: &str, timestamp_us: i64) -> LogEntry
     LogEntry {
         timestamp_us,
         level,
-        source: "deis-runtime".to_string(),
+        component: "deis-runtime".to_string(),
         app_id: app_id.to_string(),
         message: message.to_string(),
         fields: HashMap::new(),
@@ -82,15 +94,29 @@ async fn push_query_and_tail_against_a_running_service() {
         .expect("the service must start");
     let mut client = connect(&server).await;
 
-    // Health first: it answers for this process and says nothing about
-    // anybody else's.
-    let health = client
-        .health_check(HealthCheckRequest {})
-        .await
-        .expect("health check must answer")
-        .into_inner();
-    assert!(health.healthy);
-    assert!(!health.version.is_empty());
+    // Health first, over the standard grpc.health.v1 service - the one every
+    // Deislet component registers, and the only one this process answers. It
+    // reports on this process and says nothing about anybody else's.
+    let mut health = HealthClient::new(channel(&server).await);
+    for service in [
+        "deis.telemetry.LogService",
+        "deis.telemetry.MetricService",
+        // The empty name asks about the server as a whole.
+        "",
+    ] {
+        let status = health
+            .check(HealthCheckRequest {
+                service: service.to_string(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("health check for {service:?} must answer: {e}"))
+            .into_inner();
+        assert_eq!(
+            status.status,
+            ServingStatus::Serving as i32,
+            "{service:?} must report itself as serving"
+        );
+    }
 
     // A tail stream is opened before anything is pushed; once the call has
     // returned, the subscription is attached, so the pushes below cannot
@@ -248,7 +274,7 @@ async fn metrics_are_stored_queryable_and_scrapable() {
         .await
         .expect("the service must start");
     let metrics_addr = server.metrics_addr;
-    let mut client = connect(&server).await;
+    let mut client = connect_metrics(&server).await;
 
     let now = now_us();
     let pushed = client

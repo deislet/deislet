@@ -49,19 +49,21 @@ impl From<crate::database::DatabaseError> for ApiError {
     }
 }
 
-/// Map product model failures onto HTTP status classes. The variants were
+/// Map catalog failures onto HTTP status classes. The variants were
 /// chosen so this stays a straight table with no guessing.
-impl From<crate::product::ProductError> for ApiError {
-    fn from(err: crate::product::ProductError) -> Self {
-        use crate::product::ProductError;
+impl From<crate::catalog::CatalogError> for ApiError {
+    fn from(err: crate::catalog::CatalogError) -> Self {
+        use crate::catalog::CatalogError;
         let message = err.to_string();
         match err {
-            ProductError::NotFound(_) => ApiError::NotFound(message),
-            ProductError::Conflict(_) => ApiError::Conflict(message),
-            ProductError::Invalid(_) => ApiError::BadRequest(message),
-            ProductError::BundleStorage(_) => ApiError::InternalError(message),
-            ProductError::SecretsUnavailable(_) => ApiError::ServiceUnavailable(message),
-            ProductError::Database(_) => ApiError::DatabaseError(message),
+            CatalogError::NotFound(_) => ApiError::NotFound(message),
+            CatalogError::Conflict(_) => ApiError::Conflict(message),
+            CatalogError::Invalid(_) => ApiError::BadRequest(message),
+            CatalogError::BundleStorage(_) => ApiError::InternalError(message),
+            CatalogError::SecretsUnavailable(_) => ApiError::ServiceUnavailable(message),
+            CatalogError::Database(_) | CatalogError::Backend(_) => {
+                ApiError::DatabaseError(message)
+            }
         }
     }
 }

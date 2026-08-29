@@ -32,7 +32,8 @@ impl DbClient {
     /// Connect to remote Database service
     ///
     /// # Parameters
-    /// - endpoint: gRPC service address (e.g., "http://127.0.0.1:50051")
+    /// - endpoint: deis-store gRPC address (e.g., "http://127.0.0.1:8090",
+    ///   deis-store's default listen address)
     /// - app_id: the tenant every call of this client is charged to
     ///
     /// # Returns
@@ -269,12 +270,18 @@ impl DbClient {
 mod tests {
     use super::*;
 
-    /// Note: These tests require running a deis-control server
-    /// Temporarily marked as #[ignore], to be enabled in integration testing environments
+    /// These tests need a live deis-store; they stay #[ignore] until an
+    /// integration environment provides one.
+    ///
+    /// The address below is a deliberate placeholder, not configuration:
+    /// port 1 is reserved and nothing listens there, so a run that forgets
+    /// the #[ignore] fails as a connection error instead of quietly talking
+    /// to whatever happens to be on a real port. deis-store's actual default
+    /// is 127.0.0.1:8090.
     #[tokio::test]
     #[ignore]
     async fn test_db_client_connect() {
-        let result = DbClient::connect("http://127.0.0.1:50051", "test_app").await;
+        let result = DbClient::connect("http://127.0.0.1:1", "test_app").await;
         // Should return connection error if service is not running
         // Only testing client code compilation and basic logic here
         assert!(result.is_err() || result.is_ok());
@@ -284,7 +291,7 @@ mod tests {
     #[ignore]
     async fn test_db_client_operations() {
         // This test requires a real deis-control server
-        let client = DbClient::connect("http://127.0.0.1:50051", "test_app")
+        let client = DbClient::connect("http://127.0.0.1:1", "test_app")
             .await
             .expect("Failed to connect");
 

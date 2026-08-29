@@ -3,6 +3,10 @@
 //! This service is deliberately "dumb": it knows only `app_id` as a tenant
 //! dimension, and knows nothing about versions, environments or deployments.
 //! Those concepts live in deis-control and deis-runtime.
+//!
+//! It also does not authenticate its callers: the tenant header is taken at
+//! face value, which is why it listens on loopback by default. See the crate
+//! docs for what would have to exist before it can be bound anywhere else.
 
 use anyhow::Result;
 use clap::Parser;
@@ -15,7 +19,9 @@ use std::path::PathBuf;
     about = "Deislet storage services: KV, database and blob"
 )]
 struct Cli {
-    /// Path to the TOML configuration file.
+    /// Path to the TOML configuration file. Every key is optional and
+    /// `deis-store.example.toml` lists them all with their defaults; a
+    /// missing file starts the service on those defaults.
     #[arg(short, long, default_value = "deis-store.toml")]
     config: PathBuf,
 }

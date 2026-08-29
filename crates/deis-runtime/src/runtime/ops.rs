@@ -98,14 +98,33 @@ async fn op_kv_list(
     ))
 }
 
-/// Log operation
+/// The application this isolate is running.
+///
+/// Kept in `OpState` so an op can say which tenant it is acting for. `op_log`
+/// is the reason it exists: deis-telemetry stores one tenant dimension and
+/// every query filters on it, so a line shipped without an application id is
+/// stored but can never be found again -- `deis tail my-app` stays empty while
+/// the shipper reports a successful delivery.
+#[derive(Debug, Clone)]
+pub struct AppId(pub String);
+
+/// Log operation: the sink behind an application's `console.*` calls.
+///
+/// An isolate built without an [`AppId`] in its state logs with an empty
+/// application id, which the log layer treats as "no application" -- the line
+/// still reaches deis-telemetry, it is just not attributable to a tenant.
 #[op2(fast)]
-fn op_log(#[string] level: String, #[string] message: String) {
+fn op_log(state: &mut OpState, #[string] level: String, #[string] message: String) {
+    let app_id = state
+        .try_borrow::<AppId>()
+        .map(|app| app.0.clone())
+        .unwrap_or_default();
+
     match level.as_str() {
-        "info" => tracing::info!(target: "app", "{}", message),
-        "warn" => tracing::warn!(target: "app", "{}", message),
-        "error" => tracing::error!(target: "app", "{}", message),
-        _ => tracing::debug!(target: "app", "{}", message),
+        "info" => tracing::info!(target: "app", app_id, "{}", message),
+        "warn" => tracing::warn!(target: "app", app_id, "{}", message),
+        "error" => tracing::error!(target: "app", app_id, "{}", message),
+        _ => tracing::debug!(target: "app", app_id, "{}", message),
     }
 }
 

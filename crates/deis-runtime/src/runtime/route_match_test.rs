@@ -12,10 +12,7 @@ mod tests {
 
     #[test]
     fn test_exact_match_no_params() {
-        assert_eq!(
-            match_route("/health", "/health"),
-            Some(HashMap::new())
-        );
+        assert_eq!(match_route("/health", "/health"), Some(HashMap::new()));
     }
 
     #[test]
@@ -85,20 +82,51 @@ mod tests {
     }
 
     #[test]
+    fn test_percent_encoded_literal_segment_matches() {
+        // A non-ASCII literal segment reaches the server percent-encoded:
+        // a browser sends "/cafe\u{e9}/1" as "/caf%C3%A9/1". Literal segments
+        // must therefore be compared after decoding, exactly like placeholder
+        // values, or a manifest with such a segment silently never matches.
+        assert_eq!(
+            match_route("/caf\u{e9}/:id", "/caf%C3%A9/1"),
+            Some(params(&[("id", "1")]))
+        );
+    }
+
+    #[test]
+    fn test_space_in_literal_segment_matches_when_escaped() {
+        assert_eq!(
+            match_route("/a b/:id", "/a%20b/7"),
+            Some(params(&[("id", "7")]))
+        );
+    }
+
+    #[test]
+    fn test_escaped_pattern_literal_matches_unescaped_path() {
+        // Decoding both sides also makes the pattern's own escaping
+        // irrelevant, so a manifest written either way behaves the same.
+        assert_eq!(
+            match_route("/a%20b/:id", "/a b/7"),
+            Some(params(&[("id", "7")]))
+        );
+    }
+
+    #[test]
+    fn test_decoded_literal_still_rejects_a_different_segment() {
+        // Decoding must not make everything match: a different escaped
+        // segment still has to be rejected.
+        assert_eq!(match_route("/caf\u{e9}/:id", "/th\u{e9}/1"), None);
+    }
+
+    #[test]
     fn test_empty_placeholder_name_never_matches() {
         assert_eq!(match_route("/users/:", "/users/123"), None);
     }
 
     #[test]
     fn test_match_routes_returns_first_match() {
-        let patterns = vec![
-            "/users/:id/posts".to_string(),
-            "/users/:id".to_string(),
-        ];
-        assert_eq!(
-            match_routes(&patterns, "/users/9"),
-            params(&[("id", "9")])
-        );
+        let patterns = vec!["/users/:id/posts".to_string(), "/users/:id".to_string()];
+        assert_eq!(match_routes(&patterns, "/users/9"), params(&[("id", "9")]));
     }
 
     #[test]

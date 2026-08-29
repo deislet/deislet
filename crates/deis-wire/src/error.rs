@@ -42,10 +42,7 @@ impl fmt::Display for WireError {
                 help,
             } => {
                 if let Some(help_text) = help {
-                    write!(
-                        f,
-                        "Control error [{code}]: {message} (help: {help_text})"
-                    )
+                    write!(f, "Control error [{code}]: {message} (help: {help_text})")
                 } else {
                     write!(f, "Control error [{code}]: {message}")
                 }

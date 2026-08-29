@@ -125,12 +125,25 @@ message ResourceLimits {
     double rate_limit_ops_per_sec = 6;
 }
 
-// Routing rule
+// Routing rule.
+//
+// The runtime uses these only to fill `context.params`; they do not select an
+// app (deis-proxy does that) and they do not gate a request.
 message RouteRule {
-    // Path to match (wildcards supported)
+    // Path pattern: exact segments plus `:name` placeholders, for example
+    // "/api/users/:id". Wildcards are NOT supported -- "/api/*" matches
+    // nothing, and a pattern that never matches shows up only as an empty
+    // `context.params`, so do not write one expecting it to work. Matching
+    // lives in crates/deis-runtime/src/runtime/route_match.rs; a full route
+    // table (wildcards, priority, method selection) is wave B work.
+    //
+    // The app bundle manifest spells this field `routes[].pattern`
+    // (docs/implementation-plan.zh.md section 2); they are the same thing.
     string path = 1;
 
-    // Methods to match
+    // Methods to match. Currently ignored by the runtime: a request reaches
+    // the app whatever its method, and the manifest carries a single `method`
+    // per route rather than a list. Reconciling the two is wave B work.
     repeated string methods = 2;
 }
 

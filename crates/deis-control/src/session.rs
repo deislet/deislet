@@ -1,12 +1,12 @@
+use chrono::Utc;
+use dashmap::DashMap;
+use deis_wire::pb::ControlMessage;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use dashmap::DashMap;
-use uuid::Uuid;
-use chrono::Utc;
 use tonic::Status;
-use deis_wire::pb::ControlMessage;
+use uuid::Uuid;
 
-use crate::message::{NodeRole, NodeInfo};
+use crate::message::{NodeInfo, NodeRole};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeState {

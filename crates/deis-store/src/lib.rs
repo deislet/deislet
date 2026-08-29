@@ -16,10 +16,36 @@
 //! db/<app_id>.sqlite                 one SQL database per app
 //! blob/<app_id>/<aa>/<bb>/<sha256>   object content, addressed by digest
 //! ```
+//!
+//! # Trust model: the tenant header is believed, and that is why we listen on
+//! loopback
+//!
+//! Every request names its tenant in the `x-deis-app-id` header and the
+//! service acts on it as given. There is no authorization step, because
+//! there is nothing to authorize against: the store holds no credentials, no
+//! per-app keys and no table of who may be whom. So a client that can open a
+//! connection to this port can read, overwrite and delete any app's data
+//! simply by putting that app's id in the header. There is no privilege
+//! escalation to find here; it is the design as it stands.
+//!
+//! What contains it, for this round, is reachability. The default listen
+//! address is `127.0.0.1`, so the only callers are processes on the same
+//! host - which is where deis-runtime, the sole intended caller, runs. The
+//! service warns at startup when it is bound anywhere else, because that
+//! turns a local trust assumption into an open one.
+//!
+//! Exposing this service beyond the local host is therefore not a
+//! configuration change, it is a feature that does not exist yet. It needs,
+//! at a minimum: an identity per caller (mutual TLS certificate or a signed
+//! token issued by deis-control), a check that the identity is entitled to
+//! the `app_id` the call claims, refusals logged with enough context to
+//! investigate, and the same treatment for the health endpoint. Until that
+//! exists, an operator who widens `listen` is publishing every app's data to
+//! whoever can route to the port.
 
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
-pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
+pub use deis_wire::conventions::{MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES};
 
 pub mod blob;
 pub mod config;
@@ -30,7 +56,6 @@ pub mod proto;
 pub mod server;
 pub mod sqlite;
 pub mod tenant;
-
 
 /// Seconds since the unix epoch, the one time representation used in every
 /// table here.

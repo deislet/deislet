@@ -222,7 +222,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     )?;
 
     // ------------------------------------------------------------------
-    // Product model (docs/implementation-plan.zh.md section 3).
+    // Catalog tables, the product model of docs/implementation-plan.zh.md
+    // section 3.
     //
     // These tables are independent of the node-management tables above:
     // creating them never rewrites an existing row, so an older database
@@ -231,7 +232,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // ------------------------------------------------------------------
 
     // Applications. The id is the globally unique app name (app_id) that
-    // every other product table and every dumb service keys off.
+    // every other catalog table and every dumb service keys off.
     conn.execute(
         r#"
         CREATE TABLE IF NOT EXISTS apps (
@@ -312,7 +313,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     )?;
 
     // "Newest deployment of this environment" is the hottest query in the
-    // product model: it backs both the current-deployment endpoint and the
+    // catalog: it backs both the current-deployment endpoint and the
     // per-node assignment list.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_deployments_env ON deployments(env_id, created_at DESC)",
@@ -381,10 +382,10 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The product tables must appear next to the node-management tables,
+    /// The catalog tables must appear next to the node-management tables,
     /// and re-running the migration must stay a no-op.
     #[test]
-    fn creates_product_tables_alongside_node_tables() {
+    fn creates_catalog_tables_alongside_node_tables() {
         let conn = Connection::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         create_tables(&conn).unwrap();

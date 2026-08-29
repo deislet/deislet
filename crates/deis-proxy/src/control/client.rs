@@ -19,20 +19,18 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use deis_wire::pb::control_message::Payload;
 use deis_wire::pb::{CommandRequest, CommandResponse};
-use deis_wire::{
-    SdkResult, ControlConfig, NodeInfo, NodeRole, WireClient, WireError,
-};
+use deis_wire::{ControlConfig, NodeInfo, NodeRole, SdkResult, WireClient, WireError};
 use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
 use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{
-    AppConfig, AppConfigEntry, ConfigError, ConfigManager, ControlAppsConfig,
-    ControlSystemConfig, Validatable,
+    AppConfig, AppConfigEntry, ConfigError, ConfigManager, ControlAppsConfig, ControlSystemConfig,
+    Validatable,
 };
-use crate::restart::ProcessCommand;
 use crate::control::state::{ProxyStateManager, State};
+use crate::restart::ProcessCommand;
 
 /// `ConfigUpdate` key carrying the complete application list.
 pub const CONFIG_KEY_APPS: &str = "apps";

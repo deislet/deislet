@@ -1,4 +1,5 @@
 pub mod apps;
+pub mod catalog;
 pub mod commands;
 pub mod configs;
 pub mod error;
@@ -6,30 +7,27 @@ pub mod events;
 pub mod grpc;
 pub mod metrics;
 pub mod middleware;
-pub mod product;
-pub mod static_files;
 pub mod nodes;
+pub mod static_files;
 
 use axum::{
-    middleware as axum_middleware,
+    Router, middleware as axum_middleware,
     routing::{delete, get, post, put},
-    Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
+use std::future::Future;
 use std::sync::Arc;
-use tower_http::{
-    cors::CorsLayer,
-    trace::TraceLayer,
-};
-use tracing::{error, info};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tracing::{error, info, warn};
 
 use crate::{
     broadcast::EventBroadcaster,
+    catalog::{BundleStore, CatalogStore, SecretsBackend},
     command::CommandExecutor,
     config::ControlConfig,
     config_manager::ConfigManager,
     database::Database,
     metrics::MetricsCollector,
-    product::{BundleStore, ProductStore, SecretsBackend},
     session::SessionManager,
 };
 
@@ -86,7 +84,7 @@ pub fn build_api_router(
         deis_runtime: Arc::clone(&deis_runtime_manager),
     };
 
-    let product_state = build_product_state(Arc::clone(&database), &config);
+    let catalog_state = build_catalog_state(Arc::clone(&database), &config);
 
     let auth_config = middleware::AuthConfig::from_control_config(&config);
 
@@ -99,20 +97,56 @@ pub fn build_api_router(
         .route("/api/configs/stats", get(configs::get_config_stats))
         .route("/api/configs/:node_id", get(configs::get_node_configs))
         .route("/api/configs/:node_id", post(configs::update_node_configs))
-        .route("/api/configs/:node_id", delete(configs::delete_node_configs))
-        .route("/api/configs/:node_id/history", get(configs::get_config_history))
-        .route("/api/configs/:node_id/:config_key", get(configs::get_config_value))
-        .route("/api/configs/:node_id/:config_key", delete(configs::delete_config))
-        .route("/api/configs/:node_id/:config_key/history", get(configs::get_config_key_history))
-        .route("/api/configs/:node_id/:config_key/rollback", post(configs::rollback_config_key))
-        .route("/api/configs/push/:node_id", post(configs::push_all_configs))
-        .route("/api/configs/push/:node_id/:config_key", post(configs::push_config))
+        .route(
+            "/api/configs/:node_id",
+            delete(configs::delete_node_configs),
+        )
+        .route(
+            "/api/configs/:node_id/history",
+            get(configs::get_config_history),
+        )
+        .route(
+            "/api/configs/:node_id/:config_key",
+            get(configs::get_config_value),
+        )
+        .route(
+            "/api/configs/:node_id/:config_key",
+            delete(configs::delete_config),
+        )
+        .route(
+            "/api/configs/:node_id/:config_key/history",
+            get(configs::get_config_key_history),
+        )
+        .route(
+            "/api/configs/:node_id/:config_key/rollback",
+            post(configs::rollback_config_key),
+        )
+        .route(
+            "/api/configs/push/:node_id",
+            post(configs::push_all_configs),
+        )
+        .route(
+            "/api/configs/push/:node_id/:config_key",
+            post(configs::push_config),
+        )
         .with_state(configs_state)
         .route("/api/commands", get(commands::list_commands))
-        .route("/api/commands/execute/:node_id", post(commands::execute_command))
-        .route("/api/commands/node/:node_id", get(commands::list_node_commands))
-        .route("/api/commands/status/:command_id", get(commands::get_command_status))
-        .route("/api/commands/cancel/:command_id", post(commands::cancel_command))
+        .route(
+            "/api/commands/execute/:node_id",
+            post(commands::execute_command),
+        )
+        .route(
+            "/api/commands/node/:node_id",
+            get(commands::list_node_commands),
+        )
+        .route(
+            "/api/commands/status/:command_id",
+            get(commands::get_command_status),
+        )
+        .route(
+            "/api/commands/cancel/:command_id",
+            post(commands::cancel_command),
+        )
         .with_state(commands_state)
         .route("/api/events", get(events::list_events))
         .route("/api/events/stats", get(events::get_event_stats))
@@ -125,9 +159,9 @@ pub fn build_api_router(
         .route("/api/runtime/:node/apps/:app_id", put(apps::deploy_app))
         .route("/api/runtime/:node/apps/:app_id", delete(apps::unload_app))
         .with_state(apps_state)
-        // The product model brings its own state, so it is merged as a
+        // The catalog brings its own state, so it is merged as a
         // finished router rather than threaded through the chain above.
-        .merge(product::router(product_state))
+        .merge(catalog::router(catalog_state))
         .layer(axum_middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::api_key_auth,
@@ -142,7 +176,11 @@ pub fn build_api_router(
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 
-    let tls_enabled = config.tls.as_ref().map(|tls| tls.api_enabled).unwrap_or(false);
+    let tls_enabled = config
+        .tls
+        .as_ref()
+        .map(|tls| tls.api_enabled)
+        .unwrap_or(false);
 
     ApiRouter {
         router: app,
@@ -151,12 +189,12 @@ pub fn build_api_router(
     }
 }
 
-/// Assemble the state every product endpoint shares.
+/// Assemble the state every catalog endpoint shares.
 ///
 /// Both fallible pieces - the bundle directory and the secret master key -
 /// are resolved once here so a misconfiguration shows up in the startup
 /// log instead of on a request hours later.
-fn build_product_state(database: Arc<Database>, config: &ControlConfig) -> product::ProductState {
+fn build_catalog_state(database: Arc<Database>, config: &ControlConfig) -> catalog::CatalogState {
     let bundles = BundleStore::new(config.bundle_dir.clone());
     match bundles.ensure_root() {
         Ok(()) => info!(
@@ -172,28 +210,111 @@ fn build_product_state(database: Arc<Database>, config: &ControlConfig) -> produ
 
     let secrets = SecretsBackend::load(config.secret_key_file.as_deref());
 
-    let tls_enabled = config.tls.as_ref().map(|tls| tls.api_enabled).unwrap_or(false);
+    let tls_enabled = config
+        .tls
+        .as_ref()
+        .map(|tls| tls.api_enabled)
+        .unwrap_or(false);
     let scheme = if tls_enabled { "https" } else { "http" };
     let host = if config.bind_addr == "0.0.0.0" || config.bind_addr == "::" {
         "127.0.0.1"
     } else {
         config.bind_addr.as_str()
     };
-    let address = product::PublicAddress {
+    let address = catalog::PublicAddress {
         configured: config.public_base_url.clone(),
         scheme,
         fallback: format!("{}://{}:{}", scheme, host, config.port),
     };
 
-    product::ProductState {
-        store: Arc::new(ProductStore::new(database)),
+    catalog::CatalogState {
+        store: Arc::new(CatalogStore::new(database)),
         bundles: Arc::new(bundles),
         secrets: Arc::new(secrets),
         address: Arc::new(address),
     }
 }
 
-pub fn log_api_ready(port: u16, tls_enabled: bool, auth_config: &middleware::AuthConfig, grpc_shared: bool) {
+/// Serve `app` on an already bound listener until `shutdown` resolves,
+/// then drain.
+///
+/// One function for both schemes and, in the binary, for both protocols:
+/// the node gRPC service is merged into the same router as the REST API and
+/// shares this port, so a single graceful stop covers them together.
+///
+/// What draining buys: after the signal the listener stops accepting, open
+/// connections are told to finish (HTTP/2 peers get a GOAWAY), and only
+/// then does the process leave. Without it a SIGTERM cut bundle uploads and
+/// deployment writes in half. The window is bounded because node channels
+/// stay open by design; see [`crate::shutdown::DRAIN_GRACE`].
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    tls: Option<RustlsConfig>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let addr = listener.local_addr()?;
+    // axum-server owns the accept loop, and it takes the listener in its
+    // standard-library form; it puts it back into non-blocking mode itself.
+    let listener = listener.into_std()?;
+    let handle = axum_server::Handle::new();
+
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            shutdown.await;
+            info!(
+                %addr,
+                open_connections = handle.connection_count(),
+                grace_secs = crate::shutdown::DRAIN_GRACE.as_secs(),
+                "Draining the control plane: no new connections are accepted, and in-flight REST requests and node gRPC calls have this long to finish before they are cut"
+            );
+            handle.graceful_shutdown(Some(crate::shutdown::DRAIN_GRACE));
+        }
+    });
+
+    let result = match tls {
+        Some(tls) => {
+            axum_server::from_tcp_rustls(listener, tls)
+                .handle(handle.clone())
+                .serve(app.into_make_service())
+                .await
+        }
+        None => {
+            axum_server::from_tcp(listener)
+                .handle(handle.clone())
+                .serve(app.into_make_service())
+                .await
+        }
+    };
+
+    match &result {
+        Ok(()) => {
+            let cut = handle.connection_count();
+            if cut > 0 {
+                warn!(
+                    %addr,
+                    connections = cut,
+                    "Grace period expired with connections still open; they were cut, so those callers see a broken connection and have to retry against the next instance"
+                );
+            }
+            info!(%addr, "Control plane stopped serving");
+        }
+        Err(e) => error!(
+            %addr,
+            error = %e,
+            "Control plane stopped serving with an error; the API and the node channel are down until it is restarted"
+        ),
+    }
+    result
+}
+
+pub fn log_api_ready(
+    port: u16,
+    tls_enabled: bool,
+    auth_config: &middleware::AuthConfig,
+    grpc_shared: bool,
+) {
     let scheme = if tls_enabled { "https" } else { "http" };
     let ws_scheme = if tls_enabled { "wss" } else { "ws" };
 
@@ -206,10 +327,17 @@ pub fn log_api_ready(port: u16, tls_enabled: bool, auth_config: &middleware::Aut
     info!("📡 API: {}://localhost:{}", scheme, port);
     info!("📊 Health: {}://localhost:{}/health", scheme, port);
     info!("🔌 WebSocket: {}://localhost:{}/api/ws", ws_scheme, port);
-    info!("{} TLS: {}", if tls_enabled { "🔒" } else { "⚠️" }, if tls_enabled { "ENABLED" } else { "DISABLED" });
+    info!(
+        "{} TLS: {}",
+        if tls_enabled { "🔒" } else { "⚠️" },
+        if tls_enabled { "ENABLED" } else { "DISABLED" }
+    );
 
     if auth_config.enabled {
-        info!("🔐 Authentication: ENABLED ({} API keys configured)", auth_config.api_keys.len());
+        info!(
+            "🔐 Authentication: ENABLED ({} API keys configured)",
+            auth_config.api_keys.len()
+        );
     } else {
         info!("⚠️  Authentication: DISABLED (all endpoints are public)");
     }
@@ -250,20 +378,19 @@ pub async fn start_api_server(
     let addr = format!("0.0.0.0:{}", port);
     log_api_ready(port, api.tls_enabled, &api.auth_config, false);
 
-    if api.tls_enabled {
+    let tls = if api.tls_enabled {
         let tls_config = tls_config
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("TLS config missing"))?;
         let rustls_config = crate::tls::build_tls_config(tls_config)
             .map_err(|e| anyhow::anyhow!("Failed to build TLS config: {}", e))?;
-        let tls_rust_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_config);
-        axum_server::bind_rustls(addr.parse()?, tls_rust_config)
-            .serve(api.router.into_make_service())
-            .await?;
+        Some(RustlsConfig::from_config(rustls_config))
     } else {
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, api.router).await?;
-    }
+        None
+    };
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    serve(listener, api.router, tls, crate::shutdown::signal()).await?;
 
     Ok(())
 }

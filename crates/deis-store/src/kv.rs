@@ -6,7 +6,10 @@
 //!
 //! Expiry is stored, not enforced by a timer: reads filter on `expires_at`,
 //! so an expired entry is invisible the instant it lapses, and a background
-//! sweep reclaims the space afterwards.
+//! sweep reclaims the space afterwards. Callers express it as a lifetime
+//! (`SetRequest.ttl_seconds`) and the store turns that into an absolute
+//! second at the moment of the write, so a slow client does not extend its
+//! own entry's life by however long its request was in flight.
 
 use crate::error::{StoreError, StoreResult};
 use crate::proto::storage::{
@@ -219,6 +222,30 @@ impl KvService {
         Ok((keys, next_cursor))
     }
 
+    /// The expiry and metadata stored for one key, ignoring whether it has
+    /// already lapsed. Only for tests: no RPC returns either field yet.
+    #[cfg(test)]
+    pub async fn stored_attributes(
+        &self,
+        app: &AppId,
+        key: &str,
+    ) -> StoreResult<Option<(Option<i64>, Option<String>)>> {
+        let key = check_key(key)?;
+        let app_id = app.as_str().to_string();
+        self.pool
+            .with_conn(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT expires_at, metadata FROM kv WHERE app_id = ?1 AND key = ?2",
+                        rusqlite::params![app_id, key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .await
+    }
+
     /// Delete every entry whose expiry has passed, across all tenants.
     /// Returns how many rows went away.
     pub async fn sweep_expired(&self) -> StoreResult<usize> {
@@ -232,6 +259,32 @@ impl KvService {
                 Ok(removed)
             })
             .await
+    }
+}
+
+/// Turn a caller's lifetime into the absolute second the entry lapses.
+///
+/// `None` stays `None`: an entry with no lifetime never expires. A lifetime
+/// that is not positive is refused instead of stored: writing a value that is
+/// already invisible to every reader is never what a caller means, and
+/// silently accepting it would look like the store dropped the write.
+fn expiry_from_ttl(now: i64, ttl_seconds: Option<i64>) -> StoreResult<Option<i64>> {
+    match ttl_seconds {
+        None => Ok(None),
+        Some(ttl) if ttl <= 0 => {
+            tracing::warn!(
+                ttl_seconds = ttl,
+                "kv set asked for a lifetime that is not positive, refusing it; the entry would \
+                 have been unreadable the moment it was written"
+            );
+            Err(StoreError::InvalidArgument(format!(
+                "ttl_seconds is {ttl}, it must be positive"
+            )))
+        }
+        // A clock far enough along that `now + ttl` would wrap is not a
+        // recoverable situation, but an entry that never expires is the safe
+        // way to lose that argument: it costs disk, not data.
+        Some(ttl) => Ok(Some(now.saturating_add(ttl))),
     }
 }
 
@@ -336,10 +389,24 @@ impl KvStore for KvService {
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
         let app = app_id_of(&request)?;
         let req = request.into_inner();
-        tracing::trace!(app = %app, key = %req.key, bytes = req.value.len(), "kv set");
+        let expires_at = expiry_from_ttl(unix_seconds(), req.ttl_seconds)?;
+        tracing::trace!(
+            app = %app,
+            key = %req.key,
+            bytes = req.value.len(),
+            ttl_seconds = req.ttl_seconds,
+            has_metadata = req.metadata.is_some(),
+            "kv set"
+        );
 
-        self.set(&app, &req.key, req.value.into_bytes(), None, None)
-            .await?;
+        self.set(
+            &app,
+            &req.key,
+            req.value.into_bytes(),
+            req.metadata,
+            expires_at,
+        )
+        .await?;
         Ok(Response::new(SetResponse { success: true }))
     }
 
@@ -385,6 +452,7 @@ impl KvStore for KvService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tenant::APP_ID_HEADER;
     use tempfile::TempDir;
 
     async fn service() -> (TempDir, KvService) {
@@ -395,6 +463,16 @@ mod tests {
 
     fn app(name: &str) -> AppId {
         AppId::parse(name).unwrap()
+    }
+
+    /// Stamp the tenant the way deis-runtime does, for the tests that go
+    /// through the gRPC surface rather than the storage methods.
+    fn as_app<T>(app: &str, message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request
+            .metadata_mut()
+            .insert(APP_ID_HEADER, app.parse().unwrap());
+        request
     }
 
     #[tokio::test]
@@ -413,6 +491,96 @@ mod tests {
         assert_eq!(svc.get(&a, "greeting").await.unwrap(), None);
         // Deleting again is not an error, it just removes nothing.
         assert!(!svc.delete(&a, "greeting").await.unwrap());
+    }
+
+    /// Nothing could ever set an expiry before `SetRequest` carried a
+    /// lifetime, so the `expires_at` column and the sweeper that reads it had
+    /// no way to act on anything.
+    #[tokio::test]
+    async fn a_set_with_a_lifetime_stores_an_absolute_expiry() {
+        let (_dir, svc) = service().await;
+        let a = app("app-one");
+        let before = unix_seconds();
+
+        let request = as_app(
+            "app-one",
+            SetRequest {
+                key: "session".to_string(),
+                value: "token".to_string(),
+                ttl_seconds: Some(3600),
+                metadata: Some(r#"{"kind":"session"}"#.to_string()),
+            },
+        );
+        KvStore::set(&svc, request).await.unwrap();
+
+        let (expires_at, metadata) = svc
+            .stored_attributes(&a, "session")
+            .await
+            .unwrap()
+            .expect("the entry should be there");
+        let expires_at = expires_at.expect("a lifetime was asked for");
+        // Absolute, computed at the write: within the window the write took.
+        assert!(
+            (before + 3600..=unix_seconds() + 3600).contains(&expires_at),
+            "expiry {expires_at} is not {before} + 3600"
+        );
+        assert_eq!(metadata.as_deref(), Some(r#"{"kind":"session"}"#));
+        assert_eq!(
+            svc.get(&a, "session").await.unwrap(),
+            Some(b"token".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_without_a_lifetime_never_expires() {
+        let (_dir, svc) = service().await;
+        let a = app("app-one");
+        let request = as_app(
+            "app-one",
+            SetRequest {
+                key: "forever".to_string(),
+                value: "v".to_string(),
+                ttl_seconds: None,
+                metadata: None,
+            },
+        );
+        KvStore::set(&svc, request).await.unwrap();
+        assert_eq!(
+            svc.stored_attributes(&a, "forever").await.unwrap(),
+            Some((None, None))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifetime_that_is_not_positive_is_refused() {
+        let (_dir, svc) = service().await;
+        let a = app("app-one");
+        for ttl in [0, -1] {
+            let request = as_app(
+                "app-one",
+                SetRequest {
+                    key: "doomed".to_string(),
+                    value: "v".to_string(),
+                    ttl_seconds: Some(ttl),
+                    metadata: None,
+                },
+            );
+            let status = KvStore::set(&svc, request).await.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "ttl {ttl}");
+        }
+        // Refused means nothing was written, not written and hidden.
+        assert!(svc.stored_attributes(&a, "doomed").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn a_lifetime_on_an_impossible_clock_never_expires_rather_than_wrapping() {
+        // Wrapping would make the entry look long expired and take a live
+        // value away; costing disk is the better half of that trade.
+        assert_eq!(
+            expiry_from_ttl(i64::MAX, Some(60)).unwrap(),
+            Some(i64::MAX),
+            "the expiry must not wrap into the past"
+        );
     }
 
     #[tokio::test]

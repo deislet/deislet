@@ -280,6 +280,14 @@ ExecStart=/usr/local/bin/deis-control \
 Restart=always
 RestartSec=10
 
+# Shutdown: on stop, systemd sends SIGTERM and deis-control stops accepting
+# new connections, then finishes the requests it already has (bundle
+# uploads and deployment writes among them) before leaving. It gives that
+# drain 15 seconds, so leave the stop timeout above that or systemd will
+# SIGKILL mid-request - the exact thing the drain avoids.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
 # Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096

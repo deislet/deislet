@@ -1,4 +1,6 @@
-//! gRPC surface: ingest, query, live follow, metrics.
+//! gRPC surface: [`LogService`] (ingest, query, live follow) and
+//! [`MetricService`] (sample ingest and query). Both are served on the same
+//! port and share one database.
 //!
 //! The service stores what it is given and gives it back. It never evaluates
 //! whether anything it stored is healthy, never raises an alert and never
@@ -17,15 +19,19 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
 use crate::now_us;
-use crate::proto::log_service_server::LogService;
+// The generated traits carry the same names as the types implementing them,
+// which is the point: proto service and Rust type line up. They are aliased
+// only so both can be named in this file.
+use crate::proto::log_service_server::LogService as LogServiceRpc;
+use crate::proto::metric_service_server::MetricService as MetricServiceRpc;
 use crate::proto::{
-    HealthCheckRequest, HealthCheckResponse, LogEntry, MetricSample, PushLogsRequest,
-    PushLogsResponse, PushMetricsRequest, PushMetricsResponse, QueryMetricsRequest,
-    QueryMetricsResponse, QueryRequest, QueryResponse, TailRequest,
+    LogEntry, MetricSample, PushLogsRequest, PushLogsResponse, PushMetricsRequest,
+    PushMetricsResponse, QueryMetricsRequest, QueryMetricsResponse, QueryRequest, QueryResponse,
+    TailRequest,
 };
 use crate::stats::ServiceStats;
 use crate::store::{
-    LogCursor, LogFilter, LogRecord, MetricCursor, MetricFilter, MetricRecord, Store,
+    LogCursor, LogFilter, LogRecord, MetricCursor, MetricFilter, MetricRecord, TelemetryStore,
 };
 use crate::tail::{TailFilter, TailHub};
 
@@ -72,18 +78,18 @@ impl QueryLimits {
     }
 }
 
-/// The `LogService` implementation.
+/// Serves `deis.telemetry.LogService`.
 #[derive(Clone)]
-pub struct TelemetryService {
-    store: Store,
+pub struct LogService {
+    store: TelemetryStore,
     hub: Arc<TailHub>,
     stats: Arc<ServiceStats>,
     limits: QueryLimits,
 }
 
-impl TelemetryService {
+impl LogService {
     pub fn new(
-        store: Store,
+        store: TelemetryStore,
         hub: Arc<TailHub>,
         stats: Arc<ServiceStats>,
         limits: QueryLimits,
@@ -91,6 +97,28 @@ impl TelemetryService {
         Self {
             store,
             hub,
+            stats,
+            limits,
+        }
+    }
+}
+
+/// Serves `deis.telemetry.MetricService`.
+///
+/// It shares the database and the counters with [`LogService`] but keeps no
+/// tail hub: samples have no live-follow surface, they are read back with
+/// `QueryMetrics` or scraped from the HTTP endpoint.
+#[derive(Clone)]
+pub struct MetricService {
+    store: TelemetryStore,
+    stats: Arc<ServiceStats>,
+    limits: QueryLimits,
+}
+
+impl MetricService {
+    pub fn new(store: TelemetryStore, stats: Arc<ServiceStats>, limits: QueryLimits) -> Self {
+        Self {
+            store,
             stats,
             limits,
         }
@@ -176,7 +204,7 @@ fn to_record(
     Ok(LogRecord {
         timestamp_us,
         level: entry.level,
-        source: entry.source,
+        component: entry.component,
         app_id: entry.app_id,
         message,
         fields: entry.fields.into_iter().collect(),
@@ -189,7 +217,7 @@ fn to_entry(record: &LogRecord) -> LogEntry {
     LogEntry {
         timestamp_us: record.timestamp_us,
         level: record.level,
-        source: record.source.clone(),
+        component: record.component.clone(),
         app_id: record.app_id.clone(),
         message: record.message.clone(),
         fields: record
@@ -270,7 +298,7 @@ fn check_window(start_us: i64, end_us: i64) -> Result<(), String> {
 }
 
 #[tonic::async_trait]
-impl LogService for TelemetryService {
+impl LogServiceRpc for LogService {
     type TailStream = Pin<Box<dyn Stream<Item = Result<LogEntry, Status>> + Send + 'static>>;
 
     async fn push_logs(
@@ -433,7 +461,10 @@ impl LogService for TelemetryService {
         let stream = ReceiverStream::new(rx).map(|record| Ok(to_entry(&record)));
         Ok(Response::new(Box::pin(stream) as Self::TailStream))
     }
+}
 
+#[tonic::async_trait]
+impl MetricServiceRpc for MetricService {
     async fn push_metrics(
         &self,
         request: Request<PushMetricsRequest>,
@@ -536,18 +567,6 @@ impl LogService for TelemetryService {
             has_more: page.has_more,
         }))
     }
-
-    async fn health_check(
-        &self,
-        _request: Request<HealthCheckRequest>,
-    ) -> Result<Response<HealthCheckResponse>, Status> {
-        // This answers for this process only. It says nothing about the
-        // components whose logs are stored here.
-        Ok(Response::new(HealthCheckResponse {
-            healthy: true,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        }))
-    }
 }
 
 #[cfg(test)]
@@ -558,7 +577,7 @@ mod tests {
         LogEntry {
             timestamp_us: 1_700_000_000_000_000,
             level: 3,
-            source: "runtime".into(),
+            component: "deis-runtime".into(),
             app_id: "shop".into(),
             message: message.into(),
             fields: Default::default(),

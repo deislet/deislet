@@ -11,8 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::{
-    AppConfig, ConfigError, LocalConfig, RouteTable, ControlSystemConfig, SystemConfig,
-    Validatable,
+    AppConfig, ConfigError, ControlSystemConfig, LocalConfig, RouteTable, SystemConfig, Validatable,
 };
 
 pub use database::{AppConfigEntry, ConfigDatabase, DatabaseError};

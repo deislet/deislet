@@ -18,9 +18,9 @@ use tracing_subscriber::EnvFilter;
 use deis_proxy::cli::CliConfig;
 use deis_proxy::config::system::LogLevel;
 use deis_proxy::config::{ConfigManager, SystemConfig};
+use deis_proxy::control::{ControlService, ProxyControlClient};
 use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic};
 use deis_proxy::restart::{ProcessControl, RelaunchArgs, announce_ready};
-use deis_proxy::control::{ProxyControlClient, ControlService};
 use deis_proxy::tls::SniCertificates;
 
 /// Upper bound on the initial upstream discovery. It runs after the listening
@@ -338,10 +338,7 @@ fn main() -> Result<()> {
                 .with_listen_ports(ports)
                 .with_config_manager(Arc::clone(&config));
             client.set_process_channel(commands.clone());
-            server.add_service(background_service(
-                "control",
-                ControlService::new(client),
-            ));
+            server.add_service(background_service("control", ControlService::new(client)));
         }
         None => info!("no control configured; running standalone"),
     }

@@ -8,9 +8,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use super::ProductState;
+use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::product::App;
+use crate::catalog::App;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
@@ -27,13 +27,13 @@ pub struct AppsResponse {
 #[derive(Debug, Serialize)]
 pub struct DeleteAppResponse {
     pub app_id: String,
-    pub removed: crate::product::DeletedApp,
+    pub removed: crate::catalog::DeletedApp,
     pub bundle_files_removed: usize,
 }
 
 /// POST /api/apps
 pub async fn create_app(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Json(request): Json<CreateAppRequest>,
 ) -> ApiResult<(StatusCode, Json<App>)> {
     let app = state.store.create_app(request.id.trim()).await?;
@@ -41,7 +41,7 @@ pub async fn create_app(
 }
 
 /// GET /api/apps
-pub async fn list_apps(State(state): State<ProductState>) -> ApiResult<Json<AppsResponse>> {
+pub async fn list_apps(State(state): State<CatalogState>) -> ApiResult<Json<AppsResponse>> {
     let apps = state.store.list_apps().await?;
     Ok(Json(AppsResponse {
         total: apps.len(),
@@ -51,7 +51,7 @@ pub async fn list_apps(State(state): State<ProductState>) -> ApiResult<Json<Apps
 
 /// GET /api/apps/:app_id
 pub async fn get_app(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path(app_id): Path<String>,
 ) -> ApiResult<Json<App>> {
     Ok(Json(state.store.get_app(&app_id).await?))
@@ -64,7 +64,7 @@ pub async fn get_app(
 /// referenced. Nodes keep serving what they already loaded until their
 /// next assignment refresh, which is why the log line says so.
 pub async fn delete_app(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path(app_id): Path<String>,
 ) -> ApiResult<Json<DeleteAppResponse>> {
     let removed = state.store.delete_app(&app_id).await?;
@@ -110,10 +110,10 @@ pub async fn delete_app(
 /// environment in one step so a bad app id never reads as a bad
 /// environment name.
 pub(super) async fn resolve_environment(
-    state: &ProductState,
+    state: &CatalogState,
     app_id: &str,
     env_name: &str,
-) -> Result<crate::product::Environment, ApiError> {
+) -> Result<crate::catalog::Environment, ApiError> {
     state.store.get_app(app_id).await?;
     Ok(state.store.get_environment(app_id, env_name).await?)
 }

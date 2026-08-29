@@ -1,24 +1,23 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use deis_wire::pb::control_service_server::ControlService;
 use deis_wire::pb::{
-    control_message::Payload, Heartbeat, ControlMessage,
-    AuthResponse, RegisterResponse,
+    AuthResponse, ControlMessage, Heartbeat, RegisterResponse, control_message::Payload,
 };
 
-use crate::config::ControlConfig;
-use crate::session::{SessionManager, NodeSession};
-use crate::message::{RegisterRequest as InternalRegisterRequest, NodeInfo};
-use crate::handler::MessageHandler;
-use crate::database::Database;
 use crate::broadcast::EventBroadcaster;
 use crate::command::CommandExecutor;
+use crate::config::ControlConfig;
+use crate::database::Database;
+use crate::handler::MessageHandler;
+use crate::message::{NodeInfo, RegisterRequest as InternalRegisterRequest};
+use crate::session::{NodeSession, SessionManager};
 
 pub struct GrpcControlService {
     config: Arc<ControlConfig>,
@@ -56,7 +55,8 @@ impl GrpcControlService {
 
 #[tonic::async_trait]
 impl ControlService for GrpcControlService {
-    type EstablishChannelStream = Pin<Box<dyn Stream<Item = Result<ControlMessage, Status>> + Send + 'static>>;
+    type EstablishChannelStream =
+        Pin<Box<dyn Stream<Item = Result<ControlMessage, Status>> + Send + 'static>>;
 
     async fn establish_channel(
         &self,
@@ -64,7 +64,7 @@ impl ControlService for GrpcControlService {
     ) -> Result<Response<Self::EstablishChannelStream>, Status> {
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
-        
+
         // Context needed for the connection loop
         let sessions = self.sessions.clone();
         let config = self.config.clone();
@@ -75,7 +75,7 @@ impl ControlService for GrpcControlService {
         // Create a MessageHandler instance
         let mut handler = MessageHandler::new(config.clone(), sessions.clone())
             .with_broadcaster(broadcaster.clone());
-        
+
         if let Some(db) = &database {
             handler = handler.with_database(db.clone());
         }
@@ -100,7 +100,8 @@ impl ControlService for GrpcControlService {
                                 &handler,
                                 &mut current_session,
                                 &mut authenticated,
-                            ).await;
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -115,7 +116,9 @@ impl ControlService for GrpcControlService {
                 info!("Cleaning up session {} (gRPC)", session.instance_id);
 
                 // Call handler to handle disconnection event
-                handler.handle_disconnect(&session, "Connection closed").await;
+                handler
+                    .handle_disconnect(&session, "Connection closed")
+                    .await;
 
                 // Remove from session manager
                 sessions.remove(&session.id);
@@ -123,7 +126,9 @@ impl ControlService for GrpcControlService {
         });
 
         let out_stream = ReceiverStream::new(rx);
-        Ok(Response::new(Box::pin(out_stream) as Self::EstablishChannelStream))
+        Ok(Response::new(
+            Box::pin(out_stream) as Self::EstablishChannelStream
+        ))
     }
 }
 
@@ -188,15 +193,12 @@ async fn handle_payload(
             // Create session with gRPC sender
             // Note: node_id is derived from context, here simplistic
             // Ideally we track node_id from auth phase
-            let node_id = internal_req.id.clone(); 
-            
-            let session = Arc::new(
-                NodeSession::new(node_id, node_info)
-                    .with_sender(tx.clone())
-            );
-            
+            let node_id = internal_req.id.clone();
+
+            let session = Arc::new(NodeSession::new(node_id, node_info).with_sender(tx.clone()));
+
             *current_session = Some(session.clone());
-            
+
             let response = handler.handle_register(internal_req, &session).await;
 
             let reply = Payload::RegisterResponse(RegisterResponse {
@@ -279,7 +281,10 @@ async fn handle_payload(
             };
 
             // Call handler to handle response
-            if let Err(e) = handler.handle_command_response(command_id, internal_response).await {
+            if let Err(e) = handler
+                .handle_command_response(command_id, internal_response)
+                .await
+            {
                 error!("Failed to handle command response {}: {}", command_id, e);
             } else {
                 info!("Command {} response processed successfully", command_id);
@@ -289,11 +294,10 @@ async fn handle_payload(
     }
 }
 
-async fn send_payload(
-    tx: &mpsc::Sender<Result<ControlMessage, Status>>,
-    payload: Payload,
-) {
-    let msg = ControlMessage { payload: Some(payload) };
+async fn send_payload(tx: &mpsc::Sender<Result<ControlMessage, Status>>, payload: Payload) {
+    let msg = ControlMessage {
+        payload: Some(payload),
+    };
     if let Err(e) = tx.send(Ok(msg)).await {
         error!("Failed to send gRPC message: {}", e);
     }

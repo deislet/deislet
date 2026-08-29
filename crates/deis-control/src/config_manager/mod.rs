@@ -1,14 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::broadcast::{BroadcastEvent, EventBroadcaster};
 use crate::database::{Database, DatabaseError};
 use crate::session::SessionManager;
-use crate::broadcast::{EventBroadcaster, BroadcastEvent};
-use deis_wire::pb::{ControlMessage, ConfigUpdate, control_message::Payload};
+use deis_wire::pb::{ConfigUpdate, ControlMessage, control_message::Payload};
 
 /// Configuration manager
 ///
@@ -63,14 +63,13 @@ impl ConfigManager {
         let mut versions: HashMap<String, DateTime<Utc>> = HashMap::new();
 
         for config in configs {
-            let node_configs_map = node_configs
-                .entry(config.node_id.clone())
-                .or_default();
+            let node_configs_map = node_configs.entry(config.node_id.clone()).or_default();
 
             node_configs_map.insert(config.config_key, config.config_value);
 
             // Update version timestamp (taking the latest)
-            versions.entry(config.node_id)
+            versions
+                .entry(config.node_id)
                 .and_modify(|v| {
                     if config.version_timestamp > *v {
                         *v = config.version_timestamp;
@@ -98,10 +97,7 @@ impl ConfigManager {
 
     /// Get a single configuration item for a specific node
     pub fn get_config_value(&self, node_id: &str, config_key: &str) -> Option<JsonValue> {
-        self.configs.load()
-            .get(node_id)?
-            .get(config_key)
-            .cloned()
+        self.configs.load().get(node_id)?.get(config_key).cloned()
     }
 
     /// Update node configuration
@@ -162,7 +158,8 @@ impl ConfigManager {
         config_key: &str,
     ) -> Result<(), PushError> {
         // Get node session
-        let session = self.sessions
+        let session = self
+            .sessions
             .get_node(node_id)
             .ok_or_else(|| PushError::NodeNotFound(node_id.to_string()))?;
 
@@ -252,7 +249,11 @@ impl ConfigManager {
     }
 
     /// Delete a single configuration item for a node
-    pub async fn delete_config_key(&self, node_id: &str, config_key: &str) -> Result<(), DatabaseError> {
+    pub async fn delete_config_key(
+        &self,
+        node_id: &str,
+        config_key: &str,
+    ) -> Result<(), DatabaseError> {
         // Delete from database
         self.database.delete_config(node_id, config_key).await?;
 
@@ -340,7 +341,10 @@ mod tests {
         configs.insert("key1".to_string(), serde_json::json!("value1"));
         configs.insert("key2".to_string(), serde_json::json!(123));
 
-        let version = manager.update_config("node-1", configs.clone()).await.unwrap();
+        let version = manager
+            .update_config("node-1", configs.clone())
+            .await
+            .unwrap();
         assert!(version <= Utc::now());
 
         let retrieved = manager.get_node_config("node-1").unwrap();
@@ -406,10 +410,22 @@ mod tests {
 
         // Verify: key1 is deleted, key2 and key3 still exist
         let node_configs = manager.get_node_config("node-1").unwrap();
-        assert_eq!(node_configs.len(), 2, "Node should have 2 configs remaining");
+        assert_eq!(
+            node_configs.len(),
+            2,
+            "Node should have 2 configs remaining"
+        );
         assert!(!node_configs.contains_key("key1"), "key1 should be deleted");
-        assert_eq!(node_configs.get("key2"), Some(&serde_json::json!("value2")), "key2 should still exist");
-        assert_eq!(node_configs.get("key3"), Some(&serde_json::json!({"nested": "object"})), "key3 should still exist");
+        assert_eq!(
+            node_configs.get("key2"),
+            Some(&serde_json::json!("value2")),
+            "key2 should still exist"
+        );
+        assert_eq!(
+            node_configs.get("key3"),
+            Some(&serde_json::json!({"nested": "object"})),
+            "key3 should still exist"
+        );
 
         // Delete another key
         manager.delete_config_key("node-1", "key2").await.unwrap();
@@ -417,13 +433,20 @@ mod tests {
         // Verify: only key3 remains
         let node_configs = manager.get_node_config("node-1").unwrap();
         assert_eq!(node_configs.len(), 1, "Node should have 1 config remaining");
-        assert_eq!(node_configs.get("key3"), Some(&serde_json::json!({"nested": "object"})), "key3 should still exist");
+        assert_eq!(
+            node_configs.get("key3"),
+            Some(&serde_json::json!({"nested": "object"})),
+            "key3 should still exist"
+        );
 
         // Delete the last key
         manager.delete_config_key("node-1", "key3").await.unwrap();
 
         // Verify: entire node config should be removed (since no configs left)
-        assert!(manager.get_node_config("node-1").is_none(), "Node config should be removed when empty");
+        assert!(
+            manager.get_node_config("node-1").is_none(),
+            "Node config should be removed when empty"
+        );
     }
 
     #[tokio::test]
@@ -438,7 +461,10 @@ mod tests {
         manager.update_config("node-1", configs).await.unwrap();
 
         // Delete a non-existent key (should not error)
-        manager.delete_config_key("node-1", "nonexistent").await.unwrap();
+        manager
+            .delete_config_key("node-1", "nonexistent")
+            .await
+            .unwrap();
 
         // Verify: key1 still exists
         let node_configs = manager.get_node_config("node-1").unwrap();

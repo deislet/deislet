@@ -15,9 +15,16 @@ pub async fn execute(strict: bool) -> Result<()> {
         println!("\n{}", "✓ Validation passed".green().bold());
 
         if !result.warnings.is_empty() {
-            println!("\n{}", format!("⚠ {} warning(s):", result.warnings.len()).yellow());
+            println!(
+                "\n{}",
+                format!("⚠ {} warning(s):", result.warnings.len()).yellow()
+            );
             for warning in &result.warnings {
-                println!("\n  {}:{}", warning.file.yellow(), warning.line.to_string().yellow());
+                println!(
+                    "\n  {}:{}",
+                    warning.file.yellow(),
+                    warning.line.to_string().yellow()
+                );
                 println!("  {}", warning.message.dimmed());
                 if let Some(suggestion) = &warning.suggestion {
                     println!("  {}: {}", "Suggestion".cyan(), suggestion.cyan());

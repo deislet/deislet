@@ -3,7 +3,7 @@ use std::sync::Arc;
 use structopt::StructOpt;
 use tonic::service::Routes;
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(StructOpt, Debug)]
 struct Opts {
@@ -25,8 +25,7 @@ fn init_logging() {
         .unwrap_or_else(|_| "text".to_string())
         .to_lowercase();
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     match log_format.as_str() {
         "json" => {
@@ -44,7 +43,7 @@ fn init_logging() {
                     tracing_subscriber::fmt::layer()
                         .with_target(true)
                         .with_thread_ids(false)
-                        .with_line_number(false)
+                        .with_line_number(false),
                 )
                 .init();
         }
@@ -78,8 +77,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let api_config = Arc::new(config.clone());
 
-    let server = deis_control::ControlServer::new(config)
-        .with_database(Arc::clone(&database));
+    let server = deis_control::ControlServer::new(config).with_database(Arc::clone(&database));
 
     let sessions = server.sessions();
     let broadcaster = server.broadcaster();
@@ -90,30 +88,28 @@ async fn main() -> Result<(), anyhow::Error> {
         Arc::clone(&sessions),
     ));
 
-    let command_executor = Arc::new(deis_control::CommandExecutor::new(
-        Arc::clone(&sessions),
-        Arc::clone(&db),
-    ).with_broadcaster(Arc::clone(&broadcaster)));
+    let command_executor = Arc::new(
+        deis_control::CommandExecutor::new(Arc::clone(&sessions), Arc::clone(&db))
+            .with_broadcaster(Arc::clone(&broadcaster)),
+    );
 
     let server = server.with_command_executor(Arc::clone(&command_executor));
 
-    let metrics_collector = Arc::new(deis_control::MetricsCollector::new(
-        Arc::clone(&sessions),
-    ));
+    let metrics_collector = Arc::new(deis_control::MetricsCollector::new(Arc::clone(&sessions)));
 
     let scheduler = Arc::new(deis_control::CronScheduler::new(
         Arc::clone(&command_executor),
         Some(Arc::clone(&db)),
         60,
     ));
-    Arc::clone(&scheduler).start().await;
+    let scheduler_task = Arc::clone(&scheduler).start().await;
     info!("Cron scheduler started");
 
     let deis_runtime_manager = Arc::new(deis_control::RuntimeNodeManager::new(
         api_config.deis_runtime_nodes.clone(),
         api_config.deis_runtime_poll_interval,
     ));
-    tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop());
+    let runtime_poll_task = tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop());
 
     let api = deis_control::api::build_api_router(
         sessions,
@@ -131,27 +127,43 @@ async fn main() -> Result<(), anyhow::Error> {
     let app = grpc_routes
         .into_axum_router()
         .merge(api.router)
-        .fallback(axum::routing::get(deis_control::api::static_files::serve_fallback));
+        .fallback(axum::routing::get(
+            deis_control::api::static_files::serve_fallback,
+        ));
 
     deis_control::api::log_api_ready(port, api.tls_enabled, &api.auth_config, true);
 
     let addr = format!("{}:{}", bind_addr, port);
 
-    if api.tls_enabled {
+    let tls = if api.tls_enabled {
         let tls_config = api_config
             .tls
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("TLS config missing"))?;
         let rustls_config = deis_control::tls::build_tls_config(tls_config)
             .map_err(|e| anyhow::anyhow!("Failed to build TLS config: {}", e))?;
-        let tls_rust_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_config);
-        axum_server::bind_rustls(addr.parse()?, tls_rust_config)
-            .serve(app.into_make_service())
-            .await?;
+        Some(axum_server::tls_rustls::RustlsConfig::from_config(
+            rustls_config,
+        ))
     } else {
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
-    }
+        None
+    };
 
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // The REST API and the node gRPC channel share this listener, so this
+    // one call serves both and later drains both.
+    let served =
+        deis_control::api::serve(listener, app, tls, deis_control::shutdown::signal()).await;
+
+    // The servers are done; the background loops would otherwise keep
+    // ticking against a process that is on its way out.
+    scheduler_task.abort();
+    runtime_poll_task.abort();
+    info!(
+        "Cron scheduler and runtime node poller stopped; no scheduled trigger or node health probe runs from this instance any more"
+    );
+
+    served?;
+    info!("Control stopped");
     Ok(())
 }

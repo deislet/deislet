@@ -1,8 +1,10 @@
 # deis-telemetry configuration. Every key is optional; the values below are
 # the defaults, so an empty file starts a working service.
 
-# gRPC endpoint: PushLogs / Query / Tail / PushMetrics / QueryMetrics,
-# plus the standard grpc.health.v1 service.
+# gRPC endpoint. Three services share it: LogService (PushLogs / Query /
+# Tail), MetricService (PushMetrics / QueryMetrics) and the standard
+# grpc.health.v1 service, which is the only liveness surface this process
+# offers.
 listen = "127.0.0.1:8092"
 
 # Prometheus scrape endpoint (HTTP GET /metrics). A separate port so a

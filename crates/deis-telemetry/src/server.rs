@@ -20,9 +20,10 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::http::{self, MetricsState};
 use crate::proto::log_service_server::LogServiceServer;
-use crate::service::{QueryLimits, TelemetryService};
+use crate::proto::metric_service_server::MetricServiceServer;
+use crate::service::{LogService, MetricService, QueryLimits};
 use crate::stats::ServiceStats;
-use crate::store::Store;
+use crate::store::TelemetryStore;
 use crate::tail::TailHub;
 use crate::{MAX_GRPC_MESSAGE_BYTES, now_us};
 
@@ -32,7 +33,7 @@ use crate::{MAX_GRPC_MESSAGE_BYTES, now_us};
 pub struct RunningServer {
     pub grpc_addr: SocketAddr,
     pub metrics_addr: SocketAddr,
-    pub store: Store,
+    pub store: TelemetryStore,
     pub stats: Arc<ServiceStats>,
     hub: Arc<TailHub>,
     shutdown: watch::Sender<bool>,
@@ -114,18 +115,15 @@ fn report_interrupt(result: std::io::Result<()>) {
 /// Start every part of the service against `config`.
 pub async fn start(config: &Config) -> Result<RunningServer> {
     config.validate()?;
-    let store = Store::open(&config.data_dir)?;
+    let store = TelemetryStore::open(&config.data_dir)?;
     let stats = Arc::new(ServiceStats::new());
     let hub = Arc::new(TailHub::new(config.tail_capacity, Arc::clone(&stats)));
-    let service = TelemetryService::new(
-        store.clone(),
-        Arc::clone(&hub),
-        Arc::clone(&stats),
-        QueryLimits {
-            default_limit: config.query_default_limit,
-            max_limit: config.query_max_limit,
-        },
-    );
+    let limits = QueryLimits {
+        default_limit: config.query_default_limit,
+        max_limit: config.query_max_limit,
+    };
+    let logs = LogService::new(store.clone(), Arc::clone(&hub), Arc::clone(&stats), limits);
+    let metrics_service = MetricService::new(store.clone(), Arc::clone(&stats), limits);
 
     let grpc_listener = TcpListener::bind(&config.listen)
         .await
@@ -147,18 +145,25 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
 
     let (shutdown, _) = watch::channel(false);
 
-    // Health reporting is always on so the control plane has a uniform
-    // liveness probe across every Deislet service. It answers for this
-    // process only.
+    // The standard grpc.health.v1 service is the only liveness surface this
+    // process offers, which is what deis-store and deis-queue offer too: one
+    // probe shape for the whole platform, and no second answer that could
+    // disagree with it. Both services are reported separately so a caller can
+    // ask about the one it actually uses. It answers for this process only.
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
-        .set_serving::<LogServiceServer<TelemetryService>>()
+        .set_serving::<LogServiceServer<LogService>>()
+        .await;
+    health_reporter
+        .set_serving::<MetricServiceServer<MetricService>>()
         .await;
 
-    let log_service = LogServiceServer::new(service)
-        // Log batches are the reason this ceiling exists: a runtime shipping
-        // a few thousand lines at once must not be cut off at tonic's 4 MB
-        // default.
+    // Log batches are the reason this ceiling exists: a runtime shipping a few
+    // thousand lines at once must not be cut off at tonic's 4 MB default.
+    let log_service = LogServiceServer::new(logs)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+    let metric_service = MetricServiceServer::new(metrics_service)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
 
@@ -167,6 +172,7 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         let result = Server::builder()
             .add_service(health_service)
             .add_service(log_service)
+            .add_service(metric_service)
             .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), grpc_shutdown)
             .await;
         match result {
@@ -249,7 +255,7 @@ struct RetentionPolicy {
 
 /// Drop expired day partitions and metric samples on a timer.
 async fn retention_loop(
-    store: Store,
+    store: TelemetryStore,
     stats: Arc<ServiceStats>,
     policy: RetentionPolicy,
     shutdown: impl std::future::Future<Output = ()> + Send,
@@ -276,7 +282,7 @@ async fn retention_loop(
     }
 }
 
-async fn sweep_once(store: &Store, stats: &Arc<ServiceStats>, policy: RetentionPolicy) {
+async fn sweep_once(store: &TelemetryStore, stats: &Arc<ServiceStats>, policy: RetentionPolicy) {
     let store = store.clone();
     let now = now_us();
     let outcome = tokio::task::spawn_blocking(move || {

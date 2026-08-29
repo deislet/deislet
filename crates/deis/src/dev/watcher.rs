@@ -119,16 +119,17 @@ pub fn discover_routes(config: &ProjectConfig) -> Result<Vec<RouteInfo>> {
             let path = entry.path();
             if let Some(ext) = path.extension()
                 && (ext == "ts" || ext == "js" || ext == "tsx" || ext == "jsx")
-                    && let Ok(code) = std::fs::read_to_string(path)
-                        && let Ok(handler_info) = parser.parse(&code, path.to_str().unwrap_or(""))
-                            && handler_info.has_default_export {
-                                let route = handler_info.route.clone();
-                                routes.push(RouteInfo {
-                                    path: route,
-                                    file_path: path.to_path_buf(),
-                                    method: "ALL".to_string(),
-                                });
-                            }
+                && let Ok(code) = std::fs::read_to_string(path)
+                && let Ok(handler_info) = parser.parse(&code, path.to_str().unwrap_or(""))
+                && handler_info.has_default_export
+            {
+                let route = handler_info.route.clone();
+                routes.push(RouteInfo {
+                    path: route,
+                    file_path: path.to_path_buf(),
+                    method: "ALL".to_string(),
+                });
+            }
         }
     }
 

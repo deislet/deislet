@@ -1,18 +1,18 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::{DateTime, Utc};
 
+use super::error::ApiError;
 use crate::config_manager::ConfigManager;
 use crate::database::Database;
-use super::error::ApiError;
 
 #[derive(Clone)]
 pub struct ConfigsState {
@@ -299,9 +299,7 @@ pub async fn rollback_config_key(
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "No config value found for {}:{} at version {}",
-                node_id,
-                config_key,
-                request.version_timestamp
+                node_id, config_key, request.version_timestamp
             ))
         })?;
 

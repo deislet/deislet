@@ -9,7 +9,7 @@
 
 - [Authentication](#authentication)
 - [Nodes API](#nodes-api)
-- [Product Model API](#product-model-api)
+- [Catalog API](#catalog-api)
 - [Configs API](#configs-api)
 - [Commands API](#commands-api)
 - [Events API](#events-api)
@@ -148,9 +148,12 @@ GET /api/nodes/:id/heartbeats?limit=10
 
 ---
 
-## Product Model API
+## Catalog API
 
-Apps, versions, environments, deployments, routes and secrets. Two rules
+Apps, versions, environments, deployments, routes and secrets: the record
+of which applications exist, which versions each has, and where each
+environment points. This is what `docs/implementation-plan.zh.md` section 3
+calls the product model; in the code it is the `catalog` module. Two rules
 shape this surface:
 
 - **A version is immutable.** Uploading a bundle creates a version and
@@ -303,7 +306,10 @@ POST /api/apps/{app_id}/environments/{env}/rollback
 
 With no body, rolls back to the previous distinct version this environment
 ran; `409 Conflict` when there is none. A body may name a target with
-`version_id` or `version_number`, and may carry a `note`. The rollback is
+`version_id` or `version_number`, and may carry a `note`. A body that is
+present but does not parse - wrong type, malformed JSON, anything that is
+not a JSON object - is `400 Bad Request`; it is never treated as "no body"
+and never silently rolls back to the previous version. The rollback is
 appended as a new deployment row - nothing is mutated, so the rollback is
 itself reversible.
 
@@ -935,10 +941,13 @@ curl http://localhost:8080/api/metrics
 ## Changelog
 
 ### Unreleased
-- Product model API: apps, versions, environments, deployments, routes and secrets
+- Catalog API: apps, versions, environments, deployments, routes and secrets
 - Bundle upload with sha256 and manifest verification, plus streamed bundle download
 - Per-node assignment list at `GET /api/nodes/{node_id}/assignments`
 - Secrets encrypted with AES-256-GCM; values are never returned by any endpoint
+- Graceful shutdown on SIGINT and SIGTERM: the listener stops accepting and
+  in-flight REST requests and node gRPC calls are drained before the process
+  leaves
 
 ### v0.1.0 (2026-01-11)
 - Initial release

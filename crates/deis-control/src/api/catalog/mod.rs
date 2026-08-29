@@ -1,4 +1,4 @@
-//! REST surface of the product model: apps, versions, environments,
+//! REST surface of the catalog: apps, versions, environments,
 //! deployments, routes, secrets, and the two endpoints nodes use to work
 //! out what they should be running (`assignments` and the bundle
 //! download).
@@ -25,7 +25,7 @@ use axum::{
 };
 use tracing::warn;
 
-use crate::product::{BundleStore, ProductStore, SecretsBackend};
+use crate::catalog::{BundleStore, CatalogStore, SecretsBackend};
 
 /// Largest bundle the control plane will accept in one upload. Bundles
 /// carry the worker code plus every static asset, so this is generous;
@@ -70,10 +70,10 @@ impl PublicAddress {
     }
 }
 
-/// Shared state of every product endpoint.
+/// Shared state of every catalog endpoint.
 #[derive(Clone)]
-pub struct ProductState {
-    pub store: Arc<ProductStore>,
+pub struct CatalogState {
+    pub store: Arc<CatalogStore>,
     pub bundles: Arc<BundleStore>,
     pub secrets: Arc<SecretsBackend>,
     pub address: Arc<PublicAddress>,
@@ -84,9 +84,9 @@ pub fn bundle_url(base: &str, app_id: &str, version_id: &str) -> String {
     format!("{base}/api/apps/{app_id}/versions/{version_id}/bundle")
 }
 
-/// Build the product half of the API router. The caller merges it into the
+/// Build the catalog half of the API router. The caller merges it into the
 /// authenticated router.
-pub fn router(state: ProductState) -> Router {
+pub fn router(state: CatalogState) -> Router {
     Router::new()
         .route("/api/apps", get(apps::list_apps).post(apps::create_app))
         .route(
@@ -148,16 +148,16 @@ pub fn router(state: ProductState) -> Router {
         // The path parameter is named `:id` to match the node routes it
         // shares a prefix with; the router rejects two names in the same
         // position.
-        .route("/api/nodes/:id/assignments", get(assignments::assignments))
+        .route("/api/nodes/:id/assignments", get(assignments::for_node))
         .with_state(state)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::catalog::bundle::tests::sample_bundle;
+    use crate::catalog::{SecretCipher, secrets::MASTER_KEY_LEN};
     use crate::database::Database;
-    use crate::product::bundle::tests::sample_bundle;
-    use crate::product::{SecretCipher, secrets::MASTER_KEY_LEN};
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -179,8 +179,8 @@ pub(crate) mod tests {
         } else {
             SecretsBackend::Unavailable("no key file in this test".to_string())
         };
-        let state = ProductState {
-            store: Arc::new(ProductStore::new(database)),
+        let state = CatalogState {
+            store: Arc::new(CatalogStore::new(database)),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
             secrets: Arc::new(secrets),
             address: Arc::new(PublicAddress {
@@ -274,7 +274,7 @@ pub(crate) mod tests {
         assert_eq!(body["version"]["manifest"]["app"], "demo");
 
         // A second, different bundle becomes version 2.
-        let bundle2 = crate::product::bundle::tests::bundle_with_manifest(
+        let bundle2 = crate::catalog::bundle::tests::bundle_with_manifest(
             r#"{"schema":1,"app":"demo","entry":"worker/index.js","env":{"LOG_LEVEL":"debug"}}"#,
             true,
         );

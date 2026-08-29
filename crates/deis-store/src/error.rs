@@ -25,10 +25,17 @@ pub enum StoreError {
     TooLarge(String),
     /// SQLite refused or failed.
     Sqlite(rusqlite::Error),
-    /// The filesystem refused or failed.
+    /// The filesystem refused or failed - or an inbound stream broke, which
+    /// arrives here as a `BrokenPipe`, because to this layer the difference
+    /// between "the disk went away" and "the peer went away" is only which
+    /// half of the copy stopped.
     Io(std::io::Error),
-    /// A blocking database task panicked or was cancelled.
-    Worker(String),
+    /// A tokio blocking task panicked or was cancelled. Nothing to do with a
+    /// Cloudflare Worker: this service never runs application code.
+    BlockingTask(String),
+    /// The peer stopped sending in the middle of a streamed request and did
+    /// not close it either. Whatever it had sent is discarded.
+    Stalled(String),
 }
 
 impl fmt::Display for StoreError {
@@ -41,7 +48,8 @@ impl fmt::Display for StoreError {
             Self::TooLarge(m) => write!(f, "too large: {m}"),
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
-            Self::Worker(m) => write!(f, "worker task: {m}"),
+            Self::BlockingTask(m) => write!(f, "blocking task: {m}"),
+            Self::Stalled(m) => write!(f, "stalled: {m}"),
         }
     }
 }
@@ -70,7 +78,7 @@ impl From<std::io::Error> for StoreError {
 
 impl From<tokio::task::JoinError> for StoreError {
     fn from(e: tokio::task::JoinError) -> Self {
-        Self::Worker(e.to_string())
+        Self::BlockingTask(e.to_string())
     }
 }
 
@@ -84,7 +92,13 @@ impl From<StoreError> for Status {
             // will never get this object back without operator repair.
             StoreError::Corrupt(_) => Code::DataLoss,
             StoreError::TooLarge(_) => Code::ResourceExhausted,
-            StoreError::Sqlite(_) | StoreError::Io(_) | StoreError::Worker(_) => Code::Internal,
+            // The caller ran out of time, not the store: telling it apart
+            // from an internal fault is what lets a client retry instead of
+            // paging whoever owns the store.
+            StoreError::Stalled(_) => Code::DeadlineExceeded,
+            StoreError::Sqlite(_) | StoreError::Io(_) | StoreError::BlockingTask(_) => {
+                Code::Internal
+            }
         };
         Status::new(code, e.to_string())
     }
@@ -108,10 +122,12 @@ mod tests {
             (StoreError::NotFound("x".into()), Code::NotFound),
             (StoreError::Corrupt("x".into()), Code::DataLoss),
             (StoreError::TooLarge("x".into()), Code::ResourceExhausted),
+            (StoreError::Stalled("x".into()), Code::DeadlineExceeded),
             (
                 StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
                 Code::Internal,
             ),
+            (StoreError::BlockingTask("x".into()), Code::Internal),
         ];
         for (err, want) in cases {
             let status: Status = err.into();

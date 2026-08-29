@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use deis_wire::pb::control_message::Payload;
 use deis_wire::pb::control_service_server::{ControlService, ControlServiceServer};
-use deis_wire::pb::{AuthResponse, RegisterResponse, ControlMessage};
+use deis_wire::pb::{AuthResponse, ControlMessage, RegisterResponse};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;

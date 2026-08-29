@@ -36,6 +36,14 @@ message GetResponse {
 message SetRequest {
   string key = 1;
   string value = 2;
+  // Lifetime in seconds from the moment the store accepts the write. Absent
+  // means the entry never lapses. Must be positive: a zero or negative
+  // lifetime is a caller bug, not a request to store something already
+  // expired, so it is refused rather than honoured.
+  optional int64 ttl_seconds = 3;
+  // Opaque caller-defined string kept alongside the value. The store never
+  // parses it; it is stored and returned untouched.
+  optional string metadata = 4;
 }
 
 // Set response

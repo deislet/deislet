@@ -1,14 +1,14 @@
 use axum::{
+    Json,
     extract::{Query, State},
     response::IntoResponse,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::database::Database;
 use super::error::ApiError;
+use crate::database::Database;
 
 #[derive(Clone)]
 pub struct EventsState {

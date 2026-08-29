@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let protos: &[&str] = &["proto/logging.proto"];
+    let protos: &[&str] = &["proto/telemetry.proto"];
     tonic_build::configure()
         // The client is generated for this crate's own integration tests and
         // for anyone who prefers depending on the crate over recompiling the

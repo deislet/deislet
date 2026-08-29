@@ -1,43 +1,62 @@
-# Runtime configuration file
-# Autonomous JavaScript runtime platform
+# deis-runtime node configuration.
+#
+# Every setting below can also be given as an environment variable, whose name
+# is the TOML path with "DEIS_RUNTIME_" in front, upper-cased and joined by
+# underscores: "http_port" is DEIS_RUNTIME_HTTP_PORT, and
+# "[default_execution_limits] timeout_ms" is
+# DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS. There are no aliases, so the
+# guess made from the TOML key always works. DEIS_RUNTIME_CONFIG, which selects
+# this file, is the only variable that names no setting.
+#
+# Values are validated at startup; an out-of-range value stops the node with an
+# explanation instead of failing every request later.
 
-# HTTP service port (used for both HTTP traffic and the gRPC management interface)
+# Port serving both HTTP traffic and the gRPC management interface.
 http_port = 8000
 
-# Data directory (stores configuration, log buffers, etc.)
-# Can be overridden via the DEIS_RUNTIME_DATA_DIR environment variable
-# data_dir = "./data"
+# Directory holding this node's SQLite database and other local state.
+data_dir = "./data"
 
-# Platform-wide default execution limits for app isolates. An individual app
-# may override either value via its own ResourceLimits config; these are only
-# the fallback used when it does not.
-[limits]
+# How long a SIGINT/SIGTERM gives in-flight requests to finish before the node
+# stops waiting and exits anyway.
+shutdown_grace_period_secs = 30
+
+# Default execution limits applied to each app's isolate. An individual app may
+# override either value through its own ResourceLimits; these are the fallback
+# used when it does not.
+[default_execution_limits]
 # Maximum wall-clock time (ms) a single fetch invocation may run before the
-# isolate is terminated and the request fails.
-# Can be overridden via the DEIS_RUNTIME_DEFAULT_TIMEOUT_MS environment variable
+# isolate is terminated and the request fails. Must be at least 100.
 timeout_ms = 30000
 
-# Maximum rate (ops/sec) of JS-op dispatch before the isolate is terminated
-# and the in-flight request fails.
-# Can be overridden via the DEIS_RUNTIME_DEFAULT_RATE_LIMIT_OPS_PER_SEC environment variable
+# Maximum rate (ops/sec) of JS-op dispatch before the isolate is terminated and
+# the in-flight request fails. Must be a finite value greater than 0.
 rate_limit_ops_per_sec = 1000.0
 
-# Logging configuration (optional)
+# Log shipping to deis-telemetry. While disabled, this node's logs exist only in
+# its own output; "deis tail" shows nothing for it.
 [logging]
-# Whether log shipping is enabled
 enabled = false
 
-# Log service endpoint (to be implemented)
-# endpoint = "http://log-service:9000"
+# deis-telemetry LogService address. Required whenever enabled is true; leaving
+# it unset with shipping enabled stops the node rather than silently dropping
+# every entry.
+# endpoint = "http://127.0.0.1:8092"
 
-# Buffer size
+# Entries held in memory before the oldest are dropped to make room.
 buffer_size = 10000
 
-# Flush interval (seconds)
-flush_interval = 5
+# Seconds between flush attempts.
+flush_interval_secs = 5
 
-# Maximum number of logs per batch
+# Maximum entries sent in one PushLogs call.
 batch_size = 100
 
-# Maximum number of retries
+# Attempts per batch before it is given up on.
 max_retries = 3
+
+# Ceiling on the retry queue (entries taken out of the buffer but not yet
+# accepted by deis-telemetry). Once full, the node stops draining the buffer, so
+# a telemetry outage costs old logs rather than memory. Must be at least
+# batch_size.
+max_pending_entries = 10000

@@ -5,7 +5,7 @@
 //! is derived, judged or alerted on here - a scraper (or Grafana on top of it)
 //! decides what any of it means.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use tracing::warn;
@@ -29,103 +29,15 @@ pub fn render(samples: &[MetricRecord], stats: &ServiceStats) -> String {
 }
 
 fn render_self(out: &mut String, stats: &ServiceStats) {
-    let uptime = stats.uptime_seconds();
-    let counters: [(&str, &str, &str, u64); 15] = [
-        (
-            "uptime_seconds",
-            "counter",
-            "Seconds since this deis-telemetry process started",
-            uptime,
-        ),
-        (
-            "log_pushes_total",
-            "counter",
-            "PushLogs calls served",
-            ServiceStats::get(&stats.log_pushes),
-        ),
-        (
-            "logs_accepted_total",
-            "counter",
-            "Log entries written to storage",
-            ServiceStats::get(&stats.logs_accepted),
-        ),
-        (
-            "logs_rejected_total",
-            "counter",
-            "Log entries refused as malformed and never stored",
-            ServiceStats::get(&stats.logs_rejected),
-        ),
-        (
-            "logs_truncated_total",
-            "counter",
-            "Log entries stored with their message cut short",
-            ServiceStats::get(&stats.logs_truncated),
-        ),
-        (
-            "log_queries_total",
-            "counter",
-            "Query calls served",
-            ServiceStats::get(&stats.log_queries),
-        ),
-        (
-            "tail_streams_started_total",
-            "counter",
-            "Tail streams opened since start",
-            ServiceStats::get(&stats.tail_streams_started),
-        ),
-        (
-            "tail_streams_open",
-            "gauge",
-            "Tail streams currently open",
-            ServiceStats::get(&stats.tail_streams_open),
-        ),
-        (
-            "tail_entries_dropped_total",
-            "counter",
-            "Entries skipped for slow tail consumers; storage is unaffected",
-            ServiceStats::get(&stats.tail_entries_dropped),
-        ),
-        (
-            "metric_pushes_total",
-            "counter",
-            "PushMetrics calls served",
-            ServiceStats::get(&stats.metric_pushes),
-        ),
-        (
-            "metric_samples_accepted_total",
-            "counter",
-            "Metric samples written to storage",
-            ServiceStats::get(&stats.metric_samples_accepted),
-        ),
-        (
-            "metric_samples_rejected_total",
-            "counter",
-            "Metric samples refused as malformed and never stored",
-            ServiceStats::get(&stats.metric_samples_rejected),
-        ),
-        (
-            "metric_queries_total",
-            "counter",
-            "QueryMetrics calls served",
-            ServiceStats::get(&stats.metric_queries),
-        ),
-        (
-            "retention_partitions_dropped_total",
-            "counter",
-            "Expired daily log partitions dropped since start",
-            ServiceStats::get(&stats.retention_partitions_dropped),
-        ),
-        (
-            "retention_log_rows_dropped_total",
-            "counter",
-            "Log rows lost with expired partitions since start",
-            ServiceStats::get(&stats.retention_log_rows_dropped),
-        ),
-    ];
-    for (name, kind, help, value) in counters {
-        let _ = writeln!(out, "# HELP {SELF_PREFIX}_{name} {help}");
-        let _ = writeln!(out, "# TYPE {SELF_PREFIX}_{name} {kind}");
-        let _ = writeln!(out, "{SELF_PREFIX}_{name} {value}");
+    // Whatever the process keeps, the export shows: the set is walked from
+    // its single declaration in `stats`, never copied here. A counter that
+    // exists but is not exported would leave an operator with no evidence
+    // for something the service really did.
+    for metric in stats.snapshot() {
+        let name = metric.name;
+        let _ = writeln!(out, "# HELP {SELF_PREFIX}_{name} {}", metric.help);
+        let _ = writeln!(out, "# TYPE {SELF_PREFIX}_{name} {}", metric.kind.as_str());
+        let _ = writeln!(out, "{SELF_PREFIX}_{name} {}", metric.value);
     }
 }
 
@@ -171,13 +83,24 @@ fn render_samples(out: &mut String, samples: &[MetricRecord]) {
 }
 
 /// Build the `{k="v",...}` part, with `app_id` first when present.
+///
+/// One label name may appear at most once on a line. Prometheus does not skip
+/// a line that repeats one, it fails the entire scrape, so a single bad pair
+/// of names pushed by a single application would blank out every series on
+/// this endpoint - including this service's own counters. Names are therefore
+/// deduplicated after sanitising, which is where the collisions come from:
+/// `http.status` and `http-status` are two different names to a producer and
+/// the same name here. The first one wins, which also settles `app_id`: the
+/// dedicated field is placed first, so a label of that name loses to it.
 fn label_signature(sample: &MetricRecord) -> String {
     let mut pairs: Vec<(String, &str)> = Vec::new();
+    let mut taken: BTreeSet<String> = BTreeSet::new();
     if !sample.app_id.is_empty() {
+        taken.insert("app_id".to_string());
         pairs.push(("app_id".to_string(), sample.app_id.as_str()));
     }
     for (key, value) in &sample.labels {
-        let Some(key) = sanitize_name(key) else {
+        let Some(sanitized) = sanitize_name(key) else {
             warn!(
                 label = %key,
                 metric = %sample.name,
@@ -186,12 +109,19 @@ fn label_signature(sample: &MetricRecord) -> String {
             );
             continue;
         };
-        if key == "app_id" && !sample.app_id.is_empty() {
-            // The dedicated field wins; a label of the same name would make
-            // the exposition line invalid.
+        if !taken.insert(sanitized.clone()) {
+            warn!(
+                label = %key,
+                exported_as = %sanitized,
+                metric = %sample.name,
+                "this label name is already taken on the series - by the dedicated app_id \
+                 field, or by an earlier label that sanitises to the same name - so it is \
+                 left out of /metrics; emitting it twice would repeat a label name and make \
+                 the scraper reject the entire scrape, not just this series"
+            );
             continue;
         }
-        pairs.push((key, value.as_str()));
+        pairs.push((sanitized, value.as_str()));
     }
     if pairs.is_empty() {
         return String::new();
@@ -339,6 +269,73 @@ mod tests {
         assert_eq!(sanitize_name("9lives").as_deref(), Some("_lives"));
         assert_eq!(sanitize_name(""), None);
         assert_eq!(sanitize_name("---"), None);
+    }
+
+    #[test]
+    fn colliding_label_names_are_not_emitted_twice() {
+        // Two distinct label names that sanitise to the same identifier. A
+        // line carrying both is rejected by Prometheus as a duplicate label
+        // name, and the rejection throws away the whole scrape, not just the
+        // offending series.
+        let text = render(
+            &[sample(
+                "requests",
+                "",
+                &[("http.status", "200"), ("http-status", "500")],
+                1.0,
+                1,
+            )],
+            &ServiceStats::new(),
+        );
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("requests{"))
+            .unwrap_or_else(|| panic!("the series must be exported:\n{text}"));
+        assert_eq!(
+            line.matches("http_status=").count(),
+            1,
+            "a label name must appear once per line, got: {line}"
+        );
+    }
+
+    #[test]
+    fn a_label_named_app_id_never_shadows_the_field() {
+        let text = render(
+            &[sample("requests", "shop", &[("app_id", "other")], 1.0, 1)],
+            &ServiceStats::new(),
+        );
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("requests{"))
+            .unwrap_or_else(|| panic!("the series must be exported:\n{text}"));
+        assert_eq!(line.matches("app_id=").count(), 1, "got: {line}");
+        assert!(line.contains("app_id=\"shop\""), "got: {line}");
+    }
+
+    #[test]
+    fn every_counter_the_process_keeps_is_exported() {
+        // The counters are declared in exactly one place; this proves the
+        // export walks that declaration rather than a hand-kept copy of it.
+        let stats = ServiceStats::new();
+        let text = render(&[], &stats);
+        for metric in stats.snapshot() {
+            assert!(
+                text.contains(&format!("{SELF_PREFIX}_{} ", metric.name)),
+                "counter {} is kept but never exported:\n{text}",
+                metric.name
+            );
+        }
+    }
+
+    #[test]
+    fn retention_of_metric_samples_is_visible_on_metrics() {
+        let stats = ServiceStats::new();
+        ServiceStats::add(&stats.retention_metric_samples_dropped, 5);
+        let text = render(&[], &stats);
+        assert!(
+            text.contains("deis_telemetry_retention_metric_samples_dropped_total 5"),
+            "retention deletes data permanently and must be observable:\n{text}"
+        );
     }
 
     #[test]

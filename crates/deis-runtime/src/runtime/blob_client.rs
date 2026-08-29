@@ -12,8 +12,10 @@
 //! application for its whole life.
 
 use super::tenant::Tenant;
+use crate::STREAM_CHUNK_BYTES;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{stream, Stream, StreamExt};
+use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
@@ -26,17 +28,24 @@ use proto::{
     GetRequest, GetResponse, PutHeader, PutRequest,
 };
 
-/// Size of one uploaded body slice, matching `deis_store::blob::CHUNK_BYTES`.
-///
-/// Chunk boundaries carry no meaning on the wire, so this only has to stay
-/// comfortably below [`crate::MAX_GRPC_MESSAGE_BYTES`]; 1 MiB is also what the
-/// store sends back on `Get`.
-const CHUNK_BYTES: usize = 1024 * 1024;
-
 /// Upper bound on how much a download preallocates from the size the store
 /// declares. The declared size is a hint for `Vec::reserve`, never a promise:
 /// a wrong or corrupted value must not turn into a huge allocation.
 const MAX_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default ceiling on a single downloaded object.
+///
+/// `ctx.blob.get` hands the app one contiguous `Vec<u8>`, which is then copied
+/// again into V8, so a read costs roughly twice the object on this node. An
+/// isolate's `memory_limit_mb` only bounds the V8 heap and cannot see the Rust
+/// side at all, so without a ceiling here one app reading one large object of
+/// its own -- deis-store accepts uploads up to 512 MiB by default -- can drive
+/// the whole node out of memory and take down every other app on it.
+///
+/// 64 MiB is well under any realistic node and still far above what a request
+/// handler sensibly loads whole. Anything larger needs a streaming read, which
+/// is wave B work.
+pub const DEFAULT_MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Client for one application's object storage.
 ///
@@ -48,13 +57,17 @@ const MAX_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 pub struct BlobClient {
     client: GrpcBlobClient<Channel>,
     tenant: Tenant,
+    max_object_bytes: usize,
 }
 
 impl BlobClient {
     /// Connect to deis-store's blob service on behalf of one application.
     ///
+    /// Reads are capped at [`DEFAULT_MAX_OBJECT_BYTES`]; use
+    /// [`BlobClient::with_max_object_bytes`] to choose another ceiling.
+    ///
     /// # Parameters
-    /// - endpoint: gRPC address, e.g. `http://127.0.0.1:50053`
+    /// - endpoint: gRPC address of deis-store, e.g. `http://127.0.0.1:8090`
     /// - app_id: the tenant every call of this client is charged to
     pub async fn connect(endpoint: impl Into<String>, app_id: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
@@ -68,7 +81,20 @@ impl BlobClient {
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::info!(%endpoint, app_id = tenant.app_id(), "blob store client connected");
 
-        Ok(Self { client, tenant })
+        Ok(Self {
+            client,
+            tenant,
+            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+        })
+    }
+
+    /// Change the largest object [`BlobClient::get`] will assemble in memory.
+    ///
+    /// Raising it raises what one read can cost this node; see
+    /// [`DEFAULT_MAX_OBJECT_BYTES`].
+    pub fn with_max_object_bytes(mut self, max_object_bytes: usize) -> Self {
+        self.max_object_bytes = max_object_bytes;
+        self
     }
 
     /// The application every call of this client is charged to.
@@ -104,7 +130,7 @@ impl BlobClient {
             }
         };
 
-        let body = collect_body(self.app_id(), &key, inbound).await?;
+        let body = collect_body(self.app_id(), &key, inbound, self.max_object_bytes).await?;
         tracing::debug!(
             app_id = self.app_id(),
             %key,
@@ -114,7 +140,7 @@ impl BlobClient {
         Ok(Some(body))
     }
 
-    /// Store an object, framed into [`CHUNK_BYTES`] slices.
+    /// Store an object, framed into [`STREAM_CHUNK_BYTES`] slices.
     pub async fn put(&self, key: String, data: Vec<u8>) -> Result<()> {
         self.put_typed(key, data, None).await
     }
@@ -131,7 +157,7 @@ impl BlobClient {
             app_id = self.app_id(),
             %key,
             size,
-            chunks = size.div_ceil(CHUNK_BYTES),
+            chunks = size.div_ceil(STREAM_CHUNK_BYTES),
             "blob put streaming"
         );
 
@@ -202,7 +228,7 @@ impl BlobClient {
 }
 
 /// Frame one object body into the message sequence `Put` expects: the header
-/// first, then the body in [`CHUNK_BYTES`] slices.
+/// first, then the body in [`STREAM_CHUNK_BYTES`] slices.
 ///
 /// The slices are cut as the stream is polled rather than all at once, so
 /// sending a large object costs the body plus one chunk instead of two full
@@ -230,7 +256,7 @@ fn put_messages(
             if sent >= data.len() {
                 return None;
             }
-            let end = (sent + CHUNK_BYTES).min(data.len());
+            let end = (sent + STREAM_CHUNK_BYTES).min(data.len());
             let chunk = PutRequest {
                 payload: Some(put_request::Payload::Chunk(data[sent..end].to_vec())),
             };
@@ -244,7 +270,17 @@ fn put_messages(
 /// A stream that breaks that shape is an error rather than a short read: the
 /// caller asked for an object, and handing it a silently truncated body would
 /// look like success.
-async fn collect_body<S>(app_id: &str, key: &str, inbound: S) -> Result<Vec<u8>>
+///
+/// Three things can end the read in failure, and all three are deliberate:
+/// the object is larger than `max_object_bytes`, the assembled length
+/// disagrees with the metadata, or the assembled digest disagrees with it.
+/// In every case the application sees an exception rather than bytes.
+async fn collect_body<S>(
+    app_id: &str,
+    key: &str,
+    inbound: S,
+    max_object_bytes: usize,
+) -> Result<Vec<u8>>
 where
     S: Stream<Item = Result<GetResponse, Status>>,
 {
@@ -252,6 +288,7 @@ where
 
     let mut info = None;
     let mut body: Vec<u8> = Vec::new();
+    let mut digest = Sha256::new();
 
     while let Some(message) = inbound.next().await {
         match message?.payload {
@@ -259,6 +296,27 @@ where
                 if info.is_some() {
                     anyhow::bail!("blob get stream for {key} sent a second header");
                 }
+
+                // Refuse before reading a single chunk when the store already
+                // says the object is too big; there is no point paying for the
+                // transfer of something that will be rejected.
+                if header.size > max_object_bytes as u64 {
+                    tracing::error!(
+                        %app_id,
+                        %key,
+                        size = header.size,
+                        limit = max_object_bytes,
+                        "blob object exceeds this node's read ceiling; the read fails and the \
+                         application sees an exception. Assembling it would cost roughly twice \
+                         its size on this node and could exhaust memory for every app here"
+                    );
+                    anyhow::bail!(
+                        "blob get for {key} refused: object is {} bytes, this node reads at most \
+                         {max_object_bytes}",
+                        header.size
+                    );
+                }
+
                 let hint = usize::try_from(header.size)
                     .unwrap_or(usize::MAX)
                     .min(MAX_PREALLOC_BYTES);
@@ -269,6 +327,26 @@ where
                 if info.is_none() {
                     anyhow::bail!("blob get stream for {key} sent a body chunk before its header");
                 }
+
+                // The header's size is a claim, not a guarantee. Check the
+                // running total too, so a stream that keeps sending past what
+                // it declared cannot grow the buffer without bound.
+                if body.len().saturating_add(chunk.len()) > max_object_bytes {
+                    tracing::error!(
+                        %app_id,
+                        %key,
+                        received = body.len(),
+                        limit = max_object_bytes,
+                        "blob get stream ran past this node's read ceiling; aborting the read, \
+                         the application sees an exception"
+                    );
+                    anyhow::bail!(
+                        "blob get for {key} aborted: stream exceeded the {max_object_bytes} byte \
+                         read ceiling"
+                    );
+                }
+
+                digest.update(&chunk);
                 body.extend_from_slice(&chunk);
             }
             // Forward compatibility: a payload this build does not know about
@@ -303,7 +381,52 @@ where
         );
     }
 
+    verify_digest(app_id, key, &info.sha256, digest)?;
+
     Ok(body)
+}
+
+/// Compare what we actually received against the digest the store sent with
+/// it.
+///
+/// Length alone only catches truncation. A flipped bit on disk, a
+/// content-addressed file replaced underneath the store, or a server that
+/// opened the wrong shard all produce a body of exactly the right length and
+/// entirely the wrong contents -- and this module's whole promise is that a
+/// corrupt object never reaches the application. The store hashes by content
+/// anyway and sends the digest in the same stream, so this costs one pass that
+/// was already happening chunk by chunk.
+fn verify_digest(app_id: &str, key: &str, expected: &str, digest: Sha256) -> Result<()> {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.is_empty() {
+        // Tolerated rather than fatal: a store that stops sending the digest
+        // is a protocol change, not a corrupt object. Say plainly that this
+        // body went out unchecked so the gap is visible in the log.
+        tracing::warn!(
+            %app_id,
+            %key,
+            "blob get response carried no sha256; the body was handed to the application without \
+             an integrity check"
+        );
+        return Ok(());
+    }
+
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected {
+        tracing::error!(
+            %app_id,
+            %key,
+            %expected,
+            %actual,
+            "blob get body does not hash to its metadata digest; refusing to hand the application \
+             a corrupt object, the read fails instead"
+        );
+        anyhow::bail!(
+            "blob get for {key} returned a body whose sha256 is {actual}, metadata says {expected}"
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -325,17 +448,29 @@ mod tests {
         }
     }
 
-    fn info_message(size: u64) -> GetResponse {
+    /// A header claiming `size` bytes and `sha256`, whatever they are.
+    /// Used where the check under test fires before the digest comparison.
+    fn info_message(size: u64, sha256: &str) -> GetResponse {
         GetResponse {
             payload: Some(get_response::Payload::Info(BlobInfo {
                 key: "k".to_string(),
-                sha256: "aa".to_string(),
+                sha256: sha256.to_string(),
                 size,
                 content_type: None,
                 created_at: 0,
             })),
         }
     }
+
+    /// A header that honestly describes `body`, the way deis-store sends it.
+    fn info_for(body: &[u8]) -> GetResponse {
+        let mut digest = Sha256::new();
+        digest.update(body);
+        info_message(body.len() as u64, &format!("{:x}", digest.finalize()))
+    }
+
+    /// The ceiling used by tests that are not about the ceiling.
+    const TEST_MAX_OBJECT_BYTES: usize = 1024;
 
     fn chunk_message(bytes: &[u8]) -> GetResponse {
         GetResponse {
@@ -367,12 +502,14 @@ mod tests {
 
     #[tokio::test]
     async fn large_body_is_split_at_the_chunk_size_and_reassembles() {
-        let data: Vec<u8> = (0..CHUNK_BYTES * 2 + 7).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..STREAM_CHUNK_BYTES * 2 + 7)
+            .map(|i| (i % 251) as u8)
+            .collect();
         let messages = framed("k", None, data.clone()).await;
 
         assert_eq!(messages.len(), 4, "one header plus three chunks");
-        assert_eq!(chunk_of(&messages[1]).len(), CHUNK_BYTES);
-        assert_eq!(chunk_of(&messages[2]).len(), CHUNK_BYTES);
+        assert_eq!(chunk_of(&messages[1]).len(), STREAM_CHUNK_BYTES);
+        assert_eq!(chunk_of(&messages[2]).len(), STREAM_CHUNK_BYTES);
         assert_eq!(chunk_of(&messages[3]).len(), 7);
 
         let rejoined: Vec<u8> = messages[1..]
@@ -385,11 +522,11 @@ mod tests {
     #[tokio::test]
     async fn download_reassembles_chunks_in_order() {
         let messages = vec![
-            Ok(info_message(6)),
+            Ok(info_for(b"abcdef")),
             Ok(chunk_message(b"abc")),
             Ok(chunk_message(b"def")),
         ];
-        let body = collect_body("app", "k", stream::iter(messages))
+        let body = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
             .await
             .expect("stream is well formed");
         assert_eq!(body, b"abcdef");
@@ -397,16 +534,21 @@ mod tests {
 
     #[tokio::test]
     async fn download_accepts_a_zero_length_object() {
-        let body = collect_body("app", "k", stream::iter(vec![Ok(info_message(0))]))
-            .await
-            .expect("header alone is a complete empty object");
+        let body = collect_body(
+            "app",
+            "k",
+            stream::iter(vec![Ok(info_for(b""))]),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect("header alone is a complete empty object");
         assert!(body.is_empty());
     }
 
     #[tokio::test]
     async fn download_rejects_a_body_that_never_declared_a_header() {
         let messages = vec![Ok(chunk_message(b"abc"))];
-        let err = collect_body("app", "k", stream::iter(messages))
+        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
             .await
             .expect_err("a chunk before the header is a protocol violation");
         assert!(err.to_string().contains("before its header"), "{err}");
@@ -415,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn download_rejects_an_empty_stream() {
         let messages: Vec<Result<GetResponse, Status>> = Vec::new();
-        let err = collect_body("app", "k", stream::iter(messages))
+        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
             .await
             .expect_err("a stream with no header answered nothing");
         assert!(
@@ -426,8 +568,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_rejects_a_truncated_body() {
-        let messages = vec![Ok(info_message(10)), Ok(chunk_message(b"abc"))];
-        let err = collect_body("app", "k", stream::iter(messages))
+        let messages = vec![Ok(info_message(10, "aa")), Ok(chunk_message(b"abc"))];
+        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
             .await
             .expect_err("a short body must not look like a successful read");
         assert!(err.to_string().contains("metadata says 10"), "{err}");
@@ -436,10 +578,10 @@ mod tests {
     #[tokio::test]
     async fn download_propagates_a_mid_stream_status() {
         let messages = vec![
-            Ok(info_message(6)),
+            Ok(info_message(6, "aa")),
             Err(Status::data_loss("content file is missing")),
         ];
-        let err = collect_body("app", "k", stream::iter(messages))
+        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
             .await
             .expect_err("a status inside the stream must not be swallowed");
         assert!(err.to_string().contains("content file is missing"), "{err}");
@@ -448,13 +590,89 @@ mod tests {
     #[tokio::test]
     async fn download_skips_a_payload_it_cannot_decode() {
         let messages = vec![
-            Ok(info_message(3)),
+            Ok(info_for(b"abc")),
             Ok(GetResponse { payload: None }),
             Ok(chunk_message(b"abc")),
         ];
-        let body = collect_body("app", "k", stream::iter(messages))
+        let body = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
             .await
             .expect("an unknown payload is skipped, not fatal");
         assert_eq!(body, b"abc");
+    }
+
+    #[tokio::test]
+    async fn download_rejects_a_body_that_hashes_to_something_else() {
+        // Right length, wrong contents: only the digest can catch this, and
+        // handing it to the application is exactly what this client promises
+        // never to do.
+        let messages = vec![Ok(info_for(b"abcdef")), Ok(chunk_message(b"abcdeX"))];
+        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
+            .await
+            .expect_err("a body that does not match its digest is corrupt");
+        assert!(err.to_string().contains("sha256"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn download_compares_the_digest_case_insensitively() {
+        let mut digest = Sha256::new();
+        digest.update(b"abc");
+        let upper = format!("{:x}", digest.finalize()).to_ascii_uppercase();
+
+        let messages = vec![Ok(info_message(3, &upper)), Ok(chunk_message(b"abc"))];
+        let body = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
+            .await
+            .expect("hex case is not part of the digest");
+        assert_eq!(body, b"abc");
+    }
+
+    #[tokio::test]
+    async fn download_accepts_a_response_without_a_digest() {
+        // A store that stops sending the digest is a protocol change, not a
+        // corrupt object; the body goes through with a warning rather than
+        // failing every read on the node.
+        let messages = vec![Ok(info_message(3, "")), Ok(chunk_message(b"abc"))];
+        let body = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
+            .await
+            .expect("an absent digest is tolerated");
+        assert_eq!(body, b"abc");
+    }
+
+    #[tokio::test]
+    async fn download_refuses_an_object_larger_than_the_ceiling_before_reading_it() {
+        // The refusal must come from the header alone: nothing is allocated
+        // and no chunk is transferred for an object that cannot be accepted.
+        let messages = vec![Ok(info_message(TEST_MAX_OBJECT_BYTES as u64 + 1, "aa"))];
+        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
+            .await
+            .expect_err("an oversized object must not be assembled");
+        assert!(err.to_string().contains("this node reads at most"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn download_aborts_a_stream_that_grows_past_the_ceiling() {
+        // The declared size is a claim. A server (or a corrupted stream) that
+        // keeps sending past it must not be able to grow the buffer without
+        // bound, which is what would exhaust the node's memory.
+        let limit = 8;
+        let messages = vec![
+            Ok(info_message(4, "aa")),
+            Ok(chunk_message(b"abcd")),
+            Ok(chunk_message(b"efgh")),
+            Ok(chunk_message(b"ijkl")),
+        ];
+        let err = collect_body("app", "k", stream::iter(messages), limit)
+            .await
+            .expect_err("a stream past the ceiling must be aborted");
+        assert!(err.to_string().contains("read ceiling"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn download_accepts_an_object_exactly_at_the_ceiling() {
+        let limit = 4;
+        let messages = vec![Ok(info_for(b"abcd")), Ok(chunk_message(b"abcd"))];
+        let body = collect_body("app", "k", stream::iter(messages), limit)
+            .await
+            .expect("the ceiling is inclusive");
+        assert_eq!(body, b"abcd");
     }
 }

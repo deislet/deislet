@@ -1,9 +1,9 @@
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 use crate::session::NodeState;
 
@@ -91,13 +91,21 @@ impl EventBroadcaster {
     /// Register a new WebSocket client
     pub fn register(&self, client_id: Uuid, sender: mpsc::UnboundedSender<String>) {
         self.clients.insert(client_id, sender);
-        tracing::info!("WebSocket client {} registered, total clients: {}", client_id, self.clients.len());
+        tracing::info!(
+            "WebSocket client {} registered, total clients: {}",
+            client_id,
+            self.clients.len()
+        );
     }
 
     /// Unregister a WebSocket client
     pub fn unregister(&self, client_id: &Uuid) {
         self.clients.remove(client_id);
-        tracing::info!("WebSocket client {} unregistered, total clients: {}", client_id, self.clients.len());
+        tracing::info!(
+            "WebSocket client {} unregistered, total clients: {}",
+            client_id,
+            self.clients.len()
+        );
     }
 
     /// Broadcast event to all connected clients
@@ -117,7 +125,10 @@ impl EventBroadcaster {
             let sender = entry.value();
 
             if sender.send(json.clone()).is_err() {
-                tracing::warn!("Failed to send to client {}, marking for removal", client_id);
+                tracing::warn!(
+                    "Failed to send to client {}, marking for removal",
+                    client_id
+                );
                 disconnected.push(client_id);
             }
         }

@@ -12,10 +12,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::ProductState;
+use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::product::SecretMeta;
-use crate::product::secrets::secret_aad;
+use crate::catalog::SecretMeta;
+use crate::catalog::secrets::secret_aad;
 
 #[derive(Debug, Deserialize)]
 pub struct PutSecretRequest {
@@ -32,7 +32,7 @@ pub struct SecretsResponse {
 
 /// PUT /api/apps/:app_id/environments/:env/secrets/:name
 pub async fn put_secret(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, env_name, name)): Path<(String, String, String)>,
     Json(request): Json<PutSecretRequest>,
 ) -> ApiResult<Json<SecretMeta>> {
@@ -60,7 +60,7 @@ pub async fn put_secret(
 /// Names and timestamps only. There is deliberately no endpoint that
 /// returns a secret value.
 pub async fn list_secrets(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
 ) -> ApiResult<Json<SecretsResponse>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
@@ -73,7 +73,7 @@ pub async fn list_secrets(
 
 /// DELETE /api/apps/:app_id/environments/:env/secrets/:name
 pub async fn delete_secret(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, env_name, name)): Path<(String, String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;

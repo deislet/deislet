@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::Path,
-    http::{header, Request, StatusCode},
+    http::{Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use rust_embed::Embed;

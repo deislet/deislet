@@ -512,4 +512,72 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
   }
 };
 
+// ---------------------------------------------------------
+// Console bridge
+// ---------------------------------------------------------
+//
+// deno_core installs a console that only writes to this process's stdout.
+// Application output that stops there is invisible to `deis tail` and to the
+// log panel: it exists solely in the node's local journal, and disappears with
+// the container. This wrapper hands every call to op_log as well, which tags
+// the line with the application and puts it in the node's log buffer for the
+// shipper to send to deis-telemetry.
+//
+// The native console is still called, so stdout keeps showing what it showed
+// before -- that copy is the fallback the shipper's own warnings point at when
+// telemetry is unreachable.
+{
+  const native = globalThis.console;
+
+  // Render one console argument the way a log line wants it: strings as
+  // themselves, errors with their stack, everything else as JSON, and anything
+  // JSON refuses (cycles, BigInt, functions) as its plain string form.
+  const render = (value) => {
+    if (typeof value === "string") return value;
+    if (value === undefined) return "undefined";
+    if (value === null) return "null";
+    if (value instanceof Error) return value.stack || String(value);
+    try {
+      const json = JSON.stringify(value);
+      return json === undefined ? String(value) : json;
+    } catch (_) {
+      return String(value);
+    }
+  };
+
+  const forward = (level, args) => {
+    let line;
+    try {
+      line = args.map(render).join(" ");
+    } catch (_) {
+      // A getter on one of the arguments threw. Losing the line entirely
+      // would be worse than losing its contents, so ship a marker.
+      line = "<unrenderable console argument>";
+    }
+    try {
+      DenoCore.ops.op_log(level, line);
+    } catch (_) {
+      // Never let logging break the request that produced it; the native
+      // console call below still puts the line in this node's own output.
+    }
+  };
+
+  const bridged = (level, method) =>
+    function (...args) {
+      forward(level, args);
+      if (native && typeof native[method] === "function") {
+        native[method].apply(native, args);
+      }
+    };
+
+  globalThis.console = Object.assign(Object.create(native ?? null), native, {
+    log: bridged("info", "log"),
+    info: bridged("info", "info"),
+    debug: bridged("debug", "debug"),
+    warn: bridged("warn", "warn"),
+    error: bridged("error", "error"),
+    trace: bridged("debug", "trace"),
+  });
+}
+
 globalThis.user_module = {}; globalThis.__deis_runtime_set_response = (json) => DenoCore.ops.op_set_response(json);

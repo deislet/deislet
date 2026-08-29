@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-use crate::session::{SessionManager, NodeState};
 use crate::database::Database;
+use crate::session::{NodeState, SessionManager};
 
 /// Metrics summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,10 +59,7 @@ impl MetricsCollector {
         let nodes = self.collect_nodes_metrics().await;
         let system = self.collect_system_metrics().await;
 
-        MetricsSummary {
-            nodes,
-            system,
-        }
+        MetricsSummary { nodes, system }
     }
 
     /// Collect nodes metrics
@@ -136,40 +133,70 @@ impl MetricsCollector {
         // Nodes metrics
         output.push_str("# HELP deis_control_nodes_total Total number of nodes\n");
         output.push_str("# TYPE deis_control_nodes_total gauge\n");
-        output.push_str(&format!("deis_control_nodes_total {}\n", summary.nodes.total));
+        output.push_str(&format!(
+            "deis_control_nodes_total {}\n",
+            summary.nodes.total
+        ));
 
         output.push_str("# HELP deis_control_nodes_by_state Number of nodes by state\n");
         output.push_str("# TYPE deis_control_nodes_by_state gauge\n");
-        output.push_str(&format!("deis_control_nodes_by_state{{state=\"active\"}} {}\n", summary.nodes.active));
-        output.push_str(&format!("deis_control_nodes_by_state{{state=\"connected\"}} {}\n", summary.nodes.connected));
-        output.push_str(&format!("deis_control_nodes_by_state{{state=\"registered\"}} {}\n", summary.nodes.registered));
-        output.push_str(&format!("deis_control_nodes_by_state{{state=\"disconnected\"}} {}\n", summary.nodes.disconnected));
+        output.push_str(&format!(
+            "deis_control_nodes_by_state{{state=\"active\"}} {}\n",
+            summary.nodes.active
+        ));
+        output.push_str(&format!(
+            "deis_control_nodes_by_state{{state=\"connected\"}} {}\n",
+            summary.nodes.connected
+        ));
+        output.push_str(&format!(
+            "deis_control_nodes_by_state{{state=\"registered\"}} {}\n",
+            summary.nodes.registered
+        ));
+        output.push_str(&format!(
+            "deis_control_nodes_by_state{{state=\"disconnected\"}} {}\n",
+            summary.nodes.disconnected
+        ));
 
         // Statistics by type
         if !summary.nodes.by_type.is_empty() {
             output.push_str("# HELP deis_control_nodes_by_role Number of nodes by role\n");
             output.push_str("# TYPE deis_control_nodes_by_role gauge\n");
             for (node_role, count) in &summary.nodes.by_type {
-                output.push_str(&format!("deis_control_nodes_by_role{{role=\"{}\"}} {}\n", node_role, count));
+                output.push_str(&format!(
+                    "deis_control_nodes_by_role{{role=\"{}\"}} {}\n",
+                    node_role, count
+                ));
             }
         }
 
         // System metrics
         output.push_str("# HELP deis_control_uptime_seconds System uptime in seconds\n");
         output.push_str("# TYPE deis_control_uptime_seconds counter\n");
-        output.push_str(&format!("deis_control_uptime_seconds {}\n", summary.system.uptime_seconds));
+        output.push_str(&format!(
+            "deis_control_uptime_seconds {}\n",
+            summary.system.uptime_seconds
+        ));
 
         output.push_str("# HELP deis_control_events_total Total number of events\n");
         output.push_str("# TYPE deis_control_events_total counter\n");
-        output.push_str(&format!("deis_control_events_total {}\n", summary.system.total_events));
+        output.push_str(&format!(
+            "deis_control_events_total {}\n",
+            summary.system.total_events
+        ));
 
         output.push_str("# HELP deis_control_commands_total Total number of commands\n");
         output.push_str("# TYPE deis_control_commands_total counter\n");
-        output.push_str(&format!("deis_control_commands_total {}\n", summary.system.total_commands));
+        output.push_str(&format!(
+            "deis_control_commands_total {}\n",
+            summary.system.total_commands
+        ));
 
         output.push_str("# HELP deis_control_heartbeats_total Total number of heartbeats\n");
         output.push_str("# TYPE deis_control_heartbeats_total counter\n");
-        output.push_str(&format!("deis_control_heartbeats_total {}\n", summary.system.total_heartbeats));
+        output.push_str(&format!(
+            "deis_control_heartbeats_total {}\n",
+            summary.system.total_heartbeats
+        ));
 
         output
     }
@@ -178,8 +205,8 @@ impl MetricsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{NodeSession};
     use crate::message::{NodeInfo, NodeRole};
+    use crate::session::NodeSession;
 
     #[tokio::test]
     async fn test_metrics_collector_creation() {

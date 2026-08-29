@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use super::model::validate_app_id;
-use super::{ProductError, ProductResult};
+use super::{CatalogError, CatalogResult};
 
 /// Manifest schema this control plane understands.
 pub const SUPPORTED_MANIFEST_SCHEMA: u32 = 1;
@@ -109,9 +109,9 @@ impl BundleStore {
 
     /// Create the bundle root up front so a misconfigured path is reported
     /// at startup instead of on the first upload.
-    pub fn ensure_root(&self) -> ProductResult<()> {
+    pub fn ensure_root(&self) -> CatalogResult<()> {
         std::fs::create_dir_all(&self.root).map_err(|e| {
-            ProductError::BundleStorage(format!(
+            CatalogError::BundleStorage(format!(
                 "cannot create bundle directory {}: {e}",
                 self.root.display()
             ))
@@ -136,11 +136,11 @@ impl BundleStore {
         app_id: &str,
         bytes: &[u8],
         expected_sha: Option<&str>,
-    ) -> ProductResult<StoredBundle> {
+    ) -> CatalogResult<StoredBundle> {
         validate_app_id(app_id)?;
 
         if bytes.is_empty() {
-            return Err(ProductError::invalid(
+            return Err(CatalogError::invalid(
                 "bundle body is empty; expected a zip archive",
             ));
         }
@@ -156,7 +156,7 @@ impl BundleStore {
                     received_bytes = bytes.len(),
                     "Rejected bundle upload: the digest of the received bytes does not match the one the client declared, so the upload was truncated or tampered with"
                 );
-                return Err(ProductError::invalid(format!(
+                return Err(CatalogError::invalid(format!(
                     "bundle sha256 mismatch: declared {expected}, received {sha256}"
                 )));
             }
@@ -171,7 +171,7 @@ impl BundleStore {
                 bundle_sha = %sha256,
                 "Rejected bundle upload: the manifest declares a different app, which would have filed one app's code under another app's versions"
             );
-            return Err(ProductError::invalid(format!(
+            return Err(CatalogError::invalid(format!(
                 "bundle manifest declares app {:?} but it was uploaded to app {:?}",
                 manifest.app, app_id
             )));
@@ -182,7 +182,7 @@ impl BundleStore {
         if !already_present {
             let dir = path.parent().unwrap_or(&self.root);
             std::fs::create_dir_all(dir).map_err(|e| {
-                ProductError::BundleStorage(format!(
+                CatalogError::BundleStorage(format!(
                     "cannot create bundle directory {}: {e}",
                     dir.display()
                 ))
@@ -226,19 +226,19 @@ impl BundleStore {
 }
 
 /// Read and validate `manifest.json` out of a zip in memory.
-pub fn read_manifest(bytes: &[u8]) -> ProductResult<(String, BundleManifest)> {
+pub fn read_manifest(bytes: &[u8]) -> CatalogResult<(String, BundleManifest)> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| ProductError::invalid(format!("bundle is not a readable zip archive: {e}")))?;
+        .map_err(|e| CatalogError::invalid(format!("bundle is not a readable zip archive: {e}")))?;
 
     let manifest_json = {
         let mut entry = archive.by_name(MANIFEST_ENTRY).map_err(|e| {
-            ProductError::invalid(format!(
+            CatalogError::invalid(format!(
                 "bundle has no {MANIFEST_ENTRY} at its root ({e}); it was not produced by a deislet build"
             ))
         })?;
         let mut text = String::new();
         entry.read_to_string(&mut text).map_err(|e| {
-            ProductError::invalid(format!(
+            CatalogError::invalid(format!(
                 "bundle {MANIFEST_ENTRY} is not valid UTF-8 text: {e}"
             ))
         })?;
@@ -246,27 +246,27 @@ pub fn read_manifest(bytes: &[u8]) -> ProductResult<(String, BundleManifest)> {
     };
 
     let manifest: BundleManifest = serde_json::from_str(&manifest_json).map_err(|e| {
-        ProductError::invalid(format!("bundle {MANIFEST_ENTRY} does not parse: {e}"))
+        CatalogError::invalid(format!("bundle {MANIFEST_ENTRY} does not parse: {e}"))
     })?;
 
     if manifest.schema != SUPPORTED_MANIFEST_SCHEMA {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "bundle manifest schema {} is not supported; this control plane understands schema {}",
             manifest.schema, SUPPORTED_MANIFEST_SCHEMA
         )));
     }
     if manifest.app.is_empty() {
-        return Err(ProductError::invalid(
+        return Err(CatalogError::invalid(
             "bundle manifest has an empty \"app\"",
         ));
     }
     if manifest.entry.is_empty() {
-        return Err(ProductError::invalid(
+        return Err(CatalogError::invalid(
             "bundle manifest has an empty \"entry\"",
         ));
     }
     if archive.by_name(&manifest.entry).is_err() {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "bundle manifest points at entry {:?}, which is not in the archive",
             manifest.entry
         )));
@@ -278,9 +278,9 @@ pub fn read_manifest(bytes: &[u8]) -> ProductResult<(String, BundleManifest)> {
 /// Write through a temporary file in the same directory, then rename, so a
 /// crash mid-write can never leave a half bundle under a digest that
 /// claims to describe complete content.
-fn write_atomically(path: &Path, bytes: &[u8]) -> ProductResult<()> {
+fn write_atomically(path: &Path, bytes: &[u8]) -> CatalogResult<()> {
     let dir = path.parent().ok_or_else(|| {
-        ProductError::BundleStorage(format!("bundle path {} has no parent", path.display()))
+        CatalogError::BundleStorage(format!("bundle path {} has no parent", path.display()))
     })?;
     let temp = dir.join(format!(
         ".{}.partial",
@@ -297,14 +297,14 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> ProductResult<()> {
     };
     if let Err(e) = write() {
         let _ = std::fs::remove_file(&temp);
-        return Err(ProductError::BundleStorage(format!(
+        return Err(CatalogError::BundleStorage(format!(
             "cannot write bundle to {}: {e}",
             temp.display()
         )));
     }
     std::fs::rename(&temp, path).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
-        ProductError::BundleStorage(format!(
+        CatalogError::BundleStorage(format!(
             "cannot move bundle into place at {}: {e}",
             path.display()
         ))
@@ -386,7 +386,7 @@ pub(crate) mod tests {
         let err = store
             .store("demo", &bytes, Some(&"0".repeat(64)))
             .unwrap_err();
-        assert!(matches!(err, ProductError::Invalid(_)), "got {err:?}");
+        assert!(matches!(err, CatalogError::Invalid(_)), "got {err:?}");
         assert!(!dir.path().join("demo").exists(), "nothing may be written");
     }
 

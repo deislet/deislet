@@ -11,7 +11,7 @@ pub use register::{RegisterRequest, RegisterResponse};
 
 pub use messages::{
     AuthMessage, AuthResponseMessage, CommandData, CommandMessage, CommandResponseMessage,
-    ConfigPushAckMessage, ConfigPushData, ConfigPushMessage, HeartbeatAckMessage,
-    HeartbeatMessage, Message, MessageBuilder, RegisterMessage, RegisterResponseMessage,
-    StatusUpdateMessage, NodeCommand, WireMessage, deis_proxy, deis_runtime, control,
+    ConfigPushAckMessage, ConfigPushData, ConfigPushMessage, HeartbeatAckMessage, HeartbeatMessage,
+    Message, MessageBuilder, NodeCommand, RegisterMessage, RegisterResponseMessage,
+    StatusUpdateMessage, WireMessage, control, deis_proxy, deis_runtime,
 };

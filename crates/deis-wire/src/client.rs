@@ -6,11 +6,11 @@ use crate::config::{ControlConfig, NodeInfo};
 use crate::error::WireError;
 use crate::pb::control_service_client::ControlServiceClient;
 use crate::pb::{
-    control_message::Payload, AuthenticateRequest, Heartbeat, RegisterRequest, ControlMessage,
+    AuthenticateRequest, ControlMessage, Heartbeat, RegisterRequest, control_message::Payload,
 };
 
 use serde_json;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::{Request, Streaming};
@@ -53,9 +53,7 @@ impl WireClient {
             .map_err(|e| WireError::ConfigurationError(format!("Invalid URL: {e}")))?
             .connect()
             .await
-            .map_err(|e| {
-                WireError::ConnectionError(format!("Failed to connect to {url}: {e}"))
-            })?;
+            .map_err(|e| WireError::ConnectionError(format!("Failed to connect to {url}: {e}")))?;
 
         let mut client = ControlServiceClient::new(channel);
         let (tx, rx) = mpsc::channel(128);
@@ -78,10 +76,11 @@ impl WireClient {
             let message = ControlMessage {
                 payload: Some(payload),
             };
-            
-            sender.send(message).await.map_err(|e| {
-                WireError::ConnectionError(format!("Failed to send message: {e}"))
-            })?;
+
+            sender
+                .send(message)
+                .await
+                .map_err(|e| WireError::ConnectionError(format!("Failed to send message: {e}")))?;
 
             Ok(())
         } else {
@@ -94,7 +93,9 @@ impl WireClient {
         if let Some(receiver) = &mut self.response_rx {
             match receiver.lock().await.message().await {
                 Ok(Some(msg)) => Ok(msg.payload),
-                Ok(None) => Err(WireError::ConnectionError("Stream closed by server".to_string())),
+                Ok(None) => Err(WireError::ConnectionError(
+                    "Stream closed by server".to_string(),
+                )),
                 Err(e) => Err(WireError::ConnectionError(format!("gRPC error: {e}"))),
             }
         } else {
@@ -122,8 +123,12 @@ impl WireClient {
                     Err(WireError::AuthenticationError(resp.message))
                 }
             }
-            Some(_) => Err(WireError::AuthenticationError("Unexpected response type".to_string())),
-            None => Err(WireError::AuthenticationError("No payload in response".to_string())),
+            Some(_) => Err(WireError::AuthenticationError(
+                "Unexpected response type".to_string(),
+            )),
+            None => Err(WireError::AuthenticationError(
+                "No payload in response".to_string(),
+            )),
         }
     }
 
@@ -139,9 +144,7 @@ impl WireClient {
             WireError::SerializationError(format!("Failed to serialize node info: {e}"))
         })?;
 
-        let req = RegisterRequest {
-            node_info_json,
-        };
+        let req = RegisterRequest { node_info_json };
 
         self.send_message(Payload::Register(req)).await?;
 
@@ -156,8 +159,12 @@ impl WireClient {
                     Err(WireError::RegistrationError(resp.message))
                 }
             }
-            Some(_) => Err(WireError::RegistrationError("Unexpected response type".to_string())),
-            None => Err(WireError::RegistrationError("No payload in response".to_string())),
+            Some(_) => Err(WireError::RegistrationError(
+                "Unexpected response type".to_string(),
+            )),
+            None => Err(WireError::RegistrationError(
+                "No payload in response".to_string(),
+            )),
         }
     }
 
@@ -259,9 +266,10 @@ impl WireClient {
         let message = ControlMessage {
             payload: Some(Payload::Heartbeat(req)),
         };
-        sender.send(message).await.map_err(|e| {
-            WireError::ConnectionError(format!("Failed to send heartbeat: {e}"))
-        })
+        sender
+            .send(message)
+            .await
+            .map_err(|e| WireError::ConnectionError(format!("Failed to send heartbeat: {e}")))
     }
 }
 

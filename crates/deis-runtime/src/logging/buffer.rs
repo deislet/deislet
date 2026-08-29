@@ -22,11 +22,15 @@ struct BufferStats {
     /// Total received logs count
     total_received: u64,
 
-    /// Total dropped logs count (due to full capacity)
+    /// Entries discarded because the buffer was full when a new one arrived.
+    /// These never reach deis-telemetry and exist nowhere but this node's own
+    /// output; the shipper reports the increase on every flush.
     total_dropped: u64,
 
-    /// Total shipped logs count
-    total_shipped: u64,
+    /// Entries handed to the shipper. Being drained is not the same as being
+    /// delivered -- the shipper may still be retrying them or may give up on
+    /// them at shutdown.
+    total_drained: u64,
 }
 
 impl LogBuffer {
@@ -67,7 +71,7 @@ impl LogBuffer {
         let drain_count = count.min(buffer.len());
         let entries: Vec<LogEntry> = buffer.drain(..drain_count).collect();
 
-        stats.total_shipped += entries.len() as u64;
+        stats.total_drained += entries.len() as u64;
         debug!("Drained {} log entries from buffer", entries.len());
 
         entries
@@ -83,13 +87,16 @@ impl LogBuffer {
         self.buffer.read().is_empty()
     }
 
-    /// Get statistics
+    /// Counters as `(received, dropped, drained)`.
+    ///
+    /// `dropped` is the one that means data loss: those entries were
+    /// overwritten before anything could take them.
     pub fn stats(&self) -> (u64, u64, u64) {
         let stats = self.stats.read();
         (
             stats.total_received,
             stats.total_dropped,
-            stats.total_shipped,
+            stats.total_drained,
         )
     }
 
@@ -127,9 +134,9 @@ mod tests {
         assert_eq!(buffer.len(), 1);
 
         // Statistics
-        let (received, dropped, shipped) = buffer.stats();
+        let (received, dropped, drained) = buffer.stats();
         assert_eq!(received, 5);
         assert_eq!(dropped, 2);
-        assert_eq!(shipped, 2);
+        assert_eq!(drained, 2);
     }
 }

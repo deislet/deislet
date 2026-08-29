@@ -2,13 +2,17 @@ syntax = "proto3";
 
 package deis.telemetry;
 
-// Log service - receives logs shipped by every Deislet component, stores them,
-// and serves them back for querying and live following.
+// Log ingest, query and live follow.
 //
-// This service is deliberately "dumb": it stores and returns what it was given.
-// It never evaluates health, never raises alerts and never calls back into any
-// other component. Liveness of a component is judged by a direct health check
-// against that component, never through this service.
+// This service is deliberately "dumb": it stores and returns what it was
+// given. It never evaluates health, never raises alerts and never calls back
+// into any other component. Liveness of a component is judged by a direct
+// health check against that component, never through this service.
+//
+// Liveness of this service itself is answered by the standard
+// grpc.health.v1.Health service, which every Deislet component registers.
+// There is deliberately no health RPC here: two health surfaces that can
+// disagree are worse than one.
 service LogService {
     // Push logs (batched)
     rpc PushLogs(PushLogsRequest) returns (PushLogsResponse);
@@ -18,15 +22,23 @@ service LogService {
 
     // Follow logs as they arrive (backs "deis tail")
     rpc Tail(TailRequest) returns (stream LogEntry);
+}
 
+// Metric ingest and query.
+//
+// Split from LogService because the two carry different data with different
+// retention and different consumers: a component that only ships metrics has
+// no reason to hold a client for the log surface. Stored samples are also
+// exported in Prometheus text format on this service's HTTP scrape port.
+//
+// Just as dumb as LogService: samples are stored and handed back, never
+// judged, thresholded or alerted on.
+service MetricService {
     // Push numeric metric samples (batched)
     rpc PushMetrics(PushMetricsRequest) returns (PushMetricsResponse);
 
     // Query stored metric samples, newest first, paginated
     rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
-
-    // Health check
-    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
 // Log level
@@ -48,8 +60,10 @@ message LogEntry {
     // Log level
     LogLevel level = 2;
 
-    // Log source (worker ID)
-    string source = 3;
+    // Component that produced the entry, e.g. "deis-runtime", "deis-proxy".
+    // Not an application and not a node: the application dimension is app_id
+    // below, and this service does not know about nodes at all.
+    string component = 3;
 
     // Application ID (optional)
     string app_id = 4;
@@ -219,16 +233,4 @@ message QueryMetricsResponse {
 
     // True when at least one older matching sample exists
     bool has_more = 3;
-}
-
-// Health check request
-message HealthCheckRequest {}
-
-// Health check response
-message HealthCheckResponse {
-    // Service status
-    bool healthy = 1;
-
-    // Version info
-    string version = 2;
 }

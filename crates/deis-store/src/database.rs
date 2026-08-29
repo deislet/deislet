@@ -157,13 +157,13 @@ impl DatabaseService {
         app: &AppId,
         sql: &str,
         params: &[SqlValue],
-    ) -> StoreResult<Executed> {
+    ) -> StoreResult<ExecOutcome> {
         let sql = check_sql(sql)?;
         let params = params.to_vec();
         self.pool(app)
             .with_conn(move |conn| {
                 let rows_affected = conn.execute(&sql, rusqlite::params_from_iter(params))?;
-                Ok(Executed {
+                Ok(ExecOutcome {
                     rows_affected: rows_affected as i64,
                     last_insert_id: conn.last_insert_rowid(),
                 })
@@ -177,7 +177,7 @@ impl DatabaseService {
         app: &AppId,
         sql: &str,
         params: &[SqlValue],
-    ) -> StoreResult<Queried> {
+    ) -> StoreResult<ResultSet> {
         let sql = check_sql(sql)?;
         let params = params.to_vec();
         self.pool(app)
@@ -197,7 +197,7 @@ impl DatabaseService {
                     }
                     out.push(JsonValue::Object(object));
                 }
-                Ok(Queried {
+                Ok(ResultSet {
                     columns,
                     rows: JsonValue::Array(out),
                 })
@@ -211,17 +211,22 @@ impl DatabaseService {
         &self,
         app: &AppId,
         statements: Vec<(String, Vec<SqlValue>)>,
-    ) -> StoreResult<Result<Vec<Executed>, BatchFailure>> {
+    ) -> StoreResult<Result<Vec<ExecOutcome>, BatchFailure>> {
         for (sql, _) in &statements {
             check_sql(sql)?;
         }
         self.pool(app)
             .with_conn(move |conn| {
+                // Deferred is enough here: `tx.execute` refuses a statement
+                // that returns rows, so a batch never reads before it writes
+                // and never has to upgrade a read snapshot to a write lock -
+                // the upgrade being the case SQLite refuses outright instead
+                // of waiting out with `busy_timeout`.
                 let tx = conn.transaction()?;
                 let mut done = Vec::with_capacity(statements.len());
                 for (index, (sql, params)) in statements.into_iter().enumerate() {
                     match tx.execute(&sql, rusqlite::params_from_iter(params)) {
-                        Ok(rows_affected) => done.push(Executed {
+                        Ok(rows_affected) => done.push(ExecOutcome {
                             rows_affected: rows_affected as i64,
                             last_insert_id: tx.last_insert_rowid(),
                         }),
@@ -264,16 +269,17 @@ impl DatabaseService {
     }
 }
 
-/// Result of a row-less statement.
+/// What a row-less statement did: how many rows it touched and, for an
+/// insert, the id it handed out.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Executed {
+pub struct ExecOutcome {
     pub rows_affected: i64,
     pub last_insert_id: i64,
 }
 
-/// Result of a row-returning statement.
+/// The rows a query returned, plus the column names they are keyed by.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Queried {
+pub struct ResultSet {
     pub columns: Vec<String>,
     /// JSON array of objects, one per row, keyed by column name.
     pub rows: JsonValue,
@@ -285,7 +291,7 @@ pub struct Queried {
 pub struct BatchFailure {
     pub index: usize,
     pub message: String,
-    pub partial: Vec<Executed>,
+    pub partial: Vec<ExecOutcome>,
 }
 
 /// Refuse SQL that is empty or nothing but whitespace before it reaches the
@@ -670,6 +676,46 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Two of an app's batches overlapping is ordinary and must not make
+    /// either of them fail. They contend for one file's write lock, and the
+    /// loser is expected to wait its turn rather than come back "database is
+    /// locked".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_batches_wait_for_each_other() {
+        let (_dir, svc) = service();
+        let a = app("app-one");
+        make_table(&svc, &a).await;
+
+        let batches: Vec<_> = (0..16)
+            .map(|n| {
+                let (svc, a) = (svc.clone(), a.clone());
+                tokio::spawn(async move {
+                    svc.exec_batch(
+                        &a,
+                        vec![(
+                            "INSERT INTO users(name) VALUES(?1)".to_string(),
+                            vec![SqlValue::Text(format!("user-{n}"))],
+                        )],
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for (n, batch) in batches.into_iter().enumerate() {
+            let outcome = batch
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("batch {n} failed: {e}"));
+            assert!(outcome.is_ok(), "batch {n} rolled back: {outcome:?}");
+        }
+
+        let found = svc
+            .fetch_rows(&a, "SELECT count(*) AS n FROM users", &[])
+            .await
+            .unwrap();
+        assert_eq!(found.rows[0]["n"], serde_json::json!(16));
     }
 
     #[tokio::test]

@@ -112,6 +112,8 @@ async fn kv_round_trip_over_grpc() {
         SetRequest {
             key: "greeting".to_string(),
             value: "hello".to_string(),
+            ttl_seconds: None,
+            metadata: None,
         },
     ))
     .await
@@ -176,6 +178,67 @@ async fn kv_round_trip_over_grpc() {
     assert_eq!(gone.value, None);
 }
 
+/// The `expires_at` column and the sweeper behind it are only reachable
+/// through `ttl_seconds`, so the round trip is checked over the wire rather
+/// than only against the storage method.
+#[tokio::test]
+async fn kv_honours_a_lifetime_over_grpc() {
+    let harness = Harness::start().await;
+    let mut kv = harness.kv().await;
+
+    kv.set(as_app(
+        "app-one",
+        SetRequest {
+            key: "session".to_string(),
+            value: "token".to_string(),
+            ttl_seconds: Some(3600),
+            metadata: Some("owner=tests".to_string()),
+        },
+    ))
+    .await
+    .unwrap();
+
+    // An hour out, so it is still readable.
+    let got = kv
+        .get(as_app(
+            "app-one",
+            GetRequest {
+                key: "session".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.value.as_deref(), Some("token"));
+
+    // A lifetime that cannot be honoured is refused outright, rather than
+    // stored as something no reader will ever see again.
+    let refused = kv
+        .set(as_app(
+            "app-one",
+            SetRequest {
+                key: "doomed".to_string(),
+                value: "v".to_string(),
+                ttl_seconds: Some(0),
+                metadata: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    let absent = kv
+        .has(as_app(
+            "app-one",
+            HasRequest {
+                key: "doomed".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!absent.exists, "a refused write must store nothing");
+}
+
 #[tokio::test]
 async fn kv_list_pages_by_prefix() {
     let harness = Harness::start().await;
@@ -186,6 +249,8 @@ async fn kv_list_pages_by_prefix() {
             SetRequest {
                 key: key.to_string(),
                 value: "v".to_string(),
+                ttl_seconds: None,
+                metadata: None,
             },
         ))
         .await
@@ -260,6 +325,8 @@ async fn a_value_larger_than_the_tonic_default_still_goes_through() {
         SetRequest {
             key: "big".to_string(),
             value: big.clone(),
+            ttl_seconds: None,
+            metadata: None,
         },
     ))
     .await
@@ -478,7 +545,7 @@ async fn blob_put_and_get_stream_in_chunks() {
             content_type: Some("application/octet-stream".to_string()),
         })),
     }];
-    for chunk in body.chunks(deis_store::blob::CHUNK_BYTES) {
+    for chunk in body.chunks(deis_store::STREAM_CHUNK_BYTES) {
         messages.push(PutRequest {
             payload: Some(put_request::Payload::Chunk(chunk.to_vec())),
         });
@@ -516,7 +583,7 @@ async fn blob_put_and_get_stream_in_chunks() {
             }
             get_response::Payload::Chunk(bytes) => {
                 assert!(info.is_some(), "the header must precede the body");
-                assert!(bytes.len() <= deis_store::blob::CHUNK_BYTES);
+                assert!(bytes.len() <= deis_store::STREAM_CHUNK_BYTES);
                 chunks += 1;
                 received.extend_from_slice(&bytes);
             }
@@ -638,7 +705,7 @@ async fn an_oversized_object_is_refused_in_the_response() {
         messages.push(PutRequest {
             payload: Some(put_request::Payload::Chunk(vec![
                 0u8;
-                deis_store::blob::CHUNK_BYTES
+                deis_store::STREAM_CHUNK_BYTES
             ])),
         });
     }

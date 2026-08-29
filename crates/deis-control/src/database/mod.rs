@@ -1,14 +1,15 @@
 pub mod schema;
 
-use rusqlite::{Connection, params};
-use std::path::Path;
-use tokio::sync::Mutex;
-use thiserror::Error;
 use chrono::{DateTime, Utc};
+use rusqlite::{Connection, params};
 use serde_json::Value as JsonValue;
+use std::path::Path;
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::Mutex;
 
-use crate::session::{NodeSession, NodeState};
 use crate::message::NodeRole;
+use crate::session::{NodeSession, NodeState};
 
 /// Database error types
 #[derive(Error, Debug)]
@@ -161,13 +162,16 @@ pub struct ConfigHistoryEntry {
     pub config_key: String,
     pub config_value: JsonValue,
     pub version_timestamp: DateTime<Utc>,
-    pub operation: String,  // "create", "update", "delete"
+    pub operation: String, // "create", "update", "delete"
     pub created_at: DateTime<Utc>,
 }
 
 /// Database manager
 pub struct Database {
-    connection: Mutex<Connection>,
+    /// The one connection of the process, shared with the blocking threads
+    /// that actually run the SQLite calls. `Arc` because a blocking task
+    /// outlives the borrow of `&self` that started it.
+    connection: Arc<Mutex<Connection>>,
 }
 
 impl Database {
@@ -176,7 +180,7 @@ impl Database {
         let connection = Connection::open(path)?;
 
         let db = Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
         };
 
         // Create tables
@@ -188,20 +192,52 @@ impl Database {
         Ok(db)
     }
 
-    /// Run `f` with the shared SQLite connection held.
+    /// Run `f` with the shared SQLite connection held, on a blocking
+    /// thread.
+    ///
+    /// rusqlite is synchronous: every call blocks the thread it runs on
+    /// until SQLite is done. Running that on an async worker stalls every
+    /// other task scheduled there - heartbeat acknowledgements, health
+    /// probes, the next node's assignment fetch - so the work is handed to
+    /// `spawn_blocking` and only the wait for its result is async. That is
+    /// also why the closure must be `Send + 'static`: it runs on another
+    /// thread.
     ///
     /// The connection is a single `Mutex<Connection>` for the whole
-    /// process, so callers must keep the closure short and must not block
-    /// on anything else inside it. Feature-specific storage layers (for
-    /// instance `crate::product::ProductStore`) build on this instead of
-    /// opening a second connection, which would fight the first one for
-    /// the write lock and defeat the `PRAGMA foreign_keys` set at init.
+    /// process. Feature-specific storage layers (for instance
+    /// `crate::catalog::CatalogStore`) build on this instead of opening a
+    /// second connection, which would fight the first one for the write
+    /// lock and defeat the `PRAGMA foreign_keys` set at init.
     pub async fn with_connection<T, E, F>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce(&Connection) -> Result<T, E>,
+        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: From<DatabaseError> + Send + 'static,
     {
-        let conn = self.connection.lock().await;
-        f(&conn)
+        // Wait for the connection here, asynchronously: a caller queuing
+        // behind another query parks its task instead of parking a thread,
+        // and a blocking thread is taken only for the time SQLite is
+        // actually working.
+        let conn = Arc::clone(&self.connection).lock_owned().await;
+        let outcome = tokio::task::spawn_blocking(move || f(&conn)).await;
+
+        match outcome {
+            Ok(result) => result,
+            Err(e) => {
+                // Only a panic inside the closure or a runtime shutdown
+                // gets here. The caller's write, if it was one, may or may
+                // not have reached the database, so the request must fail
+                // rather than report success.
+                tracing::error!(
+                    error = %e,
+                    "A database task did not finish; this request is failed and whether its write landed is unknown"
+                );
+                Err(DatabaseError::ConnectionError {
+                    message: format!("database task did not finish: {e}"),
+                }
+                .into())
+            }
+        }
     }
 
     /// Save or update node information
@@ -342,7 +378,9 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
         let completed_at = match status {
-            CommandStatus::Completed | CommandStatus::Failed | CommandStatus::Timeout => Some(now.clone()),
+            CommandStatus::Completed | CommandStatus::Failed | CommandStatus::Timeout => {
+                Some(now.clone())
+            }
             _ => None,
         };
 
@@ -355,7 +393,10 @@ impl Database {
             params![
                 status.as_str(),
                 completed_at,
-                response_data.as_ref().map(serde_json::to_string).transpose()?,
+                response_data
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
                 error_message,
                 command_id,
             ],
@@ -378,7 +419,11 @@ impl Database {
                 &event.node_id,
                 event.severity.as_str(),
                 &event.message,
-                event.metadata.as_ref().map(serde_json::to_string).transpose()?,
+                event
+                    .metadata
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
                 Utc::now().to_rfc3339(),
             ],
         )?;
@@ -519,7 +564,8 @@ impl Database {
                 }
             };
 
-            let existing_keys_result = stmt.query_map(params![node_id], |row| row.get::<_, String>(0));
+            let existing_keys_result =
+                stmt.query_map(params![node_id], |row| row.get::<_, String>(0));
             match existing_keys_result {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                 Err(e) => {
@@ -601,7 +647,11 @@ impl Database {
     }
 
     /// Delete a single config key for a node
-    pub async fn delete_config(&self, node_id: &str, config_key: &str) -> Result<(), DatabaseError> {
+    pub async fn delete_config(
+        &self,
+        node_id: &str,
+        config_key: &str,
+    ) -> Result<(), DatabaseError> {
         let conn = self.connection.lock().await;
 
         // Begin transaction
@@ -618,15 +668,17 @@ impl Database {
             }
         };
 
-        let config_data = stmt.query_row(params![node_id, config_key], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }).ok();
+        let config_data = stmt
+            .query_row(params![node_id, config_key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok();
         drop(stmt);
 
         // Delete from configs table
         if let Err(e) = conn.execute(
             "DELETE FROM configs WHERE node_id = ?1 AND config_key = ?2",
-            params![node_id, config_key]
+            params![node_id, config_key],
         ) {
             conn.execute("ROLLBACK", []).ok();
             return Err(e.into());
@@ -799,7 +851,7 @@ impl Database {
                 let config_value: JsonValue = serde_json::from_str(&config_value_str)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 Ok(config_value)
-            }
+            },
         );
 
         match result {
@@ -837,11 +889,16 @@ impl Database {
             sql.push_str(&format!(" AND severity = ?{}", params_vec.len() + 1));
             params_vec.push(Box::new(sev.to_string()));
         }
-        sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ?{} OFFSET ?{}", params_vec.len() + 1, params_vec.len() + 2));
+        sql.push_str(&format!(
+            " ORDER BY timestamp DESC LIMIT ?{} OFFSET ?{}",
+            params_vec.len() + 1,
+            params_vec.len() + 2
+        ));
         params_vec.push(Box::new(limit as i64));
         params_vec.push(Box::new(offset as i64));
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
         let events = stmt.query_map(params_refs.as_slice(), |row| {
@@ -851,7 +908,8 @@ impl Database {
                 severity: EventSeverity::from_str(&row.get::<_, String>(2)?)
                     .unwrap_or(EventSeverity::Info),
                 message: row.get(3)?,
-                metadata: row.get::<_, Option<String>>(4)?
+                metadata: row
+                    .get::<_, Option<String>>(4)?
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
                     .ok()
@@ -860,7 +918,9 @@ impl Database {
             })
         })?;
 
-        events.collect::<Result<Vec<_>, _>>().map_err(DatabaseError::from)
+        events
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
     }
 
     /// Get event statistics
@@ -871,7 +931,8 @@ impl Database {
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
 
         // By severity
-        let mut severity_stmt = conn.prepare("SELECT severity, COUNT(*) FROM events GROUP BY severity")?;
+        let mut severity_stmt =
+            conn.prepare("SELECT severity, COUNT(*) FROM events GROUP BY severity")?;
         let severity_counts = severity_stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -925,18 +986,23 @@ impl Database {
         }
         sql.push_str(" ORDER BY created_at DESC");
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
-        let commands = stmt.query_map(params_refs.as_slice(), |row| {
-            self.row_to_command_entry(row)
-        })?;
+        let commands =
+            stmt.query_map(params_refs.as_slice(), |row| self.row_to_command_entry(row))?;
 
-        commands.collect::<Result<Vec<_>, _>>().map_err(DatabaseError::from)
+        commands
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
     }
 
     /// Get a single command by ID
-    pub async fn get_command(&self, command_id: &str) -> Result<Option<CommandEntry>, DatabaseError> {
+    pub async fn get_command(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<CommandEntry>, DatabaseError> {
         let conn = self.connection.lock().await;
 
         let mut stmt = conn.prepare(
@@ -959,7 +1025,8 @@ impl Database {
             id: row.get(0)?,
             node_id: row.get(1)?,
             command_type: row.get(2)?,
-            command_data: row.get::<_, Option<String>>(3)?
+            command_data: row
+                .get::<_, Option<String>>(3)?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(serde_json::json!({})),
             status: CommandStatus::from_str(&row.get::<_, String>(4)?)
@@ -968,16 +1035,20 @@ impl Database {
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(Utc::now),
-            sent_at: row.get::<_, Option<String>>(6)?
+            sent_at: row
+                .get::<_, Option<String>>(6)?
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc)),
-            completed_at: row.get::<_, Option<String>>(7)?
+            completed_at: row
+                .get::<_, Option<String>>(7)?
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc)),
-            timeout_at: row.get::<_, Option<String>>(8)?
+            timeout_at: row
+                .get::<_, Option<String>>(8)?
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc)),
-            response_data: row.get::<_, Option<String>>(9)?
+            response_data: row
+                .get::<_, Option<String>>(9)?
                 .and_then(|s| serde_json::from_str(&s).ok()),
             error_message: row.get(10)?,
         })
@@ -1051,11 +1122,24 @@ impl Database {
     }
 
     /// Load all enabled cron tasks
-    pub async fn load_enabled_cron_tasks(&self) -> Result<Vec<(String, String, String, bool, Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>)>, DatabaseError> {
+    pub async fn load_enabled_cron_tasks(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            String,
+            bool,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+        )>,
+        DatabaseError,
+    > {
         let conn = self.connection.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, node_id, cron_expr, enabled, last_run, next_run, created_at
-             FROM cron_tasks WHERE enabled = 1"
+             FROM cron_tasks WHERE enabled = 1",
         )?;
 
         let tasks = stmt.query_map([], |row| {
@@ -1092,6 +1176,31 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQLite calls block the thread they run on. If they run on the
+    /// thread driving async tasks, everything else scheduled there -
+    /// heartbeat acknowledgements, health probes, the assignment fetch of
+    /// the next node - waits behind the query, and a busy control plane
+    /// starts reporting healthy nodes as unreachable. Comparing thread ids
+    /// is the direct way to see where the work actually ran.
+    #[tokio::test]
+    async fn queries_run_off_the_thread_driving_async_tasks() {
+        let db = Database::init(":memory:").await.unwrap();
+        let caller = std::thread::current().id();
+
+        let ran_on = db
+            .with_connection(move |conn| {
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
+                Ok::<_, DatabaseError>(std::thread::current().id())
+            })
+            .await
+            .unwrap();
+
+        assert_ne!(
+            ran_on, caller,
+            "the query ran on the caller's thread, so it blocked the async runtime while SQLite worked"
+        );
+    }
 
     #[tokio::test]
     async fn test_database_init() {
@@ -1214,7 +1323,10 @@ mod tests {
         db.save_configs(node_id, &configs, v2).await.unwrap();
 
         // Get history for "port" key only
-        let port_history = db.get_config_key_history(node_id, "port", 100).await.unwrap();
+        let port_history = db
+            .get_config_key_history(node_id, "port", 100)
+            .await
+            .unwrap();
 
         // Should have 2 entries for port: 1 create + 1 update
         assert_eq!(port_history.len(), 2);
@@ -1238,7 +1350,10 @@ mod tests {
         db.delete_config(node_id, "port").await.unwrap();
 
         // Get history
-        let history = db.get_config_key_history(node_id, "port", 100).await.unwrap();
+        let history = db
+            .get_config_key_history(node_id, "port", 100)
+            .await
+            .unwrap();
 
         // Should have 2 entries: create + delete
         assert_eq!(history.len(), 2);
@@ -1286,7 +1401,10 @@ mod tests {
 
         // Get value at a time before v1 - should be None
         let before_v1 = v1 - chrono::Duration::seconds(1);
-        let value_before = db.get_config_at_version(node_id, "port", before_v1).await.unwrap();
+        let value_before = db
+            .get_config_at_version(node_id, "port", before_v1)
+            .await
+            .unwrap();
         assert_eq!(value_before, None);
     }
 }

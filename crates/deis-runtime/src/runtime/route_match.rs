@@ -19,7 +19,9 @@ use std::collections::HashMap;
 /// gives us "trailing slash is insignificant" matching for free: `/users/1` and
 /// `/users/1/` both split to `["users", "1"]`.
 fn segments(path: &str) -> Vec<&str> {
-    path.split('/').filter(|segment| !segment.is_empty()).collect()
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 /// Decode a `%XX` percent-encoded path segment.
@@ -64,7 +66,10 @@ pub fn path_from_url(url: &str) -> String {
 
     if let Some(scheme_end) = url.find("://") {
         let after_scheme = &url[scheme_end + 3..];
-        path = after_scheme.find('/').map(|i| &after_scheme[i..]).unwrap_or("/");
+        path = after_scheme
+            .find('/')
+            .map(|i| &after_scheme[i..])
+            .unwrap_or("/");
     } else if url.starts_with('/') {
         path = url;
     }
@@ -82,9 +87,17 @@ pub fn path_from_url(url: &str) -> String {
 /// Match a single `:name`-style route pattern against a request path.
 ///
 /// Returns `Some(params)` (possibly empty, for a pattern with no
-/// placeholders) on an exact structural match, `None` otherwise. Placeholder
-/// values are percent-decoded; a pattern segment of exactly `:` (empty
-/// placeholder name) never matches, since it cannot name a param.
+/// placeholders) on an exact structural match, `None` otherwise. A pattern
+/// segment of exactly `:` (empty placeholder name) never matches, since it
+/// cannot name a param.
+///
+/// Both kinds of segment are compared in decoded form: a placeholder's value
+/// is percent-decoded before it is handed to the app, and a literal is
+/// percent-decoded on both sides before the comparison. Comparing literals as
+/// raw bytes instead would make any pattern with a non-ASCII or space-bearing
+/// literal segment -- `/caf\u{e9}/:id`, `/a b/:id` -- unmatchable, because the
+/// browser always sends those segments escaped. The failure would be silent:
+/// `context.params` would simply stay `{}` forever.
 pub fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
     let pattern_segments = segments(pattern);
     let path_segments = segments(path);
@@ -100,7 +113,7 @@ pub fn match_route(pattern: &str, path: &str) -> Option<HashMap<String, String>>
                 return None;
             }
             params.insert(name.to_string(), percent_decode(path_seg));
-        } else if pattern_seg != path_seg {
+        } else if percent_decode(pattern_seg) != percent_decode(path_seg) {
             return None;
         }
     }

@@ -18,7 +18,6 @@ use tonic::transport::Server;
 use tonic_health::pb::health_server::HealthServer;
 use tracing::{error, info};
 
-
 #[derive(Parser)]
 #[command(name = "deis-queue", about = "Deislet message queue")]
 struct Cli {

@@ -1,5 +1,5 @@
 //! Environment endpoints. An environment is the second key of the whole
-//! product model: deployment pointers, routes and secrets all hang off
+//! catalog: deployment pointers, routes and secrets all hang off
 //! `app + environment`, never off the app alone.
 
 use axum::{
@@ -9,9 +9,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::ProductState;
+use super::CatalogState;
 use crate::api::error::ApiResult;
-use crate::product::Environment;
+use crate::catalog::Environment;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateEnvironmentRequest {
@@ -27,7 +27,7 @@ pub struct EnvironmentsResponse {
 
 /// POST /api/apps/:app_id/environments
 pub async fn create_environment(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path(app_id): Path<String>,
     Json(request): Json<CreateEnvironmentRequest>,
 ) -> ApiResult<(StatusCode, Json<Environment>)> {
@@ -40,7 +40,7 @@ pub async fn create_environment(
 
 /// GET /api/apps/:app_id/environments
 pub async fn list_environments(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path(app_id): Path<String>,
 ) -> ApiResult<Json<EnvironmentsResponse>> {
     let environments = state.store.list_environments(&app_id).await?;
@@ -52,7 +52,7 @@ pub async fn list_environments(
 
 /// GET /api/apps/:app_id/environments/:env
 pub async fn get_environment(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
 ) -> ApiResult<Json<Environment>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;

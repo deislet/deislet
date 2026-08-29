@@ -1,6 +1,7 @@
 // HTTP request handlers
 
 use super::AppState;
+use crate::APP_ID_HEADER;
 use axum::{
     body::Body,
     extract::{
@@ -13,7 +14,12 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 
-/// Unified request handler - routes to applications via x-deis-app-id header
+/// Unified request handler - routes to applications via the tenant header.
+///
+/// The header name comes from [`APP_ID_HEADER`] rather than a literal here:
+/// deis-proxy stamps it and this reads it, and a node that disagreed with the
+/// proxy about the spelling would reject every request with 400 while both
+/// sides looked correct in isolation.
 pub async fn handle_request(
     State(state): State<AppState>,
     method: Method,
@@ -23,13 +29,18 @@ pub async fn handle_request(
     body: String,
 ) -> impl IntoResponse {
     // Get app_id from header
-    let app_id = match headers.get("x-deis-app-id").and_then(|v| v.to_str().ok()) {
+    let app_id = match headers.get(APP_ID_HEADER).and_then(|v| v.to_str().ok()) {
         Some(id) => id.to_string(),
         None => {
-            tracing::warn!("Request missing x-deis-app-id header: {} {}", method, uri);
+            tracing::warn!(
+                "Request missing {} header, so there is no application to route it to: {} {}",
+                APP_ID_HEADER,
+                method,
+                uri
+            );
             return (
                 StatusCode::BAD_REQUEST,
-                "Missing x-deis-app-id header".to_string(),
+                format!("Missing {APP_ID_HEADER} header"),
             )
                 .into_response();
         }

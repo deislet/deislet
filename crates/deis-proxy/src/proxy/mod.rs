@@ -46,7 +46,6 @@ pub use access_log::AccessLog;
 pub use balancer::Balancer;
 pub use service::ExitOnPanic;
 
-
 pub struct DeisProxy {
     config: Arc<ConfigManager>,
     balancer: Balancer,

@@ -2,8 +2,8 @@
 
 use super::types::{App, AppConfig, AppState, ResourceLimits};
 use crate::app_repo::AppRepo;
-use crate::config::RuntimeLimits;
-use crate::runtime::RuntimePool;
+use crate::config::ExecutionLimits;
+use crate::runtime::{IsolateSpec, RuntimePool};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use deno_core::OpMetricsSummary;
@@ -19,7 +19,7 @@ pub struct ApplicationManager {
     // Platform-wide defaults for per-app execution limits (timeout, rate limit).
     // An app's own `ResourceLimits` may override either value; see
     // `effective_limits`.
-    default_limits: RuntimeLimits,
+    default_limits: ExecutionLimits,
 }
 
 impl ApplicationManager {
@@ -38,7 +38,7 @@ impl ApplicationManager {
             apps: DashMap::new(),
             runtime_pool: Arc::new(RuntimePool::new(num_threads)),
             inspect_sessions: DashMap::new(),
-            default_limits: RuntimeLimits::default(),
+            default_limits: ExecutionLimits::default(),
         }
     }
 
@@ -47,14 +47,14 @@ impl ApplicationManager {
             apps: DashMap::new(),
             runtime_pool: Arc::new(RuntimePool::new_with_repo(num_threads, Some(app_repo))),
             inspect_sessions: DashMap::new(),
-            default_limits: RuntimeLimits::default(),
+            default_limits: ExecutionLimits::default(),
         }
     }
 
     /// Override the platform-wide default execution limits (timeout, rate
     /// limit) used for apps that do not configure their own. Intended to be
     /// called once at startup with the values loaded from `RuntimeConfig`.
-    pub fn with_limits(mut self, default_limits: RuntimeLimits) -> Self {
+    pub fn with_limits(mut self, default_limits: ExecutionLimits) -> Self {
         self.default_limits = default_limits;
         self
     }
@@ -63,12 +63,13 @@ impl ApplicationManager {
     /// `ResourceLimits` override where present, the platform default
     /// otherwise. Logs at info level whenever an app overrides a default, so
     /// operators can see which apps deviate from the platform baseline.
-    fn effective_limits(&self, app_id: &str, limits: Option<&ResourceLimits>) -> (u64, f64) {
+    fn effective_limits(&self, app_id: &str, limits: Option<&ResourceLimits>) -> ExecutionLimits {
         let timeout_override = limits.and_then(|l| l.timeout_ms);
         let timeout_ms = timeout_override.unwrap_or(self.default_limits.timeout_ms);
         if let Some(overridden) = timeout_override {
             tracing::info!(
                 target: "app",
+                app_id = %app_id,
                 "App {} overrides default execution timeout: {}ms (platform default {}ms)",
                 app_id,
                 overridden,
@@ -82,6 +83,7 @@ impl ApplicationManager {
         if let Some(overridden) = rate_limit_override {
             tracing::info!(
                 target: "app",
+                app_id = %app_id,
                 "App {} overrides default rate limit: {} ops/sec (platform default {} ops/sec)",
                 app_id,
                 overridden,
@@ -89,7 +91,10 @@ impl ApplicationManager {
             );
         }
 
-        (timeout_ms, rate_limit_ops_per_sec)
+        ExecutionLimits {
+            timeout_ms,
+            rate_limit_ops_per_sec,
+        }
     }
 
     /// Load application
@@ -119,26 +124,16 @@ impl ApplicationManager {
         };
 
         // Load application in runtime pool
-        let memory_limit = config.limits.as_ref().map(|l| l.memory_mb);
-        let resource_table_max = config.limits.as_ref().and_then(|l| l.resource_table_max);
-        let (timeout_ms, rate_limit_ops_per_sec) =
-            self.effective_limits(&id, config.limits.as_ref());
-        match self
-            .runtime_pool
-            .load_app(
-                id.clone(),
-                code,
-                entry_point,
-                config.env.clone(),
-                config.permissions.clone(),
-                memory_limit,
-                resource_table_max,
-                config.routes.clone(),
-                timeout_ms,
-                rate_limit_ops_per_sec,
-            )
-            .await
-        {
+        let spec = IsolateSpec {
+            entry_point,
+            env: config.env.clone(),
+            permissions: config.permissions.clone(),
+            memory_limit_mb: config.limits.as_ref().map(|l| l.memory_mb),
+            resource_table_max: config.limits.as_ref().and_then(|l| l.resource_table_max),
+            route_patterns: config.routes.clone(),
+            limits: self.effective_limits(&id, config.limits.as_ref()),
+        };
+        match self.runtime_pool.load_app(id.clone(), code, spec).await {
             Ok(()) => {
                 app_info.state = AppState::Running;
                 app_info.updated_at = SystemTime::now();
@@ -245,26 +240,20 @@ impl ApplicationManager {
         self.runtime_pool.unload_app(id).await?;
 
         // Load new version
-        let memory_limit = current_config.limits.as_ref().map(|l| l.memory_mb);
-        let resource_table_max = current_config
-            .limits
-            .as_ref()
-            .and_then(|l| l.resource_table_max);
-        let (timeout_ms, rate_limit_ops_per_sec) =
-            self.effective_limits(id, current_config.limits.as_ref());
+        let spec = IsolateSpec {
+            entry_point,
+            env: current_config.env.clone(),
+            permissions: current_config.permissions.clone(),
+            memory_limit_mb: current_config.limits.as_ref().map(|l| l.memory_mb),
+            resource_table_max: current_config
+                .limits
+                .as_ref()
+                .and_then(|l| l.resource_table_max),
+            route_patterns: current_config.routes.clone(),
+            limits: self.effective_limits(id, current_config.limits.as_ref()),
+        };
         self.runtime_pool
-            .load_app(
-                id.to_string(),
-                code,
-                entry_point,
-                current_config.env.clone(),
-                current_config.permissions.clone(),
-                memory_limit,
-                resource_table_max,
-                current_config.routes.clone(),
-                timeout_ms,
-                rate_limit_ops_per_sec,
-            )
+            .load_app(id.to_string(), code, spec)
             .await?;
 
         // Update application information

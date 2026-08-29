@@ -35,7 +35,9 @@ pub fn load_or_create_startup_snapshot() -> Result<Option<&'static [u8]>> {
 }
 
 fn snapshot_path() -> Option<PathBuf> {
-    std::env::var("DEIS_RUNTIME_SNAPSHOT_PATH").ok().map(PathBuf::from)
+    std::env::var("DEIS_RUNTIME_SNAPSHOT_PATH")
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn load_snapshot(path: &PathBuf) -> Result<&'static [u8]> {

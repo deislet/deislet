@@ -10,6 +10,14 @@
 //! exists in full in memory on either side: `Put` hashes and appends chunk by
 //! chunk into a temporary file and renames it into place once the digest is
 //! known, and `Get` reads the file back in chunks.
+//!
+//! Because the content file is shared by every key with the same bytes, two
+//! sections of code must never interleave: a store that finds the content
+//! already on disk and then writes a row pointing at it, and a delete that
+//! counts the rows pointing at content and then removes the file. Left
+//! unsynchronised they lose data - the delete counts zero before the store's
+//! row lands, unlinks the file, and the new key is left pointing at nothing.
+//! [`ContentLocks`] holds those two sections apart, per app and digest.
 
 use crate::error::{StoreError, StoreResult};
 use crate::proto::blob::{
@@ -19,18 +27,19 @@ use crate::proto::blob::{
 use crate::sqlite::{PoolSize, SqlitePool};
 use crate::tenant::{AppId, app_id_of};
 use crate::unix_seconds;
+// Body slice size for `Get`, and the size clients are expected to use for
+// `Put`; see deis_wire::conventions for why it lives in one place.
+use deis_wire::conventions::STREAM_CHUNK_BYTES;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
-
-/// Body slice size for `Get`, and the size clients should use for `Put`.
-/// Well under the 16 MB message ceiling, large enough that a 1 GB object is
-/// a thousand frames rather than a hundred thousand.
-pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Directory under each app's blob root where in-flight uploads land. Two hex
 /// characters name a shard, so an eight-letter name can never collide with
@@ -45,13 +54,40 @@ const MAX_KEY_LEN: usize = 1024;
 /// rather than let the object pile up in memory.
 const CHANNEL_DEPTH: usize = 4;
 
+/// What an upload is held to: how big it may get, and how long it may say
+/// nothing before the store gives up on it.
+#[derive(Debug, Clone, Copy)]
+pub struct UploadLimits {
+    /// Largest object `Put` will accept. An upload that goes over is refused
+    /// and its temporary file removed.
+    pub max_object_bytes: u64,
+    /// Longest silence between two body chunks. `None` waits forever, which
+    /// lets one stalled client hold a task, a file descriptor and a temporary
+    /// file for the life of the process.
+    pub idle_timeout: Option<Duration>,
+}
+
+/// A test-only pause point: a closure returning the future the store awaits
+/// while it sits inside the critical section, so a test can drive one exact
+/// interleaving instead of hoping for it.
+#[cfg(test)]
+type DedupPause =
+    Arc<dyn Fn() -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Object storage service.
 #[derive(Clone)]
 pub struct BlobService {
     /// `<data_dir>/blob`
     root: PathBuf,
     pool: SqlitePool,
-    max_object_bytes: u64,
+    limits: UploadLimits,
+    /// Serialises the two critical sections that share one content file.
+    content_locks: ContentLocks,
+    /// Test-only pause fired after the "the content is already here" check,
+    /// so a test can hold a store inside the critical section while a delete
+    /// runs. Always `None` in a real process.
+    #[cfg(test)]
+    dedup_pause: Option<DedupPause>,
 }
 
 impl BlobService {
@@ -60,7 +96,7 @@ impl BlobService {
     pub async fn open(
         data_dir: &Path,
         connections: usize,
-        max_object_bytes: u64,
+        limits: UploadLimits,
     ) -> StoreResult<Self> {
         let root = data_dir.join("blob");
         std::fs::create_dir_all(&root)?;
@@ -89,14 +125,27 @@ impl BlobService {
         let service = Self {
             root,
             pool,
-            max_object_bytes,
+            limits,
+            content_locks: ContentLocks::default(),
+            #[cfg(test)]
+            dedup_pause: None,
         };
         service.discard_incoming();
-        tracing::info!(
-            root = %service.root.display(),
-            max_object_bytes,
-            "blob store ready"
-        );
+        match limits.idle_timeout {
+            Some(idle) => tracing::info!(
+                root = %service.root.display(),
+                max_object_bytes = limits.max_object_bytes,
+                upload_idle_timeout_secs = idle.as_secs(),
+                "blob store ready"
+            ),
+            None => tracing::warn!(
+                root = %service.root.display(),
+                max_object_bytes = limits.max_object_bytes,
+                "blob store ready with no upload idle timeout; a client that stops sending \
+                 mid-object holds a task, a file descriptor and a temporary file until the \
+                 process restarts"
+            ),
+        }
         Ok(service)
     }
 
@@ -186,60 +235,17 @@ impl BlobService {
     where
         S: Stream<Item = StoreResult<Vec<u8>>> + Unpin,
     {
-        use tokio_stream::StreamExt;
-
         let key = check_key(key)?;
         let incoming = self.app_root(app).join(INCOMING_DIR);
         tokio::fs::create_dir_all(&incoming).await?;
         let temp = TempFile::new(incoming.join(format!("{}.part", uuid::Uuid::new_v4())));
 
-        let mut file = tokio::fs::File::create(temp.path()).await?;
-        let mut hasher = Sha256::new();
-        let mut size: u64 = 0;
+        let (sha256, size) = self.receive(app, &key, temp.path(), &mut body).await?;
 
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk?;
-            size += chunk.len() as u64;
-            if size > self.max_object_bytes {
-                tracing::warn!(
-                    app = %app,
-                    key = %key,
-                    limit = self.max_object_bytes,
-                    "upload exceeded the object size limit and was abandoned; nothing was stored"
-                );
-                return Err(StoreError::TooLarge(format!(
-                    "object exceeds the {} byte limit",
-                    self.max_object_bytes
-                )));
-            }
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        // The rename below only makes the file visible under its digest; the
-        // bytes have to be on the platter first or a crash leaves a name
-        // pointing at nothing.
-        file.sync_all().await?;
-        drop(file);
-
-        let sha256 = hex(&hasher.finalize());
         let destination = self.content_path(app, &sha256);
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        if tokio::fs::metadata(&destination).await.is_ok() {
-            // Same bytes already stored under this digest, for this or
-            // another key. Keep what is there and drop the upload.
-            tracing::debug!(
-                app = %app,
-                key = %key,
-                sha256 = %sha256,
-                "content already present, reusing it instead of writing a second copy"
-            );
-        } else {
-            tokio::fs::rename(temp.path(), &destination).await?;
-        }
-        temp.forget();
 
         let meta = ObjectMeta {
             key: key.clone(),
@@ -249,12 +255,44 @@ impl BlobService {
             created_at: unix_seconds(),
         };
 
-        let replaced = self.record(app, &meta).await?;
+        // Everything from here to the end of the block decides which file
+        // this key's bytes live in, and must not interleave with a delete of
+        // the same digest; see the module docs.
+        let replaced = {
+            let _content = self.content_locks.acquire(app, &sha256).await;
+            if tokio::fs::metadata(&destination).await.is_ok() {
+                // Same bytes already stored under this digest, for this or
+                // another key. Keep what is there and let the temporary file
+                // go: dropping it is what deletes it, so this branch must not
+                // call `forget`, or every duplicate upload would leave a
+                // full-size `.part` behind.
+                #[cfg(test)]
+                self.pause_after_dedup_check().await;
+                tracing::debug!(
+                    app = %app,
+                    key = %key,
+                    sha256 = %sha256,
+                    "content already present, reusing it instead of writing a second copy; this \
+                     upload's temporary file is removed"
+                );
+                drop(temp);
+            } else {
+                tokio::fs::rename(temp.path(), &destination).await?;
+                // Only now is the file reachable under its digest, so only
+                // now may the temporary stop being tracked. A rename that
+                // failed leaves `temp` armed and its file is removed on drop.
+                temp.forget();
+            }
+            self.record(app, &meta).await?
+        };
+
         if let Some(old) = replaced
             && old != sha256
         {
             // This key used to point somewhere else, and may have been the
-            // last thing holding those bytes.
+            // last thing holding those bytes. Deliberately outside the block
+            // above: this takes the lock of a different digest, and holding
+            // two content locks at once is how two uploads deadlock.
             self.drop_unreferenced(app, &old).await;
         }
         tracing::info!(
@@ -267,13 +305,101 @@ impl BlobService {
         Ok(meta)
     }
 
+    /// Write `body` into `temp`, returning its digest and length.
+    ///
+    /// A client that stops sending without closing the stream is given
+    /// `idle_timeout` and then dropped: waiting forever would pin a task, a
+    /// file descriptor and a full temporary file per stalled connection.
+    async fn receive<S>(
+        &self,
+        app: &AppId,
+        key: &str,
+        temp: &Path,
+        body: &mut S,
+    ) -> StoreResult<(String, u64)>
+    where
+        S: Stream<Item = StoreResult<Vec<u8>>> + Unpin,
+    {
+        use tokio_stream::StreamExt;
+
+        let mut file = tokio::fs::File::create(temp).await?;
+        let mut hasher = Sha256::new();
+        let mut size: u64 = 0;
+
+        loop {
+            let next = match self.limits.idle_timeout {
+                Some(idle) => match tokio::time::timeout(idle, body.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        tracing::warn!(
+                            app = %app,
+                            key = %key,
+                            received = size,
+                            idle_timeout_secs = idle.as_secs(),
+                            "upload sent nothing for the idle timeout and was abandoned; the \
+                             temporary file is removed and nothing is stored under this key, so \
+                             the caller has to send the object again"
+                        );
+                        return Err(StoreError::Stalled(format!(
+                            "no data for {} seconds",
+                            idle.as_secs()
+                        )));
+                    }
+                },
+                None => body.next().await,
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = chunk?;
+            size += chunk.len() as u64;
+            if size > self.limits.max_object_bytes {
+                tracing::warn!(
+                    app = %app,
+                    key = %key,
+                    limit = self.limits.max_object_bytes,
+                    "upload exceeded the object size limit and was abandoned; nothing was stored"
+                );
+                return Err(StoreError::TooLarge(format!(
+                    "object exceeds the {} byte limit",
+                    self.limits.max_object_bytes
+                )));
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        // The rename that follows only makes the file visible under its
+        // digest; the bytes have to be on the platter first or a crash leaves
+        // a name pointing at nothing.
+        file.sync_all().await?;
+        Ok((hex(&hasher.finalize()), size))
+    }
+
+    /// Fire the test-only pause, if a test installed one.
+    #[cfg(test)]
+    async fn pause_after_dedup_check(&self) {
+        if let Some(pause) = self.dedup_pause.clone() {
+            pause().await;
+        }
+    }
+
     /// Upsert the metadata row, returning the digest it replaced, if any.
+    ///
+    /// The transaction is `IMMEDIATE`: it reads the old digest and then
+    /// writes, and a transaction that starts as a reader and asks to become a
+    /// writer later is refused outright ("database is locked") the moment any
+    /// other connection has committed in between - `busy_timeout` cannot wait
+    /// that out, because the upgrade can never succeed. Taking the write lock
+    /// up front is what makes two apps uploading at the same time wait for
+    /// each other instead of one of them failing.
     async fn record(&self, app: &AppId, meta: &ObjectMeta) -> StoreResult<Option<String>> {
         let app_id = app.as_str().to_string();
         let meta = meta.clone();
         self.pool
             .with_conn(move |conn| {
-                let tx = conn.transaction()?;
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let previous: Option<String> = tx
                     .query_row(
                         "SELECT sha256 FROM blob WHERE app_id = ?1 AND key = ?2",
@@ -305,6 +431,9 @@ impl BlobService {
     }
 
     /// Remove one key. Returns whether a row went away.
+    ///
+    /// `IMMEDIATE` for the same reason as [`Self::record`]: this reads the
+    /// digest and then deletes the row.
     pub async fn remove_object(&self, app: &AppId, key: &str) -> StoreResult<bool> {
         let key = check_key(key)?;
         let app_id = app.as_str().to_string();
@@ -312,7 +441,8 @@ impl BlobService {
         let removed: Option<String> = self
             .pool
             .with_conn(move |conn| {
-                let tx = conn.transaction()?;
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let sha: Option<String> = tx
                     .query_row(
                         "SELECT sha256 FROM blob WHERE app_id = ?1 AND key = ?2",
@@ -344,7 +474,15 @@ impl BlobService {
 
     /// Delete the content file for `sha256` if no key for this app points at
     /// it any more.
+    ///
+    /// The count and the unlink are one critical section: a store that finds
+    /// this same content already on disk is writing its row under the same
+    /// lock, so it either lands before the count (and is counted) or after
+    /// the unlink (and writes the file again). Counting outside the lock is
+    /// what used to leave a fresh key pointing at a file that had just been
+    /// collected.
     async fn drop_unreferenced(&self, app: &AppId, sha256: &str) {
+        let _content = self.content_locks.acquire(app, sha256).await;
         let app_id = app.as_str().to_string();
         let sha = sha256.to_string();
         let referenced = self
@@ -490,6 +628,64 @@ impl Drop for TempFile {
     }
 }
 
+/// One `tokio::Mutex` per `(app, digest)`, created on demand and dropped
+/// when the last holder lets go.
+///
+/// A single global lock would serialise every upload in the process; a lock
+/// per digest only serialises the operations that can actually collide,
+/// which is a store and a delete of the very same bytes. Entries are removed
+/// as soon as nobody holds them, so a long-running process does not
+/// accumulate one entry per object ever written.
+#[derive(Clone, Default)]
+struct ContentLocks {
+    entries: Arc<Mutex<HashMap<ContentKey, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+/// One app's one digest: what a content file is shared under.
+type ContentKey = (String, String);
+
+impl ContentLocks {
+    /// Take the lock for one app's digest, waiting for whoever holds it.
+    async fn acquire(&self, app: &AppId, sha256: &str) -> ContentGuard {
+        let key = (app.as_str().to_string(), sha256.to_string());
+        let lock = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(entries.entry(key.clone()).or_default())
+        };
+        let held = Arc::clone(&lock).lock_owned().await;
+        ContentGuard {
+            locks: self.clone(),
+            key,
+            lock,
+            held: Some(held),
+        }
+    }
+}
+
+/// Holds one content lock and removes its table entry on the way out.
+struct ContentGuard {
+    locks: ContentLocks,
+    key: ContentKey,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for ContentGuard {
+    fn drop(&mut self) {
+        // Release before pruning, so a waiter can start the moment the table
+        // lock is free.
+        self.held.take();
+        let mut entries = self.locks.entries.lock().unwrap_or_else(|e| e.into_inner());
+        // Two references means the table and this guard: nobody is waiting,
+        // so the entry can go. Every other holder took its reference while
+        // holding this same table lock, so this count cannot go stale and
+        // hand two callers two different locks for one digest.
+        if Arc::strong_count(&self.lock) == 2 {
+            entries.remove(&self.key);
+        }
+    }
+}
+
 fn check_key(key: &str) -> StoreResult<String> {
     if key.is_empty() {
         tracing::warn!("blob request with an empty key, refusing it");
@@ -563,7 +759,7 @@ impl BlobStore for BlobService {
             {
                 return;
             }
-            let mut buf = vec![0u8; CHUNK_BYTES];
+            let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
             let mut sent: u64 = 0;
             loop {
                 match file.read(&mut buf).await {
@@ -739,8 +935,9 @@ fn inbound_chunks(
                          key and the caller must retry"
                     );
                     let _ = tx
-                        .send(Err(StoreError::Worker(format!(
-                            "upload stream failed: {e}"
+                        .send(Err(StoreError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            format!("upload stream failed: {e}"),
                         ))))
                         .await;
                     return;
@@ -758,10 +955,32 @@ mod tests {
 
     const TEST_LIMIT: u64 = 8 * 1024 * 1024;
 
+    /// How many times a test lets the runtime run other tasks while waiting
+    /// for something that may deliberately never happen. Bounded on purpose:
+    /// the point of the fix is that a delete waits, so a test that waited for
+    /// it to finish would hang instead of failing.
+    const NUDGES: usize = 4096;
+
+    /// Limits for a test that is not about limits.
+    fn limits(max_object_bytes: u64) -> UploadLimits {
+        UploadLimits {
+            max_object_bytes,
+            idle_timeout: Some(Duration::from_secs(60)),
+        }
+    }
+
     async fn service() -> (TempDir, BlobService) {
         let dir = TempDir::new().unwrap();
-        let svc = BlobService::open(dir.path(), 4, TEST_LIMIT).await.unwrap();
+        let svc = BlobService::open(dir.path(), 4, limits(TEST_LIMIT))
+            .await
+            .unwrap();
         (dir, svc)
+    }
+
+    /// How many `.part` files are waiting in an app's upload directory.
+    fn incoming_count(dir: &TempDir, app: &str) -> usize {
+        let incoming = dir.path().join("blob").join(app).join(INCOMING_DIR);
+        std::fs::read_dir(&incoming).map(|d| d.count()).unwrap_or(0)
     }
 
     fn app(name: &str) -> AppId {
@@ -853,7 +1072,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_keys_with_the_same_bytes_share_one_file() {
-        let (_dir, svc) = service().await;
+        let (dir, svc) = service().await;
         let a = app("app-one");
         let one = svc
             .store_object(&a, "a", None, chunks(vec![b"same".to_vec()]))
@@ -872,6 +1091,15 @@ mod tests {
 
         assert!(svc.remove_object(&a, "b").await.unwrap());
         assert!(!svc.content_path(&a, &two.sha256).exists());
+
+        // The second upload wrote no content file, so its temporary must have
+        // been removed rather than left to age. Every re-upload of an
+        // unchanged asset takes this path, so a leak here grows without end.
+        assert_eq!(
+            incoming_count(&dir, "app-one"),
+            0,
+            "the deduplicated upload left its temporary file behind"
+        );
     }
 
     #[tokio::test]
@@ -891,7 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_upload_leaves_nothing_behind() {
         let dir = TempDir::new().unwrap();
-        let svc = BlobService::open(dir.path(), 4, 8).await.unwrap();
+        let svc = BlobService::open(dir.path(), 4, limits(8)).await.unwrap();
         let a = app("app-one");
         let err = svc
             .store_object(&a, "big", None, chunks(vec![vec![0u8; 9]]))
@@ -899,10 +1127,75 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StoreError::TooLarge(_)));
         assert!(svc.head(&a, "big").await.unwrap().is_none());
+        assert_eq!(
+            incoming_count(&dir, "app-one"),
+            0,
+            "the temporary file should have been removed"
+        );
+    }
 
-        let incoming = dir.path().join("blob/app-one").join(INCOMING_DIR);
-        let leftovers = std::fs::read_dir(&incoming).map(|d| d.count()).unwrap_or(0);
-        assert_eq!(leftovers, 0, "the temporary file should have been removed");
+    /// A client that sends a header and then goes quiet must not hold a task,
+    /// a file descriptor and a temporary file for the life of the process.
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_that_goes_quiet_is_abandoned() {
+        let dir = TempDir::new().unwrap();
+        let svc = BlobService::open(
+            dir.path(),
+            4,
+            UploadLimits {
+                max_object_bytes: TEST_LIMIT,
+                idle_timeout: Some(Duration::from_secs(60)),
+            },
+        )
+        .await
+        .unwrap();
+        let a = app("app-one");
+
+        // One chunk, then silence: the stream is neither closed nor fed.
+        use tokio_stream::StreamExt;
+        let body = Box::pin(
+            tokio_stream::iter(vec![Ok(b"half an object".to_vec())])
+                .chain(tokio_stream::pending::<StoreResult<Vec<u8>>>()),
+        );
+        // Paused time: the store's minute passes without the test waiting one.
+        // The outer bound is an hour of the same virtual clock, so a store
+        // that waits forever fails here instead of hanging the suite.
+        let err = tokio::time::timeout(
+            Duration::from_secs(3600),
+            svc.store_object(&a, "stalled", None, body),
+        )
+        .await
+        .expect("the upload was never given up on; a stalled client holds this task for good")
+        .unwrap_err();
+
+        assert!(matches!(err, StoreError::Stalled(_)), "got {err:?}");
+        assert!(svc.head(&a, "stalled").await.unwrap().is_none());
+        assert_eq!(
+            incoming_count(&dir, "app-one"),
+            0,
+            "the abandoned upload's temporary file should have been removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_with_no_idle_timeout_still_completes() {
+        let dir = TempDir::new().unwrap();
+        let svc = BlobService::open(
+            dir.path(),
+            4,
+            UploadLimits {
+                max_object_bytes: TEST_LIMIT,
+                idle_timeout: None,
+            },
+        )
+        .await
+        .unwrap();
+        let a = app("app-one");
+        let meta = svc
+            .store_object(&a, "k", None, chunks(vec![b"abcdef".to_vec()]))
+            .await
+            .unwrap();
+        assert_eq!(meta.size, 6);
     }
 
     #[tokio::test]
@@ -927,7 +1220,9 @@ mod tests {
         std::fs::create_dir_all(&incoming).unwrap();
         std::fs::write(incoming.join("stale.part"), b"half an object").unwrap();
 
-        let _svc = BlobService::open(dir.path(), 4, TEST_LIMIT).await.unwrap();
+        let _svc = BlobService::open(dir.path(), 4, limits(TEST_LIMIT))
+            .await
+            .unwrap();
         assert!(!incoming.exists());
     }
 
@@ -939,6 +1234,166 @@ mod tests {
             svc.store_object(&a, "", None, chunks(vec![])).await,
             Err(StoreError::InvalidArgument(_))
         ));
+    }
+
+    /// The interleaving that used to lose an object for good.
+    ///
+    /// `duplicate` carries bytes that are already on disk, so its upload
+    /// takes the deduplication path and writes no file of its own; meanwhile
+    /// `original`, the key those bytes were stored under, is deleted. If the
+    /// two are allowed to interleave, the delete counts no remaining
+    /// references and unlinks the content a moment before the duplicate's
+    /// metadata row lands, leaving a key whose bytes are gone - `Get` can
+    /// only answer DataLoss, and no retry brings the object back.
+    ///
+    /// The upload is parked at exactly that point rather than raced against
+    /// the delete, so this reproduces the loss on every run instead of one
+    /// run in a thousand.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_cannot_collect_content_a_concurrent_put_is_claiming() {
+        let (_dir, mut svc) = service().await;
+        let a = app("app-one");
+        let payload = b"shared bytes".to_vec();
+
+        let stored = svc
+            .store_object(&a, "original", None, chunks(vec![payload.clone()]))
+            .await
+            .unwrap();
+        let content = svc.content_path(&a, &stored.sha256);
+
+        // Park the second upload right after it has seen the content is
+        // already there, and let the test decide when it may go on.
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let (at_check, may_continue) = (reached.clone(), resume.clone());
+        svc.dedup_pause = Some(Arc::new(move || {
+            let (at_check, may_continue) = (at_check.clone(), may_continue.clone());
+            Box::pin(async move {
+                at_check.notify_one();
+                may_continue.notified().await;
+            })
+        }));
+
+        let put = {
+            let (svc, a, payload) = (svc.clone(), a.clone(), payload.clone());
+            tokio::spawn(async move {
+                svc.store_object(&a, "duplicate", None, chunks(vec![payload]))
+                    .await
+            })
+        };
+        reached.notified().await;
+
+        let delete = {
+            let (svc, a) = (svc.clone(), a.clone());
+            tokio::spawn(async move { svc.remove_object(&a, "original").await })
+        };
+        // The delete takes the metadata row away first, which needs no lock,
+        // so this point is reached whether or not the fix is in place.
+        while svc.head(&a, "original").await.unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+        // Then it wants to collect the content file. Unsynchronised it gets
+        // there; holding the digest's lock it waits for the parked upload, so
+        // this stops nudging instead of hanging.
+        for _ in 0..NUDGES {
+            if !content.exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        resume.notify_one();
+        put.await.unwrap().unwrap();
+        delete.await.unwrap().unwrap();
+
+        assert!(
+            content.exists(),
+            "the content the surviving key points at was collected"
+        );
+        assert_eq!(
+            svc.get_all(&a, "duplicate").await.unwrap().unwrap(),
+            payload,
+            "the deduplicated key must still read back the bytes it stored"
+        );
+    }
+
+    /// Uploads of unrelated objects share one metadata file, so their
+    /// `record` transactions run against one another. A read-modify-write
+    /// that starts as a reader and only then asks to write cannot be retried
+    /// by SQLite - it comes back "database is locked" straight away - and the
+    /// caller sees a perfectly ordinary upload fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_uploads_of_different_objects_all_succeed() {
+        let (_dir, svc) = service().await;
+        let a = app("app-one");
+
+        let uploads: Vec<_> = (0..16)
+            .map(|n| {
+                let (svc, a) = (svc.clone(), a.clone());
+                tokio::spawn(async move {
+                    let payload = format!("object-{n}").into_bytes();
+                    svc.store_object(&a, &format!("key-{n}"), None, chunks(vec![payload]))
+                        .await
+                })
+            })
+            .collect();
+        for (n, upload) in uploads.into_iter().enumerate() {
+            upload
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("upload {n} failed: {e}"));
+        }
+
+        let deletes: Vec<_> = (0..16)
+            .map(|n| {
+                let (svc, a) = (svc.clone(), a.clone());
+                tokio::spawn(async move { svc.remove_object(&a, &format!("key-{n}")).await })
+            })
+            .collect();
+        for (n, delete) in deletes.into_iter().enumerate() {
+            assert!(
+                delete
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("delete {n} failed: {e}")),
+                "delete {n} found no row"
+            );
+        }
+    }
+
+    /// The same collision the other way round: two uploads of identical bytes
+    /// at once must agree on one content file, and neither may end up with a
+    /// row pointing at nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_uploads_of_identical_bytes_agree_on_one_file() {
+        let (dir, svc) = service().await;
+        let a = app("app-one");
+        let payload = b"identical".to_vec();
+
+        let uploads: Vec<_> = (0..8)
+            .map(|n| {
+                let (svc, a, payload) = (svc.clone(), a.clone(), payload.clone());
+                tokio::spawn(async move {
+                    svc.store_object(&a, &format!("key-{n}"), None, chunks(vec![payload]))
+                        .await
+                })
+            })
+            .collect();
+        for upload in uploads {
+            upload.await.unwrap().unwrap();
+        }
+
+        for n in 0..8 {
+            assert_eq!(
+                svc.get_all(&a, &format!("key-{n}")).await.unwrap().unwrap(),
+                payload
+            );
+        }
+        assert_eq!(
+            incoming_count(&dir, "app-one"),
+            0,
+            "the uploads that deduplicated left their temporary files behind"
+        );
     }
 
     #[test]

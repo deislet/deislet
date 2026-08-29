@@ -20,7 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = ProxyControlClient::new(config)?;
     println!("[OK] Client created\n");
 
-    println!("[2] Connecting, authenticating and registering (retries until deis_control answers)...");
+    println!(
+        "[2] Connecting, authenticating and registering (retries until deis_control answers)..."
+    );
     tokio::time::timeout(CONNECT_TIMEOUT, client.connect_with_backoff())
         .await
         .map_err(|_| {

@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tracing::{debug, error, info, warn};
 
 /// Cron task definition
@@ -61,9 +61,17 @@ impl CronScheduler {
         }
     }
 
-    /// Start scheduler
-    pub async fn start(self: Arc<Self>) {
-        info!("Starting cron scheduler with {}s interval", self.tick_interval);
+    /// Start scheduler.
+    ///
+    /// The returned handle is the only way to stop the tick loop: it runs
+    /// forever otherwise, and on shutdown a tick that fires while the
+    /// servers are draining would push commands at nodes the process is
+    /// about to stop talking to.
+    pub async fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        info!(
+            "Starting cron scheduler with {}s interval",
+            self.tick_interval
+        );
 
         // Load tasks from database
         if let Err(e) = self.load_tasks().await {
@@ -71,7 +79,7 @@ impl CronScheduler {
         }
 
         let scheduler = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(scheduler.tick_interval));
 
             loop {
@@ -83,6 +91,7 @@ impl CronScheduler {
         });
 
         info!("Cron scheduler started");
+        handle
     }
 
     /// Add cron task
@@ -96,10 +105,7 @@ impl CronScheduler {
         let node_id = task.node_id.clone();
 
         // Add to memory
-        self.tasks
-            .entry(node_id)
-            .or_default()
-            .push(task.clone());
+        self.tasks.entry(node_id).or_default().push(task.clone());
 
         // Persist to database
         if let Some(db) = &self.database {
@@ -212,7 +218,7 @@ impl CronScheduler {
 
     /// Trigger single task
     async fn trigger_task(&self, node_id: &str, task: &CronTask) -> Result<()> {
-        use crate::command::{CommandType, CommandRequest};
+        use crate::command::{CommandRequest, CommandType};
         use serde_json::json;
 
         // Construct scheduled event data
@@ -288,10 +294,7 @@ impl CronScheduler {
                     created_at,
                 };
 
-                self.tasks
-                    .entry(node_id)
-                    .or_default()
-                    .push(task);
+                self.tasks.entry(node_id).or_default().push(task);
             }
 
             info!("Loaded {} nodes with cron tasks", self.tasks.len());

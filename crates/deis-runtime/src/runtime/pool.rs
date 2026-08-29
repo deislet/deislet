@@ -1,6 +1,6 @@
 // Runtime thread pool - multi-core support
 
-use super::isolate::AppRuntime;
+use super::isolate::{AppRuntime, IsolateSpec};
 use crate::app_repo::AppRepo;
 use anyhow::Result;
 use deno_core::JsRuntime;
@@ -29,15 +29,8 @@ pub enum RuntimeMessage {
     LoadApp {
         app_id: String,
         code: String,
-        entry_point: Option<String>,
         app_repo: Option<Arc<AppRepo>>,
-        env: HashMap<String, String>,
-        permissions: super::super::app::types::AppPermissions,
-        memory_limit_mb: Option<usize>,
-        resource_table_max: Option<usize>,
-        route_patterns: Vec<String>,
-        timeout_ms: u64,
-        rate_limit_ops_per_sec: f64,
+        spec: IsolateSpec,
         response: oneshot::Sender<Result<()>>,
     },
     /// Unload application
@@ -155,31 +148,12 @@ impl RuntimeThread {
                 RuntimeMessage::LoadApp {
                     app_id,
                     code,
-                    entry_point,
                     app_repo,
-                    env,
-                    permissions,
-                    memory_limit_mb,
-                    resource_table_max,
-                    route_patterns,
-                    timeout_ms,
-                    rate_limit_ops_per_sec,
+                    spec,
                     response,
                 } => {
                     tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
-                    let result = match AppRuntime::new(
-                        app_id.clone(),
-                        code,
-                        entry_point,
-                        app_repo,
-                        env,
-                        permissions,
-                        memory_limit_mb,
-                        resource_table_max,
-                        route_patterns,
-                        timeout_ms,
-                        rate_limit_ops_per_sec,
-                    ) {
+                    let result = match AppRuntime::new(app_id.clone(), code, app_repo, spec) {
                         Ok(mut runtime) => match runtime.init_module().await {
                             Ok(()) => {
                                 runtimes.insert(app_id.clone(), runtime);
@@ -410,20 +384,7 @@ impl RuntimePool {
     }
 
     /// Load application
-    #[allow(clippy::too_many_arguments)]
-    pub async fn load_app(
-        &self,
-        app_id: String,
-        code: String,
-        entry_point: Option<String>,
-        env: HashMap<String, String>,
-        permissions: super::super::app::types::AppPermissions,
-        memory_limit_mb: Option<usize>,
-        resource_table_max: Option<usize>,
-        route_patterns: Vec<String>,
-        timeout_ms: u64,
-        rate_limit_ops_per_sec: f64,
-    ) -> Result<()> {
+    pub async fn load_app(&self, app_id: String, code: String, spec: IsolateSpec) -> Result<()> {
         // Check if already exists
         if self.get_thread_id(&app_id).await.is_some() {
             return Err(anyhow::anyhow!("App already exists"));
@@ -438,15 +399,8 @@ impl RuntimePool {
         self.threads[thread_id].send(RuntimeMessage::LoadApp {
             app_id: app_id.clone(),
             code,
-            entry_point,
             app_repo: self.app_repo.clone(),
-            env,
-            permissions,
-            memory_limit_mb,
-            resource_table_max,
-            route_patterns,
-            timeout_ms,
-            rate_limit_ops_per_sec,
+            spec,
             response: tx,
         })?;
 
@@ -693,7 +647,6 @@ impl RuntimePool {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::app::types::AppPermissions;
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
 
@@ -722,14 +675,7 @@ mod tests {
             .load_app(
                 "test_load_exec_app".to_string(),
                 code.to_string(),
-                None,
-                HashMap::new(),
-                AppPermissions::default(),
-                None,
-                None,
-                Vec::new(),
-                30_000,
-                1000.0,
+                IsolateSpec::default(),
             )
             .await;
         assert!(result.is_ok());
@@ -764,14 +710,7 @@ mod tests {
             pool.load_app(
                 format!("lb_app{}", i),
                 code.to_string(),
-                None,
-                HashMap::new(),
-                AppPermissions::default(),
-                None,
-                None,
-                Vec::new(),
-                30_000,
-                1000.0,
+                IsolateSpec::default(),
             )
             .await
             .unwrap();
@@ -796,14 +735,7 @@ mod tests {
         pool.load_app(
             "unload_test_app".to_string(),
             code.to_string(),
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         )
         .await
         .unwrap();

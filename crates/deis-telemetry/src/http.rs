@@ -16,21 +16,21 @@ use tracing::{debug, error};
 use crate::now_us;
 use crate::prom;
 use crate::stats::ServiceStats;
-use crate::store::Store;
+use crate::store::TelemetryStore;
 
 /// The exposition format version this endpoint speaks.
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 #[derive(Clone)]
 pub struct MetricsState {
-    store: Store,
+    store: TelemetryStore,
     stats: Arc<ServiceStats>,
     /// How far back to look for the latest sample of each series.
     window_secs: u64,
 }
 
 impl MetricsState {
-    pub fn new(store: Store, stats: Arc<ServiceStats>, window_secs: u64) -> Self {
+    pub fn new(store: TelemetryStore, stats: Arc<ServiceStats>, window_secs: u64) -> Self {
         Self {
             store,
             stats,

@@ -19,7 +19,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use rand::RngCore;
 use tracing::{error, info, warn};
 
-use super::{ProductError, ProductResult};
+use super::{CatalogError, CatalogResult};
 
 /// AES-256 key length in bytes.
 pub const MASTER_KEY_LEN: usize = 32;
@@ -40,9 +40,9 @@ impl fmt::Debug for SecretCipher {
 
 impl SecretCipher {
     /// Build a cipher from raw key material.
-    pub fn from_key_bytes(key: &[u8]) -> ProductResult<Self> {
+    pub fn from_key_bytes(key: &[u8]) -> CatalogResult<Self> {
         if key.len() != MASTER_KEY_LEN {
-            return Err(ProductError::SecretsUnavailable(format!(
+            return Err(CatalogError::SecretsUnavailable(format!(
                 "master key must be {MASTER_KEY_LEN} bytes, got {}",
                 key.len()
             )));
@@ -59,9 +59,9 @@ impl SecretCipher {
     /// 64 hex characters with optional surrounding whitespace (what
     /// `openssl rand -hex 32` prints). Raw is checked first so a random
     /// 32-byte key that happens to end in a newline byte is not mangled.
-    pub fn load_from_file(path: &Path) -> ProductResult<Self> {
+    pub fn load_from_file(path: &Path) -> CatalogResult<Self> {
         let raw = std::fs::read(path).map_err(|e| {
-            ProductError::SecretsUnavailable(format!(
+            CatalogError::SecretsUnavailable(format!(
                 "cannot read secret_key_file {}: {e}",
                 path.display()
             ))
@@ -75,7 +75,7 @@ impl SecretCipher {
 
         let text = String::from_utf8(raw)
             .map_err(|_| {
-                ProductError::SecretsUnavailable(format!(
+                CatalogError::SecretsUnavailable(format!(
                     "secret_key_file {} is neither {MASTER_KEY_LEN} raw bytes nor hex text",
                     path.display()
                 ))
@@ -85,7 +85,7 @@ impl SecretCipher {
 
         if text.len() == MASTER_KEY_LEN * 2 {
             let decoded = hex::decode(&text).map_err(|e| {
-                ProductError::SecretsUnavailable(format!(
+                CatalogError::SecretsUnavailable(format!(
                     "secret_key_file {} looks like hex but does not decode: {e}",
                     path.display()
                 ))
@@ -93,7 +93,7 @@ impl SecretCipher {
             return Self::from_key_bytes(&decoded);
         }
 
-        Err(ProductError::SecretsUnavailable(format!(
+        Err(CatalogError::SecretsUnavailable(format!(
             "secret_key_file {} must hold {MASTER_KEY_LEN} raw bytes or {} hex characters; generate one with: openssl rand -hex 32",
             path.display(),
             MASTER_KEY_LEN * 2
@@ -106,7 +106,7 @@ impl SecretCipher {
     /// `associated_data` binds the ciphertext to where it is stored, so a
     /// blob copied into another environment's row fails to decrypt instead
     /// of silently leaking across environments.
-    pub fn encrypt(&self, plaintext: &[u8], associated_data: &[u8]) -> ProductResult<Vec<u8>> {
+    pub fn encrypt(&self, plaintext: &[u8], associated_data: &[u8]) -> CatalogResult<Vec<u8>> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -123,7 +123,7 @@ impl SecretCipher {
             .map_err(|_| {
                 // The AEAD error type carries no detail by design; there is
                 // nothing safe to add here beyond the fact that it failed.
-                ProductError::SecretsUnavailable("secret encryption failed".to_string())
+                CatalogError::SecretsUnavailable("secret encryption failed".to_string())
             })?;
 
         let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -133,9 +133,9 @@ impl SecretCipher {
     }
 
     /// Decrypt a `nonce || ciphertext` blob produced by [`Self::encrypt`].
-    pub fn decrypt(&self, blob: &[u8], associated_data: &[u8]) -> ProductResult<Vec<u8>> {
+    pub fn decrypt(&self, blob: &[u8], associated_data: &[u8]) -> CatalogResult<Vec<u8>> {
         if blob.len() <= NONCE_LEN {
-            return Err(ProductError::SecretsUnavailable(format!(
+            return Err(CatalogError::SecretsUnavailable(format!(
                 "stored secret is {} bytes, too short to hold a {NONCE_LEN}-byte nonce and a tag",
                 blob.len()
             )));
@@ -151,7 +151,7 @@ impl SecretCipher {
                 },
             )
             .map_err(|_| {
-                ProductError::SecretsUnavailable(
+                CatalogError::SecretsUnavailable(
                     "stored secret does not decrypt with the configured master key; the key was rotated or replaced".to_string(),
                 )
             })
@@ -217,11 +217,11 @@ impl SecretsBackend {
         }
     }
 
-    pub fn cipher(&self) -> ProductResult<&SecretCipher> {
+    pub fn cipher(&self) -> CatalogResult<&SecretCipher> {
         match self {
             SecretsBackend::Ready(cipher) => Ok(cipher),
             SecretsBackend::Unavailable(reason) => {
-                Err(ProductError::SecretsUnavailable(reason.clone()))
+                Err(CatalogError::SecretsUnavailable(reason.clone()))
             }
         }
     }
@@ -355,7 +355,7 @@ mod tests {
         let backend = SecretsBackend::load(Some(Path::new("/nonexistent/deis-master.key")));
         assert!(!backend.is_ready());
         let err = backend.cipher().unwrap_err();
-        assert!(matches!(err, ProductError::SecretsUnavailable(_)));
+        assert!(matches!(err, CatalogError::SecretsUnavailable(_)));
 
         let unset = SecretsBackend::load(None);
         assert!(!unset.is_ready());

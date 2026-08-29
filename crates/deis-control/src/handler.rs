@@ -1,12 +1,14 @@
-use std::sync::Arc;
-use chrono::Utc;
-use uuid::Uuid;
-use crate::config::ControlConfig;
-use crate::session::{SessionManager, NodeSession, NodeState};
-use crate::message::{AuthData, AuthResponse, RegisterRequest, RegisterResponse, HeartbeatRequest, HeartbeatAck};
-use crate::database::{Database, Event, EventSeverity, HeartbeatEntry};
-use crate::broadcast::{EventBroadcaster, BroadcastEvent};
+use crate::broadcast::{BroadcastEvent, EventBroadcaster};
 use crate::command::{CommandExecutor, CommandResponse};
+use crate::config::ControlConfig;
+use crate::database::{Database, Event, EventSeverity, HeartbeatEntry};
+use crate::message::{
+    AuthData, AuthResponse, HeartbeatAck, HeartbeatRequest, RegisterRequest, RegisterResponse,
+};
+use crate::session::{NodeSession, NodeState, SessionManager};
+use chrono::Utc;
+use std::sync::Arc;
+use uuid::Uuid;
 
 pub struct MessageHandler {
     config: Arc<ControlConfig>,
@@ -48,7 +50,7 @@ impl MessageHandler {
 
     pub async fn handle_auth(&self, data: AuthData) -> AuthResponse {
         let associated_id = &data.associated_id;
-        
+
         if self.config.node_preshared_keys.is_empty() {
             tracing::warn!(
                 associated_id = %associated_id,
@@ -86,7 +88,11 @@ impl MessageHandler {
         }
     }
 
-    pub async fn handle_register(&self, request: RegisterRequest, session: &Arc<NodeSession>) -> RegisterResponse {
+    pub async fn handle_register(
+        &self,
+        request: RegisterRequest,
+        session: &Arc<NodeSession>,
+    ) -> RegisterResponse {
         session.set_state(NodeState::Registered).await;
         self.sessions.add(Arc::clone(session));
 
@@ -143,7 +149,11 @@ impl MessageHandler {
         }
     }
 
-    pub async fn handle_heartbeat(&self, request: HeartbeatRequest, session: &Arc<NodeSession>) -> HeartbeatAck {
+    pub async fn handle_heartbeat(
+        &self,
+        request: HeartbeatRequest,
+        session: &Arc<NodeSession>,
+    ) -> HeartbeatAck {
         let now = Utc::now();
         *session.last_heartbeat.lock().await = now;
         session.set_state(NodeState::Active).await;
@@ -155,7 +165,7 @@ impl MessageHandler {
                 instance_id: session.instance_id.clone(),
                 timestamp: now,
                 power_reserve: request.power_reserve,
-                latency_ms: None,  // Could calculate from request timestamp if available
+                latency_ms: None, // Could calculate from request timestamp if available
             };
 
             if let Err(e) = db.save_heartbeat(&entry).await {
@@ -192,7 +202,9 @@ impl MessageHandler {
             let success = response.success;
             let message = response.message.clone();
 
-            executor.handle_response(command_id, response).await
+            executor
+                .handle_response(command_id, response)
+                .await
                 .map_err(|e| format!("Failed to handle command response: {}", e))?;
 
             tracing::info!(
@@ -278,8 +290,8 @@ impl MessageHandler {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::session::SessionManager;
     use crate::message::{NodeInfo, NodeRole};
+    use crate::session::SessionManager;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -329,8 +341,7 @@ mod tests {
         let client_id = uuid::Uuid::new_v4();
         broadcaster.register(client_id, tx);
 
-        let handler = MessageHandler::new(config, sessions.clone())
-            .with_broadcaster(broadcaster);
+        let handler = MessageHandler::new(config, sessions.clone()).with_broadcaster(broadcaster);
 
         let node_info = NodeInfo {
             node_role: NodeRole::Runtime("1.0.0".to_string()),
@@ -341,11 +352,9 @@ mod tests {
         let session = Arc::new(NodeSession::new("test-node".to_string(), node_info));
 
         // Call handle_state_change
-        handler.handle_state_change(
-            &session,
-            NodeState::Connected,
-            NodeState::Active,
-        ).await;
+        handler
+            .handle_state_change(&session, NodeState::Connected, NodeState::Active)
+            .await;
 
         // Verify: NodeStateChanged event should be received
         let event_json = rx.recv().await.unwrap();

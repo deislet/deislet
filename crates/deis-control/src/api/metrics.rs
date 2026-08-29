@@ -1,13 +1,9 @@
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    Json,
-};
+use axum::{Json, extract::State, response::IntoResponse};
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::metrics::MetricsCollector;
 use super::error::ApiError;
+use crate::metrics::MetricsCollector;
 
 #[derive(Clone)]
 pub struct MetricsState {

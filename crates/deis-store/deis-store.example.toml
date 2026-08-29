@@ -1,0 +1,46 @@
+# deis-store configuration. Every key is optional; the values below are the
+# defaults, so an empty file starts a working service.
+
+# gRPC endpoint: KvStore, Database and BlobStore, plus the standard
+# grpc.health.v1 service.
+#
+# Loopback on purpose. deis-store has no caller authentication: it takes the
+# tenant from the `x-deis-app-id` header and serves that app's data, so
+# anything that can reach this port can read, overwrite and delete any app's
+# data by naming its id. What keeps that contained is that only processes on
+# this host can connect, and deis-runtime is one of them. Binding elsewhere
+# publishes every app's data to that network; the service logs a warning when
+# you do, and the warning is not the thing to silence - caller identity
+# (mutual TLS, or a token issued by deis-control) has to exist first.
+listen = "127.0.0.1:8090"
+
+# Directory holding kv.sqlite, blob.sqlite, db/<app_id>.sqlite and the blob
+# content tree. Back this up: it is the only copy of every app's data.
+data_dir = "./data"
+
+# Connections in the pool of each shared SQLite file (KV and blob metadata),
+# and with it the ceiling on blocking threads those two stores occupy.
+# Raising it buys concurrency for readers; SQLite serialises writers whatever
+# this says.
+shared_connections = 8
+
+# Connections in the pool of one app's database file. Kept small on purpose:
+# with many apps it is the sum across them that decides how many threads and
+# file handles the process holds.
+app_connections = 4
+
+# Seconds between sweeps of expired KV entries. Expiry is already honoured by
+# every read, so this only decides how long dead rows keep occupying disk, not
+# whether an expired value can still be read (it cannot).
+kv_sweep_interval_secs = 300
+
+# Largest object BlobStore.Put will accept, in bytes (512 MiB). An upload that
+# goes over is refused once it crosses the line and its temporary file is
+# removed, so the caller pays for the transfer but the disk does not.
+max_object_bytes = 536870912
+
+# Seconds a blob upload may go without sending a body chunk before the store
+# gives up on it. Set to 0 to wait forever - then one client that stops
+# sending mid-object holds a task, a file descriptor and a full-size temporary
+# file until the process restarts.
+upload_idle_timeout_secs = 60

@@ -18,13 +18,18 @@ use axum::{
 use serde::Serialize;
 use tracing::{debug, info};
 
-use super::ProductState;
+use super::CatalogState;
 use crate::api::error::ApiResult;
 
+/// One line of the list, in exactly the shape the wire contract of
+/// docs/implementation-plan.zh.md section 4 specifies.
 #[derive(Debug, Serialize)]
 pub struct AssignmentView {
     pub app_id: String,
     pub version_id: String,
+    /// The environment *name*, `production` or a preview name. The
+    /// environment id stays inside the control plane: the node has no use
+    /// for it, and the runtime branches on the name.
     pub environment: String,
     /// Absolute URL the node downloads the bundle from.
     pub bundle_url: String,
@@ -33,8 +38,8 @@ pub struct AssignmentView {
 }
 
 /// GET /api/nodes/:id/assignments
-pub async fn assignments(
-    State(state): State<ProductState>,
+pub async fn for_node(
+    State(state): State<CatalogState>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<AssignmentView>>> {

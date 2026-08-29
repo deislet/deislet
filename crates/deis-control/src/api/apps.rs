@@ -12,7 +12,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tracing::warn;
 
-use crate::runtime_client::{RuntimeNodeManager, NodeError};
+use crate::runtime_client::{NodeError, RuntimeNodeManager};
 
 /// Hard cap for uploaded app packages. Keeps a misbehaving client from
 /// buffering arbitrary amounts of memory in the control.
@@ -129,7 +129,11 @@ pub async fn deploy_app(
             })),
         );
     }
-    match state.deis_runtime.deploy_app(&node, &app_id, body.to_vec()).await {
+    match state
+        .deis_runtime
+        .deploy_app(&node, &app_id, body.to_vec())
+        .await
+    {
         Ok(resp) if resp.success => (
             StatusCode::OK,
             Json(json!({ "success": true, "app_id": resp.app_id, "message": resp.message })),

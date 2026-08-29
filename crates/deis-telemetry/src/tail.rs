@@ -214,7 +214,7 @@ mod tests {
         Arc::new(LogRecord {
             timestamp_us: 1,
             level,
-            source: "test".into(),
+            component: "deis-runtime".into(),
             app_id: app_id.into(),
             message: message.into(),
             fields: BTreeMap::new(),

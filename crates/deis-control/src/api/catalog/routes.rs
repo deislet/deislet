@@ -8,9 +8,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::ProductState;
+use super::CatalogState;
 use crate::api::error::ApiResult;
-use crate::product::Route;
+use crate::catalog::Route;
 
 #[derive(Debug, Deserialize)]
 pub struct RouteRequest {
@@ -36,7 +36,7 @@ pub struct RoutesResponse {
 
 /// POST /api/apps/:app_id/environments/:env/routes
 pub async fn create_route(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
     Json(request): Json<RouteRequest>,
 ) -> ApiResult<(StatusCode, Json<RouteResponse>)> {
@@ -50,7 +50,7 @@ pub async fn create_route(
 
 /// GET /api/apps/:app_id/environments/:env/routes
 pub async fn list_routes(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
 ) -> ApiResult<Json<RoutesResponse>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
@@ -68,7 +68,7 @@ pub async fn list_routes(
 ///
 /// Every route the platform knows, highest priority first. This is the
 /// whole routing table an edge needs in one call.
-pub async fn list_all_routes(State(state): State<ProductState>) -> ApiResult<Json<RoutesResponse>> {
+pub async fn list_all_routes(State(state): State<CatalogState>) -> ApiResult<Json<RoutesResponse>> {
     let routes = state.store.list_routes(None, None).await?;
     Ok(Json(RoutesResponse {
         total: routes.len(),
@@ -81,7 +81,7 @@ pub async fn list_all_routes(State(state): State<ProductState>) -> ApiResult<Jso
 /// Replaces the route's fields wholesale, so an omitted `host` clears it
 /// back to "any domain" rather than keeping the old value.
 pub async fn update_route(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, env_name, route_id)): Path<(String, String, String)>,
     Json(request): Json<RouteRequest>,
 ) -> ApiResult<Json<RouteResponse>> {
@@ -101,7 +101,7 @@ pub async fn update_route(
 
 /// DELETE /api/apps/:app_id/environments/:env/routes/:route_id
 pub async fn delete_route(
-    State(state): State<ProductState>,
+    State(state): State<CatalogState>,
     Path((app_id, env_name, route_id)): Path<(String, String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;

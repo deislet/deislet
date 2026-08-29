@@ -6,8 +6,8 @@
 //! depend on this crate for that module alone.
 
 pub mod client;
-pub mod conventions;
 pub mod config;
+pub mod conventions;
 pub mod error;
 pub mod models;
 
@@ -42,14 +42,14 @@ pub use models::messages::{
     Message,
     MessageBuilder,
 
+    // Data types
+    NodeCommand,
     RegisterMessage,
     RegisterResponseMessage,
     StatusUpdateMessage,
-    // Data types
-    NodeCommand,
     WireMessage,
-    deis_proxy,
-    deis_runtime,
     // Extension modules
     control,
+    deis_proxy,
+    deis_runtime,
 };

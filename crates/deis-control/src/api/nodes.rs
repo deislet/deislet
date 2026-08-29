@@ -1,10 +1,13 @@
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
 
-use super::{error::{ApiError, ApiResult}, AppState};
+use super::{
+    AppState,
+    error::{ApiError, ApiResult},
+};
 
 #[derive(Serialize)]
 pub struct NodeInfo {

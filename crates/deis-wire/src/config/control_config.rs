@@ -157,7 +157,7 @@ mod tests {
 
         assert!(config.validate().is_ok());
     }
-// ...
+    // ...
     #[test]
     fn test_validation_invalid_addr_scheme() {
         let config = ControlConfig::new(
@@ -168,7 +168,10 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "addr must start with http:// or https://");
+        assert_eq!(
+            result.unwrap_err(),
+            "addr must start with http:// or https://"
+        );
     }
 
     #[test]

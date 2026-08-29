@@ -1,9 +1,9 @@
 use axum::{
+    Json,
     extract::Request,
-    http::{StatusCode, HeaderMap},
+    http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -87,7 +87,10 @@ pub async fn api_key_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::{Request as HttpRequest, StatusCode}};
+    use axum::{
+        body::Body,
+        http::{Request as HttpRequest, StatusCode},
+    };
     use tower::ServiceExt;
 
     #[test]
@@ -126,19 +129,18 @@ mod tests {
             api_keys: Arc::new(vec![]),
         };
 
-        let app = Router::new()
-            .route("/test", get(test_handler))
-            .layer(axum::middleware::from_fn_with_state(
-                auth_config,
-                api_key_auth,
-            ));
+        let app = Router::new().route("/test", get(test_handler)).layer(
+            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
+        );
 
         // Send request without authentication
         let response = app
-            .oneshot(HttpRequest::builder()
-                .uri("/test")
-                .body(Body::empty())
-                .unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -160,19 +162,18 @@ mod tests {
             api_keys: Arc::new(vec!["valid-key-123".to_string()]),
         };
 
-        let app = Router::new()
-            .route("/test", get(test_handler))
-            .layer(axum::middleware::from_fn_with_state(
-                auth_config,
-                api_key_auth,
-            ));
+        let app = Router::new().route("/test", get(test_handler)).layer(
+            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
+        );
 
         // Send request without API key
         let response = app
-            .oneshot(HttpRequest::builder()
-                .uri("/test")
-                .body(Body::empty())
-                .unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -194,20 +195,19 @@ mod tests {
             api_keys: Arc::new(vec!["valid-key-123".to_string()]),
         };
 
-        let app = Router::new()
-            .route("/test", get(test_handler))
-            .layer(axum::middleware::from_fn_with_state(
-                auth_config,
-                api_key_auth,
-            ));
+        let app = Router::new().route("/test", get(test_handler)).layer(
+            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
+        );
 
         // Use Bearer token
         let response = app
-            .oneshot(HttpRequest::builder()
-                .uri("/test")
-                .header("Authorization", "Bearer valid-key-123")
-                .body(Body::empty())
-                .unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/test")
+                    .header("Authorization", "Bearer valid-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -229,20 +229,19 @@ mod tests {
             api_keys: Arc::new(vec!["valid-key-123".to_string()]),
         };
 
-        let app = Router::new()
-            .route("/test", get(test_handler))
-            .layer(axum::middleware::from_fn_with_state(
-                auth_config,
-                api_key_auth,
-            ));
+        let app = Router::new().route("/test", get(test_handler)).layer(
+            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
+        );
 
         // Use X-API-Key header
         let response = app
-            .oneshot(HttpRequest::builder()
-                .uri("/test")
-                .header("X-API-Key", "valid-key-123")
-                .body(Body::empty())
-                .unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/test")
+                    .header("X-API-Key", "valid-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -264,20 +263,19 @@ mod tests {
             api_keys: Arc::new(vec!["valid-key-123".to_string()]),
         };
 
-        let app = Router::new()
-            .route("/test", get(test_handler))
-            .layer(axum::middleware::from_fn_with_state(
-                auth_config,
-                api_key_auth,
-            ));
+        let app = Router::new().route("/test", get(test_handler)).layer(
+            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
+        );
 
         // Use invalid API key
         let response = app
-            .oneshot(HttpRequest::builder()
-                .uri("/test")
-                .header("Authorization", "Bearer wrong-key")
-                .body(Body::empty())
-                .unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/test")
+                    .header("Authorization", "Bearer wrong-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -299,19 +297,18 @@ mod tests {
             api_keys: Arc::new(vec!["valid-key-123".to_string()]),
         };
 
-        let app = Router::new()
-            .route("/health", get(health_handler))
-            .layer(axum::middleware::from_fn_with_state(
-                auth_config,
-                api_key_auth,
-            ));
+        let app = Router::new().route("/health", get(health_handler)).layer(
+            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
+        );
 
         // /health endpoint does not require authentication
         let response = app
-            .oneshot(HttpRequest::builder()
-                .uri("/health")
-                .body(Body::empty())
-                .unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -342,10 +339,12 @@ mod tests {
 
         // /api/metrics endpoint does not require authentication (needed for Prometheus)
         let response = app
-            .oneshot(HttpRequest::builder()
-                .uri("/api/metrics")
-                .body(Body::empty())
-                .unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

@@ -2,13 +2,15 @@
 
 use super::cache_ops::{create_cache_store, CacheStore};
 use super::loader::DbModuleLoader;
-use super::ops::{EnvStore, ResponseStore};
+use super::ops::{AppId, EnvStore, ResponseStore};
 use super::queue_ops::MemoryQueue;
 use super::rate_limit::RateLimiter;
 use super::route_match::{match_routes, path_from_url};
 use super::runtime_init::{build_runtime_extensions, init_lazy_extensions};
 use super::snapshot::load_or_create_startup_snapshot;
 use super::ws_server_ops::{create_ws_server_manager, WsServerManager};
+use crate::app::types::AppPermissions;
+use crate::config::ExecutionLimits;
 use anyhow::Result;
 use deno_ast::{MediaType, ParseParams};
 use deno_core::{
@@ -46,6 +48,40 @@ struct JsResponse {
     body: Option<String>,
 }
 
+/// Everything one isolate needs beyond its identity and its source.
+///
+/// These values used to travel as a run of positional arguments through
+/// `RuntimePool::load_app`, `RuntimeMessage::LoadApp` and `AppRuntime::new`.
+/// Several of them share a type (`Option<usize>` twice, and previously a bare
+/// `u64` and `f64` for the limits), so a swapped pair compiled cleanly and only
+/// showed up at runtime as an app with limits nobody configured. Naming the
+/// fields makes that class of mistake a compile error, and adding a limit now
+/// touches one struct instead of four signatures.
+#[derive(Debug, Clone, Default)]
+pub struct IsolateSpec {
+    /// Module path inside the app bundle; defaults to `app.ts` when absent.
+    pub entry_point: Option<String>,
+
+    /// Values visible to the app through `Deno.env` / `ctx.env`.
+    pub env: HashMap<String, String>,
+
+    /// Net and env permissions granted to the isolate.
+    pub permissions: AppPermissions,
+
+    /// V8 heap ceiling (MB). `None` leaves V8 on its own default.
+    pub memory_limit_mb: Option<usize>,
+
+    /// Maximum live entries in the op resource table. `None` means unbounded.
+    pub resource_table_max: Option<usize>,
+
+    /// Route patterns from the app's manifest, used to fill `context.params`.
+    pub route_patterns: Vec<String>,
+
+    /// Effective execution limits: the app's own overrides where it set any,
+    /// the platform defaults otherwise.
+    pub limits: ExecutionLimits,
+}
+
 pub struct AppRuntime {
     runtime: JsRuntime,
     app_id: String,
@@ -69,20 +105,26 @@ pub struct AppRuntime {
 }
 
 impl AppRuntime {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         app_id: String,
         code: String,
-        entry_point: Option<String>,
         app_repo: Option<Arc<crate::app_repo::AppRepo>>,
-        env: HashMap<String, String>,
-        permissions_config: super::super::app::types::AppPermissions,
-        memory_limit_mb: Option<usize>,
-        resource_table_max: Option<usize>,
-        route_patterns: Vec<String>,
-        timeout_ms: u64,
-        rate_limit_ops_per_sec: f64,
+        spec: IsolateSpec,
     ) -> Result<Self> {
+        let IsolateSpec {
+            entry_point,
+            env,
+            permissions: permissions_config,
+            memory_limit_mb,
+            resource_table_max,
+            route_patterns,
+            limits,
+        } = spec;
+        let ExecutionLimits {
+            timeout_ms,
+            rate_limit_ops_per_sec,
+        } = limits;
+
         let mut create_params = deno_core::v8::CreateParams::default();
         if let Some(mb) = memory_limit_mb {
             create_params = create_params.heap_limits(0, mb * 1024 * 1024);
@@ -145,6 +187,7 @@ impl AppRuntime {
                     if !limiter.check() {
                         tracing::warn!(
                             target: "app",
+                            app_id = %app_id,
                             "Rate limit exceeded for app {}, op: {}. Terminating isolate execution; the in-flight request will fail.",
                             app_id,
                             op_name
@@ -226,11 +269,16 @@ impl AppRuntime {
 
             let memory_queue: MemoryQueue = Rc::new(RefCell::new(Vec::new()));
             state.put(memory_queue);
+
+            // Ops that emit logs need to say which tenant they are acting for;
+            // see `AppId`.
+            state.put(AppId(app_id.clone()));
         }
 
         if let Some(limit) = resource_table_max {
             tracing::info!(
                 target: "app",
+                app_id = %app_id,
                 "ResourceTable quota enabled: app_id={}, limit={}",
                 app_id,
                 limit
@@ -245,6 +293,7 @@ impl AppRuntime {
             runtime.add_near_heap_limit_callback(move |current, initial| {
                 tracing::error!(
                     target: "app",
+                    app_id = %app_id_clone,
                     "OOM detected for app {}: current={} bytes, limit={} bytes. Terminating.",
                     app_id_clone,
                     current,
@@ -280,9 +329,8 @@ impl AppRuntime {
 
         // Skip bootstrap load if snapshot is already loaded
         if !self.snapshot_loaded {
-            let bootstrap_specifier = deno_core::ModuleSpecifier::parse(
-                "ext:bootstrap/src/runtime/js/bootstrap.js",
-            )?;
+            let bootstrap_specifier =
+                deno_core::ModuleSpecifier::parse("ext:bootstrap/src/runtime/js/bootstrap.js")?;
             let bootstrap_id = self
                 .runtime
                 .load_side_es_module(&bootstrap_specifier)
@@ -390,6 +438,7 @@ impl AppRuntime {
         if !params.is_empty() {
             tracing::debug!(
                 target: "app",
+                app_id = %self.app_id,
                 "Matched route params for app {}: path={}, params={:?}",
                 self.app_id,
                 pathname,
@@ -398,6 +447,7 @@ impl AppRuntime {
         } else if !self.route_patterns.is_empty() {
             tracing::trace!(
                 target: "app",
+                app_id = %self.app_id,
                 "No configured route pattern matched: app={}, path={}",
                 self.app_id,
                 pathname
@@ -437,6 +487,7 @@ impl AppRuntime {
             tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
             tracing::warn!(
                 target: "app",
+                app_id = %app_id_for_timeout,
                 "App {} execution timed out after {}ms. Terminating isolate execution; the request will fail.",
                 app_id_for_timeout,
                 timeout_ms
@@ -485,6 +536,7 @@ impl AppRuntime {
             if resource_count > limit {
                 tracing::warn!(
                     target: "app",
+                    app_id = %self.app_id,
                     "ResourceTable limit exceeded: app_id={}, limit={}, current={}",
                     self.app_id,
                     limit,
@@ -501,6 +553,7 @@ impl AppRuntime {
         let metrics = self.op_metrics.aggregate();
         tracing::debug!(
             target: "app",
+            app_id = %self.app_id,
             "OpMetrics summary: app_id={}, sync={}, async={}, fast={}, completed_async={}",
             self.app_id,
             metrics.ops_dispatched_sync,

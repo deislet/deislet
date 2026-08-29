@@ -9,10 +9,13 @@ use crate::management::ManagementServer;
 use crate::trigger::TriggerServer;
 use anyhow::Result;
 use axum::Router;
+use std::future::IntoFuture;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{error, info, warn};
 
 /// Application State
 #[derive(Clone)]
@@ -20,14 +23,88 @@ pub struct AppState {
     pub app_manager: Arc<ApplicationManager>,
 }
 
-/// Start HTTP + gRPC server (reuse the same port)
-pub async fn start_server(
-    app_manager: Arc<ApplicationManager>,
-    config_store: Arc<ConfigStore>,
-    app_repo: Arc<AppRepo>,
-    node_id: String,
-    port: u16,
-) -> Result<()> {
+/// Everything `start_server` needs to stand the node up.
+///
+/// Grouped rather than passed positionally so that adding a knob does not turn
+/// into another same-typed argument at a call site.
+pub struct ServerOptions {
+    pub app_manager: Arc<ApplicationManager>,
+    pub config_store: Arc<ConfigStore>,
+    pub app_repo: Arc<AppRepo>,
+    pub node_id: String,
+    pub port: u16,
+
+    /// How long in-flight requests get to finish after a shutdown signal
+    /// before the node stops waiting.
+    pub shutdown_grace: Duration,
+}
+
+/// Wait for the first shutdown signal and name it.
+///
+/// SIGTERM is what a supervisor (systemd, a container runtime, `deis` itself)
+/// sends on a restart or a rolling deploy, and SIGINT is Ctrl-C in a terminal.
+/// Both mean the same thing here: stop taking new work, let what is running
+/// finish.
+async fn shutdown_signal() -> &'static str {
+    let interrupt = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "SIGINT",
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not install the SIGINT handler; Ctrl-C will kill this node \
+                     outright instead of draining, and in-flight requests will be \
+                     cut off"
+                );
+                std::future::pending().await
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+                "SIGTERM"
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not install the SIGTERM handler; a supervisor restart will kill \
+                     this node outright instead of draining, and in-flight requests \
+                     will be cut off"
+                );
+                std::future::pending().await
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<&'static str>();
+
+    tokio::select! {
+        signal = interrupt => signal,
+        signal = terminate => signal,
+    }
+}
+
+/// Start HTTP + gRPC server (reuse the same port) and serve until a shutdown
+/// signal arrives.
+///
+/// Returns once the listener is closed and either every in-flight request has
+/// finished or the grace period has run out.
+pub async fn start_server(options: ServerOptions) -> Result<()> {
+    let ServerOptions {
+        app_manager,
+        config_store,
+        app_repo,
+        node_id,
+        port,
+        shutdown_grace,
+    } = options;
+
     let state = AppState {
         app_manager: app_manager.clone(),
     };
@@ -154,8 +231,49 @@ pub async fn start_server(
     );
     info!("====================================");
 
-    // Start server
-    axum::serve(listener, app).await?;
+    // Serve until a signal arrives, then drain.
+    //
+    // `with_graceful_shutdown` stops accepting new connections and lets the
+    // ones already in flight run to completion, which is what keeps an isolate
+    // from being torn down half way through a request. The deadline exists so
+    // that one stuck handler cannot hold the whole node open forever.
+    let (drain_tx, drain_rx) = oneshot::channel::<()>();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = drain_rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => {
+            result?;
+            info!("HTTP server stopped on its own");
+        }
+        signal = shutdown_signal() => {
+            info!(
+                signal,
+                grace_secs = shutdown_grace.as_secs(),
+                "Shutdown signal received; no longer accepting connections, in-flight requests \
+                 have the grace period to finish"
+            );
+            let _ = drain_tx.send(());
+
+            match tokio::time::timeout(shutdown_grace, &mut server).await {
+                Ok(Ok(())) => info!("All in-flight requests finished; the node drained cleanly"),
+                Ok(Err(e)) => warn!(
+                    error = %e,
+                    "The server reported an error while draining; some requests may have been cut \
+                     off"
+                ),
+                Err(_) => error!(
+                    grace_secs = shutdown_grace.as_secs(),
+                    "Grace period expired with requests still running; those isolates are being \
+                     torn down mid-request and their clients will see a dropped connection"
+                ),
+            }
+        }
+    }
 
     Ok(())
 }

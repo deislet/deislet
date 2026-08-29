@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::app::types::AppPermissions;
-    use crate::runtime::isolate::AppRuntime;
+    use crate::config::ExecutionLimits;
+    use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
@@ -20,14 +20,7 @@ mod tests {
             "test_esm".to_string(),
             ts_code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         );
         assert!(
             result.is_ok(),
@@ -47,14 +40,7 @@ mod tests {
             "test_counter".to_string(),
             ts_code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         );
         assert!(
             result.is_ok(),
@@ -79,14 +65,7 @@ export default function handler(context: any): Response {
             "test_interface".to_string(),
             ts_code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         );
         assert!(
             result.is_ok(),
@@ -112,14 +91,7 @@ export default function handler(context: any): Response {
             "test_echo".to_string(),
             ts_code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         );
         assert!(
             result.is_ok(),
@@ -140,14 +112,7 @@ export default function handler(context: any): Response {
             "test_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         );
         assert!(result.is_ok());
     }
@@ -159,14 +124,7 @@ export default function handler(context: any): Response {
             "test_app".to_string(),
             invalid_code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         );
         assert!(result.is_err());
     }
@@ -183,14 +141,7 @@ export default function handler(context: any): Response {
             "test_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         );
         assert!(result.is_ok());
 
@@ -213,14 +164,7 @@ export default function handler(context: any): Response {
             "test_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         )
         .unwrap();
 
@@ -263,14 +207,7 @@ export default function handler(context: any): Response {
             "test_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         )
         .unwrap();
 
@@ -306,14 +243,7 @@ export default function handler(context: any): Response {
             "test_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         )
         .unwrap();
 
@@ -356,14 +286,7 @@ export default function handler(context: any): Response {
             "test_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         )
         .unwrap();
 
@@ -406,14 +329,10 @@ export default function handler(context: any): Response {
             "test_params_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            vec!["/users/:id".to_string()],
-            30_000,
-            1000.0,
+            IsolateSpec {
+                route_patterns: vec!["/users/:id".to_string()],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -450,14 +369,10 @@ export default function handler(context: any): Response {
             "test_no_params_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            vec!["/users/:id".to_string()],
-            30_000,
-            1000.0,
+            IsolateSpec {
+                route_patterns: vec!["/users/:id".to_string()],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -493,14 +408,13 @@ export default function handler(context: any): Response {
             "test_limits_override_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            5_000,
-            42.5,
+            IsolateSpec {
+                limits: ExecutionLimits {
+                    timeout_ms: 5_000,
+                    rate_limit_ops_per_sec: 42.5,
+                },
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -524,18 +438,129 @@ export default function handler(context: any): Response {
             "test_default_limits_app".to_string(),
             code.to_string(),
             None,
-            None,
-            HashMap::new(),
-            AppPermissions::default(),
-            None,
-            None,
-            Vec::new(),
-            30_000,
-            1000.0,
+            IsolateSpec::default(),
         )
         .unwrap();
 
         assert_eq!(runtime.timeout_ms(), 30_000);
         assert_eq!(runtime.rate_limit_ops_per_sec(), 1000.0);
+    }
+
+    /// A `console.log` from an application must reach deis-telemetry tagged
+    /// with that application. Untagged, the entry is stored but no per-app
+    /// query can ever surface it, so `deis tail my-app` stays empty while the
+    /// shipper reports success.
+    #[tokio::test]
+    async fn console_log_is_attributed_to_the_application() {
+        use crate::logging::{LogBuffer, RuntimeLayer};
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+
+        let code = r#"
+            export default function handler() {
+                console.log("hello from the app");
+                return new Response("ok");
+            }
+        "#;
+
+        let buffer = Arc::new(LogBuffer::new(16));
+        let subscriber = tracing_subscriber::registry()
+            .with(RuntimeLayer::new(buffer.clone(), "node-a".to_string()));
+        // `set_default` rather than `with_default`: the guard has to stay alive
+        // across the awaits below, which a closure-scoped default cannot do.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut runtime = AppRuntime::new(
+            "log_attribution_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        let entries = buffer.drain(16);
+        let logged = entries
+            .iter()
+            .find(|e| e.message.contains("hello from the app"))
+            .expect("the app's console.log should have been buffered");
+        assert_eq!(
+            logged.app_id.as_deref(),
+            Some("log_attribution_app"),
+            "an app log with no app_id is unqueryable in deis-telemetry"
+        );
+    }
+
+    /// The console bridge has to preserve severity and render non-string
+    /// arguments; a log that arrives at the wrong level defeats the `min_level`
+    /// filter every telemetry query uses, and one that arrives as
+    /// "[object Object]" carries no information at all.
+    #[tokio::test]
+    async fn console_levels_and_objects_survive_the_bridge() {
+        use crate::logging::{LogBuffer, LogLevel, RuntimeLayer};
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+
+        let code = r#"
+            export default function handler() {
+                console.error("boom", { code: 7 });
+                console.warn("careful");
+                return new Response("ok");
+            }
+        "#;
+
+        let buffer = Arc::new(LogBuffer::new(16));
+        let subscriber = tracing_subscriber::registry()
+            .with(RuntimeLayer::new(buffer.clone(), "node-a".to_string()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut runtime = AppRuntime::new(
+            "console_levels_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        let entries = buffer.drain(16);
+        let error = entries
+            .iter()
+            .find(|e| e.message.starts_with("boom"))
+            .expect("console.error should have been buffered");
+        assert_eq!(error.level, LogLevel::Error);
+        assert_eq!(error.message, r#"boom {"code":7}"#);
+
+        let warning = entries
+            .iter()
+            .find(|e| e.message == "careful")
+            .expect("console.warn should have been buffered");
+        assert_eq!(warning.level, LogLevel::Warn);
     }
 }

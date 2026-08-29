@@ -9,9 +9,9 @@
 
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod proxy;
 pub mod restart;
-pub mod control;
 pub mod tls;
 
 pub use config::{AppConfig, ConfigManager, SystemConfig};

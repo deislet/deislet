@@ -99,7 +99,7 @@ impl SqlitePool {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| StoreError::Worker("sqlite pool was closed".to_string()))?;
+            .map_err(|_| StoreError::BlockingTask("sqlite pool was closed".to_string()))?;
 
         tokio::task::spawn_blocking(move || {
             let mut conn = match inner.idle.lock() {

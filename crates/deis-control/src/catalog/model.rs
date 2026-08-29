@@ -1,4 +1,4 @@
-//! Row types of the product model plus the identifier rules that keep
+//! Row types of the catalog plus the identifier rules that keep
 //! user-supplied names safe to put in a file path or a route table.
 //!
 //! Every timestamp in this module is Unix epoch seconds, matching the
@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 
-use super::ProductError;
+use super::CatalogError;
 
 /// Longest accepted app id, environment name or route host label.
 pub const MAX_NAME_LEN: usize = 64;
@@ -88,10 +88,19 @@ pub struct SecretMeta {
 
 /// What one node should be running, before the bundle download URL is
 /// filled in by the REST layer (which knows the public base address).
+///
+/// The two environment fields are deliberately spelled apart: everything
+/// ending in `_id` is a primary key, and `environment` is the human name
+/// (`production`, `pr-42`). That is the name the wire contract carries
+/// (docs/implementation-plan.zh.md section 4) and the one the runtime
+/// branches on, so putting an id in it would reach the application code
+/// as a uuid without anything on the way noticing.
 #[derive(Debug, Clone)]
 pub struct Assignment {
     pub app_id: String,
-    pub env_id: String,
+    /// Primary key of the environment row. Control-plane internal.
+    pub environment_id: String,
+    /// Environment name, as sent to the node.
     pub environment: String,
     pub version_id: String,
     pub bundle_sha: String,
@@ -113,7 +122,7 @@ pub struct DeletedApp {
 }
 
 /// Current wall clock as the Unix epoch seconds stored in every
-/// `created_at` / `updated_at` column of the product tables.
+/// `created_at` / `updated_at` column of the catalog tables.
 pub fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -121,13 +130,13 @@ pub fn now_secs() -> i64 {
 /// App ids become directory names under the bundle root and appear in
 /// route tables, so they are restricted to a conservative slug: lowercase
 /// letters, digits, `-` and `_`, starting with a letter or digit.
-pub fn validate_app_id(id: &str) -> Result<(), ProductError> {
+pub fn validate_app_id(id: &str) -> Result<(), CatalogError> {
     validate_slug(id, "app id", MAX_NAME_LEN, false)
 }
 
 /// Environment names additionally allow `.` so that names like `pr-42.1`
 /// work, but are otherwise as restricted as app ids.
-pub fn validate_environment_name(name: &str) -> Result<(), ProductError> {
+pub fn validate_environment_name(name: &str) -> Result<(), CatalogError> {
     validate_slug(name, "environment name", MAX_NAME_LEN, true)
 }
 
@@ -136,18 +145,18 @@ fn validate_slug(
     what: &str,
     max_len: usize,
     allow_dot: bool,
-) -> Result<(), ProductError> {
+) -> Result<(), CatalogError> {
     if value.is_empty() {
-        return Err(ProductError::invalid(format!("{what} must not be empty")));
+        return Err(CatalogError::invalid(format!("{what} must not be empty")));
     }
     if value.len() > max_len {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "{what} is longer than {max_len} characters"
         )));
     }
     let first = value.as_bytes()[0];
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "{what} must start with a lowercase letter or a digit, got {value:?}"
         )));
     }
@@ -158,7 +167,7 @@ fn validate_slug(
             || ch == '_'
             || (allow_dot && ch == '.');
         if !ok {
-            return Err(ProductError::invalid(format!(
+            return Err(CatalogError::invalid(format!(
                 "{what} may only contain lowercase letters, digits, '-'{} and '_', got {value:?}",
                 if allow_dot { ", '.'" } else { "" }
             )));
@@ -170,23 +179,23 @@ fn validate_slug(
 /// Secret names are injected as environment variables into the isolate,
 /// so they follow the shell variable rule: letter or `_` first, then
 /// letters, digits and `_`.
-pub fn validate_secret_name(name: &str) -> Result<(), ProductError> {
+pub fn validate_secret_name(name: &str) -> Result<(), CatalogError> {
     if name.is_empty() {
-        return Err(ProductError::invalid("secret name must not be empty"));
+        return Err(CatalogError::invalid("secret name must not be empty"));
     }
     if name.len() > MAX_SECRET_NAME_LEN {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "secret name is longer than {MAX_SECRET_NAME_LEN} characters"
         )));
     }
     let first = name.as_bytes()[0];
     if !first.is_ascii_alphabetic() && first != b'_' {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "secret name must start with a letter or '_', got {name:?}"
         )));
     }
     if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "secret name may only contain letters, digits and '_', got {name:?}"
         )));
     }
@@ -196,24 +205,24 @@ pub fn validate_secret_name(name: &str) -> Result<(), ProductError> {
 /// Route path prefixes are matched literally against the request path, so
 /// they must be absolute and free of the traversal segments that would let
 /// one environment shadow another.
-pub fn validate_path_prefix(prefix: &str) -> Result<(), ProductError> {
+pub fn validate_path_prefix(prefix: &str) -> Result<(), CatalogError> {
     if !prefix.starts_with('/') {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "route path_prefix must start with '/', got {prefix:?}"
         )));
     }
     if prefix.len() > MAX_PATH_PREFIX_LEN {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "route path_prefix is longer than {MAX_PATH_PREFIX_LEN} characters"
         )));
     }
     if prefix.contains("..") {
-        return Err(ProductError::invalid(
+        return Err(CatalogError::invalid(
             "route path_prefix must not contain '..'",
         ));
     }
     if prefix.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(ProductError::invalid(
+        return Err(CatalogError::invalid(
             "route path_prefix must not contain whitespace or control characters",
         ));
     }
@@ -223,20 +232,20 @@ pub fn validate_path_prefix(prefix: &str) -> Result<(), ProductError> {
 /// Route hosts are compared against the request `Host` header. Only the
 /// characters a hostname can legally carry are accepted, plus a leading
 /// `*.` for a wildcard domain.
-pub fn validate_host(host: &str) -> Result<(), ProductError> {
+pub fn validate_host(host: &str) -> Result<(), CatalogError> {
     if host.is_empty() {
-        return Err(ProductError::invalid(
+        return Err(CatalogError::invalid(
             "route host must not be empty; omit it to match any domain",
         ));
     }
     if host.len() > 253 {
-        return Err(ProductError::invalid(
+        return Err(CatalogError::invalid(
             "route host is longer than 253 characters",
         ));
     }
     let body = host.strip_prefix("*.").unwrap_or(host);
     if body.is_empty() {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "route host {host:?} is not a hostname"
         )));
     }
@@ -244,7 +253,7 @@ pub fn validate_host(host: &str) -> Result<(), ProductError> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b':');
     if !valid {
-        return Err(ProductError::invalid(format!(
+        return Err(CatalogError::invalid(format!(
             "route host may only contain letters, digits, '-', '.', ':' and an optional leading '*.', got {host:?}"
         )));
     }

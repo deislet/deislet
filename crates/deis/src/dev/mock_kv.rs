@@ -41,7 +41,10 @@ impl MockKVStore {
         }
     }
 
-    pub async fn get_with_metadata(&self, key: &str) -> Option<(String, Option<serde_json::Value>)> {
+    pub async fn get_with_metadata(
+        &self,
+        key: &str,
+    ) -> Option<(String, Option<serde_json::Value>)> {
         let data = self.data.read().await;
 
         if let Some(entry) = data.get(key) {
@@ -97,21 +100,24 @@ impl MockKVStore {
             .filter(|(k, v)| {
                 // Check prefix
                 if let Some(p) = prefix
-                    && !k.starts_with(p) {
-                        return false;
-                    }
+                    && !k.starts_with(p)
+                {
+                    return false;
+                }
 
                 // Check expiration
                 if let Some(exp) = v.expiration
-                    && now >= exp {
-                        return false;
-                    }
+                    && now >= exp
+                {
+                    return false;
+                }
 
                 // Check cursor (pagination)
                 if let Some(c) = cursor
-                    && k.as_str() <= c {
-                        return false;
-                    }
+                    && k.as_str() <= c
+                {
+                    return false;
+                }
 
                 true
             })
@@ -199,7 +205,8 @@ mod tests {
     async fn test_basic_get_put() {
         let kv = MockKVStore::new();
 
-        kv.put("key1".to_string(), "value1".to_string(), None, None).await;
+        kv.put("key1".to_string(), "value1".to_string(), None, None)
+            .await;
 
         let value = kv.get("key1").await;
         assert_eq!(value, Some("value1".to_string()));
@@ -209,7 +216,8 @@ mod tests {
     async fn test_delete() {
         let kv = MockKVStore::new();
 
-        kv.put("key1".to_string(), "value1".to_string(), None, None).await;
+        kv.put("key1".to_string(), "value1".to_string(), None, None)
+            .await;
         assert!(kv.delete("key1").await);
         assert_eq!(kv.get("key1").await, None);
     }
@@ -218,9 +226,12 @@ mod tests {
     async fn test_list_with_prefix() {
         let kv = MockKVStore::new();
 
-        kv.put("app:user:1".to_string(), "data1".to_string(), None, None).await;
-        kv.put("app:user:2".to_string(), "data2".to_string(), None, None).await;
-        kv.put("app:post:1".to_string(), "data3".to_string(), None, None).await;
+        kv.put("app:user:1".to_string(), "data1".to_string(), None, None)
+            .await;
+        kv.put("app:user:2".to_string(), "data2".to_string(), None, None)
+            .await;
+        kv.put("app:post:1".to_string(), "data3".to_string(), None, None)
+            .await;
 
         let result = kv.list(Some("app:user:"), None, None).await;
         assert_eq!(result.keys.len(), 2);
@@ -231,7 +242,8 @@ mod tests {
         let kv = MockKVStore::new();
 
         // TTL of 1 second
-        kv.put("temp".to_string(), "value".to_string(), None, Some(1)).await;
+        kv.put("temp".to_string(), "value".to_string(), None, Some(1))
+            .await;
 
         assert!(kv.get("temp").await.is_some());
 

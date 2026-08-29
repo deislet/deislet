@@ -4,19 +4,19 @@ use deno_runtime::{deno_crypto, deno_fetch, deno_net, deno_web, deno_webidl, den
 use std::sync::Arc;
 
 use super::blob_ops::init_blob_extension;
+use super::bootstrap::init_bootstrap_extension;
 use super::cache_ops::init_cache_extension;
 use super::db_ops::init_db_extension;
-use super::bootstrap::init_bootstrap_extension;
+use super::deno_telemetry_stub::init_deno_telemetry_extension;
 use super::ops::init_ops_extension;
 use super::queue_ops::init_queue_extension;
-use super::telemetry_stub::init_telemetry_extension;
 use super::tls_ops::init_tls_ops_extension;
 use super::ws_server_ops::init_ws_server_extension;
 
 pub fn build_runtime_extensions() -> Vec<Extension> {
     vec![
         init_bootstrap_extension(),
-        init_telemetry_extension(),
+        init_deno_telemetry_extension(),
         deno_webidl::deno_webidl::init(),
         deno_web::deno_web::lazy_init(),
         deno_fetch::deno_fetch::lazy_init(),

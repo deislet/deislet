@@ -416,15 +416,23 @@ id = "deis-runtime-demo-01"
 addr = "http://127.0.0.1:${DEIS_RUNTIME_PORT}"
 EOF
 
+    # No [control] section is written. deis-runtime has no such setting, so the
+    # block this file used to carry was read by nobody while looking like
+    # working configuration. The node does not dial the control plane yet
+    # (architecture principle 8); it is deis-control that reaches the node,
+    # through the [[deis_runtime_nodes]] entry above.
+    #
+    # [logging] is what makes `deis tail` possible: without it the node's app
+    # logs stop at its own stdout and deis-telemetry has nothing to answer a
+    # query with. The flush interval is dropped to a second so a request's logs
+    # are queryable while the person who made it is still looking.
     cat > "$DEIS_RUNTIME_CONFIG" <<EOF
 http_port = ${DEIS_RUNTIME_PORT}
 
-[control]
+[logging]
 enabled = true
-addr = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
-associated_id = "deis-runtime-demo-01"
-secret = "${SECRET}"
-reconnect_interval = 5
+endpoint = "http://127.0.0.1:${DEIS_TELEMETRY_PORT}"
+flush_interval_secs = 1
 EOF
 
     cat > "$DEIS_PROXY_CONFIG" <<EOF
@@ -543,50 +551,92 @@ with zipfile.ZipFile('${APP_ZIP}', 'w') as zf:
   echo "- Telemetry metrics: http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics"
 }
 
+# How long one component may take to drain before it is killed outright.
+#
+# It has to exceed each component's own drain window -- deis-control gives
+# in-flight requests 15s, deis-runtime defaults to 30 -- or a normal, healthy
+# shutdown would end in a SIGKILL every time.
+STOP_GRACE_SECONDS=45
+
+# Block until a process that is not our child has exited.
+#
+# `tail --pid` sleeps on the process itself and returns the moment it is gone,
+# so this waits on the actual event instead of guessing at a duration; it also
+# returns immediately for a pid that has already exited. Returns non-zero if
+# the wait timed out, or if this system has no `tail --pid` to wait with -- in
+# which case the caller reports that it could not confirm the exit rather than
+# claiming one.
+wait_for_exit() {
+  local pid=$1
+  local seconds=$2
+  timeout "$seconds" tail --pid="$pid" -f /dev/null >/dev/null 2>&1
+}
+
+# Ask one component to stop, then wait until it really has.
+#
+# SIGTERM is a request, not an instant stop: every component drains in-flight
+# work first. Returning before the process has gone would leave its port held,
+# so the next `start` would fail to bind against a service the script had just
+# reported as stopped. Returns non-zero if the process is still alive at the
+# end, having said what that costs.
+stop_service() {
+  local name=$1
+  local pid=$2
+
+  if ! pid_running "$pid"; then
+    return 0
+  fi
+
+  echo "🛑 Stopping ${name} (PID: ${pid})"
+  kill "$pid" 2>/dev/null || true
+
+  wait_for_exit "$pid" "$STOP_GRACE_SECONDS" || true
+  if ! pid_running "$pid"; then
+    return 0
+  fi
+
+  echo "⚠️  ${name} did not exit within ${STOP_GRACE_SECONDS}s; killing it. Whatever it was still draining is cut off."
+  kill -9 "$pid" 2>/dev/null || true
+
+  wait_for_exit "$pid" 5 || true
+  if ! pid_running "$pid"; then
+    return 0
+  fi
+
+  echo "❌ ${name} (PID: ${pid}) survived SIGKILL; port ${name} was using stays held"
+  return 1
+}
+
 # SIGTERM, not SIGINT. Bash sets SIGINT to "ignored" for every command it
 # starts asynchronously, and that disposition survives exec, so a service that
 # does not install its own SIGINT handler never sees the signal at all and
 # keeps running with its port held. SIGTERM is not ignored, and deis-store,
 # deis-queue, deis-telemetry and deis-proxy all drain on it.
 #
-# deis-control and deis-runtime have no shutdown handler yet, so for them the
-# default action applies: they stop immediately, without draining.
+# Every component installs its own SIGTERM handler and drains in-flight work,
+# so the signal is a request to finish, not an instant stop. stop_demo waits
+# for each process to actually go away rather than assuming the signal landed.
 stop_demo() {
   load_state
 
-  if pid_running "$DEIS_RUNTIME_PID"; then
-    echo "🛑 Stopping Runtime (PID: $DEIS_RUNTIME_PID)"
-    kill "$DEIS_RUNTIME_PID" || true
-  fi
+  local failed=0
 
-  if pid_running "$DEIS_PROXY_PID"; then
-    echo "🛑 Stopping Proxy (PID: $DEIS_PROXY_PID)"
-    kill "$DEIS_PROXY_PID" || true
-  fi
-
-  if pid_running "$DEIS_CONTROL_PID"; then
-    echo "🛑 Stopping Control (PID: $DEIS_CONTROL_PID)"
-    kill "$DEIS_CONTROL_PID" || true
-  fi
+  stop_service "Runtime" "${DEIS_RUNTIME_PID:-}" || failed=1
+  stop_service "Proxy" "${DEIS_PROXY_PID:-}" || failed=1
+  stop_service "Control" "${DEIS_CONTROL_PID:-}" || failed=1
 
   # The data plane goes last: the components above may still be flushing logs
   # to deis-telemetry or finishing storage calls while they shut down.
-  if pid_running "${DEIS_QUEUE_PID:-}"; then
-    echo "🛑 Stopping Queue (PID: $DEIS_QUEUE_PID)"
-    kill "$DEIS_QUEUE_PID" || true
+  stop_service "Queue" "${DEIS_QUEUE_PID:-}" || failed=1
+  stop_service "Store" "${DEIS_STORE_PID:-}" || failed=1
+  stop_service "Telemetry" "${DEIS_TELEMETRY_PID:-}" || failed=1
+
+  if [ "$failed" -ne 0 ]; then
+    echo "❌ Some components are still running; their ports stay held and the next start will fail to bind"
+    return 1
   fi
 
-  if pid_running "${DEIS_STORE_PID:-}"; then
-    echo "🛑 Stopping Store (PID: $DEIS_STORE_PID)"
-    kill "$DEIS_STORE_PID" || true
-  fi
-
-  if pid_running "${DEIS_TELEMETRY_PID:-}"; then
-    echo "🛑 Stopping Telemetry (PID: $DEIS_TELEMETRY_PID)"
-    kill "$DEIS_TELEMETRY_PID" || true
-  fi
-
-  echo "✅ Stop signals sent; force-kill manually if needed"
+  echo "✅ Demo environment stopped; every component has exited"
 }
 
 status_demo() {

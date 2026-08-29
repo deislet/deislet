@@ -11,10 +11,14 @@
 //! that judgement through here would mean an outage of the observability
 //! component looked like an outage of everything it observes.
 //!
+//! Its own liveness is answered by the standard `grpc.health.v1` service and
+//! nothing else, the same probe deis-store and deis-queue answer. A second,
+//! home-grown health RPC would only add an answer that could disagree.
+//!
 //! Layout:
 //! - [`store`]   SQLite: day-partitioned logs, a metric time series, retention
 //! - [`tail`]    live fan-out to `Tail` subscribers, dropping for slow ones
-//! - [`service`] the gRPC surface
+//! - [`service`] the two gRPC services, `LogService` and `MetricService`
 //! - [`http`]    the Prometheus scrape endpoint on its own port
 //! - [`prom`]    exposition-format rendering
 //! - [`stats`]   this process's own counters
@@ -38,7 +42,6 @@ pub mod proto {
 
     tonic::include_proto!("deis.telemetry");
 }
-
 
 /// Current wall-clock time in microseconds since the Unix epoch.
 ///

@@ -42,7 +42,10 @@ fn map_proto_limits(
         };
 
         let timeout_ms = if limits.timeout_ms < 0 {
-            warn!("ResourceLimits.timeout_ms is negative: {}", limits.timeout_ms);
+            warn!(
+                "ResourceLimits.timeout_ms is negative: {}",
+                limits.timeout_ms
+            );
             None
         } else if limits.timeout_ms > 0 {
             Some(limits.timeout_ms as u64)

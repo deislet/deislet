@@ -1,15 +1,15 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use serde::Deserialize;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use std::sync::Arc;
 
-use crate::command::{CommandExecutor, CommandRequest, CommandType};
 use super::error::ApiError;
+use crate::command::{CommandExecutor, CommandRequest, CommandType};
 
 #[derive(Clone)]
 pub struct CommandsState {
@@ -90,10 +90,7 @@ pub async fn list_node_commands(
     State(state): State<CommandsState>,
     Path(node_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let commands = state
-        .command_executor
-        .list_node_commands(&node_id)
-        .await;
+    let commands = state.command_executor.list_node_commands(&node_id).await;
 
     Ok(Json(json!({
         "success": true,

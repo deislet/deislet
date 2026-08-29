@@ -30,7 +30,8 @@ impl KvClient {
     /// Connect to remote KV Store service
     ///
     /// # Parameters
-    /// - endpoint: gRPC service address (e.g., "http://127.0.0.1:50051")
+    /// - endpoint: deis-store gRPC address (e.g., "http://127.0.0.1:8090",
+    ///   deis-store's default listen address)
     /// - app_id: the tenant every call of this client is charged to
     ///
     /// # Returns
@@ -79,18 +80,38 @@ impl KvClient {
         Ok(get_response.value)
     }
 
-    /// Set value
+    /// Set a value that never lapses and carries no metadata.
     ///
     /// # Parameters
     /// - key: Key
     /// - value: Value
     pub async fn set(&self, key: String, value: String) -> Result<()> {
+        self.set_with_options(key, value, None, None).await
+    }
+
+    /// Set a value, optionally with a lifetime and caller-defined metadata.
+    ///
+    /// # Parameters
+    /// - key: Key
+    /// - value: Value
+    /// - ttl_seconds: lifetime from the moment the store accepts the write;
+    ///   `None` never lapses. The store refuses a non-positive value.
+    /// - metadata: opaque string stored and returned untouched
+    pub async fn set_with_options(
+        &self,
+        key: String,
+        value: String,
+        ttl_seconds: Option<i64>,
+        metadata: Option<String>,
+    ) -> Result<()> {
         let request = self.tenant.stamp(SetRequest {
             key: key.clone(),
             value: value.clone(),
+            ttl_seconds,
+            metadata,
         });
 
-        tracing::debug!("KV Set: {} = {}", key, value);
+        tracing::debug!("KV Set: {} = {} (ttl={:?})", key, value, ttl_seconds);
 
         let mut client = self.client.lock().await;
         let response = client.set(request).await?;
@@ -176,12 +197,18 @@ impl KvClient {
 mod tests {
     use super::*;
 
-    /// Note: These tests require running a deis-control server
-    /// Temporarily marked as #[ignore], to be enabled in integration testing environments
+    /// These tests need a live deis-store; they stay #[ignore] until an
+    /// integration environment provides one.
+    ///
+    /// The address below is a deliberate placeholder, not configuration:
+    /// port 1 is reserved and nothing listens there, so a run that forgets
+    /// the #[ignore] fails as a connection error instead of quietly talking
+    /// to whatever happens to be on a real port. deis-store's actual default
+    /// is 127.0.0.1:8090.
     #[tokio::test]
     #[ignore]
     async fn test_kv_client_connect() {
-        let result = KvClient::connect("http://127.0.0.1:50051", "test_app").await;
+        let result = KvClient::connect("http://127.0.0.1:1", "test_app").await;
         // Should return connection error if service is not running
         // Only testing client code compilation and basic logic here
         assert!(result.is_err() || result.is_ok());
@@ -191,7 +218,7 @@ mod tests {
     #[ignore]
     async fn test_kv_client_operations() {
         // This test requires a real deis-control server
-        let client = KvClient::connect("http://127.0.0.1:50051", "test_app")
+        let client = KvClient::connect("http://127.0.0.1:1", "test_app")
             .await
             .expect("Failed to connect");
 

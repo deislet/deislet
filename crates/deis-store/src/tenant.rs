@@ -16,7 +16,6 @@ use crate::error::StoreError;
 use std::fmt;
 use tonic::Request;
 
-
 /// Longest accepted tenant id. Well under any filesystem name limit even
 /// after the `.sqlite` suffix.
 const MAX_APP_ID_LEN: usize = 64;

@@ -1,0 +1,405 @@
+//! Deployment endpoints.
+//!
+//! A deployment is a pointer row, so every operation here is an insert:
+//! deploying moves an environment forward, rolling back moves it
+//! backwards, and both leave the full history behind them.
+
+use axum::{
+    Json,
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+
+use super::CatalogState;
+use super::versions::VersionView;
+use crate::api::error::{ApiError, ApiResult};
+use crate::catalog::{Deployment, Environment, Version};
+
+/// Default and maximum number of history rows returned at once.
+const DEFAULT_HISTORY_LIMIT: usize = 50;
+const MAX_HISTORY_LIMIT: usize = 500;
+
+#[derive(Debug, Deserialize)]
+pub struct DeployRequest {
+    /// Target version by id. Takes precedence over `version_number`.
+    #[serde(default)]
+    pub version_id: Option<String>,
+    /// Target version by its per-app number, i.e. the "v3" a human says.
+    #[serde(default)]
+    pub version_number: Option<i64>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RollbackRequest {
+    /// Explicit target. When omitted, the previous distinct version this
+    /// environment ran is used.
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub version_number: Option<i64>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeploymentResponse {
+    pub deployment: Deployment,
+    pub environment: String,
+    pub version: VersionView,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeploymentHistoryResponse {
+    pub deployments: Vec<Deployment>,
+    pub total: usize,
+}
+
+/// POST /api/apps/:app_id/environments/:env/deployments
+pub async fn deploy(
+    State(state): State<CatalogState>,
+    Path((app_id, env_name)): Path<(String, String)>,
+    Json(request): Json<DeployRequest>,
+) -> ApiResult<(StatusCode, Json<DeploymentResponse>)> {
+    let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
+    let version = resolve_version(
+        &state,
+        &app_id,
+        request.version_id.as_deref(),
+        request.version_number,
+    )
+    .await?;
+
+    let deployment = state.store.deploy(&env, &version.id, request.note).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(response(&env, deployment, &version)),
+    ))
+}
+
+/// POST /api/apps/:app_id/environments/:env/rollback
+///
+/// Inserts a pointer row aimed at an older version. Nothing is mutated and
+/// nothing is deleted, so the rollback itself is just as reversible.
+pub async fn rollback(
+    State(state): State<CatalogState>,
+    Path((app_id, env_name)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<DeploymentResponse>)> {
+    let request = parse_rollback_body(&body).map_err(|detail| {
+        warn!(
+            app_id = %app_id,
+            environment = %env_name,
+            detail = %detail,
+            "Rollback refused because its body did not parse; nothing moved, so the environment still runs the version it ran before"
+        );
+        ApiError::BadRequest(format!(
+            "rollback body is not a valid rollback request: {detail}; send no body at all to roll back to the previous version"
+        ))
+    })?;
+    let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
+
+    let version =
+        if request.version_id.is_some() || request.version_number.is_some() {
+            resolve_version(
+                &state,
+                &app_id,
+                request.version_id.as_deref(),
+                request.version_number,
+            )
+            .await?
+        } else {
+            let previous = state.store.previous_version(&env.id).await?.ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "environment {env_name} of app {app_id} has no earlier version to roll back to"
+            ))
+        })?;
+            state.store.get_version(&app_id, &previous).await?
+        };
+
+    let note = request
+        .note
+        .unwrap_or_else(|| format!("rollback to version {}", version.number));
+    let deployment = state.store.deploy(&env, &version.id, Some(note)).await?;
+
+    info!(
+        app_id = %app_id,
+        environment = %env_name,
+        version_id = %version.id,
+        number = version.number,
+        "Rollback recorded as a new deployment; the previous pointer stays in the history"
+    );
+    Ok((
+        StatusCode::CREATED,
+        Json(response(&env, deployment, &version)),
+    ))
+}
+
+/// GET /api/apps/:app_id/environments/:env/deployment
+///
+/// The current version of an environment: the newest pointer row.
+pub async fn current_deployment(
+    State(state): State<CatalogState>,
+    Path((app_id, env_name)): Path<(String, String)>,
+) -> ApiResult<Json<DeploymentResponse>> {
+    let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
+    let deployment = state
+        .store
+        .current_deployment(&env.id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "environment {env_name} of app {app_id} has never been deployed"
+            ))
+        })?;
+    let version = state
+        .store
+        .get_version(&app_id, &deployment.version_id)
+        .await?;
+    Ok(Json(response(&env, deployment, &version)))
+}
+
+/// GET /api/apps/:app_id/environments/:env/deployments
+pub async fn list_deployments(
+    State(state): State<CatalogState>,
+    Path((app_id, env_name)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+) -> ApiResult<Json<DeploymentHistoryResponse>> {
+    let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let deployments = state.store.list_deployments(&env.id, limit).await?;
+    Ok(Json(DeploymentHistoryResponse {
+        total: deployments.len(),
+        deployments,
+    }))
+}
+
+/// Read the optional rollback body.
+///
+/// Taken as raw bytes on purpose. `Option<Json<T>>` turns *every* rejection
+/// into `None`, so a typo in the payload would read as "no body given" and
+/// silently roll production back to the previous version. Here an empty
+/// body means exactly that and nothing else; anything that does not parse
+/// is the caller's mistake and is reported as one.
+///
+/// Returns the reason it could not be read, so the caller can both answer
+/// the client and say in the log why a production-changing request was
+/// turned away.
+fn parse_rollback_body(body: &[u8]) -> Result<RollbackRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(RollbackRequest::default());
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    if !value.is_object() {
+        // serde would happily read a JSON array into this struct and fill
+        // every field with its default, which is indistinguishable from an
+        // empty body and would roll the environment back regardless.
+        return Err(format!("expected a JSON object, got {}", json_kind(&value)));
+    }
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
+/// Name the JSON shape a caller sent, for an error message that says what
+/// was wrong rather than only that something was.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+fn response(env: &Environment, deployment: Deployment, version: &Version) -> DeploymentResponse {
+    DeploymentResponse {
+        deployment,
+        environment: env.name.clone(),
+        version: VersionView::from(version),
+    }
+}
+
+/// Accept either form of "which version", and say so plainly when neither
+/// was given.
+async fn resolve_version(
+    state: &CatalogState,
+    app_id: &str,
+    version_id: Option<&str>,
+    version_number: Option<i64>,
+) -> Result<Version, ApiError> {
+    if let Some(version_id) = version_id {
+        return Ok(state.store.get_version(app_id, version_id).await?);
+    }
+    if let Some(number) = version_number {
+        return Ok(state.store.get_version_by_number(app_id, number).await?);
+    }
+    Err(ApiError::BadRequest(
+        "name the version to deploy with either \"version_id\" or \"version_number\"".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{Harness, call, harness, json};
+    use crate::api::catalog::MAX_BUNDLE_BYTES;
+    use crate::catalog::bundle::tests::{bundle_with_manifest, sample_bundle};
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    /// An app with two versions where production currently runs v2, which
+    /// is the only state in which a rollback has an unambiguous target.
+    async fn deployed_twice() -> (Harness, String, String) {
+        let h = harness(true).await;
+        let router = &h.router;
+
+        json(
+            router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let (_, body) = call(
+            router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(sample_bundle("demo")),
+            "application/zip",
+        )
+        .await;
+        let v1 = body["version"]["id"].as_str().unwrap().to_string();
+        let (_, body) = call(
+            router,
+            "POST",
+            "/api/apps/demo/versions",
+            Body::from(bundle_with_manifest(
+                r#"{"schema":1,"app":"demo","entry":"worker/index.js","env":{"LOG_LEVEL":"debug"}}"#,
+                true,
+            )),
+            "application/zip",
+        )
+        .await;
+        let v2 = body["version"]["id"].as_str().unwrap().to_string();
+
+        json(
+            router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+        for version in [&v1, &v2] {
+            let (status, _) = json(
+                router,
+                "POST",
+                "/api/apps/demo/environments/production/deployments",
+                serde_json::json!({"version_id": version}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        (h, v1, v2)
+    }
+
+    async fn current_version(h: &Harness) -> String {
+        let (status, body) = json(
+            &h.router,
+            "GET",
+            "/api/apps/demo/environments/production/deployment",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        body["deployment"]["version_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A body that does not parse must be refused. Treating it as "no body
+    /// given" would roll production back to the previous version without
+    /// anyone asking for that.
+    #[tokio::test]
+    async fn a_malformed_rollback_body_is_rejected() {
+        let (h, _v1, v2) = deployed_twice().await;
+
+        for body in [
+            // Right field, wrong type.
+            r#"{"version_number": "3"}"#,
+            // Not JSON at all.
+            "{oops",
+            // Valid JSON of the wrong shape.
+            "[]",
+        ] {
+            let (status, response) = call(
+                &h.router,
+                "POST",
+                "/api/apps/demo/environments/production/rollback",
+                Body::from(body),
+                "application/json",
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "body {body:?} must be refused, got {response}"
+            );
+            assert_eq!(
+                current_version(&h).await,
+                v2,
+                "a refused rollback must leave the environment where it was"
+            );
+        }
+    }
+
+    /// The other half of the contract: no body at all still means "roll
+    /// back to the previous version".
+    #[tokio::test]
+    async fn an_absent_rollback_body_still_rolls_back_to_the_previous_version() {
+        let (h, v1, _v2) = deployed_twice().await;
+
+        // Empty body with a JSON content type, which is what most clients
+        // send when they pass no payload.
+        let (status, body) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/rollback",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["deployment"]["version_id"], v1);
+
+        // And with no content type header at all.
+        let (h, v1, _v2) = deployed_twice().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/apps/demo/environments/production/rollback")
+            .body(Body::empty())
+            .unwrap();
+        let response = h.router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = to_bytes(response.into_body(), MAX_BUNDLE_BYTES)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["deployment"]["version_id"], v1);
+    }
+}
