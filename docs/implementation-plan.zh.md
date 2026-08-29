@@ -75,7 +75,7 @@ assets/                  # 静态资产，原样保留目录结构
   "services": { "kv": true, "database": true, "blob": false, "queue": true },
   "env": { "LOG_LEVEL": "info" },
   "secrets": ["API_KEY"],
-  "routes": [ { "pattern": "/api/users/:id", "method": "GET" } ],
+  "routes": [ { "pattern": "/api/users/:id", "methods": ["GET"] } ],
   "cron": [ "0 */6 * * *" ],
   "queues": [ { "name": "jobs", "batch_size": 10 } ],
   "assets": [
@@ -88,12 +88,15 @@ assets/                  # 静态资产，原样保留目录结构
 
 - `secrets` 只列名字，值永远不进包。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
-- `routes[].pattern` 用 `:name` 占位，运行时据此填 `context.params`。
+- `routes[].pattern` 用 `:name` 占位，运行时据此填 `context.params`；`methods` 为空数组表示任意方法。字段名与 `management.proto` 的 `RouteRule.pattern` / `RouteRule.methods` 一一对应。
+- **通配捕获尚未实现**：edge-canon 规定 `functions/api/[[catch]].ts` 映射到 `/api/*`，但当前匹配器只支持精确段与 `:name`，这类模式匹配不到任何东西，且唯一症状是 `context.params` 为空。补齐属波次 B。
 - 包的 sha256 就是版本标识的一部分；同样的输入应产出同样的包（构建可复现）。
 
 ---
 
 ## 3. 控制面数据模型
+
+> 代码里这一层叫 **`catalog`**（`CatalogStore` / `api::catalog`）——它是「有哪些应用、各有哪些版本、每个环境指向哪一版」的权威记录。中文里说的「产品模型」指的就是它。
 
 在 `deis-control` 的 SQLite 里新增（现有 nodes / configs / heartbeats / commands / events 保留）：
 
@@ -272,11 +275,20 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 | 编号 | 内容 | 依赖 |
 |---|---|---|
 | B1 | 包格式 + `deis-build` 的 deislet 目标（`Platform::Deislet` + 适配器） | A1 |
-| B2 | 部署下发改造：`ApplyDeployment` + assignments + 节点自取包 | A1、B1 |
+| B2 | 部署下发改造：`ApplyDeployment` + 节点启动主动拉 assignments + 自取包（原则 8 至今未实现，现在是控制面按配置去够节点） | A1、B1 |
 | B3 | 资产优先服务 | B1、B2 |
 | B4 | `context.env` 注入 + 密钥下发 | A1、B2 |
-| B5 | `deis-queue` 新 crate + 运行时消费轮询 | A2 |
-| B6 | cron 重接 | A1、B2 |
+| B5 | `deis-queue` 服务端 + 运行时消费轮询 | A2 |
+| B6 | cron 重接（现在 `CronTask` 挂 `node_id`，挂错了对象） | A1、B2 |
+| B7 | 存储绑定接通：运行时至今**从未构造过** KV/DB/Blob/Queue 客户端，`ctx.kv` / `ctx.db` / `ctx.blob` / `ctx.queue` 一律返回「service not available」。deis-store 地址由控制面下发 | A2、B2 |
+
+波次 A 收尾时新发现、归入 B 的：
+
+- **通配捕获**：edge-canon 规定 `/api/*`，匹配器只支持 `:name`（并入 B1）
+- **KV 的 metadata 只能写不能读**：`GetResponse` 只有 value、`ListResponse` 只有 keys；`ctx.kv.put` 也还没把 `expirationTtl` / `metadata` 传下去（并入 B7）
+- **运行时一条指标都不上报**：shipper 只接了 `LogService`，同一份 proto 的 `MetricService` 无人使用（并入 B7）
+- **Blob 下行没有空闲保护**：客户端拉一半不读，服务端发送任务卡在满通道上占着文件描述符，有内存上限没有时间上限。deis-queue 的 `Pull`、telemetry 的 `Tail` 大概率同形（并入 B5）
+- **控制面另外 28 个数据库方法**仍在异步线程上跑 rusqlite 并跨 await 持锁，与已修的那处同源
 
 ### 波次 C
 

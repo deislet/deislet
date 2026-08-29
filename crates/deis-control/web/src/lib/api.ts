@@ -1,10 +1,10 @@
 /**
  * Control API Client
  *
- * 统一的 API 请求封装，支持：
- * - Bearer Token 认证
- * - 自动 401 处理
- * - 错误处理
+ * Single entry point for every dashboard API call. It provides:
+ * - bearer token authentication
+ * - automatic handling of a 401 by clearing the key and returning to login
+ * - uniform error handling
  */
 
 const API_BASE = import.meta.env.VITE_API_BASE || "";
@@ -21,28 +21,28 @@ export class ApiError extends Error {
 
 export const api = {
   /**
-   * 获取存储的 API Key
+   * Read the stored API key.
    */
   getToken: (): string | null => {
     return localStorage.getItem("apiKey");
   },
 
   /**
-   * 设置 API Key
+   * Store the API key.
    */
   setToken: (token: string): void => {
     localStorage.setItem("apiKey", token);
   },
 
   /**
-   * 移除 API Key
+   * Forget the stored API key.
    */
   removeToken: (): void => {
     localStorage.removeItem("apiKey");
   },
 
   /**
-   * 统一的 HTTP 请求方法
+   * The one place an HTTP request is issued.
    */
   request: async <T = any>(
     endpoint: string,
@@ -64,25 +64,25 @@ export const api = {
         headers,
       });
 
-      // 401 未认证 - 自动跳转登录
+      // Unauthenticated: drop the stale key and send the user back to login
       if (res.status === 401) {
         api.removeToken();
         window.location.href = "/";
         throw new ApiError(401, "Unauthorized");
       }
 
-      // HTTP 错误
+      // Any other non-2xx
       if (!res.ok) {
         const errorText = await res.text();
         throw new ApiError(res.status, errorText || res.statusText);
       }
 
-      // 204 无内容
+      // No content
       if (res.status === 204) {
         return null as T;
       }
 
-      // 解析响应
+      // Parse the body
       const contentType = res.headers.get("content-type");
       if (contentType && contentType.includes("application/json")) {
         return await res.json();
@@ -100,17 +100,17 @@ export const api = {
   // ==================== Nodes API ====================
 
   /**
-   * 获取所有 nodes
+   * List every registered node.
    */
   getNodes: () => api.request<NodeSummary[]>("/api/nodes"),
 
   /**
-   * 获取单个 node 详情
+   * Fetch one node.
    */
   getNode: (id: string) => api.request<NodeSummary>(`/api/nodes/${id}`),
 
   /**
-   * 获取 node 心跳历史
+   * Fetch a node's heartbeat history.
    */
   getNodeHeartbeats: (id: string, limit = 100) =>
     api.request<Heartbeat[]>(`/api/nodes/${id}/heartbeats?limit=${limit}`),
@@ -118,23 +118,23 @@ export const api = {
   // ==================== Configs API ====================
 
   /**
-   * 获取所有配置
+   * List every configuration.
    */
   getConfigs: () => api.request<{ [nodeId: string]: { [key: string]: any } }>("/api/configs"),
 
   /**
-   * 获取配置统计
+   * Configuration counts.
    */
   getConfigStats: () => api.request<ConfigStats>("/api/configs/stats"),
 
   /**
-   * 获取 node 配置
+   * Fetch one node's configuration.
    */
   getNodeConfig: (nodeId: string) =>
     api.request<{ [key: string]: any }>(`/api/configs/${nodeId}`),
 
   /**
-   * 更新 node 配置
+   * Update one node's configuration.
    */
   updateNodeConfig: (nodeId: string, configs: { [key: string]: any }) =>
     api.request(`/api/configs/${nodeId}`, {
@@ -143,31 +143,31 @@ export const api = {
     }),
 
   /**
-   * 删除 node 配置
+   * Delete a node's whole configuration.
    */
   deleteNodeConfig: (nodeId: string) =>
     api.request(`/api/configs/${nodeId}`, { method: "DELETE" }),
 
   /**
-   * 删除单个配置项
+   * Delete a single configuration key.
    */
   deleteConfigKey: (nodeId: string, key: string) =>
     api.request(`/api/configs/${nodeId}/${key}`, { method: "DELETE" }),
 
   /**
-   * 获取配置历史
+   * Configuration change history.
    */
   getConfigHistory: (nodeId: string, limit = 100) =>
     api.request<ConfigHistory[]>(`/api/configs/${nodeId}/history?limit=${limit}`),
 
   /**
-   * 获取配置键历史
+   * Change history for one configuration key.
    */
   getConfigKeyHistory: (nodeId: string, key: string, limit = 50) =>
     api.request<ConfigHistory[]>(`/api/configs/${nodeId}/${key}/history?limit=${limit}`),
 
   /**
-   * 回滚配置
+   * Roll a configuration back to an earlier version.
    */
   rollbackConfig: (nodeId: string, key: string, versionTimestamp: string) =>
     api.request(`/api/configs/${nodeId}/${key}/rollback`, {
@@ -176,7 +176,7 @@ export const api = {
     }),
 
   /**
-   * 推送配置到 node
+   * Push a configuration to a node.
    */
   pushConfig: (nodeId: string, key?: string) => {
     const endpoint = key
@@ -188,24 +188,24 @@ export const api = {
   // ==================== Commands API ====================
 
   /**
-   * 获取所有命令
+   * List every command.
    */
   getCommands: () => api.request<Command[]>("/api/commands"),
 
   /**
-   * 获取 node 的命令
+   * List the commands issued to one node.
    */
   getNodeCommands: (nodeId: string) =>
     api.request<Command[]>(`/api/commands/node/${nodeId}`),
 
   /**
-   * 获取命令状态
+   * Fetch a command's status.
    */
   getCommandStatus: (commandId: string) =>
     api.request<Command>(`/api/commands/status/${commandId}`),
 
   /**
-   * 执行命令
+   * Issue a command.
    */
   executeCommand: (nodeId: string, command: ExecuteCommandRequest) =>
     api.request<{ command_id: string }>(`/api/commands/execute/${nodeId}`, {
@@ -214,7 +214,7 @@ export const api = {
     }),
 
   /**
-   * 取消命令
+   * Cancel a command.
    */
   cancelCommand: (commandId: string) =>
     api.request(`/api/commands/cancel/${commandId}`, { method: "POST" }),
@@ -222,7 +222,7 @@ export const api = {
   // ==================== Events API ====================
 
   /**
-   * 获取事件列表
+   * List events.
    */
   getEvents: (params?: EventsParams) => {
     const query = new URLSearchParams();
@@ -236,19 +236,19 @@ export const api = {
   },
 
   /**
-   * 获取事件统计
+   * Event counts.
    */
   getEventStats: () => api.request<EventStats>("/api/events/stats"),
 
   // ==================== Metrics API ====================
 
   /**
-   * 获取指标摘要
+   * Metrics summary.
    */
   getMetricsSummary: () => api.request<MetricsSummary>("/api/metrics/summary"),
 };
 
-// ==================== 类型定义 ====================
+// ==================== Types ====================
 
 export interface NodeSummary {
   id: string;

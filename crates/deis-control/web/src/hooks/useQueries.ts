@@ -1,7 +1,7 @@
 /**
  * React Query Hooks for Control API
  *
- * 提供统一的数据获取和缓存管理
+ * Query hooks: one place for fetching and cache invalidation.
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -15,7 +15,7 @@ export function useNodes() {
   return useQuery({
     queryKey: ["nodes"],
     queryFn: () => api.getNodes(),
-    refetchInterval: 5000, // 每 5 秒刷新
+    refetchInterval: 5000, // refresh every 5s
   });
 }
 
@@ -67,12 +67,12 @@ export function useUpdateNodeConfig() {
     mutationFn: ({ nodeId, configs }: { nodeId: string; configs: any }) =>
       api.updateNodeConfig(nodeId, configs),
     onSuccess: (_, variables) => {
-      toast.success("配置已更新");
+      toast.success("Configuration updated");
       queryClient.invalidateQueries({ queryKey: ["configs"] });
       queryClient.invalidateQueries({ queryKey: ["configs", variables.nodeId] });
     },
     onError: (error: any) => {
-      toast.error(`配置更新失败: ${error.message}`);
+      toast.error(`Configuration update failed: ${error.message}`);
     },
   });
 }
@@ -83,11 +83,11 @@ export function useDeleteNodeConfig() {
   return useMutation({
     mutationFn: (nodeId: string) => api.deleteNodeConfig(nodeId),
     onSuccess: () => {
-      toast.success("配置已删除");
+      toast.success("Configuration deleted");
       queryClient.invalidateQueries({ queryKey: ["configs"] });
     },
     onError: (error: any) => {
-      toast.error(`删除失败: ${error.message}`);
+      toast.error(`Delete failed: ${error.message}`);
     },
   });
 }
@@ -99,12 +99,12 @@ export function useDeleteConfigKey() {
     mutationFn: ({ nodeId, key }: { nodeId: string; key: string }) =>
       api.deleteConfigKey(nodeId, key),
     onSuccess: (_, variables) => {
-      toast.success("配置项已删除");
+      toast.success("Configuration key deleted");
       queryClient.invalidateQueries({ queryKey: ["configs"] });
       queryClient.invalidateQueries({ queryKey: ["configs", variables.nodeId] });
     },
     onError: (error: any) => {
-      toast.error(`删除失败: ${error.message}`);
+      toast.error(`Delete failed: ${error.message}`);
     },
   });
 }
@@ -139,13 +139,13 @@ export function useRollbackConfig() {
       versionTimestamp: string;
     }) => api.rollbackConfig(nodeId, key, versionTimestamp),
     onSuccess: (_, variables) => {
-      toast.success("配置已回滚");
+      toast.success("Configuration rolled back");
       queryClient.invalidateQueries({ queryKey: ["configs"] });
       queryClient.invalidateQueries({ queryKey: ["configs", variables.nodeId] });
       queryClient.invalidateQueries({ queryKey: ["configs", variables.nodeId, "history"] });
     },
     onError: (error: any) => {
-      toast.error(`回滚失败: ${error.message}`);
+      toast.error(`Rollback failed: ${error.message}`);
     },
   });
 }
@@ -155,10 +155,10 @@ export function usePushConfig() {
     mutationFn: ({ nodeId, key }: { nodeId: string; key?: string }) =>
       api.pushConfig(nodeId, key),
     onSuccess: () => {
-      toast.success("配置已推送到 Node");
+      toast.success("Configuration pushed to node");
     },
     onError: (error: any) => {
-      toast.error(`推送失败: ${error.message}`);
+      toast.error(`Push failed: ${error.message}`);
     },
   });
 }
@@ -187,7 +187,7 @@ export function useCommandStatus(commandId: string) {
     queryKey: ["commands", "status", commandId],
     queryFn: () => api.getCommandStatus(commandId),
     enabled: !!commandId,
-    refetchInterval: 1000, // 命令执行时频繁刷新
+    refetchInterval: 1000, // poll faster while a command is running
   });
 }
 
@@ -198,11 +198,11 @@ export function useExecuteCommand() {
     mutationFn: ({ nodeId, command }: { nodeId: string; command: ExecuteCommandRequest }) =>
       api.executeCommand(nodeId, command),
     onSuccess: () => {
-      toast.success("命令已发送");
+      toast.success("Command sent");
       queryClient.invalidateQueries({ queryKey: ["commands"] });
     },
     onError: (error: any) => {
-      toast.error(`命令执行失败: ${error.message}`);
+      toast.error(`Command failed: ${error.message}`);
     },
   });
 }
@@ -213,11 +213,11 @@ export function useCancelCommand() {
   return useMutation({
     mutationFn: (commandId: string) => api.cancelCommand(commandId),
     onSuccess: () => {
-      toast.success("命令已取消");
+      toast.success("Command cancelled");
       queryClient.invalidateQueries({ queryKey: ["commands"] });
     },
     onError: (error: any) => {
-      toast.error(`取消失败: ${error.message}`);
+      toast.error(`Cancel failed: ${error.message}`);
     },
   });
 }
@@ -250,6 +250,6 @@ export function useMetricsSummary() {
   return useQuery({
     queryKey: ["metrics", "summary"],
     queryFn: () => api.getMetricsSummary(),
-    refetchInterval: 2000, // 每 2 秒刷新
+    refetchInterval: 2000, // refresh every 2s
   });
 }

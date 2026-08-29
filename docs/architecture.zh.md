@@ -352,31 +352,49 @@ sequenceDiagram
 
 ---
 
-## 6. deis-store：存储组件
+## 6. deis-store 与 deis-queue：存储与队列
 
-新 crate（`crates/deis-store`），四套 gRPC 服务。proto 复用 deis-runtime 现有的 `storage.proto`、`blob.proto`、`queue.proto`——客户端已经写好，接口基本不用重新设计。
+两个独立组件（`crates/deis-store`、`crates/deis-queue`）。队列**没有**放进存储里——队列不是存储，它的语义（租约、重投、死信）与键值/对象读写完全不同，混在一个组件里名不副实。
 
-| 服务 | 底层 | 隔离 | proto 改动 |
+| 组件 | 服务 | 底层 | proto |
 |---|---|---|---|
-| **KV** | SQLite 表（key, value, metadata, expires_at） | namespace | 无 |
-| **DB** | 每 namespace 一个独立 SQLite 文件 | 文件级 | 无 |
-| **Blob** | 本地磁盘 `<数据目录>/<namespace>/<key>`，元数据进 SQLite | 目录级 | **Get/Put 改流式** |
-| **Queue** | SQLite 表做持久队列 | namespace | **补 Receive / Ack / Nack** |
+| **deis-store** | KV | SQLite 表（app_id, key, value, metadata, expires_at） | `storage.proto`，已补 `ttl_seconds` / `metadata` |
+| | Database | 每 app 一个独立 SQLite 文件 | `storage.proto`，无改动 |
+| | Blob | 内容寻址落盘 + SQLite 元数据 | `blob.proto`，Get/Put 已改流式 |
+| **deis-queue** | Queue | SQLite 表做持久队列 | `queue.proto`，待补 `Pull` / `Ack` / `Nack` |
+
+### 租户维度只有 app_id
+
+两个组件都只认 `app_id` 一个维度，**不认版本、环境、部署**。这些概念只存在于控制面和运行时。app_id 走带外的 `x-deis-app-id` 头传递（gRPC metadata），与 deis-proxy 在 HTTP 数据面已经在用的是同一个头，所以现有 proto 消息不需要加租户字段。
 
 ### 队列语义
 
-现在 `queue.proto` 只有 `Send` 和 `SendBatch`，**没有任何消费接口**。补齐后的语义：
+`queue.proto` 现在只有 `Send` 和 `SendBatch`，**没有任何消费接口**。补齐后的语义：
 
-- **拉模式**：deis-runtime 定期 `Receive(queue, max, lease_secs)`，deis-store 把消息标记为「租约中」并返回。
-- **租约**：租约期内其他节点看不到这条消息。超时未 Ack 则重新可见。全量复制下多个 deis-runtime 拉同一队列，靠这个防重复消费。
-- **至少一次**：Ack 之前的崩溃会导致重投。应用侧需要幂等。
+- **拉模式**：deis-runtime 定期 `Pull(queue, max, lease_secs)`，deis-queue 把消息标记为「租约中」并返回。
+- **租约**：租约期内其他节点看不到这条消息。超时未 Ack 则重新可见。全量复制下多个节点拉同一队列，靠这个防重复消费。
+- **至少一次**：Ack 之前的崩溃会导致重投，应用侧需要幂等。
 - **死信**：重试超过 N 次（默认 5）进死信队列，不再投递，留待人工处理。
+
+不做成 deis-queue 主动推给节点——那需要队列知道哪个节点跑哪个应用，会破坏「哑服务」这条边界。
+
+### 授权：现阶段靠网络收敛，不是靠校验
+
+**现状与早前的设想相反，这里写清楚**：deis-store 目前**无条件相信** `x-deis-app-id` 头，没有授权表。能连上端口的任何东西都能读写删任意应用的数据。收敛手段是网络层——默认只监听回环地址，绑定非回环地址时启动会打 warn 说明后果。
+
+这对「自己/团队内部用」是相称的：只有同机的 deis-runtime 需要连它。要把它暴露到本机之外，**必须先有**这几样，缺一不可：
+
+1. 每个调用方的身份（mTLS 客户端证书，或控制面签发的令牌）
+2. 身份与所声明 app_id 的核对
+3. 拒绝要有可追查的日志
+4. 健康端点同等对待——否则它成了免鉴权的存活探针
+
+授权表列为未来工作，不在当前波次。
 
 ### 其他取舍
 
-- **先单机**。SQLite + 本地盘对内部使用够用。接口层不暴露单机假设，以后换后端不动 proto。
-- **授权由 deis-store 自己校验**，不信任调用方。调用带 app_id + environment + binding 名，deis-store 查授权表。否则拿到地址就能读所有数据。
-- **不做跨节点复制**。deis-store 单实例，是全量复制模型下唯一的有状态点，也是单点。内部使用先接受，需配定期快照备份。
+- **先单机**。SQLite + 本地盘对内部规模够用。接口层不暴露单机假设，以后换后端不动 proto。
+- **不做跨节点复制**。deis-store 是全量复制模型下唯一的有状态点，也是单点。内部使用先接受，但**目前连快照备份机制都还没有**：数据目录里同时有 `kv.sqlite`、`blob.sqlite`、`db/<app_id>.sqlite` 和内容树，SQLite 开着 WAL，直接 `cp` 目录不安全。这是已知缺口。
 - **地址由 deis-control 下发**给 deis-runtime，不写死在 deis-runtime 配置里。
 
 ---

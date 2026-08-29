@@ -82,7 +82,8 @@ export function useNodes() {
 
   const fetchNodes = useCallback(async () => {
     try {
-      // 只在初始加载时显示 loading
+      // Only show the loading state on the first fetch, so background refreshes
+      // do not blank out data the user is already reading
       if (initialLoadRef.current) {
         setLoading(true)
       }

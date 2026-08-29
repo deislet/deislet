@@ -90,10 +90,10 @@ fn map_proto_config(config: Option<super::proto::AppConfig>) -> InternalAppConfi
                     if !route.methods.is_empty() {
                         warn!(
                             "Route methods are ignored in current runtime: path={}, methods={:?}",
-                            route.path, route.methods
+                            route.pattern, route.methods
                         );
                     }
-                    routes.push(route.path);
+                    routes.push(route.pattern);
                 }
                 internal.routes = routes;
             }

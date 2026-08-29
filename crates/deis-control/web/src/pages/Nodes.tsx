@@ -58,7 +58,8 @@ export function Nodes() {
         description: `Node ${nodeToRestart.type} is restarting. Command ID: ${result.command_id}`,
       })
 
-      // 延迟一下再刷新，给 node 时间处理
+      // Give the node a moment to act on the restart before refetching,
+      // otherwise the list still shows the pre-restart state
       setTimeout(() => {
         refetch()
         setRestartingNode(null)
