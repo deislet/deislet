@@ -138,3 +138,22 @@ cache_control = "public, max-age=0, must-revalidate"
 # one does not reopen the zip. A version above it is refused and whatever is
 # already running stays up.
 max_bytes = 134217728
+
+# Where an application's outbound fetch() may go.
+#
+# Deny by default: an application may reach public internet destinations and
+# nothing else. Loopback, the private ranges, link-local (the cloud metadata
+# service), unique-local IPv6, multicast and the reserved ranges are all
+# refused, and the check is on the address a name resolves to, not on the name.
+# Without that, an application could POST to this node's own deis-store with
+# any tenant header it liked and read every other application's data.
+[fetch]
+# Non-public destinations applications on this node may nevertheless reach,
+# written as "host", "host:port" or a whole URL. An entry with no port covers
+# every port on that host. Empty, the default, means public destinations only.
+#
+# This cannot be widened into the platform's own services: deis-store,
+# deis-queue, deis-control and deis-telemetry are refused after this list has
+# been consulted, so an entry that happens to cover one of them still does not
+# reach it.
+allow = []

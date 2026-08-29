@@ -36,7 +36,12 @@ pub enum RuntimeMessage {
         app_id: String,
         code: String,
         app_repo: Option<Arc<AppRepo>>,
-        spec: IsolateSpec,
+        /// Boxed because this is by far the largest thing any of these
+        /// variants carries, and every message sent down a thread's channel is
+        /// as big as the biggest variant. One indirection on the load path,
+        /// which happens once per deployment, keeps every request message
+        /// small.
+        spec: Box<IsolateSpec>,
         /// Which storage services this app declared and where they live.
         wiring: ServiceWiring,
         response: oneshot::Sender<Result<()>>,
@@ -223,7 +228,7 @@ impl RuntimeThread {
                         );
                     }
                     let result =
-                        match AppRuntime::new(app_id.clone(), code, app_repo, spec, &wiring) {
+                        match AppRuntime::new(app_id.clone(), code, app_repo, *spec, &wiring) {
                             Ok(mut runtime) => match runtime.init_module().await {
                                 Ok(()) => {
                                     hosted = Some(HostedApp {
@@ -788,7 +793,7 @@ impl RuntimePool {
             app_id: tenant.clone(),
             code,
             app_repo: self.app_repo.clone(),
-            spec,
+            spec: Box::new(spec),
             wiring: wiring.clone(),
             response: tx,
         });

@@ -249,8 +249,19 @@ message UnloadAppResponse {
 // Update app request
 message UpdateAppRequest {
     string app_id = 1;
-    // Application ZIP package data
-    bytes package_data = 2;
+    // Field 2 was `bytes package_data`: a whole application archive carried
+    // inside one gRPC message. That shape is gone from this platform - it is
+    // what `DeployApp` was deleted for. A version is uploaded to the control
+    // plane, which points a node at it (`ApplyDeployment`); the node fetches
+    // the bundle over HTTP and verifies its digest, so no archive ever travels
+    // in a message and a node never installs bytes it was handed.
+    //
+    // Keeping the field would have kept the shape available: a `bytes` field
+    // on a request is an invitation, and the message ceiling
+    // (`deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES`) is the only thing
+    // that would have said no.
+    reserved 2;
+    reserved "package_data";
     // Application config (optional; overrides the config in the manifest)
     AppConfig config = 3;
 }

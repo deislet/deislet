@@ -89,12 +89,21 @@ keep serving.
   on its own OS thread.
 - **Handler shape**: `export default function handler(context)`. The legacy
   Cloudflare `fetch(request, env, ctx)` signature is not accepted.
-- **Not** Edge Canon compliant, and not WinterCG compatible. `context`,
-  routing, assets, KV, SQL, blob, queue, cron and the Cache API are all there,
-  but most Web API globals — `fetch` among them — are absent from the isolate's
-  `globalThis`. The verified list is in [README.md](README.md); the accounting
-  against the canon's matrix is section 12 of
-  [`docs/architecture.zh.md`](../../docs/architecture.zh.md).
+- **Web globals**: `context`, routing, assets, KV, SQL, blob, queue, cron and
+  the Cache API are all there, and so is every global SPECIFICATION_BASIC.md
+  section 8.1 requires — `fetch`, `crypto`, the stream types and the timers
+  included. They are bound onto `globalThis` by `src/runtime/js/bootstrap.js`,
+  because registering a Deno extension does not install a global. A handful of
+  names a handler ported from another platform might reach for are still
+  absent; the verified list, asserted in both directions by a test, is in
+  [README.md](README.md), and the accounting against the canon's matrix is
+  section 12 of [`docs/architecture.zh.md`](../../docs/architecture.zh.md).
+- **Outbound `fetch` is policed**: deny by default, allow public destinations,
+  judge the resolved address rather than the hostname, and refuse this
+  platform's own service endpoints whatever the operator's allowlist says.
+  Without that, an application could reach deis-store on loopback and read
+  every other application's data, because deis-store believes the tenant header
+  it is handed. See `src/runtime/fetch_policy.rs`.
 - **Sandboxing**:
     - V8 heap ceiling per isolate, when the application sets one.
     - Wall-clock timeout and an op-dispatch rate limit; there is no CPU time

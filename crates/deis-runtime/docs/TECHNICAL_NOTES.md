@@ -261,7 +261,7 @@ app2-instance-1 → thread 3
 
 - 📈 **监控和指标**: Prometheus metrics, tracing
 - 🗄️ **持久化存储**: KV 后端支持 (Redis, PostgreSQL)
-- 🌐 **更多 Web APIs**: fetch, crypto, WebSocket
+- 🌐 **更多 Web APIs**: 客户端 `WebSocket`、`Blob`/`FormData`、`URLPattern`（`fetch`、`crypto`、几个流和定时器已经有了，见 README 的全局作用域一节）
 - 🔐 **认证授权**: API key, JWT, OAuth2
 - 📦 **WebAssembly**: WASM 模块支持
 - 🚀 **边缘部署**: 多地域部署和同步

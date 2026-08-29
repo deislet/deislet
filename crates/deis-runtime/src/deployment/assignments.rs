@@ -294,6 +294,92 @@ pub struct SyncOutcome {
     pub removal_pending: usize,
 }
 
+impl SyncOutcome {
+    /// How many environments this node is serving when the pass ends.
+    ///
+    /// This is the number the node publishes as its own health
+    /// ([`crate::health::NodeHealth::mark_ready`]), so it has to be a count
+    /// of what is *running*, not of what this pass happened to touch. Every
+    /// category below leaves an environment serving:
+    ///
+    /// * `installed` and `unchanged` - the ordinary two.
+    /// * `superseded` - the pass left the environment alone because this node
+    ///   changed it after the list was asked for. It is serving; it is
+    ///   serving the newer thing. Counting only the first two reported a node
+    ///   that took a push mid-pass as running fewer applications than it does,
+    ///   and a node that took a push for *every* environment as running none.
+    /// * `removal_pending` - absent from one complete list, which is not yet
+    ///   enough to stop anything. Still serving, by design.
+    /// * `unload_failed` - it should have stopped and did not. Still serving,
+    ///   which is exactly why the pass reports the node degraded.
+    ///
+    /// `failed` is deliberately not here: a version that would not load
+    /// leaves either nothing running or the previous version running, and
+    /// this outcome cannot tell which. `unloaded` is not here either - those
+    /// are stopped.
+    pub fn serving(&self) -> usize {
+        self.installed
+            + self.unchanged
+            + self.superseded
+            + self.removal_pending
+            + self.unload_failed
+    }
+}
+
+#[cfg(test)]
+mod serving_test {
+    use super::SyncOutcome;
+
+    /// The count the node publishes is a count of running environments.
+    ///
+    /// Every field asserted here was, at some point, a way for a node to
+    /// under-report itself: a push that landed mid-pass, an absence seen once,
+    /// or an unload that failed all leave an application serving requests
+    /// while the pass that saw them counted it as nothing.
+    #[test]
+    fn every_environment_still_serving_is_counted() {
+        let outcome = SyncOutcome {
+            assigned: 4,
+            installed: 1,
+            unchanged: 1,
+            superseded: 1,
+            removal_pending: 1,
+            unload_failed: 1,
+            ..Default::default()
+        };
+        assert_eq!(outcome.serving(), 5);
+    }
+
+    /// A pass in which every assignment was superseded by a push is not a
+    /// node running nothing.
+    #[test]
+    fn a_pass_that_only_superseded_still_reports_what_it_runs() {
+        let outcome = SyncOutcome {
+            assigned: 3,
+            superseded: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            outcome.serving(),
+            3,
+            "the list was the older instruction for all three; the node is serving all three"
+        );
+    }
+
+    /// What has stopped, or may never have started, is not counted.
+    #[test]
+    fn stopped_and_failed_environments_are_not_counted() {
+        let outcome = SyncOutcome {
+            assigned: 2,
+            installed: 1,
+            failed: 1,
+            unloaded: 3,
+            ..Default::default()
+        };
+        assert_eq!(outcome.serving(), 1);
+    }
+}
+
 /// Keeps this node running what the control plane says it should, one pass at
 /// a time.
 ///
@@ -745,7 +831,7 @@ pub async fn run_control_loop(
 
         match reconciler.once().await {
             Ok(outcome) => {
-                let serving = outcome.installed + outcome.unchanged;
+                let serving = outcome.serving();
                 if outcome.failed > 0 || outcome.unload_failed > 0 {
                     // The control plane answered, so the node is not cut off;
                     // but it is not running exactly what it was told to.

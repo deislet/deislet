@@ -2,6 +2,7 @@
 
 use super::bindings::{AppServices, ServiceWiring};
 use super::cache_ops::{create_cache_store, CacheStore};
+use super::fetch_policy::FetchPolicy;
 use super::loader::DbModuleLoader;
 use super::metrics::{recorder, MetricsRegistry, RequestOutcome};
 use super::ops::{AppId, EnvStore, ResponseStore};
@@ -135,6 +136,16 @@ pub struct IsolateSpec {
     /// Effective execution limits: the app's own overrides where it set any,
     /// the platform defaults otherwise.
     pub limits: ExecutionLimits,
+
+    /// Where this isolate's `fetch()` may go. The node's own policy: the
+    /// operator's allowlist plus the platform endpoints this node knows about.
+    /// `AppRuntime::new` adds the service addresses this particular deployment
+    /// was wired to.
+    ///
+    /// The default is the tightest one -- public destinations only, no
+    /// allowlist -- so an isolate built by a path that forgets to set it is
+    /// closed rather than open.
+    pub fetch_policy: FetchPolicy,
 }
 
 pub struct AppRuntime {
@@ -193,11 +204,25 @@ impl AppRuntime {
             resource_table_max,
             route_patterns,
             limits,
+            fetch_policy,
         } = spec;
         let ExecutionLimits {
             timeout_ms,
             rate_limit_ops_per_sec,
         } = limits;
+
+        // The node's own configuration knows where deis-control and
+        // deis-telemetry are; where deis-store and deis-queue are arrives per
+        // deployment, in this app's wiring, so it can only be added now. An
+        // app that declared no services still gets the node-wide half.
+        let fetch_policy = fetch_policy.with_platform_endpoints(
+            wiring
+                .endpoints
+                .store
+                .iter()
+                .chain(wiring.endpoints.queue.iter()),
+            &app_id,
+        );
 
         let mut create_params = deno_core::v8::CreateParams::default();
         if let Some(mb) = memory_limit_mb {
@@ -316,32 +341,74 @@ impl AppRuntime {
                 sys,
             ));
 
+            // deno reads these lists the opposite way round from how they
+            // look. `Some(list)` grants exactly that list, `Some(vec![])`
+            // grants everything (it is what a bare `--allow-net` means), and
+            // `None` grants nothing at all.
+            //
+            // `allow_net` therefore has to be `Some(vec![])` for an
+            // application that names no hosts, which is every application
+            // that says nothing about permissions. Mapped to `None`, as it
+            // was, deno refuses every outbound call inside `op_fetch` before
+            // this crate's own `FetchPolicy` is ever consulted -- and the
+            // refusal reads "Requires net access to \"host:port\", run again
+            // with the --allow-net flag", which names a command-line flag this
+            // platform does not have and an operator cannot set. It was
+            // invisible only because nothing could call `fetch`.
+            //
+            // Where an application may go is decided by `FetchPolicy`; an
+            // application that *does* list hosts is narrowing itself further
+            // on top of that, and then both have to agree.
+            let allow_net = if permissions_config.allow_net.is_empty()
+                || permissions_config.allow_net.contains(&"*".to_string())
+            {
+                Some(Vec::new())
+            } else {
+                Some(permissions_config.allow_net)
+            };
+
+            // `allow_env` stays deny-by-default deliberately: nothing in this
+            // runtime serves `Deno.env`, which is what that permission gates.
+            // An application's variables arrive through `op_get_env`, which is
+            // this crate's own op and is scoped to the application by
+            // construction.
+            let allow_env = if permissions_config.allow_env.is_empty()
+                || permissions_config.allow_env.contains(&"*".to_string())
+            {
+                None
+            } else {
+                Some(permissions_config.allow_env)
+            };
+
+            // The redirect backstop. `fetch` follows redirects by default and
+            // deno re-enters `op_fetch` for each hop, so a `Location:` header
+            // pointing at `http://127.0.0.1:8090/` never passes the pre-flight
+            // guard -- it is a destination the application never named. deno
+            // checks this list on every hop, which is where that one is
+            // refused. See `super::fetch_policy` on redirects.
+            let deny_net = fetch_policy.denied_net_ranges(&app_id);
+
             let permission_opts = deno_permissions::PermissionsOptions {
-                allow_env: if permissions_config.allow_env.is_empty()
-                    || permissions_config.allow_env.contains(&"*".to_string())
-                {
-                    None
-                } else {
-                    Some(permissions_config.allow_env)
-                },
-                allow_net: if permissions_config.allow_net.is_empty()
-                    || permissions_config.allow_net.contains(&"*".to_string())
-                {
-                    None
-                } else {
-                    Some(permissions_config.allow_net)
-                },
+                allow_env,
+                allow_net,
+                deny_net: Some(deny_net),
                 ..Default::default()
             };
 
+            // A descriptor this crate generated that deno cannot parse would
+            // be a bug here, not a bad application; failing the load says so,
+            // where the `unwrap()` this replaced took the whole node down with
+            // a panic on a runtime thread.
             let permissions =
                 deno_permissions::Permissions::from_options(parser.as_ref(), &permission_opts)
-                    .unwrap();
+                    .map_err(|e| {
+                        anyhow::anyhow!("building the net permissions of {app_id}: {e}")
+                    })?;
 
             let permissions_container =
                 deno_permissions::PermissionsContainer::new(parser.clone(), permissions);
 
-            init_lazy_extensions(&mut runtime)?;
+            init_lazy_extensions(&mut runtime, &fetch_policy, &app_id)?;
 
             let op_state = runtime.op_state();
             let mut state = op_state.borrow_mut();
@@ -351,6 +418,11 @@ impl AppRuntime {
 
             let env_store: EnvStore = Rc::new(RefCell::new(env));
             state.put(env_store);
+
+            // The same policy the HTTP client's resolver was built with, put
+            // where `op_deis_fetch_guard` can read it. Both halves have to see
+            // the same rules or the gate and the backstop would disagree.
+            state.put(fetch_policy.clone());
 
             // The Cache API's store. Edge Canon makes it a basic feature, so
             // it is built for every isolate whether or not the application

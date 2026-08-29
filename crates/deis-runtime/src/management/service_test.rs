@@ -157,10 +157,13 @@ async fn unmeasured_resource_usage_is_left_out_rather_than_reported_as_zero() {
 }
 
 #[tokio::test]
-async fn a_package_upload_is_refused_rather_than_half_applied() {
-    // The RPC used to parse the zip with a second, incompatible manifest
-    // definition of its own. A caller that still sends a package has to see
-    // that nothing was deployed.
+async fn an_update_app_call_is_refused_rather_than_half_applied() {
+    // The RPC used to take a whole zip in one message and parse it with a
+    // second, incompatible manifest definition of its own. The archive field
+    // is now `reserved` in management.proto - hence the absence of a field
+    // for it here, which is the point of the test as much as the refusal is:
+    // if `package_data` ever comes back, this stops compiling. A caller that
+    // still asks has to see that nothing was deployed.
     let _turn = test_host::take();
     let dir = tempfile::tempdir().unwrap();
     let environments = ["production"];
@@ -169,11 +172,10 @@ async fn a_package_upload_is_refused_rather_than_half_applied() {
     let status = service
         .update_app(Request::new(UpdateAppRequest {
             app_id: "status-upload".to_string(),
-            package_data: b"PK\x03\x04 not really a bundle".to_vec(),
             config: None,
         }))
         .await
-        .expect_err("an upload path that no longer exists must not answer success");
+        .expect_err("an install path that no longer exists must not answer success");
 
     assert_eq!(status.code(), tonic::Code::Unimplemented);
     assert!(status.message().contains("ApplyDeployment"), "{status}");

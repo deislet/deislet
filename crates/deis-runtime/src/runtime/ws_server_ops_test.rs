@@ -90,26 +90,57 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn test_ws_server_api_availability() {
-        let mut runtime = setup_test_runtime();
+    /// The WebSocket classes are reachable from an application.
+    ///
+    /// Driven through a real `AppRuntime` rather than by evaluating
+    /// `js/runtime.js` on a bare `JsRuntime`, which is what this used to do.
+    /// That shortcut stopped working once the standard web globals were bound
+    /// from the deno extensions: `js/runtime.js` now subclasses the `Response`
+    /// that `js/bootstrap.js` binds, so evaluating it in an isolate that was
+    /// built without those extensions fails on the first class it declares.
+    /// Going through `AppRuntime` also means this asserts what an application
+    /// actually sees, rather than what one particular script leaves behind.
+    #[tokio::test]
+    async fn test_ws_server_api_availability() {
+        use crate::runtime::isolate::{AppRuntime, IsolateSpec};
+        use crate::runtime::ServiceWiring;
+        use std::collections::HashMap;
 
-        // Test whether WebSocketServer and WebSocketPair classes are available
         let code = r#"
-            if (typeof WebSocketServer === "undefined") {
-                throw new Error("WebSocketServer not available");
+            export default function handler() {
+                if (typeof WebSocketServer === "undefined") {
+                    throw new Error("WebSocketServer not available");
+                }
+                if (typeof WebSocketPair === "undefined") {
+                    throw new Error("WebSocketPair not available");
+                }
+                return new Response("ok");
             }
-            if (typeof WebSocketPair === "undefined") {
-                throw new Error("WebSocketPair not available");
-            }
-            "ok";
         "#;
 
-        // Load runtime.js first
-        runtime
-            .execute_script("<runtime>", include_str!("js/runtime.js"))
-            .unwrap();
+        let mut runtime = AppRuntime::new(
+            "ws_api_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
 
-        runtime.execute_script("<test>", code).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200, "{body:?}");
+        assert_eq!(body.as_deref(), Some("ok"));
     }
 }

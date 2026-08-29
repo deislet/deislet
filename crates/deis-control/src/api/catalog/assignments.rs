@@ -111,12 +111,28 @@ pub async fn for_node(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<(HeaderMap, Json<Vec<AssignmentView>>)> {
-    let assignments = state.store.list_assignments().await?;
+    let list = state.store.list_assignments().await?;
     let base = state.deliverer.base_url(&headers);
 
-    let mut views: Vec<AssignmentView> = Vec::with_capacity(assignments.len());
-    let mut withheld: usize = 0;
-    for assignment in &assignments {
+    let mut views: Vec<AssignmentView> = Vec::with_capacity(list.assignments.len());
+
+    // Everything this answer should have named and does not. The catalog
+    // starts it off: an environment that is deployed and whose version row is
+    // missing never reaches the loop below, and counting only what the loop
+    // itself skips would report that answer as the whole truth while it was
+    // short by exactly those environments.
+    let mut withheld: usize = list.undescribable.len();
+    for broken in &list.undescribable {
+        error!(
+            node = %node_id,
+            app_id = %broken.app_id,
+            environment = %broken.environment,
+            version_id = %broken.version_id,
+            "The catalog holds a deployment for this environment that it cannot describe, so it is not in this node's list; the list is marked incomplete, which is what stops the node from treating the gap as a deletion"
+        );
+    }
+
+    for assignment in &list.assignments {
         // One environment whose secrets will not decrypt must not cost the
         // node every other application on the list, so it is dropped from
         // this answer with the reason said out loud. The node then simply
@@ -152,12 +168,13 @@ pub async fn for_node(
         });
     }
 
-    // The answer is authoritative only when every assignment in the catalog
-    // could be described. That is what lets a node use it to remove things:
-    // an application the catalog no longer names is simply absent here, and
-    // absence is an instruction. Absence caused by this control plane failing
-    // to build a row is not, which is the whole reason the two cases are told
-    // apart on the wire.
+    // The answer is authoritative only when every environment the catalog
+    // holds a deployment for could be described, whether it fell over in the
+    // catalog's own query or in the loop above. That is what lets a node use
+    // this answer to remove things: an application the catalog no longer
+    // names is simply absent here, and absence is an instruction. Absence
+    // caused by this control plane failing to describe a row is not, which is
+    // the whole reason the two cases are told apart on the wire.
     let complete = withheld == 0;
     let mut response_headers = HeaderMap::new();
     response_headers.insert(

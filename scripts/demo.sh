@@ -17,6 +17,12 @@ DEFAULT_DEIS_STORE_PORT=8090
 DEFAULT_DEIS_QUEUE_PORT=8091
 DEFAULT_DEIS_TELEMETRY_PORT=8092
 DEFAULT_DEIS_TELEMETRY_METRICS_PORT=8093
+# Not a component. A plain HTTP server the demo runs so that the example
+# application has somewhere real to `fetch`, in the role an upstream API would
+# play for a real application. It is what the node's `[fetch] allow` opens up,
+# and the only non-public destination that is opened: deis-store's address is
+# asked for by the same handler and must be refused.
+DEFAULT_DEIS_ORIGIN_PORT=8094
 
 # The example app, and the names the demo files it under. deis-store and
 # deis-queue still understand exactly one tenant dimension, but that key is now
@@ -35,6 +41,16 @@ NODE_ID="${NODE_ID:-deis-runtime-demo-01}"
 # Deliberately recognisable: `verify` greps the logs and the data directories
 # for it to prove a decrypted secret is never written down anywhere.
 DEMO_SECRET_VALUE="${DEMO_SECRET_VALUE:-demo-secret-do-not-log-me}"
+
+# What the origin server answers with. `verify` asserts on this exact string,
+# so a handler that returned a plausible body of its own - or an error page
+# from something else listening on that port - is not mistaken for a fetch
+# that worked.
+ORIGIN_BODY="the-demo-origin-answered"
+# SHA-256 of the string "deislet", which functions/api/crypto.ts digests. A
+# `crypto.subtle.digest` that invented well-formed bytes would pass any
+# "did it throw?" test; it does not pass this one.
+DEISLET_SHA256="939a37e7f6ca53c6b3ba5ee5e748b1cc5dda0fe3b8d5ad6d428ab3bb5961c405"
 
 usage() {
   cat <<'EOF'
@@ -61,6 +77,7 @@ Options:
   --deis-queue-port <port>              Queue gRPC port (default 8091)
   --deis-telemetry-port <port>          Telemetry gRPC port (default 8092)
   --deis-telemetry-metrics-port <port>  Telemetry Prometheus port (default 8093)
+  --deis-origin-port <port>             Origin the example app fetches (default 8094)
   --secret <hex>                        Control shared secret (64-char hex)
   --demo-dir <path>                     Runtime directory (default .demo)
   --app-dir <path>                      Example app sources (default scripts/demo-assets/example-app)
@@ -97,6 +114,7 @@ reset_previous_run() {
     "${DEMO_DIR}/deis-telemetry-data" \
     "${DEMO_DIR}/deis-runtime-data" \
     "${DEMO_DIR}/bundles" \
+    "${DEMO_DIR}/origin" \
     "${DEMO_DIR}/deis-control.db" \
     "${DEMO_DIR}/deis-proxy.db" \
     "${DEMO_DIR}/deis-config"
@@ -277,6 +295,8 @@ DEIS_STORE_PORT=$DEIS_STORE_PORT
 DEIS_QUEUE_PORT=$DEIS_QUEUE_PORT
 DEIS_TELEMETRY_PORT=$DEIS_TELEMETRY_PORT
 DEIS_TELEMETRY_METRICS_PORT=$DEIS_TELEMETRY_METRICS_PORT
+DEIS_ORIGIN_PORT=$DEIS_ORIGIN_PORT
+DEIS_ORIGIN_PID=${DEIS_ORIGIN_PID:-}
 DEIS_CONTROL_PID=$DEIS_CONTROL_PID
 DEIS_RUNTIME_PID=$DEIS_RUNTIME_PID
 DEIS_PROXY_PID=$DEIS_PROXY_PID
@@ -394,6 +414,50 @@ EOF
   wait_for_service wait_for_tcp "$DEIS_QUEUE_PORT" "$DEIS_QUEUE_PID" 60 || rc=$?
   report_service "Queue" "$rc" "${LOG_DIR}/deis-queue.log" \
     "ctx.queue calls will fail"
+}
+
+# Bring up the destination the example application is allowed to fetch.
+#
+# `fetch` is a basic requirement of Edge Canon, and a platform that grants it
+# has to say where an application may go. deis-runtime denies every
+# non-public address by default, so without something here the only honest
+# demonstration of a working `fetch` would need the internet - and the check
+# that matters could not be shown at all, because "refused" and "no network"
+# would look the same from the outside.
+#
+# So the demo serves its own upstream on a port of its own and opens exactly
+# that one address in the node's `[fetch] allow`. deis-store sits one port
+# away, is not opened, and is asked for by the same handler: one call gets
+# through, the neighbouring one does not, and the difference is the policy
+# rather than the network.
+#
+# python3 is the only thing in this script that needs it, which is why its
+# absence is reported and does not stop the run: everything except the two
+# fetch checks works without it, and those two then fail loudly with the
+# reason instead of being quietly skipped.
+start_origin() {
+  local dir="${DEMO_DIR}/origin"
+  mkdir -p "$dir"
+  printf '%s\n' "$ORIGIN_BODY" > "${dir}/payload.txt"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "⚠️  python3 not found, so the fetch origin is not started."
+    echo "     The example app's outbound-fetch checks will fail; everything else runs."
+    DEIS_ORIGIN_PID=""
+    return 0
+  fi
+
+  echo "🚀 Starting the fetch origin (HTTP: ${DEIS_ORIGIN_PORT})"
+  python3 -m http.server "$DEIS_ORIGIN_PORT" \
+    --bind 127.0.0.1 --directory "$dir" \
+    > "${LOG_DIR}/origin.log" 2>&1 &
+  DEIS_ORIGIN_PID=$!
+
+  local rc=0
+  wait_for_service wait_for_http \
+    "http://127.0.0.1:${DEIS_ORIGIN_PORT}/payload.txt" "$DEIS_ORIGIN_PID" 30 || rc=$?
+  report_service "Origin" "$rc" "${LOG_DIR}/origin.log" \
+    "the example app has nowhere to fetch and those checks fail"
 }
 
 # ----------------------------------------------------------------------
@@ -593,6 +657,7 @@ start_demo() {
   local user_deis_queue_port
   local user_deis_telemetry_port
   local user_deis_telemetry_metrics_port
+  local user_deis_origin_port
   user_deis_control_port=${DEIS_CONTROL_PORT:-}
   user_deis_runtime_port=${DEIS_RUNTIME_PORT:-}
   user_deis_proxy_port=${DEIS_PROXY_PORT:-}
@@ -600,6 +665,7 @@ start_demo() {
   user_deis_queue_port=${DEIS_QUEUE_PORT:-}
   user_deis_telemetry_port=${DEIS_TELEMETRY_PORT:-}
   user_deis_telemetry_metrics_port=${DEIS_TELEMETRY_METRICS_PORT:-}
+  user_deis_origin_port=${DEIS_ORIGIN_PORT:-}
 
   if [ -f "$STATE_FILE" ]; then
     # shellcheck disable=SC1090
@@ -634,6 +700,7 @@ start_demo() {
   DEIS_QUEUE_PORT=$user_deis_queue_port
   DEIS_TELEMETRY_PORT=$user_deis_telemetry_port
   DEIS_TELEMETRY_METRICS_PORT=$user_deis_telemetry_metrics_port
+  DEIS_ORIGIN_PORT=$user_deis_origin_port
 
   claim_port DEIS_RUNTIME_PORT "${DEIS_RUNTIME_PORT:-$DEFAULT_DEIS_RUNTIME_PORT}"
   claim_port DEIS_PROXY_PORT "${DEIS_PROXY_PORT:-$DEFAULT_DEIS_PROXY_PORT}"
@@ -642,6 +709,7 @@ start_demo() {
   claim_port DEIS_TELEMETRY_PORT "${DEIS_TELEMETRY_PORT:-$DEFAULT_DEIS_TELEMETRY_PORT}"
   claim_port DEIS_TELEMETRY_METRICS_PORT \
     "${DEIS_TELEMETRY_METRICS_PORT:-$DEFAULT_DEIS_TELEMETRY_METRICS_PORT}"
+  claim_port DEIS_ORIGIN_PORT "${DEIS_ORIGIN_PORT:-$DEFAULT_DEIS_ORIGIN_PORT}"
 
   SECRET=${SECRET:-$(generate_secret)}
 
@@ -664,6 +732,7 @@ start_demo() {
 
   build_binaries
   start_data_plane
+  start_origin
 
   local start_port
   start_port=${DEIS_CONTROL_PORT:-$DEFAULT_DEIS_CONTROL_PORT}
@@ -719,6 +788,14 @@ EOF
     # they stop at this node's stdout and deis-telemetry has nothing to answer
     # with. The flush interval is dropped to a second so a request's logs are
     # queryable while the person who made it is still looking.
+    #
+    # [fetch] is the node's outbound policy, and this is the whole of it: one
+    # address opened, the demo's own origin server. Everything an application
+    # can name that is not a public internet address stays refused - which on
+    # this machine is everything else, deis-store and deis-queue and the
+    # control plane included. Their addresses are refused twice over: they are
+    # loopback, and they are the platform's own service endpoints, which no
+    # allowlist entry can reach. `verify` asks for one of each.
     cat > "$DEIS_RUNTIME_CONFIG" <<EOF
 node_id = "${NODE_ID}"
 http_port = ${DEIS_RUNTIME_PORT}
@@ -733,6 +810,9 @@ flush_interval_secs = 1
 endpoint = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 secret = "${SECRET}"
 retry_interval_secs = 2
+
+[fetch]
+allow = ["127.0.0.1:${DEIS_ORIGIN_PORT}"]
 EOF
 
     cat > "$DEIS_PROXY_CONFIG" <<EOF
@@ -835,6 +915,7 @@ EOF
   echo "- Queue (gRPC): 127.0.0.1:${DEIS_QUEUE_PORT}"
   echo "- Telemetry (gRPC): 127.0.0.1:${DEIS_TELEMETRY_PORT}"
   echo "- Telemetry metrics: http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics"
+  echo "- Fetch origin: http://127.0.0.1:${DEIS_ORIGIN_PORT}/payload.txt (the one address applications may reach)"
 }
 
 # How long one component may take to drain before it is killed outright.
@@ -910,6 +991,9 @@ stop_demo() {
   stop_service "Runtime" "${DEIS_RUNTIME_PID:-}" || failed=1
   stop_service "Proxy" "${DEIS_PROXY_PID:-}" || failed=1
   stop_service "Control" "${DEIS_CONTROL_PID:-}" || failed=1
+  # Not a component, but it holds a port like one, and a port still held is
+  # what makes the next `start` fail to bind.
+  stop_service "Origin" "${DEIS_ORIGIN_PID:-}" || failed=1
 
   # The data plane goes last: the components above may still be flushing logs
   # to deis-telemetry or finishing storage calls while they shut down.
@@ -1362,6 +1446,192 @@ check_rollback() {
   fi
 }
 
+# Ask the example app to fetch a URL and hand back the JSON it answers with.
+#
+# The destination is passed as a query parameter rather than baked into the
+# app, because the two checks below need the same handler to be pointed at two
+# different addresses: one it is allowed to reach and one it is not. What the
+# platform does with the second is the difference between an egress policy and
+# a comment about one.
+app_fetch() {
+  local label=$1
+  local target=$2
+  curl -s -G -D "${LOG_DIR}/verify-${label}.headers" \
+    -H "x-deis-app-id: ${APP_ID}" \
+    --data-urlencode "url=${target}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/fetch"
+}
+
+# Did the handler answer at all?
+#
+# Worth its own step because of what it caught the first time it ran: an
+# outbound call that aborts the node process. There is then no JSON to read,
+# and every field below reads as `false` - so the fetch checks would have
+# reported "this isolate has no fetch" and the refusal check would have
+# reported a refusal, when what actually happened is that the node died
+# mid-request. Both are the wrong sentence. Returns non-zero having said so.
+answered_json() {
+  local title=$1
+  local label=$2
+  local body=$3
+
+  if echo "$body" | jq -e . >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local status
+  status=$(http_status "${LOG_DIR}/verify-${label}.headers" 2>/dev/null || true)
+  fail_check "$title" \
+    "the node did not answer with JSON (HTTP ${status:-no response}). Either the request never reached the handler, or the node stopped answering while it ran - check .demo/logs/deis-runtime.log. Body: $(echo "$body" | tr '\n' ' ' | head -c 200)"
+  return 1
+}
+
+# `fetch` exists at all, and reaches a destination the operator opened up.
+#
+# Edge Canon lists `fetch` under basic features (SPECIFICATION_BASIC.md
+# section 8.1), so a handler calling it must not meet a ReferenceError. The
+# handler reports `available` separately from `reached` precisely so this check
+# can tell "the platform has no fetch" from "the destination was refused" -
+# without that, a platform missing `fetch` entirely would pass the refusal
+# check below and fail nothing.
+check_app_fetch_allowed() {
+  local title="a handler's fetch reaches a destination the node allows"
+
+  # A run started before the origin existed has no port for it in its state,
+  # and the node it started has no `[fetch] allow` line either. Say that
+  # rather than dying on an unset variable half way through the run.
+  if [ -z "${DEIS_ORIGIN_PORT:-}" ]; then
+    fail_check "$title" \
+      "this run's state names no fetch origin, so it was started before the demo had one. Restart it: ./scripts/demo.sh stop && ./scripts/demo.sh start"
+    return
+  fi
+
+  local target="http://127.0.0.1:${DEIS_ORIGIN_PORT}/payload.txt"
+  local body
+  body=$(app_fetch fetch-allowed "$target")
+  answered_json "$title" fetch-allowed "$body" || return
+
+  local available reached status got
+  available=$(echo "$body" | jq -r '.available // false' 2>/dev/null || true)
+  reached=$(echo "$body" | jq -r '.reached // false' 2>/dev/null || true)
+  status=$(echo "$body" | jq -r '.status // empty' 2>/dev/null || true)
+  got=$(echo "$body" | jq -r '.body // empty' 2>/dev/null || true)
+
+  if [ "$available" != "true" ]; then
+    fail_check "$title" \
+      "the isolate has no fetch: $(echo "$body" | tr '\n' ' ' | head -c 300)"
+    return
+  fi
+  if [ "$reached" != "true" ] || [ "$status" != "200" ]; then
+    fail_check "$title" \
+      "GET ${target} from inside the handler did not answer 200: $(echo "$body" | tr '\n' ' ' | head -c 300)"
+    return
+  fi
+  # The body, not just the status: something else listening on that port
+  # answers 200 too, and this is what makes the check about the demo's own
+  # origin rather than about any server at all.
+  case "$got" in
+    *"$ORIGIN_BODY"*)
+      pass_check "$title" \
+        "the handler called ${target} and got the origin's own body back (HTTP ${status}, \"${ORIGIN_BODY}\"); that address is the single entry in the node's [fetch] allow"
+      ;;
+    *)
+      fail_check "$title" \
+        "the fetch answered ${status} but the body was not the origin's: $(echo "$got" | tr '\n' ' ' | head -c 200)"
+      ;;
+  esac
+}
+
+# The check this whole arrangement exists for.
+#
+# deis-store trusts the tenant header it is given: it has to, because until an
+# application could open an outbound connection, nothing but the node could
+# reach it. The moment `fetch` exists, a handler that can reach deis-store can
+# read and delete any other application's keys, rows and blobs by asking with
+# a different `x-deis-tenant`. So the handler is pointed straight at it here,
+# and a call that gets through is a failure - not a curiosity, and not
+# something to note and move on from.
+#
+# Note what is *not* asserted: no wording, no status code, no particular
+# refusal message. Only that the application did not reach it. Any refusal
+# passes; only an answer fails.
+check_app_fetch_refused() {
+  local title="a handler's fetch to deis-store is refused"
+  local target="http://127.0.0.1:${DEIS_STORE_PORT}/"
+  local body
+  body=$(app_fetch fetch-refused "$target")
+  answered_json "$title" fetch-refused "$body" || return
+
+  local available reached status error
+  available=$(echo "$body" | jq -r '.available // false' 2>/dev/null || true)
+  reached=$(echo "$body" | jq -r '.reached // false' 2>/dev/null || true)
+  status=$(echo "$body" | jq -r '.status // empty' 2>/dev/null || true)
+  error=$(echo "$body" | jq -r '.error // empty' 2>/dev/null || true)
+
+  # Without this the check would pass on a platform that has no `fetch` at
+  # all, and report an egress policy that does not exist.
+  if [ "$available" != "true" ]; then
+    fail_check "$title" \
+      "nothing was refused: the isolate has no fetch to refuse with. $(echo "$body" | tr '\n' ' ' | head -c 300)"
+    return
+  fi
+
+  if [ "$reached" = "true" ]; then
+    fail_check "$title" \
+      "the application reached deis-store on its own (HTTP ${status}). Any handler on this node can now address storage directly with a tenant header of its choosing, which is every other application's data"
+    return
+  fi
+
+  pass_check "$title" \
+    "the handler asked for ${target} and the platform did not make the call: ${error}. It sits on the same loopback interface as the origin the same handler reaches freely, so what stopped it is the policy and not the network"
+}
+
+# The Web Crypto globals, judged on their values.
+#
+# SPECIFICATION_BASIC.md section 8.1 lists `crypto.randomUUID` and
+# `crypto.subtle`. The digest is checked against the known SHA-256 of a fixed
+# string, so an implementation that returned well-formed bytes of its own
+# invention fails here rather than passing a "did it throw?" test.
+check_web_crypto() {
+  local title="crypto.randomUUID and crypto.subtle.digest produce real values"
+  local headers="${LOG_DIR}/verify-crypto.headers"
+  local body
+  body=$(app_request "$headers" "/api/crypto")
+  answered_json "$title" crypto "$body" || return
+
+  local has_crypto uuid differ digest
+  has_crypto=$(echo "$body" | jq -r '.present.crypto // false' 2>/dev/null || true)
+  uuid=$(echo "$body" | jq -r '.uuid // empty' 2>/dev/null || true)
+  differ=$(echo "$body" | jq -r '.uuidsDiffer // false' 2>/dev/null || true)
+  digest=$(echo "$body" | jq -r '.digestHex // empty' 2>/dev/null || true)
+
+  if [ "$has_crypto" != "true" ]; then
+    fail_check "$title" \
+      "the isolate has no crypto: $(echo "$body" | tr '\n' ' ' | head -c 300)"
+    return
+  fi
+
+  # Version 4, variant 1: the shape a UUID has to have. A generator that
+  # returned a well-formed string of the wrong version is still wrong, and a
+  # loose length check would not notice.
+  if ! echo "$uuid" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'; then
+    fail_check "$title" "randomUUID answered '${uuid}', which is not a version 4 UUID"
+    return
+  fi
+  if [ "$differ" != "true" ]; then
+    fail_check "$title" "randomUUID returned the same id twice"
+    return
+  fi
+  if [ "$digest" != "$DEISLET_SHA256" ]; then
+    fail_check "$title" \
+      "subtle.digest('SHA-256', 'deislet') answered ${digest:-nothing}, expected ${DEISLET_SHA256}"
+    return
+  fi
+
+  pass_check "$title" \
+    "randomUUID gave ${uuid} and a different one on the next call; subtle.digest('SHA-256', 'deislet') gave ${digest}, which is the known digest of that string"
+}
+
 check_telemetry_logs() {
   if ! command -v grpcurl >/dev/null 2>&1; then
     fail_check "the app's logs are queryable from deis-telemetry" \
@@ -1755,6 +2025,13 @@ verify_demo() {
   check_static_asset
   echo "-- routing --"
   check_route_parameter
+  echo "-- the web platform --"
+  # Here rather than at the end: these are about what a handler finds on
+  # `globalThis`, which is the same subject as the check above, and they run
+  # before the rollback moves production around underneath them.
+  check_app_fetch_allowed
+  check_app_fetch_refused
+  check_web_crypto
   echo "-- secrets --"
   # The list runs before the sweep: it writes its own output under LOG_DIR,
   # and the sweep is what would catch a value in it.
@@ -1796,6 +2073,7 @@ status_demo() {
   echo "- Store PID: ${DEIS_STORE_PID:-unknown}"
   echo "- Queue PID: ${DEIS_QUEUE_PID:-unknown}"
   echo "- Telemetry PID: ${DEIS_TELEMETRY_PID:-unknown}"
+  echo "- Origin PID: ${DEIS_ORIGIN_PID:-none}"
   echo "- Control API: http://127.0.0.1:${DEIS_CONTROL_PORT}"
   echo "- Runtime: http://127.0.0.1:${DEIS_RUNTIME_PORT}"
   echo "- Proxy: http://127.0.0.1:${DEIS_PROXY_PORT}"
@@ -1803,6 +2081,7 @@ status_demo() {
   echo "- Queue (gRPC): 127.0.0.1:${DEIS_QUEUE_PORT:-unknown}"
   echo "- Telemetry (gRPC): 127.0.0.1:${DEIS_TELEMETRY_PORT:-unknown}"
   echo "- Telemetry metrics: http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT:-unknown}/metrics"
+  echo "- Fetch origin: http://127.0.0.1:${DEIS_ORIGIN_PORT:-unknown}/payload.txt (PID: ${DEIS_ORIGIN_PID:-none})"
 
   if command -v jq >/dev/null 2>&1 && [ -n "${APP_ID:-}" ]; then
     local current
@@ -1845,6 +2124,10 @@ while [ $# -gt 0 ]; do
       ;;
     --deis-telemetry-metrics-port)
       DEIS_TELEMETRY_METRICS_PORT=$2
+      shift 2
+      ;;
+    --deis-origin-port)
+      DEIS_ORIGIN_PORT=$2
       shift 2
       ;;
     --secret)

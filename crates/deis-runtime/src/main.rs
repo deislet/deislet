@@ -12,7 +12,7 @@ use deis_runtime::deployment::{
 use deis_runtime::dispatcher::{self, ServerOptions};
 use deis_runtime::health::NodeHealth;
 use deis_runtime::logging::{LogBuffer, LogShipper, RuntimeLayer, ShipperConfig};
-use deis_runtime::runtime::{MetricShipper, MetricShipperConfig};
+use deis_runtime::runtime::{FetchPolicy, MetricShipper, MetricShipperConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,15 +71,59 @@ async fn main() -> Result<()> {
         MetricShipper::for_process(MetricShipperConfig::from(&config.logging), node_id.clone());
     metric_shipper.start().await;
 
+    // Where an application's `fetch()` may go. Deny by default; the operator's
+    // allowlist widens it, and this node's own service endpoints are added as
+    // destinations no allowlist can reach. deis-store's and deis-queue's
+    // addresses are not here because they arrive per deployment, not from this
+    // file; `AppRuntime::new` adds them when it builds the isolate.
+    //
+    // This node's own listener is in the list as well, on every spelling of
+    // the local machine. It is a service endpoint like the others: the
+    // dispatcher decides which application a request belongs to from the
+    // `x-deis-app-id` header it is handed, so a handler that could open a
+    // connection to it -- headers of its own choosing included -- would be
+    // invoking another tenant's code on this node.
+    let own_listener = |host: &str| format!("http://{host}:{}", config.http_port);
+    let platform_endpoints: Vec<String> = config
+        .control
+        .endpoint
+        .iter()
+        .chain(config.logging.endpoint.iter())
+        .cloned()
+        .chain([
+            own_listener("127.0.0.1"),
+            own_listener("[::1]"),
+            own_listener("localhost"),
+        ])
+        .collect();
+    let fetch_policy = FetchPolicy::new(&config.fetch.allow, &platform_endpoints)
+        .map_err(|e| anyhow::anyhow!("building the outbound fetch policy: {e}"))?;
+
     // Create application manager
     let app_manager = Arc::new(
         ApplicationManager::new_with_repo(app_repo.clone())
-            .with_limits(config.default_execution_limits.clone()),
+            .with_limits(config.default_execution_limits.clone())
+            .with_fetch_policy(fetch_policy.clone()),
     );
     info!(
         "Application manager initialized (default timeout={}ms, default rate limit={} ops/sec)",
         config.default_execution_limits.timeout_ms,
         config.default_execution_limits.rate_limit_ops_per_sec
+    );
+    // The entries themselves are not logged: an allowlist is a map of the
+    // internal network, and this line goes to the same place application logs
+    // do.
+    info!(
+        allowlist_entries = fetch_policy.allowlist_len(),
+        platform_endpoints = platform_endpoints.len(),
+        "Outbound fetch policy: public destinations only, plus {} operator allowlist entr{}; \
+         this node's own service endpoints are refused to every application",
+        fetch_policy.allowlist_len(),
+        if fetch_policy.allowlist_len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
     );
 
     // Deployment delivery: bundles land here and versions are loaded from

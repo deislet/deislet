@@ -6,6 +6,7 @@ use once_cell::sync::OnceCell;
 use std::fs;
 use std::path::PathBuf;
 
+use super::fetch_policy::FetchPolicy;
 use super::runtime_init::{build_runtime_extensions, init_lazy_extensions};
 
 static STARTUP_SNAPSHOT: OnceCell<Option<&'static [u8]>> = OnceCell::new();
@@ -59,7 +60,13 @@ fn create_startup_snapshot() -> Result<&'static [u8]> {
                 extensions,
                 extension_transpiler: None,
                 with_runtime_cb: Some(Box::new(|runtime| {
-                    if let Err(err) = init_lazy_extensions(runtime) {
+                    // The snapshot is the shape of the isolate, not any one
+                    // application's permissions: nothing fetches while it is
+                    // being taken, and every isolate restored from it installs
+                    // its own policy in `AppRuntime::new`.
+                    if let Err(err) =
+                        init_lazy_extensions(runtime, &FetchPolicy::default(), "<snapshot>")
+                    {
                         panic!("Failed to init lazy extensions for snapshot: {}", err);
                     }
 

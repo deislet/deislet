@@ -255,8 +255,12 @@ impl RuntimeManagement for RuntimeManagementService {
     /// points at a bundle and this node fetches and verifies it
     /// (docs/implementation-plan.zh.md section 4).
     ///
-    /// `Unimplemented` rather than a silent success: a caller that still sends
-    /// a package must see that nothing was deployed.
+    /// The archive field is gone from the request as well (`reserved 2` in
+    /// `management.proto`), so a caller cannot even put one on the wire; what
+    /// arrives here is an app id and, at most, a configuration block.
+    ///
+    /// `Unimplemented` rather than a silent success: a caller that still asks
+    /// for this must see that nothing was deployed.
     async fn update_app(
         &self,
         request: Request<UpdateAppRequest>,
@@ -264,14 +268,14 @@ impl RuntimeManagement for RuntimeManagementService {
         let req = request.into_inner();
         warn!(
             app_id = %req.app_id,
-            package_bytes = req.package_data.len(),
-            "Refusing an UpdateApp package upload: this node only takes deployments through \
-             ApplyDeployment, which points at a verified bundle. Nothing was installed and the \
-             app keeps running whatever it was running"
+            "Refusing an UpdateApp: this node only takes deployments through ApplyDeployment, \
+             which points at a bundle it fetches and verifies itself. Nothing was installed and \
+             the app keeps running whatever it was running"
         );
         Err(Status::unimplemented(
             "UpdateApp is superseded by ApplyDeployment: upload the version to the control \
-             plane and point an environment at it. This node does not accept package uploads",
+             plane and point an environment at it. This node does not install an application \
+             from anything a caller hands it",
         ))
     }
 

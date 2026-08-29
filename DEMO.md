@@ -16,6 +16,8 @@
 - 先编译一次全部二进制，再按依赖顺序拉起六个进程：
   - 数据面：`deis-telemetry`（gRPC + Prometheus 两个端口）、`deis-store`（KV/DB/Blob 三套 gRPC 服务共用一个端口）、`deis-queue`
   - 控制面与流量面：`deis-control`（单端口 HTTP/gRPC）、`deis-runtime`、`deis-proxy`
+- 另起一个**不属于平台**的小 HTTP 服务（`python3 -m http.server`，默认 8094），当示例
+  应用 `fetch` 的上游用；节点配置里 `[fetch] allow` 只开这一个地址（见下文「出网」）
 - 每个进程都探活之后才继续，探活同时看「端口有没有应答」和「进程还在不在」
 - 按开发者会走的那条线部署示例应用（见下一节）
 - 输出访问地址与日志路径
@@ -70,6 +72,8 @@ scripts/demo-assets/example-app/
   functions/hello/[name].ts        -> /hello/:name   占位符进 context.params
   functions/api/kv/[key].ts        -> /api/kv/:key   PUT 写、GET 读，经 deis-store
   functions/api/enqueue.ts         -> /api/enqueue   往 jobs 队列投一条消息
+  functions/api/fetch.ts           -> /api/fetch     按 ?url= 往外打一发 fetch，回报结果
+  functions/api/crypto.ts          -> /api/crypto    跑一遍 Web Crypto，把值本身回出来
   functions/_queue.ts              队列消费函数（下划线开头 = 平台调用，不是路由）
   functions/_scheduled.ts          cron 处理函数，同上
 ```
@@ -77,9 +81,33 @@ scripts/demo-assets/example-app/
 `BUILD_LABEL` 是回滚那一项的抓手：v2 把它改成 `v2` 并顺手改了静态页面，回滚之后
 两样要一起变回 `v1`。
 
+`functions/api/fetch.ts` 是**故意写成中转**的：查询串给什么地址，它就往那个地址打。
+真项目里没人该这么写，但演示要验的恰恰是这一条——一个能被指挥去哪儿的应用，正是出网
+策略存在的理由。它回的 JSON 里 `available` 和 `reached` 是分开的两件事：前者说这个
+Isolate 里到底有没有 `fetch`，后者说这一发有没有打出去。分开是必须的——平台要是根本
+没有 `fetch`，调用会抛 `ReferenceError`，被 catch 之后跟「被拒绝」长得一模一样，合成
+一个字段的话，一个没有 `fetch` 的平台反而能把「打不到 deis-store」这项验过去。
+
+## 出网：应用的 fetch 能去哪儿
+
+`fetch` 是 Edge Canon 的基础特性，装上它就必须同时回答「应用能打到哪儿」。deis-runtime
+的策略是**默认全拒，按例外放行**：不是公网地址的一律不通（回环、私网段、链路本地——
+云上元数据服务 `169.254.169.254` 就在这一段），操作员可以在节点配置的 `[fetch] allow`
+里逐个开口子；而平台自己那几个服务地址（deis-store / deis-queue / deis-control /
+deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条目都开不到它们**。
+
+理由很直接：deis-store 信任别人递给它的 `x-deis-tenant` 头——在应用没法自己往外发包
+之前，「只有节点进程能连到它」就是它的全部保护。一旦 Isolate 里有了 `fetch`，一个处理
+函数只要能连上 deis-store，换个租户头就能读、能删别的应用的 KV、数据行和 blob。
+
+演示据此摆了一个最小的对照组：脚本自己起一个上游（默认 8094），节点配置里
+`[fetch] allow` 只写这一个地址；deis-store 在同一块回环网卡的另一个端口上，不写。
+然后让**同一个处理函数**先后打这两个地址——一发通、一发不通，两者之间差的是策略而
+不是网络。这也是 `verify` 里唯一一项「成功了反而算失败」的检查。
+
 ## verify 检查什么
 
-`./scripts/demo.sh verify` 分十一组跑十九项，每项打印它据以判断的证据：
+`./scripts/demo.sh verify` 分十二组跑二十二项，每项打印它据以判断的证据：
 
 | 组 | 检查 | 证明了什么 |
 |---|---|---|
@@ -88,6 +116,9 @@ scripts/demo-assets/example-app/
 | 资产优先 | `GET /` | 返回的是包里那个文件本身，没起 Isolate；ETag 是资产自身的 sha256 |
 | | 带 `If-None-Match` 再打一次 | 回 304 且零字节 |
 | 路由 | `GET /hello/world` | 路由占位符进了 `context.params` |
+| Web 标准 | 处理函数里 `fetch` 打演示自己起的那个上游 | Isolate 里真有 `fetch`（`available`），而且这一发确实打了出去并把上游的响应体原样带回来了 |
+| | 同一个处理函数改打 `http://127.0.0.1:<deis-store 端口>` | **打不通**。它和刚刚打通的那个上游在同一块回环网卡上，只是端口不同，所以拦住它的是出网策略不是网络。这一项是唯一一条「成功了算失败」的检查：应用只要连得上 deis-store，换个租户头就能读别的应用的数据。不校验措辞、状态码或错误文本——只看这一发有没有打出去 |
+| | `crypto.randomUUID()` 与 `crypto.subtle.digest()` | 值本身被检查：UUID 要是 v4 形状且两次不同；摘要要等于字符串 `deislet` 的已知 SHA-256。凭空造出的合法字节能过「没抛异常」，过不了这一项 |
 | 密钥 | `deis secret list` | 只列出名字与最后修改时间；JSON 与人读两种输出都不含值，也没有任何命令能打印值 |
 | | 同一响应的 `secretPresent` | 加密存库的密钥被解开、随下发进了 Isolate |
 | | 递归 grep 数据目录与全部日志 | 解开后的明文哪儿都没落下 |
@@ -104,9 +135,11 @@ scripts/demo-assets/example-app/
 | | `deis status` | 节点是健康的、问得到的，而且它自己报出正在服务哪些环境——「目录说该跑什么」与「节点说在跑什么」是两回事 |
 
 日志那一项和存储那一项都需要 `grpcurl`：分别用来直接问 deis-telemetry 和
-deis-store，缺了会各自报为失败并说明原因，而不是悄悄跳过或者放宽标准去凑一个通过；
-其余各项除 `curl` 与 `jq` 外没有额外依赖。cron 那一项最长要等一个 tick 加一分钟，所以
-整体会跑一两分钟。
+deis-store，缺了会各自报为失败并说明原因，而不是悄悄跳过或者放宽标准去凑一个通过。
+两项 `fetch` 检查同理需要 `python3`——上游是 `python3 -m http.server` 起的，没有它
+`start` 会说一声、照常把别的都拉起来，然后这两项各自报失败并写明原因。其余各项除
+`curl` 与 `jq` 外没有额外依赖。cron 那一项最长要等一个 tick 加一分钟，所以整体会跑
+一两分钟。
 
 ## 验证日志链路（手工）
 
@@ -164,6 +197,7 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
   --deis-queue-port 8091 \
   --deis-telemetry-port 8092 \
   --deis-telemetry-metrics-port 8093 \
+  --deis-origin-port 8094 \
   --secret <64位hex> \
   --demo-dir .demo \
   --app-dir scripts/demo-assets/example-app
@@ -179,6 +213,8 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
 - `deis-control.db`、`bundles/`（控制面存的版本包）
 - `deis-runtime-data/`：节点自己的库与它拉下来的包
 - `deis-store-data/` / `deis-queue-data/` / `deis-telemetry-data/` 各自的数据目录
+- `origin/`：那个上游服务的根目录，里面只有一个 `payload.txt`；`verify` 校验取回来的
+  正是它的内容，免得端口上换了个别的服务照样答 200 也算过
 - `app-v1/` / `app-v2/`：示例应用的构建副本（构建会往项目里写 `dist/`，所以不在仓库里做）
 - `logs/` 日志目录（含 `build.log`、每次构建的 `build-app-*.log`）
 - `state.env` 运行状态
@@ -186,13 +222,17 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
 ## 注意事项
 
 - 需要本地安装 `cargo`、`curl`、`jq`，并确保 `ss`/`lsof`/`nc` 其一可用；
-  `stop` 用 `timeout` 与 `tail --pid` 等进程退出（GNU coreutils）
+  `stop` 用 `timeout` 与 `tail --pid` 等进程退出（GNU coreutils）；`python3` 只用来
+  起那个给应用 `fetch` 的上游，缺了不影响其余各项
 - **第一次跑之前要先构建控制面的 Web 面板**：`crates/deis-control/web/dist` 被
   gitignore 掉了，而 `deis-control` 在编译期把它嵌进二进制，所以少了它
   `cargo build` 直接失败。`demo.sh` 不会替你做这一步：
   `cd crates/deis-control/web && npm ci && npm run build`
 - `verify` 里查日志、以及直接向 deis-store 求证 KV 那两项需要 `grpcurl`；缺了它这两项
   各自报失败，其余照跑
+- 出网只开了上游那一个地址（`[fetch] allow`）。想让示例应用够到别处，加
+  `--deis-origin-port` 换端口或者自己改节点配置里的这一行；平台自己那几个服务地址
+  改不动——它们在 allow 之后再被拒一次
 - `verify` 里发请求的各项都直接打节点端口，不经 deis-proxy（原因见上文）
 - 节点这次是自己去连控制面的：`[control] endpoint` 一配，节点启动就去拉自己的清单
   （`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`），把里面每一版拉下来装好才报

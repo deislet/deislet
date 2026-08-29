@@ -73,6 +73,12 @@ prost = "0.13"
 # arrives, instead of being buffered whole in memory first.
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
+# The DNS half of the outbound fetch policy. `deno_fetch::dns::Resolve` is
+# written in terms of hyper-util's `Name`, so a custom resolver has to be
+# implemented against the same crate deno_fetch links; the workspace lock keeps
+# it on the one version already in the graph.
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+
 # WebSocket client
 tokio-tungstenite = { version = "0.21", features = ["__rustls-tls"] }
 futures-util = "0.3"

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::model::{
@@ -38,6 +38,46 @@ const ROUTE_COLUMNS: &str = "id, app_id, env_id, host, path_prefix, priority";
 /// `rowid` is monotonic per insert, so it breaks the tie in true insertion
 /// order and keeps the pointer semantics correct under rapid changes.
 const DEPLOYMENT_ORDER: &str = "created_at DESC, rowid DESC";
+
+/// The answer to "what should be running?", and what could not be answered.
+///
+/// The two halves are kept apart because the caller has to say which one it
+/// is looking at: the node-facing REST layer marks its response incomplete
+/// when anything is in [`Self::undescribable`], and an incomplete answer is
+/// one a node may load from but never remove on.
+///
+/// It lives here rather than in [`super::model`] because it is the shape of
+/// one query's result, not a thing the catalog stores: nothing writes an
+/// `AssignmentList` and no table holds one.
+#[derive(Debug, Clone, Default)]
+pub struct AssignmentList {
+    /// One per environment whose current deployment could be described in
+    /// full, in the order a node reads them.
+    pub assignments: Vec<Assignment>,
+
+    /// Environments that have a current deployment which this catalog could
+    /// not turn into an assignment. Not an empty list of things to run -
+    /// a list of questions this control plane cannot answer, which is the
+    /// opposite instruction.
+    pub undescribable: Vec<UndescribableEnvironment>,
+}
+
+/// An environment that is deployed and yet cannot be handed to a node.
+///
+/// Today there is exactly one way to get here: the deployment names a
+/// `version_id` with no row behind it. The type names the environment rather
+/// than the reason, because what a caller does about it is the same whatever
+/// broke - leave it out, and say the answer is not the whole truth.
+#[derive(Debug, Clone)]
+pub struct UndescribableEnvironment {
+    pub app_id: String,
+    /// Primary key of the environment row. Control-plane internal.
+    pub environment_id: String,
+    /// Environment name, the half a node would have been told.
+    pub environment: String,
+    /// The version the deployment points at, which is not in the catalog.
+    pub version_id: String,
+}
 
 pub struct CatalogStore {
     db: Arc<Database>,
@@ -787,13 +827,36 @@ impl CatalogStore {
     // ----------------------------------------------------------------
 
     /// Everything that should currently be running, one row per
-    /// environment that has a deployment.
+    /// environment that has a deployment, together with the environments
+    /// this catalog holds a deployment for and could *not* describe.
     ///
     /// Every runtime node runs every app (full replication), so this list
     /// is the same for all nodes; the node id only shapes the log line.
-    pub async fn list_assignments(&self) -> CatalogResult<Vec<Assignment>> {
-        let assignments = self
+    ///
+    /// The second half is why this returns a struct rather than a bare
+    /// `Vec`. A node is allowed to stop serving whatever an authoritative
+    /// list leaves out, so "this row is missing because nothing is deployed
+    /// there" and "this row is missing because this control plane could not
+    /// build it" are two different sentences, and only the first one is an
+    /// instruction. Reporting the second as an ordinary short list is how a
+    /// fault in here becomes an outage out there.
+    pub async fn list_assignments(&self) -> CatalogResult<AssignmentList> {
+        let list = self
             .with_conn(|conn| {
+                // The join onto `versions` is a LEFT JOIN deliberately.
+                // With an inner join, an environment whose current
+                // deployment names a version row that is not there simply
+                // vanished from the result, and the caller - which decides
+                // completeness by "was anything skipped?" - then told the
+                // node its list was the whole truth. That is the platform's
+                // most trusted sentence, and it would have been false.
+                //
+                // The join onto `deployments` stays an inner join, and that
+                // one drops rows for a reason that is not a fault: an
+                // environment nobody has deployed to has nothing to run, so
+                // its absence *is* the truth about it, and a node
+                // reconciling against this answer should indeed be running
+                // nothing for it.
                 let mut stmt = conn.prepare(
                     "SELECT e.app_id, e.id, e.name, d.version_id, v.bundle_sha
                      FROM environments e
@@ -802,31 +865,69 @@ impl CatalogStore {
                          WHERE inner_d.env_id = e.id
                          ORDER BY inner_d.created_at DESC, inner_d.rowid DESC LIMIT 1
                      )
-                     JOIN versions v ON v.id = d.version_id
+                     LEFT JOIN versions v ON v.id = d.version_id
                      ORDER BY e.app_id, e.name",
                 )?;
                 let rows = stmt.query_map([], |row| {
-                    Ok(Assignment {
-                        app_id: row.get(0)?,
-                        environment_id: row.get(1)?,
-                        environment: row.get(2)?,
-                        version_id: row.get(3)?,
-                        bundle_sha: row.get(4)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
                 })?;
+
                 let mut assignments = Vec::new();
+                let mut undescribable = Vec::new();
                 for row in rows {
-                    assignments.push(row?);
+                    let (app_id, environment_id, environment, version_id, bundle_sha) = row?;
+                    match bundle_sha {
+                        Some(bundle_sha) => assignments.push(Assignment {
+                            app_id,
+                            environment_id,
+                            environment,
+                            version_id,
+                            bundle_sha,
+                        }),
+                        None => undescribable.push(UndescribableEnvironment {
+                            app_id,
+                            environment_id,
+                            environment,
+                            version_id,
+                        }),
+                    }
                 }
-                Ok(assignments)
+                Ok(AssignmentList {
+                    assignments,
+                    undescribable,
+                })
             })
             .await?;
 
+        for broken in &list.undescribable {
+            // Error, not warn. No entry point in this crate can produce
+            // this state - version rows are append-only and only the delete
+            // of a whole app removes them, and the connection runs with
+            // `PRAGMA foreign_keys = ON` - so reaching this line means the
+            // database was edited or restored underneath the control plane.
+            // Somebody has to be told, because until it is fixed this
+            // environment runs nowhere.
+            error!(
+                app_id = %broken.app_id,
+                environment = %broken.environment,
+                environment_id = %broken.environment_id,
+                version_id = %broken.version_id,
+                "This environment's current deployment names a version that is not in the catalog, so there is nothing to tell a node to run for it. It is left out of the assignment list, and the list is reported incomplete so that no node reads its absence as a deletion and stops an application that is serving"
+            );
+        }
+
         debug!(
-            assignments = assignments.len(),
+            assignments = list.assignments.len(),
+            undescribable = list.undescribable.len(),
             "Assembled the current assignment list"
         );
-        Ok(assignments)
+        Ok(list)
     }
 
     /// The same set of environments as [`Self::list_assignments`], but
@@ -1154,24 +1255,88 @@ mod tests {
 
         // An environment without a deployment must not appear.
         store.deploy(&production, &v1.id, None).await.unwrap();
-        let assignments = store.list_assignments().await.unwrap();
-        assert_eq!(assignments.len(), 1);
+        let list = store.list_assignments().await.unwrap();
+        assert_eq!(list.assignments.len(), 1);
+        // ...and it is not a gap either: nothing is deployed there, so
+        // there is nothing this control plane failed to describe, and the
+        // answer built from this is the whole truth.
+        assert!(
+            list.undescribable.is_empty(),
+            "an environment with no deployment is not a description failure"
+        );
         // The name goes on the wire and the id stays here; swapping them
         // would hand the node a uuid where it expects "production".
-        assert_eq!(assignments[0].environment, "production");
-        assert_eq!(assignments[0].environment_id, production.id);
-        assert_eq!(assignments[0].bundle_sha, "sha-1");
+        assert_eq!(list.assignments[0].environment, "production");
+        assert_eq!(list.assignments[0].environment_id, production.id);
+        assert_eq!(list.assignments[0].bundle_sha, "sha-1");
 
         store.deploy(&preview, &v2.id, None).await.unwrap();
         store.deploy(&production, &v2.id, None).await.unwrap();
-        let assignments = store.list_assignments().await.unwrap();
-        assert_eq!(assignments.len(), 2);
+        let list = store.list_assignments().await.unwrap();
+        assert_eq!(list.assignments.len(), 2);
         assert!(
-            assignments
+            list.assignments
                 .iter()
                 .all(|assignment| assignment.bundle_sha == "sha-2"),
             "both environments must report the version they run now"
         );
+    }
+
+    /// A deployment pointing at a version that is not there is reported as a
+    /// gap, not silently dropped.
+    ///
+    /// This is the difference between a list that is short and a list that
+    /// says it is complete while being short. The node acts on that sentence:
+    /// a complete list is the whole truth about what it should run, so an
+    /// environment missing from one gets stopped. Dropping this row and still
+    /// claiming completeness would turn a fault inside the control plane into
+    /// a healthy application being unloaded out on the fleet.
+    ///
+    /// The state is reached by deleting the version row with foreign keys
+    /// turned off for that one statement, because no entry point in this
+    /// crate can produce it - which is the point. A database edited by hand
+    /// or restored from a half-finished backup can, and the control plane
+    /// still has to answer honestly about what it is holding.
+    #[tokio::test]
+    async fn a_deployment_whose_version_row_is_missing_is_reported_as_a_gap() {
+        let store = store().await;
+        let production = app_with_env(&store, "demo", "production").await;
+        let broken_env = store.create_environment("demo", "pr-42").await.unwrap();
+        let good = version(&store, "demo", "sha-good").await;
+        let doomed = version(&store, "demo", "sha-doomed").await;
+
+        store.deploy(&production, &good.id, None).await.unwrap();
+        store.deploy(&broken_env, &doomed.id, None).await.unwrap();
+
+        let doomed_id = doomed.id.clone();
+        store
+            .with_conn(move |conn| {
+                conn.execute("PRAGMA foreign_keys = OFF", [])?;
+                conn.execute("DELETE FROM versions WHERE id = ?1", params![doomed_id])?;
+                conn.execute("PRAGMA foreign_keys = ON", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let list = store.list_assignments().await.unwrap();
+
+        assert_eq!(
+            list.assignments.len(),
+            1,
+            "the environment whose version is gone has nothing to run and must not be listed"
+        );
+        assert_eq!(list.assignments[0].environment, "production");
+
+        assert_eq!(
+            list.undescribable.len(),
+            1,
+            "the broken environment must be counted, or the answer built from this list would \
+             claim to be the whole truth while being short by exactly this environment"
+        );
+        assert_eq!(list.undescribable[0].environment, "pr-42");
+        assert_eq!(list.undescribable[0].environment_id, broken_env.id);
+        assert_eq!(list.undescribable[0].version_id, doomed.id);
     }
 
     #[tokio::test]
@@ -1316,9 +1481,13 @@ mod tests {
 
         assert!(store.get_app("demo").await.is_err());
         assert_eq!(store.list_routes(None, None).await.unwrap().len(), 0);
-        let assignments = store.list_assignments().await.unwrap();
-        assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].app_id, "keeper");
+        let list = store.list_assignments().await.unwrap();
+        assert_eq!(list.assignments.len(), 1);
+        assert_eq!(list.assignments[0].app_id, "keeper");
+        assert!(
+            list.undescribable.is_empty(),
+            "deleting an app removes its deployments too, so it leaves no gap behind"
+        );
 
         assert!(store.delete_app("demo").await.is_err());
     }

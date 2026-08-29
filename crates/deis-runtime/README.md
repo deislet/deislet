@@ -91,54 +91,151 @@ A service the application did not declare is not bound, and calling it says
 shape is built by `createServiceContext` in
 [`src/runtime/js/runtime.js`](src/runtime/js/runtime.js).
 
-### Global scope — read this before assuming a Web API is there
+### Global scope — what an application can assume
 
-**This runtime is not WinterCG-compatible, and previous versions of this file
-claimed it was.** The Deno extensions are registered — `deno_web`,
-`deno_fetch`, `deno_crypto`, `deno_websocket`, `deno_net`, `deno_tls` are all
-in `build_runtime_extensions()`, and their ops exist — but registering an
-extension does not install a global. Their JS modules only `export`; the file
-that assigns them onto `globalThis` in Deno itself (`99_main.js`) is not part
-of this runtime.
+The Deno extensions are registered — `deno_web`, `deno_fetch`, `deno_crypto`,
+`deno_websocket`, `deno_net`, `deno_tls` are all in
+`build_runtime_extensions()` — but registering an extension does not install a
+global. Their JS modules only `export`; the file that assigns them onto
+`globalThis` in Deno itself (`99_main.js`) is not part of this runtime, so
+this runtime does that job for itself, in
+[`src/runtime/js/bootstrap.js`](src/runtime/js/bootstrap.js).
 
 Measured inside a real isolate by asking `typeof globalThis[name]`:
 
-**Present:** `Headers`, `Request`, `Response`, `URL`, `URLSearchParams`,
-`EventTarget`, `setTimeout`, `clearTimeout`, `queueMicrotask`, `console`,
-`caches`, `WebSocketPair`, `WebSocketServer`, `TextEncoder`, `TextDecoder`,
-`atob`, `btoa`.
+**Present:** `fetch`, `crypto`, `Headers`, `Request`, `Response`, `URL`,
+`URLSearchParams`, `ReadableStream`, `WritableStream`, `TransformStream`,
+`AbortController`, `AbortSignal`, `DOMException`, `setTimeout`,
+`clearTimeout`, `setInterval`, `clearInterval`, `EventTarget`,
+`queueMicrotask`, `console`, `caches`, `WebSocketPair`, `WebSocketServer`,
+`TextEncoder`, `TextDecoder`, `atob`, `btoa`.
 
-**Absent:** `fetch`, `crypto`, `AbortController`, `AbortSignal`,
-`ReadableStream`, `WritableStream`, `TransformStream`, `Blob`, `File`,
-`FormData`, `URLPattern`, `WebSocket` (the client), `BroadcastChannel`,
-`structuredClone`, `Event`, `setInterval`, `clearInterval`, `performance`,
-`DOMException`, `MessageChannel`, `MessagePort`, `CompressionStream`,
-`DecompressionStream`, `EventSource`, `FileReader`, `navigator`,
+**Absent:** `Deno`, `Blob`, `File`, `FormData`, `URLPattern`, `WebSocket` (the
+client), `BroadcastChannel`, `structuredClone`, `Event`, `performance`,
+`navigator`, `addEventListener`, `MessageChannel`, `MessagePort`,
+`CompressionStream`, `DecompressionStream`, `EventSource`, `FileReader`,
 `reportError`.
 
-That measurement is no longer a one-off. `the_isolate_global_surface_is_the_one_the_documents_describe`
+That covers all of SPECIFICATION_BASIC.md section 8.1. Several of the absent
+names are loaded and working *inside* the isolate — `deno_fetch` needs `Blob`
+and `FormData`, `deno_web` needs `Event` — and are simply not bound to a global
+name, so `response.blob()` returns a `Blob` that an application cannot name.
+The line is deliberate: section 8.1, plus what section 8.1 needs in order to be
+usable, and nothing further.
+
+That measurement is not a one-off. `the_isolate_global_surface_is_the_one_the_documents_describe`
 in `src/runtime/isolate_test.rs` walks both lists in a real isolate and
 asserts **both directions**: a name that should be there and is not fails, and
 so does a name that should not be there and is. Adding a global therefore
 turns that test red until this section is updated with it, which is what keeps
-the two from drifting apart again.
+the two from drifting apart.
 
-Of the present names, `console` and `queueMicrotask` come from `deno_core`'s
-own `01_core.js`; every other one is a minimal stand-in written in
-`src/runtime/js/runtime.js`. They are not the Deno classes, so `Response.json()`
-(the static method) and `Response.prototype.arrayBuffer()` are not there
-either, and request and response bodies are strings — binary payloads do not
-cross the isolate boundary as a request or response body.
+`Request`, `Response`, `Headers`, `URL`, the streams, the timers and `crypto`
+are the real Deno classes, so `Response.json()`, `response.arrayBuffer()` and
+a streaming body all behave as they do in a browser. Two things are this
+platform's own:
 
-`TextEncoder` / `TextDecoder` do UTF-8 and nothing else: any other encoding
-label is a `RangeError` rather than a silent UTF-8 decode. They exist because
-the runtime's own code needs them — `request.arrayBuffer()`, a binary request
-body, `blob.put(key, "a string")`, `blob.get(key).text()` and binary WebSocket
-frames all called them and all raised `ReferenceError` while they were
-missing.
+- `Response` is a thin subclass, so that `new Response(null, { status: 101,
+  webSocket })` — the WebSocket upgrade the dispatcher looks for — can express
+  a status the standard constructor refuses and carry an init member it would
+  otherwise drop. `instanceof Response` accepts a native `Response` too, so
+  `return fetch(upstream)` works.
+- `TextEncoder` / `TextDecoder` are hand-written and do UTF-8 and nothing else:
+  any other encoding label is a `RangeError` rather than a silent UTF-8 decode.
+  UTF-8 is the only encoding the canon asks for, and an application that
+  happened to work here on `iso-8859-1` would be relying on something the canon
+  does not promise.
 
-`fetch` being absent is the sharpest edge: Edge Canon lists it as a basic
-feature, and calling it in a handler raises a `ReferenceError`.
+Request and response bodies still cross the Rust/JS boundary as strings, so a
+binary payload is not carried through as a request or response body.
+
+### Outbound `fetch` is policed
+
+An edge platform cannot hand an application an unrestricted HTTP client. This
+node's own services — deis-store, deis-queue, deis-control, deis-telemetry —
+listen on loopback and believe the tenant header they are given, so a `fetch`
+with no policy behind it is a read of every other application's data.
+
+So `fetch` is **deny by default and allow by exception**:
+
+- Public internet destinations are allowed. Everything else is refused:
+  loopback, the private ranges, link-local (which is where a cloud instance's
+  metadata service answers with its credentials), unique-local and link-local
+  IPv6, multicast, broadcast, the unspecified address, and the ranges reserved
+  for documentation, benchmarking, carrier NAT and future use. An IPv4 address
+  written as IPv6 (`::ffff:127.0.0.1`) is judged as the IPv4 address it is.
+- The check is on the **resolved address**, not the hostname: a name that
+  resolves to `127.0.0.1` is refused. A name is judged twice — once before the
+  call, which is where the error message and the log line come from, and again
+  inside the HTTP client's DNS resolver, which returns only addresses the
+  policy accepts, so a rebind between the two cannot produce a connection.
+- The platform's own service endpoints are refused whatever the allowlist says.
+- A refusal is logged at `warn` with the application, the destination and the
+  reason, and reaches the handler as a `TypeError` it can catch. Nothing is
+  dialled.
+- A **redirect** is a destination the application never named, and `fetch`
+  follows one by default, so the blocked ranges are also handed to deno's own
+  net permission as a deny list — which it checks inside `op_fetch`, on every
+  hop. A `Location:` pointing at `http://127.0.0.1:8090/` is refused there.
+
+An operator who has an internal service applications are meant to call opens it
+with `[fetch] allow` in the node's configuration (`host`, `host:port`, or a
+whole URL; an entry with no port covers every port on that host). That list
+cannot be widened into the platform's own services.
+
+#### What the redirect backstop still does not cover
+
+Both of these were measured against a running node, not reasoned about, and
+both are limits of the *redirect* layer only: every destination an application
+names itself goes through the full check above, IPv6 and ports included.
+
+- **IPv6 ranges.** deno's net descriptor has no spelling for an IPv6 subnet —
+  it reads `fc00::/7` as a host and a port and gives up — so the deny list
+  carries the IPv4 ranges and the two exact addresses `::1` and `::`, and not
+  `fc00::/7` or `fe80::/10`. A `Location:` naming an IPv6 unique-local or
+  link-local *literal* is refused by nothing; deno logs
+  `Granted net access to "[fd00::1]:8091"` and follows it. Closing this needs
+  either an upstream descriptor that can carry an IPv6 prefix, or following
+  redirects in the wrapper with `redirect: "manual"` so every hop is checked.
+- **Other ports on an address an operator opened.** A deny list has no per-port
+  exception, so an allowlist entry that is a literal address is punched out of
+  the range covering it — one address, every port. The platform's own endpoints
+  are written into the deny list as exact `host:port` entries precisely so this
+  cannot swallow them, in both their IPv4 and IPv4-mapped-IPv6 spellings, since
+  deno matches the host as the URL writes it. Anything *else* the node happens
+  to run on that address is still reachable through a redirect. An allowlist
+  entry that is a **name** has none of this problem and is the shape to prefer.
+
+#### An HTTP proxy in the node's environment moves the socket
+
+`deno_fetch` builds its client with `proxy::from_env()`, unconditionally and
+with no option to suppress it, so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+`NO_PROXY` in the **node process's** environment decide where an application's
+`fetch` actually connects. When a proxy intercepts, the connector dials the
+proxy and the destination travels as a `CONNECT` target, which means the
+policy's DNS resolver resolves the proxy's host and never sees the
+destination's.
+
+The pre-flight check and the deny list still judge the URL, so a destination an
+application names is refused exactly as before. What is lost is the rebinding
+guarantee — the name is resolved once here and once more by the proxy, and
+nothing in this process constrains the second answer. An operator who wants
+that guarantee has to keep those variables out of the environment
+deis-runtime starts in.
+
+The reasoning and the address classification are in
+[`src/runtime/fetch_policy.rs`](src/runtime/fetch_policy.rs).
+
+### Timers do not outlive the request
+
+An isolate is reused: one per (application, environment) on each node, handed
+every later request. A `setTimeout` left pending is bounded — it fires once and
+is gone — so it is left alone, which is also what makes `waitUntil` usable. A
+`setInterval` never stops on its own, so one created per request would
+accumulate without bound, firing inside every later request in that isolate and
+spending its rate-limit budget. Intervals are therefore tracked and cleared at
+the end of each invocation, after `waitUntil` work has been awaited; the
+application is told at `warn` when one had to be swept.
 
 ## Remote debugging
 

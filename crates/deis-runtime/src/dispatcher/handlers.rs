@@ -139,9 +139,18 @@ pub async fn handle_request(
         }
     }
 
-    // Add WebSocket upgrade flag
+    // Add WebSocket upgrade flag.
+    //
+    // Lower-cased deliberately, because the loop above spells every name the
+    // way `HeaderName` prints it, which is lower case. Spelled `Upgrade` this
+    // was a *second* entry beside the client's own `upgrade`, and once the
+    // isolate started building a standard `Headers` out of this map -- which
+    // appends rather than overwrites -- `request.headers.get("upgrade")`
+    // answered "websocket, websocket". Every handler that compares it to
+    // "websocket" then took its non-upgrade branch and the handshake never
+    // happened.
     if ws.is_some() {
-        header_map.insert("Upgrade".to_string(), "websocket".to_string());
+        header_map.insert("upgrade".to_string(), "websocket".to_string());
     }
 
     let body_opt = if body.is_empty() { None } else { Some(body) };

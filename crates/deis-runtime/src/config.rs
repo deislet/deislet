@@ -107,6 +107,10 @@ pub struct RuntimeConfig {
     /// How static assets out of a bundle are served.
     #[serde(default)]
     pub assets: AssetsConfig,
+
+    /// Where an application's `fetch()` is allowed to go.
+    #[serde(default)]
+    pub fetch: FetchConfig,
 }
 
 fn default_http_port() -> u16 {
@@ -133,6 +137,7 @@ impl Default for RuntimeConfig {
             control: ControlPlaneConfig::default(),
             bundles: BundleConfig::default(),
             assets: AssetsConfig::default(),
+            fetch: FetchConfig::default(),
         }
     }
 }
@@ -315,6 +320,41 @@ impl Default for AssetsConfig {
             cache_control: default_asset_cache_control(),
             max_bytes: default_max_asset_bytes(),
         }
+    }
+}
+
+/// Where an application's outbound `fetch()` may go.
+///
+/// The policy itself is deny-by-default and lives in
+/// `crate::runtime::fetch_policy`, which explains what it refuses and why.
+/// This is only the one dial an operator has: the list of destinations that
+/// are opened up despite not being public.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FetchConfig {
+    /// Non-public destinations applications on this node may nevertheless
+    /// reach, as `host` or `host:port` (an entry with no port covers every
+    /// port on that host), e.g. `["internal-api.svc:8443", "10.4.0.7"]`.
+    ///
+    /// This is the escape hatch for a deployment whose applications are meant
+    /// to call an internal service. It cannot be widened into the platform's
+    /// own services: deis-store, deis-queue, deis-control and deis-telemetry
+    /// are refused after this list has been consulted, so an entry that
+    /// happens to cover one of them still does not reach it.
+    ///
+    /// Empty, the default, means applications may reach public internet
+    /// destinations and nothing else.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl FetchConfig {
+    fn validate(&self) -> Result<()> {
+        // Parsed here rather than at first use so that a typo is an operator's
+        // startup error and not a request that mysteriously still fails months
+        // later. The parse is the same one the policy does.
+        crate::runtime::FetchPolicy::new(&self.allow, Vec::<String>::new())
+            .map_err(|e| anyhow!("fetch.allow is not a list of host or host:port entries: {e}"))?;
+        Ok(())
     }
 }
 
@@ -516,6 +556,17 @@ impl RuntimeConfig {
             )?;
         }
 
+        if let Some(value) = env_var("DEIS_RUNTIME_FETCH_ALLOW") {
+            // Comma-separated, because that is what an environment variable
+            // can carry; the TOML form is a list.
+            self.fetch.allow = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+
         if let Some(value) = env_var("DEIS_RUNTIME_LOGGING_ENABLED") {
             self.logging.enabled = parse_env(&value, "DEIS_RUNTIME_LOGGING_ENABLED", "true|false")?;
         }
@@ -690,6 +741,7 @@ impl RuntimeConfig {
         self.control.validate()?;
         self.bundles.validate()?;
         self.assets.validate()?;
+        self.fetch.validate()?;
 
         Ok(())
     }
@@ -958,6 +1010,40 @@ mod tests {
             config.default_execution_limits.rate_limit_ops_per_sec,
             250.0
         );
+    }
+
+    #[test]
+    fn the_fetch_allowlist_is_read_and_defaults_to_empty() {
+        let config: RuntimeConfig = toml::from_str("http_port = 9000").unwrap();
+        assert!(
+            config.fetch.allow.is_empty(),
+            "a node that says nothing about fetch must let applications reach public \
+             destinations and nothing else"
+        );
+
+        let toml_str = r#"
+            [fetch]
+            allow = ["internal-api.svc:8443", "10.4.0.7"]
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.fetch.allow, ["internal-api.svc:8443", "10.4.0.7"]);
+        config
+            .validate()
+            .expect("both of those are shapes the policy accepts");
+    }
+
+    #[test]
+    fn a_fetch_allowlist_entry_that_is_not_a_host_fails_startup() {
+        // Silently ignoring it would leave the operator believing an internal
+        // service was reachable; they would only find out from an application
+        // failing in production.
+        let toml_str = r#"
+            [fetch]
+            allow = ["not a host at all"]
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let error = config.validate().expect_err("that entry is not a host");
+        assert!(error.to_string().contains("fetch.allow"), "{error}");
     }
 
     #[test]

@@ -1,0 +1,1012 @@
+//! Where an application's `fetch()` may go, and where it may not.
+//!
+//! # Why an outbound call needs a policy at all
+//!
+//! Until `fetch` existed in an isolate, deis-store's only protection was that
+//! nothing but this process could reach it: it trusts the `x-deis-tenant`
+//! header it is given and listens on loopback. The moment an application can
+//! open an outbound HTTP connection, that stops being protection. A handler
+//! could `POST http://127.0.0.1:8090` with any tenant header it liked and read
+//! or delete another application's keys, rows and blobs. The same reasoning
+//! covers deis-queue, deis-control (which holds every node's credentials and
+//! every application's secrets) and deis-telemetry.
+//!
+//! So an outbound destination is **denied by default and allowed by
+//! exception**, which is also the model an edge platform is expected to have:
+//! the public internet is reachable, the machine and the network the node
+//! happens to sit on are not.
+//!
+//! # What is refused
+//!
+//! Every address that is not a public one: loopback, the private ranges, the
+//! link-local range (which is where a cloud instance's metadata service lives,
+//! `169.254.169.254`, and reading that is how a node's cloud credentials
+//! leak), unique-local and link-local IPv6, multicast, broadcast, the
+//! unspecified address, and the ranges reserved for documentation,
+//! benchmarking, carrier NAT and future use. An IPv4 address written as IPv6
+//! (`::ffff:127.0.0.1`) is classified as the IPv4 address it is, because it
+//! reaches the same machine.
+//!
+//! # The address, not the name
+//!
+//! The check is on the **resolved address**. A name under an attacker's
+//! control can be pointed at `127.0.0.1` as easily as it can be pointed
+//! anywhere else, so a policy that only reads the hostname string is
+//! decoration.
+//!
+//! ## The gap between resolving and connecting
+//!
+//! Resolving a name in order to judge it, and then handing the *name* to the
+//! HTTP client so that it resolves it again, leaves a window: the second
+//! answer can differ from the first. That is DNS rebinding, and it is the
+//! standard way past a check like this one. It is closed here in two layers,
+//! which between them cover both kinds of destination:
+//!
+//! * A URL whose host is an **IP literal** involves no DNS at all. The
+//!   connector parses it directly and never calls a resolver, so
+//!   [`FetchPolicy::check`] is both the first and the last word, and there is
+//!   no window to exploit.
+//! * A URL whose host is a **name** is resolved twice: once by
+//!   [`FetchPolicy::check`], which produces the refusal message and the log
+//!   line, and once by the connector -- through [`PolicyResolver`], which is
+//!   installed as `deno_fetch`'s resolver and returns *only* addresses this
+//!   policy accepts. The socket can therefore only be opened to an address
+//!   the policy approved, whatever the name resolved to a moment earlier. A
+//!   rebind between the two lookups changes which of the two layers refuses
+//!   the call, and the wording of the error; it cannot produce a connection.
+//!
+//! ## Redirects
+//!
+//! A redirect is a second destination that the application never named, and
+//! `fetch` follows one by default. deno re-enters `op_fetch` for each hop, so
+//! the hop that matters never passes [`FetchPolicy::check`], which runs once,
+//! in front of the call. A hop to a *name* is still caught by
+//! [`PolicyResolver`]; a hop to an IP literal would not be caught by anything.
+//!
+//! That last gap is closed by [`FetchPolicy::denied_net_ranges`], which hands
+//! the blocked ranges to deno's own net permission as a deny list. deno checks
+//! it inside `op_fetch`, on every hop, against the address in the URL -- so a
+//! `Location:` pointing at `http://127.0.0.1:8090/` is refused there even
+//! though nothing in this module saw it. It is a backstop and not the policy:
+//! it cannot see ports, and it does not fire for a hostname, both of which the
+//! two layers above handle.
+//!
+//! ### What that backstop still does not reach
+//!
+//! It is a backstop and not the policy, and two holes in it are known and
+//! measured rather than assumed. Both are holes in *redirect* handling only:
+//! every destination an application names itself goes through
+//! [`FetchPolicy::check`] in full, IPv6 and ports included.
+//!
+//! **IPv6 ranges.** deno's net descriptor has no spelling for an IPv6
+//! *subnet* -- it parses `fc00::/7` as a host and a port and gives up -- so
+//! the deny list carries the IPv4 ranges and the two exact IPv6 addresses
+//! `::1` and `::`, and not `fc00::/7` or `fe80::/10`. A `Location:` naming an
+//! IPv6 unique-local or link-local *literal*, or the IPv4-mapped spelling
+//! `[::ffff:127.0.0.1]`, is refused by nothing here; deno logs it as
+//! "Granted net access". Closing it needs either an upstream descriptor that
+//! can carry an IPv6 prefix, or following redirects in the wrapper with
+//! `redirect: "manual"` so that every hop passes [`FetchPolicy::check`].
+//!
+//! **Ports on an address the operator opened.** A deny list has no per-port
+//! exception, so an allowlist entry that is a literal address is punched out
+//! of the range that covers it -- one address wide, every port. Every other
+//! port on that address then becomes a legal redirect hop. The platform's own
+//! endpoints are named explicitly in the deny list for exactly this reason
+//! (see [`FetchPolicy::denied_net_ranges`]), so they are not among those
+//! ports; anything *else* the node happens to run on that address is. An
+//! allowlist entry that is a *name* has none of this problem, and is the
+//! shape to prefer: deno compares the URL's host against these entries, and a
+//! hostname never matches an address range.
+//!
+//! ## An HTTP proxy in the node's environment moves the socket
+//!
+//! `deno_fetch` builds its client with `proxy::from_env()`, unconditionally
+//! and with no option to suppress it, so `HTTP_PROXY`, `HTTPS_PROXY`,
+//! `ALL_PROXY` and `NO_PROXY` in the *node process's* environment decide where
+//! an application's `fetch` actually connects. When a proxy intercepts, the
+//! connector dials the proxy and the destination travels as a `CONNECT`
+//! target or a request line, which means [`PolicyResolver`] resolves the
+//! proxy's host and never sees the destination's.
+//!
+//! [`FetchPolicy::check`] and the deny list still judge the URL, so a
+//! destination the application names is refused exactly as before. What is
+//! lost is the rebinding guarantee: the name is resolved once here and once
+//! more by the proxy, and nothing in this process constrains the second
+//! answer. An operator who wants that guarantee has to keep those variables
+//! out of the environment deis-runtime is started in.
+//!
+//! # The platform's own services are not merely denied by default
+//!
+//! An operator may widen this policy for their own internal APIs
+//! (`[fetch] allow` in the node's configuration). They must not be able to
+//! widen it into deis-store by accident, so the platform's own endpoints are
+//! refused *after* the allowlist has been consulted rather than before, and no
+//! allowlist entry can reach them -- on the way in through
+//! [`FetchPolicy::check`], and on a redirect hop through the explicit entries
+//! [`FetchPolicy::denied_net_ranges`] adds.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+
+use deno_core::url::{Host, Url};
+use hyper_util::client::legacy::connect::dns::Name;
+
+/// One `host` or `host:port` an operator wrote down, either as an allowlist
+/// entry or as one of the platform's own service endpoints.
+///
+/// An entry that names no port matches every port on that host. That is the
+/// wider reading on purpose: an operator writing `internal-api.svc` means the
+/// service, and a policy that silently only covered port 80 would send them
+/// hunting for why their allowlist "did not work".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostPort {
+    /// Lower-cased, without the brackets an IPv6 URL host carries.
+    host: String,
+    /// The address `host` is, when it is a literal rather than a name. Kept
+    /// alongside the string so a resolved address can be compared with a
+    /// platform endpoint without resolving anything.
+    addr: Option<IpAddr>,
+    port: Option<u16>,
+}
+
+impl HostPort {
+    /// Parse `host`, `host:port`, `[v6]`, `[v6]:port`, or a whole URL
+    /// (`http://host:port`), which is the shape the platform's own endpoints
+    /// are configured in.
+    fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("an empty entry names no destination".to_string());
+        }
+
+        // A configured service endpoint is a URL; an allowlist entry is
+        // usually bare. Try the URL reading first, and only when it actually
+        // carries a scheme, so that `example.com:8080` is not read as the
+        // scheme `example.com`.
+        if raw.contains("://") {
+            let url = Url::parse(raw).map_err(|e| format!("{raw:?} is not a URL: {e}"))?;
+            let host = url.host().ok_or_else(|| format!("{raw:?} names no host"))?;
+            return Ok(Self::from_host(host, url.port_or_known_default()));
+        }
+
+        let (host, port) = split_host_port(raw)?;
+        // `url`'s host parser wants an IPv6 address in brackets, and the
+        // brackets are exactly what the split above took off -- so an address
+        // is recognised here rather than handed back as a malformed name.
+        if let Ok(v6) = host.parse::<Ipv6Addr>() {
+            return Ok(Self::from_host(Host::<&str>::Ipv6(v6), port));
+        }
+        let host = Host::parse(&host).map_err(|e| format!("{raw:?} is not a host: {e}"))?;
+        Ok(Self::from_host(host, port))
+    }
+
+    fn from_host<S: AsRef<str>>(host: Host<S>, port: Option<u16>) -> Self {
+        let (host, addr) = match host {
+            Host::Domain(name) => (name.as_ref().to_ascii_lowercase(), None),
+            Host::Ipv4(v4) => (v4.to_string(), Some(IpAddr::V4(v4))),
+            Host::Ipv6(v6) => (v6.to_string(), Some(IpAddr::V6(v6))),
+        };
+        Self { host, addr, port }
+    }
+
+    /// Does this entry cover the destination `(host, port)`?
+    ///
+    /// `port` is `None` when the caller does not know it -- the DNS layer is
+    /// asked for a name with no port attached. An entry that names a port then
+    /// still matches, because refusing to match would make the backstop
+    /// *narrower* than the gate in front of it, which is the wrong direction
+    /// for a backstop.
+    fn covers(&self, host: &str, port: Option<u16>) -> bool {
+        if !self.host.eq_ignore_ascii_case(host) {
+            return false;
+        }
+        match (self.port, port) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => true,
+        }
+    }
+
+    /// Does this entry name exactly this address, on this port?
+    ///
+    /// Used for the platform's endpoints: an allowlist that opened up a whole
+    /// internal subnet must still not reach deis-store, and the application
+    /// may well have spelled it under a different name than the one the
+    /// deployment configured.
+    fn covers_addr(&self, addr: IpAddr, port: Option<u16>) -> bool {
+        let Some(mine) = self.addr else {
+            return false;
+        };
+        if mine != addr {
+            return false;
+        }
+        match (self.port, port) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => true,
+        }
+    }
+
+    /// How deno's net descriptor spells this entry, for the deny list.
+    ///
+    /// An IPv6 address has to be bracketed, and an entry that names no port
+    /// is written bare, which deno reads as every port on that host.
+    ///
+    /// An IPv4 address gets a second descriptor, its IPv4-mapped IPv6 form.
+    /// deno matches a deny entry against the host *as the URL spells it*, and
+    /// `http://[::ffff:127.0.0.1]:8085/` reaches the same socket as
+    /// `http://127.0.0.1:8085/` while matching neither the address nor any
+    /// IPv4 range. Measured, not assumed: without the second spelling deno
+    /// logs "Granted net access to `[::ffff:127.0.0.1]:8085`" for a redirect
+    /// to the control plane.
+    fn to_deno_descriptors(&self) -> Vec<String> {
+        let with_port = |host: String| match self.port {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
+        match self.addr {
+            Some(IpAddr::V6(v6)) => vec![with_port(format!("[{v6}]"))],
+            Some(IpAddr::V4(v4)) => vec![
+                with_port(v4.to_string()),
+                with_port(format!("[{}]", v4.to_ipv6_mapped())),
+            ],
+            None => vec![with_port(self.host.clone())],
+        }
+    }
+}
+
+fn split_host_port(raw: &str) -> Result<(String, Option<u16>), String> {
+    if let Some(rest) = raw.strip_prefix('[') {
+        // `[::1]` or `[::1]:8090`
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("{raw:?} opens a bracket it never closes"))?;
+        let port = match tail {
+            "" => None,
+            _ => Some(parse_port(tail.trim_start_matches(':'), raw)?),
+        };
+        return Ok((host.to_string(), port));
+    }
+
+    match raw.rsplit_once(':') {
+        // More than one colon and no brackets: a bare IPv6 address.
+        Some(_) if raw.matches(':').count() > 1 => Ok((raw.to_string(), None)),
+        Some((host, port)) => Ok((host.to_string(), Some(parse_port(port, raw)?))),
+        None => Ok((raw.to_string(), None)),
+    }
+}
+
+fn parse_port(raw: &str, whole: &str) -> Result<u16, String> {
+    raw.parse::<u16>()
+        .map_err(|_| format!("{whole:?} does not end in a port number"))
+}
+
+/// Why one outbound call was not made.
+///
+/// Each variant carries what the application needs in order to fix its own
+/// code, and nothing about the node it happens to be running on: an
+/// application learns that a destination is out of bounds, not which internal
+/// addresses exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Not a URL, or a URL with no host to judge.
+    Unaddressable(String),
+    /// A scheme this platform does not let an application open. `file:` is the
+    /// one that matters: it is the node's own disk.
+    Scheme(String),
+    /// A platform service endpoint. Refused whatever the allowlist says.
+    PlatformService,
+    /// The destination resolves to an address applications may not reach.
+    BlockedAddress { addr: IpAddr, kind: &'static str },
+    /// The name does not resolve, so there is nothing to judge and nothing to
+    /// connect to either.
+    Unresolvable { host: String, error: String },
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unaddressable(what) => {
+                write!(f, "{what} is not an absolute http(s) URL")
+            }
+            Self::Scheme(scheme) => write!(
+                f,
+                "the {scheme}: scheme is not available to applications; fetch() may open http \
+                 and https destinations only"
+            ),
+            Self::PlatformService => write!(
+                f,
+                "that address is one of the platform's own service endpoints, which no \
+                 application may call directly; use ctx.services instead"
+            ),
+            Self::BlockedAddress { addr, kind } => write!(
+                f,
+                "it resolves to {addr}, which is {kind}. Applications may only reach public \
+                 internet destinations; ask the operator to add the host to [fetch] allow if \
+                 this is an internal service the application is meant to reach"
+            ),
+            Self::Unresolvable { host, error } => {
+                write!(f, "the host {host} could not be resolved: {error}")
+            }
+        }
+    }
+}
+
+/// The rules, shared by every isolate that was built with the same node
+/// configuration. Behind an `Arc` because a copy travels into every
+/// `IsolateSpec` and into the DNS resolver of every isolate's HTTP client.
+#[derive(Debug, Default)]
+struct Rules {
+    /// Destinations an operator has opened up even though they are not public.
+    allow: Vec<HostPort>,
+    /// The platform's own services. Refused regardless of `allow`.
+    platform: Vec<HostPort>,
+}
+
+/// The outbound-fetch policy of one isolate.
+#[derive(Debug, Clone, Default)]
+pub struct FetchPolicy {
+    rules: Arc<Rules>,
+}
+
+impl FetchPolicy {
+    /// Build the node's policy.
+    ///
+    /// `allow` is what the operator wrote under `[fetch] allow`; `platform` is
+    /// every address of this platform's own services that is known at this
+    /// point. Both are `host`, `host:port` or a whole URL. A malformed entry
+    /// is an error rather than a skipped line: an allowlist entry that is
+    /// silently ignored looks exactly like one that worked, and a platform
+    /// entry that is silently ignored is a hole.
+    pub fn new<A, P>(allow: A, platform: P) -> Result<Self, String>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<str>,
+        P: IntoIterator,
+        P::Item: AsRef<str>,
+    {
+        let allow = allow
+            .into_iter()
+            .map(|e| HostPort::parse(e.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let platform = platform
+            .into_iter()
+            .map(|e| HostPort::parse(e.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            rules: Arc::new(Rules { allow, platform }),
+        })
+    }
+
+    /// The same policy, plus service endpoints this application in particular
+    /// was wired to.
+    ///
+    /// The node's own configuration knows where deis-control and
+    /// deis-telemetry are; where deis-store and deis-queue are arrives per
+    /// deployment, in the application's wiring, so it can only be added when
+    /// the isolate is built. A malformed address here is reported and dropped
+    /// rather than failing the load: the same string is validated where the
+    /// clients are built, and refusing to start an application because a
+    /// *deny* rule could not be parsed would take the application down over a
+    /// value that was never going to be reachable anyway.
+    pub fn with_platform_endpoints<I>(&self, endpoints: I, app_id: &str) -> Self
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let mut platform = self.rules.platform.clone();
+        for entry in endpoints {
+            match HostPort::parse(entry.as_ref()) {
+                Ok(parsed) => {
+                    if !platform.contains(&parsed) {
+                        platform.push(parsed);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "app",
+                    app_id = %app_id,
+                    "Could not read a platform service address into the outbound fetch policy \
+                     of {}: {}. That address is still refused by the deny-by-default rule \
+                     unless an allowlist entry covers it",
+                    app_id,
+                    e
+                ),
+            }
+        }
+        Self {
+            rules: Arc::new(Rules {
+                allow: self.rules.allow.clone(),
+                platform,
+            }),
+        }
+    }
+
+    /// Judge one destination, resolving its host if it is a name.
+    ///
+    /// The order is deliberate: scheme, then the platform's own services, then
+    /// the allowlist, then the address ranges. The platform check comes before
+    /// the allowlist so that no allowlist entry can reach deis-store, and the
+    /// allowlist comes before the ranges so that an operator's internal
+    /// service is reachable.
+    pub async fn check(&self, url: &str) -> Result<(), Refusal> {
+        let parsed = Url::parse(url).map_err(|_| Refusal::Unaddressable(format!("{url:?}")))?;
+
+        match parsed.scheme() {
+            "http" | "https" => {}
+            // `data:` and `blob:` never leave the isolate, so they are not the
+            // business of a network policy.
+            "data" | "blob" => return Ok(()),
+            other => return Err(Refusal::Scheme(other.to_string())),
+        }
+
+        let port = parsed.port_or_known_default();
+        let host = parsed
+            .host()
+            .ok_or_else(|| Refusal::Unaddressable(format!("{url:?}")))?;
+        let host_text = match host {
+            Host::Domain(name) => name.to_ascii_lowercase(),
+            Host::Ipv4(v4) => v4.to_string(),
+            Host::Ipv6(v6) => v6.to_string(),
+        };
+
+        if self.names_a_platform_service(&host_text, port) {
+            return Err(Refusal::PlatformService);
+        }
+
+        // A literal address needs no lookup, and the connector will not do one
+        // either -- see the module comment on the resolve/connect gap.
+        let addresses: Vec<IpAddr> = match host {
+            Host::Ipv4(v4) => vec![IpAddr::V4(v4)],
+            Host::Ipv6(v6) => vec![IpAddr::V6(v6)],
+            Host::Domain(name) => {
+                resolve(name, port.unwrap_or(0))
+                    .await
+                    .map_err(|e| Refusal::Unresolvable {
+                        host: name.to_string(),
+                        error: e.to_string(),
+                    })?
+            }
+        };
+
+        // Checked on the resolved addresses too: an allowlist that opened a
+        // whole internal subnet by name must still not reach deis-store, and
+        // an application can spell the same machine under a name of its own.
+        for addr in &addresses {
+            if self.is_a_platform_service_address(*addr, port) {
+                return Err(Refusal::PlatformService);
+            }
+        }
+
+        if self.is_allowlisted(&host_text, port) {
+            return Ok(());
+        }
+
+        // Every address, not just the first: a name that resolves to one
+        // public address and one loopback address is exactly the shape an
+        // attack takes, and the client is free to try any of them.
+        for addr in addresses {
+            if let Some(kind) = blocked_reason(addr) {
+                return Err(Refusal::BlockedAddress { addr, kind });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn names_a_platform_service(&self, host: &str, port: Option<u16>) -> bool {
+        self.rules.platform.iter().any(|e| e.covers(host, port))
+    }
+
+    fn is_a_platform_service_address(&self, addr: IpAddr, port: Option<u16>) -> bool {
+        self.rules
+            .platform
+            .iter()
+            .any(|e| e.covers_addr(addr, port))
+    }
+
+    fn is_allowlisted(&self, host: &str, port: Option<u16>) -> bool {
+        self.rules.allow.iter().any(|e| e.covers(host, port))
+    }
+
+    /// The blocked ranges as deno's net permission spells them, for
+    /// `PermissionsOptions::deny_net`.
+    ///
+    /// This is the redirect backstop described in the module comment: deno
+    /// applies it inside `op_fetch`, on every hop, so a `Location:` header
+    /// pointing at a loopback or private address is refused even though it was
+    /// never handed to [`Self::check`].
+    ///
+    /// An address the operator's allowlist opens is *punched out* of the range
+    /// that covers it, rather than the range being dropped. deno's deny list
+    /// wins over its allow list with no way to spell an exception, so keeping
+    /// the range whole would refuse a destination the operator deliberately
+    /// opened; dropping the range would leave the rest of it -- the whole of
+    /// `127.0.0.0/8` because one node allows `127.0.0.1` -- unchecked at
+    /// redirect time. Splitting it keeps both promises, at the cost of a
+    /// handful more entries in a list deno holds in a set.
+    ///
+    /// The hole is one address wide and covers every port on it, because a
+    /// deny list cannot carry a per-port exception. The pre-flight check is
+    /// still port-exact for every destination an application names itself.
+    ///
+    /// An allowlist entry that is a *name* needs no hole: deno compares the
+    /// URL's host against these entries, and a hostname never matches an
+    /// address range.
+    pub fn denied_net_ranges(&self, app_id: &str) -> Vec<String> {
+        let opened: Vec<IpAddr> = self
+            .rules
+            .allow
+            .iter()
+            .filter_map(|entry| entry.addr)
+            .collect();
+
+        let mut denied = Vec::new();
+        for range in ranges_deno_can_deny() {
+            for piece in range.without(&opened) {
+                denied.push(piece.to_deno_descriptor());
+            }
+        }
+
+        // The platform's own endpoints, named exactly, on top of the ranges.
+        //
+        // Without these the hole punched just above would swallow them. An
+        // operator who opens one address on the node -- `127.0.0.1:8095`, the
+        // shape the demo ships -- takes the whole of that address out of the
+        // deny list, because deno's deny list has no per-port exception. Every
+        // other port on it then becomes a legal redirect hop, and on a node
+        // that is where deis-control, deis-store, deis-queue and
+        // deis-telemetry all live. A `Location:` pointing at the control
+        // plane's REST API would have been followed.
+        //
+        // Naming them here costs a handful of entries and restores what
+        // `check` promises on the way in: an allowlist may widen the policy,
+        // and it may not widen it into the platform. Entries with no port
+        // cover every port on that host, which is the same reading `covers`
+        // takes.
+        let platform: Vec<String> = self
+            .rules
+            .platform
+            .iter()
+            .flat_map(|entry| entry.to_deno_descriptors())
+            .collect();
+        let platform_entries = platform.len();
+        denied.extend(platform);
+
+        tracing::debug!(
+            target: "app",
+            app_id = %app_id,
+            entries = denied.len(),
+            opened = opened.len(),
+            platform_entries,
+            "Outbound fetch redirect backstop for {}: {} denied entries, of which {} name the \
+             platform's own services, with {} address(es) punched out for the operator's \
+             allowlist",
+            app_id,
+            denied.len(),
+            platform_entries,
+            opened.len()
+        );
+        denied
+    }
+
+    /// How many destinations an operator has opened up. For the startup line;
+    /// the entries themselves are not logged, because an allowlist is a map of
+    /// the internal network.
+    pub fn allowlist_len(&self) -> usize {
+        self.rules.allow.len()
+    }
+}
+
+/// One range of addresses applications may not reach, in the form deno's net
+/// permission accepts.
+///
+/// This table and [`blocked_reason`] are two spellings of one decision, and
+/// `the_two_spellings_of_the_blocked_set_agree` holds them together: the
+/// classifier is what an application is told and why, this is what deno
+/// enforces on a redirect hop nothing else sees.
+#[derive(Debug, Clone, Copy)]
+struct BlockedRange {
+    net: IpAddr,
+    prefix: u8,
+}
+
+impl BlockedRange {
+    fn contains(&self, addr: IpAddr) -> bool {
+        match (self.net, addr) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => {
+                let shift = 32 - u32::from(self.prefix);
+                let mask = if shift == 32 { 0 } else { u32::MAX << shift };
+                u32::from(net) & mask == u32::from(addr) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => {
+                let shift = 128 - u32::from(self.prefix);
+                let mask = if shift == 128 { 0 } else { u128::MAX << shift };
+                u128::from(net) & mask == u128::from(addr) & mask
+            }
+            // An IPv4 range never covers an IPv6 address and the other way
+            // round; the IPv4-in-IPv6 spellings are separate entries below.
+            _ => false,
+        }
+    }
+
+    /// This range with `excluded` taken out of it, as the smallest set of
+    /// ranges that covers the rest.
+    ///
+    /// Splitting in halves and recursing is the standard way to subtract an
+    /// address from a network: a half that contains none of the excluded
+    /// addresses is kept whole, and only the halves that do are split further.
+    /// One address out of a `/8` becomes 24 ranges, which is why this is not
+    /// done for the ranges nobody opened.
+    fn without(self, excluded: &[IpAddr]) -> Vec<BlockedRange> {
+        if !excluded.iter().any(|addr| self.contains(*addr)) {
+            return vec![self];
+        }
+
+        let full_width = match self.net {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if self.prefix >= full_width {
+            // The excluded address *is* this range.
+            return Vec::new();
+        }
+
+        let Some((lower, upper)) = self.halves() else {
+            return vec![self];
+        };
+        let mut out = lower.without(excluded);
+        out.extend(upper.without(excluded));
+        out
+    }
+
+    /// The two halves of this range, or `None` for a single address.
+    fn halves(self) -> Option<(BlockedRange, BlockedRange)> {
+        let prefix = self.prefix + 1;
+        match self.net {
+            IpAddr::V4(net) => {
+                if prefix > 32 {
+                    return None;
+                }
+                let bit = 1u32 << (32 - u32::from(prefix));
+                Some((
+                    BlockedRange {
+                        net: IpAddr::V4(net),
+                        prefix,
+                    },
+                    BlockedRange {
+                        net: IpAddr::V4(Ipv4Addr::from(u32::from(net) | bit)),
+                        prefix,
+                    },
+                ))
+            }
+            IpAddr::V6(net) => {
+                if prefix > 128 {
+                    return None;
+                }
+                let bit = 1u128 << (128 - u32::from(prefix));
+                Some((
+                    BlockedRange {
+                        net: IpAddr::V6(net),
+                        prefix,
+                    },
+                    BlockedRange {
+                        net: IpAddr::V6(Ipv6Addr::from(u128::from(net) | bit)),
+                        prefix,
+                    },
+                ))
+            }
+        }
+    }
+
+    /// How deno's net descriptor spells this range. An IPv6 address has to be
+    /// bracketed, and a single address is written without a prefix at all --
+    /// `[::1]/128` is not something that parser accepts.
+    fn to_deno_descriptor(self) -> String {
+        match self.net {
+            IpAddr::V4(v4) if self.prefix == 32 => v4.to_string(),
+            IpAddr::V4(v4) => format!("{v4}/{}", self.prefix),
+            IpAddr::V6(v6) => format!("[{v6}]"),
+        }
+    }
+}
+
+/// The IPv4 ranges, as (network, prefix length). Exactly the set
+/// [`blocked_v4`] refuses.
+const BLOCKED_V4: &[([u8; 4], u8)] = &[
+    ([0, 0, 0, 0], 8),       // "this network"
+    ([10, 0, 0, 0], 8),      // private
+    ([100, 64, 0, 0], 10),   // carrier-grade NAT
+    ([127, 0, 0, 0], 8),     // loopback
+    ([169, 254, 0, 0], 16),  // link-local, incl. the cloud metadata service
+    ([172, 16, 0, 0], 12),   // private
+    ([192, 0, 0, 0], 24),    // IETF protocol assignments
+    ([192, 0, 2, 0], 24),    // documentation
+    ([192, 168, 0, 0], 16),  // private
+    ([198, 18, 0, 0], 15),   // benchmarking
+    ([198, 51, 100, 0], 24), // documentation
+    ([203, 0, 113, 0], 24),  // documentation
+    ([224, 0, 0, 0], 4),     // multicast
+    ([240, 0, 0, 0], 4),     // reserved, incl. 255.255.255.255
+];
+
+/// The IPv6 ranges. Exactly the set [`blocked_v6`] refuses.
+const BLOCKED_V6: &[(u128, u8)] = &[
+    (0, 128),                // ::
+    (1, 128),                // ::1
+    (0xfc00 << 112, 7),      // unique local
+    (0xfe80 << 112, 10),     // link-local
+    (0xff00 << 112, 8),      // multicast
+    (0x2001_0db8 << 96, 32), // documentation
+];
+
+/// Every blocked range, as this module classifies addresses.
+fn blocked_ranges() -> Vec<BlockedRange> {
+    let mut ranges = Vec::with_capacity(BLOCKED_V4.len() + BLOCKED_V6.len());
+    for (octets, prefix) in BLOCKED_V4 {
+        ranges.push(BlockedRange {
+            net: IpAddr::V4(Ipv4Addr::from(*octets)),
+            prefix: *prefix,
+        });
+    }
+    for (net, prefix) in BLOCKED_V6 {
+        ranges.push(BlockedRange {
+            net: IpAddr::V6(Ipv6Addr::from(*net)),
+            prefix: *prefix,
+        });
+    }
+    ranges
+}
+
+/// The subset of [`blocked_ranges`] that deno's net descriptor can express.
+///
+/// It reads `10.0.0.0/8` as a subnet, and a bracketed `[::1]` as one address,
+/// but it has no spelling for an IPv6 subnet at all -- `fc00::/7` is read as a
+/// host and a port and refused. So the IPv6 ranges survive only where the
+/// range happens to be a single address. See the module comment on redirects
+/// for what that leaves uncovered.
+fn ranges_deno_can_deny() -> Vec<BlockedRange> {
+    blocked_ranges()
+        .into_iter()
+        .filter(|range| match range.net {
+            IpAddr::V4(_) => true,
+            IpAddr::V6(_) => range.prefix == 128,
+        })
+        .collect()
+}
+
+/// The destination as it is safe to write into a log line.
+///
+/// A URL may carry credentials -- `https://user:token@api.example.com/` is a
+/// shape applications do use -- and a refusal is logged on the node and
+/// shipped to deis-telemetry. Logging the URL as given would put that password
+/// somewhere the application never agreed to put it. The userinfo is the only
+/// part removed: the host and path are what make the line useful to whoever is
+/// working out why a call was refused.
+pub fn loggable(url: &str) -> String {
+    let Ok(mut parsed) = Url::parse(url) else {
+        return url.to_string();
+    };
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        return url.to_string();
+    }
+    // Both setters fail only on a URL that cannot have a host, which this one
+    // has already been shown to have.
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.to_string()
+}
+
+async fn resolve(host: &str, port: u16) -> std::io::Result<Vec<IpAddr>> {
+    let addresses: Vec<IpAddr> = tokio::net::lookup_host((host, port))
+        .await?
+        .map(|addr: SocketAddr| addr.ip())
+        .collect();
+    if addresses.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the name resolved to no addresses",
+        ));
+    }
+    Ok(addresses)
+}
+
+/// `deno_fetch`'s DNS resolver for one isolate: the same policy, applied where
+/// the socket is actually opened.
+///
+/// This is the half of the policy an application cannot get in front of. It
+/// sees only the name -- hyper asks for the name and attaches the port itself
+/// -- so it enforces the part of the policy that does not depend on a port:
+/// the address ranges, and the platform's own service hosts. The port-aware
+/// part (an allowlist entry that names a port, a platform endpoint on one
+/// port of a shared host) is enforced by [`FetchPolicy::check`] before the
+/// request is ever handed to the client.
+#[derive(Debug)]
+pub struct PolicyResolver {
+    policy: FetchPolicy,
+    app_id: String,
+}
+
+impl PolicyResolver {
+    pub fn new(policy: FetchPolicy, app_id: impl Into<String>) -> Self {
+        Self {
+            policy,
+            app_id: app_id.into(),
+        }
+    }
+
+    /// Wrap this in the shape `deno_fetch::Options` wants.
+    pub fn into_resolver(self) -> deno_runtime::deno_fetch::dns::Resolver {
+        deno_runtime::deno_fetch::dns::Resolver::Custom(Arc::new(self))
+    }
+}
+
+impl deno_runtime::deno_fetch::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: Name) -> deno_runtime::deno_fetch::dns::Resolving {
+        let policy = self.policy.clone();
+        let app_id = self.app_id.clone();
+        let host = name.as_str().to_ascii_lowercase();
+
+        Box::pin(async move {
+            if policy.names_a_platform_service(&host, None) {
+                tracing::warn!(
+                    target: "app",
+                    app_id = %app_id,
+                    host = %host,
+                    "Refused to resolve {} for {}: it names one of the platform's own service \
+                     endpoints. The outbound call fails; no connection was opened",
+                    host,
+                    app_id
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{host} is a platform service endpoint"),
+                ));
+            }
+
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .collect::<Vec<SocketAddr>>();
+
+            if policy.is_allowlisted(&host, None) {
+                return Ok(addresses.into_iter());
+            }
+
+            let mut kept = Vec::with_capacity(addresses.len());
+            for addr in addresses {
+                match blocked_reason(addr.ip()) {
+                    None => kept.push(addr),
+                    Some(kind) => {
+                        // Warn rather than debug: reaching this line means the
+                        // name resolved differently than it did a moment ago
+                        // in `FetchPolicy::check`, which is what a rebinding
+                        // attack looks like from here.
+                        tracing::warn!(
+                            target: "app",
+                            app_id = %app_id,
+                            host = %host,
+                            address = %addr.ip(),
+                            "Dropped {} from the addresses of {} for {}: it is {}. The name \
+                             passed the outbound fetch policy and then resolved to a blocked \
+                             address, so the connection is not opened",
+                            addr.ip(),
+                            host,
+                            app_id,
+                            kind
+                        );
+                    }
+                }
+            }
+
+            if kept.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{host} resolves only to addresses this platform refuses"),
+                ));
+            }
+            Ok(kept.into_iter())
+        })
+    }
+}
+
+/// What is wrong with one address, or `None` when an application may reach it.
+///
+/// The wording is what the application is told, so each arm reads as the tail
+/// of "it resolves to 10.0.0.1, which is ...".
+fn blocked_reason(addr: IpAddr) -> Option<&'static str> {
+    match addr {
+        IpAddr::V4(v4) => blocked_v4(v4),
+        IpAddr::V6(v6) => {
+            // `::1` and `::` are IPv6 addresses in their own right, and
+            // `to_ipv4` would read them as `0.0.0.1` and `0.0.0.0`: still
+            // refused, but for a reason that would puzzle whoever read the
+            // message. Judged as themselves first.
+            if v6.is_loopback() || v6.is_unspecified() {
+                return blocked_v6(v6);
+            }
+            // `::ffff:127.0.0.1` and the deprecated `::127.0.0.1` reach the
+            // same machine as `127.0.0.1` does, so they are judged as the IPv4
+            // address they carry. Without this, every rule below is one URL
+            // rewrite away from being bypassed.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return blocked_v4(v4);
+            }
+            if let Some(v4) = v6.to_ipv4() {
+                return blocked_v4(v4);
+            }
+            blocked_v6(v6)
+        }
+    }
+}
+
+fn blocked_v4(addr: Ipv4Addr) -> Option<&'static str> {
+    let octets = addr.octets();
+    if addr.is_unspecified() {
+        Some("the unspecified address, which means \"this host\"")
+    } else if addr.is_loopback() {
+        Some("a loopback address, which is this node itself")
+    } else if addr.is_private() {
+        Some("in a private range, which is this node's own network")
+    } else if addr.is_link_local() {
+        // 169.254.169.254 lives here on every major cloud and answers with the
+        // instance's credentials to anyone who asks.
+        Some("link-local, which is where a cloud instance's metadata service lives")
+    } else if addr.is_broadcast() {
+        Some("the broadcast address")
+    } else if addr.is_multicast() {
+        Some("a multicast address")
+    } else if addr.is_documentation() {
+        Some("in a range reserved for documentation")
+    } else if octets[0] == 0 {
+        Some("in 0.0.0.0/8, which is not a destination")
+    } else if octets[0] == 100 && (octets[1] & 0b1100_0000) == 64 {
+        Some("in the carrier-grade NAT range")
+    } else if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        Some("in a range reserved for IETF protocol assignments")
+    } else if octets[0] == 198 && (octets[1] & 0xfe) == 18 {
+        Some("in a range reserved for benchmarking")
+    } else if octets[0] >= 240 {
+        Some("in a range reserved for future use")
+    } else {
+        None
+    }
+}
+
+fn blocked_v6(addr: Ipv6Addr) -> Option<&'static str> {
+    let segments = addr.segments();
+    if addr.is_unspecified() {
+        Some("the unspecified address, which means \"this host\"")
+    } else if addr.is_loopback() {
+        Some("a loopback address, which is this node itself")
+    } else if addr.is_multicast() {
+        Some("a multicast address")
+    } else if (segments[0] & 0xfe00) == 0xfc00 {
+        Some("a unique-local address, which is this node's own network")
+    } else if (segments[0] & 0xffc0) == 0xfe80 {
+        Some("link-local")
+    } else if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        Some("in a range reserved for documentation")
+    } else {
+        None
+    }
+}
+
+/// The network address of every blocked range, for the test that holds this
+/// table and [`blocked_reason`] together.
+#[cfg(test)]
+pub fn blocked_range_networks_for_test() -> Vec<IpAddr> {
+    blocked_ranges().into_iter().map(|r| r.net).collect()
+}
+
+/// Whether any blocked range covers `addr`, for the same test.
+#[cfg(test)]
+pub fn any_blocked_range_covers_for_test(addr: IpAddr) -> bool {
+    blocked_ranges().iter().any(|range| range.contains(addr))
+}
+
+#[cfg(test)]
+pub fn blocked_reason_for_test(addr: IpAddr) -> Option<&'static str> {
+    blocked_reason(addr)
+}
+
+#[cfg(test)]
+#[path = "fetch_policy_test.rs"]
+mod fetch_policy_test;

@@ -1496,10 +1496,13 @@ export default function handler(context: any): Response {
     // --- the global surface ---------------------------------------------
     //
     // This runtime boots the bare `deno_core` engine, which brings only
-    // `console` and `queueMicrotask`; every other global below is written out
-    // by hand in `runtime/js/runtime.js`. That makes the inventory easy to
-    // change by accident in either direction - a global quietly added, or one
-    // lost in a refactor - and until this test existed nothing noticed.
+    // `console` and `queueMicrotask`. Everything else is put on the global
+    // object by hand: most of it in `runtime/js/bootstrap.js`, which binds the
+    // classes deno_web, deno_fetch and deno_crypto define but never expose
+    // (Deno does that in a `99_main.js` this runtime does not use), and the
+    // rest in `runtime/js/runtime.js`. That makes the inventory easy to change
+    // by accident in either direction - a global quietly added, or one lost in
+    // a refactor - and until this test existed nothing noticed.
     //
     // Both halves are asserted on purpose. The present list is what the
     // platform promises; the absent list is what `crates/deis-runtime/README.md`
@@ -1509,6 +1512,11 @@ export default function handler(context: any): Response {
 
     /// Names SPECIFICATION_BASIC.md section 8.1 requires that this platform
     /// does provide.
+    ///
+    /// All of them, as of the change that bound the deno extensions' classes
+    /// onto the global object. `fetch` is not the raw one: it is the wrapper
+    /// in `js/bootstrap.js` that puts every destination past
+    /// `runtime/fetch_policy.rs` first.
     const CANON_GLOBALS_PRESENT: &[&str] = &[
         "Request",
         "Response",
@@ -1521,12 +1529,6 @@ export default function handler(context: any): Response {
         "atob",
         "setTimeout",
         "clearTimeout",
-    ];
-
-    /// Names section 8.1 requires that this platform does NOT provide. Every
-    /// one of these is a documented gap, not an oversight to paper over: a
-    /// handler calling one gets a ReferenceError.
-    const CANON_GLOBALS_ABSENT: &[&str] = &[
         "fetch",
         "crypto",
         "ReadableStream",
@@ -1536,6 +1538,13 @@ export default function handler(context: any): Response {
         "clearInterval",
     ];
 
+    /// Names section 8.1 requires that this platform does NOT provide.
+    ///
+    /// Empty, and meant to stay that way: section 8.1 is met in full. A name
+    /// that has to be given up again belongs here with the reason, because
+    /// this list is what the documents are checked against.
+    const CANON_GLOBALS_ABSENT: &[&str] = &[];
+
     /// Beyond the canon's list: platform extras this runtime does provide.
     const EXTRA_GLOBALS_PRESENT: &[&str] = &[
         "console",
@@ -1544,14 +1553,27 @@ export default function handler(context: any): Response {
         "caches",
         "WebSocketPair",
         "WebSocketServer",
+        // Not in section 8.1, but section 8.1's own surface is not usable
+        // without them: `AbortController`/`AbortSignal` are the only way to
+        // cancel an outbound `fetch`, so without them a slow upstream burns
+        // the isolate's whole execution budget, and `DOMException` is the type
+        // `crypto.subtle`, the streams and an aborted fetch throw - a handler
+        // that cannot name it cannot tell those errors apart.
+        "AbortController",
+        "AbortSignal",
+        "DOMException",
     ];
 
     /// Beyond the canon's list: things a handler ported from another platform
     /// is likely to reach for and will not find here.
+    ///
+    /// Several of these are loaded and working inside the isolate - deno_fetch
+    /// needs `Blob` and `FormData`, deno_web needs `Event` - and are simply
+    /// not bound to a global name. That is the deliberate line: section 8.1
+    /// plus what section 8.1 needs, and nothing further, so the surface this
+    /// platform promises stays one an operator can reason about.
     const EXTRA_GLOBALS_ABSENT: &[&str] = &[
         "Deno",
-        "AbortController",
-        "AbortSignal",
         "Blob",
         "File",
         "FormData",
@@ -1623,6 +1645,542 @@ export default function handler(context: any): Response {
                  to crates/deis-runtime/README.md and edge-canon's PLATFORM_MATRIX.md"
             );
         }
+    }
+
+    // --- outbound fetch ----------------------------------------------------
+    //
+    // The policy itself is unit-tested in `runtime/fetch_policy_test.rs`.
+    // These drive it the way an application does: through the `fetch` binding
+    // in `js/bootstrap.js`, so they also assert that a refusal reaches the
+    // handler as a catchable error and that an allowed call really opens a
+    // socket.
+
+    /// Run one handler and hand back its body.
+    async fn body_of(app: &str, code: &str, spec: IsolateSpec, wiring: &ServiceWiring) -> String {
+        let mut runtime =
+            AppRuntime::new(app.to_string(), code.to_string(), None, spec, wiring).unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = body.unwrap_or_default();
+        assert_eq!(status, 200, "the handler failed: {body}");
+        body
+    }
+
+    /// A handler that reports what `fetch(url)` did, without letting the
+    /// failure escape: a refusal has to be something an application can catch.
+    const FETCH_PROBE: &str = r#"
+        export default async function handler(ctx) {
+            const url = ctx.request.headers.get("x-probe-url") ?? ctx.env.PROBE_URL;
+            try {
+                const response = await fetch(url);
+                return new Response("reached:" + response.status + ":" + (await response.text()));
+            } catch (e) {
+                return new Response("refused:" + e.constructor.name + ":" + e.message);
+            }
+        }
+    "#;
+
+    fn probe_spec(url: &str, policy: crate::runtime::FetchPolicy) -> IsolateSpec {
+        IsolateSpec {
+            env: HashMap::from([("PROBE_URL".to_string(), url.to_string())]),
+            fetch_policy: policy,
+            ..IsolateSpec::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_outbound_fetch_to_loopback_is_refused() {
+        // deis-store listens on loopback and believes the tenant header it is
+        // handed, so this exact call is how one application would read every
+        // other application's data.
+        let body = body_of(
+            "fetch-loopback.production",
+            FETCH_PROBE,
+            probe_spec(
+                "http://127.0.0.1:8090/kv/get",
+                crate::runtime::FetchPolicy::default(),
+            ),
+            &ServiceWiring::default(),
+        )
+        .await;
+
+        assert!(body.starts_with("refused:TypeError:"), "{body}");
+        assert!(body.contains("127.0.0.1"), "{body}");
+        assert!(body.contains("loopback"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_outbound_fetch_to_a_name_that_resolves_to_loopback_is_refused() {
+        // The case a policy that only read the hostname string would wave
+        // through: `localhost` is a name, and a name an attacker controls can
+        // be pointed at 127.0.0.1 just as easily.
+        let body = body_of(
+            "fetch-localhost.production",
+            FETCH_PROBE,
+            probe_spec(
+                "http://localhost:8090/kv/get",
+                crate::runtime::FetchPolicy::default(),
+            ),
+            &ServiceWiring::default(),
+        )
+        .await;
+
+        assert!(body.starts_with("refused:TypeError:"), "{body}");
+        assert!(body.contains("loopback"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_outbound_fetch_into_a_private_range_is_refused() {
+        let body = body_of(
+            "fetch-private.production",
+            FETCH_PROBE,
+            probe_spec(
+                "http://10.0.0.5:9200/_search",
+                crate::runtime::FetchPolicy::default(),
+            ),
+            &ServiceWiring::default(),
+        )
+        .await;
+
+        assert!(body.starts_with("refused:TypeError:"), "{body}");
+        assert!(body.contains("private range"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_platform_service_endpoint_is_refused_even_when_the_operator_allowlisted_it() {
+        // The operator has opened up the whole of 127.0.0.1 - which is already
+        // a mistake - and the application still may not reach the store this
+        // deployment is wired to. Widening the policy must not be able to
+        // widen it into deis-store by accident.
+        let wiring = ServiceWiring {
+            declaration: ServiceDeclaration::from_names(["kv"]),
+            endpoints: ServiceEndpoints {
+                store: Some("http://127.0.0.1:8090".to_string()),
+                queue: None,
+            },
+            consumers: Vec::new(),
+        };
+        let policy = crate::runtime::FetchPolicy::new(["127.0.0.1"], Vec::<String>::new()).unwrap();
+
+        let body = body_of(
+            "fetch-platform.production",
+            FETCH_PROBE,
+            probe_spec("http://127.0.0.1:8090/kv/get", policy),
+            &wiring,
+        )
+        .await;
+
+        assert!(body.starts_with("refused:TypeError:"), "{body}");
+        assert!(body.contains("platform"), "{body}");
+        assert!(body.contains("ctx.services"), "{body}");
+    }
+
+    /// Serve one fixed body on loopback and hand back the address.
+    async fn a_server_answering(body: &'static str) -> std::net::SocketAddr {
+        use axum::routing::get;
+        let router = axum::Router::new().route("/", get(move || async move { body }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn an_allowlisted_destination_is_actually_reachable() {
+        // The other half of the policy: a refusal that refused everything
+        // would pass every test above and be useless. This one opens a real
+        // socket to a real server and reads the body back, so the whole path -
+        // the guard op, deno_fetch, the response body - has to work.
+        let addr = a_server_answering("hello from upstream").await;
+        let url = format!("http://{addr}/");
+        let policy =
+            crate::runtime::FetchPolicy::new([addr.to_string()], Vec::<String>::new()).unwrap();
+
+        let body = body_of(
+            "fetch-allowed.production",
+            FETCH_PROBE,
+            probe_spec(&url, policy),
+            &ServiceWiring::default(),
+        )
+        .await;
+
+        assert_eq!(body, "reached:200:hello from upstream", "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_allowlisted_name_survives_the_resolver_that_backs_the_policy() {
+        // An allowlisted *name* takes the other path: hyper asks
+        // `PolicyResolver` for its addresses, and that resolver would drop
+        // every loopback answer if it did not consult the allowlist too. If it
+        // did, an operator's allowlist would appear to work and then fail at
+        // connect time with an unexplained network error.
+        let addr = a_server_answering("hello by name").await;
+        let url = format!("http://localhost:{}/", addr.port());
+        let policy = crate::runtime::FetchPolicy::new(
+            [format!("localhost:{}", addr.port())],
+            Vec::<String>::new(),
+        )
+        .unwrap();
+
+        let body = body_of(
+            "fetch-allowed-name.production",
+            FETCH_PROBE,
+            probe_spec(&url, policy),
+            &ServiceWiring::default(),
+        )
+        .await;
+
+        assert_eq!(body, "reached:200:hello by name", "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_into_loopback_is_refused_even_though_the_handler_never_named_it() {
+        // The destination that matters here is one the application never
+        // wrote down: it asks for an allowed address, and that address answers
+        // 302 to deis-store. `fetch` follows redirects, and the pre-flight
+        // guard runs once, in front of the call, so this hop reaches deno's
+        // own permission layer and nothing else. That layer carries the
+        // blocked ranges as a deny list precisely for this.
+        use axum::response::{IntoResponse, Redirect};
+        use axum::routing::get;
+
+        let router = axum::Router::new().route(
+            "/",
+            get(|| async { Redirect::temporary("http://127.0.0.1:8090/kv/get").into_response() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        // The redirector is allowlisted by *name*, which is how an operator
+        // opens an internal service and is also what keeps this test honest:
+        // an allowlist entry that is a literal address is punched out of the
+        // range covering it, and allowlisting `127.0.0.1` would punch out the
+        // very address the second hop goes to.
+        let entry = format!("localhost:{}", addr.port());
+        let policy = crate::runtime::FetchPolicy::new([entry], Vec::<String>::new()).unwrap();
+        let body = body_of(
+            "redirect-chaser.production",
+            FETCH_PROBE,
+            probe_spec(&format!("http://localhost:{}/", addr.port()), policy),
+            &ServiceWiring::default(),
+        )
+        .await;
+
+        assert!(
+            body.starts_with("refused:"),
+            "the redirect reached loopback: {body}"
+        );
+        assert!(body.contains("127.0.0.1"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_handler_can_return_the_response_it_fetched() {
+        // `return fetch(upstream)` is the shortest reverse proxy anyone
+        // writes, and it is the shape that catches two things at once: the
+        // Response `fetch` hands back is a *native* one, so it has to satisfy
+        // `instanceof Response` in the dispatcher glue, and it still carries
+        // the upstream's own framing headers, which no longer describe the
+        // body this node will send.
+        let addr = a_server_answering("proxied body").await;
+        let url = format!("http://{addr}/");
+        let policy =
+            crate::runtime::FetchPolicy::new([addr.to_string()], Vec::<String>::new()).unwrap();
+
+        let code = r#"
+            export default async function handler(ctx) {
+                return await fetch(ctx.env.PROBE_URL);
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "proxy.production".to_string(),
+            code.to_string(),
+            None,
+            probe_spec(&url, policy),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, headers, body) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(body.as_deref(), Some("proxied body"));
+        // The upstream sent one; forwarding it would describe a body this node
+        // is not sending, and a client would truncate or hang on the
+        // difference.
+        assert!(
+            !headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-length")),
+            "the upstream's framing was forwarded: {headers:?}"
+        );
+        // Everything that does describe the body still comes through.
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/plain")),
+            "{headers:?}"
+        );
+    }
+
+    // --- the rest of section 8.1 -------------------------------------------
+
+    #[tokio::test]
+    async fn web_crypto_is_available_to_a_handler() {
+        let code = r#"
+            export default async function handler() {
+                const bytes = new Uint8Array(16);
+                crypto.getRandomValues(bytes);
+
+                const digest = await crypto.subtle.digest(
+                    "SHA-256",
+                    new TextEncoder().encode("abc"),
+                );
+                const hex = Array.from(new Uint8Array(digest))
+                    .map((b) => b.toString(16).padStart(2, "0"))
+                    .join("");
+
+                const key = await crypto.subtle.importKey(
+                    "raw",
+                    new TextEncoder().encode("secret"),
+                    { name: "HMAC", hash: "SHA-256" },
+                    false,
+                    ["sign"],
+                );
+                const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode("abc"));
+
+                return new Response(JSON.stringify({
+                    // 16 zero bytes coming back would mean getRandomValues did
+                    // nothing, which is the failure worth catching here.
+                    filled: bytes.some((b) => b !== 0),
+                    sha256OfAbc: hex,
+                    uuidShape: /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+                        .test(crypto.randomUUID()),
+                    macBytes: mac.byteLength,
+                }));
+            }
+        "#;
+
+        let seen: serde_json::Value = serde_json::from_str(
+            &body_of(
+                "crypto_app",
+                code,
+                IsolateSpec::default(),
+                &ServiceWiring::default(),
+            )
+            .await,
+        )
+        .unwrap();
+
+        assert_eq!(seen["filled"], true);
+        // The published SHA-256 of "abc"; a digest that is merely 32 bytes
+        // long proves nothing.
+        assert_eq!(
+            seen["sha256OfAbc"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(seen["uuidShape"], true);
+        assert_eq!(seen["macBytes"], 32);
+    }
+
+    #[tokio::test]
+    async fn the_stream_types_are_available_to_a_handler() {
+        let code = r#"
+            export default async function handler() {
+                const readable = new ReadableStream({
+                    start(controller) {
+                        controller.enqueue("one ");
+                        controller.enqueue("two");
+                        controller.close();
+                    },
+                });
+
+                const upper = new TransformStream({
+                    transform(chunk, controller) {
+                        controller.enqueue(chunk.toUpperCase());
+                    },
+                });
+
+                const collected = [];
+                const writable = new WritableStream({
+                    write(chunk) {
+                        collected.push(chunk);
+                    },
+                });
+
+                await readable.pipeThrough(upper).pipeTo(writable);
+
+                // A Response reads its body off a stream, so this is also the
+                // check that the streams the platform binds are the ones
+                // deno_fetch is built on.
+                const streamed = await new Response(
+                    new ReadableStream({
+                        start(controller) {
+                            controller.enqueue(new TextEncoder().encode("streamed body"));
+                            controller.close();
+                        },
+                    }),
+                ).text();
+
+                return new Response(JSON.stringify({ collected, streamed }));
+            }
+        "#;
+
+        let seen: serde_json::Value = serde_json::from_str(
+            &body_of(
+                "streams_app",
+                code,
+                IsolateSpec::default(),
+                &ServiceWiring::default(),
+            )
+            .await,
+        )
+        .unwrap();
+
+        assert_eq!(seen["collected"][0], "ONE ");
+        assert_eq!(seen["collected"][1], "TWO");
+        assert_eq!(seen["streamed"], "streamed body");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_fires_and_an_interval_repeats() {
+        let code = r#"
+            export default async function handler() {
+                const started = Date.now();
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                const slept = Date.now() - started >= 15;
+
+                let ticks = 0;
+                await new Promise((resolve) => {
+                    const id = setInterval(() => {
+                        ticks++;
+                        if (ticks === 3) {
+                            clearInterval(id);
+                            resolve();
+                        }
+                    }, 1);
+                });
+
+                return new Response(JSON.stringify({ slept, ticks }));
+            }
+        "#;
+
+        let seen: serde_json::Value = serde_json::from_str(
+            &body_of(
+                "timers_app",
+                code,
+                IsolateSpec::default(),
+                &ServiceWiring::default(),
+            )
+            .await,
+        )
+        .unwrap();
+
+        // The polyfill these replaced ignored the delay and ran the callback
+        // on the microtask queue, so `setTimeout(f, 20)` returned immediately.
+        assert_eq!(seen["slept"], true);
+        assert_eq!(seen["ticks"], 3);
+    }
+
+    #[tokio::test]
+    async fn an_interval_does_not_outlive_the_request_that_created_it() {
+        // An isolate is reused across requests. An interval left running would
+        // keep firing inside every later request - burning CPU that the
+        // request being served is charged for, and spending that isolate's
+        // rate-limit budget - for the life of the application. See the timers
+        // section of js/bootstrap.js.
+        //
+        // Two requests: the first starts an interval, the second starts none.
+        // If the first one's interval survived, the second would see its
+        // counter move while it was doing nothing but sleeping.
+        let code = r#"
+            globalThis.__ticks = 0;
+            export default async function handler(ctx) {
+                const before = globalThis.__ticks;
+                if (ctx.request.headers.get("x-start-interval") === "yes") {
+                    setInterval(() => { globalThis.__ticks++; }, 1);
+                }
+                await new Promise((resolve) => setTimeout(resolve, 30));
+                return new Response(JSON.stringify({ before, after: globalThis.__ticks }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "interval-leak.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let mut seen = Vec::new();
+        for start_interval in [true, false] {
+            let mut headers = HashMap::new();
+            if start_interval {
+                headers.insert("x-start-interval".to_string(), "yes".to_string());
+            }
+            let (tx, rx) = oneshot::channel();
+            runtime
+                .execute_fetch(
+                    "http://localhost/".to_string(),
+                    "GET".to_string(),
+                    headers,
+                    None,
+                    tx,
+                )
+                .await
+                .unwrap();
+            let (status, _headers, body) = rx.await.unwrap().unwrap();
+            let body = body.unwrap_or_default();
+            assert_eq!(status, 200, "{body}");
+            seen.push(serde_json::from_str::<serde_json::Value>(&body).unwrap());
+        }
+
+        // The interval did run while the request that created it was running:
+        // the sweep is the end of an invocation, not a ban on intervals.
+        assert!(
+            seen[0]["after"].as_i64().unwrap() > seen[0]["before"].as_i64().unwrap(),
+            "the interval never fired at all: {:?}",
+            seen[0]
+        );
+        // ... and nothing ticked during the second request, which started no
+        // interval of its own. A survivor would have fired around a dozen
+        // times in the 30ms that request spent asleep.
+        assert_eq!(
+            seen[1]["after"], seen[1]["before"],
+            "an interval from the first request was still firing during the second: {seen:?}"
+        );
     }
 
     #[tokio::test]

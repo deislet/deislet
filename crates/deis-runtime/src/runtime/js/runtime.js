@@ -1,24 +1,45 @@
+// Edge Canon Runtime (v0.2.0) for Runtime.
+//
+// The standard web globals -- fetch, crypto, the streams, Request/Response,
+// URL, the timers -- are bound in `js/bootstrap.js`, which runs before this
+// file. What is here is the part that is this platform rather than the web:
+// the service bindings behind `ctx.services`, the WebSocket bridge, the Cache
+// API, the console bridge, and the entry points the Rust side calls into.
+//
+// # Why the whole file is a closure
+//
+// This runs through `execute_script`, so it is a classic script, and a
+// top-level `const` in one of those goes into the *global* lexical scope --
+// visible by name to every script and module evaluated afterwards, which
+// includes the application's own. `DenoCore` was declared that way, so until
+// this closure existed an application could write `DenoCore.ops.op_fetch(...)`
+// and reach every op in the isolate directly: past the outbound fetch policy,
+// past `ctx.services`, past everything. Inside a closure none of these names
+// exist outside this file, and the only way in is the handful of properties
+// explicitly written onto `globalThis` below.
+(() => {
+
 const DenoCore = Deno.core; delete globalThis.Deno;
-// Edge Canon Runtime (v0.2.0) for Runtime
-// Native Deno Runtime extensions enabled.
 
 // ---------------------------------------------------------
 // 0. Encoding
 // ---------------------------------------------------------
 //
 // TextEncoder, TextDecoder, btoa and atob, which SPECIFICATION_BASIC.md
-// section 8.1 lists among the Web APIs every platform must provide. They are
-// written out here rather than pulled from deno_core because this runtime
-// boots the bare `deno_core` engine: nothing but `console` and
-// `queueMicrotask` comes with it.
+// section 8.1 lists among the Web APIs every platform must provide.
+//
+// These four are written out here rather than bound from deno_web the way the
+// rest of section 8.1 is, and that is a deliberate narrowing: UTF-8 is the
+// only encoding the canon asks for, so it is the only one implemented, and any
+// other label is refused rather than silently decoded as UTF-8. deno_web's
+// decoder accepts the whole WHATWG encoding registry; an application that
+// happened to work here on `iso-8859-1` would be relying on something the
+// canon does not promise.
 //
 // They are not decoration. Several things below already reached for them and
 // therefore threw ReferenceError instead of doing their job: reading a binary
 // request body, `request.arrayBuffer()`, `blob.put(key, "a string")`,
 // `(await blob.get(key)).text()` and a binary WebSocket frame.
-//
-// UTF-8 is the only encoding implemented, which is the only one the canon
-// asks for; any other label is refused rather than silently decoded as UTF-8.
 
 if (typeof globalThis.TextEncoder === "undefined") {
   class TextEncoder {
@@ -270,210 +291,60 @@ if (typeof globalThis.EventTarget === "undefined") {
   globalThis.EventTarget = EventTarget;
 }
 
-if (typeof globalThis.Headers === "undefined") {
-  class Headers {
-    constructor(init = {}) {
-      this._map = new Map();
-      if (init instanceof Headers) {
-        init.forEach((value, key) => this._map.set(key.toLowerCase(), String(value)));
-      } else if (Array.isArray(init)) {
-        for (const [key, value] of init) {
-          this._map.set(String(key).toLowerCase(), String(value));
-        }
-      } else if (init && typeof init === "object") {
-        for (const key of Object.keys(init)) {
-          this._map.set(String(key).toLowerCase(), String(init[key]));
-        }
-      }
+// The Response an application returns, and the one it gets back from
+// `fetch()`, are both the standard `Response` that `js/bootstrap.js` binds
+// from deno_fetch. This subclass adds the one thing the platform needs on top
+// of it, and nothing else.
+//
+// # Why there is a subclass at all
+//
+// A WebSocket upgrade is spelled `new Response(null, { status: 101, webSocket:
+// client })` -- that is the shape on Cloudflare, it is the shape the canon's
+// examples use, and `dispatcher/handlers.rs` looks for exactly it. The
+// standard `Response` cannot express either half of it: its constructor
+// refuses any status outside 200-599, and it drops init members it does not
+// know, so `webSocket` would never arrive. So:
+//
+//   * status 101 is built as 200 and then written over the instance, where it
+//     shadows the prototype's getter. `__deis_runtime_invoke` reads
+//     `resp.status`, so what it sees is the 101 the handler asked for.
+//   * `webSocket` is carried across as an own property, which is where
+//     `__deis_runtime_invoke` looks for it.
+//
+// # Why `instanceof` is widened
+//
+// `__deis_runtime_invoke` rejects a handler that does not return a Response,
+// and `return fetch(upstream)` -- a plain reverse proxy, and the first thing
+// anyone writes once `fetch` exists -- hands back a *native* Response, which
+// is not an instance of a subclass of it. Without the `hasInstance` below that
+// handler would get "Handler did not return a Response object" and a 500. Both
+// directions are accepted here: anything the native constructor made counts.
+const NativeResponse = globalThis.Response;
+
+class Response extends NativeResponse {
+  constructor(body = null, init = undefined) {
+    const options = init ?? {};
+    const upgrading = Number(options.status) === 101;
+    super(body, upgrading ? { ...options, status: 200 } : options);
+    if (upgrading) {
+      Object.defineProperty(this, "status", {
+        value: 101,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+      });
     }
-    set(key, value) {
-      this._map.set(String(key).toLowerCase(), String(value));
-    }
-    get(key) {
-      const value = this._map.get(String(key).toLowerCase());
-      return value === undefined ? null : value;
-    }
-    forEach(callback) {
-      for (const [key, value] of this._map.entries()) {
-        callback(value, key, this);
-      }
-    }
-    entries() {
-      return this._map.entries();
+    if (options.webSocket) {
+      this.webSocket = options.webSocket;
     }
   }
-  globalThis.Headers = Headers;
-}
 
-// Render whatever the runtime handed down as a body into text. It is a
-// string today, but a clone or a handler-built Request can carry bytes.
-function bodyToText(body) {
-  if (body === null || body === undefined) return "";
-  if (typeof body === "string") return body;
-  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
-  if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
-  if (ArrayBuffer.isView(body)) {
-    return new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+  static [Symbol.hasInstance](value) {
+    return value instanceof NativeResponse;
   }
-  return String(body);
 }
 
-if (typeof globalThis.Request === "undefined") {
-  class Request {
-    constructor(url, init = {}) {
-      this.url = String(url);
-      this.method = (init.method || "GET").toUpperCase();
-      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
-      this._body = init.body ?? null;
-      this._bodyUsed = false;
-    }
-    // Reading the body. A handler that posts JSON has no other way in: the
-    // runtime hands the body down as a string, and without these a call to
-    // request.text() threw "not a function" and the whole request failed
-    // with a 500 that named the polyfill rather than the app.
-    //
-    // `bodyUsed` follows the standard: a body may be read once, and a second
-    // read is a bug in the handler worth surfacing rather than answering with
-    // the same bytes twice.
-    async text() {
-      if (this._bodyUsed) {
-        throw new TypeError("Request body has already been read");
-      }
-      this._bodyUsed = true;
-      return bodyToText(this._body);
-    }
-    async json() {
-      return JSON.parse(await this.text());
-    }
-    async arrayBuffer() {
-      const text = await this.text();
-      return new TextEncoder().encode(text).buffer;
-    }
-    get bodyUsed() {
-      return this._bodyUsed;
-    }
-    get body() {
-      return this._body;
-    }
-    clone() {
-      return new Request(this.url, { method: this.method, headers: this.headers, body: this._body });
-    }
-  }
-  globalThis.Request = Request;
-}
-
-if (typeof globalThis.Response === "undefined") {
-  class Response {
-    constructor(body = null, init = {}) {
-      this.status = init.status || 200;
-      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
-      this._body = body;
-      if (init && init.webSocket) {
-        this.webSocket = init.webSocket;
-      }
-    }
-    async text() {
-      return bodyToText(this._body);
-    }
-    async json() {
-      return JSON.parse(await this.text());
-    }
-    clone() {
-      return new Response(this._body, { status: this.status, headers: this.headers });
-    }
-    get body() {
-      return this._body;
-    }
-  }
-  globalThis.Response = Response;
-}
-
-if (typeof globalThis.URLSearchParams === "undefined") {
-  class URLSearchParams {
-    constructor(query = "") {
-      this._map = new Map();
-      let raw = String(query);
-      if (raw.startsWith("?")) raw = raw.slice(1);
-      if (!raw) return;
-      for (const part of raw.split("&")) {
-        if (!part) continue;
-        const [key, value = ""] = part.split("=");
-        const decodedKey = decodeURIComponent(key.replace(/\+/g, " "));
-        const decodedValue = decodeURIComponent(value.replace(/\+/g, " "));
-        this._map.set(decodedKey, decodedValue);
-      }
-    }
-    get(key) {
-      return this._map.has(key) ? this._map.get(key) : null;
-    }
-  }
-  globalThis.URLSearchParams = URLSearchParams;
-}
-
-if (typeof globalThis.URL === "undefined") {
-  class URL {
-    constructor(url) {
-      const href = String(url);
-      this.href = href;
-      this.pathname = URL._extractPathname(href);
-      this.search = URL._extractSearch(href);
-      this.searchParams = new URLSearchParams(this.search);
-    }
-    toString() {
-      return this.href;
-    }
-    static _extractPathname(href) {
-      if (!href) return "/";
-      let path = "/";
-      const schemeIndex = href.indexOf("://");
-      if (schemeIndex >= 0) {
-        const pathIndex = href.indexOf("/", schemeIndex + 3);
-        if (pathIndex >= 0) {
-          path = href.slice(pathIndex);
-        }
-      } else if (href.startsWith("/")) {
-        path = href;
-      }
-      const queryIndex = path.indexOf("?");
-      if (queryIndex >= 0) path = path.slice(0, queryIndex);
-      const hashIndex = path.indexOf("#");
-      if (hashIndex >= 0) path = path.slice(0, hashIndex);
-      return path || "/";
-    }
-    static _extractSearch(href) {
-      if (!href) return "";
-      const queryIndex = href.indexOf("?");
-      if (queryIndex < 0) return "";
-      const hashIndex = href.indexOf("#", queryIndex);
-      if (hashIndex >= 0) return href.slice(queryIndex, hashIndex);
-      return href.slice(queryIndex);
-    }
-  }
-  globalThis.URL = URL;
-}
-
-if (typeof globalThis.setTimeout === "undefined") {
-  globalThis.setTimeout = (callback, _ms, ...args) => {
-    const id = Math.random();
-    Promise.resolve().then(() => callback(...args));
-    return id;
-  };
-  globalThis.clearTimeout = (_id) => {};
-}
-
-if (globalThis.Response && !globalThis.Response.__deis_runtime_patched) {
-  const OriginalResponse = globalThis.Response;
-  class ResponseWrapper extends OriginalResponse {
-    constructor(body = null, init = {}) {
-      super(body, init);
-      if (init && init.webSocket) {
-        this.webSocket = init.webSocket;
-      }
-    }
-  }
-  ResponseWrapper.__deis_runtime_patched = true;
-  globalThis.Response = ResponseWrapper;
-}
+globalThis.Response = Response;
 
 // BridgeWebSocket: A placeholder WebSocket for the client side of a WebSocketPair.
 // It mainly serves to carry the ws_id back to the platform via Response.
@@ -939,7 +810,25 @@ globalThis.__deis_runtime_wait_until_all = async function() {
     }
     if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
       await globalThis.__deis_runtime_wait_until_all();
+      // The recursive call already swept; sweeping twice would report the
+      // same intervals to the application a second time.
+      return;
     }
+  }
+
+  // Last thing on every path the Rust side runs -- request, queue batch and
+  // cron tick all end here, after waitUntil work has been awaited. An interval
+  // still running at this point would keep firing inside every later request
+  // this isolate serves; see the timers section of js/bootstrap.js for why
+  // that is unbounded and why timeouts are left alone.
+  const swept = globalThis.__deis_runtime_sweep_intervals();
+  if (swept > 0) {
+    console.warn(
+      swept + " interval(s) were still running when this invocation ended and have been " +
+      "cleared. An isolate is reused across requests, so an interval that outlives the " +
+      "request that created it keeps firing inside later ones; clear it before returning, " +
+      "or do the work in the request itself"
+    );
   }
 };
 
@@ -1070,6 +959,24 @@ globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
   return { ok: true };
 };
 
+// Response headers that belong to the connection a body arrived on rather
+// than to the body itself. See where this is used, in __deis_runtime_invoke.
+// `content-encoding` is in the list because the body is handed on as decoded
+// text: telling the client it is gzip would leave it trying to inflate a
+// string.
+const REFRAMED_HEADERS = new Set([
+  "connection",
+  "content-encoding",
+  "content-length",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
 globalThis.__deis_runtime_invoke = async function(requestPayload) {
   try {
     let handler;
@@ -1091,8 +998,20 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     }
 
     // Prepare response
+    //
+    // Headers that describe how a body was framed on some *other* connection
+    // are dropped. What leaves this isolate is the text below, and the node
+    // frames it again on its own connection to the client, so a Content-Length
+    // or Transfer-Encoding taken from somewhere else is a claim about a body
+    // that no longer exists. This is not hypothetical since `fetch` exists:
+    // `return fetch(upstream)` -- the shortest reverse proxy anyone writes --
+    // hands back a Response still carrying the upstream's framing, and a
+    // Content-Length that disagrees with the bytes actually sent is a
+    // truncated or hung response at the client.
     const headers = {};
-    resp.headers.forEach((v, k) => headers[k] = v);
+    resp.headers.forEach((v, k) => {
+      if (!REFRAMED_HEADERS.has(k.toLowerCase())) headers[k] = v;
+    });
     
     // Check for WebSocket upgrade
     // Check if user attached webSocket to the response object dynamically
@@ -1194,3 +1113,5 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
 }
 
 globalThis.user_module = {}; globalThis.__deis_runtime_set_response = (json) => DenoCore.ops.op_set_response(json);
+
+})();

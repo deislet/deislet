@@ -1,0 +1,32 @@
+# Repository checks that do not need a build.
+#
+# There is deliberately no cargo job here yet. `deis-control` embeds
+# `crates/deis-control/web/dist` at compile time, so a build in CI has to run
+# `npm ci && npm run build` in `crates/deis-control/web` first or it compiles a
+# binary that answers 404 for every dashboard page. Adding that belongs in its
+# own change, with the caching it needs; this workflow exists now because the
+# check below has no such prerequisite and the mistake it catches has already
+# been made twice.
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  document-path-literals:
+    name: documents reference the path constants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails when a document spells out an HTTP path that
+      # `deis_wire::conventions` already defines a constant for, and when one
+      # is spelled nearly-but-not-quite right. The script explains both rules
+      # and names the constant to reference instead.
+      - name: Node-facing paths are referenced, not restated
+        run: ./scripts/check-doc-path-literals.sh

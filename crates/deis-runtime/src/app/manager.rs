@@ -5,7 +5,7 @@ use super::types::{App, AppConfig, AppState, ResourceLimits};
 use crate::app_repo::AppRepo;
 use crate::assets::AssetBundle;
 use crate::config::ExecutionLimits;
-use crate::runtime::{IsolateSpec, RuntimePool};
+use crate::runtime::{FetchPolicy, IsolateSpec, RuntimePool};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use deno_core::OpMetricsSummary;
@@ -122,6 +122,11 @@ pub struct ApplicationManager {
     // An app's own `ResourceLimits` may override either value; see
     // `effective_limits`.
     default_limits: ExecutionLimits,
+    /// Where every isolate on this node may send an outbound `fetch()`. One
+    /// policy for the node, because it is the node's network that is being
+    /// protected, not any one application's. The default refuses everything
+    /// that is not a public internet address.
+    fetch_policy: FetchPolicy,
 }
 
 impl ApplicationManager {
@@ -142,6 +147,7 @@ impl ApplicationManager {
             runtime_pool: Arc::new(RuntimePool::new(num_threads)),
             inspect_sessions: DashMap::new(),
             default_limits: ExecutionLimits::default(),
+            fetch_policy: FetchPolicy::default(),
         }
     }
 
@@ -152,6 +158,7 @@ impl ApplicationManager {
             runtime_pool: Arc::new(RuntimePool::new_with_repo(num_threads, Some(app_repo))),
             inspect_sessions: DashMap::new(),
             default_limits: ExecutionLimits::default(),
+            fetch_policy: FetchPolicy::default(),
         }
     }
 
@@ -160,6 +167,17 @@ impl ApplicationManager {
     /// called once at startup with the values loaded from `RuntimeConfig`.
     pub fn with_limits(mut self, default_limits: ExecutionLimits) -> Self {
         self.default_limits = default_limits;
+        self
+    }
+
+    /// Set the node's outbound-fetch policy. Intended to be called once at
+    /// startup with the operator's `[fetch] allow` list and the addresses of
+    /// this node's own platform services.
+    ///
+    /// Leaving it unset is not a hole: the default policy is the strictest
+    /// one, refusing every destination that is not a public address.
+    pub fn with_fetch_policy(mut self, policy: FetchPolicy) -> Self {
+        self.fetch_policy = policy;
         self
     }
 
@@ -239,6 +257,7 @@ impl ApplicationManager {
             resource_table_max: config.limits.as_ref().and_then(|l| l.resource_table_max),
             route_patterns: config.routes.clone(),
             limits: self.effective_limits(&key, config.limits.as_ref()),
+            fetch_policy: self.fetch_policy.clone(),
         };
         match self
             .runtime_pool
@@ -412,6 +431,7 @@ impl ApplicationManager {
                 .and_then(|l| l.resource_table_max),
             route_patterns: record.config.routes.clone(),
             limits: self.effective_limits(key, record.config.limits.as_ref()),
+            fetch_policy: self.fetch_policy.clone(),
         }
     }
 
