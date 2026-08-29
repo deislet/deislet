@@ -4,10 +4,11 @@
 //!
 //! deis-queue never pushes. Pushing would require the queue to know which
 //! node runs which application, and the queue deliberately knows nothing
-//! except the app id (`docs/architecture.zh.md` section 6). So each node
-//! polls for the applications it runs, and the queue's lease is what stops
-//! two nodes from handling the same message: a leased message is invisible to
-//! everybody else until the lease lapses.
+//! except the tenant -- one application in one environment
+//! (`docs/architecture.zh.md` section 6). So each node polls for the
+//! applications it runs, and the queue's lease is what stops two nodes from
+//! handling the same message: a leased message is invisible to everybody else
+//! until the lease lapses.
 //!
 //! # The loop
 //!
@@ -24,10 +25,12 @@
 //! acknowledging it will see that message again once the lease lapses, so an
 //! application's queue handler must be idempotent. A handler that runs longer
 //! than the lease has the same effect, which is why the lease is derived from
-//! the app's execution timeout rather than fixed.
+//! the app's execution timeout rather than fixed, and why a batch is given up
+//! on before its lease lapses rather than acknowledged afterwards -- see
+//! [`handle_batch`].
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::BoxFuture;
 use tokio::sync::oneshot;
@@ -140,12 +143,32 @@ pub struct ConsumerSettings {
 /// Messages leased per pull when the manifest does not say.
 pub const DEFAULT_BATCH_SIZE: u32 = 10;
 
-/// Slack added to the app's execution timeout when deriving the lease, to
-/// cover the pull, the hand-off to the isolate thread and the acknowledgement.
+/// Slack added to the app's execution timeout when deriving the lease.
+///
+/// It covers the pull and the acknowledgement, and *some* of the wait before
+/// the isolate thread gets to the batch. That wait has no ceiling of its own:
+/// several applications share one runtime thread, so a batch can sit in that
+/// thread's channel behind other applications' requests for as long as they
+/// take. The slack is therefore a guess, and the thing that actually keeps the
+/// lease honest is the deadline in [`handle_batch`], which gives up on a batch
+/// while the lease is still valid instead of acknowledging it afterwards.
 const LEASE_SLACK: Duration = Duration::from_secs(30);
 
-/// Upper bound deis-queue puts on a lease; asking for more is refused.
+/// The lease this consumer will not ask beyond.
+///
+/// It is deis-queue's *default* ceiling, not a protocol constant:
+/// `max_lease_secs` is configurable there, and a request above whatever it is
+/// set to is silently clamped rather than refused (deis-queue's
+/// `clamp_lease`). So this value only keeps the request sane; what was
+/// actually granted is read back off the messages, see [`granted_lease`].
 const MAX_LEASE_SECONDS: u32 = 3600;
+
+/// How much of a lease is kept back for settling the batch: reporting the
+/// outcome and the ack or nack round trip.
+///
+/// A batch handed back at the instant the lease lapses is a batch deis-queue
+/// has already given to somebody else.
+const SETTLE_RESERVE: Duration = Duration::from_secs(5);
 
 impl ConsumerSettings {
     /// Settings for an app whose isolate is bounded by `execution_timeout`.
@@ -271,6 +294,10 @@ async fn run(
     mut stop: oneshot::Receiver<()>,
 ) {
     let mut backoff = settings.idle_backoff_min;
+    // The shortfall is reported once per poller: it is a configuration fact,
+    // not an event, and repeating it every poll would bury the batches that
+    // actually failed.
+    let mut lease_shortfall_reported = false;
 
     loop {
         // Checked before the pull as well as during the wait, so a stop that
@@ -319,6 +346,10 @@ async fn run(
         }
 
         backoff = settings.idle_backoff_min;
+        if !lease_shortfall_reported {
+            lease_shortfall_reported =
+                report_lease_shortfall(&app_id, &queue, &settings, &messages);
+        }
         handle_batch(
             &app_id,
             &queue,
@@ -341,6 +372,17 @@ async fn run(
 }
 
 /// Hand one batch to the app and settle it with the queue.
+///
+/// The hand-off is bounded by the lease, not by the app's execution timeout.
+/// Those are different budgets: the timeout starts when the isolate begins to
+/// run the batch, while the lease has been running since the pull, and between
+/// the two the batch waits its turn in the queue of the runtime thread this
+/// app shares with every other app on it. That wait has no ceiling. Without a
+/// deadline here the poller would keep waiting past the lease and then
+/// acknowledge messages deis-queue had already handed to the next puller: the
+/// same work done twice, delivery attempts burnt, and eventually dead letters
+/// for messages nothing was ever wrong with. The only trace would be an info
+/// line on the queue side about acknowledging ids that were no longer queued.
 async fn handle_batch(
     app_id: &str,
     queue: &str,
@@ -352,12 +394,24 @@ async fn handle_batch(
 ) {
     let delivered = messages.len();
     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+    let budget = handling_budget(&messages, settings, now_unix());
 
-    let outcome = match invoke(queue.to_string(), messages.clone()).await {
+    let outcome = match tokio::time::timeout(budget, invoke(queue.to_string(), messages.clone()))
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "the batch was not finished within the {} second(s) its lease still had to run; \
+                 it is handed back now rather than acknowledged after deis-queue has already \
+                 given it to somebody else. The handler may still be running, so these messages \
+                 can be processed twice -- queue handlers must be idempotent",
+                budget.as_secs()
+            ))
+        }) {
         Ok(outcome) => outcome,
         Err(e) => {
-            // The handler never ran, or threw. Every message in the batch is
-            // unfinished; hand them all back rather than losing them.
+            // The handler never ran, threw, or is still running with the
+            // lease about to lapse. Every message in the batch is unfinished;
+            // hand them all back rather than losing them.
             tracing::warn!(
                 app_id,
                 queue,
@@ -437,6 +491,98 @@ async fn handle_batch(
             ),
         }
     }
+}
+
+/// How much shorter than requested a granted lease may be before it is worth a
+/// log line.
+///
+/// The lease is stamped on the server before the batch travels back and
+/// expiry is whole seconds, so a small shortfall is normal rather than a sign
+/// of anything.
+const LEASE_SHORTFALL_TOLERANCE: Duration = Duration::from_secs(5);
+
+/// Unix seconds: the clock deis-queue stamps lease expiry with.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long the server's lease on this batch still has to run.
+///
+/// Read off the messages rather than assumed: deis-queue clamps a lease
+/// request above its own configured `max_lease_secs` instead of refusing it,
+/// so what was asked for and what was granted are not always the same number.
+/// The earliest expiry in the batch is the one that counts -- from that
+/// instant on, that message belongs to whoever pulls next.
+///
+/// `None` when no message carries an expiry; a real deis-queue always does,
+/// so this is the shape of a test double rather than of a server, and the
+/// caller falls back to the lease it asked for.
+fn granted_lease(messages: &[LeasedMessage], now: i64) -> Option<Duration> {
+    let earliest = messages
+        .iter()
+        .map(|message| message.lease_expires_at)
+        .filter(|expiry| *expiry > 0)
+        .min()?;
+    Some(Duration::from_secs(
+        earliest.saturating_sub(now).max(0) as u64
+    ))
+}
+
+/// How long the app may hold this batch: what is left of the lease, less what
+/// settling it will cost.
+///
+/// Floored at one second, so a batch whose lease is already spent when it
+/// arrives is still offered to the app -- the work may well succeed, and the
+/// message is going to be redelivered either way.
+fn handling_budget(messages: &[LeasedMessage], settings: &ConsumerSettings, now: i64) -> Duration {
+    let lease = granted_lease(messages, now)
+        .unwrap_or_else(|| Duration::from_secs(u64::from(settings.lease_seconds)));
+    lease
+        .saturating_sub(SETTLE_RESERVE)
+        .max(Duration::from_secs(1))
+}
+
+/// Report a lease materially shorter than the one asked for, once.
+///
+/// deis-queue clamps an over-long request to its configured `max_lease_secs`
+/// and logs that on its own side at debug level, so without this the node
+/// would keep planning around a lease it does not have: handlers running past
+/// the real expiry, their messages quietly handed to the next puller, and the
+/// duplicates showing up as work done twice. Returns whether anything was
+/// reported.
+fn report_lease_shortfall(
+    app_id: &str,
+    queue: &str,
+    settings: &ConsumerSettings,
+    messages: &[LeasedMessage],
+) -> bool {
+    let Some(granted) = granted_lease(messages, now_unix()) else {
+        return false;
+    };
+    let asked = Duration::from_secs(u64::from(settings.lease_seconds));
+    if granted + LEASE_SHORTFALL_TOLERANCE >= asked {
+        return false;
+    }
+
+    tracing::warn!(
+        app_id,
+        queue,
+        asked_seconds = settings.lease_seconds,
+        granted_seconds = granted.as_secs(),
+        "deis-queue leased queue {} for {}s, not the {}s this node asked for -- it caps leases at \
+         its own max_lease_secs rather than refusing the request. Batches are given up on at the \
+         shorter deadline, so a handler of app {} that needs longer will have its messages \
+         delivered a second time; raise max_lease_secs on deis-queue or lower this app's \
+         execution timeout",
+        queue,
+        granted.as_secs(),
+        settings.lease_seconds,
+        app_id
+    );
+    true
 }
 
 #[derive(Debug, PartialEq, Eq)]

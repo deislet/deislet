@@ -40,7 +40,7 @@ impl PoolSize {
 
 struct Inner {
     path: PathBuf,
-    /// What this pool is for, used only in logs (`kv`, `blob`, `db:<app>`).
+    /// What this pool is for, used only in logs (`kv`, `blob`, `db:<tenant>`).
     label: String,
     /// Connections not currently checked out. Guarded by a std mutex that is
     /// only ever locked inside a blocking task, never across an await.
@@ -56,8 +56,8 @@ pub struct SqlitePool {
 
 impl SqlitePool {
     /// Create a pool over `path`. No connection is opened yet: the first
-    /// caller pays for it, so a per-app database costs nothing until the app
-    /// actually stores something.
+    /// caller pays for it, so a per-tenant database costs nothing until that
+    /// tenant actually stores something.
     pub fn new(path: impl Into<PathBuf>, label: impl Into<String>, size: PoolSize) -> Self {
         let path = path.into();
         let label = label.into();

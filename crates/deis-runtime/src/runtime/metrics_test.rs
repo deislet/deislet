@@ -197,4 +197,44 @@ mod tests {
         shipper.start().await;
         shipper.shutdown().await;
     }
+
+    /// A sample is charged to the tenant, but Prometheus has to see the two
+    /// halves apart: otherwise `demo.production` and `demo.preview` look like two
+    /// unrelated applications and no query can add them up.
+    #[test]
+    fn a_shipped_sample_carries_the_environment_as_a_label() {
+        let registry = MetricsRegistry::new();
+        registry.record_request("demo.preview", Duration::from_millis(5), RequestOutcome::Ok);
+
+        let samples = registry.snapshot(1);
+        let requests = samples
+            .iter()
+            .find(|s| s.name == REQUESTS_TOTAL)
+            .expect("requests counter");
+
+        assert_eq!(requests.app_id, "demo");
+        assert_eq!(
+            requests
+                .labels
+                .iter()
+                .find(|(k, _)| *k == "environment")
+                .map(|(_, v)| v.as_str()),
+            Some("preview")
+        );
+    }
+
+    #[test]
+    fn a_sample_recorded_under_a_bare_application_id_gets_no_environment_label() {
+        let registry = MetricsRegistry::new();
+        registry.record_rate_limit_cutoff("legacy-app");
+
+        let samples = registry.snapshot(1);
+        let cutoffs = samples
+            .iter()
+            .find(|s| s.name == RATE_LIMIT_CUTOFFS_TOTAL)
+            .expect("cutoff counter");
+
+        assert_eq!(cutoffs.app_id, "legacy-app");
+        assert!(cutoffs.labels.iter().all(|(k, _)| *k != "environment"));
+    }
 }

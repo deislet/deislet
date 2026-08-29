@@ -134,6 +134,20 @@ impl CatalogStore {
                     paths
                 };
 
+                // Read before the rows go: an application on a node is
+                // keyed by (app_id, environment), and after this
+                // transaction nothing can say which environments existed.
+                let environment_names: Vec<String> = {
+                    let mut stmt = tx
+                        .prepare("SELECT name FROM environments WHERE app_id = ?1 ORDER BY name")?;
+                    let rows = stmt.query_map(params![app_id], |row| row.get::<_, String>(0))?;
+                    let mut names = Vec::new();
+                    for row in rows {
+                        names.push(row?);
+                    }
+                    names
+                };
+
                 // Children first: the foreign keys are enforced.
                 let secrets =
                     tx.execute("DELETE FROM secrets WHERE app_id = ?1", params![app_id])?;
@@ -156,6 +170,7 @@ impl CatalogStore {
                     routes,
                     secrets,
                     bundle_paths,
+                    environment_names,
                 })
             })
             .await?;
@@ -169,7 +184,7 @@ impl CatalogStore {
             deployments = removed.deployments,
             routes = removed.routes,
             secrets = removed.secrets,
-            "App deleted; its version history and secrets are gone and any node still running it will keep serving stale code until the next assignment refresh"
+            "App deleted from the catalog; its version history and secrets are gone. Every node must now be told to drop it: a node only ever adds what its assignment list names and never removes what has left it"
         );
         Ok(removed)
     }

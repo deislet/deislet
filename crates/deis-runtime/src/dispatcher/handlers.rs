@@ -1,8 +1,9 @@
 // HTTP request handlers
 
 use super::AppState;
+use crate::app::AppKey;
 use crate::assets::{if_none_match_matches, AssetHit};
-use crate::APP_ID_HEADER;
+use crate::{APP_ID_HEADER, ENVIRONMENT_HEADER};
 use axum::{
     body::Body,
     extract::{
@@ -15,12 +16,18 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 
-/// Unified request handler - routes to applications via the tenant header.
+/// Unified request handler - routes to applications via the tenant headers.
 ///
-/// The header name comes from [`APP_ID_HEADER`] rather than a literal here:
-/// deis-proxy stamps it and this reads it, and a node that disagreed with the
-/// proxy about the spelling would reject every request with 400 while both
-/// sides looked correct in isolation.
+/// Two headers, because a running application is an application *in an
+/// environment*: [`APP_ID_HEADER`] names the application and
+/// [`ENVIRONMENT_HEADER`] names which of its environments to serve. An absent
+/// environment means [`crate::DEFAULT_ENVIRONMENT`], so a caller that predates
+/// previews still reaches production rather than being refused.
+///
+/// The header names come from `deis_wire::conventions` rather than literals
+/// here: deis-proxy stamps them and this reads them, and a node that disagreed
+/// with the proxy about the spelling would reject every request with 400 while
+/// both sides looked correct in isolation.
 pub async fn handle_request(
     State(state): State<AppState>,
     method: Method,
@@ -47,6 +54,8 @@ pub async fn handle_request(
         }
     };
 
+    let environment = requested_environment(&headers).to_string();
+
     // Check if it's a debug request
     if let Some(target_app_id) = app_id.strip_prefix("_inspect:") {
         let token = headers
@@ -54,20 +63,15 @@ pub async fn handle_request(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        if !state
-            .app_manager
-            .validate_inspect_token(target_app_id, token)
-        {
+        let target = AppKey::new(target_app_id, environment);
+        if !state.app_manager.validate_inspect_token(&target, token) {
             return (StatusCode::FORBIDDEN, "Invalid or expired inspector token").into_response();
         }
 
         if let Some(ws_upgrade) = ws {
             let app_manager = state.app_manager.clone();
-            let target_app_id = target_app_id.to_string();
             return ws_upgrade
-                .on_upgrade(move |socket| {
-                    handle_inspector_session(socket, target_app_id, app_manager)
-                })
+                .on_upgrade(move |socket| handle_inspector_session(socket, target, app_manager))
                 .into_response();
         } else {
             return (
@@ -76,6 +80,20 @@ pub async fn handle_request(
             )
                 .into_response();
         }
+    }
+
+    // The pair names a directory on this node and a storage tenant, so a
+    // request that carries something else is refused here rather than being
+    // allowed to reach code that would build a path out of it.
+    let key = AppKey::new(app_id, environment);
+    if let Err(e) = key.validate() {
+        tracing::warn!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            "Refusing a request whose routing headers are not usable: {}",
+            e
+        );
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
     // Asset-first, the platform's first design principle: a request whose path
@@ -87,10 +105,11 @@ pub async fn handle_request(
     // to collide with a static file is far more likely to be a route the app
     // implements than a request for the file, so those fall through.
     if matches!(method, Method::GET | Method::HEAD) {
-        if let Some(assets) = state.app_manager.assets(&app_id) {
+        if let Some(assets) = state.app_manager.assets(&key) {
             if let Some(hit) = assets.resolve(uri.path()) {
                 tracing::debug!(
-                    app_id = %app_id,
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
                     path = %hit.path,
                     bytes = hit.bytes.len(),
                     "Served a static asset without entering an isolate"
@@ -104,8 +123,10 @@ pub async fn handle_request(
     let url = format!("http://localhost{}", uri);
 
     tracing::debug!(
-        "Routing request: app_id={}, method={}, url={}",
-        app_id,
+        app_id = %key.app_id(),
+        environment = %key.environment(),
+        "Routing request: app={}, method={}, url={}",
+        key,
         method,
         url
     );
@@ -128,7 +149,7 @@ pub async fn handle_request(
     // Execute application
     match state
         .app_manager
-        .execute_app(&app_id, url, method.to_string(), header_map, body_opt)
+        .execute_app(&key, url, method.to_string(), header_map, body_opt)
         .await
     {
         Ok((status, resp_headers, resp_body)) => {
@@ -138,25 +159,29 @@ pub async fn handle_request(
                     // Extract WebSocket ID
                     if let Some(ws_id) = resp_headers.get("X-Runtime-WebSocket-ID") {
                         let ws_id = ws_id.clone();
-                        let app_id_clone = app_id.clone();
+                        let key_clone = key.clone();
                         let app_manager = state.app_manager.clone();
 
                         tracing::info!(
+                            app_id = %key.app_id(),
+                            environment = %key.environment(),
                             "WebSocket upgrade for app {} with ws_id: {}",
-                            app_id,
+                            key,
                             ws_id
                         );
 
                         // Execute WebSocket upgrade and start message bridging
                         return ws_upgrade
                             .on_upgrade(move |socket| {
-                                handle_websocket_bridged(socket, app_id_clone, ws_id, app_manager)
+                                handle_websocket_bridged(socket, key_clone, ws_id, app_manager)
                             })
                             .into_response();
                     } else {
                         tracing::warn!(
+                            app_id = %key.app_id(),
+                            environment = %key.environment(),
                             "App {} returned status 101 but no X-Runtime-WebSocket-ID header",
-                            app_id
+                            key
                         );
                     }
                 }
@@ -175,10 +200,30 @@ pub async fn handle_request(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("Application {} execution failed: {}", app_id, e);
+            tracing::error!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                "Application {} execution failed: {}",
+                key,
+                e
+            );
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
+}
+
+/// Which environment of an application a request names.
+///
+/// An absent or unreadable header is an empty string, which
+/// [`AppKey::new`] turns into [`crate::DEFAULT_ENVIRONMENT`]: a caller that
+/// predates previews - an older proxy, a curl by hand - reaches production
+/// rather than being refused, which is the rule the whole platform agrees on
+/// in `deis_wire::conventions`.
+pub(crate) fn requested_environment(headers: &HeaderMap) -> &str {
+    headers
+        .get(ENVIRONMENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
 }
 
 /// Turn a resolved asset into a response, honouring a conditional request.
@@ -253,13 +298,15 @@ fn header_value(value: &str, fallback: &'static str) -> axum::http::HeaderValue 
 /// Implements full bidirectional message bridging between client WebSocket and JavaScript WebSocketServer
 async fn handle_websocket_bridged(
     socket: WebSocket,
-    app_id: String,
+    key: AppKey,
     ws_id: String,
     app_manager: Arc<crate::app::ApplicationManager>,
 ) {
     tracing::info!(
+        app_id = %key.app_id(),
+        environment = %key.environment(),
         "WebSocket bridge established for app: {}, ws_id: {}",
-        app_id,
+        key,
         ws_id
     );
 
@@ -272,7 +319,7 @@ async fn handle_websocket_bridged(
     // Register WebSocket connection in RuntimePool
     // Note: we only need to register js_to_client_tx, as client messages are sent directly via dispatch_ws_message
     if let Err(e) = app_manager
-        .register_ws_connection(&app_id, ws_id.clone(), js_to_client_tx)
+        .register_ws_connection(&key, ws_id.clone(), js_to_client_tx)
         .await
     {
         tracing::error!("Failed to register WebSocket connection {}: {}", ws_id, e);
@@ -288,7 +335,7 @@ async fn handle_websocket_bridged(
     tracing::debug!("WebSocket connection {} registered successfully", ws_id);
 
     // Task A: Receive message from client -> send to JavaScript
-    let app_id_clone = app_id.clone();
+    let key_clone = key.clone();
     let ws_id_clone = ws_id.clone();
     let app_manager_clone = app_manager.clone();
     let client_to_js_task = tokio::spawn(async move {
@@ -297,7 +344,7 @@ async fn handle_websocket_bridged(
                 Ok(Message::Text(text)) => {
                     tracing::debug!("Client -> JS: {} (ws_id: {})", text, ws_id_clone);
                     if let Err(e) = app_manager_clone
-                        .send_ws_message(&app_id_clone, ws_id_clone.clone(), text)
+                        .send_ws_message(&key_clone, ws_id_clone.clone(), text)
                         .await
                     {
                         tracing::error!("Failed to send message to JavaScript: {}", e);
@@ -315,7 +362,7 @@ async fn handle_websocket_bridged(
                         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
                     let json_message = format!(r#"{{"type":"binary","data":"{}"}}"#, base64_data);
                     if let Err(e) = app_manager_clone
-                        .send_ws_message(&app_id_clone, ws_id_clone.clone(), json_message)
+                        .send_ws_message(&key_clone, ws_id_clone.clone(), json_message)
                         .await
                     {
                         tracing::error!("Failed to send binary message to JavaScript: {}", e);
@@ -406,15 +453,17 @@ async fn handle_websocket_bridged(
 
     // Cleanup: unregister WebSocket connection
     if let Err(e) = app_manager
-        .unregister_ws_connection(&app_id, ws_id.clone())
+        .unregister_ws_connection(&key, ws_id.clone())
         .await
     {
         tracing::error!("Failed to unregister WebSocket {}: {}", ws_id, e);
     }
 
     tracing::info!(
+        app_id = %key.app_id(),
+        environment = %key.environment(),
         "WebSocket bridge closed for app: {}, ws_id: {}",
-        app_id,
+        key,
         ws_id
     );
 }
@@ -422,13 +471,13 @@ async fn handle_websocket_bridged(
 /// Handle debugger session
 async fn handle_inspector_session(
     socket: WebSocket,
-    app_id: String,
+    key: AppKey,
     app_manager: Arc<crate::app::ApplicationManager>,
 ) {
-    tracing::info!("Inspector session started for app: {}", app_id);
+    tracing::info!("Inspector session started for app: {}", key);
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    match app_manager.connect_inspector(&app_id).await {
+    match app_manager.connect_inspector(&key).await {
         Ok((in_tx, mut out_rx)) => {
             // Task: WS -> V8
             let ws_to_v8 = tokio::spawn(async move {
@@ -458,7 +507,7 @@ async fn handle_inspector_session(
             let _ = tokio::join!(ws_to_v8, v8_to_ws);
         }
         Err(e) => {
-            tracing::error!("Failed to connect inspector for app {}: {}", app_id, e);
+            tracing::error!("Failed to connect inspector for app {}: {}", key, e);
             let _ = ws_sender
                 .send(Message::Close(Some(axum::extract::ws::CloseFrame {
                     code: 1011,
@@ -467,5 +516,5 @@ async fn handle_inspector_session(
                 .await;
         }
     }
-    tracing::info!("Inspector session ended for app: {}", app_id);
+    tracing::info!("Inspector session ended for app: {}", key);
 }

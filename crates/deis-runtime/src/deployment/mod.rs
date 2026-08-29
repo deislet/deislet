@@ -21,6 +21,7 @@
 //! management API gives.
 
 mod assignments;
+mod credential;
 mod fetch;
 mod store;
 
@@ -33,17 +34,23 @@ use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
 use crate::app::types::AppConfig;
-use crate::app::{ApplicationManager, VersionInstall};
+use crate::app::{AppKey, ApplicationManager, VersionInstall};
 use crate::assets::{AssetBundle, AssetError};
 use crate::config::RuntimeConfig;
 
 pub use assignments::{
     run_startup_sync, sync_once, Assignment, AssignmentClient, AssignmentError, SyncOutcome,
 };
+pub use credential::NodeCredential;
 pub use fetch::{sha256_hex, BundleFetcher, FetchError, FetchedBundle};
 pub use store::{check_identifier, BundleStore, InstalledRecord, InvalidIdentifier};
 
 /// One deployment the node has been told to run.
+///
+/// `app_id` and `environment` arrive as two fields because that is how the
+/// control plane sends them; on this node they are one key
+/// ([`DeploymentOrder::key`]), because a preview and production of the same
+/// application are two deployments that must not share a slot.
 ///
 /// `env` holds decrypted secret values, which is why this type has a
 /// hand-written `Debug`: it is built straight from a gRPC request, and a
@@ -56,6 +63,13 @@ pub struct DeploymentOrder {
     pub bundle_url: String,
     pub bundle_sha: String,
     pub env: HashMap<String, String>,
+}
+
+impl DeploymentOrder {
+    /// Which running application this order is about.
+    pub fn key(&self) -> AppKey {
+        AppKey::new(self.app_id.clone(), self.environment.clone())
+    }
 }
 
 impl std::fmt::Debug for DeploymentOrder {
@@ -112,9 +126,10 @@ impl std::error::Error for DeployError {}
 pub enum Applied {
     /// The version was fetched (or reused from disk) and is now serving.
     Installed { reused_bundle: bool },
-    /// The app was already on this exact version and was left alone. Only the
-    /// startup path can produce this; a push always reloads, because a secret
-    /// may have changed under a version that did not move.
+    /// This environment was already on this exact version, with an environment
+    /// the control plane had confirmed, and was left alone. Only the startup
+    /// path can produce this; a push always reloads, because a secret may have
+    /// changed under a version that did not move.
     AlreadyRunning,
 }
 
@@ -125,10 +140,11 @@ pub struct DeploymentManager {
     store: BundleStore,
     cache_control: Arc<str>,
     max_asset_bytes: u64,
-    /// One lock per app, so two deliveries for the same app cannot interleave
-    /// while deliveries for different apps still run side by side. Startup and
-    /// a control-plane push race exactly here.
-    locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// One lock per (app, environment), so two deliveries for the same running
+    /// application cannot interleave while deliveries for anything else - a
+    /// different app, or another environment of the same app - still run side
+    /// by side. Startup and a control-plane push race exactly here.
+    locks: DashMap<AppKey, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl DeploymentManager {
@@ -138,7 +154,8 @@ impl DeploymentManager {
     ) -> anyhow::Result<Self> {
         let fetcher = BundleFetcher::new(
             Duration::from_secs(config.bundles.download_timeout_secs),
-            config.bundles.max_bundle_bytes,
+            config.bundles.max_bytes,
+            config.node_credential(),
         )?;
         let store = BundleStore::open(config.bundle_dir()).await?;
         Ok(Self {
@@ -155,14 +172,15 @@ impl DeploymentManager {
         &self.store
     }
 
-    /// How many apps this node currently has a deployed version for.
+    /// How many deployed versions this node currently runs, counting each
+    /// environment of an application separately - which is how they run.
     pub fn installed_app_count(&self) -> usize {
         self.app_manager.installed_versions().len()
     }
 
-    fn lock_for(&self, app_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn lock_for(&self, key: &AppKey) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
-            .entry(app_id.to_string())
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -173,32 +191,54 @@ impl DeploymentManager {
     /// produces no new version but does change what the isolate must see, and
     /// `context.env` is read when the isolate is built.
     pub async fn apply(&self, order: DeploymentOrder) -> Result<Applied, DeployError> {
-        let lock = self.lock_for(&order.app_id);
+        let lock = self.lock_for(&order.key());
         let _guard = lock.lock().await;
         self.install(order, false).await
     }
 
     /// Apply a deployment from the startup assignment list.
     ///
-    /// Skips an app that is already running the same version, because that can
-    /// only mean a control-plane push landed while startup was still working
-    /// through its list - and that push is the newer instruction, plus it is
-    /// the one that carried the secrets.
+    /// Skips an app that is already running the same version *with an
+    /// environment the control plane confirmed*, because that can only mean a
+    /// control-plane push landed while startup was still working through its
+    /// list - and that push is the newer instruction, plus it is the one that
+    /// carried the secrets.
+    ///
+    /// The second half of that condition is what makes it safe. The other way
+    /// to be "already on this version" is to have recovered it from local
+    /// disk, where secret values are never written: that copy runs the right
+    /// code with an empty environment. Comparing version ids alone would wave
+    /// the real delivery through, and the app would keep serving with no
+    /// secrets and no storage addresses for as long as the process lived,
+    /// while the node reported itself ready.
     pub async fn apply_from_assignment(
         &self,
         order: DeploymentOrder,
     ) -> Result<Applied, DeployError> {
-        let lock = self.lock_for(&order.app_id);
+        let key = order.key();
+        let lock = self.lock_for(&key);
         let _guard = lock.lock().await;
 
-        if let Some(current) = self.app_manager.installed_version(&order.app_id) {
+        if let Some(current) = self.app_manager.installed_version(&key) {
             if current.version_id == order.version_id {
-                debug!(
-                    app_id = %order.app_id,
+                if current.env_confirmed {
+                    debug!(
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        version_id = %order.version_id,
+                        "App is already on the assigned version with a confirmed environment; \
+                         leaving it alone"
+                    );
+                    return Ok(Applied::AlreadyRunning);
+                }
+                info!(
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
                     version_id = %order.version_id,
-                    "App is already on the assigned version; leaving it alone"
+                    "This version was recovered from local disk and is running without the \
+                     secrets and storage addresses it declares; reloading it from the control \
+                     plane's copy so that its environment is complete"
                 );
-                return Ok(Applied::AlreadyRunning);
             }
         }
 
@@ -220,10 +260,11 @@ impl DeploymentManager {
 
         let mut recovered = 0;
         for record in records {
-            let lock = self.lock_for(&record.app_id);
+            let key = record.key();
+            let lock = self.lock_for(&key);
             let _guard = lock.lock().await;
 
-            if self.app_manager.installed_version(&record.app_id).is_some() {
+            if self.app_manager.installed_version(&key).is_some() {
                 continue;
             }
 
@@ -265,18 +306,84 @@ impl DeploymentManager {
         recovered
     }
 
-    /// Drop an app: its isolate, its assets and its bundles.
-    pub async fn unload(&self, app_id: &str) -> anyhow::Result<()> {
-        let lock = self.lock_for(app_id);
-        let _guard = lock.lock().await;
+    /// Stop serving an application here.
+    ///
+    /// `environment` names one of them; `None` means all of them, which is
+    /// what deleting an application from the catalog asks for - by then the
+    /// rows that would name its environments are gone, and this node may still
+    /// hold one the control plane has already forgotten.
+    ///
+    /// Returns the environments that were actually running. An application
+    /// this node was not running is not a failure: there is nothing left to
+    /// serve, which is the outcome the caller asked for. Its bundles are
+    /// removed from disk either way, because a node that restarts without a
+    /// reachable control plane loads what its disk holds.
+    pub async fn unload(
+        &self,
+        app_id: &str,
+        environment: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let loaded = self.app_manager.environments_of(app_id);
+        let targets: Vec<AppKey> = match environment {
+            Some(environment) => {
+                let wanted = AppKey::new(app_id, environment);
+                loaded.into_iter().filter(|key| *key == wanted).collect()
+            }
+            None => loaded,
+        };
 
-        let result = self.app_manager.unload_app(app_id).await;
-        self.store.forget(app_id).await;
-        // The lock stays in the map on purpose. Removing it while holding it
-        // would let the next caller mint a fresh mutex and run alongside
-        // whoever is still inside this one; the map holds one small entry per
-        // app id this node has ever seen, which is not worth that race.
-        result
+        let mut unloaded: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for key in &targets {
+            let lock = self.lock_for(key);
+            let _guard = lock.lock().await;
+            match self.app_manager.unload_app(key).await {
+                Ok(()) => unloaded.push(key.environment().to_string()),
+                Err(e) => failures.push(format!("{key}: {e}")),
+            }
+            // The lock stays in the map on purpose. Removing it while holding
+            // it would let the next caller mint a fresh mutex and run
+            // alongside whoever is still inside this one; the map holds one
+            // small entry per pair this node has ever seen, which is not worth
+            // that race.
+        }
+
+        match environment {
+            Some(environment) => {
+                self.store
+                    .forget_environment(&AppKey::new(app_id, environment))
+                    .await
+            }
+            None => self.store.forget(app_id).await,
+        }
+
+        if !failures.is_empty() {
+            return Err(anyhow::anyhow!(
+                "could not unload {app_id}: {}. It may still be serving on this node",
+                failures.join("; ")
+            ));
+        }
+
+        if unloaded.is_empty() {
+            info!(
+                app_id = %app_id,
+                environment = %environment.unwrap_or("<all>"),
+                "Asked to unload {} but this node was not running it; its bundles were removed \
+                 so a restart will not bring it back",
+                app_id
+            );
+        } else {
+            info!(
+                app_id = %app_id,
+                environments = ?unloaded,
+                "Unloaded {} environment(s) of {}: {}",
+                unloaded.len(),
+                app_id,
+                unloaded.join(", ")
+            );
+        }
+
+        Ok(unloaded)
     }
 
     /// The one path that ever changes what an app runs.
@@ -288,16 +395,25 @@ impl DeploymentManager {
         order: DeploymentOrder,
         local_only: bool,
     ) -> Result<Applied, DeployError> {
-        check_identifier("app_id", &order.app_id).map_err(DeployError::Identifier)?;
+        let key = order.key();
+        // Both halves of the key become a directory name here and a storage
+        // tenant later, so they are checked together and before anything is
+        // written.
+        key.validate().map_err(|e| {
+            DeployError::Identifier(InvalidIdentifier {
+                field: e.field,
+                value: e.value,
+            })
+        })?;
         check_identifier("version_id", &order.version_id).map_err(DeployError::Identifier)?;
 
-        let (bytes, reused_bundle) = self.bundle_bytes(&order, local_only).await?;
+        let (bytes, reused_bundle) = self.bundle_bytes(&key, &order, local_only).await?;
         let bundle_bytes = bytes.len();
 
         // Inflating a zip and hashing every file in it is CPU work measured in
-        // whole megabytes. On the async runtime it would stall the worker
-        // thread it lands on, and with it every request being served by that
-        // thread, so it happens on the blocking pool instead.
+        // whole megabytes. On the async runtime it would stall the thread it
+        // lands on, and with it every request being served by that thread, so
+        // it happens on the blocking pool instead.
         let Unpacked {
             manifest,
             code,
@@ -317,7 +433,8 @@ impl DeploymentManager {
 
         if assets.duplicate_paths() > 0 {
             warn!(
-                app_id = %order.app_id,
+                app_id = %key.app_id(),
+                environment = %key.environment(),
                 version_id = %order.version_id,
                 duplicates = assets.duplicate_paths(),
                 "The manifest names the same asset path more than once; the first entry wins \
@@ -326,7 +443,8 @@ impl DeploymentManager {
         }
         if assets.undeclared_files() > 0 {
             warn!(
-                app_id = %order.app_id,
+                app_id = %key.app_id(),
+                environment = %key.environment(),
                 version_id = %order.version_id,
                 undeclared = assets.undeclared_files(),
                 "The bundle carries files under assets/ that its manifest does not list; they \
@@ -347,7 +465,8 @@ impl DeploymentManager {
 
         if local_only && declared_secrets > 0 {
             warn!(
-                app_id = %order.app_id,
+                app_id = %key.app_id(),
+                environment = %key.environment(),
                 secrets = declared_secrets,
                 "This app declares {} secret(s) and is being loaded from disk, where secret \
                  values are deliberately never stored; handlers reading them will find them \
@@ -372,7 +491,8 @@ impl DeploymentManager {
             && !env.contains_key(crate::runtime::QUEUE_ENDPOINT_KEY)
         {
             warn!(
-                app_id = %order.app_id,
+                app_id = %key.app_id(),
+                environment = %key.environment(),
                 version_id = %order.version_id,
                 services = %wired_services,
                 "This deployment carries no storage addresses, so the services this app \
@@ -388,9 +508,9 @@ impl DeploymentManager {
         };
 
         info!(
-            app_id = %order.app_id,
+            app_id = %key.app_id(),
+            environment = %key.environment(),
             version_id = %order.version_id,
-            environment = %order.environment,
             bundle_bytes,
             reused_bundle,
             assets = assets.len(),
@@ -401,12 +521,16 @@ impl DeploymentManager {
 
         self.app_manager
             .install_version(VersionInstall {
-                app_id: order.app_id.clone(),
+                key: key.clone(),
                 version_id: order.version_id.clone(),
-                environment: order.environment.clone(),
                 entry_point: manifest.entry.clone(),
                 code,
                 config,
+                // A local recovery reconstructs everything except the secrets,
+                // which are never on disk. Saying so here is what lets the
+                // next delivery of this same version be recognised as the one
+                // that completes it, instead of being skipped as redundant.
+                env_confirmed: !local_only,
                 assets: Arc::new(assets),
             })
             .await
@@ -422,7 +546,7 @@ impl DeploymentManager {
                 })
                 .await;
         }
-        self.store.prune(&order.app_id, &order.version_id).await;
+        self.store.prune(&key, &order.version_id).await;
 
         Ok(Applied::Installed { reused_bundle })
     }
@@ -431,12 +555,13 @@ impl DeploymentManager {
     /// hold exactly these bytes.
     async fn bundle_bytes(
         &self,
+        key: &AppKey,
         order: &DeploymentOrder,
         local_only: bool,
     ) -> Result<(Vec<u8>, bool), DeployError> {
         let path = self
             .store
-            .bundle_path(&order.app_id, &order.version_id)
+            .bundle_path(key, &order.version_id)
             .map_err(DeployError::Identifier)?;
 
         if path.exists() {
@@ -461,14 +586,16 @@ impl DeploymentManager {
                     };
                     if digest.eq_ignore_ascii_case(&order.bundle_sha) {
                         debug!(
-                            app_id = %order.app_id,
+                            app_id = %key.app_id(),
+                            environment = %key.environment(),
                             version_id = %order.version_id,
                             "Reusing the bundle already on disk; its digest matches"
                         );
                         return Ok((bytes, true));
                     }
                     warn!(
-                        app_id = %order.app_id,
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
                         version_id = %order.version_id,
                         expected = %order.bundle_sha,
                         actual = %digest,
@@ -488,7 +615,7 @@ impl DeploymentManager {
             return Err(DeployError::Storage(format!(
                 "no verified bundle for {} version {} on this node's disk, and there is no \
                  control plane to fetch one from",
-                order.app_id, order.version_id
+                key, order.version_id
             )));
         }
 
@@ -501,7 +628,7 @@ impl DeploymentManager {
 
         let stored = self
             .store
-            .adopt(&fetched.path, &order.app_id, &order.version_id)
+            .adopt(&fetched.path, key, &order.version_id)
             .await
             .map_err(|e| DeployError::Storage(e.to_string()))?;
 

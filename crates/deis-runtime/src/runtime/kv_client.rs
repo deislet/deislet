@@ -1,8 +1,10 @@
 //! Key/value client backing `ctx.kv`.
 //!
-//! Talks to deis-store, which partitions data by application: the tenant
-//! travels in the `x-deis-app-id` metadata header (see [`Tenant`]), not in the
-//! proto messages, so one client speaks for exactly one application.
+//! Talks to deis-store, which partitions data by tenant -- one application in
+//! one environment. The tenant travels in the `x-deis-tenant` metadata header
+//! (see [`Tenant`]), not in the proto messages, so one client speaks for
+//! exactly one environment of one application and a preview cannot read or
+//! overwrite what production stored.
 
 use super::tenant::Tenant;
 use anyhow::{Context, Result};
@@ -32,15 +34,16 @@ impl KvClient {
     /// # Parameters
     /// - endpoint: deis-store gRPC address (e.g., "http://127.0.0.1:8090",
     ///   deis-store's default listen address)
-    /// - app_id: the tenant every call of this client is charged to
+    /// - tenant: the `<app>.<environment>` every call of this client is
+    ///   charged to; see [`Tenant`]
     ///
     /// # Returns
     /// - Ok(KvClient): Connection successful
     /// - Err: Connection failed
-    pub async fn connect(endpoint: impl Into<String>, app_id: impl Into<String>) -> Result<Self> {
+    pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let tenant = Tenant::new(app_id)?;
-        tracing::info!(%endpoint, app_id = tenant.app_id(), "connecting to KV store");
+        let tenant = Tenant::new(tenant)?;
+        tracing::info!(%endpoint, app_id = tenant.as_str(), "connecting to KV store");
 
         let client = KvStoreClient::connect(endpoint.clone())
             .await
@@ -48,7 +51,7 @@ impl KvClient {
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
-        tracing::info!(%endpoint, app_id = tenant.app_id(), "KV store client connected");
+        tracing::info!(%endpoint, app_id = tenant.as_str(), "KV store client connected");
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             tenant,
@@ -61,17 +64,17 @@ impl KvClient {
     /// because the store is down, so a store outage never stops an app from
     /// loading or takes the node with it. The first call after an outage
     /// dials again, so the binding recovers on its own once the store is
-    /// back. Only an address that is not a URL, or an app id that cannot be
-    /// a gRPC header, is refused here -- neither would ever start working.
-    pub fn connect_lazy(endpoint: &str, app_id: impl Into<String>) -> Result<Self> {
-        let tenant = Tenant::new(app_id)?;
+    /// back. Only an address that is not a URL, or a tenant that is not an
+    /// application and an environment, is refused here -- neither would ever start working.
+    pub fn connect_lazy(endpoint: &str, tenant: impl Into<String>) -> Result<Self> {
+        let tenant = Tenant::new(tenant)?;
         let channel = super::bindings::unary_channel(endpoint)?;
         let client = KvStoreClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::debug!(
             endpoint,
-            app_id = tenant.app_id(),
+            app_id = tenant.as_str(),
             "KV client prepared; it will dial on the first call"
         );
         Ok(Self {
@@ -80,9 +83,10 @@ impl KvClient {
         })
     }
 
-    /// The application every call of this client is charged to.
-    pub fn app_id(&self) -> &str {
-        self.tenant.app_id()
+    /// The tenant -- application and environment -- every call of this client
+    /// is charged to.
+    pub fn tenant(&self) -> &str {
+        self.tenant.as_str()
     }
 
     /// Get value
@@ -264,8 +268,9 @@ mod tests {
             }
         }
 
-        async fn client(&self, app_id: &str) -> KvClient {
-            KvClient::connect(self.endpoint.clone(), app_id)
+        /// `tenant` is the `<app>.<environment>` pair the store keys on.
+        async fn client(&self, tenant: &str) -> KvClient {
+            KvClient::connect(self.endpoint.clone(), tenant)
                 .await
                 .expect("connect kv client")
         }
@@ -282,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn a_value_written_with_a_lifetime_is_readable_until_it_lapses() {
         let store = Store::start().await;
-        let client = store.client("demo").await;
+        let client = store.client("demo.production").await;
 
         client
             .set_with_options("session".to_string(), "abc".to_string(), Some(3600), None)
@@ -303,7 +308,7 @@ mod tests {
         // pins the half that does work, so the gap is a missing read path and
         // not a silently dropped write.
         let store = Store::start().await;
-        let client = store.client("demo").await;
+        let client = store.client("demo.production").await;
 
         client
             .set_with_options(
@@ -327,7 +332,7 @@ mod tests {
         // already lapsed; honouring it would delete the write immediately and
         // look like the store losing data.
         let store = Store::start().await;
-        let client = store.client("demo").await;
+        let client = store.client("demo.production").await;
 
         let error = client
             .set_with_options("k".to_string(), "v".to_string(), Some(0), None)
@@ -345,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn a_plain_write_never_lapses_and_carries_no_metadata() {
         let store = Store::start().await;
-        let client = store.client("demo").await;
+        let client = store.client("demo.production").await;
 
         client
             .set("greeting".to_string(), "hello".to_string())
@@ -364,8 +369,8 @@ mod tests {
         // The tenant travels in the header, not in the message; a client that
         // stopped stamping it would read another application's data.
         let store = Store::start().await;
-        let first = store.client("app-one").await;
-        let second = store.client("app-two").await;
+        let first = store.client("app-one.production").await;
+        let second = store.client("app-two.production").await;
 
         first
             .set("shared-name".to_string(), "one".to_string())
@@ -382,11 +387,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_environments_of_one_app_do_not_share_a_namespace() {
+        // The reason the header carries a tenant rather than an app id: a
+        // preview deployment that could overwrite what production stored is
+        // an unrecoverable failure, and nothing in the app's own code says
+        // which environment it is running in.
+        let store = Store::start().await;
+        let production = store.client("demo.production").await;
+        let preview = store.client("demo.preview-7").await;
+
+        production
+            .set("customer".to_string(), "real".to_string())
+            .await
+            .expect("write as production");
+        preview
+            .set("customer".to_string(), "fixture".to_string())
+            .await
+            .expect("write as the preview");
+
+        assert_eq!(
+            production
+                .get("customer".to_string())
+                .await
+                .expect("read as production"),
+            Some("real".to_string()),
+            "a preview deployment overwrote production's data"
+        );
+        assert_eq!(
+            preview
+                .get("customer".to_string())
+                .await
+                .expect("read as the preview"),
+            Some("fixture".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn a_lazy_client_reports_the_transport_error_on_the_call() {
         // Nothing listens on port 1. Building the client must succeed -- an
         // app may not be blocked from loading by a store outage -- and the
         // call must fail with something an operator can act on.
-        let client = KvClient::connect_lazy("http://127.0.0.1:1", "demo").expect("client is built");
+        let client = KvClient::connect_lazy("http://127.0.0.1:1", "demo.production")
+            .expect("client is built");
         let error = client
             .get("anything".to_string())
             .await
@@ -404,7 +446,8 @@ mod tests {
         // again. Without this an app whose store restarted would keep failing
         // until the app itself was reloaded.
         let store = Store::start().await;
-        let client = KvClient::connect_lazy(&store.endpoint, "demo").expect("client is built");
+        let client =
+            KvClient::connect_lazy(&store.endpoint, "demo.production").expect("client is built");
 
         client
             .set("k".to_string(), "v".to_string())

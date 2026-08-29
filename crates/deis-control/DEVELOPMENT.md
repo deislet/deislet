@@ -78,7 +78,7 @@ deis-control/
 │   └── vite.config.ts
 ├── tests/                 # Integration tests
 ├── Cargo.toml             # Rust dependencies
-├── config.example.toml    # Configuration example
+├── deis-control.example.toml  # Configuration example (the only one)
 └── README.md
 ```
 

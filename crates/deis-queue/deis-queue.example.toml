@@ -3,14 +3,20 @@
 
 # Address the gRPC server binds to.
 #
-# Loopback on purpose. The service trusts the `x-deis-app-id` header it is
+# Loopback on purpose. The service trusts the `x-deis-tenant` header it is
 # handed and has no way to tell one caller from another, so the only thing
-# keeping an unrelated client away from an app's messages is that it cannot
-# reach the port. Binding anything else publishes every app's queue to that
+# keeping an unrelated client away from a tenant's messages is that it cannot
+# reach the port. Binding anything else publishes every tenant's queue to that
 # network; the service warns at startup when you do.
 listen = "127.0.0.1:8091"
 
 # Directory holding queue.sqlite.
+#
+# A tenant is one application in one environment, spelled "<app>.<environment>"
+# (for example "demo.production"). A database written before that was true is
+# keyed by bare application ids and cannot be read now; there is no migration,
+# and the service refuses to start on one rather than reporting every queue
+# empty.
 data_dir = "./data"
 
 # Connections in the SQLite pool, and the ceiling on blocking threads this

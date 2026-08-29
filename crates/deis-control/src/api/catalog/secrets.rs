@@ -1,13 +1,20 @@
-//! Secret endpoints.
+//! Secret endpoints - the human surface: write, delete, list names.
 //!
-//! Three rules shape this module. Values go in encrypted and never come
-//! back out: reads return names and timestamps only. When the master key is
-//! not available the endpoints fail with 503 instead of falling back to
+//! Three rules shape this module. A value goes in encrypted and never comes
+//! back out *here*: every read on this surface returns names and timestamps
+//! only, so the dashboard and the CLI cannot read a secret back
+//! (docs/architecture.zh.md section 8). When the master key is not
+//! available the endpoints fail with 503 instead of falling back to
 //! anything that would put a plaintext value in the database. And a change
 //! here produces no new version - a secret is not part of the immutable
 //! bundle - so it must redeliver the current version to the nodes by
 //! itself, or the code would keep running with the value it was given at
 //! deploy time.
+//!
+//! Where values *do* leave the process, so that this is not read as a
+//! platform-wide claim it cannot make: the `ApplyDeployment` push and the
+//! assignment list a node fetches, both of them decrypted at the moment of
+//! sending and both authenticated as a node. See [`crate::delivery`].
 
 use axum::{
     Json,

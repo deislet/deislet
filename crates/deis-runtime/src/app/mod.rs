@@ -1,5 +1,11 @@
+mod key;
 mod manager;
+#[cfg(test)]
+pub(crate) mod test_host;
 pub mod types;
 
-pub use manager::{ApplicationManager, InstalledVersion, VersionInstall, VersionRecord};
+pub use key::{AppKey, InvalidAppKey};
+pub use manager::{
+    ApplicationManager, InstalledVersion, ScheduledFailure, VersionInstall, VersionRecord,
+};
 pub use types::{AppConfig, AppState};

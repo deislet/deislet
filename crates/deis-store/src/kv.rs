@@ -1,8 +1,8 @@
 //! Key-value store.
 //!
-//! One SQLite file holds every tenant's keys, partitioned by the `app_id`
-//! column and keyed on `(app_id, key)`. `List` is a prefix range scan over
-//! that primary key, so listing one app's keys never walks another's.
+//! One SQLite file holds every tenant's keys, partitioned by the `tenant`
+//! column and keyed on `(tenant, key)`. `List` is a prefix range scan over
+//! that primary key, so listing one tenant's keys never walks another's.
 //!
 //! Expiry is stored, not enforced by a timer: reads filter on `expires_at`,
 //! so an expired entry is invisible the instant it lapses, and a background
@@ -17,7 +17,7 @@ use crate::proto::storage::{
     ListResponse, SetRequest, SetResponse, kv_store_server::KvStore,
 };
 use crate::sqlite::{PoolSize, SqlitePool};
-use crate::tenant::{AppId, app_id_of};
+use crate::tenant::{TenantId, tenant_of};
 use crate::unix_seconds;
 use rusqlite::OptionalExtension;
 use tonic::{Request, Response, Status};
@@ -44,14 +44,18 @@ impl KvService {
     pub async fn open(data_dir: &std::path::Path, connections: usize) -> StoreResult<Self> {
         let pool = SqlitePool::new(data_dir.join("kv.sqlite"), "kv", PoolSize::new(connections));
         pool.migrate(|conn| {
+            // Before anything is created: a kv.sqlite from before the tenant
+            // change would otherwise gain a second, empty table beside the
+            // one holding the data nobody can reach any more.
+            crate::legacy::reject_pre_tenant_table(conn, "kv")?;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS kv (
-                     app_id     TEXT NOT NULL,
+                     tenant     TEXT NOT NULL,
                      key        TEXT NOT NULL,
                      value      BLOB NOT NULL,
                      metadata   TEXT,
                      expires_at INTEGER,
-                     PRIMARY KEY (app_id, key)
+                     PRIMARY KEY (tenant, key)
                  );
                  CREATE INDEX IF NOT EXISTS kv_expires_at
                      ON kv(expires_at) WHERE expires_at IS NOT NULL;",
@@ -64,18 +68,18 @@ impl KvService {
     }
 
     /// Read one key, honouring expiry.
-    pub async fn get(&self, app: &AppId, key: &str) -> StoreResult<Option<Vec<u8>>> {
+    pub async fn get(&self, tenant: &TenantId, key: &str) -> StoreResult<Option<Vec<u8>>> {
         let key = check_key(key)?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         let now = unix_seconds();
         self.pool
             .with_conn(move |conn| {
                 let value: Option<Vec<u8>> = conn
                     .query_row(
                         "SELECT value FROM kv
-                          WHERE app_id = ?1 AND key = ?2
+                          WHERE tenant = ?1 AND key = ?2
                             AND (expires_at IS NULL OR expires_at > ?3)",
-                        rusqlite::params![app_id, key, now],
+                        rusqlite::params![tenant_id, key, now],
                         |row| row.get(0),
                     )
                     .optional()?;
@@ -88,24 +92,24 @@ impl KvService {
     /// an entry that never lapses.
     pub async fn set(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         key: &str,
         value: Vec<u8>,
         metadata: Option<String>,
         expires_at: Option<i64>,
     ) -> StoreResult<()> {
         let key = check_key(key)?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         self.pool
             .with_conn(move |conn| {
                 conn.execute(
-                    "INSERT INTO kv (app_id, key, value, metadata, expires_at)
+                    "INSERT INTO kv (tenant, key, value, metadata, expires_at)
                           VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(app_id, key) DO UPDATE SET
+                     ON CONFLICT(tenant, key) DO UPDATE SET
                           value      = excluded.value,
                           metadata   = excluded.metadata,
                           expires_at = excluded.expires_at",
-                    rusqlite::params![app_id, key, value, metadata, expires_at],
+                    rusqlite::params![tenant_id, key, value, metadata, expires_at],
                 )?;
                 Ok(())
             })
@@ -114,14 +118,14 @@ impl KvService {
 
     /// Remove one key. Removing a key that is not there is not an error.
     /// Returns whether a row was actually removed.
-    pub async fn delete(&self, app: &AppId, key: &str) -> StoreResult<bool> {
+    pub async fn delete(&self, tenant: &TenantId, key: &str) -> StoreResult<bool> {
         let key = check_key(key)?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         self.pool
             .with_conn(move |conn| {
                 let removed = conn.execute(
-                    "DELETE FROM kv WHERE app_id = ?1 AND key = ?2",
-                    rusqlite::params![app_id, key],
+                    "DELETE FROM kv WHERE tenant = ?1 AND key = ?2",
+                    rusqlite::params![tenant_id, key],
                 )?;
                 Ok(removed > 0)
             })
@@ -129,18 +133,18 @@ impl KvService {
     }
 
     /// Whether a live (unexpired) key exists.
-    pub async fn has(&self, app: &AppId, key: &str) -> StoreResult<bool> {
+    pub async fn has(&self, tenant: &TenantId, key: &str) -> StoreResult<bool> {
         let key = check_key(key)?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         let now = unix_seconds();
         self.pool
             .with_conn(move |conn| {
                 let found: Option<i64> = conn
                     .query_row(
                         "SELECT 1 FROM kv
-                          WHERE app_id = ?1 AND key = ?2
+                          WHERE tenant = ?1 AND key = ?2
                             AND (expires_at IS NULL OR expires_at > ?3)",
-                        rusqlite::params![app_id, key, now],
+                        rusqlite::params![tenant_id, key, now],
                         |row| row.get(0),
                     )
                     .optional()?;
@@ -155,13 +159,13 @@ impl KvService {
     /// cursor to resume from.
     pub async fn list(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         prefix: &str,
         limit: Option<i32>,
         cursor: Option<String>,
     ) -> StoreResult<(Vec<String>, Option<String>)> {
         let limit = clamp_limit(limit);
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         // The cursor is the last key of the previous page, so resume strictly
         // after it. A cursor that sits before the prefix is ignored rather
         // than trusted: honouring it would widen the scan to keys the caller
@@ -179,7 +183,8 @@ impl KvService {
             }
             None => (prefix.to_string(), false),
         };
-        // `None` means "no upper bound": scan to the end of this app's range.
+        // `None` means "no upper bound": scan to the end of this tenant's
+        // range.
         let upper = prefix_upper_bound(prefix);
         let now = unix_seconds();
 
@@ -188,7 +193,7 @@ impl KvService {
             .with_conn(move |conn| {
                 let sql = format!(
                     "SELECT key FROM kv
-                      WHERE app_id = ?1
+                      WHERE tenant = ?1
                         AND key {} ?2
                         {}
                         AND (expires_at IS NULL OR expires_at > ?3)
@@ -200,9 +205,9 @@ impl KvService {
                 let mut stmt = conn.prepare(&sql)?;
                 let mut rows = match &upper {
                     Some(upper) => {
-                        stmt.query(rusqlite::params![app_id, lower, now, limit, upper])?
+                        stmt.query(rusqlite::params![tenant_id, lower, now, limit, upper])?
                     }
-                    None => stmt.query(rusqlite::params![app_id, lower, now, limit])?,
+                    None => stmt.query(rusqlite::params![tenant_id, lower, now, limit])?,
                 };
                 let mut keys = Vec::new();
                 while let Some(row) = rows.next()? {
@@ -227,17 +232,17 @@ impl KvService {
     #[cfg(test)]
     pub async fn stored_attributes(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         key: &str,
     ) -> StoreResult<Option<(Option<i64>, Option<String>)>> {
         let key = check_key(key)?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         self.pool
             .with_conn(move |conn| {
                 let row = conn
                     .query_row(
-                        "SELECT expires_at, metadata FROM kv WHERE app_id = ?1 AND key = ?2",
-                        rusqlite::params![app_id, key],
+                        "SELECT expires_at, metadata FROM kv WHERE tenant = ?1 AND key = ?2",
+                        rusqlite::params![tenant_id, key],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
@@ -358,11 +363,11 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 #[tonic::async_trait]
 impl KvStore for KvService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let key = request.into_inner().key;
-        tracing::trace!(app = %app, key = %key, "kv get");
+        tracing::trace!(tenant = %tenant, key = %key, "kv get");
 
-        let value = self.get(&app, &key).await?;
+        let value = self.get(&tenant, &key).await?;
         let value = match value {
             None => None,
             Some(bytes) => match String::from_utf8(bytes) {
@@ -371,7 +376,7 @@ impl KvStore for KvService {
                     // storage.proto types the value as a string, so bytes
                     // that are not UTF-8 cannot be handed back at all.
                     tracing::error!(
-                        app = %app,
+                        tenant = %tenant,
                         key = %key,
                         error = %e,
                         "stored kv value is not valid UTF-8; the caller cannot read this key \
@@ -387,11 +392,11 @@ impl KvStore for KvService {
     }
 
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
         let expires_at = expiry_from_ttl(unix_seconds(), req.ttl_seconds)?;
         tracing::trace!(
-            app = %app,
+            tenant = %tenant,
             key = %req.key,
             bytes = req.value.len(),
             ttl_seconds = req.ttl_seconds,
@@ -400,7 +405,7 @@ impl KvStore for KvService {
         );
 
         self.set(
-            &app,
+            &tenant,
             &req.key,
             req.value.into_bytes(),
             req.metadata,
@@ -414,24 +419,24 @@ impl KvStore for KvService {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let key = request.into_inner().key;
 
-        let removed = self.delete(&app, &key).await?;
-        tracing::debug!(app = %app, key = %key, removed, "kv delete");
+        let removed = self.delete(&tenant, &key).await?;
+        tracing::debug!(tenant = %tenant, key = %key, removed, "kv delete");
         // Delete is idempotent: the post-condition "this key is gone" holds
         // either way, so a missing key is a success, not a failure.
         Ok(Response::new(DeleteResponse { success: true }))
     }
 
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
         let (keys, next_cursor) = self
-            .list(&app, &req.prefix, req.limit, req.cursor.clone())
+            .list(&tenant, &req.prefix, req.limit, req.cursor.clone())
             .await?;
         tracing::debug!(
-            app = %app,
+            tenant = %tenant,
             prefix = %req.prefix,
             returned = keys.len(),
             more = next_cursor.is_some(),
@@ -441,10 +446,10 @@ impl KvStore for KvService {
     }
 
     async fn has(&self, request: Request<HasRequest>) -> Result<Response<HasResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let key = request.into_inner().key;
-        let exists = self.has(&app, &key).await?;
-        tracing::trace!(app = %app, key = %key, exists, "kv has");
+        let exists = self.has(&tenant, &key).await?;
+        tracing::trace!(tenant = %tenant, key = %key, exists, "kv has");
         Ok(Response::new(HasResponse { exists }))
     }
 }
@@ -452,7 +457,7 @@ impl KvStore for KvService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tenant::APP_ID_HEADER;
+    use crate::tenant::TENANT_HEADER;
     use tempfile::TempDir;
 
     async fn service() -> (TempDir, KvService) {
@@ -461,24 +466,24 @@ mod tests {
         (dir, svc)
     }
 
-    fn app(name: &str) -> AppId {
-        AppId::parse(name).unwrap()
+    fn tenant(name: &str) -> TenantId {
+        TenantId::parse(name).unwrap()
     }
 
     /// Stamp the tenant the way deis-runtime does, for the tests that go
     /// through the gRPC surface rather than the storage methods.
-    fn as_app<T>(app: &str, message: T) -> Request<T> {
+    fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
         let mut request = Request::new(message);
         request
             .metadata_mut()
-            .insert(APP_ID_HEADER, app.parse().unwrap());
+            .insert(TENANT_HEADER, tenant.parse().unwrap());
         request
     }
 
     #[tokio::test]
     async fn round_trips_a_value() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         svc.set(&a, "greeting", b"hello".to_vec(), None, None)
             .await
             .unwrap();
@@ -499,11 +504,11 @@ mod tests {
     #[tokio::test]
     async fn a_set_with_a_lifetime_stores_an_absolute_expiry() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let before = unix_seconds();
 
-        let request = as_app(
-            "app-one",
+        let request = as_tenant(
+            "app-one.production",
             SetRequest {
                 key: "session".to_string(),
                 value: "token".to_string(),
@@ -534,9 +539,9 @@ mod tests {
     #[tokio::test]
     async fn a_set_without_a_lifetime_never_expires() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
-        let request = as_app(
-            "app-one",
+        let a = tenant("app-one.production");
+        let request = as_tenant(
+            "app-one.production",
             SetRequest {
                 key: "forever".to_string(),
                 value: "v".to_string(),
@@ -554,10 +559,10 @@ mod tests {
     #[tokio::test]
     async fn a_lifetime_that_is_not_positive_is_refused() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         for ttl in [0, -1] {
-            let request = as_app(
-                "app-one",
+            let request = as_tenant(
+                "app-one.production",
                 SetRequest {
                     key: "doomed".to_string(),
                     value: "v".to_string(),
@@ -586,7 +591,7 @@ mod tests {
     #[tokio::test]
     async fn set_overwrites_in_place() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         svc.set(&a, "k", b"first".to_vec(), None, None)
             .await
             .unwrap();
@@ -601,8 +606,8 @@ mod tests {
     #[tokio::test]
     async fn tenants_cannot_see_each_other() {
         let (_dir, svc) = service().await;
-        let one = app("app-one");
-        let two = app("app-two");
+        let one = tenant("app-one.production");
+        let two = tenant("app-two.production");
         svc.set(&one, "secret", b"one".to_vec(), None, None)
             .await
             .unwrap();
@@ -615,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn list_scans_only_the_prefix() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         for key in ["user:1", "user:2", "user:3", "post:1", "usea", "usez"] {
             svc.set(&a, key, b"v".to_vec(), None, None).await.unwrap();
         }
@@ -627,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn list_pages_through_a_cursor() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         for i in 0..5 {
             svc.set(&a, &format!("k{i}"), b"v".to_vec(), None, None)
                 .await
@@ -645,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn a_cursor_from_outside_the_prefix_does_not_widen_the_scan() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         for key in ["post:1", "user:1", "user:2"] {
             svc.set(&a, key, b"v".to_vec(), None, None).await.unwrap();
         }
@@ -660,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn expired_entries_are_invisible_then_swept() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let past = unix_seconds() - 1;
         let future = unix_seconds() + 3600;
         svc.set(&a, "stale", b"v".to_vec(), None, Some(past))
@@ -684,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_and_oversized_keys() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         assert!(matches!(
             svc.get(&a, "").await,
             Err(StoreError::InvalidArgument(_))

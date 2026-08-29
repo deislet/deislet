@@ -358,14 +358,22 @@ sequenceDiagram
 
 | 组件 | 服务 | 底层 | proto |
 |---|---|---|---|
-| **deis-store** | KV | SQLite 表（app_id, key, value, metadata, expires_at） | `storage.proto`，已补 `ttl_seconds` / `metadata` |
-| | Database | 每 app 一个独立 SQLite 文件 | `storage.proto`，无改动 |
+| **deis-store** | KV | SQLite 表（tenant, key, value, metadata, expires_at） | `storage.proto`，已补 `ttl_seconds` / `metadata` |
+| | Database | 每租户一个独立 SQLite 文件 | `storage.proto`，无改动 |
 | | Blob | 内容寻址落盘 + SQLite 元数据 | `blob.proto`，Get/Put 已改流式 |
 | **deis-queue** | Queue | SQLite 表做持久队列 | `queue.proto`，待补 `Pull` / `Ack` / `Nack` |
 
-### 租户维度只有 app_id
+### 租户维度只有一个，值是「应用 + 环境」
 
-两个组件都只认 `app_id` 一个维度，**不认版本、环境、部署**。这些概念只存在于控制面和运行时。app_id 走带外的 `x-deis-app-id` 头传递（gRPC metadata），与 deis-proxy 在 HTTP 数据面已经在用的是同一个头，所以现有 proto 消息不需要加租户字段。
+两个组件都只认**一个**租户维度，**不认版本、不认部署，也不知道「环境」是什么**。它们收到的租户 id 是一个不透明的字符串，走带外的 `x-deis-tenant` 头传递（gRPC metadata），所以现有 proto 消息不需要加租户字段。
+
+这个串由调用方用 `deis_wire::conventions::tenant_id(app, environment)` 拼出来，形如 `demo.production`；服务端用同一个 crate 的 `split_tenant` 校验，只接受恰好两段合法部分，因此没有哪个取值能拼出上级目录（租户 id 会变成磁盘路径 `db/<tenant>.sqlite`、`blob/<tenant>/…`）。缺头、非可打印 ASCII、或校验不过（裸 app id、三段、空段、含 `.` `/` `\`、半边超 64 字节）一律回 `PermissionDenied`，绝不退回某个默认命名空间。
+
+**为什么把环境揉进这把钥匙**：原则 10 说每个环境有自己的绑定与数据。如果预览环境和生产共用一个命名空间，预览的一次写就能覆盖掉生产的键——而这是回滚救不回来的，回滚只换代码，不还数据。所以这里宁可让钥匙长一点，也不让两个环境有机会撞在一起。
+
+服务端刻意**不提供**拆开后两半的访问器：存储是按租户存的，不是按应用存的，代码里不该有任何地方能因为「前缀一样」把两个租户当成一个。
+
+`x-deis-app-id` 仍然存在，但只在数据面表示「这是哪个应用」（配合 `x-deis-environment`），不再是存储租户；只带它来调存储的调用会被拒绝。
 
 ### 队列语义
 
@@ -380,12 +388,12 @@ sequenceDiagram
 
 ### 授权：现阶段靠网络收敛，不是靠校验
 
-**现状与早前的设想相反，这里写清楚**：deis-store 目前**无条件相信** `x-deis-app-id` 头，没有授权表。能连上端口的任何东西都能读写删任意应用的数据。收敛手段是网络层——默认只监听回环地址，绑定非回环地址时启动会打 warn 说明后果。
+**现状与早前的设想相反，这里写清楚**：deis-store 校验 `x-deis-tenant` 的**形状**，但不校验**身份**，也没有授权表。能连上端口的任何东西都能自称任何租户——包括同一个应用的另一个环境——从而读写删它的数据。租户拆分挡不住这一层，它挡的是应用自己写错租户。收敛手段仍是网络层：默认只监听回环地址，绑定非回环地址时启动会打 warn 说明后果。
 
 这对「自己/团队内部用」是相称的：只有同机的 deis-runtime 需要连它。要把它暴露到本机之外，**必须先有**这几样，缺一不可：
 
 1. 每个调用方的身份（mTLS 客户端证书，或控制面签发的令牌）
-2. 身份与所声明 app_id 的核对
+2. 身份与所声明租户的核对
 3. 拒绝要有可追查的日志
 4. 健康端点同等对待——否则它成了免鉴权的存活探针
 
@@ -394,7 +402,7 @@ sequenceDiagram
 ### 其他取舍
 
 - **先单机**。SQLite + 本地盘对内部规模够用。接口层不暴露单机假设，以后换后端不动 proto。
-- **不做跨节点复制**。deis-store 是全量复制模型下唯一的有状态点，也是单点。内部使用先接受，但**目前连快照备份机制都还没有**：数据目录里同时有 `kv.sqlite`、`blob.sqlite`、`db/<app_id>.sqlite` 和内容树，SQLite 开着 WAL，直接 `cp` 目录不安全。这是已知缺口。
+- **不做跨节点复制**。deis-store 是全量复制模型下唯一的有状态点，也是单点。内部使用先接受，但**目前连快照备份机制都还没有**：数据目录里同时有 `kv.sqlite`、`blob.sqlite`、`db/<tenant>.sqlite` 和内容树，SQLite 开着 WAL，直接 `cp` 目录不安全。这是已知缺口。
 - **地址由 deis-control 下发**给 deis-runtime，不写死在 deis-runtime 配置里。
 
 ---

@@ -107,16 +107,16 @@ impl Feature {
             (Feature::SQLDatabase, Platform::Cloudflare) => Some("D1 Database"),
             (Feature::SQLDatabase, Platform::Deno) => Some("Postgres (via integration)"),
             (Feature::SQLDatabase, Platform::Tencent) => None,
-            // deis-store serves per-app SQLite over gRPC, but deis-runtime never
-            // constructs a client for it, so every `context.services.database`
-            // call fails. See `pending_on`.
+            // deis-store serves one SQLite database per tenant over gRPC, and
+            // deis-runtime builds the client in `runtime/bindings.rs` from the
+            // manifest's `services`, so `context.services.database` reaches it.
             (Feature::SQLDatabase, Platform::Deislet) => Some("Per-app SQLite in deis-store"),
 
             (Feature::ObjectStorage, Platform::Cloudflare) => Some("R2 Buckets"),
             (Feature::ObjectStorage, Platform::Deno) => None,
             (Feature::ObjectStorage, Platform::Tencent) => None,
-            // Same shape as the database: deis-store has the blob service, the
-            // isolate has no client. See `pending_on`.
+            // Same shape as the database: deis-store serves the blobs and
+            // deis-runtime builds the isolate's client from the manifest.
             (Feature::ObjectStorage, Platform::Deislet) => {
                 Some("Content-addressed blobs in deis-store")
             }
@@ -142,8 +142,9 @@ impl Feature {
             (Feature::CronJobs, Platform::Cloudflare) => Some("Cron Triggers"),
             (Feature::CronJobs, Platform::Deno) => Some("Deno.cron"),
             (Feature::CronJobs, Platform::Tencent) => None,
-            // A bundle carries `cron`, and deis-control has a scheduler, but the
-            // node's `Trigger.OnScheduled` is still a stub. See `pending_on`.
+            // A bundle carries `cron`; the control plane keeps one schedule per
+            // (app_id, environment) and calls a node's `Trigger.OnScheduled`
+            // when it is due, which runs the app's `scheduled` export.
             (Feature::CronJobs, Platform::Deislet) => {
                 Some("Scheduled by deis-control, run on one node")
             }
@@ -151,8 +152,10 @@ impl Feature {
             (Feature::WebSockets, Platform::Cloudflare) => Some("WebSocket API"),
             (Feature::WebSockets, Platform::Deno) => Some("WebSocket API"),
             (Feature::WebSockets, Platform::Tencent) => None,
-            // The one extended feature that really works today: deis-runtime
-            // bridges server-side sockets into the isolate.
+            // deis-runtime bridges server-side sockets into the isolate and
+            // deis-proxy tunnels upgrades, but the two halves have never been
+            // tested end to end (architecture.zh.md section 11), so this is the
+            // one entry claiming more than a green test proves.
             (Feature::WebSockets, Platform::Deislet) => Some("WebSocket bridge in deis-runtime"),
 
             (Feature::DurableObjects, Platform::Cloudflare) => Some("Durable Objects"),
@@ -165,9 +168,9 @@ impl Feature {
             (Feature::Queues, Platform::Cloudflare) => Some("Queues"),
             (Feature::Queues, Platform::Deno) => None,
             (Feature::Queues, Platform::Tencent) => None,
-            // deis-queue does not exist yet and the node's `Trigger.OnQueue` is
-            // a stub; `context.services.queue.send` lands in a per-isolate list
-            // that is dropped with the isolate. See `pending_on`.
+            // deis-queue is its own process; `context.services.queue.send`
+            // reaches it through the client deis-runtime builds, and a node
+            // polls it for every queue the manifest declares a consumer for.
             (Feature::Queues, Platform::Deislet) => Some("deis-queue, consumed by polling"),
 
             (Feature::WorkersAI, Platform::Cloudflare) => Some("Workers AI"),

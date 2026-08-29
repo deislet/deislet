@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use crate::path::percent_decode;
 use crate::{ASSETS_PREFIX, Asset};
 
 /// What to serve for a request path that named an asset.
@@ -69,15 +70,23 @@ impl AssetIndex {
     ///   - `/css/app.css` serves the file of that name
     ///   - `/` and `/docs/` serve `index.html` inside that directory
     ///
+    /// The request path is percent-decoded first. A manifest records the
+    /// name the file has on disk, `report 2026.pdf`, while a browser can only
+    /// ask for `/report%202026.pdf`; probing the map with the escaped form
+    /// misses every asset whose name holds a space or a non-ASCII character,
+    /// and misses it silently - the file is in the archive, listed in the
+    /// manifest, and the request falls through to the isolate and 404s.
+    ///
     /// A path containing a `..` segment never resolves. The index is built
     /// from a validated manifest so it cannot hold such a path, but a request
-    /// can still ask for one, and answering it would be a traversal.
+    /// can still ask for one, and answering it would be a traversal. The check
+    /// runs *after* decoding, or `%2e%2e` would walk straight past it.
     pub fn lookup(&self, request_path: &str) -> Option<AssetMatch<'_>> {
-        let path = request_path.split(['?', '#']).next().unwrap_or("");
+        let path = percent_decode(request_path.split(['?', '#']).next().unwrap_or(""));
         if path.split('/').any(|seg| seg == "..") {
             return None;
         }
-        let key = normalise(path);
+        let key = normalise(&path);
 
         if let Some(asset) = self.by_path.get(&key) {
             return Some(self.to_match(asset, false));
@@ -216,6 +225,37 @@ mod tests {
         let ix = index(&["index.html"]);
         assert!(ix.lookup("/../../etc/passwd").is_none());
         assert!(ix.lookup("/a/../index.html").is_none());
+    }
+
+    #[test]
+    fn refuses_a_traversal_written_in_escapes() {
+        // Decoding before the check is what makes this a rejection instead of
+        // a lookup for a path that climbs out of the assets directory.
+        let ix = index(&["index.html"]);
+        assert!(ix.lookup("/%2e%2e/%2e%2e/etc/passwd").is_none());
+        assert!(ix.lookup("/a/%2E%2E/index.html").is_none());
+    }
+
+    #[test]
+    fn finds_a_file_whose_name_a_browser_has_to_escape() {
+        // The manifest holds the name on disk; the client can only send the
+        // escaped form. Probing with the escaped form finds nothing, and the
+        // miss is silent - the request just 404s from the isolate.
+        let ix = index(&["docs/my file.txt", "caf\u{e9}/men\u{fc}.pdf"]);
+        assert_eq!(
+            ix.lookup("/docs/my%20file.txt").unwrap().archive_path,
+            "assets/docs/my file.txt"
+        );
+        assert_eq!(
+            ix.lookup("/caf%C3%A9/men%C3%BC.pdf").unwrap().archive_path,
+            "assets/caf\u{e9}/men\u{fc}.pdf"
+        );
+    }
+
+    #[test]
+    fn an_escaped_directory_request_still_finds_its_index() {
+        let ix = index(&["my docs/index.html"]);
+        assert!(ix.lookup("/my%20docs/").unwrap().via_index);
     }
 
     #[test]

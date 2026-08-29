@@ -1,9 +1,11 @@
 //! Deislet message queue.
 //!
-//! This service is deliberately "dumb": it knows only `app_id` as a tenant
-//! dimension, and knows nothing about versions, environments, deployments or
-//! nodes. Those concepts live in deis-control and deis-runtime. Consumers
-//! come to it and lease work; it never pushes to anyone.
+//! This service is deliberately "dumb": one tenant dimension, carried in the
+//! `x-deis-tenant` header, and no idea what a version, an environment, a
+//! deployment or a node is. Those concepts live in deis-control and
+//! deis-runtime, which is also where the tenant id is built - here it is one
+//! opaque key. Consumers come to it and lease work; it never pushes to
+//! anyone.
 //!
 //! It also does not authenticate its callers: the tenant header is taken at
 //! face value, which is why it listens on loopback by default. See the crate

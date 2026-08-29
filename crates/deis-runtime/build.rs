@@ -29,8 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["../deis-store/proto"],
         )?;
 
-    // Compiling telemetry proto (client - deis-runtime pushes logs to
-    // LogService; MetricService in the same file is not consumed here yet)
+    // Compiling telemetry proto (client - both services in this file are
+    // consumed by this crate: LogService by src/logging/shipper.rs and
+    // MetricService by src/runtime/metrics.rs, so neither generated client
+    // can be dropped without breaking the build)
     tonic_build::configure()
         .build_server(false)
         .build_client(true)

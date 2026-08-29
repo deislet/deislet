@@ -36,7 +36,16 @@ pub enum AssetError {
         actual: String,
     },
     /// The assets of this one version exceed the node's memory ceiling.
-    TooLarge { total: u64, limit: u64 },
+    ///
+    /// `path` names the entry the ceiling was hit on, which is the one an
+    /// operator has to look at; `total` is what had been read when reading
+    /// stopped, not what the bundle claims, because the claim is the thing
+    /// that must not be trusted.
+    TooLarge {
+        path: String,
+        total: u64,
+        limit: u64,
+    },
 }
 
 impl std::fmt::Display for AssetError {
@@ -63,11 +72,11 @@ impl std::fmt::Display for AssetError {
                  it would hand clients an ETag that does not describe the bytes, and caches would \
                  keep the wrong file"
             ),
-            Self::TooLarge { total, limit } => write!(
+            Self::TooLarge { path, total, limit } => write!(
                 f,
-                "the assets of this version total {total} bytes, over the {limit} byte ceiling; \
-                 they are held in memory for the life of the version, so loading it would put the \
-                 node's own memory at risk"
+                "the assets of this version passed the {limit} byte ceiling while reading \
+                 {path:?} ({total} bytes read); they are held in memory for the life of the \
+                 version, so loading it would put the node's own memory at risk"
             ),
         }
     }
@@ -134,6 +143,13 @@ impl AssetBundle {
     /// it becomes the `ETag`: a manifest that disagrees with its own bytes
     /// would make caches hold content under a tag that never changes when the
     /// content does.
+    ///
+    /// So is the size. A zip header's uncompressed size is a claim made by the
+    /// file, and deflate compresses a run of zeros by a factor of a thousand,
+    /// so a 5 MB bundle can declare a 20 GB entry. Nothing is allocated or
+    /// read past what is left of `max_bytes`, which is what keeps one bad
+    /// bundle from taking the node - and with it every other application on
+    /// it - down with an out-of-memory kill.
     pub fn from_archive<R: Read + Seek>(
         manifest: &Manifest,
         archive: &mut zip::ZipArchive<R>,
@@ -151,25 +167,45 @@ impl AssetBundle {
                 continue;
             }
 
-            let mut entry = archive
+            let entry = archive
                 .by_name(&archive_path)
                 .map_err(|_| AssetError::Missing {
                     path: asset.path.clone(),
                 })?;
 
-            let mut bytes = Vec::with_capacity(entry.size() as usize);
-            entry
+            // What is left of the ceiling for this entry. Reading one byte
+            // more than that is enough to know the version is over it, and it
+            // is the most this entry can ever cost in memory.
+            let remaining = max_bytes.saturating_sub(total_bytes);
+            let declared = entry.size();
+            let mut bytes = Vec::with_capacity(allocation_for(declared, remaining));
+            let read = entry
+                .take(remaining.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .map_err(|e| AssetError::Unreadable {
                     path: asset.path.clone(),
                     reason: e.to_string(),
-                })?;
+                })? as u64;
 
-            total_bytes = total_bytes.saturating_add(bytes.len() as u64);
-            if total_bytes > max_bytes {
+            total_bytes = total_bytes.saturating_add(read);
+            if read > remaining {
                 return Err(AssetError::TooLarge {
+                    path: asset.path.clone(),
                     total: total_bytes,
                     limit: max_bytes,
+                });
+            }
+            if read != declared {
+                // The entry ended early. Its digest will not match what the
+                // manifest declares, and if the manifest declares none the
+                // ETag would describe a truncated file, so the version is
+                // refused rather than served half a file.
+                return Err(AssetError::Unreadable {
+                    path: asset.path.clone(),
+                    reason: format!(
+                        "the archive declares {declared} bytes but yielded {read}; the bundle is \
+                         truncated or its directory disagrees with its contents"
+                    ),
                 });
             }
 
@@ -247,6 +283,19 @@ impl AssetBundle {
     pub fn undeclared_files(&self) -> usize {
         self.undeclared_files
     }
+}
+
+/// How much to reserve for one entry up front.
+///
+/// The declared size is a hint from an untrusted file, so it is capped by what
+/// is left of the ceiling (nothing beyond that will ever be kept) and by a
+/// modest chunk, so that a declaration of "20 GB" costs one small allocation
+/// and a growing read rather than 20 GB of address space on the first line.
+fn allocation_for(declared: u64, remaining: u64) -> usize {
+    /// Enough that a normal asset is read in one or two allocations.
+    const RESERVE_CEILING: u64 = 1024 * 1024;
+
+    declared.min(remaining).min(RESERVE_CEILING) as usize
 }
 
 /// Whether an `If-None-Match` header excuses us from sending the body.

@@ -12,13 +12,15 @@
 //!    whose certificate is actually loaded are redirected to HTTPS when the
 //!    policy says so.
 //! 3. A backend is picked from the shared upstream pool and the request is
-//!    forwarded. `x-deis-app-id` is set to the id deis-proxy decided on,
-//!    replacing whatever the client sent, so deis-runtime only ever sees an id that
-//!    passed the checks above.
+//!    forwarded. `x-deis-app-id` is set to the id deis-proxy decided on and
+//!    `x-deis-environment` to that app's configured environment (defaulting
+//!    to production when the route names none), replacing whatever the
+//!    client sent for either header, so deis-runtime only ever sees values
+//!    that passed the checks above.
 
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
-pub use deis_wire::conventions::APP_ID_HEADER;
+pub use deis_wire::conventions::{APP_ID_HEADER, ENVIRONMENT_HEADER};
 
 pub mod access_log;
 pub mod balancer;
@@ -59,6 +61,10 @@ pub struct RequestCtx {
     /// Normalized request host (no port, lowercase).
     pub host: String,
     pub app_id: Option<String>,
+    /// Environment of the resolved app (`production` or a preview name).
+    /// Set together with `app_id`; `None` only in plain reverse proxy mode
+    /// where no application was resolved at all.
+    pub environment: Option<String>,
     /// Backend address the request was sent to, once selected.
     pub upstream: Option<String>,
     /// Whether the client connection is TLS.
@@ -149,6 +155,29 @@ fn resolve_app(routes: &RouteTable, requested_id: Option<&str>, host: &str) -> R
     }
 }
 
+/// Set `x-deis-app-id` and `x-deis-environment` on the upstream request from
+/// what deis-proxy resolved, replacing whatever the client sent under either
+/// name (`insert_header` replaces rather than appends, and normalizes header
+/// case). With no application resolved (plain reverse proxy mode) both
+/// fields are `None` and both headers are left exactly as the client sent
+/// them, since pingora already copied the downstream headers over.
+fn stamp_routing_headers(
+    upstream_request: &mut RequestHeader,
+    ctx: &RequestCtx,
+) -> pingora::Result<()> {
+    if let Some(app_id) = &ctx.app_id {
+        upstream_request.insert_header(APP_ID_HEADER, app_id.as_str())?;
+    }
+    // An app that names no environment still carries one here: see
+    // AppConfig::environment's default, which guarantees this is never
+    // empty once an app has been resolved, so the header on the wire is
+    // never ambiguous.
+    if let Some(environment) = &ctx.environment {
+        upstream_request.insert_header(ENVIRONMENT_HEADER, environment.as_str())?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ProxyHttp for DeisProxy {
     type CTX = RequestCtx;
@@ -224,13 +253,14 @@ impl ProxyHttp for DeisProxy {
         };
 
         if !app.enabled {
-            debug!(host = %ctx.host, app_id = %app.id, "application disabled");
+            debug!(host = %ctx.host, app_id = %app.id, environment = %app.environment, "application disabled");
             session
                 .respond_error_with_body(403, Bytes::from_static(b"application disabled\n"))
                 .await?;
             return Ok(true);
         }
         ctx.app_id = Some(app.id.clone());
+        ctx.environment = Some(app.environment.clone());
 
         let system = self.config.get_system_config();
         let tls_ports = system.tls_ports();
@@ -311,14 +341,7 @@ impl ProxyHttp for DeisProxy {
         upstream_request: &mut RequestHeader,
         ctx: &mut RequestCtx,
     ) -> pingora::Result<()> {
-        // Pingora copies the downstream headers into the upstream request, so
-        // the client's own value is replaced by the id deis-proxy decided on
-        // (insert_header replaces, and normalizes the header's case). With no
-        // app resolved (plain reverse proxy mode) the header is left alone.
-        if let Some(app_id) = &ctx.app_id {
-            upstream_request.insert_header(APP_ID_HEADER, app_id.as_str())?;
-        }
-        Ok(())
+        stamp_routing_headers(upstream_request, ctx)
     }
 
     async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut RequestCtx) {
@@ -333,6 +356,7 @@ impl ProxyHttp for DeisProxy {
             Some(e) => warn!(
                 host = %ctx.host,
                 app_id = ?ctx.app_id,
+                environment = ?ctx.environment,
                 upstream = ?ctx.upstream,
                 status,
                 elapsed_ms = ctx.elapsed().as_millis() as u64,
@@ -342,6 +366,7 @@ impl ProxyHttp for DeisProxy {
             None => debug!(
                 host = %ctx.host,
                 app_id = ?ctx.app_id,
+                environment = ?ctx.environment,
                 upstream = ?ctx.upstream,
                 status,
                 elapsed_ms = ctx.elapsed().as_millis() as u64,
@@ -356,6 +381,7 @@ mod tests {
 
     use std::collections::HashMap;
 
+    use pingora::http::Method;
     use serde_json::json;
 
     use super::*;
@@ -383,6 +409,13 @@ mod tests {
     fn resolved_id(resolution: Resolution) -> Option<String> {
         match resolution {
             Resolution::App(app) => Some(app.id.clone()),
+            _ => None,
+        }
+    }
+
+    fn resolved_environment(resolution: Resolution) -> Option<String> {
+        match resolution {
+            Resolution::App(app) => Some(app.environment.clone()),
             _ => None,
         }
     }
@@ -427,6 +460,83 @@ mod tests {
             resolve_app(&routes, Some("anything"), "any.example.com"),
             Resolution::Passthrough
         ));
+    }
+
+    #[test]
+    fn resolved_app_defaults_to_the_production_environment() {
+        // The fixture apps above never mention "environment"; a route
+        // pushed without one must still resolve to a concrete value rather
+        // than leave it unset.
+        let routes = table(&[("shop", "shop.example.com")]);
+        let resolution = resolve_app(&routes, None, "shop.example.com");
+        assert_eq!(
+            resolved_environment(resolution).as_deref(),
+            Some(deis_wire::conventions::DEFAULT_ENVIRONMENT)
+        );
+    }
+
+    fn header_str(header: &RequestHeader, name: &str) -> Option<String> {
+        header
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    fn empty_upstream_request() -> RequestHeader {
+        RequestHeader::build(Method::GET, b"/", None).unwrap()
+    }
+
+    #[test]
+    fn stamp_overwrites_a_client_supplied_app_id_and_environment() {
+        let mut upstream_request = empty_upstream_request();
+        upstream_request
+            .insert_header(APP_ID_HEADER, "attacker-app")
+            .unwrap();
+        upstream_request
+            .insert_header(ENVIRONMENT_HEADER, "attacker-env")
+            .unwrap();
+
+        let ctx = RequestCtx {
+            app_id: Some("shop".to_string()),
+            environment: Some("production".to_string()),
+            ..Default::default()
+        };
+        stamp_routing_headers(&mut upstream_request, &ctx).unwrap();
+
+        assert_eq!(
+            header_str(&upstream_request, APP_ID_HEADER).as_deref(),
+            Some("shop")
+        );
+        assert_eq!(
+            header_str(&upstream_request, ENVIRONMENT_HEADER).as_deref(),
+            Some("production")
+        );
+    }
+
+    #[test]
+    fn stamp_leaves_headers_untouched_in_passthrough_mode() {
+        // No application was resolved (RequestCtx::default has both fields
+        // as None), so whatever pingora already copied from the client must
+        // survive unchanged: deis-proxy has no opinion to stamp.
+        let mut upstream_request = empty_upstream_request();
+        upstream_request
+            .insert_header(APP_ID_HEADER, "client-value")
+            .unwrap();
+        upstream_request
+            .insert_header(ENVIRONMENT_HEADER, "client-env")
+            .unwrap();
+
+        stamp_routing_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
+
+        assert_eq!(
+            header_str(&upstream_request, APP_ID_HEADER).as_deref(),
+            Some("client-value")
+        );
+        assert_eq!(
+            header_str(&upstream_request, ENVIRONMENT_HEADER).as_deref(),
+            Some("client-env")
+        );
     }
 
     #[test]

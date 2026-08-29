@@ -323,7 +323,7 @@ Control uses SQLite for persistence with the following tables:
 deis-control/
 ├── Cargo.toml
 ├── README.md
-├── deis-control.toml.example
+├── deis-control.example.toml
 ├── src/
 │   ├── main.rs              # CLI entry point
 │   ├── lib.rs               # Library exports + tests

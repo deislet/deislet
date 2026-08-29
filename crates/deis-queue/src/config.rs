@@ -3,10 +3,11 @@
 //! # Why `listen` defaults to loopback
 //!
 //! deis-queue has no authorization of its own. It reads the tenant from the
-//! `x-deis-app-id` header and serves that app's messages; it does not check
-//! that the caller is entitled to that app, because there is nothing to check
-//! against - no credential, no key, no per-app table. Whoever can open a TCP
-//! connection to this port can drain or delete any app's queue by naming it.
+//! `x-deis-tenant` header and serves that tenant's messages; it does not
+//! check that the caller is entitled to that tenant, because there is nothing
+//! to check against - no credential, no key, no per-tenant table. Whoever can
+//! open a TCP connection to this port can drain or delete any tenant's queue
+//! by naming it.
 //!
 //! The containment for this round is therefore the network, not a permission
 //! check: the default address is `127.0.0.1`, so only processes on the same
@@ -27,9 +28,9 @@ pub struct Config {
     ///
     /// Loopback by default on purpose: the service trusts the tenant header
     /// it is handed and has no way to tell one caller from another, so the
-    /// only thing keeping one app's messages away from an unrelated client is
-    /// that the client cannot reach the port. See the module docs before
-    /// changing this.
+    /// only thing keeping one tenant's messages away from an unrelated
+    /// client is that the client cannot reach the port. See the module docs
+    /// before changing this.
     #[serde(default = "default_listen")]
     pub listen: String,
     /// Directory holding the SQLite database.
@@ -238,7 +239,7 @@ mod tests {
     #[test]
     fn the_default_address_is_loopback() {
         // The service trusts the tenant header, so reachability is the only
-        // thing keeping an unrelated client away from an app's messages.
+        // thing keeping an unrelated client away from a tenant's messages.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
     }

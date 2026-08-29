@@ -9,11 +9,21 @@
 //! environment and digest - all of which the control plane already logs - and
 //! the bundle itself carries only secret *names*. Decrypted values exist in
 //! this process's memory and nowhere else.
+//!
+//! The layout is `apps/<app>/<environment>/<version>.zip`. The environment is
+//! part of the path because it is part of the identity: production and a
+//! preview of one application are two deployments, and one path for both would
+//! make whichever was installed last the one both of them loaded after a
+//! restart. A node upgraded from the older, environment-less layout finds no
+//! bundle where it now looks, says so, and downloads again on the next
+//! delivery.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::app::AppKey;
 
 /// Name of the file recording what this node has installed.
 const RECORD_FILE: &str = "installed.json";
@@ -23,6 +33,10 @@ const TEMP_DIR: &str = "incoming";
 
 /// One line of the installed record.
 ///
+/// One line per (app, environment), not per app: a node runs production and
+/// every preview of the same application at once, and a record that collapsed
+/// them would bring back only one of them after a restart.
+///
 /// Deliberately no `env`: see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledRecord {
@@ -30,6 +44,13 @@ pub struct InstalledRecord {
     pub version_id: String,
     pub environment: String,
     pub bundle_sha: String,
+}
+
+impl InstalledRecord {
+    /// Which running application this line describes.
+    pub fn key(&self) -> AppKey {
+        AppKey::new(self.app_id.clone(), self.environment.clone())
+    }
 }
 
 /// Why an identifier cannot be used as a path segment.
@@ -116,29 +137,41 @@ impl BundleStore {
     }
 
     /// Where one version's bundle lives once it has been verified.
+    ///
+    /// The environment is a directory of its own, because production and a
+    /// preview of one application are two deployments that happen to share a
+    /// name: writing them to one path would make whichever was installed last
+    /// the one both of them load after a restart.
     pub fn bundle_path(
         &self,
-        app_id: &str,
+        key: &AppKey,
         version_id: &str,
     ) -> Result<PathBuf, InvalidIdentifier> {
-        check_identifier("app_id", app_id)?;
+        key.validate().map_err(|e| InvalidIdentifier {
+            field: e.field,
+            value: e.value,
+        })?;
         check_identifier("version_id", version_id)?;
         Ok(self
-            .root
-            .join("apps")
-            .join(app_id)
+            .app_dir(key.app_id())
+            .join(key.environment())
             .join(format!("{version_id}.zip")))
+    }
+
+    /// Everything this node holds for one application, across environments.
+    fn app_dir(&self, app_id: &str) -> PathBuf {
+        self.root.join("apps").join(app_id)
     }
 
     /// Move a verified download into place, replacing any earlier copy.
     pub async fn adopt(
         &self,
         temp_path: &Path,
-        app_id: &str,
+        key: &AppKey,
         version_id: &str,
     ) -> std::io::Result<PathBuf> {
         let target = self
-            .bundle_path(app_id, version_id)
+            .bundle_path(key, version_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -151,12 +184,14 @@ impl BundleStore {
         tokio::fs::read(path).await
     }
 
-    /// Delete every bundle of `app_id` except the one being kept.
+    /// Delete every bundle of one environment except the one being kept.
     ///
     /// Older versions are already immutable and stored on the control plane;
-    /// keeping them here only costs disk, and a rollback re-downloads.
-    pub async fn prune(&self, app_id: &str, keep_version: &str) {
-        let Ok(keep) = self.bundle_path(app_id, keep_version) else {
+    /// keeping them here only costs disk, and a rollback re-downloads. Only
+    /// this environment's directory is touched, so pruning a preview cannot
+    /// delete the bundle production is serving.
+    pub async fn prune(&self, key: &AppKey, keep_version: &str) {
+        let Ok(keep) = self.bundle_path(key, keep_version) else {
             return;
         };
         let Some(dir) = keep.parent().map(|p| p.to_path_buf()) else {
@@ -181,10 +216,15 @@ impl BundleStore {
         }
     }
 
-    /// Forget one app entirely: its bundles and its line in the record.
+    /// Forget one app entirely: every environment's bundles and every line it
+    /// has in the record.
+    ///
+    /// Application-wide because that is what the management API can express -
+    /// `UnloadApp` names an app and no environment - and because a half-forgotten
+    /// app would come back from disk on the next restart.
     pub async fn forget(&self, app_id: &str) {
         if check_identifier("app_id", app_id).is_ok() {
-            let dir = self.root.join("apps").join(app_id);
+            let dir = self.app_dir(app_id);
             if dir.exists() {
                 if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
                     warn!(
@@ -203,13 +243,40 @@ impl BundleStore {
         self.write_records(&records).await;
     }
 
-    /// Record that `record.app_id` now runs `record.version_id`, replacing any
-    /// earlier line for that app.
+    /// Forget one environment of one app: its bundles and its line in the
+    /// record, leaving the app's other environments untouched.
+    pub async fn forget_environment(&self, key: &AppKey) {
+        if key.validate().is_ok() {
+            let dir = self.app_dir(key.app_id()).join(key.environment());
+            if dir.exists() {
+                if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                    warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "Could not remove the bundles of an unloaded environment; they occupy \
+                         disk and would be picked up again if this node restarts without \
+                         reaching the control plane"
+                    );
+                }
+            }
+        }
+
+        let mut records = self.records().await;
+        records.retain(|r| r.app_id != key.app_id() || r.environment != key.environment());
+        self.write_records(&records).await;
+    }
+
+    /// Record what one environment of one app now runs, replacing any earlier
+    /// line for that same pair and leaving the app's other environments alone.
     pub async fn remember(&self, record: InstalledRecord) {
         let mut records = self.records().await;
-        records.retain(|r| r.app_id != record.app_id);
+        records.retain(|r| r.app_id != record.app_id || r.environment != record.environment);
         records.push(record);
-        records.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+        records.sort_by(|a, b| {
+            a.app_id
+                .cmp(&b.app_id)
+                .then_with(|| a.environment.cmp(&b.environment))
+        });
         self.write_records(&records).await;
     }
 

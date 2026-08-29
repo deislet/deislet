@@ -65,7 +65,10 @@ message LogEntry {
     // below, and this service does not know about nodes at all.
     string component = 3;
 
-    // Application ID (optional)
+    // Application ID (optional). The application, not the storage tenant: a
+    // node that runs several environments of one application sends them all
+    // under this one id and puts the environment in `fields`, so a query for
+    // an application answers with every environment of it.
     string app_id = 4;
 
     // Log message

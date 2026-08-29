@@ -19,6 +19,15 @@ mod tests {
         }
     }
 
+    /// The same message, leased until `seconds` from now -- the shape a real
+    /// deis-queue hands back.
+    fn message_leased_for(id: &str, seconds: i64) -> LeasedMessage {
+        LeasedMessage {
+            lease_expires_at: now_unix() + seconds,
+            ..message(id)
+        }
+    }
+
     /// What the fake queue was asked to do.
     #[derive(Debug, Default)]
     struct Journal {
@@ -288,6 +297,114 @@ mod tests {
         let before = queue.pull_count();
         tokio::task::yield_now().await;
         assert_eq!(queue.pull_count(), before);
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_outlives_its_lease_is_handed_back_instead_of_acknowledged() {
+        // The hand-off to the isolate thread has no ceiling of its own: the
+        // batch waits behind every other app on that thread. Waiting for it
+        // regardless and then acknowledging would acknowledge messages
+        // deis-queue had already given to the next puller -- the work is done
+        // twice, the delivery attempts are spent, and messages nothing was
+        // ever wrong with end up dead lettered. So the poller gives up while
+        // the lease is still valid and hands the batch back.
+        //
+        // The lease here is short enough that the deadline is one second (the
+        // floor), and the invoker never answers at all.
+        let (queue, journal) = FakeQueue::with_batches(vec![vec![message_leased_for("stuck", 2)]]);
+        let mut pulls = queue.watch_pulls();
+        let never: BatchInvoker = Arc::new(|_queue, _messages| {
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                unreachable!("this invoker never answers")
+            })
+        });
+
+        let handle = spawn_with_registry(
+            "demo".to_string(),
+            "jobs".to_string(),
+            queue.clone(),
+            settings(),
+            never,
+            Arc::new(MetricsRegistry::new()),
+        );
+        wait_for_pulls(&mut pulls, 2).await;
+        handle.stop().await;
+
+        let journal = journal.lock().unwrap();
+        assert!(
+            journal.acked.is_empty(),
+            "nothing may be acknowledged while the handler is still running"
+        );
+        assert_eq!(
+            journal.nacked,
+            vec!["stuck".to_string()],
+            "the batch has to go back to deis-queue before the lease lapses"
+        );
+    }
+
+    #[test]
+    fn the_handling_budget_comes_from_the_lease_the_server_granted() {
+        // deis-queue caps a lease above its configured max_lease_secs instead
+        // of refusing it, so what was asked for is not what is held.
+        let asked = ConsumerSettings {
+            lease_seconds: 600,
+            ..settings()
+        };
+        let clamped = vec![message_leased_for("m1", 100)];
+
+        let budget = handling_budget(&clamped, &asked, now_unix());
+        assert!(
+            budget <= std::time::Duration::from_secs(100),
+            "the budget must follow the granted lease, not the requested one: {budget:?}"
+        );
+        assert!(
+            budget >= std::time::Duration::from_secs(90),
+            "and it must not throw away most of a lease that is nearly all usable: {budget:?}"
+        );
+    }
+
+    #[test]
+    fn the_earliest_expiry_in_a_batch_is_the_one_that_counts() {
+        // Once the first message's lease lapses it is somebody else's, even
+        // though the rest of the batch is still held.
+        let messages = vec![
+            message_leased_for("later", 300),
+            message_leased_for("soonest", 60),
+        ];
+        let budget = handling_budget(&messages, &settings(), now_unix());
+        assert!(budget <= std::time::Duration::from_secs(60), "{budget:?}");
+    }
+
+    #[test]
+    fn a_batch_whose_lease_is_already_spent_is_still_offered_to_the_app() {
+        // The work may well succeed, and the message is going to be
+        // redelivered either way; refusing to try would only waste it.
+        let messages = vec![message_leased_for("stale", -30)];
+        assert_eq!(
+            handling_budget(&messages, &settings(), now_unix()),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn a_lease_the_server_shortened_is_reported_once() {
+        let asked = ConsumerSettings {
+            lease_seconds: 600,
+            ..settings()
+        };
+        assert!(
+            report_lease_shortfall("demo", "jobs", &asked, &[message_leased_for("m1", 100)]),
+            "a lease six times shorter than requested has to be visible"
+        );
+        assert!(
+            !report_lease_shortfall("demo", "jobs", &asked, &[message_leased_for("m1", 599)]),
+            "a second of slack in a granted lease is normal and must not be reported"
+        );
+        assert!(
+            !report_lease_shortfall("demo", "jobs", &asked, &[message("m1")]),
+            "a message carrying no expiry says nothing about the lease"
+        );
     }
 
     #[test]

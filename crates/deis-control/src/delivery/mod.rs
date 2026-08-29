@@ -16,9 +16,22 @@
 //!   reach the nodes, because the value they hold in memory is now stale.
 //!
 //! Secrets are decrypted here and nowhere else, at the moment of sending.
-//! They are never stored decrypted, never returned by a read API, and
-//! never logged - which is why [`DeploymentPayload`] has a hand-written
-//! `Debug` and why the proto request built from it must not be printed.
+//! They are never stored decrypted and never logged - which is why
+//! [`DeploymentPayload`] has a hand-written `Debug` and why the proto
+//! request built from it must not be printed.
+//!
+//! There are exactly **two** places where a decrypted value leaves this
+//! process, and both of them go to a node:
+//!
+//! * the `ApplyDeployment` push built by [`DeploymentPayload::to_request`];
+//! * the answer to `GET /api/nodes/:id/assignments`, which a node that
+//!   restarts uses to come back with the environment it had.
+//!
+//! Both therefore authenticate the caller as a node - the assignment list
+//! through `api::middleware::node_auth`, whatever `api_auth_enabled` says.
+//! No other read API returns a value: the dashboard and the CLI can write
+//! and delete a secret and list its name, never read it back
+//! (docs/architecture.zh.md section 8).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -116,20 +129,27 @@ impl StorageEndpoints {
 
     /// Add the addresses to a deployment's environment map.
     ///
-    /// Platform wiring wins over an application variable of the same name:
-    /// letting an application overwrite it would point its storage client at
-    /// an address of its own choosing.
+    /// Every reserved key is *removed* first and only then written back,
+    /// which is the part that matters when an address is not configured: an
+    /// application that declares `DEIS_STORE_ENDPOINT` in its own manifest
+    /// would otherwise keep that value - the platform having nothing to
+    /// overwrite it with - and the node would build its KV, SQL and blob
+    /// clients against a host the application chose.
     fn write_into(&self, app_id: &str, env: &mut BTreeMap<String, String>) {
         let mut put = |key: &str, value: &Option<String>| {
-            let Some(value) = value else { return };
-            if let Some(previous) = env.insert(key.to_string(), value.clone())
-                && previous != *value
-            {
+            // The declared value is dropped without being logged: it is
+            // the application's own text, and one of these keys can also
+            // carry a secret of the same name.
+            if env.remove(key).is_some() {
                 warn!(
                     app_id = %app_id,
                     key = %key,
-                    "The manifest declares a variable named like a reserved platform key; the platform address is used and the manifest's value never reaches the application"
+                    replaced_by_platform = value.is_some(),
+                    "The manifest declares a variable named like a reserved platform key; it is dropped, so the value in the bundle never reaches the application and can never point its storage client at another host"
                 );
+            }
+            if let Some(value) = value {
+                env.insert(key.to_string(), value.clone());
             }
         };
         put(deis_wire::conventions::STORE_ENDPOINT_ENV, &self.store);
@@ -297,6 +317,34 @@ impl DeliveryReport {
     }
 }
 
+/// What came of taking an application off the fleet.
+///
+/// Deleting an application is the one operation whose failure is silent
+/// without this: the rows are gone from the catalog, so nothing will ever
+/// mention the app again, while a node that was not reached keeps serving
+/// it - with its code, its secrets in memory and its queue consumers still
+/// polling - until that process restarts.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemovalReport {
+    pub app_id: String,
+    /// Environment names the catalog had for this app when it was deleted.
+    /// Informational: the nodes are told to drop every environment of it.
+    pub environments: Vec<String>,
+    /// Nodes that dropped it and no longer serve it.
+    pub unloaded: Vec<String>,
+    /// Nodes that did not. **These still serve the deleted application.**
+    pub failed: Vec<NodeFailure>,
+    /// Set when nothing was sent at all, with the reason.
+    pub skipped: Option<String>,
+}
+
+impl RemovalReport {
+    /// True when no node is left serving the application.
+    pub fn fully_removed(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
 /// Builds deployment payloads and pushes them to the fleet.
 ///
 /// Every node runs every application (architecture principle 2), so a
@@ -397,6 +445,26 @@ impl DeploymentDeliverer {
                     "The manifest declares this secret but no value is stored for this environment; the application will read it as missing"
                 );
             }
+        }
+
+        // The node builds its storage tenant from this pair
+        // (`conventions::tenant_id`), and deis-store rejects a tenant id it
+        // cannot split back into exactly two legal parts. Names created
+        // today cannot break that rule; a row written before the rule
+        // existed can, and the only symptom on the node would be every
+        // ctx.services call failing with an opaque error from the store.
+        if deis_wire::conventions::split_tenant(&deis_wire::conventions::tenant_id(
+            &env.app_id,
+            &env.name,
+        ))
+        .is_none()
+        {
+            error!(
+                app_id = %env.app_id,
+                environment = %env.name,
+                version_id = %version_id,
+                "This app and environment do not form a storage tenant id, so deis-store and deis-queue will reject every call this deployment makes; the code still loads and serves, but its kv, database, blob and queue bindings are unusable until the environment is recreated with a name of letters, digits, '-' and '_'"
+            );
         }
 
         Ok(DeploymentPayload {
@@ -548,6 +616,85 @@ impl DeploymentDeliverer {
                 delivered = report.delivered.len(),
                 failed = ?failed_nodes,
                 "Part of the fleet took this version; the listed nodes still serve the previous one, so requests hit two different versions until they catch up"
+            );
+        }
+
+        report
+    }
+
+    /// Tell every node to stop serving an application.
+    ///
+    /// Called after the catalog rows are gone. A node only ever *adds* from
+    /// its assignment list, so without this call a deleted application keeps
+    /// running on every node until that node's process restarts: it still
+    /// answers requests routed by app id, still holds its decrypted secrets
+    /// in memory, and its queue consumers still poll. For a deletion done to
+    /// revoke access that is the difference between revoking it and not.
+    ///
+    /// `environments` is only for the report; each node is told to drop
+    /// every environment of the app, because the catalog rows that would say
+    /// which ones exist have already been deleted, and a node may hold an
+    /// environment this control plane forgot about earlier.
+    ///
+    /// Never fails as a whole: the rows are already gone, so a node that
+    /// cannot be reached is reported rather than propagated.
+    pub async fn remove_app(&self, app_id: &str, environments: Vec<String>) -> RemovalReport {
+        let mut report = RemovalReport {
+            app_id: app_id.to_string(),
+            environments,
+            unloaded: Vec::new(),
+            failed: Vec::new(),
+            skipped: None,
+        };
+
+        let node_ids = self.nodes.ids();
+        if node_ids.is_empty() {
+            let reason = "no runtime nodes are configured on this control plane, so there is \
+                 nothing serving the deleted application here"
+                .to_string();
+            info!(app_id = %app_id, "{reason}");
+            report.skipped = Some(reason);
+            return report;
+        }
+
+        let results = futures::future::join_all(node_ids.iter().map(|node| async move {
+            // An empty environment means every environment of this app;
+            // see UnloadAppRequest in management.proto.
+            (node.clone(), self.nodes.unload_app(node, app_id, "").await)
+        }))
+        .await;
+
+        for (node, result) in results {
+            match result {
+                Ok(resp) if resp.success => report.unloaded.push(node),
+                Ok(resp) => report.failed.push(NodeFailure {
+                    node,
+                    error: if resp.message.is_empty() {
+                        "node refused to unload the app without saying why".to_string()
+                    } else {
+                        resp.message
+                    },
+                }),
+                Err(e) => report.failed.push(NodeFailure {
+                    node,
+                    error: e.to_string(),
+                }),
+            }
+        }
+
+        if report.failed.is_empty() {
+            info!(
+                app_id = %app_id,
+                nodes = report.unloaded.len(),
+                "Every runtime node dropped the deleted application; nothing serves it any more"
+            );
+        } else {
+            error!(
+                app_id = %app_id,
+                unloaded = report.unloaded.len(),
+                nodes = ?report.failed.iter().map(|f| f.node.as_str()).collect::<Vec<_>>(),
+                errors = ?report.failed.iter().map(|f| f.error.as_str()).collect::<Vec<_>>(),
+                "These runtime nodes were not told to drop the deleted application and are still serving it, with its secrets still in memory; they will keep doing so until they are restarted, because a node only ever adds applications from its assignment list"
             );
         }
 
@@ -819,6 +966,83 @@ mod tests {
             !request
                 .env
                 .contains_key(deis_wire::conventions::QUEUE_ENDPOINT_ENV)
+        );
+    }
+
+    /// Without a configured address the platform has nothing to overwrite
+    /// the manifest's value with, so the key has to be *removed*. Leaving
+    /// it would let a bundle name the host its own kv, database and blob
+    /// clients dial.
+    #[tokio::test]
+    async fn an_application_cannot_name_a_storage_address_the_platform_never_configured() {
+        let (deliverer, store) = deliverer_with(true, StorageEndpoints::default()).await;
+        let env = environment(&store).await;
+        let manifest = format!(
+            r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"http://attacker.invalid","{}":"http://attacker.invalid","KEEP":"mine"}}}}"#,
+            deis_wire::conventions::STORE_ENDPOINT_ENV,
+            deis_wire::conventions::QUEUE_ENDPOINT_ENV
+        );
+
+        let request = deliverer
+            .payload(&env, &version(&manifest), "http://control.test")
+            .await
+            .unwrap()
+            .to_request();
+
+        for key in [
+            deis_wire::conventions::STORE_ENDPOINT_ENV,
+            deis_wire::conventions::QUEUE_ENDPOINT_ENV,
+        ] {
+            assert!(
+                !request.env.contains_key(key),
+                "{key} reached the node as the bundle declared it"
+            );
+        }
+        assert_eq!(request.env.get("KEEP").unwrap(), "mine");
+    }
+
+    /// Deleting an application has to reach the fleet: a node only ever
+    /// adds what its assignments name, so one that is not told keeps
+    /// serving the app - with its secrets - until it restarts.
+    #[tokio::test]
+    async fn removing_an_app_reports_every_node_that_is_still_serving_it() {
+        let (ready, store) = deliverer(true).await;
+        let deliverer = DeploymentDeliverer::new(
+            Arc::clone(&store),
+            Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
+            Arc::new(RuntimeNodeManager::new(
+                vec![crate::config::RuntimeNodeConfig {
+                    id: "node-a".to_string(),
+                    // Nothing listens here, so the call is refused at once.
+                    addr: "http://127.0.0.1:1".to_string(),
+                }],
+                15,
+            )),
+            Arc::clone(&ready.address),
+            StorageEndpoints::default(),
+        );
+
+        let report = deliverer
+            .remove_app("demo", vec!["production".to_string()])
+            .await;
+        assert!(report.unloaded.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].node, "node-a");
+        assert!(
+            !report.fully_removed(),
+            "a node that was not reached is still serving the deleted app"
+        );
+        assert_eq!(report.environments, ["production"]);
+    }
+
+    #[tokio::test]
+    async fn removing_an_app_on_a_fleet_of_no_nodes_is_skipped_rather_than_failed() {
+        let (deliverer, _store) = deliverer(true).await;
+        let report = deliverer.remove_app("demo", Vec::new()).await;
+        assert!(report.skipped.is_some());
+        assert!(
+            report.fully_removed(),
+            "nothing is serving it, so nothing is left behind"
         );
     }
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
 
 use deis_runtime::app::ApplicationManager;
@@ -15,6 +15,11 @@ use deis_runtime::runtime::{MetricShipper, MetricShipperConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Taken first, so the uptime this node reports to the control plane is the
+    // process's own and not the moment some later component happened to be
+    // built.
+    let started_at = std::time::Instant::now();
+
     // Configuration is read before logging is set up because it sizes the log
     // buffer. A bad value stops the node here, with the reason on stderr,
     // instead of turning into failing requests later.
@@ -36,7 +41,7 @@ async fn main() -> Result<()> {
     info!("🚀 Starting Runtime Platform (Rust)");
     info!("====================================");
 
-    info!("Worker ID: {}", node_id);
+    info!("Node ID: {}", node_id);
     info!("HTTP Port: {}", port);
 
     // Initialize data storage (Single SQLite DB)
@@ -52,7 +57,9 @@ async fn main() -> Result<()> {
     let config_store = Arc::new(ConfigStore::new(&db_path).await?);
     info!("Config store initialized");
 
-    // Initialize app repo
+    // The module file store the isolates' module loader reads from. Only the
+    // runtime pool needs it, so it is handed to the application manager and
+    // nowhere else.
     let app_repo = Arc::new(AppRepo::new(&db_path).await?);
     info!("App repo initialized");
 
@@ -87,7 +94,7 @@ async fn main() -> Result<()> {
     );
     info!(
         bundle_dir = %config.bundle_dir().display(),
-        max_bundle_bytes = config.bundles.max_bundle_bytes,
+        max_bytes = config.bundles.max_bytes,
         "Deployment delivery ready"
     );
 
@@ -97,12 +104,21 @@ async fn main() -> Result<()> {
     // answer that says "starting" rather than a refused connection.
     let health = NodeHealth::starting();
 
+    if config.control.endpoint.is_some() && config.control.secret.is_none() {
+        warn!(
+            "No control.secret is configured, so this node asks the control plane for its \
+             assignments anonymously. A control plane with node_preshared_keys set answers 401 \
+             and this node will never load a version it was assigned"
+        );
+    }
+
     let assignment_client = match config.control.endpoint.as_deref() {
         Some(endpoint) => Some(
             AssignmentClient::new(
                 endpoint,
                 &node_id,
                 std::time::Duration::from_secs(config.control.request_timeout_secs),
+                config.control.credential(),
             )
             .context("building the control plane client")?,
         ),
@@ -127,11 +143,11 @@ async fn main() -> Result<()> {
     dispatcher::start_server(ServerOptions {
         app_manager: app_manager.clone(),
         config_store,
-        app_repo,
         deployer,
         health,
         node_id,
         port,
+        started_at,
         shutdown_grace: config.shutdown_grace_period(),
     })
     .await?;

@@ -3,9 +3,17 @@
 //! out what they should be running (`assignments` and the bundle
 //! download).
 //!
-//! Everything here is mounted inside the authenticated part of the API
-//! router, nodes included: a node that fetches its assignments carries the
-//! same API key as any other client.
+//! It is built as two routers, because the two halves answer to different
+//! credentials:
+//!
+//! * [`router`] is the human surface - dashboard and CLI. It is merged into
+//!   the part of the API guarded by the API key, which `api_auth_enabled`
+//!   turns on and off.
+//! * [`node_router`] is what a runtime node calls. It carries its own
+//!   authentication ([`crate::api::middleware::node_auth`]) and ignores
+//!   `api_auth_enabled` entirely: the assignment list hands out every
+//!   environment's decrypted secrets, so that channel cannot be left open by
+//!   a flag whose purpose is to make a dashboard convenient.
 
 pub mod apps;
 pub mod assignments;
@@ -23,6 +31,7 @@ use axum::{
     routing::{get, post, put},
 };
 
+use crate::api::middleware::{NodeAuthConfig, node_auth};
 use crate::catalog::{BundleStore, CatalogStore, SecretsBackend};
 use crate::delivery::DeploymentDeliverer;
 
@@ -40,10 +49,18 @@ pub struct CatalogState {
     /// Pushes a deployment out to the nodes. Deploy, rollback and secret
     /// change all end here; see [`crate::delivery`].
     pub deliverer: Arc<DeploymentDeliverer>,
+    /// The credential the node endpoints demand.
+    ///
+    /// Handlers read it to learn whether this control plane can tell a node
+    /// from anyone else at all: [`node_router`] layers the check, so when a
+    /// key is configured every request that reaches a handler is from a
+    /// caller that presented one, and when none is configured every caller
+    /// is anonymous and no secret value may be served.
+    pub node_auth: NodeAuthConfig,
 }
 
-/// Build the catalog half of the API router. The caller merges it into the
-/// authenticated router.
+/// Build the human half of the catalog router: everything the dashboard
+/// and the CLI call. The caller merges it into the API-key-guarded router.
 pub fn router(state: CatalogState) -> Router {
     Router::new()
         .route("/api/apps", get(apps::list_apps).post(apps::create_app))
@@ -61,10 +78,6 @@ pub fn router(state: CatalogState) -> Router {
         .route(
             "/api/apps/:app_id/versions/:version_id",
             get(versions::get_version),
-        )
-        .route(
-            "/api/apps/:app_id/versions/:version_id/bundle",
-            get(versions::download_bundle),
         )
         .route(
             "/api/apps/:app_id/environments",
@@ -103,11 +116,29 @@ pub fn router(state: CatalogState) -> Router {
             put(secrets::put_secret).delete(secrets::delete_secret),
         )
         .route("/api/routes", get(routes::list_all_routes))
+        .with_state(state)
+}
+
+/// Build the node half: the assignment list and the bundle download.
+///
+/// The authentication layer is applied here rather than by the caller, so
+/// there is no way to mount these two routes without it. Both exist for
+/// runtime nodes; a dashboard API key is not accepted, because the list one
+/// of them returns contains secret values that the dashboard is deliberately
+/// unable to read back (docs/architecture.zh.md section 8).
+pub fn node_router(state: CatalogState) -> Router {
+    let auth = state.node_auth.clone();
+    Router::new()
         // The path parameter is named `:id` to match the node routes it
         // shares a prefix with; the router rejects two names in the same
         // position.
         .route("/api/nodes/:id/assignments", get(assignments::for_node))
+        .route(
+            "/api/apps/:app_id/versions/:version_id/bundle",
+            get(versions::download_bundle),
+        )
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(auth, node_auth))
 }
 
 #[cfg(test)]
@@ -129,7 +160,14 @@ pub(crate) mod tests {
         pub _bundle_dir: tempfile::TempDir,
     }
 
+    /// A router with no node credential configured: the node endpoints are
+    /// open, which is what most of these tests exercise, and what the
+    /// assignment list reacts to by withholding secrets.
     pub(crate) async fn harness(secrets_ready: bool) -> Harness {
+        harness_with(secrets_ready, Vec::new()).await
+    }
+
+    pub(crate) async fn harness_with(secrets_ready: bool, node_keys: Vec<String>) -> Harness {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
         let bundle_dir = tempfile::tempdir().unwrap();
         let secrets = if secrets_ready {
@@ -163,9 +201,13 @@ pub(crate) mod tests {
                     queue: None,
                 },
             )),
+            node_auth: NodeAuthConfig::new(node_keys),
         };
         Harness {
-            router: router(state),
+            // Both halves, mounted the way the API mounts them: the node
+            // half brings its own authentication layer, so a test that
+            // calls it is exercising the real check.
+            router: router(state.clone()).merge(node_router(state)),
             _bundle_dir: bundle_dir,
         }
     }
@@ -206,6 +248,141 @@ pub(crate) mod tests {
             Body::from(body.to_string())
         };
         call(router, method, uri, body, "application/json").await
+    }
+
+    /// GET with an optional node credential, in the header a node sends.
+    async fn get_as_node(
+        router: &Router,
+        uri: &str,
+        credential: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(credential) = credential {
+            builder = builder.header("Authorization", format!("Bearer {credential}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), MAX_BUNDLE_BYTES)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Deploy one version of `app` and store `secret` in its production
+    /// environment when one is given. Returns nothing: every assertion is
+    /// about what the node endpoints answer afterwards.
+    async fn deployed_app(router: &Router, app: &str, secret: Option<(&str, &str)>) {
+        json(router, "POST", "/api/apps", serde_json::json!({"id": app})).await;
+        let (_, body) = call(
+            router,
+            "POST",
+            &format!("/api/apps/{app}/versions"),
+            Body::from(sample_bundle(app)),
+            "application/zip",
+        )
+        .await;
+        let version_id = body["version"]["id"].as_str().unwrap().to_string();
+        json(
+            router,
+            "POST",
+            &format!("/api/apps/{app}/environments"),
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+        if let Some((name, value)) = secret {
+            let (status, _) = json(
+                router,
+                "PUT",
+                &format!("/api/apps/{app}/environments/production/secrets/{name}"),
+                serde_json::json!({"value": value}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, _) = json(
+            router,
+            "POST",
+            &format!("/api/apps/{app}/environments/production/deployments"),
+            serde_json::json!({"version_id": version_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    /// The assignment list is the one read API that answers with decrypted
+    /// secrets, so it authenticates the caller as a node - and does it
+    /// whatever `api_auth_enabled` says, which is a dashboard setting this
+    /// router does not even see.
+    #[tokio::test]
+    async fn the_assignment_list_serves_secrets_only_to_an_authenticated_node() {
+        let h = harness_with(true, vec!["node-psk".to_string()]).await;
+        let router = &h.router;
+        deployed_app(router, "demo", Some(("API_KEY", "super-secret"))).await;
+
+        let (status, body) = get_as_node(router, "/api/nodes/node-a/assignments", None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an anonymous caller must not receive the fleet's secrets"
+        );
+        assert!(!body.to_string().contains("super-secret"));
+
+        let (status, body) =
+            get_as_node(router, "/api/nodes/node-a/assignments", Some("wrong-key")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!body.to_string().contains("super-secret"));
+
+        // The node's own credential works, and the value it needs is there.
+        let (status, body) =
+            get_as_node(router, "/api/nodes/node-a/assignments", Some("node-psk")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["env"]["API_KEY"], "super-secret");
+
+        // The bundle download is the other half of the same channel.
+        let (status, _) = get_as_node(
+            router,
+            &format!(
+                "/api/apps/demo/versions/{}/bundle",
+                body[0]["version_id"].as_str().unwrap()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// With no node credential configured nobody can prove they are a node,
+    /// so an environment that has secrets is left out of the list entirely
+    /// rather than having its values published to whoever asked.
+    #[tokio::test]
+    async fn a_control_plane_without_a_node_key_serves_no_secret_to_anyone() {
+        let h = harness(true).await;
+        let router = &h.router;
+        deployed_app(router, "with-secret", Some(("API_KEY", "super-secret"))).await;
+        deployed_app(router, "plain", None).await;
+
+        let (status, body) = get_as_node(router, "/api/nodes/node-a/assignments", None).await;
+        assert_eq!(status, StatusCode::OK, "the channel itself still answers");
+        assert!(!body.to_string().contains("super-secret"), "got {body}");
+
+        let apps: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["app_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            apps,
+            ["plain"],
+            "the application with a secret is withheld; the one without still runs"
+        );
     }
 
     /// The whole loop the acceptance criteria describe: create an app,

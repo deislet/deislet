@@ -94,7 +94,7 @@ let result = compiler.build().await?;
 | Cloudflare Workers | ✅ 完整支持 Full | KV, Cache | D1, R2, Queue, DO |
 | Deno Deploy | ✅ 完整支持 Full | KV, Cache | Postgres |
 | Tencent EdgeOne | ✅ 完整支持 Full | KV, Cache | - |
-| Deislet | 🚧 开发中 WIP | KV, Cache | WebSockets（SQL / Blob / Queue / Cron 声明可进包，运行时尚未接通 declared in the bundle, not served yet） |
+| Deislet | 🚧 开发中 WIP | KV, Cache | SQL, Blob, Queue, Cron, WebSockets（WebSocket 两端未端到端验证 WebSocket not verified end to end） |
 
 ## 🔗 相关资源 | Related Resources
 

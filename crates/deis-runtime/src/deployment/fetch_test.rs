@@ -49,7 +49,7 @@ impl BundleServer {
 }
 
 fn fetcher(max_bytes: u64) -> BundleFetcher {
-    BundleFetcher::new(Duration::from_secs(10), max_bytes).unwrap()
+    BundleFetcher::new(Duration::from_secs(10), max_bytes, None).unwrap()
 }
 
 #[tokio::test]

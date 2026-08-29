@@ -1,10 +1,12 @@
 //! SQL client backing `ctx.db`, the equivalent of Cloudflare D1.
 //!
-//! Talks to deis-store, which gives each application its own SQLite file: the
-//! tenant travels in the `x-deis-app-id` metadata header (see [`Tenant`]), not
-//! in the proto messages, so one client speaks for exactly one application.
-//! Prepared-statement handles are owned by the application that created them
-//! and the store refuses them across tenants.
+//! Talks to deis-store, which gives each tenant -- one application in one
+//! environment -- its own SQLite file: the tenant travels in the
+//! `x-deis-tenant` metadata header (see [`Tenant`]), not in the proto
+//! messages, so one client speaks for exactly one environment of one
+//! application and a preview's writes never reach production's database.
+//! Prepared-statement handles are owned by the tenant that created them and
+//! the store refuses them across tenants.
 
 use super::tenant::Tenant;
 use anyhow::{Context, Result};
@@ -34,15 +36,16 @@ impl DbClient {
     /// # Parameters
     /// - endpoint: deis-store gRPC address (e.g., "http://127.0.0.1:8090",
     ///   deis-store's default listen address)
-    /// - app_id: the tenant every call of this client is charged to
+    /// - tenant: the `<app>.<environment>` every call of this client is
+    ///   charged to; see [`Tenant`]
     ///
     /// # Returns
     /// - Ok(DbClient): Connection successful
     /// - Err: Connection failed
-    pub async fn connect(endpoint: impl Into<String>, app_id: impl Into<String>) -> Result<Self> {
+    pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let tenant = Tenant::new(app_id)?;
-        tracing::info!(%endpoint, app_id = tenant.app_id(), "connecting to database");
+        let tenant = Tenant::new(tenant)?;
+        tracing::info!(%endpoint, app_id = tenant.as_str(), "connecting to database");
 
         let client = DatabaseClient::connect(endpoint.clone())
             .await
@@ -50,7 +53,7 @@ impl DbClient {
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
-        tracing::info!(%endpoint, app_id = tenant.app_id(), "database client connected");
+        tracing::info!(%endpoint, app_id = tenant.as_str(), "database client connected");
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             tenant,
@@ -60,15 +63,15 @@ impl DbClient {
     /// Build a client that dials deis-store on its first call; see
     /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
     /// rather than connecting eagerly.
-    pub fn connect_lazy(endpoint: &str, app_id: impl Into<String>) -> Result<Self> {
-        let tenant = Tenant::new(app_id)?;
+    pub fn connect_lazy(endpoint: &str, tenant: impl Into<String>) -> Result<Self> {
+        let tenant = Tenant::new(tenant)?;
         let channel = super::bindings::unary_channel(endpoint)?;
         let client = DatabaseClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::debug!(
             endpoint,
-            app_id = tenant.app_id(),
+            app_id = tenant.as_str(),
             "database client prepared; it will dial on the first call"
         );
         Ok(Self {
@@ -77,9 +80,10 @@ impl DbClient {
         })
     }
 
-    /// The application every call of this client is charged to.
-    pub fn app_id(&self) -> &str {
-        self.tenant.app_id()
+    /// The tenant -- application and environment -- every call of this client
+    /// is charged to.
+    pub fn tenant(&self) -> &str {
+        self.tenant.as_str()
     }
 
     /// Executes SQL statements (INSERT, UPDATE, DELETE, etc.)
@@ -301,7 +305,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_db_client_connect() {
-        let result = DbClient::connect("http://127.0.0.1:1", "test_app").await;
+        let result = DbClient::connect("http://127.0.0.1:1", "test_app.production").await;
         // Should return connection error if service is not running
         // Only testing client code compilation and basic logic here
         assert!(result.is_err() || result.is_ok());
@@ -311,7 +315,7 @@ mod tests {
     #[ignore]
     async fn test_db_client_operations() {
         // This test requires a real deis-control server
-        let client = DbClient::connect("http://127.0.0.1:1", "test_app")
+        let client = DbClient::connect("http://127.0.0.1:1", "test_app.production")
             .await
             .expect("Failed to connect");
 

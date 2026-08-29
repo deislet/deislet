@@ -29,6 +29,12 @@ pub struct DeleteAppResponse {
     pub app_id: String,
     pub removed: crate::catalog::DeletedApp,
     pub bundle_files_removed: usize,
+    /// Which nodes stopped serving the app, and which did not.
+    ///
+    /// A node in `failed` is still running the deleted application - its
+    /// code, its secrets in memory and its queue consumers - so the caller
+    /// has to see that here; nothing else will ever mention this app again.
+    pub unloaded: crate::delivery::RemovalReport,
 }
 
 /// POST /api/apps
@@ -60,14 +66,28 @@ pub async fn get_app(
 /// DELETE /api/apps/:app_id
 ///
 /// Removes the app together with its versions, environments, deployment
-/// history, routes and secrets, then drops the bundle files those versions
-/// referenced. Nodes keep serving what they already loaded until their
-/// next assignment refresh, which is why the log line says so.
+/// history, routes and secrets, drops the bundle files those versions
+/// referenced, and tells every node to stop serving it.
+///
+/// That last step is not optional. A node adds applications from its
+/// assignment list and never removes one that has left it, so a delete that
+/// only touched the database would leave every node serving the application
+/// forever: still answering requests, still holding its decrypted secrets
+/// in memory, still polling its queues. A delete done to revoke access has
+/// to actually revoke it, so a node that cannot be reached is reported in
+/// the answer rather than passed over.
 pub async fn delete_app(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
 ) -> ApiResult<Json<DeleteAppResponse>> {
     let removed = state.store.delete_app(&app_id).await?;
+
+    // Before the bundle files: the nodes are what is still serving the
+    // application, and a failure to delete a file must not stop that.
+    let unloaded = state
+        .deliverer
+        .remove_app(&app_id, removed.environment_names.clone())
+        .await;
 
     let mut bundle_files_removed = 0usize;
     for path in &removed.bundle_paths {
@@ -94,15 +114,26 @@ pub async fn delete_app(
         info!(app_id = %app_id, dir = %app_dir.display(), "Removed the now empty bundle directory");
     }
 
-    info!(
-        app_id = %app_id,
-        bundle_files_removed,
-        "App deletion finished"
-    );
+    if unloaded.fully_removed() {
+        info!(
+            app_id = %app_id,
+            bundle_files_removed,
+            nodes = unloaded.unloaded.len(),
+            "App deletion finished; nothing serves it any more"
+        );
+    } else {
+        warn!(
+            app_id = %app_id,
+            bundle_files_removed,
+            still_serving = ?unloaded.failed.iter().map(|f| f.node.as_str()).collect::<Vec<_>>(),
+            "App deletion finished in the catalog only; the listed nodes were not reached and keep serving the deleted application until they are restarted"
+        );
+    }
     Ok(Json(DeleteAppResponse {
         app_id,
         removed,
         bundle_files_removed,
+        unloaded,
     }))
 }
 

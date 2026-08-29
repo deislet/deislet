@@ -51,8 +51,10 @@ impl Store {
         }
     }
 
-    async fn client(&self, app_id: &str) -> BlobClient {
-        BlobClient::connect(self.endpoint.clone(), app_id)
+    /// `tenant` is the composite `<app>.<environment>` key the store partitions
+    /// by; a bare application id is refused by the client.
+    async fn client(&self, tenant: &str) -> BlobClient {
+        BlobClient::connect(self.endpoint.clone(), tenant)
             .await
             .expect("connect blob client")
     }
@@ -74,7 +76,7 @@ fn body(len: usize) -> Vec<u8> {
 #[tokio::test]
 async fn small_object_round_trips() {
     let store = Store::start().await;
-    let client = store.client("demo").await;
+    let client = store.client("demo.production").await;
 
     client
         .put("greeting".to_string(), b"hello".to_vec())
@@ -88,7 +90,7 @@ async fn small_object_round_trips() {
 #[tokio::test]
 async fn multi_chunk_object_round_trips_byte_for_byte() {
     let store = Store::start().await;
-    let client = store.client("demo").await;
+    let client = store.client("demo.production").await;
     let data = body(MULTI_CHUNK_LEN);
 
     client
@@ -108,7 +110,7 @@ async fn multi_chunk_object_round_trips_byte_for_byte() {
 #[tokio::test]
 async fn empty_object_round_trips() {
     let store = Store::start().await;
-    let client = store.client("demo").await;
+    let client = store.client("demo.production").await;
 
     client
         .put("nothing".to_string(), Vec::new())
@@ -126,7 +128,7 @@ async fn empty_object_round_trips() {
 #[tokio::test]
 async fn a_missing_key_reads_as_none_rather_than_an_error() {
     let store = Store::start().await;
-    let client = store.client("demo").await;
+    let client = store.client("demo.production").await;
 
     let got = client.get("never-written".to_string()).await.expect("get");
 
@@ -136,7 +138,7 @@ async fn a_missing_key_reads_as_none_rather_than_an_error() {
 #[tokio::test]
 async fn delete_removes_the_object_and_is_idempotent() {
     let store = Store::start().await;
-    let client = store.client("demo").await;
+    let client = store.client("demo.production").await;
 
     client
         .put("temp".to_string(), b"bye".to_vec())
@@ -154,8 +156,8 @@ async fn delete_removes_the_object_and_is_idempotent() {
 #[tokio::test]
 async fn one_application_cannot_read_another_ones_objects() {
     let store = Store::start().await;
-    let owner = store.client("owner-app").await;
-    let other = store.client("other-app").await;
+    let owner = store.client("owner-app.production").await;
+    let other = store.client("other-app.production").await;
 
     owner
         .put("shared-name".to_string(), b"owner data".to_vec())
@@ -166,5 +168,34 @@ async fn one_application_cannot_read_another_ones_objects() {
         other.get("shared-name".to_string()).await.expect("get"),
         None,
         "the tenant header must partition the store, not just label the call"
+    );
+}
+
+/// A preview environment sharing the store with production is the failure the
+/// composite tenant exists to prevent: a preview build that overwrites a
+/// production object cannot be undone by rolling the version back.
+#[tokio::test]
+async fn two_environments_of_one_app_do_not_share_objects() {
+    let store = Store::start().await;
+    let production = store.client("demo.production").await;
+    let preview = store.client("demo.preview").await;
+
+    production
+        .put("report.txt".to_string(), b"production".to_vec())
+        .await
+        .expect("put");
+    preview
+        .put("report.txt".to_string(), b"preview".to_vec())
+        .await
+        .expect("put");
+
+    assert_eq!(
+        production.get("report.txt".to_string()).await.expect("get"),
+        Some(b"production".to_vec()),
+        "the preview environment overwrote what production stored"
+    );
+    assert_eq!(
+        preview.get("report.txt".to_string()).await.expect("get"),
+        Some(b"preview".to_vec())
     );
 }

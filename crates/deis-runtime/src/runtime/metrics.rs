@@ -13,10 +13,19 @@
 //! added when the samples are pushed (see [`MetricShipper`]), so the registry
 //! itself does not need to know which node it is on.
 //!
-//! Counters are cumulative for the life of the process, the way a Prometheus
-//! counter is: each push carries the current total rather than a delta, so a
-//! push that fails costs nothing -- the next one carries the same total. The
-//! consumer takes differences.
+//! # Counters, and the one thing that is not one
+//!
+//! The counters are cumulative for the life of the process, the way a
+//! Prometheus counter is: each push carries the current total rather than a
+//! delta, so a push that fails costs nothing -- the next one carries the same
+//! total, and the consumer takes differences.
+//!
+//! [`EXECUTION_MS_MAX`] is the exception and must not be differenced. It is a
+//! gauge: a high-water mark raised by [`MetricsRegistry::record_request`] and
+//! never lowered, so differences of it are almost always zero with an
+//! occasional spike, and summing it across label sets means nothing. It also
+//! does not decay -- one slow request early in a process's life pins it for
+//! the rest of that life, which is worth knowing when reading it.
 //!
 //! # Why a process-wide registry
 //!
@@ -64,6 +73,10 @@ pub const EXECUTION_MS_SUM: &str = "deis_runtime_isolate_execution_ms_sum";
 /// Number of isolate executions the sum is over.
 pub const EXECUTION_MS_COUNT: &str = "deis_runtime_isolate_execution_ms_count";
 /// Longest single isolate execution since this node started.
+///
+/// A gauge, not a counter: it only ever rises, it never decays, and taking
+/// differences of it or summing it across label sets produces nothing
+/// meaningful. See the module documentation.
 pub const EXECUTION_MS_MAX: &str = "deis_runtime_isolate_execution_ms_max";
 /// Executions cut off because the app exceeded its op dispatch rate limit.
 pub const RATE_LIMIT_CUTOFFS_TOTAL: &str = "deis_runtime_rate_limit_cutoffs_total";
@@ -75,6 +88,9 @@ pub const QUEUE_MESSAGES_TOTAL: &str = "deis_runtime_queue_messages_total";
 pub const QUEUE_MESSAGE_FAILURES_TOTAL: &str = "deis_runtime_queue_message_failures_total";
 /// Failed polls of deis-queue: the queue was unreachable or refused the call.
 pub const QUEUE_POLL_ERRORS_TOTAL: &str = "deis_runtime_queue_poll_errors_total";
+
+/// Label carrying the environment half of a tenant on a shipped sample.
+const ENVIRONMENT_LABEL: &str = "environment";
 
 /// Identity of one counter: its name, the app it belongs to, and any extra
 /// dimensions (only the queue name, today).
@@ -109,10 +125,13 @@ pub enum RequestOutcome {
     Error,
 }
 
-/// Process-wide counters, aggregated per application.
+/// Process-wide samples, aggregated per application.
+///
+/// Almost all of them are counters; [`EXECUTION_MS_MAX`] is a high-water
+/// gauge, which is why the field is not called `counters`.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
-    counters: Mutex<HashMap<SampleKey, f64>>,
+    samples: Mutex<HashMap<SampleKey, f64>>,
 }
 
 impl MetricsRegistry {
@@ -120,14 +139,16 @@ impl MetricsRegistry {
         Self::default()
     }
 
+    /// Add to a counter.
     fn add(&self, key: SampleKey, delta: f64) {
-        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        *counters.entry(key).or_insert(0.0) += delta;
+        let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        *samples.entry(key).or_insert(0.0) += delta;
     }
 
+    /// Raise a high-water gauge, if this sample beats it. Never lowers it.
     fn raise(&self, key: SampleKey, value: f64) {
-        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = counters.entry(key).or_insert(0.0);
+        let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = samples.entry(key).or_insert(0.0);
         if value > *slot {
             *slot = value;
         }
@@ -180,11 +201,15 @@ impl MetricsRegistry {
         );
     }
 
-    /// Current value of one counter for one application, summed across label
+    /// Current value of one sample for one application, summed across label
     /// sets (so a queue counter is the total over every queue).
+    ///
+    /// Summing is right for the counters and only approximate for the gauge
+    /// [`EXECUTION_MS_MAX`], which carries no extra labels today -- so the
+    /// sum is over a single entry -- but would be meaningless if it ever did.
     pub fn value(&self, name: &str, app_id: &str) -> f64 {
-        let counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        counters
+        let samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        samples
             .iter()
             .filter(|(key, _)| key.name == name && key.app_id == app_id)
             .map(|(_, value)| *value)
@@ -193,29 +218,46 @@ impl MetricsRegistry {
 
     /// Everything recorded so far, as samples stamped with `timestamp_us`.
     ///
-    /// Nothing is reset: the values are cumulative, so a push that fails
-    /// loses nothing.
+    /// Nothing is reset: the counters are cumulative, so a push that fails
+    /// loses nothing, and the one gauge carries its current high-water mark.
     pub fn snapshot(&self, timestamp_us: i64) -> Vec<MetricSample> {
-        let counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
-        let mut keys: Vec<&SampleKey> = counters.keys().collect();
+        let samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        let mut keys: Vec<&SampleKey> = samples.keys().collect();
         keys.sort();
         keys.into_iter()
-            .map(|key| MetricSample {
-                name: key.name.to_string(),
-                app_id: key.app_id.clone(),
-                labels: key.labels.clone().into_iter().collect(),
-                value: counters[key],
-                timestamp_us,
+            .map(|key| {
+                // The key here is the tenant, because that is what a request
+                // is charged to. On the wire the two halves separate: a
+                // Prometheus series is `{app_id="demo",environment="preview"}`,
+                // so `sum by (app_id)` covers an application's environments
+                // and a query can still single one out. Sending the joined
+                // string would make every environment its own application and
+                // there would be no way to add them up.
+                let (app_id, environment) = match deis_wire::conventions::split_tenant(&key.app_id)
+                {
+                    Some((app, environment)) => (app.to_string(), Some(environment)),
+                    None => (key.app_id.clone(), None),
+                };
+                let mut labels: BTreeMap<String, String> = key.labels.clone();
+                if let Some(environment) = environment {
+                    labels
+                        .entry(ENVIRONMENT_LABEL.to_string())
+                        .or_insert_with(|| environment.to_string());
+                }
+                MetricSample {
+                    name: key.name.to_string(),
+                    app_id,
+                    labels: labels.into_iter().collect(),
+                    value: samples[key],
+                    timestamp_us,
+                }
             })
             .collect()
     }
 
-    /// How many distinct counters are being kept.
+    /// How many distinct samples are being kept.
     pub fn len(&self) -> usize {
-        self.counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.samples.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {

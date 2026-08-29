@@ -115,7 +115,35 @@ pub enum RuntimeMessage {
     Shutdown,
 }
 
-/// Runtime thread
+/// The one application a runtime thread hosts.
+///
+/// One isolate per OS thread is a V8 requirement, not a scheduling
+/// preference. `v8::OwnedIsolate` enters its isolate when it is created and
+/// exits when it is dropped, so a second isolate built on the same thread
+/// shadows the first: every later use of the first one panics with
+/// "...and Context do not belong to the same Isolate", which kills the thread
+/// and with it every application that thread was hosting, and dropping the two
+/// out of creation order aborts the process outright.
+///
+/// A map here would let a future edit put two isolates on one thread again
+/// and get that silently. An `Option` cannot.
+struct HostedApp {
+    app_id: String,
+    runtime: AppRuntime,
+}
+
+/// The hosted runtime, if this thread is hosting the application asked for.
+fn hosted_mut<'a>(slot: &'a mut Option<HostedApp>, app_id: &str) -> Option<&'a mut AppRuntime> {
+    slot.as_mut()
+        .filter(|hosted| hosted.app_id == app_id)
+        .map(|hosted| &mut hosted.runtime)
+}
+
+/// Runtime thread.
+///
+/// Hosts at most one application at a time; see [`HostedApp`]. A thread whose
+/// application has been unloaded stays alive and is handed to the next
+/// application that loads, so a deployment does not pay for starting one.
 struct RuntimeThread {
     #[allow(dead_code)]
     thread_id: usize,
@@ -163,8 +191,8 @@ impl RuntimeThread {
         // Notify main thread that this thread has finished initialization
         let _ = ready_tx.send(());
 
-        // All application runtimes managed by this thread
-        let mut runtimes: HashMap<String, AppRuntime> = HashMap::new();
+        // The one application runtime this thread hosts, if any.
+        let mut hosted: Option<HostedApp> = None;
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -177,11 +205,31 @@ impl RuntimeThread {
                     response,
                 } => {
                     tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
+                    // Drop whatever this thread hosted before building the new
+                    // isolate. Two live isolates on one thread break each other
+                    // (see `HostedApp`), and the previous one must be dropped
+                    // here, on the thread that created it.
+                    if let Some(previous) = hosted.take() {
+                        tracing::warn!(
+                            thread_id,
+                            previous = %previous.app_id,
+                            app_id = %app_id,
+                            "Runtime thread {} was still hosting {} when {} was assigned to it; \
+                             the previous isolate is being dropped, so that application stops \
+                             serving on this node until it is loaded again",
+                            thread_id,
+                            previous.app_id,
+                            app_id
+                        );
+                    }
                     let result =
                         match AppRuntime::new(app_id.clone(), code, app_repo, spec, &wiring) {
                             Ok(mut runtime) => match runtime.init_module().await {
                                 Ok(()) => {
-                                    runtimes.insert(app_id.clone(), runtime);
+                                    hosted = Some(HostedApp {
+                                        app_id: app_id.clone(),
+                                        runtime,
+                                    });
                                     Ok(())
                                 }
                                 Err(e) => Err(e),
@@ -193,7 +241,11 @@ impl RuntimeThread {
 
                 RuntimeMessage::UnloadApp { app_id, response } => {
                     tracing::debug!("Thread {}: Unloading app {}", thread_id, app_id);
-                    let result = if runtimes.remove(&app_id).is_some() {
+                    let result = if hosted.as_ref().is_some_and(|h| h.app_id == app_id) {
+                        // Dropped here rather than handed back to the caller:
+                        // an isolate must be dropped on the thread that
+                        // created it.
+                        hosted = None;
                         Ok(())
                     } else {
                         Err(anyhow::anyhow!("App not found"))
@@ -210,7 +262,7 @@ impl RuntimeThread {
                     response,
                 } => {
                     tracing::debug!("Thread {}: Executing request for app {}", thread_id, app_id);
-                    match runtimes.get_mut(&app_id) {
+                    match hosted_mut(&mut hosted, &app_id) {
                         Some(runtime) => {
                             if let Err(e) = runtime
                                 .execute_fetch(url, method, headers, body, response)
@@ -238,7 +290,7 @@ impl RuntimeThread {
                         app_id,
                         queue
                     );
-                    let result = match runtimes.get_mut(&app_id) {
+                    let result = match hosted_mut(&mut hosted, &app_id) {
                         Some(runtime) => runtime.execute_queue_batch(queue, messages).await,
                         None => Err(anyhow::anyhow!(
                             "App {app_id} is not loaded on this node; its queue batch was not \
@@ -260,7 +312,7 @@ impl RuntimeThread {
                         app_id,
                         cron
                     );
-                    let result = match runtimes.get_mut(&app_id) {
+                    let result = match hosted_mut(&mut hosted, &app_id) {
                         Some(runtime) => runtime.execute_scheduled(cron, scheduled_time_ms).await,
                         None => Err(anyhow::anyhow!(
                             "App {app_id} is not loaded on this node, so its scheduled run did                              not happen here; the control plane should try another node"
@@ -270,7 +322,7 @@ impl RuntimeThread {
                 }
 
                 RuntimeMessage::ListApps { response } => {
-                    let apps: Vec<String> = runtimes.keys().cloned().collect();
+                    let apps: Vec<String> = hosted.iter().map(|h| h.app_id.clone()).collect();
                     let _ = response.send(apps);
                 }
 
@@ -287,7 +339,7 @@ impl RuntimeThread {
                         app_id
                     );
 
-                    let result = match runtimes.get_mut(&app_id) {
+                    let result = match hosted_mut(&mut hosted, &app_id) {
                         Some(runtime) => {
                             // Register sender to WsServerManager, so JavaScript can send messages to the client
                             runtime
@@ -313,7 +365,7 @@ impl RuntimeThread {
                         app_id
                     );
 
-                    let result = match runtimes.get_mut(&app_id) {
+                    let result = match hosted_mut(&mut hosted, &app_id) {
                         Some(runtime) => runtime.dispatch_ws_message(ws_id, message).await,
                         None => Err(anyhow::anyhow!("App not found")),
                     };
@@ -333,7 +385,7 @@ impl RuntimeThread {
                         app_id
                     );
 
-                    let result = match runtimes.get_mut(&app_id) {
+                    let result = match hosted_mut(&mut hosted, &app_id) {
                         Some(runtime) => {
                             runtime
                                 .close_ws_connection(ws_id, 1000, "Gateway closed".to_string())
@@ -346,7 +398,7 @@ impl RuntimeThread {
                 }
 
                 RuntimeMessage::GetOpMetrics { app_id, response } => {
-                    let result = match runtimes.get(&app_id) {
+                    let result = match hosted_mut(&mut hosted, &app_id) {
                         Some(runtime) => Ok(runtime.op_metrics_summary()),
                         None => Err(anyhow::anyhow!("App not found")),
                     };
@@ -354,7 +406,7 @@ impl RuntimeThread {
                 }
 
                 RuntimeMessage::ConnectInspector { app_id, response } => {
-                    let result = match runtimes.get_mut(&app_id) {
+                    let result = match hosted_mut(&mut hosted, &app_id) {
                         Some(runtime) => runtime.connect_inspector(),
                         None => Err(anyhow::anyhow!("App not found")),
                     };
@@ -368,13 +420,15 @@ impl RuntimeThread {
             }
         }
 
-        // Explicitly cleanup all runtimes to ensure they are dropped in the correct context
-        tracing::debug!(
-            "Cleaning up {} runtimes in thread {}",
-            runtimes.len(),
-            thread_id
-        );
-        runtimes.clear();
+        // Dropped here, on the thread that created it: an isolate cannot be
+        // dropped anywhere else.
+        if let Some(hosted) = hosted.take() {
+            tracing::debug!(
+                "Dropping the runtime of {} on thread {}",
+                hosted.app_id,
+                thread_id
+            );
+        }
 
         tracing::info!("Runtime thread {} stopped", thread_id);
     }
@@ -399,16 +453,57 @@ impl Drop for RuntimeThread {
     }
 }
 
-/// Runtime thread pool
+/// Runtime thread pool.
+///
+/// # One application per thread
+///
+/// A thread hosts at most one application, because a thread hosts at most one
+/// V8 isolate; see [`HostedApp`] for why that is not negotiable. `num_threads`
+/// is therefore how many threads are started up front rather than a ceiling:
+/// loading an application takes an idle thread if there is one and starts
+/// another if there is not, and unloading leaves the thread idle for the next
+/// load rather than stopping it.
+///
+/// # What an application is keyed by here
+///
+/// By the pair (application, environment), spelled the way the storage
+/// services read it: [`crate::app::AppKey::tenant_id`], e.g.
+/// `demo.production`. Every `app_id: String` below is that string. Keying by
+/// the application alone would put a preview and production in one slot, so
+/// the second deployment to arrive would replace the first -- its code, its
+/// secrets and its storage tenant -- with nothing in the logs to say so.
+///
+/// Log lines and metrics keep the field name `app_id` because that is the one
+/// tenant dimension deis-telemetry stores and every query filters on; the
+/// value in it is the pair.
 pub struct RuntimePool {
-    threads: Vec<RuntimeThread>,
-    app_assignments: Arc<RwLock<HashMap<String, usize>>>, // app_id -> thread_id
+    placement: RwLock<Placement>,
     app_repo: Option<Arc<AppRepo>>,
     /// Queue pollers, per app. Held here because they must be stopped when
     /// the app is unloaded: a poller left running would keep leasing messages
     /// for an app that is no longer on this node, and every one of them would
     /// fail and eventually be dead lettered.
     consumers: Mutex<HashMap<String, Vec<ConsumerHandle>>>,
+}
+
+/// Which thread each loaded application sits on, and the threads themselves.
+///
+/// Kept behind one lock rather than two so that claiming a free thread for a
+/// new application is a single atomic step: with the two apart, two
+/// deployments arriving together could both read "thread 3 is free" and both
+/// be sent there, and the second isolate would break the first.
+struct Placement {
+    threads: Vec<RuntimeThread>,
+    /// `<app>.<environment>` tenant -> index into `threads`.
+    of_app: HashMap<String, usize>,
+}
+
+impl Placement {
+    /// A thread with no application on it, if there is one.
+    fn idle_thread(&self) -> Option<usize> {
+        let taken: std::collections::HashSet<usize> = self.of_app.values().copied().collect();
+        (0..self.threads.len()).find(|id| !taken.contains(id))
+    }
 }
 
 impl RuntimePool {
@@ -422,43 +517,86 @@ impl RuntimePool {
         init_v8_platform();
 
         let num_threads = num_threads.unwrap_or_else(num_cpus::get);
-        tracing::info!("Creating runtime pool with {} threads", num_threads);
+        tracing::info!(
+            "Creating runtime pool with {} threads started up front; one application runs per \
+             thread, so more threads are started if more applications are loaded than that",
+            num_threads
+        );
 
         let threads = (0..num_threads).map(RuntimeThread::new).collect();
 
         Self {
-            threads,
-            app_assignments: Arc::new(RwLock::new(HashMap::new())),
+            placement: RwLock::new(Placement {
+                threads,
+                of_app: HashMap::new(),
+            }),
             app_repo,
             consumers: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Select a thread (load balancing)
-    async fn select_thread_for_new_app(&self) -> usize {
-        let assignments = self.app_assignments.read().await;
-
-        // Count number of applications in each thread
-        let mut counts = vec![0; self.threads.len()];
-        for thread_id in assignments.values() {
-            counts[*thread_id] += 1;
+    /// Reserve a thread for a newly loading application, starting one if every
+    /// existing thread already hosts an application.
+    ///
+    /// The reservation is recorded before the isolate is built, so a second
+    /// load arriving at the same moment cannot be sent to the same thread;
+    /// [`Self::release`] undoes it if the load fails.
+    ///
+    /// Returns the thread's index (for logs) and a handle to post to it.
+    async fn claim_thread(&self, tenant: &str) -> Result<(usize, mpsc::Sender<RuntimeMessage>)> {
+        let mut placement = self.placement.write().await;
+        if placement.of_app.contains_key(tenant) {
+            return Err(anyhow::anyhow!("App already exists"));
         }
 
-        // Select thread with the minimum number of applications
-        counts
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, count)| *count)
-            .map(|(idx, _)| idx)
-            .unwrap_or(0)
+        let id = match placement.idle_thread() {
+            Some(id) => id,
+            None => {
+                // Starting a thread waits for it to report ready, which holds
+                // this lock for that moment. It happens once per application
+                // load, never on a request, and the alternative - deciding on
+                // a thread outside the lock - is what lets two loads pick the
+                // same one.
+                let id = placement.threads.len();
+                placement.threads.push(RuntimeThread::new(id));
+                tracing::info!(
+                    thread_id = id,
+                    app_id = tenant,
+                    "Started runtime thread {} for {}: every existing thread already hosts an \
+                     application, and two isolates cannot share one thread",
+                    id,
+                    tenant
+                );
+                id
+            }
+        };
+
+        placement.of_app.insert(tenant.to_string(), id);
+        Ok((id, placement.threads[id].sender.clone()))
     }
 
-    /// Get the thread ID where the application is located
-    async fn get_thread_id(&self, app_id: &str) -> Option<usize> {
-        self.app_assignments.read().await.get(app_id).copied()
+    /// Give up an application's thread, leaving it idle for the next load.
+    async fn release(&self, tenant: &str) {
+        self.placement.write().await.of_app.remove(tenant);
     }
 
-    /// Load application.
+    /// Post a message to the thread hosting `app_id`.
+    async fn dispatch(&self, app_id: &str, message: RuntimeMessage) -> Result<()> {
+        let placement = self.placement.read().await;
+        let id = *placement
+            .of_app
+            .get(app_id)
+            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+        placement.threads[id].send(message)
+    }
+
+    /// Load one environment of one application.
+    ///
+    /// `tenant` identifies it: [`crate::app::AppKey::tenant_id`], e.g.
+    /// `demo.production`. It is the key in this pool, the tenant every
+    /// storage call of this isolate is charged to, and the dimension its logs
+    /// and metrics carry -- so a preview's data, requests and errors never
+    /// land in production's.
     ///
     /// The platform wiring -- which storage services this app declared and
     /// where they live -- travels in `spec.env` under the reserved keys the
@@ -468,49 +606,57 @@ impl RuntimePool {
     /// information.
     pub async fn load_app(
         &self,
-        app_id: String,
+        tenant: String,
         code: String,
         mut spec: IsolateSpec,
     ) -> Result<()> {
-        // Check if already exists
-        if self.get_thread_id(&app_id).await.is_some() {
-            return Err(anyhow::anyhow!("App already exists"));
-        }
-
         let wiring = ServiceWiring::take_from_env(&mut spec.env);
         let execution_timeout = Duration::from_millis(spec.limits.timeout_ms);
 
-        // Select thread
-        let thread_id = self.select_thread_for_new_app().await;
-        tracing::info!("Assigning app {} to thread {}", app_id, thread_id);
+        // Reserved before the isolate is built, so no second load can be sent
+        // to the same thread while this one is starting.
+        let (thread_id, sender) = self.claim_thread(&tenant).await?;
+        tracing::info!("Assigning app {} to thread {}", tenant, thread_id);
 
-        // Send load message
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::LoadApp {
-            app_id: app_id.clone(),
+        let sent = sender.try_send(RuntimeMessage::LoadApp {
+            app_id: tenant.clone(),
             code,
             app_repo: self.app_repo.clone(),
             spec,
             wiring: wiring.clone(),
             response: tx,
-        })?;
+        });
 
-        // Wait for result
-        let result = rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?;
-
-        // Record assignment if successful
-        if result.is_ok() {
-            self.app_assignments
-                .write()
+        let result = match sent {
+            Ok(()) => rx
                 .await
-                .insert(app_id.clone(), thread_id);
-            self.start_consumers(&app_id, thread_id, &wiring, execution_timeout)
-                .await;
-        }
+                .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))
+                .and_then(|inner| inner),
+            Err(e) => Err(match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("Runtime thread overloaded (queue full)")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("Runtime thread has stopped")
+                }
+            }),
+        };
 
-        result
+        match result {
+            Ok(()) => {
+                self.start_consumers(&tenant, sender, &wiring, execution_timeout)
+                    .await;
+                Ok(())
+            }
+            Err(e) => {
+                // The thread is free again; leaving it reserved would strand
+                // it, and the next application would start a thread for
+                // nothing.
+                self.release(&tenant).await;
+                Err(e)
+            }
+        }
     }
 
     /// Start one poller per queue the app consumes.
@@ -520,12 +666,12 @@ impl RuntimePool {
     /// handle, and every one of them would burn a delivery attempt.
     async fn start_consumers(
         &self,
-        app_id: &str,
-        thread_id: usize,
+        tenant: &str,
+        sender: mpsc::Sender<RuntimeMessage>,
         wiring: &ServiceWiring,
         execution_timeout: Duration,
     ) {
-        let specs = wiring.active_consumers(app_id);
+        let specs = wiring.active_consumers(tenant);
         if specs.is_empty() {
             return;
         }
@@ -534,16 +680,18 @@ impl RuntimePool {
             return;
         };
 
-        let client: Arc<dyn QueuePort> = match consumer_queue_client(app_id, endpoint) {
+        // Charged to the same tenant as the app's own queue client, so a
+        // preview leases only its own messages.
+        let client: Arc<dyn QueuePort> = match consumer_queue_client(tenant, endpoint) {
             Ok(client) => Arc::new(client),
             Err(e) => {
                 tracing::error!(
-                    app_id,
+                    app_id = tenant,
                     endpoint,
                     error = %e,
-                    "Cannot build a queue client for app {}; none of its queues will be \
+                    "Cannot build a queue client for {}; none of its queues will be \
                      consumed and their messages will pile up in deis-queue",
-                    app_id
+                    tenant
                 );
                 return;
             }
@@ -551,9 +699,9 @@ impl RuntimePool {
 
         let mut handles = Vec::with_capacity(specs.len());
         for spec in specs {
-            let invoker = self.batch_invoker(app_id, thread_id);
+            let invoker = Self::batch_invoker(tenant, sender.clone());
             handles.push(queue_consumer::spawn(
-                app_id.to_string(),
+                tenant.to_string(),
                 spec.name,
                 client.clone(),
                 ConsumerSettings::for_app(spec.batch_size, execution_timeout),
@@ -564,13 +712,12 @@ impl RuntimePool {
         self.consumers
             .lock()
             .await
-            .insert(app_id.to_string(), handles);
+            .insert(tenant.to_string(), handles);
     }
 
     /// How a poller reaches the isolate: by posting the batch to the runtime
     /// thread the app lives on, exactly like a request.
-    fn batch_invoker(&self, app_id: &str, thread_id: usize) -> BatchInvoker {
-        let sender = self.threads[thread_id].sender.clone();
+    fn batch_invoker(app_id: &str, sender: mpsc::Sender<RuntimeMessage>) -> BatchInvoker {
         let app_id = app_id.to_string();
         Arc::new(move |queue: String, messages: Vec<LeasedMessage>| {
             let sender = sender.clone();
@@ -612,31 +759,28 @@ impl RuntimePool {
 
     /// Unload application
     pub async fn unload_app(&self, app_id: &str) -> Result<()> {
-        // Get thread ID
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
         // Stop polling before the isolate goes away, so no batch is leased
         // for an app that can no longer handle it.
         self.stop_consumers(app_id).await;
 
-        // Send unload message
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::UnloadApp {
-            app_id: app_id.to_string(),
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::UnloadApp {
+                app_id: app_id.to_string(),
+                response: tx,
+            },
+        )
+        .await?;
 
-        // Wait for result
         let result = rx
             .await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?;
 
-        // Remove assignment record if successful
+        // The thread is left running and idle: it costs one stack, and the
+        // next application to load takes it instead of paying to start one.
         if result.is_ok() {
-            self.app_assignments.write().await.remove(app_id);
+            self.release(app_id).await;
         }
 
         result
@@ -651,24 +795,20 @@ impl RuntimePool {
         headers: HashMap<String, String>,
         body: Option<String>,
     ) -> Result<(u16, HashMap<String, String>, Option<String>)> {
-        // Get thread ID
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
-        // Send execution message
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::ExecuteRequest {
-            app_id: app_id.to_string(),
-            url,
-            method,
-            headers,
-            body,
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::ExecuteRequest {
+                app_id: app_id.to_string(),
+                url,
+                method,
+                headers,
+                body,
+                response: tx,
+            },
+        )
+        .await?;
 
-        // Wait for result
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
@@ -676,28 +816,27 @@ impl RuntimePool {
     /// List all applications
     #[cfg(test)]
     pub async fn list_apps(&self) -> Vec<String> {
-        let assignments = self.app_assignments.read().await;
-        assignments.keys().cloned().collect()
+        self.placement.read().await.of_app.keys().cloned().collect()
     }
 
     /// Get thread count
     #[cfg(test)]
-    pub fn thread_count(&self) -> usize {
-        self.threads.len()
+    pub async fn thread_count(&self) -> usize {
+        self.placement.read().await.threads.len()
     }
 
     /// Get statistics
     pub async fn get_stats(&self) -> HashMap<String, usize> {
-        let assignments = self.app_assignments.read().await;
+        let placement = self.placement.read().await;
 
         let mut thread_apps: HashMap<String, usize> = HashMap::new();
-        for (_, thread_id) in assignments.iter() {
+        for thread_id in placement.of_app.values() {
             let key = format!("thread_{}", thread_id);
             *thread_apps.entry(key).or_insert(0) += 1;
         }
 
-        thread_apps.insert("total_threads".to_string(), self.threads.len());
-        thread_apps.insert("total_apps".to_string(), assignments.len());
+        thread_apps.insert("total_threads".to_string(), placement.threads.len());
+        thread_apps.insert("total_apps".to_string(), placement.of_app.len());
 
         thread_apps
     }
@@ -718,18 +857,17 @@ impl RuntimePool {
         ws_id: String,
         js_to_client_tx: mpsc::UnboundedSender<super::WsServerMessage>,
     ) -> Result<()> {
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::RegisterWsConnection {
-            app_id: app_id.to_string(),
-            ws_id,
-            js_to_client_tx,
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::RegisterWsConnection {
+                app_id: app_id.to_string(),
+                ws_id,
+                js_to_client_tx,
+                response: tx,
+            },
+        )
+        .await?;
 
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
@@ -751,18 +889,17 @@ impl RuntimePool {
         ws_id: String,
         message: String,
     ) -> Result<()> {
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::SendWsMessage {
-            app_id: app_id.to_string(),
-            ws_id,
-            message,
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::SendWsMessage {
+                app_id: app_id.to_string(),
+                ws_id,
+                message,
+                response: tx,
+            },
+        )
+        .await?;
 
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
@@ -778,17 +915,16 @@ impl RuntimePool {
     /// - Ok(()) Success
     /// - Err(...) Application not found or unregistration failed
     pub async fn unregister_ws_connection(&self, app_id: &str, ws_id: String) -> Result<()> {
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::UnregisterWsConnection {
-            app_id: app_id.to_string(),
-            ws_id,
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::UnregisterWsConnection {
+                app_id: app_id.to_string(),
+                ws_id,
+                response: tx,
+            },
+        )
+        .await?;
 
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
@@ -805,18 +941,17 @@ impl RuntimePool {
         queue: String,
         messages: Vec<LeasedMessage>,
     ) -> Result<BatchOutcome> {
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::ExecuteQueueBatch {
-            app_id: app_id.to_string(),
-            queue,
-            messages,
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::ExecuteQueueBatch {
+                app_id: app_id.to_string(),
+                queue,
+                messages,
+                response: tx,
+            },
+        )
+        .await?;
 
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
@@ -833,18 +968,17 @@ impl RuntimePool {
         cron: String,
         scheduled_time_ms: i64,
     ) -> Result<()> {
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::ExecuteScheduled {
-            app_id: app_id.to_string(),
-            cron,
-            scheduled_time_ms,
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::ExecuteScheduled {
+                app_id: app_id.to_string(),
+                cron,
+                scheduled_time_ms,
+                response: tx,
+            },
+        )
+        .await?;
 
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
@@ -852,16 +986,15 @@ impl RuntimePool {
 
     /// Get aggregate application OpMetrics
     pub async fn get_op_metrics(&self, app_id: &str) -> Result<OpMetricsSummary> {
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::GetOpMetrics {
-            app_id: app_id.to_string(),
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::GetOpMetrics {
+                app_id: app_id.to_string(),
+                response: tx,
+            },
+        )
+        .await?;
 
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
@@ -875,16 +1008,15 @@ impl RuntimePool {
         mpsc::UnboundedSender<String>,
         mpsc::UnboundedReceiver<String>,
     )> {
-        let thread_id = self
-            .get_thread_id(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
-
         let (tx, rx) = oneshot::channel();
-        self.threads[thread_id].send(RuntimeMessage::ConnectInspector {
-            app_id: app_id.to_string(),
-            response: tx,
-        })?;
+        self.dispatch(
+            app_id,
+            RuntimeMessage::ConnectInspector {
+                app_id: app_id.to_string(),
+                response: tx,
+            },
+        )
+        .await?;
 
         rx.await
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
@@ -907,15 +1039,29 @@ mod tests {
     static TEST_POOL: Lazy<Mutex<RuntimePool>> =
         Lazy::new(|| Mutex::new(RuntimePool::new(Some(4))));
 
+    /// Take the shared pool for one test.
+    ///
+    /// A poisoned lock is taken anyway: poisoning only means an earlier test
+    /// panicked, and refusing every later test would report that one failure
+    /// as several and hide which one was real.
+    fn pool() -> std::sync::MutexGuard<'static, RuntimePool> {
+        TEST_POOL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[tokio::test]
     async fn test_pool_creation() {
-        let pool = TEST_POOL.lock().unwrap();
-        assert_eq!(pool.thread_count(), 4);
+        let pool = pool();
+        // Not an equality: the pool starts these four up front and adds one
+        // whenever more applications are loaded than there are threads, and
+        // this pool is shared with every other test in this module.
+        assert!(pool.thread_count().await >= 4);
     }
 
     #[tokio::test]
     async fn test_load_and_execute() {
-        let pool = TEST_POOL.lock().unwrap();
+        let pool = pool();
 
         let code = r#"
             export default function handler(context) {
@@ -954,10 +1100,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_balancing() {
-        let pool = TEST_POOL.lock().unwrap();
+    async fn each_app_gets_a_thread_to_itself() {
+        let pool = pool();
 
-        // Load multiple applications
         for i in 0..4 {
             let code = r#"export default function handler(context) { return new Response("ok"); }"#;
             pool.load_app(
@@ -969,15 +1114,98 @@ mod tests {
             .unwrap();
         }
 
-        // Check application assignments
         let stats = pool.get_stats().await;
-        assert!(stats.get("total_apps").unwrap() >= &4);
-        assert_eq!(stats.get("total_threads"), Some(&4));
+        assert_eq!(stats.get("total_apps"), Some(&4));
+        // The per-thread counts are the point: two applications sharing a
+        // thread means two isolates sharing one, which breaks both.
+        for (thread, apps) in stats.iter().filter(|(k, _)| k.starts_with("thread_")) {
+            assert_eq!(*apps, 1, "{thread} hosts {apps} applications");
+        }
 
-        // Cleanup
         for i in 0..4 {
             let _ = pool.unload_app(&format!("lb_app{}", i)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn more_apps_than_threads_all_keep_serving() {
+        // Two isolates on one OS thread break each other: the second one
+        // entered shadows the first, so the first application's next request
+        // panics the runtime thread and takes every application on it down.
+        // The pool has four threads, so loading six is what used to double up.
+        let pool = pool();
+
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+        let names: Vec<String> = (0..6)
+            .map(|i| format!("crowded_app{i}.production"))
+            .collect();
+        for name in &names {
+            pool.load_app(name.clone(), code.to_string(), IsolateSpec::default())
+                .await
+                .unwrap_or_else(|e| panic!("loading {name}: {e}"));
+        }
+
+        // Every one of them, oldest first: the oldest is the one an isolate
+        // built later on the same thread would have broken.
+        for name in &names {
+            let (status, _, body) = pool
+                .execute_request(
+                    name,
+                    "http://localhost/".to_string(),
+                    "GET".to_string(),
+                    HashMap::new(),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name} stopped serving: {e}"));
+            assert_eq!(status, 200, "{name}");
+            assert_eq!(body.as_deref(), Some("ok"), "{name}");
+        }
+
+        assert!(
+            pool.thread_count().await >= names.len(),
+            "the pool must have started a thread per application rather than doubling up"
+        );
+
+        for name in &names {
+            pool.unload_app(name).await.expect("unload");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_apps_thread_is_reused() {
+        // A thread costs a stack and a tokio runtime; a node that redeploys
+        // all day must not accumulate one per deployment.
+        let pool = pool();
+
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+        pool.load_app(
+            "recycled_app.production".to_string(),
+            code.to_string(),
+            IsolateSpec::default(),
+        )
+        .await
+        .expect("load");
+        let before = pool.thread_count().await;
+        pool.unload_app("recycled_app.production")
+            .await
+            .expect("unload");
+
+        pool.load_app(
+            "recycled_app.preview".to_string(),
+            code.to_string(),
+            IsolateSpec::default(),
+        )
+        .await
+        .expect("load");
+        assert_eq!(
+            pool.thread_count().await,
+            before,
+            "the idle thread should have been taken instead of a new one started"
+        );
+        pool.unload_app("recycled_app.preview")
+            .await
+            .expect("unload");
     }
 
     #[tokio::test]
@@ -987,7 +1215,7 @@ mod tests {
         // else: platform wiring is not application configuration, and an app
         // variable spelled like one of the reserved keys must not be able to
         // point a storage client somewhere else.
-        let pool = TEST_POOL.lock().unwrap();
+        let pool = pool();
 
         let code = r#"
             export default async function handler(ctx) {
@@ -1012,7 +1240,7 @@ mod tests {
         .collect();
 
         pool.load_app(
-            "env_wiring_app".to_string(),
+            "env_wiring_app.production".to_string(),
             code.to_string(),
             IsolateSpec {
                 env,
@@ -1024,7 +1252,7 @@ mod tests {
 
         let (status, _, body) = pool
             .execute_request(
-                "env_wiring_app",
+                "env_wiring_app.production",
                 "http://localhost/".to_string(),
                 "GET".to_string(),
                 HashMap::new(),
@@ -1032,7 +1260,7 @@ mod tests {
             )
             .await
             .expect("the request runs");
-        let _ = pool.unload_app("env_wiring_app").await;
+        let _ = pool.unload_app("env_wiring_app.production").await;
 
         assert_eq!(status, 200);
         let body = body.unwrap_or_default();
@@ -1052,7 +1280,7 @@ mod tests {
         // Refusing to load would take the whole app down over a consumer that
         // cannot run; the app serves requests and the missing address is a
         // warning, not an outage.
-        let pool = TEST_POOL.lock().unwrap();
+        let pool = pool();
 
         let code = r#"export default function handler() { return new Response("ok"); }"#;
         let env: HashMap<String, String> = [
@@ -1092,7 +1320,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unload_app() {
-        let pool = TEST_POOL.lock().unwrap();
+        let pool = pool();
 
         let code = r#"export default function handler(context) { return new Response("ok"); }"#;
         pool.load_app(

@@ -12,6 +12,12 @@ Both expect deis-control listening on `ws://127.0.0.1:9001` with the test secret
 `a1b2c3d4e5f67890123456789012345678901234567890123456789012345678` in
 `node_preshared_keys`.
 
+That list is now also the credential for the control plane's two HTTP node
+endpoints - `GET /api/nodes/{id}/assignments` and the bundle download - because
+the assignment list carries every environment's decrypted secrets. A runtime
+node presents it as `[control] secret` in its own configuration; without it
+those two endpoints answer 401 and the node never loads what it was assigned.
+
 ```bash
 # terminal 1
 cargo run -p deis-control -- --port 9001 --database /tmp/deis-control-test.db

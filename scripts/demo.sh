@@ -18,12 +18,19 @@ DEFAULT_DEIS_QUEUE_PORT=8091
 DEFAULT_DEIS_TELEMETRY_PORT=8092
 DEFAULT_DEIS_TELEMETRY_METRICS_PORT=8093
 
-# The example app, and the names the demo files it under. The app id is the
-# only tenant dimension deis-store and deis-queue understand, and it is what
-# goes in the x-deis-app-id header on every request.
+# The example app, and the names the demo files it under. deis-store and
+# deis-queue still understand exactly one tenant dimension, but that key is now
+# the application and the environment joined by a dot - "demo.production" - and
+# it travels in the x-deis-tenant header. So a preview environment of this same
+# app gets its own KV, database, blob and queue namespace and cannot read or
+# overwrite what production stored.
 APP_SRC_DIR="${APP_SRC_DIR:-${ROOT_DIR}/scripts/demo-assets/example-app}"
 APP_ID="${APP_ID:-demo}"
 ENV_NAME="${ENV_NAME:-production}"
+# A second environment of the same application, deployed to a different
+# version on the same node. It is what proves an application is identified by
+# (app, environment) and not by app id alone.
+PREVIEW_ENV_NAME="${PREVIEW_ENV_NAME:-preview}"
 NODE_ID="${NODE_ID:-deis-runtime-demo-01}"
 # Deliberately recognisable: `verify` greps the logs and the data directories
 # for it to prove a decrypted secret is never written down anywhere.
@@ -69,6 +76,26 @@ require_command() {
 
 ensure_dirs() {
   mkdir -p "$LOG_DIR"
+}
+
+# `start` begins a new run, so it clears what the previous one left behind.
+#
+# This is not tidiness. deis-store and deis-queue partition by tenant --
+# "<app>.<environment>" -- and refuse to start on a directory written before
+# that, because opening it would create a second, empty set of tables beside
+# the old rows: every application would look healthy with all of its data
+# gone. The demo would rather hand them an empty directory than have anyone
+# meet that refusal. The master key is kept, so the encrypted secrets in a
+# database that survives an interrupted run still decrypt.
+reset_previous_run() {
+  rm -rf \
+    "${DEMO_DIR}/deis-store-data" \
+    "${DEMO_DIR}/deis-queue-data" \
+    "${DEMO_DIR}/deis-telemetry-data" \
+    "${DEMO_DIR}/deis-runtime-data" \
+    "${DEMO_DIR}/bundles" \
+    "${DEMO_DIR}/deis-control.db" \
+    "${DEMO_DIR}/deis-proxy.db"
 }
 
 # `ss` is asked first on purpose: it lists every listening socket on the host,
@@ -230,7 +257,14 @@ pid_running() {
   kill -0 "$pid" >/dev/null 2>&1
 }
 
+# Save what `verify`, `status` and `stop` need in a later shell.
+#
+# Owner-only: this file holds the node pre-shared key the components
+# authenticate to each other with, and the value of the demo secret, which
+# `verify` needs in order to go looking for it.
 write_state() {
+  touch "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
   cat > "$STATE_FILE" <<EOF
 DEIS_CONTROL_PORT=$DEIS_CONTROL_PORT
 DEIS_RUNTIME_PORT=$DEIS_RUNTIME_PORT
@@ -255,6 +289,7 @@ SECRET=$SECRET
 SECRET_KEY_FILE=$SECRET_KEY_FILE
 APP_ID=$APP_ID
 ENV_NAME=$ENV_NAME
+PREVIEW_ENV_NAME=$PREVIEW_ENV_NAME
 NODE_ID=$NODE_ID
 APP_SRC_DIR=$APP_SRC_DIR
 APP_V1_ID=${APP_V1_ID:-}
@@ -442,12 +477,14 @@ upload_version() {
     --data-binary "@${bundle}" | jq -r '.version.id'
 }
 
-# Point the environment at a version, and say where it landed.
+# Point an environment at a version, and say where it landed. The environment
+# defaults to production; the preview deployment passes its own.
 deploy_version() {
   local version_id=$1
   local note=$2
+  local environment=${3:-$ENV_NAME}
   local response
-  response=$(api POST "/api/apps/${APP_ID}/environments/${ENV_NAME}/deployments" \
+  response=$(api POST "/api/apps/${APP_ID}/environments/${environment}/deployments" \
     -H 'content-type: application/json' \
     -d "{\"version_id\":\"${version_id}\",\"note\":\"${note}\"}") || return 1
 
@@ -456,7 +493,7 @@ deploy_version() {
   failed=$(echo "$response" | jq -r '.delivery.failed | length')
 
   if [ "$delivered" -ge 1 ]; then
-    echo "   ✓ ${note}: ${delivered} node(s) are serving ${version_id}"
+    echo "   ✓ ${note}: ${delivered} node(s) are serving ${version_id} for ${environment}"
     return 0
   fi
 
@@ -498,18 +535,33 @@ deploy_example_app() {
 
   deploy_version "$APP_V1_ID" "deployed v1" || return 1
 
-  # The second version exists so `verify` has something to roll back from.
-  # It is built and uploaded here, not deployed.
+  # The second version exists so `verify` has something to roll back from,
+  # and so the preview environment below can be on a different version than
+  # production.
   local bundle_v2
   bundle_v2=$(build_example_app v2) || return 1
   APP_V2_ID=$(upload_version "$bundle_v2") || return 1
-  echo "   ✓ Uploaded version ${APP_V2_ID} (built, not deployed)"
+  echo "   ✓ Uploaded version ${APP_V2_ID}"
+
+  # A preview of the same application, on the same node, pointed at v2 while
+  # production stays on v1. Before an application was identified by (app,
+  # environment), this second deployment overwrote the first on the node --
+  # same slot, so production silently started serving the preview's code, the
+  # preview's environment map and the preview's secrets. `verify` checks both
+  # halves of the fix: each environment serves its own version, and neither
+  # can see the other's KV.
+  api POST "/api/apps/${APP_ID}/environments" -H 'content-type: application/json' \
+    -d "{\"name\":\"${PREVIEW_ENV_NAME}\"}" > /dev/null || return 1
+  echo "   ✓ Environment ${PREVIEW_ENV_NAME} created"
+
+  deploy_version "$APP_V2_ID" "deployed v2 to ${PREVIEW_ENV_NAME}" "$PREVIEW_ENV_NAME" || return 1
 
   echo "   Send requests with: curl -H 'x-deis-app-id: ${APP_ID}' http://127.0.0.1:${DEIS_RUNTIME_PORT}/"
 }
 
 start_demo() {
   ensure_dirs
+  reset_previous_run
   require_command cargo
   require_command curl
 
@@ -643,6 +695,12 @@ EOF
     # loaded. The control plane still pushes new deployments at it; the pull
     # is what makes a restarted node come back with what it had.
     #
+    # `secret` is the same value as the control plane's node_preshared_keys.
+    # The assignment list carries every environment's decrypted secrets, so the
+    # control plane serves it - and the bundle download - only to a caller that
+    # presents a node key. Without this line the node gets 401 and never loads
+    # anything it was assigned.
+    #
     # [logging] is what makes the app's own log lines queryable: without it
     # they stop at this node's stdout and deis-telemetry has nothing to answer
     # with. The flush interval is dropped to a second so a request's logs are
@@ -659,6 +717,7 @@ flush_interval_secs = 1
 
 [control]
 endpoint = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
+secret = "${SECRET}"
 retry_interval_secs = 2
 EOF
 
@@ -887,6 +946,19 @@ app_request() {
     "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}"
 }
 
+# The same, addressed to a named environment of the application. No header
+# means production, so production keeps working for a caller that predates
+# environments; naming one is how a preview is reached.
+env_request() {
+  local environment=$1
+  local header_file=$2
+  local path=$3
+  shift 3
+  curl -s -D "$header_file" \
+    -H "x-deis-app-id: ${APP_ID}" -H "x-deis-environment: ${environment}" "$@" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}"
+}
+
 # Read one header value out of a saved response, lower-casing the name.
 header_value() {
   local file=$1
@@ -918,8 +990,8 @@ check_static_asset() {
     fail_check "static asset carries an ETag" "no ETag header on GET /"
     return
   fi
-  pass_check "static asset served from the bundle without starting an isolate" \
-    "HTTP ${status}, content-type ${ctype}, ETag ${etag}"
+  pass_check "static asset served from the bundle" \
+    "HTTP ${status}, content-type ${ctype}, ETag ${etag}; the body is the packaged file, not a handler's answer"
 
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' \
@@ -969,16 +1041,26 @@ check_secret_delivery() {
   fi
 
   # The value is decrypted only in memory, at the moment of delivery. Nothing
-  # on either side's disk may contain it.
-  # `|| true` on every step: this whole pipeline finding nothing is the
-  # passing case, and under `set -e` a grep that matches nothing would end
-  # the run instead.
+  # on either side's disk may contain it - and that includes api-last.json,
+  # the file the api() helper saves every control plane API response to: a
+  # read endpoint that echoes the plaintext secret back is exactly the leak
+  # this check exists to catch, so no path under LOG_DIR is excluded.
+  # `|| true` at the end: this whole pipeline finding nothing is the passing
+  # case, and under `set -euo pipefail` a grep that matches nothing would
+  # end the run instead.
+  #
+  # Every component's data directory is swept, not just the node's: the
+  # control plane stores the secret encrypted, and the storage services must
+  # never have seen it at all, so a plaintext hit in any of them is a leak.
   local hits
-  hits=$( { grep -rl "$DEMO_SECRET_VALUE" "$LOG_DIR" "${DEMO_DIR}/deis-runtime-data" \
-    "${DEMO_DIR}/bundles" 2>/dev/null || true; } | grep -v 'api-last.json' | head -n 5 || true)
+  hits=$(grep -rl "$DEMO_SECRET_VALUE" "$LOG_DIR" \
+    "${DEMO_DIR}/deis-runtime-data" "${DEMO_DIR}/deis-store-data" \
+    "${DEMO_DIR}/deis-queue-data" "${DEMO_DIR}/deis-telemetry-data" \
+    "${DEMO_DIR}/bundles" "${DEMO_DIR}/deis-control.db" "${DEMO_DIR}/deis-proxy.db" \
+    2>/dev/null | head -n 5 || true)
   if [ -z "$hits" ]; then
     pass_check "the decrypted secret is written nowhere" \
-      "no hit in the node's data directory, the bundle store or any log"
+      "no hit in any component's data directory, the bundle store, either database or any log"
   else
     fail_check "the decrypted secret is written nowhere" "found in: ${hits}"
   fi
@@ -1076,6 +1158,81 @@ check_cron() {
   fi
 }
 
+# Both environments of the application answer at once, each on its own
+# version.
+#
+# Production is on v1 and the preview on v2. When an application was keyed by
+# app id alone, the node had one slot for both: whichever arrived last won,
+# and the label below came back the same from both. The header is the only
+# difference between the two requests.
+check_second_environment() {
+  local prod preview
+  prod=$(app_request "${LOG_DIR}/verify-env-production.headers" "/hello/world")
+  preview=$(env_request "$PREVIEW_ENV_NAME" \
+    "${LOG_DIR}/verify-env-preview.headers" "/hello/world")
+
+  local prod_label preview_label
+  prod_label=$(echo "$prod" | jq -r '.label // empty' 2>/dev/null || true)
+  preview_label=$(echo "$preview" | jq -r '.label // empty' 2>/dev/null || true)
+
+  if [ "$prod_label" = "v1" ] && [ "$preview_label" = "v2" ]; then
+    pass_check "two environments of one application serve at once, each its own version" \
+      "no environment header -> ${prod_label}; x-deis-environment: ${PREVIEW_ENV_NAME} -> ${preview_label}"
+  else
+    fail_check "two environments of one application serve at once, each its own version" \
+      "expected v1 from ${ENV_NAME} and v2 from ${PREVIEW_ENV_NAME}, got ${prod_label:-<none>} and ${preview_label:-<none>} (${prod} / ${preview})"
+  fi
+}
+
+# The storage tenant is (app, environment), so what a preview writes through
+# ctx.services.kv is invisible to production and the other way round.
+#
+# This is the half that cannot be undone if it is wrong: a preview build that
+# overwrites a production key cannot be rolled back, because rolling back
+# changes which code runs, not what the code already wrote.
+check_environment_kv_isolation() {
+  local shared="demo-env-shared-$$"
+  local preview_only="demo-env-preview-only-$$"
+  local headers="${LOG_DIR}/verify-env-kv.headers"
+
+  env_request "$ENV_NAME" "$headers" "/api/kv/${shared}" \
+    -X PUT --data-binary "written-by-production" > /dev/null
+  if [ "$(http_status "$headers")" != "201" ]; then
+    fail_check "a preview environment cannot see production's KV, or the reverse" \
+      "production could not write ${shared}: HTTP $(http_status "$headers")"
+    return
+  fi
+
+  env_request "$PREVIEW_ENV_NAME" "$headers" "/api/kv/${shared}" \
+    -X PUT --data-binary "written-by-preview" > /dev/null
+  if [ "$(http_status "$headers")" != "201" ]; then
+    fail_check "a preview environment cannot see production's KV, or the reverse" \
+      "the preview could not write ${shared}: HTTP $(http_status "$headers")"
+    return
+  fi
+
+  env_request "$PREVIEW_ENV_NAME" "$headers" "/api/kv/${preview_only}" \
+    -X PUT --data-binary "preview-only" > /dev/null
+
+  local from_production from_preview absent_status
+  from_production=$(env_request "$ENV_NAME" "$headers" "/api/kv/${shared}" \
+    | jq -r '.value // empty' 2>/dev/null || true)
+  from_preview=$(env_request "$PREVIEW_ENV_NAME" "$headers" "/api/kv/${shared}" \
+    | jq -r '.value // empty' 2>/dev/null || true)
+  env_request "$ENV_NAME" "$headers" "/api/kv/${preview_only}" > /dev/null
+  absent_status=$(http_status "$headers")
+
+  if [ "$from_production" = "written-by-production" ] \
+    && [ "$from_preview" = "written-by-preview" ] \
+    && [ "$absent_status" = "404" ]; then
+    pass_check "a preview environment cannot see production's KV, or the reverse" \
+      "both wrote ${shared}: production reads back \"${from_production}\", the preview \"${from_preview}\"; ${preview_only}, written only by the preview, is 404 in production"
+  else
+    fail_check "a preview environment cannot see production's KV, or the reverse" \
+      "production read \"${from_production:-<none>}\", the preview read \"${from_preview:-<none>}\", and the preview-only key answered ${absent_status} in production instead of 404"
+  fi
+}
+
 # Which version an environment is on right now, straight from the control
 # plane rather than inferred from a response.
 deployed_version() {
@@ -1094,6 +1251,9 @@ check_rollback() {
   before=$(app_request "${LOG_DIR}/verify-rollback-before.headers" "/hello/world")
   local label_before
   label_before=$(echo "$before" | jq -r '.label // empty' || true)
+  local asset_before
+  asset_before=$(curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
+    | grep -o 'data-label="[^"]*"' || true)
 
   if ! deploy_version "$APP_V2_ID" "deployed v2 for the rollback check" > /dev/null; then
     fail_check "rollback puts the previous version back" "v2 could not be deployed"
@@ -1131,12 +1291,19 @@ check_rollback() {
   asset_back=$(curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
     | grep -o 'data-label="[^"]*"' || true)
 
-  if [ "$label_back" = "$label_before" ] && [ "$rolled_to" = "$APP_V1_ID" ]; then
+  # Assets ride inside the version bundle (see "asset-first serving" in
+  # implementation-plan.zh.md, principle 5), so a rollback that put the code
+  # back without the asset is exactly the bug this check exists to catch:
+  # deploying v2 must have changed the served asset, and rolling back must
+  # have restored the original one.
+  if [ "$label_back" = "$label_before" ] && [ "$rolled_to" = "$APP_V1_ID" ] \
+    && [ -n "$asset_v2" ] && [ "$asset_v2" != "$asset_before" ] \
+    && [ "$asset_back" = "$asset_before" ]; then
     pass_check "rollback puts the previous version back" \
-      "${label_before} -> ${label_after} -> ${label_back}; the static asset went ${asset_v2} -> ${asset_back} with it"
+      "${label_before} -> ${label_after} -> ${label_back}; the static asset went ${asset_before} -> ${asset_v2} -> ${asset_back} with it"
   else
     fail_check "rollback puts the previous version back" \
-      "expected ${label_before} from ${APP_V1_ID}, got ${label_back} from ${rolled_to}"
+      "expected label ${label_before} and asset ${asset_before} from ${APP_V1_ID}, got label ${label_back} and asset ${asset_back} from ${rolled_to} (v2 served asset ${asset_v2})"
   fi
 }
 
@@ -1150,6 +1317,13 @@ check_telemetry_logs() {
   # Ask for the line the handler itself wrote, not just for "anything from
   # this app": component logs would pass that while the application's own
   # console output never left the node.
+  #
+  # The query names the application, not "demo.production". A node runs
+  # several environments of one application and charges their storage to
+  # separate tenants, but deis-telemetry keeps one application dimension and
+  # carries the environment as a field, so asking for an application answers
+  # with all of its environments - which is the question anybody looking at
+  # logs is asking.
   local out
   out=$(grpcurl -plaintext -max-time 10 \
     -import-path "${ROOT_DIR}/crates/deis-telemetry/proto" \
@@ -1157,13 +1331,17 @@ check_telemetry_logs() {
     -d "{\"app_id\":\"${APP_ID}\",\"contains\":\"greeted\",\"limit\":20}" \
     "127.0.0.1:${DEIS_TELEMETRY_PORT}" deis.telemetry.LogService/Query 2>&1)
 
-  local count sample
+  local count sample environment
   count=$(echo "$out" | jq -r '.entries | length' 2>/dev/null || echo 0)
   sample=$(echo "$out" | jq -r '.entries[0].message // empty' 2>/dev/null || true)
+  environment=$(echo "$out" | jq -r '.entries[0].fields.environment // empty' 2>/dev/null || true)
 
-  if [ "${count:-0}" -gt 0 ] 2>/dev/null; then
+  if [ "${count:-0}" -gt 0 ] 2>/dev/null && [ -n "$environment" ]; then
     pass_check "the app's logs are queryable from deis-telemetry" \
-      "Query(app_id=${APP_ID}, contains=greeted) returned ${count} entries; newest: \"${sample}\""
+      "Query(app_id=${APP_ID}, contains=greeted) returned ${count} entries; newest: \"${sample}\" from environment ${environment}"
+  elif [ "${count:-0}" -gt 0 ] 2>/dev/null; then
+    fail_check "the app's logs are queryable from deis-telemetry" \
+      "${count} entries came back but none says which environment produced it, so two environments' logs are indistinguishable"
   else
     fail_check "the app's logs are queryable from deis-telemetry" \
       "$(echo "$out" | head -n 3 | tr '\n' ' ')"
@@ -1189,6 +1367,9 @@ verify_demo() {
   check_queue_roundtrip
   echo "-- cron --"
   check_cron
+  echo "-- environments --"
+  check_second_environment
+  check_environment_kv_isolation
   echo "-- versions --"
   check_rollback
   echo "-- observability --"

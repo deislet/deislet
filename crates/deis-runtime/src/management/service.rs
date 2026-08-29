@@ -1,12 +1,13 @@
 use std::sync::Arc;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
-use crate::app::{AppConfig as InternalAppConfig, ApplicationManager};
-use crate::app_repo::{AppPackageStatus, AppRepo};
+use crate::app::{AppKey, ApplicationManager};
 use crate::config_store::{ConfigEntry, ConfigStore};
 use crate::deployment::{Applied, DeploymentManager, DeploymentOrder};
 use crate::health::NodeHealth;
+use crate::runtime::metrics::{recorder, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL};
 
 use super::proto::runtime_management_server::RuntimeManagement;
 use super::proto::*;
@@ -15,125 +16,40 @@ use super::proto::*;
 pub struct RuntimeManagementService {
     app_manager: Arc<ApplicationManager>,
     config_store: Arc<ConfigStore>,
-    app_repo: Arc<AppRepo>,
     deployer: Arc<DeploymentManager>,
     health: Arc<NodeHealth>,
     node_id: String,
-}
-
-fn map_proto_limits(
-    limits: Option<super::proto::ResourceLimits>,
-) -> Option<crate::app::types::ResourceLimits> {
-    limits.map(|limits| {
-        let memory_mb = if limits.memory_mb < 0 {
-            warn!("ResourceLimits.memory_mb is negative: {}", limits.memory_mb);
-            0
-        } else {
-            limits.memory_mb as usize
-        };
-
-        let cpu_milli = if limits.cpu_milli < 0 {
-            warn!("ResourceLimits.cpu_milli is negative: {}", limits.cpu_milli);
-            0
-        } else {
-            limits.cpu_milli as u32
-        };
-
-        let resource_table_max = if limits.resource_table_max > 0 {
-            Some(limits.resource_table_max as usize)
-        } else {
-            None
-        };
-
-        let timeout_ms = if limits.timeout_ms < 0 {
-            warn!(
-                "ResourceLimits.timeout_ms is negative: {}",
-                limits.timeout_ms
-            );
-            None
-        } else if limits.timeout_ms > 0 {
-            Some(limits.timeout_ms as u64)
-        } else {
-            None
-        };
-
-        let rate_limit_ops_per_sec = if limits.rate_limit_ops_per_sec < 0.0 {
-            warn!(
-                "ResourceLimits.rate_limit_ops_per_sec is negative: {}",
-                limits.rate_limit_ops_per_sec
-            );
-            None
-        } else if limits.rate_limit_ops_per_sec > 0.0 {
-            Some(limits.rate_limit_ops_per_sec)
-        } else {
-            None
-        };
-
-        crate::app::types::ResourceLimits {
-            memory_mb,
-            cpu_milli,
-            resource_table_max,
-            timeout_ms,
-            rate_limit_ops_per_sec,
-        }
-    })
-}
-
-fn map_proto_config(config: Option<super::proto::AppConfig>) -> InternalAppConfig {
-    match config {
-        Some(config) => {
-            let mut internal = InternalAppConfig {
-                env: config.env,
-                limits: map_proto_limits(config.limits),
-                ..Default::default()
-            };
-
-            if !config.routes.is_empty() {
-                let mut routes = Vec::new();
-                for route in config.routes {
-                    if !route.methods.is_empty() {
-                        warn!(
-                            "Route methods are ignored in current runtime: path={}, methods={:?}",
-                            route.pattern, route.methods
-                        );
-                    }
-                    routes.push(route.pattern);
-                }
-                internal.routes = routes;
-            }
-
-            internal
-        }
-        None => InternalAppConfig::default(),
-    }
+    /// When this node's process started, so `GetStatus` can report an uptime
+    /// the control plane can compare against its own view of the fleet.
+    started_at: Instant,
 }
 
 impl RuntimeManagementService {
     pub fn new(
         app_manager: Arc<ApplicationManager>,
         config_store: Arc<ConfigStore>,
-        app_repo: Arc<AppRepo>,
         deployer: Arc<DeploymentManager>,
         health: Arc<NodeHealth>,
         node_id: String,
+        started_at: Instant,
     ) -> Self {
         Self {
             app_manager,
             config_store,
-            app_repo,
             deployer,
             health,
             node_id,
+            started_at,
         }
     }
 
-    /// The version this node is running for an app, for the "what did you
-    /// keep" half of an `ApplyDeploymentResponse`. Empty when the app is not
-    /// loaded at all, which is what distinguishes "the deploy failed and the
-    /// old version is still up" from "this app is down".
-    fn running_version(&self, app_id: &str) -> String {
+    /// The version this node is running for one environment of an app, for the
+    /// "what did you keep" half of an `ApplyDeploymentResponse`. Empty when
+    /// that environment is not loaded at all, which is what distinguishes "the
+    /// deploy failed and the old version is still up" from "this app is down".
+    fn running_version(&self, key: &AppKey) -> String {
         self.app_manager
-            .installed_version(app_id)
+            .installed_version(key)
             .map(|v| v.version_id)
             .unwrap_or_default()
     }
@@ -227,18 +143,17 @@ impl RuntimeManagement for RuntimeManagementService {
             env: req.env,
         };
 
+        let key = order.key();
+
         match self.deployer.apply(order).await {
             Ok(Applied::Installed { reused_bundle }) => {
                 info!(
-                    app_id = %req.app_id,
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
                     version_id = %req.version_id,
                     reused_bundle,
                     "Deployment applied"
                 );
-                let _ = self
-                    .app_repo
-                    .update_status(&req.app_id, AppPackageStatus::Deployed)
-                    .await;
                 Ok(Response::new(ApplyDeploymentResponse {
                     success: true,
                     message: "Deployment applied".to_string(),
@@ -251,19 +166,16 @@ impl RuntimeManagement for RuntimeManagementService {
                 version_id: req.version_id,
             })),
             Err(e) => {
-                let kept = self.running_version(&req.app_id);
+                let kept = self.running_version(&key);
                 error!(
-                    app_id = %req.app_id,
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
                     version_id = %req.version_id,
                     kept_version = %kept,
                     error = %e,
                     "Deployment rejected; this node did not switch to version {}",
                     req.version_id
                 );
-                let _ = self
-                    .app_repo
-                    .update_status(&req.app_id, AppPackageStatus::Failed)
-                    .await;
                 Ok(Response::new(ApplyDeploymentResponse {
                     success: false,
                     message: e.to_string(),
@@ -273,122 +185,94 @@ impl RuntimeManagement for RuntimeManagementService {
         }
     }
 
+    /// Stop serving an application on this node.
+    ///
+    /// The request names an application and, optionally, one of its
+    /// environments; an empty environment means all of them. The response
+    /// lists what was actually unloaded, so the control plane's report says
+    /// which copies stopped rather than just "done".
     async fn unload_app(
         &self,
         request: Request<UnloadAppRequest>,
     ) -> Result<Response<UnloadAppResponse>, Status> {
         let req = request.into_inner();
-        info!("Uninstalling app: {}", req.app_id);
+        let environment = if req.environment.trim().is_empty() {
+            None
+        } else {
+            Some(req.environment.as_str())
+        };
+        info!(
+            app_id = %req.app_id,
+            environment = %environment.unwrap_or("<all>"),
+            "Uninstalling app"
+        );
+
         // Through the deployer, so the bundle files and the installed-version
         // record go with the isolate; otherwise a restart without a reachable
         // control plane would bring the app back from disk.
-        match self.deployer.unload(&req.app_id).await {
-            Ok(_) => {
-                info!("App {} uninstalled successfully", req.app_id);
+        match self.deployer.unload(&req.app_id, environment).await {
+            Ok(environments) => {
+                let message = if environments.is_empty() {
+                    format!("{} was not running on this node", req.app_id)
+                } else {
+                    format!("Unloaded {}", environments.join(", "))
+                };
+                info!(
+                    app_id = %req.app_id,
+                    environments = ?environments,
+                    "{}",
+                    message
+                );
                 Ok(Response::new(UnloadAppResponse {
                     success: true,
-                    message: "App uninstalled successfully".to_string(),
+                    message,
+                    environments,
                 }))
             }
             Err(e) => {
-                warn!("App {} uninstallation failed: {}", req.app_id, e);
+                warn!(
+                    app_id = %req.app_id,
+                    error = %e,
+                    "App {} was not fully unloaded and may still be serving here",
+                    req.app_id
+                );
                 Ok(Response::new(UnloadAppResponse {
                     success: false,
                     message: format!("App uninstallation failed: {}", e),
+                    environments: Vec::new(),
                 }))
             }
         }
     }
 
+    /// Superseded by `ApplyDeployment`, and refused rather than half-honoured.
+    ///
+    /// This RPC uploaded a zip straight into the node and read its own
+    /// `manifest.json` with a second, incompatible manifest definition, so a
+    /// real deislet bundle (`entry`, not `entry_point`) failed here on a serde
+    /// error while the deployment path accepted it. The bundle format has one
+    /// definition, in `deis-bundle`, and one way onto a node: the control plane
+    /// points at a bundle and this node fetches and verifies it
+    /// (docs/implementation-plan.zh.md section 4).
+    ///
+    /// `Unimplemented` rather than a silent success: a caller that still sends
+    /// a package must see that nothing was deployed.
     async fn update_app(
         &self,
         request: Request<UpdateAppRequest>,
     ) -> Result<Response<UpdateAppResponse>, Status> {
         let req = request.into_inner();
-        info!(
-            "Updating app: {} (package size: {} bytes)",
-            req.app_id,
-            req.package_data.len()
+        warn!(
+            app_id = %req.app_id,
+            package_bytes = req.package_data.len(),
+            "Refusing an UpdateApp package upload: this node only takes deployments through \
+             ApplyDeployment, which points at a verified bundle. Nothing was installed and the \
+             app keeps running whatever it was running"
         );
-
-        let package = match self
-            .app_repo
-            .install_package(req.app_id.clone(), req.package_data)
-            .await
-        {
-            Ok(pkg) => pkg,
-            Err(e) => {
-                error!("Failed to install app package: {}", e);
-                return Ok(Response::new(UpdateAppResponse {
-                    success: false,
-                    message: format!("Failed to install app package: {}", e),
-                }));
-            }
-        };
-
-        let entry_point = &package.manifest.entry_point;
-        let entry_code = match self.app_repo.get_file(&req.app_id, entry_point).await {
-            Ok(Some(bytes)) => match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Entry file is not valid UTF-8: {}", e);
-                    return Ok(Response::new(UpdateAppResponse {
-                        success: false,
-                        message: format!("Entry file is not valid UTF-8: {}", e),
-                    }));
-                }
-            },
-            Ok(None) => {
-                error!("Entry file does not exist: {}", entry_point);
-                return Ok(Response::new(UpdateAppResponse {
-                    success: false,
-                    message: format!("Entry file does not exist: {}", entry_point),
-                }));
-            }
-            Err(e) => {
-                error!("Failed to read entry file: {}", e);
-                return Ok(Response::new(UpdateAppResponse {
-                    success: false,
-                    message: format!("Failed to read entry file: {}", e),
-                }));
-            }
-        };
-
-        let config = map_proto_config(req.config);
-
-        match self
-            .app_manager
-            .update_app(
-                &req.app_id,
-                entry_code,
-                Some(config),
-                Some(entry_point.clone()),
-            )
-            .await
-        {
-            Ok(_) => {
-                info!("App {} updated successfully", req.app_id);
-                let _ = self
-                    .app_repo
-                    .update_status(&req.app_id, AppPackageStatus::Deployed)
-                    .await;
-                Ok(Response::new(UpdateAppResponse {
-                    success: true,
-                    message: "App updated successfully".to_string(),
-                }))
-            }
-            Err(e) => {
-                error!("App {} update failed: {}", req.app_id, e);
-                let _ = self
-                    .app_repo
-                    .update_status(&req.app_id, AppPackageStatus::Failed)
-                    .await;
-                Ok(Response::new(UpdateAppResponse {
-                    success: false,
-                    message: format!("App update failed: {}", e),
-                }))
-            }
-        }
+        Err(Status::unimplemented(
+            "UpdateApp is superseded by ApplyDeployment: upload the version to the control \
+             plane and point an environment at it. This node does not accept package uploads",
+        ))
     }
 
     async fn get_status(
@@ -398,33 +282,44 @@ impl RuntimeManagement for RuntimeManagementService {
         let req = request.into_inner();
         info!("Status query received, include_apps: {}", req.include_apps);
 
-        // Basic Worker information
+        // Node identity
         let node_info = Some(NodeInfo {
             node_id: self.node_id.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime_seconds: 0, // TODO: Calculate actual uptime
+            uptime_seconds: self.started_at.elapsed().as_secs() as i64,
             hostname: hostname::get()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string(),
         });
 
-        // Application list
+        // Application list, one entry per (app, environment) this node runs.
+        //
+        // The counters are the ones the isolates have been recording all
+        // along, read back per environment: a preview's traffic is not added
+        // to production's. They are cumulative since this process started,
+        // which is what `uptime_seconds` above is for.
         let apps = if req.include_apps {
+            let counters = recorder();
             self.app_manager
                 .list_apps()
                 .into_iter()
-                .map(|app| AppStatus {
-                    app_id: app.id,
-                    state: match app.state {
-                        crate::app::AppState::Loading => AppState::Loading as i32,
-                        crate::app::AppState::Running => AppState::Running as i32,
-                        crate::app::AppState::Stopped => AppState::Stopped as i32,
-                        crate::app::AppState::Error => AppState::Error as i32,
-                    },
-                    request_count: 0, // TODO: Real-world statistics
-                    error_count: 0,   // TODO: Real-world statistics
-                    error_message: app.error.unwrap_or_default(),
+                .map(|app| {
+                    let key = AppKey::new(app.id.clone(), app.environment.clone());
+                    let tenant = key.tenant_id();
+                    AppStatus {
+                        app_id: app.id,
+                        environment: app.environment,
+                        state: match app.state {
+                            crate::app::AppState::Loading => AppState::Loading as i32,
+                            crate::app::AppState::Running => AppState::Running as i32,
+                            crate::app::AppState::Stopped => AppState::Stopped as i32,
+                            crate::app::AppState::Error => AppState::Error as i32,
+                        },
+                        request_count: counters.value(REQUESTS_TOTAL, &tenant) as i64,
+                        error_count: counters.value(REQUEST_ERRORS_TOTAL, &tenant) as i64,
+                        error_message: app.error.unwrap_or_default(),
+                    }
                 })
                 .collect()
         } else {
@@ -434,8 +329,9 @@ impl RuntimeManagement for RuntimeManagementService {
         let op_metrics = self.app_manager.get_op_metrics().await;
         let op_metrics = op_metrics
             .into_iter()
-            .map(|(app_id, summary)| AppOpMetrics {
-                app_id,
+            .map(|(key, summary)| AppOpMetrics {
+                app_id: key.app_id().to_string(),
+                environment: key.environment().to_string(),
                 summary: Some(OpMetricsSummary {
                     ops_dispatched_sync: summary.ops_dispatched_sync,
                     ops_dispatched_async: summary.ops_dispatched_async,
@@ -445,12 +341,11 @@ impl RuntimeManagement for RuntimeManagementService {
             })
             .collect::<Vec<_>>();
 
-        // Resource usage (simplified version)
-        let resource_usage = Some(ResourceUsage {
-            cpu_percent: 0.0, // TODO: Actual CPU usage
-            memory_bytes: 0,  // TODO: Actual memory usage
-            goroutines: 0,    // Rust doesn't have goroutines, can return thread count instead
-        });
+        // Left absent, not zeroed. This node does not measure its own CPU or
+        // memory yet, and a `ResourceUsage` full of zeros reads as "this node
+        // is idle" rather than "nobody looked", which is worse than saying
+        // nothing.
+        let resource_usage = None;
 
         Ok(Response::new(GetStatusResponse {
             node_info,
@@ -489,9 +384,19 @@ impl RuntimeManagement for RuntimeManagementService {
             req.ttl_seconds as u64
         };
 
-        info!("Start inspect for app: {}, ttl: {}s", req.app_id, ttl);
+        // The request names no environment, so it means the one a caller means
+        // when it does not say: production. Inspecting a preview needs an
+        // environment on this RPC, which the proto cannot express yet.
+        let key = AppKey::production(req.app_id.clone());
+        info!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            "Start inspect for app: {}, ttl: {}s",
+            key,
+            ttl
+        );
 
-        match self.app_manager.start_inspect(req.app_id.clone(), ttl) {
+        match self.app_manager.start_inspect(key, ttl) {
             Ok((inspect_app_id, token)) => Ok(Response::new(StartInspectResponse {
                 inspect_app_id,
                 token,
@@ -524,43 +429,5 @@ impl RuntimeManagement for RuntimeManagementService {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn proto_limits(timeout_ms: i64, rate_limit_ops_per_sec: f64) -> ResourceLimits {
-        ResourceLimits {
-            memory_mb: 0,
-            cpu_milli: 0,
-            max_concurrency: 0,
-            resource_table_max: 0,
-            timeout_ms,
-            rate_limit_ops_per_sec,
-        }
-    }
-
-    #[test]
-    fn test_map_proto_limits_none_stays_none() {
-        assert!(map_proto_limits(None).is_none());
-    }
-
-    #[test]
-    fn test_map_proto_limits_zero_means_no_override() {
-        let mapped = map_proto_limits(Some(proto_limits(0, 0.0))).unwrap();
-        assert_eq!(mapped.timeout_ms, None);
-        assert_eq!(mapped.rate_limit_ops_per_sec, None);
-    }
-
-    #[test]
-    fn test_map_proto_limits_positive_values_carry_through() {
-        let mapped = map_proto_limits(Some(proto_limits(5000, 250.0))).unwrap();
-        assert_eq!(mapped.timeout_ms, Some(5000));
-        assert_eq!(mapped.rate_limit_ops_per_sec, Some(250.0));
-    }
-
-    #[test]
-    fn test_map_proto_limits_negative_values_are_dropped() {
-        let mapped = map_proto_limits(Some(proto_limits(-1, -1.0))).unwrap();
-        assert_eq!(mapped.timeout_ms, None);
-        assert_eq!(mapped.rate_limit_ops_per_sec, None);
-    }
-}
+#[path = "service_test.rs"]
+mod service_test;

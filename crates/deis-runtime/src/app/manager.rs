@@ -1,5 +1,6 @@
 // Application manager
 
+use super::key::AppKey;
 use super::types::{App, AppConfig, AppState, ResourceLimits};
 use crate::app_repo::AppRepo;
 use crate::assets::AssetBundle;
@@ -18,9 +19,16 @@ use std::time::SystemTime;
 /// for it, and a version that fails to load needs something to fall back to.
 pub struct VersionRecord {
     pub version_id: String,
-    /// Environment *name* (`production` or a preview name), which is what
-    /// application code branches on.
-    pub environment: String,
+    /// Whether the `env` this copy is running with came from the control
+    /// plane.
+    ///
+    /// False means the version was loaded from this node's own disk, where
+    /// secret *values* are deliberately never written: the code is the right
+    /// code but every secret the app declares is missing. Two copies of one
+    /// version are therefore not interchangeable, and this is what stops a
+    /// later delivery of the same version id from being waved through as
+    /// "already running" - see `DeploymentManager::apply_from_assignment`.
+    pub env_confirmed: bool,
     pub entry_point: String,
     /// Bundled module source. Kept so that a failed replacement can put the
     /// previous version back without another download.
@@ -33,7 +41,7 @@ impl std::fmt::Debug for VersionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VersionRecord")
             .field("version_id", &self.version_id)
-            .field("environment", &self.environment)
+            .field("env_confirmed", &self.env_confirmed)
             .field("entry_point", &self.entry_point)
             .field("assets", &self.assets)
             .finish()
@@ -42,33 +50,72 @@ impl std::fmt::Debug for VersionRecord {
 
 /// Everything needed to put one version of one app on this node.
 pub struct VersionInstall {
-    pub app_id: String,
+    /// Which application *and which environment of it*: the two are one key,
+    /// so a preview cannot land in production's slot.
+    pub key: AppKey,
     pub version_id: String,
-    pub environment: String,
     pub entry_point: String,
     pub code: String,
     /// Carries the decrypted `env`; see [`AppConfig`] for why it neither
     /// serialises nor prints its values.
     pub config: AppConfig,
+    /// See [`VersionRecord::env_confirmed`]. False for a version recovered
+    /// from local disk.
+    pub env_confirmed: bool,
     pub assets: Arc<AssetBundle>,
 }
 
-/// What the node is running for one app, in the terms the control plane uses.
+/// What the node is running for one (app, environment) pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledVersion {
     pub version_id: String,
-    pub environment: String,
+    /// See [`VersionRecord::env_confirmed`].
+    pub env_confirmed: bool,
 }
+
+/// Why a scheduled run did not complete.
+///
+/// The two cases look the same from the outside and mean opposite things to
+/// whoever fired the tick, which is why they are separate variants rather than
+/// one error string: one asks for another node, the other asks for no node at
+/// all. See `crate::trigger`.
+#[derive(Debug)]
+pub enum ScheduledFailure {
+    /// This node never entered the application's code: it does not have this
+    /// version of this environment loaded. Another node can still run the
+    /// tick, and nothing has happened here that a second attempt would repeat.
+    NotRunnableHere(String),
+    /// The application's own scheduled handler was entered and did not
+    /// finish - it threw, it timed out, or the bundle exports no scheduled
+    /// handler at all. The same code on another node fails the same way, and
+    /// whatever the handler did before it failed (a queue send, a write) has
+    /// already happened once.
+    HandlerFailed(String),
+}
+
+impl std::fmt::Display for ScheduledFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRunnableHere(m) | Self::HandlerFailed(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for ScheduledFailure {}
 
 /// Application manager
 pub struct ApplicationManager {
-    apps: DashMap<String, App>,
-    /// Deployed versions, keyed by app id. Only apps installed from a bundle
-    /// appear here; the built-in `_system` app has no version.
-    versions: DashMap<String, Arc<VersionRecord>>,
+    /// Loaded applications, keyed by (app, environment). Both maps are keyed
+    /// the same way on purpose: an application whose preview and production
+    /// shared one entry would have one of them silently overwrite the other's
+    /// version, bindings and secrets.
+    apps: DashMap<AppKey, App>,
+    /// Deployed versions. Only apps installed from a bundle appear here; the
+    /// built-in `_system` app has no version.
+    versions: DashMap<AppKey, Arc<VersionRecord>>,
     runtime_pool: Arc<RuntimePool>,
-    // Debug sessions: app_id -> (token, expires_at)
-    inspect_sessions: DashMap<String, (String, SystemTime)>,
+    /// Debug sessions: (app, environment) -> (token, expires_at)
+    inspect_sessions: DashMap<AppKey, (String, SystemTime)>,
     // Platform-wide defaults for per-app execution limits (timeout, rate limit).
     // An app's own `ResourceLimits` may override either value; see
     // `effective_limits`.
@@ -118,15 +165,16 @@ impl ApplicationManager {
     /// `ResourceLimits` override where present, the platform default
     /// otherwise. Logs at info level whenever an app overrides a default, so
     /// operators can see which apps deviate from the platform baseline.
-    fn effective_limits(&self, app_id: &str, limits: Option<&ResourceLimits>) -> ExecutionLimits {
+    fn effective_limits(&self, key: &AppKey, limits: Option<&ResourceLimits>) -> ExecutionLimits {
         let timeout_override = limits.and_then(|l| l.timeout_ms);
         let timeout_ms = timeout_override.unwrap_or(self.default_limits.timeout_ms);
         if let Some(overridden) = timeout_override {
             tracing::info!(
                 target: "app",
-                app_id = %app_id,
+                app_id = %key.app_id(),
+                environment = %key.environment(),
                 "App {} overrides default execution timeout: {}ms (platform default {}ms)",
-                app_id,
+                key,
                 overridden,
                 self.default_limits.timeout_ms
             );
@@ -138,9 +186,10 @@ impl ApplicationManager {
         if let Some(overridden) = rate_limit_override {
             tracing::info!(
                 target: "app",
-                app_id = %app_id,
+                app_id = %key.app_id(),
+                environment = %key.environment(),
                 "App {} overrides default rate limit: {} ops/sec (platform default {} ops/sec)",
-                app_id,
+                key,
                 overridden,
                 self.default_limits.rate_limit_ops_per_sec
             );
@@ -155,22 +204,23 @@ impl ApplicationManager {
     /// Load application
     pub async fn load_app(
         &self,
-        id: String,
+        key: AppKey,
         code: String,
         config: AppConfig,
         entry_point: Option<String>,
     ) -> Result<()> {
         // Check if application already exists
-        if self.apps.contains_key(&id) {
-            return Err(anyhow!("App {} already exists", id));
+        if self.apps.contains_key(&key) {
+            return Err(anyhow!("App {} already exists", key));
         }
 
-        tracing::info!("Loading app: {}", id);
+        tracing::info!("Loading app: {}", key);
 
         // Create application information
         let now = SystemTime::now();
         let mut app_info = App {
-            id: id.clone(),
+            id: key.app_id().to_string(),
+            environment: key.environment().to_string(),
             state: AppState::Loading,
             config: config.clone(),
             created_at: now,
@@ -186,21 +236,25 @@ impl ApplicationManager {
             memory_limit_mb: config.limits.as_ref().map(|l| l.memory_mb),
             resource_table_max: config.limits.as_ref().and_then(|l| l.resource_table_max),
             route_patterns: config.routes.clone(),
-            limits: self.effective_limits(&id, config.limits.as_ref()),
+            limits: self.effective_limits(&key, config.limits.as_ref()),
         };
-        match self.runtime_pool.load_app(id.clone(), code, spec).await {
+        match self
+            .runtime_pool
+            .load_app(key.tenant_id(), code, spec)
+            .await
+        {
             Ok(()) => {
                 app_info.state = AppState::Running;
                 app_info.updated_at = SystemTime::now();
-                self.apps.insert(id.clone(), app_info);
-                tracing::info!("App {} loaded successfully", id);
+                self.apps.insert(key.clone(), app_info);
+                tracing::info!("App {} loaded successfully", key);
                 Ok(())
             }
             Err(e) => {
                 app_info.state = AppState::Error;
                 app_info.error = Some(e.to_string());
                 app_info.updated_at = SystemTime::now();
-                tracing::error!("Failed to load app {}: {}", id, e);
+                tracing::error!("Failed to load app {}: {}", key, e);
                 Err(e)
             }
         }
@@ -208,6 +262,10 @@ impl ApplicationManager {
 
     /// Put one version of one app on this node, replacing whatever it was
     /// running.
+    ///
+    /// "Whatever it was running" is per environment: installing a preview
+    /// leaves production exactly where it was, because the two are separate
+    /// keys down to the isolate.
     ///
     /// The caller has already proven the bundle: digest checked, manifest
     /// parsed, entry point present, assets read. What is left is the one step
@@ -221,55 +279,55 @@ impl ApplicationManager {
     /// the isolate host itself is in trouble, not the deployment.
     pub async fn install_version(&self, install: VersionInstall) -> Result<()> {
         let VersionInstall {
-            app_id,
+            key,
             version_id,
-            environment,
             entry_point,
             code,
             config,
+            env_confirmed,
             assets,
         } = install;
 
-        let previous = self
-            .versions
-            .get(&app_id)
-            .map(|entry| entry.value().clone());
-        let was_loaded = self.apps.contains_key(&app_id);
+        let previous = self.versions.get(&key).map(|entry| entry.value().clone());
+        let was_loaded = self.apps.contains_key(&key);
 
         if was_loaded {
-            if let Err(e) = self.runtime_pool.unload_app(&app_id).await {
+            if let Err(e) = self.runtime_pool.unload_app(&key.tenant_id()).await {
                 // Nothing has been swapped yet, so the app keeps serving the
                 // version it already had.
                 tracing::error!(
-                    app_id = %app_id,
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
                     version_id = %version_id,
                     error = %e,
                     "Could not retire the running isolate, so version {} was not \
-                     installed; the app keeps serving the version it was already on",
-                    version_id
+                     installed; {} keeps serving the version it was already on",
+                    version_id,
+                    key
                 );
                 return Err(anyhow!(
-                    "could not unload the running version of {app_id}: {e}"
+                    "could not unload the running version of {key}: {e}"
                 ));
             }
         }
 
         let record = Arc::new(VersionRecord {
             version_id: version_id.clone(),
-            environment: environment.clone(),
+            env_confirmed,
             entry_point: entry_point.clone(),
             code: code.clone(),
             config: config.clone(),
             assets: assets.clone(),
         });
 
-        match self.load_record(&app_id, &record).await {
+        match self.load_record(&key, &record).await {
             Ok(()) => {
                 let now = SystemTime::now();
                 self.apps.insert(
-                    app_id.clone(),
+                    key.clone(),
                     App {
-                        id: app_id.clone(),
+                        id: key.app_id().to_string(),
+                        environment: key.environment().to_string(),
                         state: AppState::Running,
                         config,
                         created_at: now,
@@ -277,30 +335,31 @@ impl ApplicationManager {
                         error: None,
                     },
                 );
-                self.versions.insert(app_id.clone(), record);
+                self.versions.insert(key.clone(), record);
                 tracing::info!(
-                    app_id = %app_id,
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
                     version_id = %version_id,
-                    environment = %environment,
+                    env_confirmed,
                     assets = assets.len(),
                     asset_bytes = assets.total_bytes(),
                     "App {} is now serving version {} of environment {}",
-                    app_id,
+                    key.app_id(),
                     version_id,
-                    environment
+                    key.environment()
                 );
                 Ok(())
             }
             Err(e) => {
-                self.apps.remove(&app_id);
-                self.restore(&app_id, previous, &version_id, &e).await;
+                self.apps.remove(&key);
+                self.restore(&key, previous, &version_id, &e).await;
                 Err(e)
             }
         }
     }
 
     /// Load one version's code into the pool.
-    async fn load_record(&self, app_id: &str, record: &VersionRecord) -> Result<()> {
+    async fn load_record(&self, key: &AppKey, record: &VersionRecord) -> Result<()> {
         let spec = IsolateSpec {
             entry_point: Some(record.entry_point.clone()),
             env: record.config.env.clone(),
@@ -312,43 +371,45 @@ impl ApplicationManager {
                 .as_ref()
                 .and_then(|l| l.resource_table_max),
             route_patterns: record.config.routes.clone(),
-            limits: self.effective_limits(app_id, record.config.limits.as_ref()),
+            limits: self.effective_limits(key, record.config.limits.as_ref()),
         };
         self.runtime_pool
-            .load_app(app_id.to_string(), record.code.clone(), spec)
+            .load_app(key.tenant_id(), record.code.clone(), spec)
             .await
     }
 
     /// Put the previous version back after a failed install.
     async fn restore(
         &self,
-        app_id: &str,
+        key: &AppKey,
         previous: Option<Arc<VersionRecord>>,
         attempted_version: &str,
         cause: &anyhow::Error,
     ) {
         let Some(previous) = previous else {
-            self.versions.remove(app_id);
+            self.versions.remove(key);
             tracing::error!(
-                app_id = %app_id,
+                app_id = %key.app_id(),
+                environment = %key.environment(),
                 version_id = %attempted_version,
                 error = %cause,
-                "Version {} of {} would not load and the app had no earlier version to \
+                "Version {} of {} would not load and it had no earlier version to \
                  fall back to; it is not serving and requests for it will fail until a \
                  working version is deployed",
                 attempted_version,
-                app_id
+                key
             );
             return;
         };
 
-        match self.load_record(app_id, &previous).await {
+        match self.load_record(key, &previous).await {
             Ok(()) => {
                 let now = SystemTime::now();
                 self.apps.insert(
-                    app_id.to_string(),
+                    key.clone(),
                     App {
-                        id: app_id.to_string(),
+                        id: key.app_id().to_string(),
+                        environment: key.environment().to_string(),
                         state: AppState::Running,
                         config: previous.config.clone(),
                         created_at: now,
@@ -356,23 +417,25 @@ impl ApplicationManager {
                         error: None,
                     },
                 );
-                self.versions.insert(app_id.to_string(), previous.clone());
+                self.versions.insert(key.clone(), previous.clone());
                 tracing::warn!(
-                    app_id = %app_id,
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
                     version_id = %attempted_version,
                     restored_version = %previous.version_id,
                     error = %cause,
                     "Version {} of {} would not load; the node put version {} back and \
                      is serving it, so traffic is unaffected but the deployment did not take",
                     attempted_version,
-                    app_id,
+                    key,
                     previous.version_id
                 );
             }
             Err(restore_error) => {
-                self.versions.remove(app_id);
+                self.versions.remove(key);
                 tracing::error!(
-                    app_id = %app_id,
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
                     version_id = %attempted_version,
                     restored_version = %previous.version_id,
                     error = %cause,
@@ -381,8 +444,8 @@ impl ApplicationManager {
                      replaced; {} is not serving on this node and needs a working version \
                      deployed or the node restarted",
                     attempted_version,
-                    app_id,
-                    app_id
+                    key,
+                    key
                 );
             }
         }
@@ -390,20 +453,20 @@ impl ApplicationManager {
 
     /// The static files of the version currently running, for the HTTP entry
     /// to consult before anything reaches an isolate.
-    pub fn assets(&self, app_id: &str) -> Option<Arc<AssetBundle>> {
-        self.versions.get(app_id).map(|e| e.assets.clone())
+    pub fn assets(&self, key: &AppKey) -> Option<Arc<AssetBundle>> {
+        self.versions.get(key).map(|e| e.assets.clone())
     }
 
-    /// Which version of which environment this node runs for an app.
-    pub fn installed_version(&self, app_id: &str) -> Option<InstalledVersion> {
-        self.versions.get(app_id).map(|e| InstalledVersion {
+    /// Which version this node runs for one environment of one app.
+    pub fn installed_version(&self, key: &AppKey) -> Option<InstalledVersion> {
+        self.versions.get(key).map(|e| InstalledVersion {
             version_id: e.version_id.clone(),
-            environment: e.environment.clone(),
+            env_confirmed: e.env_confirmed,
         })
     }
 
-    /// Every app with a deployed version, and what it is running.
-    pub fn installed_versions(&self) -> Vec<(String, InstalledVersion)> {
+    /// Every (app, environment) with a deployed version, and what it runs.
+    pub fn installed_versions(&self) -> Vec<(AppKey, InstalledVersion)> {
         self.versions
             .iter()
             .map(|e| {
@@ -411,37 +474,56 @@ impl ApplicationManager {
                     e.key().clone(),
                     InstalledVersion {
                         version_id: e.version_id.clone(),
-                        environment: e.environment.clone(),
+                        env_confirmed: e.env_confirmed,
                     },
                 )
             })
             .collect()
     }
 
-    pub fn is_loaded(&self, app_id: &str) -> bool {
-        self.apps.contains_key(app_id)
+    /// Every environment of one app that this node currently has loaded.
+    ///
+    /// Used by callers that only know the application - the management API
+    /// unloads by app id, and the trigger service is told an app id with no
+    /// environment - so they can say out loud which environments they mean
+    /// instead of silently acting on one of them.
+    pub fn environments_of(&self, app_id: &str) -> Vec<AppKey> {
+        let mut keys: Vec<AppKey> = self
+            .apps
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|key| key.app_id() == app_id)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    pub fn is_loaded(&self, key: &AppKey) -> bool {
+        self.apps.contains_key(key)
     }
 
     /// Start debug session
-    pub fn start_inspect(&self, app_id: String, ttl_seconds: u64) -> Result<(String, String)> {
+    pub fn start_inspect(&self, key: AppKey, ttl_seconds: u64) -> Result<(String, String)> {
         // Check if application exists
-        if !self.apps.contains_key(&app_id) {
-            return Err(anyhow!("App {} not found", app_id));
+        if !self.apps.contains_key(&key) {
+            return Err(anyhow!("App {} not found", key));
         }
 
         // Generate token
         let token = uuid::Uuid::new_v4().to_string();
         let expires_at = SystemTime::now() + std::time::Duration::from_secs(ttl_seconds);
 
-        let inspect_app_id = format!("_inspect:{}", app_id);
+        let inspect_app_id = format!("_inspect:{}", key.app_id());
 
         // Store session
         self.inspect_sessions
-            .insert(app_id.clone(), (token.clone(), expires_at));
+            .insert(key.clone(), (token.clone(), expires_at));
 
         tracing::info!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
             "Started debug session for app {}: token={}, ttl={}s",
-            app_id,
+            key,
             token,
             ttl_seconds
         );
@@ -450,8 +532,8 @@ impl ApplicationManager {
     }
 
     /// Validate debug token
-    pub fn validate_inspect_token(&self, app_id: &str, token: &str) -> bool {
-        if let Some(entry) = self.inspect_sessions.get(app_id) {
+    pub fn validate_inspect_token(&self, key: &AppKey, token: &str) -> bool {
+        if let Some(entry) = self.inspect_sessions.get(key) {
             let (stored_token, expires_at) = entry.value();
             if stored_token == token && SystemTime::now() < *expires_at {
                 return true;
@@ -463,89 +545,39 @@ impl ApplicationManager {
     /// Connect debugger
     pub async fn connect_inspector(
         &self,
-        app_id: &str,
+        key: &AppKey,
     ) -> Result<(
         tokio::sync::mpsc::UnboundedSender<String>,
         tokio::sync::mpsc::UnboundedReceiver<String>,
     )> {
-        self.runtime_pool.connect_inspector(app_id).await
+        self.runtime_pool.connect_inspector(&key.tenant_id()).await
     }
 
-    /// Unload application
-    pub async fn unload_app(&self, id: &str) -> Result<()> {
-        tracing::info!("Unloading app: {}", id);
+    /// Unload one environment of one application.
+    pub async fn unload_app(&self, key: &AppKey) -> Result<()> {
+        tracing::info!("Unloading app: {}", key);
 
         // Unload from runtime pool
-        self.runtime_pool.unload_app(id).await?;
+        self.runtime_pool.unload_app(&key.tenant_id()).await?;
 
         // Remove application information. The version record goes with it: its
         // asset index must not answer requests for an app that is no longer
         // loaded.
-        self.versions.remove(id);
-        match self.apps.remove(id) {
+        self.versions.remove(key);
+        self.inspect_sessions.remove(key);
+        match self.apps.remove(key) {
             Some(_) => {
-                tracing::info!("App {} unloaded successfully", id);
+                tracing::info!("App {} unloaded successfully", key);
                 Ok(())
             }
-            None => Err(anyhow!("App {} not found", id)),
+            None => Err(anyhow!("App {} not found", key)),
         }
-    }
-
-    /// Update application
-    pub async fn update_app(
-        &self,
-        id: &str,
-        code: String,
-        config: Option<AppConfig>,
-        entry_point: Option<String>,
-    ) -> Result<()> {
-        tracing::info!("Updating app: {}", id);
-
-        let entry = self
-            .apps
-            .get(id)
-            .ok_or_else(|| anyhow!("App {} not found", id))?;
-
-        // Get current configuration
-        let current_config = config.unwrap_or_else(|| entry.config.clone());
-        drop(entry);
-
-        // Unload old version from runtime pool
-        self.runtime_pool.unload_app(id).await?;
-
-        // Load new version
-        let spec = IsolateSpec {
-            entry_point,
-            env: current_config.env.clone(),
-            permissions: current_config.permissions.clone(),
-            memory_limit_mb: current_config.limits.as_ref().map(|l| l.memory_mb),
-            resource_table_max: current_config
-                .limits
-                .as_ref()
-                .and_then(|l| l.resource_table_max),
-            route_patterns: current_config.routes.clone(),
-            limits: self.effective_limits(id, current_config.limits.as_ref()),
-        };
-        self.runtime_pool
-            .load_app(id.to_string(), code, spec)
-            .await?;
-
-        // Update application information
-        if let Some(mut entry) = self.apps.get_mut(id) {
-            entry.state = AppState::Running;
-            entry.config = current_config;
-            entry.updated_at = SystemTime::now();
-            entry.error = None;
-        }
-
-        tracing::info!("App {} updated successfully", id);
-        Ok(())
     }
 
     /// Execute application
     pub async fn execute_app(
         &self,
-        id: &str,
+        key: &AppKey,
         url: String,
         method: String,
         headers: std::collections::HashMap<String, String>,
@@ -555,24 +587,11 @@ impl ApplicationManager {
         std::collections::HashMap<String, String>,
         Option<String>,
     )> {
-        let entry = self
-            .apps
-            .get(id)
-            .ok_or_else(|| anyhow!("App {} not found", id))?;
-
-        if entry.state != AppState::Running {
-            return Err(anyhow!(
-                "App {} is not running (state: {:?})",
-                id,
-                entry.state
-            ));
-        }
-
-        drop(entry);
+        self.require_running(key)?;
 
         // Execute request via runtime pool
         self.runtime_pool
-            .execute_request(id, url, method, headers, body)
+            .execute_request(&key.tenant_id(), url, method, headers, body)
             .await
     }
 
@@ -584,66 +603,63 @@ impl ApplicationManager {
     /// the caller acknowledges or hands back.
     pub async fn execute_queue_batch(
         &self,
-        id: &str,
+        key: &AppKey,
         queue: String,
         messages: Vec<crate::runtime::LeasedMessage>,
     ) -> Result<crate::runtime::BatchOutcome> {
-        let entry = self
-            .apps
-            .get(id)
-            .ok_or_else(|| anyhow!("App {} not found", id))?;
-
-        if entry.state != AppState::Running {
-            return Err(anyhow!(
-                "App {} is not running (state: {:?})",
-                id,
-                entry.state
-            ));
-        }
-
-        drop(entry);
+        self.require_running(key)?;
 
         self.runtime_pool
-            .execute_queue_batch(id, queue, messages)
+            .execute_queue_batch(&key.tenant_id(), queue, messages)
             .await
     }
 
     /// Run one application's scheduled handler for one due cron expression.
     ///
-    /// The schedule lives in the control plane, which picks a single healthy
-    /// node per tick (architecture principle 6). An app that is not running
-    /// here is an error the caller has to see, so the control plane can try
-    /// another node instead of counting the tick as done.
+    /// The schedule lives in the control plane, which picks a single node per
+    /// tick (architecture principle 6), so the answer has to say *which* kind
+    /// of failure happened: a node that cannot run the app at all should be
+    /// replaced by another node, while a handler that threw has already had
+    /// whatever effect it had and must not be run again elsewhere. Everything
+    /// from the isolate inwards counts as the second kind, because by then the
+    /// application's own code has been entered.
     pub async fn execute_scheduled(
         &self,
-        id: &str,
+        key: &AppKey,
         cron: String,
         scheduled_time_ms: i64,
-    ) -> Result<()> {
+    ) -> Result<(), ScheduledFailure> {
+        self.require_running(key)
+            .map_err(|e| ScheduledFailure::NotRunnableHere(e.to_string()))?;
+
+        self.runtime_pool
+            .execute_scheduled(&key.tenant_id(), cron, scheduled_time_ms)
+            .await
+            .map_err(|e| ScheduledFailure::HandlerFailed(e.to_string()))
+    }
+
+    /// Refuse work for an app this node is not serving.
+    fn require_running(&self, key: &AppKey) -> Result<()> {
         let entry = self
             .apps
-            .get(id)
-            .ok_or_else(|| anyhow!("App {} not found", id))?;
+            .get(key)
+            .ok_or_else(|| anyhow!("App {} not found", key))?;
 
         if entry.state != AppState::Running {
             return Err(anyhow!(
                 "App {} is not running (state: {:?})",
-                id,
+                key,
                 entry.state
             ));
         }
 
-        drop(entry);
-
-        self.runtime_pool
-            .execute_scheduled(id, cron, scheduled_time_ms)
-            .await
+        Ok(())
     }
 
     /// Get application information
     #[allow(dead_code)]
-    pub fn get_app(&self, id: &str) -> Option<App> {
-        self.apps.get(id).map(|entry| entry.clone())
+    pub fn get_app(&self, key: &AppKey) -> Option<App> {
+        self.apps.get(key).map(|entry| entry.clone())
     }
 
     /// List all applications
@@ -676,21 +692,24 @@ impl ApplicationManager {
         stats
     }
 
-    /// Get aggregate OpMetrics for each application
-    pub async fn get_op_metrics(&self) -> Vec<(String, OpMetricsSummary)> {
-        let app_ids: Vec<String> = self.apps.iter().map(|entry| entry.key().clone()).collect();
+    /// Get aggregate OpMetrics for each (app, environment) this node runs.
+    pub async fn get_op_metrics(&self) -> Vec<(AppKey, OpMetricsSummary)> {
+        let keys: Vec<AppKey> = self.apps.iter().map(|entry| entry.key().clone()).collect();
         let mut results = Vec::new();
 
-        for app_id in app_ids {
-            match self.runtime_pool.get_op_metrics(&app_id).await {
+        for key in keys {
+            match self.runtime_pool.get_op_metrics(&key.tenant_id()).await {
                 Ok(summary) => {
-                    results.push((app_id, summary));
+                    results.push((key, summary));
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to get OpMetrics summary: app_id={}, error={}",
-                        app_id,
-                        e
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        error = %e,
+                        "Failed to get OpMetrics summary for {}; its op counts are missing from \
+                         this status answer",
+                        key
                     );
                 }
             }
@@ -704,45 +723,45 @@ impl ApplicationManager {
     /// Establish bidirectional message channel between Gateway and JavaScript WebSocketServer
     ///
     /// # Parameters
-    /// - app_id: Application ID
+    /// - key: which environment of which application
     /// - ws_id: WebSocket connection ID
     /// - js_to_client_tx: Channel for JavaScript to send messages to the client
     pub async fn register_ws_connection(
         &self,
-        app_id: &str,
+        key: &AppKey,
         ws_id: String,
         js_to_client_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::WsServerMessage>,
     ) -> Result<()> {
         self.runtime_pool
-            .register_ws_connection(app_id, ws_id, js_to_client_tx)
+            .register_ws_connection(&key.tenant_id(), ws_id, js_to_client_tx)
             .await
     }
 
     /// Send WebSocket message to JavaScript
     ///
     /// # Parameters
-    /// - app_id: Application ID
+    /// - key: which environment of which application
     /// - ws_id: WebSocket connection ID
     /// - message: Message content
     pub async fn send_ws_message(
         &self,
-        app_id: &str,
+        key: &AppKey,
         ws_id: String,
         message: String,
     ) -> Result<()> {
         self.runtime_pool
-            .send_ws_message(app_id, ws_id, message)
+            .send_ws_message(&key.tenant_id(), ws_id, message)
             .await
     }
 
     /// Unregister WebSocket connection
     ///
     /// # Parameters
-    /// - app_id: Application ID
+    /// - key: which environment of which application
     /// - ws_id: WebSocket connection ID
-    pub async fn unregister_ws_connection(&self, app_id: &str, ws_id: String) -> Result<()> {
+    pub async fn unregister_ws_connection(&self, key: &AppKey, ws_id: String) -> Result<()> {
         self.runtime_pool
-            .unregister_ws_connection(app_id, ws_id)
+            .unregister_ws_connection(&key.tenant_id(), ws_id)
             .await
     }
 }

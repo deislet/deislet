@@ -29,7 +29,9 @@ edge-canon 规定「文件树就是路由表」。函数根目录下的路径决
 
 模式写进 `manifest.json` 的 `routes[].pattern`，与 `management.proto` 的 `RouteRule.pattern` 是同一种写法。
 
-**匹配顺序按「谁更具体谁在前」排**：先精确段，再 `:name`，通配捕获永远垫底——否则 `/api/*` 会把它下面所有具体路由都吞掉。排序在构建期完成，不依赖目录遍历顺序，因为遍历顺序换台机器就会变，而包的 sha256 是版本身份的一部分。
+**匹配顺序按「谁更具体谁在前」排**，生成的匹配器取第一条能对上的。比较规则是逐段看：字面量赢 `:name`，`:name` 赢通配；只要模式里带通配捕获，它就永远垫底，不管别的段有多具体——否则 `/api/*` 会把它下面所有具体路由都吞掉。形状上分不出胜负时（比如 `/:org/settings` 和 `/:user/settings`）拿模式文本决胜，所以排序不依赖目录遍历顺序——遍历顺序换台机器就会变，而包的 sha256 是版本身份的一部分。
+
+这套规则是 `deis_bundle::sort_by_specificity`，deis-runtime 给 manifest 里的模式排名次用的也是它。写成两份的后果是：请求跑到的 handler 和构建期排出来的表指的不是同一个，而唯一的症状是「某个 handler 就是不执行」，没有任何报错。
 
 `methods` 一律是空数组，意思是「任意方法」。edge-canon 的 handler 自己判断方法，文件树里没有表达方法的位置。
 
@@ -38,7 +40,7 @@ edge-canon 规定「文件树就是路由表」。函数根目录下的路径决
 deis-runtime 只认一个默认导出，每个请求调一次，并且**它自己构造 context**（`request` / `env` / `services` / `waitUntil`）——它不知道一个应用里有多个 handler。所以生成的入口模块负责：
 
 1. 按路径挑中 handler；
-2. 自己解析占位符填 `context.params`（运行时那侧的匹配器目前只认精确段和 `:name`，`/api/*` 到它手里会得到空 params）；
+2. 自己解析占位符填 `context.params`：运行时那侧匹配的是同一批模式、通配段也认，但 manifest 里的模式只留一个 `*`，所以它能保证的键只有 `params['*']`；入口模块还知道这个文件写的是 `[[catch]]`，会把捕获到的尾巴再按这个名字放一份；
 3. 补上 edge-canon 约定的便利字段：`path`、`method`、`query`、`cookies`、`log`；
 4. 谁都没匹配上时返回 404。
 
@@ -74,11 +76,16 @@ deis-runtime 只认一个默认导出，每个请求调一次，并且**它自�
 
 ## 能力矩阵是「今天真能跑什么」
 
-`Platform::Deislet` 的能力表按当前代码填，不按规划填。今天扩展能力里只有 **WebSockets** 是真的（deis-runtime 有服务端 socket 桥接）。
+`Platform::Deislet` 的能力表按当前代码填，不按规划填。扩展能力里下面这些今天都是通的：
 
-其余分两类，构建时的待遇不一样：
+- **SQL Database**、**Object Storage**——服务端在 deis-store，deis-runtime 按 manifest 的 `services` 构造客户端，`context.services.database` 和 `context.services.blob` 能真的打到服务端。
+- **Queues**——deis-queue 是独立进程，`send` 直接进队列；节点按 manifest 里声明的消费者逐个起轮询。
+- **Cron**——控制面按 (app_id, environment) 维护调度，到点调节点，节点执行应用的 `scheduled` 导出。
+- **WebSockets**——deis-runtime 有服务端 socket 桥接，deis-proxy 那侧走 upgrade 隧道；但两头从没端到端连起来测过，这条在 `docs/architecture.zh.md` 第 11 节里记着。
 
-- **暂缺**（SQL Database、Object Storage、Queues、Cron）——平台规格里有、代码还没接上。构建**只警告不拦**：声明本身该留在 manifest 里让控制面记下，绑定接上之后应用不用改一行。警告里会写清楚今天调它会发生什么，例如「`context.services.database` 调用会以 "Database service not available" 失败」。
+剩下的不支持分两类，构建时的待遇不一样：
+
+- **暂缺**——平台规格里有、代码还没接上。构建**只警告不拦**：声明本身该留在 manifest 里让控制面记下，绑定接上之后应用不用改一行。**今天这一类是空的**；机制留着，是给下一个半成品服务用的。
 - **不会有**（Durable Objects、Node Runtime、SSR/ISR、Workers AI、BroadcastChannel）——按平台形态就不存在，构建直接失败。
 
 ## 可复现

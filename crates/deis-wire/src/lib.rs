@@ -21,7 +21,10 @@ pub use config::{ControlConfig, NodeInfo, NodeRole};
 pub use error::{SdkResult, WireError};
 
 // Re-export the cross-component conventions
-pub use conventions::{APP_ID_HEADER, MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES};
+pub use conventions::{
+    APP_ID_HEADER, DEFAULT_ENVIRONMENT, ENVIRONMENT_HEADER, MAX_GRPC_MESSAGE_BYTES,
+    STREAM_CHUNK_BYTES, TENANT_HEADER, split_tenant, tenant_id,
+};
 
 // Re-export models
 pub use models::{AuthData, HeartbeatRequest, InstanceDetails, InstanceStatus, RegisterRequest};

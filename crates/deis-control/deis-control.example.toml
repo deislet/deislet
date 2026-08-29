@@ -10,7 +10,24 @@ port = 8080
 heartbeat_interval = 30
 heartbeat_timeout = 90
 
-# Node pre-shared keys (used for gRPC authentication)
+# Node pre-shared keys.
+#
+# One credential, used on both channels a runtime node talks to:
+#   - the gRPC registration handshake, and
+#   - the two HTTP endpoints that exist for nodes,
+#     GET /api/nodes/{node_id}/assignments and the bundle download.
+#
+# The assignment list answers with every environment's DECRYPTED secrets,
+# because a node that restarts has to come back with the environment it
+# had. So those endpoints authenticate with this list whatever
+# api_auth_enabled says below, and an API key is not accepted on them.
+#
+# Leave this empty and there is no node credential at all: the endpoints
+# still answer (nobody could authenticate anyway), but the assignment list
+# then leaves out every application that has a secret, and says so in an
+# ERROR line. Set a key here and the same value on every node.
+#
+#   openssl rand -hex 32
 node_preshared_keys = [
     "your-node-psk-here-change-this-in-production"
 ]
@@ -20,7 +37,13 @@ node_preshared_keys = [
 # ========================================
 
 # Enable HTTP API authentication (default: false)
-# When set to true, all API endpoints (except /health and /api/metrics) require an API Key
+#
+# Covers the dashboard and the human API: with it on, every endpoint except
+# /health and /api/metrics requires one of the api_keys below.
+#
+# It does NOT cover the two node endpoints, which always use
+# node_preshared_keys - see above. Turning this off makes a dashboard
+# convenient; it must never be able to publish the platform's secrets.
 api_auth_enabled = true
 
 # API Keys list
@@ -80,16 +103,28 @@ bundle_dir = "data/bundles"
 # cron_tick_seconds = 60
 
 # ========================================
-# TLS configuration (optional)
+# TLS / HTTPS configuration (optional)
 # ========================================
 
-[tls]
-# Enable TLS for the HTTP API
-api_enabled = false
-
-# TLS certificate paths
-# cert_path = "/path/to/cert.pem"
-# key_path = "/path/to/key.pem"
+# All four fields go together: uncomment the section as a whole. cert_path
+# and key_path have no defaults, so a [tls] section without them stops the
+# control plane from reading this file at all.
+#
+# [tls]
+# api_enabled = true          # HTTPS for the HTTP API
+# ws_enabled = false          # WebSocket TLS is usually better terminated
+#                             # by a reverse proxy
+# cert_path = "/path/to/fullchain.pem"   # PEM certificate
+# key_path = "/path/to/privkey.pem"      # PEM private key
+#
+# Self-signed certificate for testing:
+#   openssl req -x509 -newkey rsa:4096 -nodes \
+#     -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost"
+#
+# Let's Encrypt in production:
+#   certbot certonly --standalone -d your-domain.com
+#   cert_path = "/etc/letsencrypt/live/your-domain.com/fullchain.pem"
+#   key_path  = "/etc/letsencrypt/live/your-domain.com/privkey.pem"
 
 # ========================================
 # Usage
@@ -97,14 +132,31 @@ api_enabled = false
 
 # 1. Copy this file to deis-control.toml
 # 2. Change node_preshared_keys and api_keys to secure random strings
-# 3. To enable authentication, set api_auth_enabled = true
+# 3. To enable the API key requirement, set api_auth_enabled = true
 # 4. Start Control: ./deis-control --config deis-control.toml
+#
+# This is the only example configuration for deis-control, matching
+# deis-store.example.toml / deis-queue.example.toml /
+# deis-telemetry.example.toml.
 
 # Example API requests (with authentication enabled):
 # curl -H "X-API-Key: deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/nodes
 # or
 # curl -H "Authorization: Bearer deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/nodes
 
-# Endpoints that do not require authentication:
+# Endpoints that do not require an API key:
 # - /health - Health check
 # - /api/metrics - Prometheus Metrics
+# - the two node endpoints, which require a node_preshared_keys value
+#   instead:
+#     GET /api/nodes/{node_id}/assignments
+#     GET /api/apps/{app_id}/versions/{version_id}/bundle
+
+# ========================================
+# Security recommendations
+# ========================================
+# 1. Generate strong random keys: openssl rand -hex 32
+# 2. Never commit real keys to version control
+# 3. Rotate keys periodically, and use different ones per deployment
+# 4. Always terminate TLS in production, here or at a reverse proxy
+# 5. Bind to 127.0.0.1 when the control plane and its nodes share a host

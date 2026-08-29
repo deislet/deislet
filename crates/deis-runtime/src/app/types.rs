@@ -80,9 +80,18 @@ pub struct ResourceLimits {
     pub rate_limit_ops_per_sec: Option<f64>,
 }
 
+/// One application, in one environment, as this node holds it.
+///
+/// `id` and `environment` are two halves of one identity (see
+/// [`crate::app::AppKey`]): the same `id` appears once per environment this
+/// node runs, and the pair is what the manager keys on.
 #[derive(Debug, Clone, Serialize)]
 pub struct App {
     pub id: String,
+    /// Environment *name* (`production` or a preview name), which is what
+    /// application code branches on and what separates this copy from the
+    /// other environments of the same application.
+    pub environment: String,
     pub state: AppState,
     pub config: AppConfig,
     pub created_at: SystemTime,
@@ -90,21 +99,4 @@ pub struct App {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateAppRequest {
-    pub id: String,
-    pub code: String,
-
-    #[serde(default)]
-    pub config: AppConfig,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateAppRequest {
-    pub code: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config: Option<AppConfig>,
 }

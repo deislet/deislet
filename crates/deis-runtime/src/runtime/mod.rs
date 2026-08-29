@@ -44,7 +44,7 @@ pub use metrics::{MetricShipper, MetricShipperConfig, MetricsRegistry};
 pub use pool::RuntimePool;
 pub use queue_client::{LeasedMessage, NackOutcome, QueueClient};
 pub use queue_consumer::{BatchOutcome, ConsumerSettings};
-pub use queue_ops::{init_queue_extension, MemoryQueue};
+pub use queue_ops::init_queue_extension;
 pub use runtime_init::{build_runtime_extensions, init_lazy_extensions};
 pub use snapshot::load_or_create_startup_snapshot;
 pub use tenant::Tenant;

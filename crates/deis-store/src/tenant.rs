@@ -1,55 +1,55 @@
-//! The one tenant dimension this service understands: `app_id`.
+//! The one tenant dimension this service understands.
 //!
-//! It arrives out of band in the `x-deis-app-id` gRPC metadata header, the
-//! same header deis-proxy already stamps on the HTTP data path, so the
-//! existing storage.proto messages need no tenant field.
+//! A tenant id arrives out of band in the `x-deis-tenant` gRPC metadata
+//! header, so the existing storage.proto messages need no tenant field. To
+//! this service the value is one opaque key: it is never taken apart, never
+//! interpreted, and nothing here knows or cares what its parts mean.
 //!
-//! The id also names files on disk (`db/<app_id>.sqlite`,
-//! `blob/<app_id>/...`), so it is validated hard rather than sanitised: an id
-//! that could escape the data directory is refused outright.
+//! Its shape is nonetheless fixed, because the platform builds it from an
+//! application and an environment (`deis_wire::conventions::tenant_id`) and
+//! two environments of one application must never land in the same namespace.
+//! [`deis_wire::conventions::split_tenant`] is therefore the validator: it
+//! accepts exactly two legal parts joined by a separator neither part may
+//! contain, and the character set has no `.`, `/` or `\`.
+//!
+//! That last property is what makes the id safe to put on disk. It names
+//! files and directories here - `db/<tenant>.sqlite`, `blob/<tenant>/...` -
+//! so it is validated hard rather than sanitised: a value that could escape
+//! the data directory is refused outright and no request is served from a
+//! fallback namespace.
+//!
+//! A bare application id, which is what callers sent before this contract
+//! existed, has one part and is refused like any other malformed value.
 
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
-pub use deis_wire::conventions::APP_ID_HEADER;
+pub use deis_wire::conventions::TENANT_HEADER;
 
 use crate::error::StoreError;
+use deis_wire::conventions::split_tenant;
 use std::fmt;
 use tonic::Request;
 
-/// Longest accepted tenant id. Well under any filesystem name limit even
-/// after the `.sqlite` suffix.
-const MAX_APP_ID_LEN: usize = 64;
-
 /// A validated tenant id, safe to use as a single path component.
 ///
-/// The only way to build one is [`AppId::parse`], so any `AppId` in the code
-/// below is already known not to contain a separator, a dot, or anything else
-/// that would resolve outside the data directory.
+/// The only way to build one is [`TenantId::parse`], so any `TenantId` in the
+/// code below carries exactly one `.`, between its two halves, and neither
+/// half holds a `.`, a path separator or anything else that would resolve
+/// outside the data directory. `..` and `.` are therefore not expressible.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AppId(String);
+pub struct TenantId(String);
 
-impl AppId {
-    /// Validate `raw`. Accepts ASCII letters, digits, `_` and `-` only.
+impl TenantId {
+    /// Validate `raw` with [`split_tenant`], keeping the whole value.
     ///
-    /// Dots are rejected on purpose: that single rule removes `.`, `..` and
-    /// hidden-file names in one go, and it removes any argument about how
-    /// many dots it takes to climb out of `<data_dir>/db`.
+    /// The halves are deliberately dropped on the floor: this service stores
+    /// per tenant, not per application, so nothing below may be tempted to
+    /// treat two tenants as one because they share a prefix.
     pub fn parse(raw: &str) -> Result<Self, StoreError> {
-        if raw.is_empty() {
-            return Err(StoreError::Tenant("app id is empty".to_string()));
-        }
-        if raw.len() > MAX_APP_ID_LEN {
+        if split_tenant(raw).is_none() {
             return Err(StoreError::Tenant(format!(
-                "app id is {} bytes, limit is {MAX_APP_ID_LEN}",
-                raw.len()
-            )));
-        }
-        if let Some(bad) = raw
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
-        {
-            return Err(StoreError::Tenant(format!(
-                "app id contains {bad:?}, only ASCII letters, digits, '_' and '-' are allowed"
+                "{raw:?} is not a tenant id; it must be exactly two parts of ASCII letters, \
+                 digits, '_' or '-', at most 64 bytes each, joined by '.'"
             )));
         }
         Ok(Self(raw.to_string()))
@@ -61,7 +61,7 @@ impl AppId {
     }
 }
 
-impl fmt::Display for AppId {
+impl fmt::Display for TenantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -73,28 +73,28 @@ impl fmt::Display for AppId {
 /// It is logged at warn rather than error: the request is lost, but nothing
 /// stored is affected, and the usual cause is a caller that forgot the header
 /// rather than a fault in the store.
-pub fn app_id_of<T>(request: &Request<T>) -> Result<AppId, StoreError> {
+pub fn tenant_of<T>(request: &Request<T>) -> Result<TenantId, StoreError> {
     let raw = request
         .metadata()
-        .get(APP_ID_HEADER)
+        .get(TENANT_HEADER)
         .ok_or_else(|| {
             tracing::warn!(
-                header = APP_ID_HEADER,
-                "request has no tenant header, refusing it; the caller must stamp the app id or it \
-                 would be reading another app's data"
+                header = TENANT_HEADER,
+                "request has no tenant header, refusing it; the caller must stamp the tenant or it \
+                 would be reading another tenant's data"
             );
-            StoreError::Tenant(format!("missing {APP_ID_HEADER} header"))
+            StoreError::Tenant(format!("missing {TENANT_HEADER} header"))
         })?
         .to_str()
         .map_err(|_| {
             tracing::warn!(
-                header = APP_ID_HEADER,
+                header = TENANT_HEADER,
                 "tenant header is not printable ASCII, refusing the request"
             );
-            StoreError::Tenant(format!("{APP_ID_HEADER} is not valid ASCII"))
+            StoreError::Tenant(format!("{TENANT_HEADER} is not valid ASCII"))
         })?;
 
-    AppId::parse(raw).inspect_err(|e| {
+    TenantId::parse(raw).inspect_err(|e| {
         tracing::warn!(
             raw = %raw.escape_debug(),
             error = %e,
@@ -107,11 +107,29 @@ pub fn app_id_of<T>(request: &Request<T>) -> Result<AppId, StoreError> {
 mod tests {
 
     use super::*;
+    use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
 
     #[test]
-    fn accepts_ordinary_app_names() {
-        for id in ["my-app", "_system", "a", "App_9", &"x".repeat(64)] {
-            assert!(AppId::parse(id).is_ok(), "{id} should be accepted");
+    fn accepts_what_the_platform_builds() {
+        for id in [
+            tenant_id("my-app", "production"),
+            tenant_id("my-app", "preview-42"),
+            tenant_id("_system", "production"),
+            tenant_id(&"x".repeat(64), &"y".repeat(64)),
+        ] {
+            assert!(TenantId::parse(&id).is_ok(), "{id} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_bare_application_id_is_not_a_tenant() {
+        // What callers sent before this contract existed. Accepting it would
+        // put every environment of an application back in one namespace.
+        for id in ["my-app", "_system", "a"] {
+            assert!(
+                TenantId::parse(id).is_err(),
+                "{id} has no environment and must be refused"
+            );
         }
     }
 
@@ -123,14 +141,17 @@ mod tests {
             "../etc",
             "a/b",
             "a\\b",
-            "a.sqlite",
-            "a b",
-            "app\0",
+            "a.sqlite/..",
+            "a b.production",
+            "app\0.production",
             "",
-            &"x".repeat(65),
+            ".production",
+            "app.",
+            "a.b.c",
+            &format!("{}.production", "x".repeat(65)),
         ] {
             assert!(
-                AppId::parse(id).is_err(),
+                TenantId::parse(id).is_err(),
                 "{} should be rejected",
                 id.escape_debug()
             );
@@ -138,17 +159,37 @@ mod tests {
     }
 
     #[test]
+    fn two_environments_of_one_application_are_two_tenants() {
+        let production = TenantId::parse(&tenant_id("shop", "production")).unwrap();
+        let preview = TenantId::parse(&tenant_id("shop", "preview-7")).unwrap();
+        assert_ne!(production, preview);
+        assert_ne!(production.as_str(), preview.as_str());
+    }
+
+    #[test]
     fn reads_the_tenant_from_metadata() {
         let mut req = Request::new(());
         req.metadata_mut()
+            .insert(TENANT_HEADER, "my-app.production".parse().unwrap());
+        assert_eq!(tenant_of(&req).unwrap().as_str(), "my-app.production");
+    }
+
+    #[test]
+    fn the_application_header_alone_is_not_enough() {
+        // deis-runtime has to stamp the tenant header; the app id header
+        // names the application and is no longer the storage tenant. A
+        // caller that only sends the old one is refused rather than served
+        // from some default namespace.
+        let mut req = Request::new(());
+        req.metadata_mut()
             .insert(APP_ID_HEADER, "my-app".parse().unwrap());
-        assert_eq!(app_id_of(&req).unwrap().as_str(), "my-app");
+        assert!(matches!(tenant_of(&req), Err(StoreError::Tenant(_))));
     }
 
     #[test]
     fn missing_metadata_is_a_tenant_error() {
         let req = Request::new(());
-        let err = app_id_of(&req).unwrap_err();
+        let err = tenant_of(&req).unwrap_err();
         assert!(matches!(err, StoreError::Tenant(_)));
     }
 
@@ -156,7 +197,7 @@ mod tests {
     fn traversal_attempt_in_metadata_is_refused() {
         let mut req = Request::new(());
         req.metadata_mut()
-            .insert(APP_ID_HEADER, "../../etc".parse().unwrap());
-        assert!(matches!(app_id_of(&req), Err(StoreError::Tenant(_))));
+            .insert(TENANT_HEADER, "../../etc".parse().unwrap());
+        assert!(matches!(tenant_of(&req), Err(StoreError::Tenant(_))));
     }
 }

@@ -13,10 +13,18 @@
 //! `query`, `cookies`, `log`) on top of what the runtime supplied, and answers
 //! 404 when nothing matched.
 //!
-//! It fills `context.params` itself rather than trusting the runtime's copy.
-//! The runtime does match the manifest's patterns, but its matcher handles
-//! only exact segments and `:name`, so a `/api/*` route would arrive with
-//! empty params and the handler would have no way to see the captured tail.
+//! It fills `context.params` itself rather than trusting the runtime's copy,
+//! and the reason is not that the runtime matches less than this module does.
+//! The runtime understands the same three kinds of segment, catch-all
+//! included, and ranks competing patterns by the same rule
+//! (`deis_bundle::routing`). What it cannot do is name a catch-all: a manifest
+//! pattern keeps only the `*`, so `params['*']` is the one key the runtime can
+//! promise, while `functions/api/[[catch]].ts` says the handler expects to
+//! read the tail as `params.catch` as well. This module still has the file
+//! name, so it publishes the capture under both spellings - and it has to
+//! build a context anyway for `path`, `method`, `query`, `cookies` and `log`,
+//! which the runtime does not supply at all. So it rebuilds `params` with the
+//! rest rather than merging into a half-filled copy.
 
 use crate::routing::RoutePlan;
 
@@ -150,8 +158,9 @@ function pathnameOf(request) {
 
 // The context the handler sees: everything deis-runtime supplied - env,
 // services, waitUntil - plus the request-shaped conveniences edge-canon
-// promises. `params` is overwritten with this module's own match, which is the
-// only one that understands catch-all routes.
+// promises. `params` is overwritten with this module's own match: it is the
+// only one that also knows the name the catch-all was written with in the
+// file tree, so `params.catch` works alongside `params['*']`.
 function buildContext(context, params, pathname) {
   const request = context.request;
   const search = request && request.url ? String(request.url).split('?')[1] : '';
@@ -211,9 +220,11 @@ pub fn generate_entry_module(plan: &RoutePlan) -> String {
         code.push_str("// This app declares no function routes.\n");
     }
 
-    code.push_str(
-        "\n// Ordered by specificity: the first pattern that fits wins.\nconst ROUTES = [\n",
-    );
+    code.push_str(concat!(
+        "\n// Ordered most-specific first, by the rule deis-runtime applies to\n",
+        "// the same patterns (deis_bundle::routing): the first one that fits wins.\n",
+        "const ROUTES = [\n",
+    ));
     for (index, route) in routes.iter().enumerate() {
         let segments: Vec<&str> = route.pattern.split('/').filter(|s| !s.is_empty()).collect();
         code.push_str(&format!(

@@ -16,8 +16,13 @@ pub const MAX_SECRET_NAME_LEN: usize = 128;
 /// Longest accepted route path prefix.
 pub const MAX_PATH_PREFIX_LEN: usize = 512;
 
-/// An application. `id` is the app name and is the only tenant dimension
-/// the dumb services (deis-store, deis-queue, deis-telemetry) ever see.
+/// An application. `id` is the app name; it is one half of what identifies
+/// a running application, the other being the environment.
+///
+/// The dumb services (deis-store, deis-queue) see a single opaque tenant id
+/// built from the pair by `deis_wire::conventions::tenant_id`, so a preview
+/// deployment cannot read or overwrite what production stored while those
+/// services still understand exactly one tenant dimension.
 #[derive(Debug, Clone, Serialize)]
 pub struct App {
     pub id: String,
@@ -136,6 +141,15 @@ pub struct DeletedApp {
     /// control-plane local paths.
     #[serde(skip)]
     pub bundle_paths: Vec<String>,
+    /// Names of the environments that were removed, read before the rows
+    /// were deleted.
+    ///
+    /// The delete path needs them after the transaction: an application on a
+    /// node is keyed by `(app_id, environment)`, and nothing can look them
+    /// up once the rows are gone. Not serialized here - the API answer
+    /// reports them alongside which nodes actually dropped the app.
+    #[serde(skip)]
+    pub environment_names: Vec<String>,
 }
 
 /// Current wall clock as the Unix epoch seconds stored in every
@@ -151,10 +165,25 @@ pub fn validate_app_id(id: &str) -> Result<(), CatalogError> {
     validate_slug(id, "app id", MAX_NAME_LEN, false)
 }
 
-/// Environment names additionally allow `.` so that names like `pr-42.1`
-/// work, but are otherwise as restricted as app ids.
+/// Environment names follow the same rule as app ids, and for a reason
+/// beyond tidiness: the pair `(app_id, environment)` is joined into the
+/// storage tenant id with `.` as the separator
+/// (`deis_wire::conventions::tenant_id`), and deis-store turns that id into
+/// a directory and a database file name. A name carrying a `.` would make
+/// the tenant id split into three parts, which the storage services reject:
+/// the app would load and serve, and only its kv, database, blob and queue
+/// calls would fail.
 pub fn validate_environment_name(name: &str) -> Result<(), CatalogError> {
-    validate_slug(name, "environment name", MAX_NAME_LEN, true)
+    validate_slug(name, "environment name", MAX_NAME_LEN, false)?;
+    // Belt and braces: the rule above is ours, this one is the storage
+    // services'. If they ever diverge, the environment is refused here
+    // rather than becoming an application whose bindings silently fail.
+    if !deis_wire::conventions::is_valid_tenant_part(name) {
+        return Err(CatalogError::invalid(format!(
+            "environment name {name:?} cannot be part of a storage tenant id, so this environment could never use kv, database, blob or queue"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_slug(
@@ -295,11 +324,29 @@ mod tests {
         assert!(validate_app_id(&"a".repeat(MAX_NAME_LEN + 1)).is_err());
     }
 
+    /// An environment name is half of a storage tenant id, so it may not
+    /// carry the separator that joins the two halves.
     #[test]
-    fn environment_names_allow_dots_but_not_slashes() {
+    fn environment_names_must_be_usable_as_a_storage_tenant_half() {
         assert!(validate_environment_name("production").is_ok());
-        assert!(validate_environment_name("pr-42.1").is_ok());
+        assert!(validate_environment_name("pr-42").is_ok());
         assert!(validate_environment_name("pr/42").is_err());
+        assert!(
+            validate_environment_name("pr-42.1").is_err(),
+            "a dot would split the tenant id into three parts, which deis-store rejects"
+        );
+
+        // What the rule is really protecting: every accepted pair joins and
+        // splits back to itself.
+        for (app, env) in [("demo", "production"), ("my_app-2", "pr-42")] {
+            assert!(validate_app_id(app).is_ok());
+            assert!(validate_environment_name(env).is_ok());
+            let tenant = deis_wire::conventions::tenant_id(app, env);
+            assert_eq!(
+                deis_wire::conventions::split_tenant(&tenant),
+                Some((app, env))
+            );
+        }
     }
 
     #[test]

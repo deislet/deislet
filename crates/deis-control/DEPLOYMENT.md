@@ -47,8 +47,9 @@ cd ..
 ### 2. Prepare Configuration File
 
 ```bash
-# Copy example configuration
-cp config.example.toml config.toml
+# Copy the example configuration (deis-control.example.toml is the only
+# one; the file it is copied to can be named anything -c is given)
+cp deis-control.example.toml config.toml
 
 # Edit configuration
 vi config.toml
@@ -59,12 +60,16 @@ vi config.toml
 bind_addr = "0.0.0.0"
 port = 8080
 
-# Change to a strong random key
+# The credential every runtime node presents: on the gRPC handshake, and
+# on the two HTTP endpoints that serve nodes. Required in practice - with
+# no key here the assignment list refuses to hand a node the decrypted
+# secrets of any application, so applications with secrets do not run.
 node_preshared_keys = [
     "your-random-key-here-change-me-in-production"
 ]
 
-# Enable API authentication (recommended)
+# Require an API key on the dashboard and the human API (recommended).
+# This setting does not reach the node endpoints above.
 api_auth_enabled = true
 api_keys = [
     "your-api-key-change-me"

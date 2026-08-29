@@ -492,21 +492,22 @@ export default function handler(context: any): Response {
     }
 
     #[tokio::test]
-    async fn an_app_can_send_to_a_queue_other_than_its_default_one() {
+    async fn an_app_can_name_the_queue_it_sends_to() {
         // A consumer polls a named queue, so a producer has to be able to
         // name one; without this everything an app sends lands in "default"
-        // and nothing consuming "jobs" would ever see it.
+        // and nothing consuming "jobs" would ever see it. An empty name is
+        // refused rather than silently turned into the default queue.
         let code = r#"
             export default async function handler(ctx) {
-                await ctx.services.queue.to("jobs").send({ work: 1 });
-                let named = "accepted";
+                const named = ctx.services.queue.to("jobs");
+                let outcome = named && named.name === "jobs" ? "named jobs" : "wrong queue";
                 try {
                     ctx.services.queue.to("");
-                    named = "an empty name was accepted";
+                    outcome += ", an empty name was accepted";
                 } catch (e) {
-                    named = "empty name rejected";
+                    outcome += ", empty name rejected";
                 }
-                return new Response(named);
+                return new Response(outcome);
             }
         "#;
 
@@ -534,7 +535,149 @@ export default function handler(context: any): Response {
         let (status, _, body) = rx.await.unwrap().unwrap();
 
         assert_eq!(status, 200);
-        assert_eq!(body, Some("empty name rejected".to_string()));
+        assert_eq!(body, Some("named jobs, empty name rejected".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_send_with_no_queue_bound_is_refused_instead_of_answered_with_an_id() {
+        // The failure this replaces: the op used to push the message into a
+        // vector inside this isolate and answer "mem-id", so the app saw a
+        // resolved promise and a plausible id while the message went nowhere
+        // and vanished with the isolate. The producer looked healthy and the
+        // consumer never received anything.
+        let code = r#"
+            export default async function handler(ctx) {
+                try {
+                    await ctx.services.queue.send({ work: 1 });
+                    return new Response("accepted");
+                } catch (e) {
+                    return new Response("refused: " + String(e.message || e));
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "queue_unbound_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 200);
+        let body = body.unwrap_or_default();
+        assert!(
+            body.starts_with("refused:"),
+            "an app with no queue must not be told its message was accepted: {body}"
+        );
+        assert!(
+            body.contains("not available") && body.contains("not enqueued"),
+            "the rejection has to say the message was not queued anywhere: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_after_a_cut_off_one_still_runs() {
+        // A cut-off ends an execution by terminating the isolate, and V8's
+        // terminate flag is not spent when that execution returns: deno_core
+        // clears it only long enough to build the error and then sets it
+        // again. Left set, this isolate is finished for good -- every later
+        // request 500s, every queue batch is handed back until its delivery
+        // attempts run out and the messages are dead lettered, and every cron
+        // tick fails -- until the app is redeployed or the node restarted. One
+        // slow request would take the application off this node.
+        //
+        // The flag is set here directly rather than through one of the two
+        // real triggers, because neither is usable in a test: the timeout is a
+        // spawned timer that only lands if the handler happens to be inside
+        // JS at that moment, and the rate limiter would go on firing during
+        // the request that is meant to prove the isolate recovered. The state
+        // it leaves behind is identical either way -- the same call on the
+        // same handle.
+        let code = r#"
+            export default function handler(ctx) {
+                return new Response("served " + new URL(ctx.request.url).pathname);
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "cut_off_recovery_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        runtime.terminate_like_a_cut_off();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/after".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the isolate must still be usable after a cut-off");
+        let (status, _, body) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(body, Some("served /after".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_queue_batch_after_a_cut_off_still_runs() {
+        // The same flag, and the consequence that made it worth fixing: a
+        // batch handed to a terminated isolate never reaches the handler, so
+        // every message is nacked, and once their attempts run out they are
+        // dead lettered -- messages nothing was ever wrong with.
+        let code = r#"
+            export async function queue(batch) {
+                return { failed: [] };
+            }
+            export default function handler() { return new Response("ok"); }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "cut_off_recovery_queue_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        runtime.terminate_like_a_cut_off();
+
+        let outcome = runtime
+            .execute_queue_batch("jobs".to_string(), vec![leased("m1", "{}", 1)])
+            .await
+            .expect("a batch after a cut-off must still reach the handler");
+        assert!(
+            outcome.failed.is_empty(),
+            "the handler acknowledged the batch; nothing should be handed back: {:?}",
+            outcome.failed
+        );
     }
 
     // --- metrics -----------------------------------------------------------
@@ -686,7 +829,7 @@ export default function handler(context: any): Response {
         "#;
 
         let mut runtime = AppRuntime::new(
-            "bound_kv_app".to_string(),
+            "bound_kv_app.production".to_string(),
             code.to_string(),
             None,
             IsolateSpec::default(),
@@ -764,7 +907,7 @@ export default function handler(context: any): Response {
         "#;
 
         let mut runtime = AppRuntime::new(
-            "e2e_kv_app".to_string(),
+            "e2e_kv_app.production".to_string(),
             code.to_string(),
             None,
             IsolateSpec::default(),

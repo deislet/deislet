@@ -4,6 +4,12 @@
 //! clients, so it exercises the parts unit tests cannot: metadata handling,
 //! the streaming blob protocol, the message size ceiling, and the fact that
 //! the three services are actually registered on the server.
+//!
+//! Every call stamps `x-deis-tenant` with an `<app>.<environment>` value,
+//! which is what deis-runtime has to send. The tests below use
+//! `app-one.production` and `app-two.production` as two unrelated tenants,
+//! and one test pairs `app-one.production` with `app-one.preview` to check
+//! that two environments of the *same* application are also two namespaces.
 
 use deis_store::config::Config;
 use deis_store::proto::blob::{
@@ -14,8 +20,9 @@ use deis_store::proto::storage::{
     PrepareRequest, QueryPreparedRequest, QueryRequest, SetRequest,
     database_client::DatabaseClient, kv_store_client::KvStoreClient,
 };
-use deis_store::tenant::APP_ID_HEADER;
+use deis_store::tenant::TENANT_HEADER;
 use deis_store::{MAX_GRPC_MESSAGE_BYTES, server};
+use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::Request;
@@ -94,11 +101,11 @@ impl Drop for Harness {
 }
 
 /// Stamp the tenant the way deis-runtime will have to.
-fn as_app<T>(app: &str, message: T) -> Request<T> {
+fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
-        .insert(APP_ID_HEADER, app.parse().unwrap());
+        .insert(TENANT_HEADER, tenant.parse().unwrap());
     request
 }
 
@@ -107,8 +114,8 @@ async fn kv_round_trip_over_grpc() {
     let harness = Harness::start().await;
     let mut kv = harness.kv().await;
 
-    kv.set(as_app(
-        "app-one",
+    kv.set(as_tenant(
+        "app-one.production",
         SetRequest {
             key: "greeting".to_string(),
             value: "hello".to_string(),
@@ -120,8 +127,8 @@ async fn kv_round_trip_over_grpc() {
     .unwrap();
 
     let got = kv
-        .get(as_app(
-            "app-one",
+        .get(as_tenant(
+            "app-one.production",
             GetRequest {
                 key: "greeting".to_string(),
             },
@@ -132,8 +139,8 @@ async fn kv_round_trip_over_grpc() {
     assert_eq!(got.value.as_deref(), Some("hello"));
 
     assert!(
-        kv.has(as_app(
-            "app-one",
+        kv.has(as_tenant(
+            "app-one.production",
             HasRequest {
                 key: "greeting".to_string()
             }
@@ -146,8 +153,8 @@ async fn kv_round_trip_over_grpc() {
 
     // A second tenant sees nothing, over the same connection.
     let other = kv
-        .get(as_app(
-            "app-two",
+        .get(as_tenant(
+            "app-two.production",
             GetRequest {
                 key: "greeting".to_string(),
             },
@@ -157,8 +164,8 @@ async fn kv_round_trip_over_grpc() {
         .into_inner();
     assert_eq!(other.value, None);
 
-    kv.delete(as_app(
-        "app-one",
+    kv.delete(as_tenant(
+        "app-one.production",
         deis_store::proto::storage::DeleteRequest {
             key: "greeting".to_string(),
         },
@@ -166,8 +173,8 @@ async fn kv_round_trip_over_grpc() {
     .await
     .unwrap();
     let gone = kv
-        .get(as_app(
-            "app-one",
+        .get(as_tenant(
+            "app-one.production",
             GetRequest {
                 key: "greeting".to_string(),
             },
@@ -186,8 +193,8 @@ async fn kv_honours_a_lifetime_over_grpc() {
     let harness = Harness::start().await;
     let mut kv = harness.kv().await;
 
-    kv.set(as_app(
-        "app-one",
+    kv.set(as_tenant(
+        "app-one.production",
         SetRequest {
             key: "session".to_string(),
             value: "token".to_string(),
@@ -200,8 +207,8 @@ async fn kv_honours_a_lifetime_over_grpc() {
 
     // An hour out, so it is still readable.
     let got = kv
-        .get(as_app(
-            "app-one",
+        .get(as_tenant(
+            "app-one.production",
             GetRequest {
                 key: "session".to_string(),
             },
@@ -214,8 +221,8 @@ async fn kv_honours_a_lifetime_over_grpc() {
     // A lifetime that cannot be honoured is refused outright, rather than
     // stored as something no reader will ever see again.
     let refused = kv
-        .set(as_app(
-            "app-one",
+        .set(as_tenant(
+            "app-one.production",
             SetRequest {
                 key: "doomed".to_string(),
                 value: "v".to_string(),
@@ -227,8 +234,8 @@ async fn kv_honours_a_lifetime_over_grpc() {
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
     let absent = kv
-        .has(as_app(
-            "app-one",
+        .has(as_tenant(
+            "app-one.production",
             HasRequest {
                 key: "doomed".to_string(),
             },
@@ -244,8 +251,8 @@ async fn kv_list_pages_by_prefix() {
     let harness = Harness::start().await;
     let mut kv = harness.kv().await;
     for key in ["user:1", "user:2", "user:3", "post:1"] {
-        kv.set(as_app(
-            "app-one",
+        kv.set(as_tenant(
+            "app-one.production",
             SetRequest {
                 key: key.to_string(),
                 value: "v".to_string(),
@@ -258,8 +265,8 @@ async fn kv_list_pages_by_prefix() {
     }
 
     let page = kv
-        .list(as_app(
-            "app-one",
+        .list(as_tenant(
+            "app-one.production",
             ListRequest {
                 prefix: "user:".to_string(),
                 limit: Some(2),
@@ -273,8 +280,8 @@ async fn kv_list_pages_by_prefix() {
     assert_eq!(page.next_cursor.as_deref(), Some("user:2"));
 
     let rest = kv
-        .list(as_app(
-            "app-one",
+        .list(as_tenant(
+            "app-one.production",
             ListRequest {
                 prefix: "user:".to_string(),
                 limit: Some(2),
@@ -289,9 +296,11 @@ async fn kv_list_pages_by_prefix() {
 }
 
 #[tokio::test]
-async fn a_request_without_a_tenant_is_refused() {
+async fn a_request_without_a_usable_tenant_is_refused() {
     let harness = Harness::start().await;
     let mut kv = harness.kv().await;
+    // No header at all. There is no default namespace to fall back to, and
+    // inventing one would put every unstamped caller in the same place.
     let status = kv
         .get(Request::new(GetRequest {
             key: "greeting".to_string(),
@@ -300,17 +309,31 @@ async fn a_request_without_a_tenant_is_refused() {
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
 
-    // So is a tenant id that would escape the data directory.
-    let status = kv
-        .get(as_app(
-            "../../etc",
-            GetRequest {
-                key: "greeting".to_string(),
-            },
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    for bad in [
+        // Would escape the data directory.
+        "../../etc",
+        // A bare application id: what every caller sent before the tenant
+        // contract. It names no environment, so it names no tenant.
+        "app-one",
+        // Neither too many parts nor an empty one is a tenant.
+        "a.b.c",
+        "app-one.",
+    ] {
+        let status = kv
+            .get(as_tenant(
+                bad,
+                GetRequest {
+                    key: "greeting".to_string(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            status.code(),
+            tonic::Code::PermissionDenied,
+            "{bad} should be refused"
+        );
+    }
 }
 
 #[tokio::test]
@@ -320,8 +343,8 @@ async fn a_value_larger_than_the_tonic_default_still_goes_through() {
     // 5 MiB: over the 4 MB tonic default, under the 16 MB Deislet ceiling.
     let big = "a".repeat(5 * 1024 * 1024);
 
-    kv.set(as_app(
-        "app-one",
+    kv.set(as_tenant(
+        "app-one.production",
         SetRequest {
             key: "big".to_string(),
             value: big.clone(),
@@ -333,8 +356,8 @@ async fn a_value_larger_than_the_tonic_default_still_goes_through() {
     .unwrap();
 
     let got = kv
-        .get(as_app(
-            "app-one",
+        .get(as_tenant(
+            "app-one.production",
             GetRequest {
                 key: "big".to_string(),
             },
@@ -351,8 +374,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
     let mut db = harness.database().await;
 
     let created = db
-        .execute(as_app(
-            "app-one",
+        .execute(as_tenant(
+            "app-one.production",
             ExecuteRequest {
                 sql: "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)".to_string(),
                 params: None,
@@ -364,8 +387,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
     assert!(created.success, "{:?}", created.error);
 
     let inserted = db
-        .execute(as_app(
-            "app-one",
+        .execute(as_tenant(
+            "app-one.production",
             ExecuteRequest {
                 sql: "INSERT INTO users(name) VALUES(?1)".to_string(),
                 params: Some(r#"["Alice"]"#.to_string()),
@@ -379,8 +402,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
     assert_eq!(inserted.last_insert_id, Some(1));
 
     let queried = db
-        .query(as_app(
-            "app-one",
+        .query(as_tenant(
+            "app-one.production",
             QueryRequest {
                 sql: "SELECT id, name FROM users".to_string(),
                 params: None,
@@ -396,8 +419,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
 
     // A batch that fails halfway leaves nothing behind.
     let batch = db
-        .batch(as_app(
-            "app-one",
+        .batch(as_tenant(
+            "app-one.production",
             BatchRequest {
                 statements: vec![
                     ExecuteRequest {
@@ -418,8 +441,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
     assert!(batch.error.unwrap().contains("rolled back"));
 
     let after = db
-        .query(as_app(
-            "app-one",
+        .query(as_tenant(
+            "app-one.production",
             QueryRequest {
                 sql: "SELECT count(*) AS n FROM users".to_string(),
                 params: None,
@@ -433,8 +456,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
 
     // Prepare once, use twice.
     let prepared = db
-        .prepare(as_app(
-            "app-one",
+        .prepare(as_tenant(
+            "app-one.production",
             PrepareRequest {
                 sql: "INSERT INTO users(name) VALUES(?1)".to_string(),
             },
@@ -445,8 +468,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
     assert!(prepared.success, "{:?}", prepared.error);
     for name in ["Bob", "Carol"] {
         let done = db
-            .execute_prepared(as_app(
-                "app-one",
+            .execute_prepared(as_tenant(
+                "app-one.production",
                 ExecutePreparedRequest {
                     statement_id: prepared.statement_id.clone(),
                     params: Some(format!(r#"["{name}"]"#)),
@@ -459,8 +482,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
     }
 
     let select = db
-        .prepare(as_app(
-            "app-one",
+        .prepare(as_tenant(
+            "app-one.production",
             PrepareRequest {
                 sql: "SELECT name FROM users WHERE name = ?1".to_string(),
             },
@@ -469,8 +492,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
         .unwrap()
         .into_inner();
     let found = db
-        .query_prepared(as_app(
-            "app-one",
+        .query_prepared(as_tenant(
+            "app-one.production",
             QueryPreparedRequest {
                 statement_id: select.statement_id.clone(),
                 params: Some(r#"["Carol"]"#.to_string()),
@@ -482,10 +505,10 @@ async fn database_executes_queries_batches_and_prepared_statements() {
     let rows: serde_json::Value = serde_json::from_str(&found.rows).unwrap();
     assert_eq!(rows, serde_json::json!([{ "name": "Carol" }]));
 
-    // Another app cannot use that handle, and has no such table anyway.
+    // Another tenant cannot use that handle, and has no such table anyway.
     let stolen = db
-        .query_prepared(as_app(
-            "app-two",
+        .query_prepared(as_tenant(
+            "app-two.production",
             QueryPreparedRequest {
                 statement_id: select.statement_id,
                 params: Some(r#"["Carol"]"#.to_string()),
@@ -496,8 +519,8 @@ async fn database_executes_queries_batches_and_prepared_statements() {
     assert_eq!(stolen.code(), tonic::Code::PermissionDenied);
 
     let missing = db
-        .query(as_app(
-            "app-two",
+        .query(as_tenant(
+            "app-two.production",
             QueryRequest {
                 sql: "SELECT * FROM users".to_string(),
                 params: None,
@@ -515,8 +538,8 @@ async fn bad_sql_is_reported_in_the_response_not_as_a_transport_error() {
     let harness = Harness::start().await;
     let mut db = harness.database().await;
     let response = db
-        .execute(as_app(
-            "app-one",
+        .execute(as_tenant(
+            "app-one.production",
             ExecuteRequest {
                 sql: "SELCT 1".to_string(),
                 params: None,
@@ -553,7 +576,10 @@ async fn blob_put_and_get_stream_in_chunks() {
     assert_eq!(messages.len(), 4, "header plus three body chunks");
 
     let stored = blob
-        .put(as_app("app-one", tokio_stream::iter(messages)))
+        .put(as_tenant(
+            "app-one.production",
+            tokio_stream::iter(messages),
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -562,8 +588,8 @@ async fn blob_put_and_get_stream_in_chunks() {
     assert_eq!(stored.sha256.len(), 64);
 
     let mut stream = blob
-        .get(as_app(
-            "app-one",
+        .get(as_tenant(
+            "app-one.production",
             deis_store::proto::blob::GetRequest {
                 key: "video.bin".to_string(),
             },
@@ -607,8 +633,8 @@ async fn blob_delete_and_missing_keys() {
     let mut blob = harness.blob().await;
 
     let missing = blob
-        .get(as_app(
-            "app-one",
+        .get(as_tenant(
+            "app-one.production",
             deis_store::proto::blob::GetRequest {
                 key: "absent".to_string(),
             },
@@ -629,7 +655,10 @@ async fn blob_delete_and_missing_keys() {
         },
     ];
     let stored = blob
-        .put(as_app("app-one", tokio_stream::iter(messages)))
+        .put(as_tenant(
+            "app-one.production",
+            tokio_stream::iter(messages),
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -637,8 +666,8 @@ async fn blob_delete_and_missing_keys() {
 
     // Another tenant cannot read it.
     let other = blob
-        .get(as_app(
-            "app-two",
+        .get(as_tenant(
+            "app-two.production",
             deis_store::proto::blob::GetRequest {
                 key: "note.txt".to_string(),
             },
@@ -648,8 +677,8 @@ async fn blob_delete_and_missing_keys() {
     assert_eq!(other.code(), tonic::Code::NotFound);
 
     let deleted = blob
-        .delete(as_app(
-            "app-one",
+        .delete(as_tenant(
+            "app-one.production",
             deis_store::proto::blob::DeleteRequest {
                 key: "note.txt".to_string(),
             },
@@ -661,8 +690,8 @@ async fn blob_delete_and_missing_keys() {
 
     // Deleting again still succeeds: the post-condition already holds.
     let again = blob
-        .delete(as_app(
-            "app-one",
+        .delete(as_tenant(
+            "app-one.production",
             deis_store::proto::blob::DeleteRequest {
                 key: "note.txt".to_string(),
             },
@@ -678,8 +707,8 @@ async fn blob_put_must_start_with_a_header() {
     let harness = Harness::start().await;
     let mut blob = harness.blob().await;
     let status = blob
-        .put(as_app(
-            "app-one",
+        .put(as_tenant(
+            "app-one.production",
             tokio_stream::iter(vec![PutRequest {
                 payload: Some(put_request::Payload::Chunk(b"orphan".to_vec())),
             }]),
@@ -711,7 +740,10 @@ async fn an_oversized_object_is_refused_in_the_response() {
     }
 
     let response = blob
-        .put(as_app("app-one", tokio_stream::iter(messages)))
+        .put(as_tenant(
+            "app-one.production",
+            tokio_stream::iter(messages),
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -719,8 +751,8 @@ async fn an_oversized_object_is_refused_in_the_response() {
     assert!(response.error.unwrap().contains("limit"));
 
     let absent = blob
-        .get(as_app(
-            "app-one",
+        .get(as_tenant(
+            "app-one.production",
             deis_store::proto::blob::GetRequest {
                 key: "too-big".to_string(),
             },
@@ -752,4 +784,134 @@ async fn health_reports_every_service_as_serving() {
             "{service} should be serving"
         );
     }
+}
+
+/// Two environments of one application must not see each other's data.
+///
+/// This is the whole reason the storage tenant is a pair rather than an app
+/// id: a preview deployment that could read or overwrite what production
+/// stored would be an unrecoverable failure, not a confusing one.
+#[tokio::test]
+async fn two_environments_of_one_application_share_nothing() {
+    let harness = Harness::start().await;
+    let production = tenant_id("app-one", "production");
+    let preview = tenant_id("app-one", "preview");
+
+    // KV: the same key in both, with different values.
+    let mut kv = harness.kv().await;
+    for (tenant, value) in [(&production, "live"), (&preview, "draft")] {
+        kv.set(as_tenant(
+            tenant,
+            SetRequest {
+                key: "banner".to_string(),
+                value: value.to_string(),
+                ttl_seconds: None,
+                metadata: None,
+            },
+        ))
+        .await
+        .unwrap();
+    }
+    for (tenant, expected) in [(&production, "live"), (&preview, "draft")] {
+        let got = kv
+            .get(as_tenant(
+                tenant,
+                GetRequest {
+                    key: "banner".to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.value.as_deref(), Some(expected), "{tenant} kv");
+    }
+
+    // SQL: a table created by one environment does not exist in the other.
+    let mut database = harness.database().await;
+    database
+        .execute(as_tenant(
+            &production,
+            ExecuteRequest {
+                sql: "CREATE TABLE orders (id INTEGER)".to_string(),
+                params: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let missing = database
+        .query(as_tenant(
+            &preview,
+            QueryRequest {
+                sql: "SELECT * FROM orders".to_string(),
+                params: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !missing.error.unwrap_or_default().is_empty(),
+        "the preview environment must not see production's table"
+    );
+
+    // Blob: the same key in both, with different bytes.
+    let mut blob = harness.blob().await;
+    for (tenant, body) in [(&production, b"live-bytes"), (&preview, b"prev-bytes")] {
+        let messages = vec![
+            PutRequest {
+                payload: Some(put_request::Payload::Header(PutHeader {
+                    key: "logo".to_string(),
+                    content_type: None,
+                })),
+            },
+            PutRequest {
+                payload: Some(put_request::Payload::Chunk(body.to_vec())),
+            },
+        ];
+        let response = blob
+            .put(as_tenant(tenant, tokio_stream::iter(messages)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{tenant} put");
+    }
+    for (tenant, expected) in [
+        (&production, b"live-bytes".as_slice()),
+        (&preview, b"prev-bytes".as_slice()),
+    ] {
+        let mut stream = blob
+            .get(as_tenant(
+                tenant,
+                deis_store::proto::blob::GetRequest {
+                    key: "logo".to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut body = Vec::new();
+        while let Some(message) = stream.message().await.unwrap() {
+            if let Some(get_response::Payload::Chunk(chunk)) = message.payload {
+                body.extend_from_slice(&chunk);
+            }
+        }
+        assert_eq!(body, expected, "{tenant} blob");
+    }
+}
+
+/// The application header is not the storage tenant. A caller that stamps
+/// only `x-deis-app-id` - which is what every caller did before this change -
+/// is refused rather than served production's data.
+#[tokio::test]
+async fn the_application_header_alone_does_not_identify_a_tenant() {
+    let harness = Harness::start().await;
+    let mut kv = harness.kv().await;
+    let mut request = Request::new(GetRequest {
+        key: "anything".to_string(),
+    });
+    request
+        .metadata_mut()
+        .insert(APP_ID_HEADER, "app-one".parse().unwrap());
+    let status = kv.get(request).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
 }

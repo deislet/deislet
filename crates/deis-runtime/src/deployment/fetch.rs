@@ -12,7 +12,9 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
+
+use super::credential::NodeCredential;
 
 /// Why a bundle did not arrive, or arrived and could not be trusted.
 #[derive(Debug)]
@@ -49,7 +51,7 @@ impl std::fmt::Display for FetchError {
             Self::TooLarge { url, limit } => write!(
                 f,
                 "the bundle at {url} went past the {limit} byte ceiling and the download was \
-                 abandoned; raise bundles.max_bundle_bytes if the app really is this big"
+                 abandoned; raise bundles.max_bytes if the app really is this big"
             ),
             Self::Timeout { url, seconds } => write!(
                 f,
@@ -89,10 +91,18 @@ pub struct BundleFetcher {
     client: reqwest::Client,
     max_bytes: u64,
     timeout: Duration,
+    credential: Option<NodeCredential>,
 }
 
 impl BundleFetcher {
-    pub fn new(timeout: Duration, max_bytes: u64) -> anyhow::Result<Self> {
+    /// `credential` is the node key. It is presented only when the bundle URL
+    /// is the control plane this node was configured with; see
+    /// [`NodeCredential`].
+    pub fn new(
+        timeout: Duration,
+        max_bytes: u64,
+        credential: Option<NodeCredential>,
+    ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             // Applies to the idle gap between chunks: a control plane that
             // stops sending mid-bundle must not hold this download open for
@@ -103,6 +113,7 @@ impl BundleFetcher {
             client,
             max_bytes,
             timeout,
+            credential,
         })
     }
 
@@ -157,20 +168,32 @@ impl BundleFetcher {
         url: &str,
         temp_path: &Path,
     ) -> Result<(u64, String), FetchError> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| FetchError::Transport {
-                url: url.to_string(),
-                reason: e.to_string(),
-            })?;
+        let mut request = self.client.get(url);
+        if let Some(credential) = &self.credential {
+            if let Some(value) = credential.header_value_for(url) {
+                request = request.header(reqwest::header::AUTHORIZATION, value);
+            }
+        }
+
+        let response = request.send().await.map_err(|e| FetchError::Transport {
+            url: url.to_string(),
+            reason: e.to_string(),
+        })?;
 
         if !response.status().is_success() {
+            let code = response.status().as_u16();
+            if code == 401 || code == 403 {
+                error!(
+                    url,
+                    code,
+                    "The bundle host refused this node's credential, so this version cannot be \
+                     installed and the environment keeps running its previous version. Set \
+                     control.secret to one of the control plane's node_preshared_keys"
+                );
+            }
             return Err(FetchError::Status {
                 url: url.to_string(),
-                code: response.status().as_u16(),
+                code,
             });
         }
 

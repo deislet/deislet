@@ -13,8 +13,17 @@
 //!      machines. The bundle is content-addressed, so a table that reorders
 //!      itself changes the version identity of a build whose input never
 //!      changed.
+//!
+//! The rule itself is not written here. deis-runtime applies the same rule to
+//! the same patterns at request time, and when the two spell it differently a
+//! request reaches a handler the built table does not point at - with no error
+//! to go on, because both halves think they are right. So the ordering comes
+//! from [`deis_bundle::sort_by_specificity`], the platform's single definition
+//! of the rule, which is what deis-runtime ranks the manifest's patterns by
+//! too.
 
 use deis_build_core::routes::{wildcard_is_reachable, wildcard_name};
+use deis_bundle::sort_by_specificity;
 
 /// Handler file, at the function root, holding this app's queue consumer.
 ///
@@ -93,7 +102,7 @@ pub fn plan_routes(routes: &[(String, String)]) -> RoutePlan {
         });
     }
 
-    entries.sort_by_key(|entry| specificity(&entry.pattern));
+    sort_by_specificity(&mut entries, |entry| entry.pattern.as_str());
 
     for entry in entries {
         if let Some(existing) = plan.routes.iter().find(|r| r.pattern == entry.pattern) {
@@ -139,25 +148,6 @@ fn reserved_stem(import_path: &str) -> Option<&str> {
     stem.starts_with('_').then_some(stem)
 }
 
-/// Sort key: the more of a request a pattern pins down, the earlier it is
-/// tried. Ties break on the pattern text so the order never depends on the
-/// order the files were found in.
-fn specificity(pattern: &str) -> (u8, usize, usize, String) {
-    let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-    let has_wildcard = segments.contains(&"*");
-    let placeholders = segments.iter().filter(|s| s.starts_with(':')).count();
-
-    (
-        // A catch-all is the last resort, whatever else it looks like.
-        u8::from(has_wildcard),
-        placeholders,
-        // Among equally dynamic patterns, the longer path is the narrower
-        // one: `/a/b/:id` before `/a/:id`.
-        usize::MAX - segments.len(),
-        pattern.to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +177,20 @@ mod tests {
             route("/api/health", "../src/api/health.ts"),
         ]);
         assert_eq!(patterns(&plan), vec!["/api/health", "/api/:id", "/api/*"]);
+    }
+
+    #[test]
+    fn the_leftmost_literal_decides_which_handler_answers() {
+        // Both patterns have one placeholder and two segments, and both fit
+        // `/admin/settings`. deis-runtime's matcher compares them segment by
+        // segment and picks `/admin/:page`; the table baked into the entry
+        // module has to reach the same handler, or the admin page is never
+        // served and nothing anywhere says why.
+        let plan = plan_routes(&[
+            route("/:org/settings", "../src/[org]/settings.ts"),
+            route("/admin/:page", "../src/admin/[page].ts"),
+        ]);
+        assert_eq!(patterns(&plan), vec!["/admin/:page", "/:org/settings"]);
     }
 
     #[test]

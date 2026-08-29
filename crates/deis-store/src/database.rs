@@ -1,10 +1,14 @@
 //! SQL database service, one SQLite file per tenant.
 //!
-//! `<data_dir>/db/<app_id>.sqlite`. File-level isolation is the cheapest
-//! correct answer here: an app cannot name another app's table, cannot lock
-//! another app's rows, and a `DROP TABLE` blast radius stops at its own file.
+//! `<data_dir>/db/<tenant>.sqlite`. File-level isolation is the cheapest
+//! correct answer here: a tenant cannot name another tenant's table, cannot
+//! lock another tenant's rows, and a `DROP TABLE` blast radius stops at its
+//! own file. Two environments of one application are two tenants, so a
+//! preview deployment cannot drop production's tables either.
+//!
 //! The price is that the tenant id becomes a filename, which is why
-//! [`AppId`] refuses anything that is not a plain identifier.
+//! [`TenantId`] refuses anything the wire conventions do not accept as
+//! exactly two plain identifiers.
 //!
 //! "Prepared" statements are prepared per call, not held open. A pooled
 //! connection cannot own a live `rusqlite::Statement` across requests, so
@@ -20,7 +24,7 @@ use crate::proto::storage::{
     database_server::Database,
 };
 use crate::sqlite::{PoolSize, SqlitePool};
-use crate::tenant::{AppId, app_id_of};
+use crate::tenant::{TenantId, tenant_of};
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::HashMap;
@@ -38,7 +42,7 @@ const MAX_PREPARED_STATEMENTS: usize = 4096;
 struct PreparedStatement {
     /// Whoever prepared it. Checked on every use, so a leaked handle is
     /// still useless to another tenant.
-    app_id: AppId,
+    tenant: TenantId,
     sql: String,
     /// Monotonic sequence number, used to evict the oldest handle first.
     seq: u64,
@@ -52,7 +56,7 @@ struct StatementRegistry {
 }
 
 impl StatementRegistry {
-    fn insert(&self, app_id: AppId, sql: String) -> String {
+    fn insert(&self, tenant: TenantId, sql: String) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let seq = {
             let mut next = self.next_seq.lock().unwrap_or_else(|e| e.into_inner());
@@ -74,29 +78,29 @@ impl StatementRegistry {
                  holding it will get an unknown-statement error and has to prepare again"
             );
         }
-        entries.insert(id.clone(), PreparedStatement { app_id, sql, seq });
+        entries.insert(id.clone(), PreparedStatement { tenant, sql, seq });
         id
     }
 
-    fn resolve(&self, app: &AppId, id: &str) -> StoreResult<String> {
+    fn resolve(&self, tenant: &TenantId, id: &str) -> StoreResult<String> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let stmt = entries.get(id).ok_or_else(|| {
             tracing::debug!(
                 statement = %id,
-                app = %app,
+                tenant = %tenant,
                 "unknown prepared statement handle; it was never prepared, or it was evicted"
             );
             StoreError::NotFound(format!("prepared statement {id} is unknown"))
         })?;
-        if &stmt.app_id != app {
+        if &stmt.tenant != tenant {
             tracing::warn!(
                 statement = %id,
-                owner = %stmt.app_id,
-                caller = %app,
-                "refused a prepared statement belonging to another app; the call touched no data"
+                owner = %stmt.tenant,
+                caller = %tenant,
+                "refused a prepared statement belonging to another tenant; the call touched no data"
             );
             return Err(StoreError::Tenant(format!(
-                "prepared statement {id} belongs to another app"
+                "prepared statement {id} belongs to another tenant"
             )));
         }
         Ok(stmt.sql.clone())
@@ -113,54 +117,63 @@ impl StatementRegistry {
 #[derive(Clone)]
 pub struct DatabaseService {
     root: PathBuf,
-    pools: Arc<Mutex<HashMap<AppId, SqlitePool>>>,
-    connections_per_app: usize,
+    pools: Arc<Mutex<HashMap<TenantId, SqlitePool>>>,
+    connections_per_tenant: usize,
     statements: Arc<StatementRegistry>,
 }
 
 impl DatabaseService {
-    /// Prepare `<data_dir>/db/`. Nothing is opened until an app asks.
-    pub fn open(data_dir: &std::path::Path, connections_per_app: usize) -> StoreResult<Self> {
+    /// Prepare `<data_dir>/db/`. Nothing is opened until a tenant asks.
+    pub fn open(data_dir: &std::path::Path, connections_per_tenant: usize) -> StoreResult<Self> {
         let root = data_dir.join("db");
         std::fs::create_dir_all(&root)?;
-        tracing::info!(path = %root.display(), "database service ready, one file per app");
+        // One file per tenant. A file named by a bare application id belongs
+        // to the layout this change replaced, and the tables in it would
+        // never be opened again.
+        crate::legacy::reject_pre_tenant_database_files(&root)?;
+        tracing::info!(path = %root.display(), "database service ready, one file per tenant");
         Ok(Self {
             root,
             pools: Arc::new(Mutex::new(HashMap::new())),
-            connections_per_app,
+            connections_per_tenant,
             statements: Arc::new(StatementRegistry::default()),
         })
     }
 
     /// The pool for one tenant, opened on first use.
-    fn pool(&self, app: &AppId) -> SqlitePool {
+    fn pool(&self, tenant: &TenantId) -> SqlitePool {
         let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pool) = pools.get(app) {
+        if let Some(pool) = pools.get(tenant) {
             return pool.clone();
         }
-        // `AppId` has already ruled out separators and dots, so this cannot
-        // resolve outside `root`.
-        let path = self.root.join(format!("{app}.sqlite"));
-        tracing::info!(app = %app, path = %path.display(), "opening this app's database file");
+        // A tenant id carries one dot, between its two halves, and neither
+        // half may contain a dot or a path separator - so the whole value is
+        // a single path component and cannot resolve outside `root`.
+        let path = self.root.join(format!("{tenant}.sqlite"));
+        tracing::info!(
+            tenant = %tenant,
+            path = %path.display(),
+            "opening this tenant's database file"
+        );
         let pool = SqlitePool::new(
             path,
-            format!("db:{app}"),
-            PoolSize::new(self.connections_per_app),
+            format!("db:{tenant}"),
+            PoolSize::new(self.connections_per_tenant),
         );
-        pools.insert(app.clone(), pool.clone());
+        pools.insert(tenant.clone(), pool.clone());
         pool
     }
 
     /// Run one statement that does not return rows.
     pub async fn exec_statement(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         sql: &str,
         params: &[SqlValue],
     ) -> StoreResult<ExecOutcome> {
         let sql = check_sql(sql)?;
         let params = params.to_vec();
-        self.pool(app)
+        self.pool(tenant)
             .with_conn(move |conn| {
                 let rows_affected = conn.execute(&sql, rusqlite::params_from_iter(params))?;
                 Ok(ExecOutcome {
@@ -174,13 +187,13 @@ impl DatabaseService {
     /// Run one statement and collect its rows.
     pub async fn fetch_rows(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         sql: &str,
         params: &[SqlValue],
     ) -> StoreResult<ResultSet> {
         let sql = check_sql(sql)?;
         let params = params.to_vec();
-        self.pool(app)
+        self.pool(tenant)
             .with_conn(move |conn| {
                 let mut stmt = conn.prepare(&sql)?;
                 let columns: Vec<String> = stmt
@@ -209,13 +222,13 @@ impl DatabaseService {
     /// land or none of them do.
     pub async fn exec_batch(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         statements: Vec<(String, Vec<SqlValue>)>,
     ) -> StoreResult<Result<Vec<ExecOutcome>, BatchFailure>> {
         for (sql, _) in &statements {
             check_sql(sql)?;
         }
-        self.pool(app)
+        self.pool(tenant)
             .with_conn(move |conn| {
                 // Deferred is enough here: `tx.execute` refuses a statement
                 // that returns rows, so a batch never reads before it writes
@@ -247,25 +260,25 @@ impl DatabaseService {
     }
 
     /// Validate `sql` and remember it under a handle.
-    pub async fn register_statement(&self, app: &AppId, sql: &str) -> StoreResult<String> {
+    pub async fn register_statement(&self, tenant: &TenantId, sql: &str) -> StoreResult<String> {
         let sql = check_sql(sql)?;
         let owned = sql.clone();
         // Prepare it once for real so a syntax error is reported now, at the
         // call that can explain it, rather than at some later execution.
-        self.pool(app)
+        self.pool(tenant)
             .with_conn(move |conn| {
                 conn.prepare(&owned)?;
                 Ok(())
             })
             .await?;
-        let id = self.statements.insert(app.clone(), sql);
-        tracing::debug!(app = %app, statement = %id, "prepared statement registered");
+        let id = self.statements.insert(tenant.clone(), sql);
+        tracing::debug!(tenant = %tenant, statement = %id, "prepared statement registered");
         Ok(id)
     }
 
     /// The SQL behind a handle, if this tenant owns it.
-    fn prepared_sql(&self, app: &AppId, id: &str) -> StoreResult<String> {
-        self.statements.resolve(app, id)
+    fn prepared_sql(&self, tenant: &TenantId, id: &str) -> StoreResult<String> {
+        self.statements.resolve(tenant, id)
     }
 }
 
@@ -306,7 +319,7 @@ fn check_sql(sql: &str) -> StoreResult<String> {
 /// Decode the JSON parameter array that storage.proto carries as a string.
 ///
 /// Only scalars are accepted: SQLite has no array or object type, and
-/// silently stringifying a nested value would store something the app never
+/// silently stringifying a nested value would store something the tenant never
 /// asked for and cannot get back.
 fn decode_params(params: Option<&str>) -> StoreResult<Vec<SqlValue>> {
     let Some(raw) = params else {
@@ -381,7 +394,7 @@ fn sql_to_json(value: ValueRef<'_>) -> JsonValue {
 }
 
 /// storage.proto reports statement failures inside the response, not as a
-/// gRPC status: an app's SQL typo is not a transport fault.
+/// gRPC status: a tenant's SQL typo is not a transport fault.
 fn failed_execute(message: String) -> ExecuteResponse {
     ExecuteResponse {
         success: false,
@@ -403,7 +416,7 @@ fn failed_query(message: String) -> QueryResponse {
 impl DatabaseService {
     async fn run_execute(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         sql: &str,
         params: Option<&str>,
     ) -> Result<ExecuteResponse, Status> {
@@ -411,10 +424,10 @@ impl DatabaseService {
             Ok(p) => p,
             Err(e) => return Ok(failed_execute(e.to_string())),
         };
-        match self.exec_statement(app, sql, &params).await {
+        match self.exec_statement(tenant, sql, &params).await {
             Ok(done) => {
                 tracing::debug!(
-                    app = %app,
+                    tenant = %tenant,
                     rows_affected = done.rows_affected,
                     "sql execute finished"
                 );
@@ -426,13 +439,13 @@ impl DatabaseService {
                 })
             }
             Err(StoreError::Sqlite(e)) => {
-                tracing::debug!(app = %app, error = %e, "sql execute rejected by sqlite");
+                tracing::debug!(tenant = %tenant, error = %e, "sql execute rejected by sqlite");
                 Ok(failed_execute(e.to_string()))
             }
             Err(e @ StoreError::InvalidArgument(_)) => Ok(failed_execute(e.to_string())),
             Err(other) => {
                 tracing::error!(
-                    app = %app,
+                    tenant = %tenant,
                     error = %other,
                     "sql execute failed below the statement level; the write did not happen"
                 );
@@ -443,7 +456,7 @@ impl DatabaseService {
 
     async fn run_query(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         sql: &str,
         params: Option<&str>,
     ) -> Result<QueryResponse, Status> {
@@ -451,10 +464,10 @@ impl DatabaseService {
             Ok(p) => p,
             Err(e) => return Ok(failed_query(e.to_string())),
         };
-        match self.fetch_rows(app, sql, &params).await {
+        match self.fetch_rows(tenant, sql, &params).await {
             Ok(result) => {
                 let row_count = result.rows.as_array().map(Vec::len).unwrap_or(0);
-                tracing::debug!(app = %app, rows = row_count, "sql query finished");
+                tracing::debug!(tenant = %tenant, rows = row_count, "sql query finished");
                 Ok(QueryResponse {
                     success: true,
                     rows: result.rows.to_string(),
@@ -463,13 +476,13 @@ impl DatabaseService {
                 })
             }
             Err(StoreError::Sqlite(e)) => {
-                tracing::debug!(app = %app, error = %e, "sql query rejected by sqlite");
+                tracing::debug!(tenant = %tenant, error = %e, "sql query rejected by sqlite");
                 Ok(failed_query(e.to_string()))
             }
             Err(e @ StoreError::InvalidArgument(_)) => Ok(failed_query(e.to_string())),
             Err(other) => {
                 tracing::error!(
-                    app = %app,
+                    tenant = %tenant,
                     error = %other,
                     "sql query failed below the statement level; no rows were returned"
                 );
@@ -485,11 +498,11 @@ impl Database for DatabaseService {
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        tracing::trace!(app = %app, sql = %req.sql, "sql execute");
+        tracing::trace!(tenant = %tenant, sql = %req.sql, "sql execute");
         Ok(Response::new(
-            self.run_execute(&app, &req.sql, req.params.as_deref())
+            self.run_execute(&tenant, &req.sql, req.params.as_deref())
                 .await?,
         ))
     }
@@ -498,11 +511,11 @@ impl Database for DatabaseService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        tracing::trace!(app = %app, sql = %req.sql, "sql query");
+        tracing::trace!(tenant = %tenant, sql = %req.sql, "sql query");
         Ok(Response::new(
-            self.run_query(&app, &req.sql, req.params.as_deref())
+            self.run_query(&tenant, &req.sql, req.params.as_deref())
                 .await?,
         ))
     }
@@ -511,9 +524,9 @@ impl Database for DatabaseService {
         &self,
         request: Request<BatchRequest>,
     ) -> Result<Response<BatchResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        tracing::debug!(app = %app, statements = req.statements.len(), "sql batch");
+        tracing::debug!(tenant = %tenant, statements = req.statements.len(), "sql batch");
 
         let mut decoded = Vec::with_capacity(req.statements.len());
         for (index, statement) in req.statements.iter().enumerate() {
@@ -529,7 +542,7 @@ impl Database for DatabaseService {
             }
         }
 
-        match self.exec_batch(&app, decoded).await {
+        match self.exec_batch(&tenant, decoded).await {
             Ok(Ok(done)) => Ok(Response::new(BatchResponse {
                 success: true,
                 results: done
@@ -545,7 +558,7 @@ impl Database for DatabaseService {
             })),
             Ok(Err(failure)) => {
                 tracing::warn!(
-                    app = %app,
+                    tenant = %tenant,
                     statement = failure.index,
                     error = %failure.message,
                     "sql batch rolled back; none of its statements were applied"
@@ -575,7 +588,7 @@ impl Database for DatabaseService {
             })),
             Err(other) => {
                 tracing::error!(
-                    app = %app,
+                    tenant = %tenant,
                     error = %other,
                     "sql batch failed below the statement level; nothing was applied"
                 );
@@ -588,16 +601,16 @@ impl Database for DatabaseService {
         &self,
         request: Request<PrepareRequest>,
     ) -> Result<Response<PrepareResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        match self.register_statement(&app, &req.sql).await {
+        match self.register_statement(&tenant, &req.sql).await {
             Ok(statement_id) => Ok(Response::new(PrepareResponse {
                 success: true,
                 statement_id,
                 error: None,
             })),
             Err(StoreError::Sqlite(e)) => {
-                tracing::debug!(app = %app, error = %e, "prepare rejected by sqlite");
+                tracing::debug!(tenant = %tenant, error = %e, "prepare rejected by sqlite");
                 Ok(Response::new(PrepareResponse {
                     success: false,
                     statement_id: String::new(),
@@ -610,7 +623,11 @@ impl Database for DatabaseService {
                 error: Some(e.to_string()),
             })),
             Err(other) => {
-                tracing::error!(app = %app, error = %other, "prepare failed; no handle was issued");
+                tracing::error!(
+                    tenant = %tenant,
+                    error = %other,
+                    "prepare failed; no handle was issued"
+                );
                 Err(other.into())
             }
         }
@@ -620,9 +637,9 @@ impl Database for DatabaseService {
         &self,
         request: Request<ExecutePreparedRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        let sql = match self.prepared_sql(&app, &req.statement_id) {
+        let sql = match self.prepared_sql(&tenant, &req.statement_id) {
             Ok(sql) => sql,
             Err(e @ StoreError::NotFound(_)) => {
                 return Ok(Response::new(failed_execute(e.to_string())));
@@ -630,7 +647,8 @@ impl Database for DatabaseService {
             Err(other) => return Err(other.into()),
         };
         Ok(Response::new(
-            self.run_execute(&app, &sql, req.params.as_deref()).await?,
+            self.run_execute(&tenant, &sql, req.params.as_deref())
+                .await?,
         ))
     }
 
@@ -638,9 +656,9 @@ impl Database for DatabaseService {
         &self,
         request: Request<QueryPreparedRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        let sql = match self.prepared_sql(&app, &req.statement_id) {
+        let sql = match self.prepared_sql(&tenant, &req.statement_id) {
             Ok(sql) => sql,
             Err(e @ StoreError::NotFound(_)) => {
                 return Ok(Response::new(failed_query(e.to_string())));
@@ -648,7 +666,7 @@ impl Database for DatabaseService {
             Err(other) => return Err(other.into()),
         };
         Ok(Response::new(
-            self.run_query(&app, &sql, req.params.as_deref()).await?,
+            self.run_query(&tenant, &sql, req.params.as_deref()).await?,
         ))
     }
 }
@@ -664,13 +682,13 @@ mod tests {
         (dir, svc)
     }
 
-    fn app(name: &str) -> AppId {
-        AppId::parse(name).unwrap()
+    fn tenant(name: &str) -> TenantId {
+        TenantId::parse(name).unwrap()
     }
 
-    async fn make_table(svc: &DatabaseService, app: &AppId) {
+    async fn make_table(svc: &DatabaseService, tenant: &TenantId) {
         svc.exec_statement(
-            app,
+            tenant,
             "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)",
             &[],
         )
@@ -678,14 +696,14 @@ mod tests {
         .unwrap();
     }
 
-    /// Two of an app's batches overlapping is ordinary and must not make
+    /// Two of a tenant's batches overlapping is ordinary and must not make
     /// either of them fail. They contend for one file's write lock, and the
     /// loser is expected to wait its turn rather than come back "database is
     /// locked".
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_batches_wait_for_each_other() {
         let (_dir, svc) = service();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         make_table(&svc, &a).await;
 
         let batches: Vec<_> = (0..16)
@@ -721,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn executes_and_queries() {
         let (_dir, svc) = service();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         make_table(&svc, &a).await;
 
         let done = svc
@@ -749,25 +767,25 @@ mod tests {
     #[tokio::test]
     async fn each_app_gets_its_own_file() {
         let (dir, svc) = service();
-        let one = app("app-one");
-        let two = app("app-two");
+        let one = tenant("app-one.production");
+        let two = tenant("app-two.production");
         make_table(&svc, &one).await;
         svc.exec_statement(&one, "INSERT INTO users(name) VALUES('Alice')", &[])
             .await
             .unwrap();
 
-        // The second app has no such table at all.
+        // The second tenant has no such table at all.
         let err = svc.fetch_rows(&two, "SELECT * FROM users", &[]).await;
         assert!(matches!(err, Err(StoreError::Sqlite(_))));
 
-        assert!(dir.path().join("db/app-one.sqlite").exists());
-        assert!(dir.path().join("db/app-two.sqlite").exists());
+        assert!(dir.path().join("db/app-one.production.sqlite").exists());
+        assert!(dir.path().join("db/app-two.production.sqlite").exists());
     }
 
     #[tokio::test]
     async fn a_batch_is_all_or_nothing() {
         let (_dir, svc) = service();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         make_table(&svc, &a).await;
 
         let failure = svc
@@ -818,8 +836,8 @@ mod tests {
     #[tokio::test]
     async fn prepared_statements_are_scoped_to_their_app() {
         let (_dir, svc) = service();
-        let one = app("app-one");
-        let two = app("app-two");
+        let one = tenant("app-one.production");
+        let two = tenant("app-two.production");
         make_table(&svc, &one).await;
 
         let id = svc
@@ -843,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_rejects_bad_sql_up_front() {
         let (_dir, svc) = service();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         assert!(matches!(
             svc.register_statement(&a, "SELCT 1").await,
             Err(StoreError::Sqlite(_))
@@ -857,7 +875,7 @@ mod tests {
     #[test]
     fn statement_registry_evicts_the_oldest_when_full() {
         let registry = StatementRegistry::default();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let first = registry.insert(a.clone(), "SELECT 1".to_string());
         for i in 0..MAX_PREPARED_STATEMENTS {
             registry.insert(a.clone(), format!("SELECT {i}"));
@@ -897,7 +915,7 @@ mod tests {
     #[tokio::test]
     async fn blob_columns_come_back_as_byte_arrays() {
         let (_dir, svc) = service();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         svc.exec_statement(&a, "CREATE TABLE raw(b BLOB)", &[])
             .await
             .unwrap();

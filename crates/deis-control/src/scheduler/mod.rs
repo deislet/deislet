@@ -60,7 +60,8 @@ pub struct CronTask {
     /// Why this expression will never fire, when that is the case.
     pub unusable: Option<String>,
     pub next_run: Option<DateTime<Utc>>,
-    /// When this task was last due, whether or not a node took it.
+    /// When this task was last due, whether or not a node took it. The
+    /// time the occurrence was due, not the time the tick fired it.
     pub last_run: Option<DateTime<Utc>>,
     /// Node that ran the last occurrence. `None` after an occurrence that
     /// no node accepted.
@@ -74,6 +75,21 @@ impl CronTask {
             environment: self.environment.clone(),
         }
     }
+}
+
+/// One occurrence that has come due, as [`CronScheduler::fire_due`] found
+/// it: which task, where it sits in that key's list, and the time it was
+/// due - which is what the node is told, and is not the same as the time
+/// the tick noticed it.
+#[derive(Debug, Clone)]
+struct Due {
+    key: CronKey,
+    /// Position in `tasks[key]`. Advancing by position rather than by
+    /// expression is what keeps two identical expressions from leaving one
+    /// of them permanently due.
+    index: usize,
+    cron_expr: String,
+    scheduled: DateTime<Utc>,
 }
 
 /// Outcome of one reconciliation against the catalog, for logging.
@@ -236,7 +252,23 @@ impl CronScheduler {
 
             let mut existing = self.tasks.remove(&key).map(|(_, v)| v).unwrap_or_default();
             let mut rebuilt = Vec::with_capacity(expressions.len());
+            let mut kept_expressions: HashSet<String> = HashSet::with_capacity(expressions.len());
             for expr in expressions {
+                // The same expression twice would be two tasks that both
+                // come due at the same instant, so the handler would run
+                // twice per occurrence - and only one of the two would ever
+                // have its next occurrence advanced, leaving the other due
+                // for ever and firing on every single tick.
+                if !kept_expressions.insert(expr.clone()) {
+                    warn!(
+                        app_id = %current.app_id,
+                        environment = %current.environment,
+                        version_id = %current.version_id,
+                        cron = %expr,
+                        "The deployed manifest declares this cron expression more than once; the repeats are ignored, so the handler runs once per occurrence and not once per copy"
+                    );
+                    continue;
+                }
                 match existing.iter().position(|t| t.cron_expr == expr) {
                     Some(index) => {
                         let mut task = existing.remove(index);
@@ -300,15 +332,27 @@ impl CronScheduler {
         // Collect first, then call. Holding a DashMap guard across an await
         // would block every other reader of the shard for the length of a
         // gRPC call.
-        let due: Vec<(CronKey, String)> = self
+        //
+        // The position in the list travels with each item, not just the
+        // expression: it is what the occurrence is recorded against
+        // afterwards, so a task can never be fired without being advanced.
+        let due: Vec<Due> = self
             .tasks
             .iter()
             .flat_map(|entry| {
                 entry
                     .value()
                     .iter()
-                    .filter(|task| task.next_run.is_some_and(|next| next <= now))
-                    .map(|task| (task.key(), task.cron_expr.clone()))
+                    .enumerate()
+                    .filter_map(|(index, task)| {
+                        let scheduled = task.next_run.filter(|next| *next <= now)?;
+                        Some(Due {
+                            key: task.key(),
+                            index,
+                            cron_expr: task.cron_expr.clone(),
+                            scheduled,
+                        })
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -317,9 +361,9 @@ impl CronScheduler {
             return;
         }
 
-        for (key, expr) in due {
-            let node = self.trigger_once(&key, &expr, now).await;
-            self.record_run(&key, &expr, now, node);
+        for item in due {
+            let node = self.trigger_once(&item, now).await;
+            self.record_run(&item, now, node);
         }
     }
 
@@ -327,12 +371,31 @@ impl CronScheduler {
     /// node refuses or is unreachable.
     ///
     /// Returns the node that ran it, or `None` when nobody did.
-    async fn trigger_once(
-        &self,
-        key: &CronKey,
-        cron_expr: &str,
-        scheduled: DateTime<Utc>,
-    ) -> Option<String> {
+    async fn trigger_once(&self, due: &Due, now: DateTime<Utc>) -> Option<String> {
+        let Due {
+            key,
+            cron_expr,
+            scheduled,
+            ..
+        } = due;
+        let cron_expr = cron_expr.as_str();
+        // The node is told when the occurrence was *due*, not when this
+        // tick noticed it. A handler that uses scheduled_time as an
+        // idempotency key would otherwise see a value that moves by up to
+        // one tick interval between runs of the same occurrence, and two
+        // control planes ticking at different offsets would disagree about
+        // the same occurrence entirely.
+        let lateness = (now - *scheduled).num_seconds();
+        if lateness >= self.tick_interval.as_secs() as i64 {
+            debug!(
+                app_id = %key.app_id,
+                environment = %key.environment,
+                cron = %cron_expr,
+                due = %scheduled,
+                late_seconds = lateness,
+                "Firing an occurrence later than one tick after it was due; the node is told the time it was due, not now"
+            );
+        }
         let rotation = self.rotation.fetch_add(1, Ordering::Relaxed);
         let candidates = self.nodes.call_order(rotation);
         if candidates.is_empty() {
@@ -349,7 +412,7 @@ impl CronScheduler {
         for node in &candidates {
             let error = match self
                 .nodes
-                .trigger_scheduled(node, &key.app_id, cron_expr, scheduled)
+                .trigger_scheduled(node, &key.app_id, cron_expr, *scheduled)
                 .await
             {
                 Ok(resp) if resp.success => {
@@ -397,24 +460,43 @@ impl CronScheduler {
     /// in the past would re-fire the same occurrence on every tick, which
     /// turns one unreachable fleet into a flood of duplicate runs once it
     /// comes back.
-    fn record_run(&self, key: &CronKey, cron_expr: &str, now: DateTime<Utc>, node: Option<String>) {
-        let Some(mut entry) = self.tasks.get_mut(key) else {
+    ///
+    /// The task is found by the position [`Self::fire_due`] read it from,
+    /// not by searching for its expression: a search advances whichever
+    /// copy comes first, so any list that ever held two identical
+    /// expressions would leave the second one permanently due.
+    ///
+    /// The next occurrence is computed from `now` rather than from the time
+    /// the fire was due, so a tick that ran late does not immediately find
+    /// the same task due again.
+    fn record_run(&self, due: &Due, now: DateTime<Utc>, node: Option<String>) {
+        let Some(mut entry) = self.tasks.get_mut(&due.key) else {
             return;
         };
         let Some(task) = entry
             .value_mut()
-            .iter_mut()
-            .find(|task| task.cron_expr == cron_expr)
+            .get_mut(due.index)
+            .filter(|task| task.cron_expr == due.cron_expr)
         else {
+            // The list was rebuilt under this fire - the version was
+            // deployed away between collecting and firing - so there is
+            // nothing left to advance.
+            debug!(
+                app_id = %due.key.app_id,
+                environment = %due.key.environment,
+                cron = %due.cron_expr,
+                "The task list changed while this occurrence was firing, so nothing was recorded against it"
+            );
             return;
         };
-        task.last_run = Some(now);
+        task.last_run = Some(due.scheduled);
         task.last_node = node;
         task.next_run = task.schedule.as_ref().and_then(|cron| cron.next_after(now));
         debug!(
-            app_id = %key.app_id,
-            environment = %key.environment,
-            cron = %cron_expr,
+            app_id = %due.key.app_id,
+            environment = %due.key.environment,
+            cron = %due.cron_expr,
+            was_due = %due.scheduled,
             next_run = ?task.next_run,
             "Scheduled the next occurrence"
         );
@@ -439,6 +521,23 @@ fn new_task(
         last_run: None,
         last_node: None,
     };
+
+    // Said once, when the task is registered, rather than on every fire.
+    // A schedule is keyed by (app, environment) here, but `ScheduledEvent`
+    // carries only the app id, so a node receiving this fire runs the
+    // default environment of that app - the wrong code with the wrong
+    // secrets when the schedule belongs to a preview. Carrying the
+    // environment needs a field on trigger.proto; until then the operator
+    // has to be told which schedules are affected.
+    if task.environment != deis_wire::conventions::DEFAULT_ENVIRONMENT {
+        warn!(
+            app_id = %task.app_id,
+            environment = %task.environment,
+            cron = %task.cron_expr,
+            default_environment = deis_wire::conventions::DEFAULT_ENVIRONMENT,
+            "This schedule belongs to a preview environment, but a scheduled trigger can only name the application; every occurrence will run the default environment's handler, with that environment's version and secrets"
+        );
+    }
 
     match task.cron_expr.parse::<Cron>() {
         Ok(cron) => match cron.next_after(now) {
@@ -619,16 +718,9 @@ mod tests {
         );
     }
 
-    /// An occurrence nobody could run is skipped, not repeated: the task
-    /// must move on to its next occurrence anyway.
-    #[tokio::test]
-    async fn a_due_task_advances_even_when_no_node_takes_it() {
-        let (scheduler, store) = scheduler().await;
-        deploy(&store, None, &["*/5 * * * *"]).await;
-        scheduler.refresh().await;
-
-        let now = Utc::now();
-        // Pull the occurrence into the past, as a tick would find it.
+    /// Pull every occurrence of one environment into the past, the way a
+    /// tick that arrives after the due time finds them.
+    fn make_due(scheduler: &CronScheduler, at: DateTime<Utc>) {
         let key = CronKey {
             app_id: "demo".to_string(),
             environment: "production".to_string(),
@@ -639,16 +731,84 @@ mod tests {
             .unwrap()
             .value_mut()
             .iter_mut()
-            .for_each(|task| task.next_run = Some(now - chrono::Duration::minutes(1)));
+            .for_each(|task| task.next_run = Some(at));
+    }
+
+    /// An occurrence nobody could run is skipped, not repeated: the task
+    /// must move on to its next occurrence anyway.
+    #[tokio::test]
+    async fn a_due_task_advances_even_when_no_node_takes_it() {
+        let (scheduler, store) = scheduler().await;
+        deploy(&store, None, &["*/5 * * * *"]).await;
+        scheduler.refresh().await;
+
+        let now = Utc::now();
+        let was_due = now - chrono::Duration::minutes(1);
+        make_due(&scheduler, was_due);
 
         scheduler.fire_due(now).await;
 
         let task = &scheduler.tasks_for("demo", "production")[0];
-        assert_eq!(task.last_run, Some(now));
+        // The occurrence is recorded at the time it was due, not at the
+        // time the tick got round to it.
+        assert_eq!(task.last_run, Some(was_due));
         assert!(task.last_node.is_none(), "no node was configured");
         assert!(
             task.next_run.is_some_and(|next| next > now),
             "the next occurrence must be in the future, or the fire repeats every tick"
         );
+    }
+
+    /// A manifest that repeats a cron line - one copy-paste - used to
+    /// register two tasks that both came due at the same instant, so the
+    /// handler ran twice; and since only the first was ever advanced, the
+    /// second stayed due and fired again on every single tick.
+    #[tokio::test]
+    async fn a_repeated_cron_expression_becomes_one_task() {
+        let (scheduler, store) = scheduler().await;
+        deploy(&store, None, &["*/5 * * * *", "*/5 * * * *", "30 2 * * *"]).await;
+        scheduler.refresh().await;
+
+        let tasks = scheduler.tasks_for("demo", "production");
+        assert_eq!(tasks.len(), 2, "the repeat must not become a second task");
+        let mut expressions: Vec<&str> = tasks.iter().map(|t| t.cron_expr.as_str()).collect();
+        expressions.sort_unstable();
+        assert_eq!(expressions, ["*/5 * * * *", "30 2 * * *"]);
+    }
+
+    /// Every task that fires must be advanced, whatever its position in
+    /// the list: advancing by a search for the expression would leave any
+    /// later duplicate permanently due.
+    #[tokio::test]
+    async fn every_fired_task_advances_not_only_the_first_of_its_list() {
+        let (scheduler, store) = scheduler().await;
+        deploy(&store, None, &["*/5 * * * *", "*/10 * * * *"]).await;
+        scheduler.refresh().await;
+
+        let now = Utc::now();
+        let was_due = now - chrono::Duration::minutes(1);
+        make_due(&scheduler, was_due);
+
+        scheduler.fire_due(now).await;
+
+        for task in scheduler.tasks_for("demo", "production") {
+            assert_eq!(
+                task.last_run,
+                Some(was_due),
+                "{} was not recorded",
+                task.cron_expr
+            );
+            assert!(
+                task.next_run.is_some_and(|next| next > now),
+                "{} stayed due and would fire again on the next tick",
+                task.cron_expr
+            );
+        }
+
+        // A second tick with nothing newly due must fire nothing at all.
+        scheduler.fire_due(now).await;
+        for task in scheduler.tasks_for("demo", "production") {
+            assert_eq!(task.last_run, Some(was_due));
+        }
     }
 }

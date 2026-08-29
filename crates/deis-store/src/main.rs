@@ -1,8 +1,9 @@
 //! Deislet storage services: KV, database and blob.
 //!
-//! This service is deliberately "dumb": it knows only `app_id` as a tenant
-//! dimension, and knows nothing about versions, environments or deployments.
-//! Those concepts live in deis-control and deis-runtime.
+//! This service is deliberately "dumb": one tenant dimension, carried in the
+//! `x-deis-tenant` header, and no idea what a version, an environment or a
+//! deployment is. Those concepts live in deis-control and deis-runtime, which
+//! is also where the tenant id is built - here it is one opaque key.
 //!
 //! It also does not authenticate its callers: the tenant header is taken at
 //! face value, which is why it listens on loopback by default. See the crate

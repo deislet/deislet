@@ -22,8 +22,15 @@ use std::io::{Cursor, Read};
 use serde::{Deserialize, Serialize};
 
 pub mod assets;
+pub mod path;
+pub mod routing;
 
 pub use assets::{AssetIndex, AssetMatch, guess_content_type};
+pub use path::percent_decode;
+pub use routing::{
+    CATCH_ALL_PARAM, CATCH_ALL_SEGMENT, PLACEHOLDER_PREFIX, Specificity, segments,
+    sort_by_specificity,
+};
 
 /// Manifest schema this version of the platform understands.
 pub const SUPPORTED_SCHEMA: u32 = 1;

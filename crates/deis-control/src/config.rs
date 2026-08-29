@@ -145,3 +145,27 @@ impl ControlConfig {
         Ok(toml::from_str(&content)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one file operators are told to copy has to deserialize into
+    /// this struct. A `[tls]` section missing `cert_path`, for instance,
+    /// turns "copy and edit" into a control plane that refuses to start
+    /// with a message about a missing field - and the example is exactly
+    /// where nobody thinks to look.
+    #[test]
+    fn the_example_configuration_parses() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/deis-control.example.toml");
+        let text = std::fs::read_to_string(path).expect("the example configuration must exist");
+        let config: ControlConfig = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("deis-control.example.toml does not parse: {e}"));
+
+        assert!(
+            !config.node_preshared_keys.is_empty(),
+            "the example must show a node key: without one the assignment list serves no secret to any node"
+        );
+        assert!(config.api_auth_enabled);
+    }
+}

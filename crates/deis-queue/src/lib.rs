@@ -1,11 +1,26 @@
 //! Deislet message queue: durable enqueue plus lease-based consumption.
 //!
 //! The service is deliberately "dumb". It knows exactly one thing about the
-//! world outside itself: an `app_id`, carried in the `x-deis-app-id` gRPC
+//! world outside itself: a tenant id, carried in the `x-deis-tenant` gRPC
 //! metadata header. It has no idea what a version, an environment, a
 //! deployment or a node is, and it never calls anything back. Consumers come
 //! to it; it does not push to them, because pushing would mean the queue had
-//! to know which node runs which app.
+//! to know which node runs which application.
+//!
+//! # What a tenant is here, and what it is not
+//!
+//! The platform above builds the tenant id out of an application and an
+//! environment (`deis_wire::conventions::tenant_id`), so `demo.production`
+//! and `demo.preview-7` are two tenants of one application with two separate
+//! sets of queues. To this service that is invisible: it sees one opaque key,
+//! one tenant dimension, and it never takes the value apart for any purpose
+//! other than validating it. That is the point - a preview deployment must
+//! not be able to consume the work production enqueued, and the cheapest way
+//! to guarantee it is that the two never name the same rows here.
+//!
+//! Note which header carries it. `x-deis-app-id` names the *application* on
+//! the data path and is not the storage tenant; a call that stamps only that
+//! one is refused rather than served from a default namespace.
 //!
 //! # Delivery semantics
 //!
@@ -27,19 +42,35 @@
 //! Data layout under the configured data directory:
 //!
 //! ```text
-//! queue.sqlite    messages and dead letters, both partitioned by app_id
+//! queue.sqlite    messages and dead letters, both partitioned by tenant
 //! ```
+//!
+//! # A data directory from before this change is not readable
+//!
+//! Rows used to be keyed by a bare application id in an `app_id` column. That
+//! column no longer exists and nothing looks for it, so an old `queue.sqlite`
+//! holds messages that would never be delivered again. There is no migration,
+//! and there will not be one: this is a development platform with no deployed
+//! data, and inventing an environment for an old message would be inventing
+//! where to deliver it.
+//!
+//! What there is instead is a refusal: the service checks at startup and will
+//! not serve over a database in the old shape, because the alternative is a
+//! queue that looks healthy while every pull answers "nothing ready". See
+//! [`legacy`].
 //!
 //! # Trust model: the tenant header is believed, and that is why we listen on
 //! loopback
 //!
-//! Every request names its tenant in the `x-deis-app-id` header and the
+//! Every request names its tenant in the `x-deis-tenant` header and the
 //! service acts on it as given. There is no authorization step, because there
 //! is nothing to authorize against: the queue holds no credentials and no
 //! table of who may be whom. A client that can open a connection to this port
-//! can read and delete any app's messages simply by putting that app's id in
-//! the header. There is no privilege escalation to find here; it is the
-//! design as it stands, and it is the same trade deis-store makes.
+//! can read and delete any tenant's messages simply by putting that tenant's
+//! id in the header - including another environment of its own application,
+//! which the tenant split otherwise keeps apart. There is no privilege
+//! escalation to find here; it is the design as it stands, and it is the same
+//! trade deis-store makes.
 //!
 //! What contains it, for this round, is reachability: the default listen
 //! address is `127.0.0.1`, so the only callers are processes on the same
@@ -48,7 +79,7 @@
 //! turns a local trust assumption into an open one. Exposing this service
 //! beyond the local host is not a configuration change, it is a feature that
 //! does not exist yet: it needs an identity per caller, a check that the
-//! identity is entitled to the `app_id` the call claims, and refusals logged
+//! identity is entitled to the tenant the call claims, and refusals logged
 //! with enough context to investigate.
 
 // Re-exported so every component in the platform spells these the same
@@ -57,6 +88,7 @@ pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 
 pub mod config;
 pub mod error;
+pub mod legacy;
 pub mod proto;
 pub mod queue;
 pub mod server;

@@ -6,6 +6,12 @@
 //! the server, and the lease and dead letter behaviour a consumer will
 //! actually meet.
 //!
+//! Every call stamps `x-deis-tenant` with an `<app>.<environment>` value,
+//! which is what deis-runtime has to send. The tests below use
+//! `app-one.production` and `app-two.production` as two unrelated tenants,
+//! and one test pairs `app-one.production` with `app-one.preview` to check
+//! that two environments of the *same* application are also two namespaces.
+//!
 //! The two tests that wait for a lease to lapse use a one-second lease and
 //! poll for the message to reappear, under a hard deadline. They wait on the
 //! event itself - the message becoming visible again - rather than assuming a
@@ -17,8 +23,9 @@ use deis_queue::proto::queue::{
     AckRequest, NackRequest, PullRequest, QueueMessage, SendBatchRequest, SendRequest,
     queue_client::QueueClient,
 };
-use deis_queue::tenant::APP_ID_HEADER;
+use deis_queue::tenant::TENANT_HEADER;
 use deis_queue::{MAX_GRPC_MESSAGE_BYTES, server};
+use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -93,18 +100,18 @@ impl Drop for Harness {
 }
 
 /// Stamp the tenant the way deis-runtime has to.
-fn as_app<T>(app: &str, message: T) -> Request<T> {
+fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
-        .insert(APP_ID_HEADER, app.parse().unwrap());
+        .insert(TENANT_HEADER, tenant.parse().unwrap());
     request
 }
 
-async fn send(client: &mut QueueClient<Channel>, app: &str, queue: &str, body: &str) -> String {
+async fn send(client: &mut QueueClient<Channel>, tenant: &str, queue: &str, body: &str) -> String {
     let response = client
-        .send(as_app(
-            app,
+        .send(as_tenant(
+            tenant,
             SendRequest {
                 queue_name: queue.to_string(),
                 message_body: body.to_string(),
@@ -121,14 +128,14 @@ async fn send(client: &mut QueueClient<Channel>, app: &str, queue: &str, body: &
 
 async fn pull(
     client: &mut QueueClient<Channel>,
-    app: &str,
+    tenant: &str,
     queue: &str,
     max_messages: i32,
     lease_seconds: i32,
 ) -> Vec<QueueMessage> {
     client
-        .pull(as_app(
-            app,
+        .pull(as_tenant(
+            tenant,
             PullRequest {
                 queue_name: queue.to_string(),
                 max_messages,
@@ -148,12 +155,12 @@ async fn pull(
 /// turns a lease that never lapses into a failure rather than a hang.
 async fn pull_until_delivered(
     client: &mut QueueClient<Channel>,
-    app: &str,
+    tenant: &str,
     queue: &str,
 ) -> Vec<QueueMessage> {
     let deadline = tokio::time::Instant::now() + LEASE_DEADLINE;
     loop {
-        let messages = pull(client, app, queue, 10, 30).await;
+        let messages = pull(client, tenant, queue, 10, 30).await;
         if !messages.is_empty() {
             return messages;
         }
@@ -165,10 +172,15 @@ async fn pull_until_delivered(
     }
 }
 
-async fn ack(client: &mut QueueClient<Channel>, app: &str, queue: &str, ids: Vec<String>) -> i32 {
+async fn ack(
+    client: &mut QueueClient<Channel>,
+    tenant: &str,
+    queue: &str,
+    ids: Vec<String>,
+) -> i32 {
     client
-        .ack(as_app(
-            app,
+        .ack(as_tenant(
+            tenant,
             AckRequest {
                 queue_name: queue.to_string(),
                 message_ids: ids,
@@ -182,14 +194,14 @@ async fn ack(client: &mut QueueClient<Channel>, app: &str, queue: &str, ids: Vec
 
 async fn nack(
     client: &mut QueueClient<Channel>,
-    app: &str,
+    tenant: &str,
     queue: &str,
     ids: Vec<String>,
     delay_seconds: i32,
 ) -> (i32, i32) {
     let response = client
-        .nack(as_app(
-            app,
+        .nack(as_tenant(
+            tenant,
             NackRequest {
                 queue_name: queue.to_string(),
                 message_ids: ids,
@@ -207,9 +219,9 @@ async fn send_pull_ack_and_the_message_is_gone() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
 
-    let id = send(&mut client, "app-one", "jobs", "work").await;
+    let id = send(&mut client, "app-one.production", "jobs", "work").await;
 
-    let leased = pull(&mut client, "app-one", "jobs", 10, 30).await;
+    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, id);
     assert_eq!(leased[0].body, "work");
@@ -219,13 +231,16 @@ async fn send_pull_ack_and_the_message_is_gone() {
         "the lease should run 30 seconds past now"
     );
 
-    assert_eq!(ack(&mut client, "app-one", "jobs", vec![id]).await, 1);
+    assert_eq!(
+        ack(&mut client, "app-one.production", "jobs", vec![id]).await,
+        1
+    );
 
     // Nothing is left, and the empty answer comes back immediately rather
     // than the server holding the call open waiting for work.
     let empty = tokio::time::timeout(
         Duration::from_secs(5),
-        pull(&mut client, "app-one", "jobs", 10, 30),
+        pull(&mut client, "app-one.production", "jobs", 10, 30),
     )
     .await
     .expect("an empty pull must answer at once, not wait for work");
@@ -238,8 +253,8 @@ async fn a_batch_is_sent_and_pulled_in_order() {
     let mut client = harness.client().await;
 
     let ids = client
-        .send_batch(as_app(
-            "app-one",
+        .send_batch(as_tenant(
+            "app-one.production",
             SendBatchRequest {
                 queue_name: "jobs".to_string(),
                 messages: vec!["one".to_string(), "two".to_string(), "three".to_string()],
@@ -251,7 +266,7 @@ async fn a_batch_is_sent_and_pulled_in_order() {
         .message_ids;
     assert_eq!(ids.len(), 3);
 
-    let leased = pull(&mut client, "app-one", "jobs", 10, 30).await;
+    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
     let bodies: Vec<&str> = leased.iter().map(|m| m.body.as_str()).collect();
     assert_eq!(bodies, vec!["one", "two", "three"]);
 }
@@ -260,24 +275,24 @@ async fn a_batch_is_sent_and_pulled_in_order() {
 async fn a_message_whose_lease_lapses_is_delivered_again() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one", "jobs", "work").await;
+    let id = send(&mut client, "app-one.production", "jobs", "work").await;
 
     // Lease it and then behave like a consumer that died: never ack, never
     // nack, just stop. Three seconds, not one: the stored lease is a whole
     // second, so a one-second lease taken at the end of a second could lapse
     // before the very next line runs.
-    let first = pull(&mut client, "app-one", "jobs", 10, 3).await;
+    let first = pull(&mut client, "app-one.production", "jobs", 10, 3).await;
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].attempts, 1);
     // Inside the lease nobody else can see it.
     assert!(
-        pull(&mut client, "app-one", "jobs", 10, 30)
+        pull(&mut client, "app-one.production", "jobs", 10, 30)
             .await
             .is_empty(),
         "a leased message must be invisible while its lease holds"
     );
 
-    let again = pull_until_delivered(&mut client, "app-one", "jobs").await;
+    let again = pull_until_delivered(&mut client, "app-one.production", "jobs").await;
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].id, id);
     assert_eq!(again[0].attempts, 2, "the redelivery is a second attempt");
@@ -288,24 +303,31 @@ async fn a_message_whose_lease_lapses_is_delivered_again() {
 async fn a_nack_with_a_delay_holds_the_message_back_then_returns_it() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one", "jobs", "work").await;
+    let id = send(&mut client, "app-one.production", "jobs", "work").await;
 
-    let leased = pull(&mut client, "app-one", "jobs", 10, 30).await;
+    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
 
     assert_eq!(
-        nack(&mut client, "app-one", "jobs", vec![id.clone()], 3).await,
+        nack(
+            &mut client,
+            "app-one.production",
+            "jobs",
+            vec![id.clone()],
+            3
+        )
+        .await,
         (1, 0),
         "an attempt is still left, so the message is released rather than retired"
     );
     assert!(
-        pull(&mut client, "app-one", "jobs", 10, 30)
+        pull(&mut client, "app-one.production", "jobs", 10, 30)
             .await
             .is_empty(),
         "the delay must actually hold the message back"
     );
 
-    let back = pull_until_delivered(&mut client, "app-one", "jobs").await;
+    let back = pull_until_delivered(&mut client, "app-one.production", "jobs").await;
     assert_eq!(back.len(), 1);
     assert_eq!(back[0].id, id);
     assert_eq!(back[0].attempts, 2);
@@ -315,13 +337,20 @@ async fn a_nack_with_a_delay_holds_the_message_back_then_returns_it() {
 async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one", "jobs", "poison").await;
+    let id = send(&mut client, "app-one.production", "jobs", "poison").await;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let leased = pull(&mut client, "app-one", "jobs", 10, 30).await;
+        let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
         assert_eq!(leased.len(), 1, "attempt {attempt} should be delivered");
         assert_eq!(leased[0].attempts, attempt);
-        let outcome = nack(&mut client, "app-one", "jobs", vec![id.clone()], 0).await;
+        let outcome = nack(
+            &mut client,
+            "app-one.production",
+            "jobs",
+            vec![id.clone()],
+            0,
+        )
+        .await;
         if attempt < MAX_ATTEMPTS {
             assert_eq!(outcome, (1, 0), "attempt {attempt} should be retried");
         } else {
@@ -330,42 +359,49 @@ async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
     }
 
     assert!(
-        pull(&mut client, "app-one", "jobs", 10, 30)
+        pull(&mut client, "app-one.production", "jobs", 10, 30)
             .await
             .is_empty(),
         "a dead lettered message must never be delivered again"
     );
     // The queue still works for everything else.
-    let next = send(&mut client, "app-one", "jobs", "healthy").await;
-    let leased = pull(&mut client, "app-one", "jobs", 10, 30).await;
+    let next = send(&mut client, "app-one.production", "jobs", "healthy").await;
+    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, next);
 }
 
 #[tokio::test]
-async fn one_app_cannot_see_or_touch_another_apps_messages() {
+async fn one_tenant_cannot_see_or_touch_another_tenants_messages() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
-    let id = send(&mut client, "app-one", "jobs", "private").await;
+    let id = send(&mut client, "app-one.production", "jobs", "private").await;
 
     // Same queue name, different tenant: nothing.
     assert!(
-        pull(&mut client, "app-two", "jobs", 10, 30)
+        pull(&mut client, "app-two.production", "jobs", 10, 30)
             .await
             .is_empty()
     );
-    // Nor can the other app acknowledge or return it.
+    // Nor can the other tenant acknowledge or return it.
     assert_eq!(
-        ack(&mut client, "app-two", "jobs", vec![id.clone()]).await,
+        ack(&mut client, "app-two.production", "jobs", vec![id.clone()]).await,
         0
     );
     assert_eq!(
-        nack(&mut client, "app-two", "jobs", vec![id.clone()], 0).await,
+        nack(
+            &mut client,
+            "app-two.production",
+            "jobs",
+            vec![id.clone()],
+            0
+        )
+        .await,
         (0, 0)
     );
 
     // The owner still has it, untouched and on its first attempt.
-    let leased = pull(&mut client, "app-one", "jobs", 10, 30).await;
+    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, id);
     assert_eq!(leased[0].attempts, 1);
@@ -394,6 +430,85 @@ async fn a_call_without_the_tenant_header_is_refused() {
         .await
         .expect_err("a call with no tenant must be refused");
     assert_eq!(status.code(), Code::PermissionDenied);
+
+    // The application header is not the storage tenant. A caller that stamps
+    // only `x-deis-app-id` - which is what every caller did before this
+    // change - is refused rather than served production's queue.
+    let mut request = Request::new(PullRequest {
+        queue_name: "jobs".to_string(),
+        max_messages: 10,
+        lease_seconds: 30,
+    });
+    request
+        .metadata_mut()
+        .insert(APP_ID_HEADER, "app-one".parse().unwrap());
+    let status = client
+        .pull(request)
+        .await
+        .expect_err("the application header alone must not identify a tenant");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    for bad in [
+        // A bare application id names no environment, so it names no tenant.
+        "app-one",
+        "../../etc",
+        "a.b.c",
+        "app-one.",
+    ] {
+        let status = client
+            .pull(as_tenant(
+                bad,
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 10,
+                    lease_seconds: 30,
+                },
+            ))
+            .await
+            .expect_err("a malformed tenant must be refused");
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{bad} should be refused"
+        );
+    }
+}
+
+/// Two environments of one application must not see each other's work.
+///
+/// This is the whole reason the storage tenant is a pair rather than an app
+/// id: a preview deployment that could lease, acknowledge or drop what
+/// production enqueued would silently eat production's work.
+#[tokio::test]
+async fn two_environments_of_one_application_share_no_queue() {
+    let harness = Harness::start().await;
+    let mut client = harness.client().await;
+    let production = tenant_id("app-one", "production");
+    let preview = tenant_id("app-one", "preview");
+
+    let live = send(&mut client, &production, "jobs", "live-work").await;
+    let draft = send(&mut client, &preview, "jobs", "draft-work").await;
+
+    let leased = pull(&mut client, &production, "jobs", 10, 30).await;
+    assert_eq!(leased.len(), 1, "production must see only its own message");
+    assert_eq!(leased[0].id, live);
+    assert_eq!(leased[0].body, "live-work");
+
+    let leased = pull(&mut client, &preview, "jobs", 10, 30).await;
+    assert_eq!(leased.len(), 1, "the preview must see only its own message");
+    assert_eq!(leased[0].id, draft);
+    assert_eq!(leased[0].body, "draft-work");
+
+    // Nor can one acknowledge the other's message, even holding its id.
+    assert_eq!(
+        ack(&mut client, &preview, "jobs", vec![live.clone()]).await,
+        0
+    );
+    assert_eq!(
+        nack(&mut client, &production, "jobs", vec![draft], 0).await,
+        (0, 0)
+    );
+    assert_eq!(ack(&mut client, &production, "jobs", vec![live]).await, 1);
 }
 
 #[tokio::test]
@@ -402,8 +517,8 @@ async fn an_oversized_message_is_refused_and_nothing_is_queued() {
     let mut client = harness.client().await;
 
     let status = client
-        .send(as_app(
-            "app-one",
+        .send(as_tenant(
+            "app-one.production",
             SendRequest {
                 queue_name: "jobs".to_string(),
                 message_body: "x".repeat(MAX_BODY_BYTES + 1),
@@ -413,7 +528,7 @@ async fn an_oversized_message_is_refused_and_nothing_is_queued() {
         .expect_err("an oversized body must be refused");
     assert_eq!(status.code(), Code::ResourceExhausted);
     assert!(
-        pull(&mut client, "app-one", "jobs", 10, 30)
+        pull(&mut client, "app-one.production", "jobs", 10, 30)
             .await
             .is_empty()
     );
@@ -424,9 +539,9 @@ async fn a_message_at_the_size_ceiling_still_round_trips() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
     let body = "x".repeat(MAX_BODY_BYTES);
-    let id = send(&mut client, "app-one", "jobs", &body).await;
+    let id = send(&mut client, "app-one.production", "jobs", &body).await;
 
-    let leased = pull(&mut client, "app-one", "jobs", 10, 30).await;
+    let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, id);
     assert_eq!(leased[0].body.len(), MAX_BODY_BYTES);
@@ -440,14 +555,20 @@ async fn concurrent_consumers_never_receive_the_same_message() {
     let harness = Harness::start().await;
     let mut producer = harness.client().await;
     for i in 0..40 {
-        send(&mut producer, "app-one", "jobs", &format!("m{i}")).await;
+        send(
+            &mut producer,
+            "app-one.production",
+            "jobs",
+            &format!("m{i}"),
+        )
+        .await;
     }
 
     let mut consumers = Vec::new();
     for _ in 0..8 {
         let mut client = harness.client().await;
         consumers.push(tokio::spawn(async move {
-            pull(&mut client, "app-one", "jobs", 5, 60).await
+            pull(&mut client, "app-one.production", "jobs", 5, 60).await
         }));
     }
 

@@ -34,6 +34,7 @@ pub use database::{
 };
 pub use delivery::{
     DeliveryReason, DeliveryReport, DeploymentDeliverer, DeploymentPayload, PublicAddress,
+    RemovalReport,
 };
 pub use handler::MessageHandler;
 pub use message::{

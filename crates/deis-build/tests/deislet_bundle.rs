@@ -101,11 +101,16 @@ async fn the_file_tree_becomes_route_patterns() {
     let manifest = read_manifest(&bytes).expect("a loadable manifest").manifest;
 
     // `functions/users/[id].ts` and `functions/api/[[catch]].ts`, spelled the
-    // way the runtime's matcher and RouteRule.pattern spell them, with the
-    // catch-all last because it would otherwise swallow everything under it.
+    // way the runtime's matcher and RouteRule.pattern spell them. The order is
+    // whatever the shared rule (`deis_bundle::sort_by_specificity`) says, and
+    // it has to be, because deis-runtime ranks the same patterns with the same
+    // code: the catch-all is last, since it would otherwise swallow everything
+    // under it, and `/users/:id` comes before the root because a pattern that
+    // keeps constraining segments after another has run out is the more
+    // specific of the two.
     assert_eq!(
         manifest.route_patterns(),
-        vec!["/", "/users/:id", "/api/*"],
+        vec!["/users/:id", "/", "/api/*"],
         "patterns and their order both matter"
     );
     assert!(

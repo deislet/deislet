@@ -6,10 +6,11 @@
 //! whole object fits in a single gRPC message, so this client always frames
 //! uploads and always reassembles downloads.
 //!
-//! The tenant travels out of band in the `x-deis-app-id` metadata header, the
-//! same header deis-proxy stamps on the HTTP data path. deis-store refuses any
+//! The tenant travels out of band in the `x-deis-tenant` metadata header: one
+//! application in one environment (see [`Tenant`]). deis-store refuses any
 //! request that arrives without it, so a client is bound to exactly one
-//! application for its whole life.
+//! environment of one application for its whole life, and a preview cannot
+//! read or overwrite an object production stored.
 
 use super::tenant::Tenant;
 use crate::STREAM_CHUNK_BYTES;
@@ -68,18 +69,19 @@ impl BlobClient {
     ///
     /// # Parameters
     /// - endpoint: gRPC address of deis-store, e.g. `http://127.0.0.1:8090`
-    /// - app_id: the tenant every call of this client is charged to
-    pub async fn connect(endpoint: impl Into<String>, app_id: impl Into<String>) -> Result<Self> {
+    /// - tenant: the `<app>.<environment>` every call of this client is
+    ///   charged to; see [`Tenant`]
+    pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let tenant = Tenant::new(app_id)?;
+        let tenant = Tenant::new(tenant)?;
 
-        tracing::info!(%endpoint, app_id = tenant.app_id(), "connecting to blob store");
+        tracing::info!(%endpoint, app_id = tenant.as_str(), "connecting to blob store");
         let client = GrpcBlobClient::connect(endpoint.clone())
             .await
             .with_context(|| format!("connecting to blob store at {endpoint}"))?
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
-        tracing::info!(%endpoint, app_id = tenant.app_id(), "blob store client connected");
+        tracing::info!(%endpoint, app_id = tenant.as_str(), "blob store client connected");
 
         Ok(Self {
             client,
@@ -96,15 +98,15 @@ impl BlobClient {
     /// a blob transfer is a stream whose honest duration depends on the size
     /// of the object, so a fixed deadline would cut off large-but-healthy
     /// downloads. [`DEFAULT_MAX_OBJECT_BYTES`] bounds the cost instead.
-    pub fn connect_lazy(endpoint: &str, app_id: impl Into<String>) -> Result<Self> {
-        let tenant = Tenant::new(app_id)?;
+    pub fn connect_lazy(endpoint: &str, tenant: impl Into<String>) -> Result<Self> {
+        let tenant = Tenant::new(tenant)?;
         let channel = super::bindings::streaming_channel(endpoint)?;
         let client = GrpcBlobClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::debug!(
             endpoint,
-            app_id = tenant.app_id(),
+            app_id = tenant.as_str(),
             "blob client prepared; it will dial on the first call"
         );
         Ok(Self {
@@ -123,14 +125,15 @@ impl BlobClient {
         self
     }
 
-    /// The application every call of this client is charged to.
-    pub fn app_id(&self) -> &str {
-        self.tenant.app_id()
+    /// The tenant -- application and environment -- every call of this client
+    /// is charged to.
+    pub fn tenant(&self) -> &str {
+        self.tenant.as_str()
     }
 
     /// Fetch an object whole. `Ok(None)` means no such key.
     pub async fn get(&self, key: String) -> Result<Option<Vec<u8>>> {
-        tracing::debug!(app_id = self.app_id(), %key, "blob get");
+        tracing::debug!(app_id = self.tenant(), %key, "blob get");
         let mut client = self.client.clone();
 
         let inbound = match client
@@ -141,12 +144,12 @@ impl BlobClient {
             // A missing key is an ordinary answer for `ctx.blob.get`, not a
             // failure: the caller gets `null`, nothing is logged above debug.
             Err(status) if status.code() == Code::NotFound => {
-                tracing::debug!(app_id = self.app_id(), %key, "blob get found no such object");
+                tracing::debug!(app_id = self.tenant(), %key, "blob get found no such object");
                 return Ok(None);
             }
             Err(status) => {
                 tracing::warn!(
-                    app_id = self.app_id(),
+                    app_id = self.tenant(),
                     %key,
                     code = ?status.code(),
                     message = status.message(),
@@ -156,9 +159,9 @@ impl BlobClient {
             }
         };
 
-        let body = collect_body(self.app_id(), &key, inbound, self.max_object_bytes).await?;
+        let body = collect_body(self.tenant(), &key, inbound, self.max_object_bytes).await?;
         tracing::debug!(
-            app_id = self.app_id(),
+            app_id = self.tenant(),
             %key,
             size = body.len(),
             "blob get complete"
@@ -180,7 +183,7 @@ impl BlobClient {
     ) -> Result<()> {
         let size = data.len();
         tracing::debug!(
-            app_id = self.app_id(),
+            app_id = self.tenant(),
             %key,
             size,
             chunks = size.div_ceil(STREAM_CHUNK_BYTES),
@@ -193,7 +196,7 @@ impl BlobClient {
             .await
             .map_err(|status| {
                 tracing::warn!(
-                    app_id = self.app_id(),
+                    app_id = self.tenant(),
                     %key,
                     size,
                     code = ?status.code(),
@@ -209,7 +212,7 @@ impl BlobClient {
                 .error
                 .unwrap_or_else(|| "no reason given".to_string());
             tracing::warn!(
-                app_id = self.app_id(),
+                app_id = self.tenant(),
                 %key,
                 size,
                 %reason,
@@ -219,7 +222,7 @@ impl BlobClient {
         }
 
         tracing::debug!(
-            app_id = self.app_id(),
+            app_id = self.tenant(),
             %key,
             sha256 = %response.sha256,
             stored = response.size,
@@ -230,7 +233,7 @@ impl BlobClient {
 
     /// Remove an object. Deleting a key that is already absent succeeds.
     pub async fn delete(&self, key: String) -> Result<()> {
-        tracing::debug!(app_id = self.app_id(), %key, "blob delete");
+        tracing::debug!(app_id = self.tenant(), %key, "blob delete");
         let mut client = self.client.clone();
         let response = client
             .delete(self.tenant.stamp(DeleteRequest { key: key.clone() }))
@@ -242,7 +245,7 @@ impl BlobClient {
                 .error
                 .unwrap_or_else(|| "no reason given".to_string());
             tracing::warn!(
-                app_id = self.app_id(),
+                app_id = self.tenant(),
                 %key,
                 %reason,
                 "blob delete failed; the object is still stored"
@@ -302,7 +305,7 @@ fn put_messages(
 /// disagrees with the metadata, or the assembled digest disagrees with it.
 /// In every case the application sees an exception rather than bytes.
 async fn collect_body<S>(
-    app_id: &str,
+    tenant: &str,
     key: &str,
     inbound: S,
     max_object_bytes: usize,
@@ -328,7 +331,7 @@ where
                 // transfer of something that will be rejected.
                 if header.size > max_object_bytes as u64 {
                     tracing::error!(
-                        %app_id,
+                        app_id = %tenant,
                         %key,
                         size = header.size,
                         limit = max_object_bytes,
@@ -359,7 +362,7 @@ where
                 // it declared cannot grow the buffer without bound.
                 if body.len().saturating_add(chunk.len()) > max_object_bytes {
                     tracing::error!(
-                        %app_id,
+                        app_id = %tenant,
                         %key,
                         received = body.len(),
                         limit = max_object_bytes,
@@ -379,7 +382,7 @@ where
             // decodes to `None`. Skipping it keeps the body contiguous.
             None => {
                 tracing::warn!(
-                    %app_id,
+                    app_id = %tenant,
                     %key,
                     "blob get stream carried a message with no payload; skipping it"
                 );
@@ -392,7 +395,7 @@ where
 
     if body.len() as u64 != info.size {
         tracing::error!(
-            %app_id,
+            app_id = %tenant,
             %key,
             expected = info.size,
             received = body.len(),
@@ -407,7 +410,7 @@ where
         );
     }
 
-    verify_digest(app_id, key, &info.sha256, digest)?;
+    verify_digest(tenant, key, &info.sha256, digest)?;
 
     Ok(body)
 }
@@ -422,14 +425,14 @@ where
 /// corrupt object never reaches the application. The store hashes by content
 /// anyway and sends the digest in the same stream, so this costs one pass that
 /// was already happening chunk by chunk.
-fn verify_digest(app_id: &str, key: &str, expected: &str, digest: Sha256) -> Result<()> {
+fn verify_digest(tenant: &str, key: &str, expected: &str, digest: Sha256) -> Result<()> {
     let expected = expected.trim().to_ascii_lowercase();
     if expected.is_empty() {
         // Tolerated rather than fatal: a store that stops sending the digest
         // is a protocol change, not a corrupt object. Say plainly that this
         // body went out unchecked so the gap is visible in the log.
         tracing::warn!(
-            %app_id,
+            app_id = %tenant,
             %key,
             "blob get response carried no sha256; the body was handed to the application without \
              an integrity check"
@@ -440,7 +443,7 @@ fn verify_digest(app_id: &str, key: &str, expected: &str, digest: Sha256) -> Res
     let actual = format!("{:x}", digest.finalize());
     if actual != expected {
         tracing::error!(
-            %app_id,
+            app_id = %tenant,
             %key,
             %expected,
             %actual,
@@ -552,16 +555,21 @@ mod tests {
             Ok(chunk_message(b"abc")),
             Ok(chunk_message(b"def")),
         ];
-        let body = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect("stream is well formed");
+        let body = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect("stream is well formed");
         assert_eq!(body, b"abcdef");
     }
 
     #[tokio::test]
     async fn download_accepts_a_zero_length_object() {
         let body = collect_body(
-            "app",
+            "app.production",
             "k",
             stream::iter(vec![Ok(info_for(b""))]),
             TEST_MAX_OBJECT_BYTES,
@@ -574,18 +582,28 @@ mod tests {
     #[tokio::test]
     async fn download_rejects_a_body_that_never_declared_a_header() {
         let messages = vec![Ok(chunk_message(b"abc"))];
-        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect_err("a chunk before the header is a protocol violation");
+        let err = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect_err("a chunk before the header is a protocol violation");
         assert!(err.to_string().contains("before its header"), "{err}");
     }
 
     #[tokio::test]
     async fn download_rejects_an_empty_stream() {
         let messages: Vec<Result<GetResponse, Status>> = Vec::new();
-        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect_err("a stream with no header answered nothing");
+        let err = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect_err("a stream with no header answered nothing");
         assert!(
             err.to_string().contains("without sending its header"),
             "{err}"
@@ -595,9 +613,14 @@ mod tests {
     #[tokio::test]
     async fn download_rejects_a_truncated_body() {
         let messages = vec![Ok(info_message(10, "aa")), Ok(chunk_message(b"abc"))];
-        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect_err("a short body must not look like a successful read");
+        let err = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect_err("a short body must not look like a successful read");
         assert!(err.to_string().contains("metadata says 10"), "{err}");
     }
 
@@ -607,9 +630,14 @@ mod tests {
             Ok(info_message(6, "aa")),
             Err(Status::data_loss("content file is missing")),
         ];
-        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect_err("a status inside the stream must not be swallowed");
+        let err = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect_err("a status inside the stream must not be swallowed");
         assert!(err.to_string().contains("content file is missing"), "{err}");
     }
 
@@ -620,9 +648,14 @@ mod tests {
             Ok(GetResponse { payload: None }),
             Ok(chunk_message(b"abc")),
         ];
-        let body = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect("an unknown payload is skipped, not fatal");
+        let body = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect("an unknown payload is skipped, not fatal");
         assert_eq!(body, b"abc");
     }
 
@@ -632,9 +665,14 @@ mod tests {
         // handing it to the application is exactly what this client promises
         // never to do.
         let messages = vec![Ok(info_for(b"abcdef")), Ok(chunk_message(b"abcdeX"))];
-        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect_err("a body that does not match its digest is corrupt");
+        let err = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect_err("a body that does not match its digest is corrupt");
         assert!(err.to_string().contains("sha256"), "{err}");
     }
 
@@ -645,9 +683,14 @@ mod tests {
         let upper = format!("{:x}", digest.finalize()).to_ascii_uppercase();
 
         let messages = vec![Ok(info_message(3, &upper)), Ok(chunk_message(b"abc"))];
-        let body = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect("hex case is not part of the digest");
+        let body = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect("hex case is not part of the digest");
         assert_eq!(body, b"abc");
     }
 
@@ -657,9 +700,14 @@ mod tests {
         // corrupt object; the body goes through with a warning rather than
         // failing every read on the node.
         let messages = vec![Ok(info_message(3, "")), Ok(chunk_message(b"abc"))];
-        let body = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect("an absent digest is tolerated");
+        let body = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect("an absent digest is tolerated");
         assert_eq!(body, b"abc");
     }
 
@@ -668,9 +716,14 @@ mod tests {
         // The refusal must come from the header alone: nothing is allocated
         // and no chunk is transferred for an object that cannot be accepted.
         let messages = vec![Ok(info_message(TEST_MAX_OBJECT_BYTES as u64 + 1, "aa"))];
-        let err = collect_body("app", "k", stream::iter(messages), TEST_MAX_OBJECT_BYTES)
-            .await
-            .expect_err("an oversized object must not be assembled");
+        let err = collect_body(
+            "app.production",
+            "k",
+            stream::iter(messages),
+            TEST_MAX_OBJECT_BYTES,
+        )
+        .await
+        .expect_err("an oversized object must not be assembled");
         assert!(err.to_string().contains("this node reads at most"), "{err}");
     }
 
@@ -686,7 +739,7 @@ mod tests {
             Ok(chunk_message(b"efgh")),
             Ok(chunk_message(b"ijkl")),
         ];
-        let err = collect_body("app", "k", stream::iter(messages), limit)
+        let err = collect_body("app.production", "k", stream::iter(messages), limit)
             .await
             .expect_err("a stream past the ceiling must be aborted");
         assert!(err.to_string().contains("read ceiling"), "{err}");
@@ -696,7 +749,7 @@ mod tests {
     async fn download_accepts_an_object_exactly_at_the_ceiling() {
         let limit = 4;
         let messages = vec![Ok(info_for(b"abcd")), Ok(chunk_message(b"abcd"))];
-        let body = collect_body("app", "k", stream::iter(messages), limit)
+        let body = collect_body("app.production", "k", stream::iter(messages), limit)
             .await
             .expect("the ceiling is inclusive");
         assert_eq!(body, b"abcd");

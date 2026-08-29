@@ -37,6 +37,12 @@ message StartInspectRequest {
     string app_id = 1;
     // Inspect session TTL (seconds), defaults to 300 seconds
     int32 ttl_seconds = 2;
+
+    // Which environment of that application to attach to. Empty means the
+    // default environment ("production"), which is what a caller that says
+    // nothing means; a node runs every environment of an app at once, so
+    // without this a preview could not be inspected at all.
+    string environment = 3;
 }
 
 message StartInspectResponse {
@@ -89,8 +95,12 @@ message PushConfigResponse {
 // DeployApp did - put a whole application inside one message and hit the
 // tonic size ceiling as soon as an app carried real assets.
 message ApplyDeploymentRequest {
-    // Application this deployment belongs to; the only tenant dimension
-    // the storage services ever see.
+    // Application this deployment belongs to. Together with `environment`
+    // it identifies a running application on a node: the same app in
+    // production and in a preview are two separate loads with their own
+    // version, bindings and secrets, and they must never overwrite each
+    // other. The storage tenant is built from the same pair, with
+    // deis_wire::conventions::tenant_id.
     string app_id = 1;
 
     // Immutable version being deployed. Echoed back in the response so the
@@ -98,7 +108,10 @@ message ApplyDeploymentRequest {
     string version_id = 2;
 
     // Environment name, "production" or a preview name. Never an id: this
-    // is the name the application code branches on.
+    // is the name the application code branches on, the other half of the
+    // key a node stores this deployment under, and the second part of the
+    // storage tenant id. Absent on the HTTP data path means "production"
+    // (deis_wire::conventions::DEFAULT_ENVIRONMENT); here it is always set.
     string environment = 3;
 
     // Absolute HTTP URL the node downloads the bundle from, on the control
@@ -113,9 +126,16 @@ message ApplyDeploymentRequest {
     // dictionary and injected as `context.env`.
     //
     // Secret values exist in the clear only here, in flight, and in the
-    // node's memory. They are never written to the bundle, never stored
-    // decrypted, never returned by a read API, and must never be logged -
-    // logging this message as a whole would print every one of them.
+    // node's memory. They are never written to the bundle and never stored
+    // decrypted, and they must never be logged - logging this message as a
+    // whole would print every one of them.
+    //
+    // Two paths carry them, both of them to a node: this message, and the
+    // answer to GET /api/nodes/{node_id}/assignments, which a node that
+    // restarts uses to come back with the environment it had. Both must
+    // therefore be authenticated. No other read API returns a value: the
+    // dashboard and the CLI can write and delete a secret and list its
+    // name, never read it back.
     map<string, string> env = 6;
 }
 
@@ -193,15 +213,37 @@ message RouteRule {
     repeated string methods = 2;
 }
 
-// Unload app request
+// Stop serving an application on this node.
+//
+// Sent when an application is deleted from the catalog. A node only ever
+// *adds* what its assignment list names and never removes what has gone
+// from it, so without this call a deleted application keeps running - still
+// answering requests, still holding its decrypted secrets in memory, still
+// polling its queues - until the node process restarts.
 message UnloadAppRequest {
     string app_id = 1;
+
+    // Which environment of that application to unload.
+    //
+    // Empty means every environment of it, which is what deleting the
+    // application does: the catalog rows that would name them are already
+    // gone by then, and a node may still hold an environment this control
+    // plane forgot about earlier. A named environment leaves the app's
+    // other environments running.
+    string environment = 2;
 }
 
 // Unload app response
 message UnloadAppResponse {
+    // False means the node may still be serving the application. An app the
+    // node was not running is not a failure: there is nothing left to
+    // serve, which is the outcome the caller asked for.
     bool success = 1;
     string message = 2;
+
+    // Environment names actually unloaded, for the control plane's report.
+    // Empty on a node that was not running the app at all.
+    repeated string environments = 3;
 }
 
 // Update app request
@@ -242,10 +284,14 @@ message GetStatusResponse {
     repeated AppOpMetrics op_metrics = 4;
 }
 
-// Per-app OpMetrics summary
+// Per-app OpMetrics summary. One entry per (app_id, environment) the node
+// runs: a preview's op counts are its own and are not added to production's.
 message AppOpMetrics {
     string app_id = 1;
     OpMetricsSummary summary = 2;
+
+    // Environment these counters belong to.
+    string environment = 3;
 }
 
 // OpMetrics summary
@@ -264,13 +310,21 @@ message NodeInfo {
     string hostname = 4;
 }
 
-// Application status
+// Status of one application on this node.
+//
+// One entry per (app_id, environment): the node runs production and every
+// preview of an app side by side, each with its own version and counters,
+// so an entry naming only the app would collapse two different things into
+// one line.
 message AppStatus {
     string app_id = 1;
     AppState state = 2;
     int64 request_count = 3;
     int64 error_count = 4;
     string error_message = 5;
+
+    // Environment name, "production" or a preview name.
+    string environment = 6;
 }
 
 // Application state enum

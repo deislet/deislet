@@ -43,6 +43,10 @@ pub struct AppState {
 pub struct ApiRouter {
     pub router: Router,
     pub auth_config: middleware::AuthConfig,
+    /// The node channel's credential, reported at startup next to the API
+    /// key so an operator sees both states rather than only the one that
+    /// `api_auth_enabled` controls.
+    pub node_auth: middleware::NodeAuthConfig,
     pub tls_enabled: bool,
 }
 
@@ -166,11 +170,16 @@ pub fn build_api_router(
         .with_state(apps_state)
         // The catalog brings its own state, so it is merged as a
         // finished router rather than threaded through the chain above.
-        .merge(catalog::router(catalog_state))
+        .merge(catalog::router(catalog_state.clone()))
         .layer(axum_middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::api_key_auth,
         ));
+
+    // The two endpoints nodes call carry their own authentication and must
+    // not be layered with the API key middleware: `api_auth_enabled` is a
+    // dashboard setting, and one of these two hands out decrypted secrets.
+    let node_routes = catalog::node_router(catalog_state);
 
     let app = Router::new()
         .route("/", get(static_files::serve_index))
@@ -178,8 +187,13 @@ pub fn build_api_router(
         .route("/deis.svg", get(static_files::serve_favicon))
         .route("/assets/*path", get(static_files::serve_assets))
         .merge(protected_routes)
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        // Permissive CORS covers the dashboard, which browsers load. It
+        // stops here on purpose: nodes are not browsers, and a page on any
+        // origin being able to *read* the assignment list is exactly the
+        // access this channel exists to withhold.
+        .layer(CorsLayer::permissive())
+        .merge(node_routes)
+        .layer(TraceLayer::new_for_http());
 
     let tls_enabled = config
         .tls
@@ -190,6 +204,7 @@ pub fn build_api_router(
     ApiRouter {
         router: app,
         auth_config,
+        node_auth: middleware::NodeAuthConfig::from_control_config(&config),
         tls_enabled,
     }
 }
@@ -255,6 +270,19 @@ fn build_catalog_state(
         );
     }
 
+    let node_auth = middleware::NodeAuthConfig::from_control_config(config);
+    match (&secrets, node_auth.is_configured()) {
+        (SecretsBackend::Ready(_), false) => error!(
+            "node_preshared_keys is empty while a secret master key is configured: the endpoints that serve nodes are reachable by anyone who can reach this port, so the assignment list refuses to carry decrypted secrets and every application that has one will not run on any node until a node key is set"
+        ),
+        (_, false) => warn!(
+            "node_preshared_keys is empty: anyone who can reach this port can read which applications and versions this platform runs and download their bundles. Set a node key on the control plane and on every node"
+        ),
+        (_, true) => info!(
+            "The endpoints that serve nodes require one of the configured node_preshared_keys, whatever api_auth_enabled says; they are the only path on which secret values leave this process"
+        ),
+    }
+
     let store = Arc::new(CatalogStore::new(database));
     let secrets = Arc::new(secrets);
 
@@ -265,6 +293,7 @@ fn build_catalog_state(
         deliverer: Arc::new(DeploymentDeliverer::new(
             store, secrets, nodes, address, endpoints,
         )),
+        node_auth,
     }
 }
 
@@ -346,6 +375,7 @@ pub fn log_api_ready(
     port: u16,
     tls_enabled: bool,
     auth_config: &middleware::AuthConfig,
+    node_auth: &middleware::NodeAuthConfig,
     grpc_shared: bool,
 ) {
     let scheme = if tls_enabled { "https" } else { "http" };
@@ -368,12 +398,27 @@ pub fn log_api_ready(
 
     if auth_config.enabled {
         info!(
-            "🔐 Authentication: ENABLED ({} API keys configured)",
+            "🔐 API key: ENABLED ({} keys configured)",
             auth_config.api_keys.len()
         );
     } else {
-        info!("⚠️  Authentication: DISABLED (all endpoints are public)");
+        info!("⚠️  API key: DISABLED (the dashboard and the human API are public)");
     }
+    // Said separately because it is a separate credential: this one is not
+    // governed by api_auth_enabled, and it is the one that guards secrets.
+    info!(
+        "{} Node endpoints (assignments, bundle download): {}",
+        if node_auth.is_configured() {
+            "🔐"
+        } else {
+            "⚠️"
+        },
+        if node_auth.is_configured() {
+            "authenticated with node_preshared_keys"
+        } else {
+            "OPEN - no node_preshared_keys configured, so no secret is served to any node"
+        }
+    );
     info!("====================================");
 }
 
@@ -409,7 +454,13 @@ pub async fn start_api_server(
     );
 
     let addr = format!("0.0.0.0:{}", port);
-    log_api_ready(port, api.tls_enabled, &api.auth_config, false);
+    log_api_ready(
+        port,
+        api.tls_enabled,
+        &api.auth_config,
+        &api.node_auth,
+        false,
+    );
 
     let tls = if api.tls_enabled {
         let tls_config = tls_config

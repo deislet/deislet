@@ -38,11 +38,20 @@ function root decides which requests reach it:
 Patterns go into `manifest.json` as `routes[].pattern`, spelled exactly the way
 `RouteRule.pattern` is spelled on the wire.
 
-**The table is ordered by specificity**: exact segments first, then `:name`,
-with a catch-all always last - otherwise `/api/*` would swallow every route
-below it. The ordering happens at build time and does not depend on directory
-walk order, which differs between machines; the bundle's sha256 is part of a
-version's identity, so nothing in it may vary on its own.
+**The table is ordered by specificity**, most specific first, so the generated
+matcher can take the first pattern that fits. The rule compares two patterns
+segment by segment - a literal beats a `:name`, which beats a catch-all - and a
+pattern carrying a catch-all is the last resort whatever else it pins down;
+otherwise `/api/*` would swallow every route below it. Where the shape leaves
+two patterns tied (`/:org/settings` and `/:user/settings`), the pattern text
+decides, so the order does not depend on directory walk order, which differs
+between machines; the bundle's sha256 is part of a version's identity, so
+nothing in it may vary on its own.
+
+The rule is `deis_bundle::sort_by_specificity`, and deis-runtime ranks the
+manifest's patterns by the same one. Two spellings of it would let a request
+reach a handler the built table does not point at, and the only symptom would
+be a handler that never runs.
 
 `methods` is always empty, meaning any method. An edge-canon handler decides
 for itself what to do with a method, and the file tree has no place to say
@@ -56,9 +65,10 @@ and it **builds the context itself** (`request`, `env`, `services`,
 generated entry module is what turns a file tree into an app:
 
 1. picks the handler whose pattern fits the path;
-2. fills `context.params` from its own match (the runtime's matcher handles
-   only exact segments and `:name`, so a `/api/*` route would otherwise arrive
-   with empty params);
+2. fills `context.params` from its own match. The runtime matches the same
+   patterns, catch-all included, but a manifest pattern keeps only the `*`, so
+   `params['*']` is the only key it can promise; this module still knows the
+   file was written `[[catch]]`, and publishes the tail under that name too;
 3. adds the conveniences edge-canon promises: `path`, `method`, `query`,
    `cookies`, `log`;
 4. answers 404 when nothing matched.
@@ -100,17 +110,25 @@ untouched.
 ## The capability set says what works today
 
 `Platform::Deislet` is filled in from the code that exists, not from the
-roadmap. Among the extended features, only **WebSockets** actually works today:
-deis-runtime bridges server-side sockets into the isolate.
+roadmap. Among the extended features these are supported:
 
-The rest split into two kinds, treated differently at build time:
+- **SQL Database** and **Object Storage** - deis-store serves both, and
+  deis-runtime builds the isolate's client from the manifest's `services`, so
+  `context.services.database` and `context.services.blob` reach the server.
+- **Queues** - deis-queue is its own process; `send` reaches it, and a node
+  polls it for every queue the manifest declares a consumer for.
+- **Cron** - the control plane holds one schedule per (app_id, environment) and
+  triggers a node when one is due; the node runs the app's `scheduled` export.
+- **WebSockets** - deis-runtime bridges server-side sockets into the isolate
+  and deis-proxy tunnels the upgrade. The two halves have never been tested end
+  to end, which `docs/architecture.zh.md` section 11 records as an open item.
 
-- **Pending** (SQL Database, Object Storage, Queues, Cron) - specified, half
-  built. These **warn and do not stop the build**: the declaration belongs in
-  the manifest, where the control plane records it, and the binding arrives
-  without the app being rewritten. The warning says what happens today, for
-  example that `context.services.database` calls fail with "Database service
-  not available".
+Two kinds of unsupported feature remain, treated differently at build time:
+
+- **Pending** - specified, half built. These **warn and do not stop the
+  build**: the declaration belongs in the manifest, where the control plane
+  records it, and the binding arrives without the app being rewritten. **The
+  list is empty today**; the mechanism stays for the next half-built service.
 - **Not coming** (Durable Objects, Node Runtime, SSR/ISR, Workers AI,
   BroadcastChannel) - nothing in the platform's shape provides them, so a build
   that needs one fails.

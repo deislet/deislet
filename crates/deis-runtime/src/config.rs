@@ -41,7 +41,19 @@ const REMOVED_ENV_VARS: &[(&str, &str)] = &[
         "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_RATE_LIMIT_OPS_PER_SEC",
     ),
     ("PORT", "DEIS_RUNTIME_HTTP_PORT"),
+    (
+        "DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES",
+        "DEIS_RUNTIME_BUNDLES_MAX_BYTES",
+    ),
 ];
+
+/// TOML keys that were once honoured, paired with the name that replaced them,
+/// written as `table.key`.
+///
+/// Same reasoning as [`REMOVED_ENV_VARS`]: a key that is quietly ignored looks
+/// exactly like one that worked, and the setting it names is a ceiling, so the
+/// node would run on a default the operator thought they had overridden.
+const REMOVED_CONFIG_KEYS: &[(&str, &str)] = &[("bundles.max_bundle_bytes", "bundles.max_bytes")];
 
 /// Smallest execution timeout that can be configured.
 ///
@@ -86,7 +98,7 @@ pub struct RuntimeConfig {
 
     /// How this node reaches the control plane to ask what it should run.
     #[serde(default)]
-    pub control: ControlConfig,
+    pub control: ControlPlaneConfig,
 
     /// Where downloaded application bundles live and how large one may be.
     #[serde(default)]
@@ -118,7 +130,7 @@ impl Default for RuntimeConfig {
             shutdown_grace_period_secs: default_shutdown_grace_period_secs(),
             default_execution_limits: ExecutionLimits::default(),
             logging: LoggingConfig::default(),
-            control: ControlConfig::default(),
+            control: ControlPlaneConfig::default(),
             bundles: BundleConfig::default(),
             assets: AssetsConfig::default(),
         }
@@ -137,11 +149,37 @@ impl Default for RuntimeConfig {
 /// still in its own bundle directory from a previous life, plus whatever the
 /// control plane pushes at it later, and it reports healthy immediately
 /// because there is no list it could be missing.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ControlConfig {
+///
+/// Named for what it configures - how this node reaches the control plane -
+/// rather than `ControlConfig`, which is already taken twice in this platform:
+/// `deis_control::config::ControlConfig` is the control plane's own server
+/// configuration, and `deis_wire::config::ControlConfig` is a gRPC client
+/// configuration. Three types of one name, two of them for different things,
+/// is a name that tells a reader nothing.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlPlaneConfig {
     /// Base URL of the control plane, e.g. `http://127.0.0.1:8080`.
+    ///
+    /// A URL with a scheme and not a socket address, which is why it is not
+    /// spelled `addr` like `deis_wire::config::ControlConfig`: that one dials
+    /// gRPC, this one is joined with `/api/nodes/{id}/assignments` to make an
+    /// HTTP request.
     #[serde(default)]
     pub endpoint: Option<String>,
+
+    /// The node credential, one of the control plane's `node_preshared_keys`.
+    ///
+    /// The assignment list carries this node's decrypted secrets, so the
+    /// control plane refuses to serve it - and the bundle download - to a
+    /// caller that cannot prove it is a node. Unset means the requests go out
+    /// anonymous, which works only against a control plane that has no node
+    /// keys configured at all; against one that has, every assignment fetch
+    /// returns 401 and this node never picks up a new version.
+    ///
+    /// Named `secret` to match `[control] secret` in deis-proxy's file: it is
+    /// the same value from the same list.
+    #[serde(default)]
+    pub secret: Option<String>,
 
     /// Seconds one assignment request may take before it is abandoned.
     #[serde(default = "default_control_request_timeout_secs")]
@@ -161,10 +199,24 @@ fn default_control_retry_interval_secs() -> u64 {
     15
 }
 
-impl Default for ControlConfig {
+/// Hand-written so dumping the configuration - in a startup line, in an error
+/// context - cannot print the node key.
+impl std::fmt::Debug for ControlPlaneConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneConfig")
+            .field("endpoint", &self.endpoint)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("retry_interval_secs", &self.retry_interval_secs)
+            .finish()
+    }
+}
+
+impl Default for ControlPlaneConfig {
     fn default() -> Self {
         Self {
             endpoint: None,
+            secret: None,
             request_timeout_secs: default_control_request_timeout_secs(),
             retry_interval_secs: default_control_retry_interval_secs(),
         }
@@ -180,8 +232,11 @@ pub struct BundleConfig {
 
     /// Largest bundle this node will accept. A download is abandoned the
     /// moment it goes over, so a wrong or hostile URL cannot fill the disk.
-    #[serde(default = "default_max_bundle_bytes")]
-    pub max_bundle_bytes: u64,
+    ///
+    /// Reads as `bundles.max_bytes`, the way the sibling setting reads as
+    /// `assets.max_bytes`; the table already says which kind of bytes.
+    #[serde(default = "default_max_bundle_size")]
+    pub max_bytes: u64,
 
     /// Seconds one bundle download may take before it is abandoned and the
     /// currently running version is kept.
@@ -189,7 +244,7 @@ pub struct BundleConfig {
     pub download_timeout_secs: u64,
 }
 
-fn default_max_bundle_bytes() -> u64 {
+fn default_max_bundle_size() -> u64 {
     256 * 1024 * 1024
 }
 
@@ -201,7 +256,7 @@ impl Default for BundleConfig {
     fn default() -> Self {
         Self {
             dir: None,
-            max_bundle_bytes: default_max_bundle_bytes(),
+            max_bytes: default_max_bundle_size(),
             download_timeout_secs: default_download_timeout_secs(),
         }
     }
@@ -398,6 +453,7 @@ impl RuntimeConfig {
     fn load_from(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        reject_removed_config_keys(&content, path)?;
         toml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
@@ -503,10 +559,10 @@ impl RuntimeConfig {
             self.bundles.dir = Some(PathBuf::from(value));
         }
 
-        if let Some(value) = env_var("DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES") {
-            self.bundles.max_bundle_bytes = parse_env(
+        if let Some(value) = env_var("DEIS_RUNTIME_BUNDLES_MAX_BYTES") {
+            self.bundles.max_bytes = parse_env(
                 &value,
-                "DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES",
+                "DEIS_RUNTIME_BUNDLES_MAX_BYTES",
                 "a whole number of bytes",
             )?;
         }
@@ -532,6 +588,12 @@ impl RuntimeConfig {
         }
 
         Ok(())
+    }
+
+    /// The node credential to present to the control plane, if one was
+    /// configured.
+    pub fn node_credential(&self) -> Option<crate::deployment::NodeCredential> {
+        self.control.credential()
     }
 
     /// Directory holding downloaded bundles, resolved against `data_dir` when
@@ -605,7 +667,15 @@ impl RuntimeConfig {
     }
 }
 
-impl ControlConfig {
+impl ControlPlaneConfig {
+    /// The credential to present on the control plane's node endpoints, bound
+    /// to the configured endpoint so it travels nowhere else.
+    pub fn credential(&self) -> Option<crate::deployment::NodeCredential> {
+        self.secret
+            .as_deref()
+            .map(|secret| crate::deployment::NodeCredential::new(secret, self.endpoint.as_deref()))
+    }
+
     fn validate(&self) -> Result<()> {
         if let Some(endpoint) = self.endpoint.as_deref() {
             if endpoint.trim().is_empty() {
@@ -619,6 +689,16 @@ impl ControlConfig {
                 return Err(anyhow!(
                     "control.endpoint {endpoint:?} has no http:// or https:// scheme; the node \
                      builds an absolute URL from it and would never reach the control plane"
+                ));
+            }
+        }
+
+        if let Some(secret) = self.secret.as_deref() {
+            if secret.trim().is_empty() {
+                return Err(anyhow!(
+                    "control.secret is empty; either remove it or set it to one of the control \
+                     plane's node_preshared_keys. An empty value is sent as a credential and \
+                     refused, so this node would never fetch an assignment list"
                 ));
             }
         }
@@ -644,9 +724,9 @@ impl ControlConfig {
 
 impl BundleConfig {
     fn validate(&self) -> Result<()> {
-        if self.max_bundle_bytes == 0 {
+        if self.max_bytes == 0 {
             return Err(anyhow!(
-                "bundles.max_bundle_bytes must be greater than 0; 0 rejects every bundle, so no \
+                "bundles.max_bytes must be greater than 0; 0 rejects every bundle, so no \
                  deployment could ever be applied on this node"
             ));
         }
@@ -765,6 +845,34 @@ where
     value
         .parse::<T>()
         .map_err(|e| anyhow!("{name} is not {expected}: {value:?} ({e})"))
+}
+
+/// Refuse a configuration file that still sets a key this node no longer
+/// reads.
+///
+/// The check is on the raw text rather than on the deserialised struct,
+/// because serde simply drops an unknown key: the node would come up on a
+/// default while the operator's file said otherwise, and nothing anywhere
+/// would say so.
+fn reject_removed_config_keys(content: &str, path: &Path) -> Result<()> {
+    let parsed: toml::Value = toml::from_str(content)
+        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+    for (removed, replacement) in REMOVED_CONFIG_KEYS {
+        let mut node = Some(&parsed);
+        for segment in removed.split('.') {
+            node = node.and_then(|value| value.get(segment));
+        }
+        if node.is_some() {
+            return Err(anyhow!(
+                "{} sets {removed}, which this node no longer reads. Rename it to {replacement}; \
+                 left as it is, the setting has no effect and the node runs on the default",
+                path.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn reject_removed_env_vars() -> Result<()> {
@@ -1054,7 +1162,7 @@ mod tests {
 
             [bundles]
             dir = "/var/lib/deis/bundles"
-            max_bundle_bytes = 1048576
+            max_bytes = 1048576
             download_timeout_secs = 60
 
             [assets]
@@ -1068,7 +1176,7 @@ mod tests {
             Some("http://127.0.0.1:8080")
         );
         assert_eq!(config.control.request_timeout_secs, 5);
-        assert_eq!(config.bundles.max_bundle_bytes, 1_048_576);
+        assert_eq!(config.bundles.max_bytes, 1_048_576);
         assert_eq!(config.assets.cache_control, "public, max-age=60");
         assert_eq!(config.assets.max_bytes, 2048);
         config.validate().unwrap();
@@ -1116,9 +1224,9 @@ mod tests {
     #[test]
     fn test_validate_rejects_a_zero_bundle_ceiling() {
         let mut config = RuntimeConfig::default();
-        config.bundles.max_bundle_bytes = 0;
+        config.bundles.max_bytes = 0;
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("max_bundle_bytes"), "{err}");
+        assert!(err.contains("max_bytes"), "{err}");
     }
 
     #[test]
@@ -1148,7 +1256,7 @@ mod tests {
 
         env::set_var("DEIS_RUNTIME_NODE_ID", "node-from-env");
         env::set_var("DEIS_RUNTIME_CONTROL_ENDPOINT", "http://control:8080");
-        env::set_var("DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES", "4096");
+        env::set_var("DEIS_RUNTIME_BUNDLES_MAX_BYTES", "4096");
         env::set_var("DEIS_RUNTIME_ASSETS_MAX_BYTES", "8192");
 
         let mut config = RuntimeConfig::default();
@@ -1156,7 +1264,7 @@ mod tests {
 
         env::remove_var("DEIS_RUNTIME_NODE_ID");
         env::remove_var("DEIS_RUNTIME_CONTROL_ENDPOINT");
-        env::remove_var("DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES");
+        env::remove_var("DEIS_RUNTIME_BUNDLES_MAX_BYTES");
         env::remove_var("DEIS_RUNTIME_ASSETS_MAX_BYTES");
 
         result.unwrap();
@@ -1165,7 +1273,7 @@ mod tests {
             config.control.endpoint.as_deref(),
             Some("http://control:8080")
         );
-        assert_eq!(config.bundles.max_bundle_bytes, 4096);
+        assert_eq!(config.bundles.max_bytes, 4096);
         assert_eq!(config.assets.max_bytes, 8192);
     }
 
@@ -1185,6 +1293,46 @@ mod tests {
             config.assets.cache_control,
             "public, max-age=0, must-revalidate"
         );
+    }
+
+    #[test]
+    fn a_config_file_that_still_sets_a_renamed_key_fails_loudly() {
+        // Serde drops an unknown key, so a file that still says
+        // `max_bundle_bytes` would leave the node on the 256 MB default while
+        // the operator's file said 1 MB, and nothing would report it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deis-runtime.toml");
+        std::fs::write(
+            &path,
+            "[bundles]\nmax_bundle_bytes = 1048576\ndownload_timeout_secs = 60\n",
+        )
+        .unwrap();
+
+        let err = RuntimeConfig::load_from(&path)
+            .expect_err("a key this node no longer reads must stop startup")
+            .to_string();
+
+        assert!(err.contains("bundles.max_bundle_bytes"), "{err}");
+        assert!(err.contains("bundles.max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn test_every_removed_config_key_points_at_a_current_name() {
+        // The replacement has to be a key this build actually reads, or the
+        // error sends the operator to a second name that also does nothing.
+        let rendered = toml::to_string(&RuntimeConfig::default())
+            .expect("the default configuration serialises");
+        let parsed: toml::Value = toml::from_str(&rendered).expect("and parses back");
+        for (removed, replacement) in REMOVED_CONFIG_KEYS {
+            let mut node = Some(&parsed);
+            for segment in replacement.split('.') {
+                node = node.and_then(|value| value.get(segment));
+            }
+            assert!(
+                node.is_some(),
+                "{removed} points at {replacement}, which this build does not read either"
+            );
+        }
     }
 
     #[test]

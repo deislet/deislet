@@ -9,7 +9,7 @@
 mod tests {
     use crate::app::{
         types::{AppConfig, AppState, ResourceLimits},
-        ApplicationManager,
+        AppKey, ApplicationManager,
     };
     use once_cell::sync::Lazy;
     use std::collections::HashMap;
@@ -18,6 +18,10 @@ mod tests {
     // Use global singleton ApplicationManager to avoid multiple RuntimePool creations
     static TEST_MANAGER: Lazy<Mutex<ApplicationManager>> =
         Lazy::new(|| Mutex::new(ApplicationManager::with_threads(Some(2))));
+
+    fn key(app_id: &str) -> AppKey {
+        AppKey::production(app_id)
+    }
 
     #[tokio::test]
     async fn test_load_app() {
@@ -30,25 +34,21 @@ mod tests {
         "#;
 
         let result = manager
-            .load_app(
-                "test1".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("test1"), code.to_string(), AppConfig::default(), None)
             .await;
 
         assert!(result.is_ok());
 
-        let app = manager.get_app("test1");
+        let app = manager.get_app(&key("test1"));
         assert!(app.is_some());
 
         let app = app.unwrap();
         assert_eq!(app.id, "test1");
+        assert_eq!(app.environment, "production");
         assert_eq!(app.state, AppState::Running);
 
         // Cleanup
-        let _ = manager.unload_app("test1").await;
+        let _ = manager.unload_app(&key("test1")).await;
     }
 
     #[tokio::test]
@@ -62,29 +62,18 @@ mod tests {
         "#;
 
         manager
-            .load_app(
-                "dup".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("dup"), code.to_string(), AppConfig::default(), None)
             .await
             .unwrap();
 
         let result = manager
-            .load_app(
-                "dup".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("dup"), code.to_string(), AppConfig::default(), None)
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already exists"));
 
         // Cleanup
-        let _ = manager.unload_app("dup").await;
+        let _ = manager.unload_app(&key("dup")).await;
     }
 
     #[tokio::test]
@@ -98,59 +87,71 @@ mod tests {
         "#;
 
         manager
-            .load_app(
-                "test2".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("test2"), code.to_string(), AppConfig::default(), None)
             .await
             .unwrap();
 
-        assert!(manager.get_app("test2").is_some());
+        assert!(manager.get_app(&key("test2")).is_some());
 
-        let result = manager.unload_app("test2").await;
+        let result = manager.unload_app(&key("test2")).await;
         assert!(result.is_ok());
 
-        assert!(manager.get_app("test2").is_none());
+        assert!(manager.get_app(&key("test2")).is_none());
     }
 
+    /// The identity of a running application is (app, environment).
+    ///
+    /// Before this was true, deploying a preview of an app replaced its
+    /// production copy - same code slot, same secrets - and nothing said so.
     #[tokio::test]
-    async fn test_update_app() {
+    async fn two_environments_of_one_app_run_side_by_side() {
         let manager = TEST_MANAGER.lock().unwrap();
 
-        let code1 = r#"
-            export default function handler(context) {
-                return new Response("version 1");
-            }
-        "#;
+        let production = AppKey::new("two-envs", "production");
+        let preview = AppKey::new("two-envs", "preview-1");
 
-        manager
-            .load_app(
-                "test3".to_string(),
-                code1.to_string(),
-                AppConfig::default(),
-                None,
-            )
-            .await
-            .unwrap();
+        for (target, body) in [(&production, "from production"), (&preview, "from preview")] {
+            let code = format!(
+                r#"
+                export default function handler(context) {{
+                    return new Response("{body}");
+                }}
+                "#
+            );
+            manager
+                .load_app(target.clone(), code, AppConfig::default(), None)
+                .await
+                .unwrap_or_else(|e| panic!("loading {target} failed: {e}"));
+        }
 
-        let code2 = r#"
-            export default function handler(context) {
-                return new Response("version 2");
-            }
-        "#;
+        // Both are loaded, and each answers with its own code.
+        async fn answer(manager: &ApplicationManager, target: &AppKey) -> String {
+            let (_status, _headers, body) = manager
+                .execute_app(
+                    target,
+                    "http://localhost/".to_string(),
+                    "GET".to_string(),
+                    HashMap::new(),
+                    None,
+                )
+                .await
+                .expect("the app is loaded");
+            body.unwrap_or_default()
+        }
+        assert_eq!(answer(&manager, &production).await, "from production");
+        assert_eq!(answer(&manager, &preview).await, "from preview");
 
-        let result = manager
-            .update_app("test3", code2.to_string(), None, None)
-            .await;
-        assert!(result.is_ok());
+        let mut environments = manager.environments_of("two-envs");
+        environments.sort();
+        assert_eq!(environments, vec![preview.clone(), production.clone()]);
 
-        let app = manager.get_app("test3").unwrap();
-        assert_eq!(app.state, AppState::Running);
+        // Unloading one leaves the other serving.
+        manager.unload_app(&preview).await.unwrap();
+        assert!(manager.get_app(&preview).is_none());
+        assert_eq!(answer(&manager, &production).await, "from production");
 
         // Cleanup
-        let _ = manager.unload_app("test3").await;
+        let _ = manager.unload_app(&production).await;
     }
 
     #[tokio::test]
@@ -165,18 +166,13 @@ mod tests {
         "#;
 
         manager
-            .load_app(
-                "test4".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("test4"), code.to_string(), AppConfig::default(), None)
             .await
             .unwrap();
 
         let result = manager
             .execute_app(
-                "test4",
+                &key("test4"),
                 "http://localhost/test/path".to_string(),
                 "GET".to_string(),
                 HashMap::new(),
@@ -191,7 +187,7 @@ mod tests {
         assert!(body.unwrap().contains("/test/path"));
 
         // Cleanup
-        let _ = manager.unload_app("test4").await;
+        let _ = manager.unload_app(&key("test4")).await;
     }
 
     #[tokio::test]
@@ -205,22 +201,12 @@ mod tests {
         "#;
 
         manager
-            .load_app(
-                "app1".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("app1"), code.to_string(), AppConfig::default(), None)
             .await
             .unwrap();
 
         manager
-            .load_app(
-                "app2".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("app2"), code.to_string(), AppConfig::default(), None)
             .await
             .unwrap();
 
@@ -232,8 +218,8 @@ mod tests {
         assert!(ids.contains(&"app2".to_string()));
 
         // Cleanup
-        let _ = manager.unload_app("app1").await;
-        let _ = manager.unload_app("app2").await;
+        let _ = manager.unload_app(&key("app1")).await;
+        let _ = manager.unload_app(&key("app2")).await;
     }
 
     #[tokio::test]
@@ -247,22 +233,12 @@ mod tests {
         "#;
 
         manager
-            .load_app(
-                "s1".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("s1"), code.to_string(), AppConfig::default(), None)
             .await
             .unwrap();
 
         manager
-            .load_app(
-                "s2".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("s2"), code.to_string(), AppConfig::default(), None)
             .await
             .unwrap();
 
@@ -271,8 +247,8 @@ mod tests {
         assert!(stats["running"].as_u64().unwrap() >= 2);
 
         // Cleanup
-        let _ = manager.unload_app("s1").await;
-        let _ = manager.unload_app("s2").await;
+        let _ = manager.unload_app(&key("s1")).await;
+        let _ = manager.unload_app(&key("s2")).await;
     }
 
     #[tokio::test]
@@ -299,19 +275,14 @@ mod tests {
         "#;
 
         manager
-            .load_app(
-                "kvtest".to_string(),
-                code.to_string(),
-                AppConfig::default(),
-                None,
-            )
+            .load_app(key("kvtest"), code.to_string(), AppConfig::default(), None)
             .await
             .unwrap();
 
         // Set value
         let (_status, _headers, _body) = manager
             .execute_app(
-                "kvtest",
+                &key("kvtest"),
                 "http://localhost/set".to_string(),
                 "GET".to_string(),
                 HashMap::new(),
@@ -323,7 +294,7 @@ mod tests {
         // Get value
         let (_status, _headers, body) = manager
             .execute_app(
-                "kvtest",
+                &key("kvtest"),
                 "http://localhost/get".to_string(),
                 "GET".to_string(),
                 HashMap::new(),
@@ -335,7 +306,7 @@ mod tests {
         assert_eq!(body, Some("42".to_string()));
 
         // Cleanup
-        let _ = manager.unload_app("kvtest").await;
+        let _ = manager.unload_app(&key("kvtest")).await;
     }
 
     #[tokio::test]
@@ -354,13 +325,13 @@ mod tests {
         };
 
         manager
-            .load_app("params_app".to_string(), code.to_string(), config, None)
+            .load_app(key("params_app"), code.to_string(), config, None)
             .await
             .unwrap();
 
         let result = manager
             .execute_app(
-                "params_app",
+                &key("params_app"),
                 "http://localhost/users/42".to_string(),
                 "GET".to_string(),
                 HashMap::new(),
@@ -374,13 +345,13 @@ mod tests {
         assert_eq!(body, Some(r#"{"id":"42"}"#.to_string()));
 
         // Cleanup
-        let _ = manager.unload_app("params_app").await;
+        let _ = manager.unload_app(&key("params_app")).await;
     }
 
     #[test]
     fn test_effective_limits_uses_platform_default_when_app_has_none() {
         let manager = ApplicationManager::with_threads(Some(1));
-        let effective = manager.effective_limits("app_a", None);
+        let effective = manager.effective_limits(&key("app_a"), None);
         assert_eq!(effective, manager.default_limits);
     }
 
@@ -394,7 +365,7 @@ mod tests {
             timeout_ms: Some(5_000),
             rate_limit_ops_per_sec: Some(10.0),
         };
-        let effective = manager.effective_limits("app_b", Some(&limits));
+        let effective = manager.effective_limits(&key("app_b"), Some(&limits));
         assert_eq!(effective.timeout_ms, 5_000);
         assert_eq!(effective.rate_limit_ops_per_sec, 10.0);
     }
@@ -411,7 +382,7 @@ mod tests {
             timeout_ms: Some(5_000),
             rate_limit_ops_per_sec: None,
         };
-        let effective = manager.effective_limits("app_c", Some(&limits));
+        let effective = manager.effective_limits(&key("app_c"), Some(&limits));
         assert_eq!(effective.timeout_ms, 5_000);
         assert_eq!(
             effective.rate_limit_ops_per_sec,

@@ -89,7 +89,7 @@ let result = compiler.build().await?;
 | Cloudflare Workers | ✅ 完整支持 | KV, Cache | D1, R2, Queue, Durable Objects |
 | Deno Deploy | ✅ 完整支持 | KV, Cache | - |
 | Tencent EdgeOne | ✅ 完整支持 | KV, Cache | - |
-| Deislet | 🚧 开发中 | KV, Cache | WebSockets（SQL / Blob / Queue / Cron 可写进包，运行时尚未接通） |
+| Deislet | 🚧 开发中 | KV, Cache | SQL, Blob, Queue, Cron, WebSockets（WebSocket 两端尚未端到端验证） |
 
 ## 🔗 相关资源
 

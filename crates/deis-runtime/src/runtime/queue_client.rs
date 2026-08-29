@@ -1,11 +1,12 @@
 //! Queue client backing `ctx.services.queue` and the consumer poller.
 //!
-//! Talks to deis-queue, which partitions messages by application: the tenant
-//! travels in the `x-deis-app-id` metadata header (see [`Tenant`]), not in the
-//! proto messages, so one client speaks for exactly one application. A call
-//! without the header is refused with `PermissionDenied` rather than served
-//! from some default namespace, which is why this client cannot be built
-//! without an app id.
+//! Talks to deis-queue, which partitions messages by tenant -- one
+//! application in one environment: the tenant travels in the `x-deis-tenant`
+//! metadata header (see [`Tenant`]), not in the proto messages, so one client
+//! speaks for exactly one environment of one application and a preview never
+//! consumes production's messages. A call without the header is refused with
+//! `PermissionDenied` rather than served from some default namespace, which is
+//! why this client cannot be built without a tenant.
 //!
 //! Delivery is at-least-once: a message stays in the queue until it is
 //! acknowledged, so a consumer that crashes mid-batch sees the same messages
@@ -77,15 +78,15 @@ impl QueueClient {
     /// Used by tests and by callers that want the failure at construction.
     /// Application bindings use [`Self::connect_lazy`] instead, so that a
     /// queue outage cannot stop an app from loading.
-    pub async fn connect(endpoint: impl Into<String>, app_id: impl Into<String>) -> Result<Self> {
+    pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let tenant = Tenant::new(app_id)?;
+        let tenant = Tenant::new(tenant)?;
         let client = GrpcQueueClient::connect(endpoint.clone())
             .await
             .with_context(|| format!("connecting to the queue at {endpoint}"))?
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
-        tracing::info!(%endpoint, app_id = tenant.app_id(), "queue client connected");
+        tracing::info!(%endpoint, app_id = tenant.as_str(), "queue client connected");
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             tenant,
@@ -94,17 +95,17 @@ impl QueueClient {
 
     /// Build a client that dials on first use.
     ///
-    /// Fails only on an address that is not a URL or an app id that cannot be
-    /// a gRPC header -- both configuration mistakes that no retry would fix.
-    pub fn connect_lazy(endpoint: &str, app_id: impl Into<String>) -> Result<Self> {
-        let tenant = Tenant::new(app_id)?;
+    /// Fails only on an address that is not a URL or a value that is not a
+    /// tenant -- both configuration mistakes that no retry would fix.
+    pub fn connect_lazy(endpoint: &str, tenant: impl Into<String>) -> Result<Self> {
+        let tenant = Tenant::new(tenant)?;
         let channel = super::bindings::unary_channel(endpoint)?;
         let client = GrpcQueueClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::debug!(
             endpoint,
-            app_id = tenant.app_id(),
+            app_id = tenant.as_str(),
             "queue client prepared; it will dial on the first call"
         );
         Ok(Self {
@@ -113,9 +114,10 @@ impl QueueClient {
         })
     }
 
-    /// The application every call of this client is charged to.
-    pub fn app_id(&self) -> &str {
-        self.tenant.app_id()
+    /// The tenant -- application and environment -- every call of this client
+    /// is charged to.
+    pub fn tenant(&self) -> &str {
+        self.tenant.as_str()
     }
 
     /// Enqueue one message, returning the id deis-queue assigned it.

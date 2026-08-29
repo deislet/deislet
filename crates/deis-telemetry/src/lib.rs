@@ -1,8 +1,19 @@
 //! Deislet log aggregation and metrics.
 //!
-//! This service is deliberately "dumb": it knows only `app_id` as a tenant
-//! dimension, and knows nothing about versions, environments or deployments.
-//! Those concepts live in deis-control and deis-runtime.
+//! This service is deliberately "dumb": it knows only `app_id` as an
+//! application dimension, and knows nothing about versions, environments or
+//! deployments. Those concepts live in deis-control and deis-runtime.
+//!
+//! deis-runtime does run production and preview environments of one
+//! application side by side, and it names them apart everywhere it stores
+//! data - the storage tenant is `demo.production`. It does not do that here.
+//! Unlike deis-store, this service partitions nothing and protects nothing:
+//! anyone who can reach this port can push or read any application's lines
+//! already, so a composite key would buy no isolation and would cost the
+//! question people actually ask - "show me this application's logs", meaning
+//! all of its environments. So the environment arrives as an ordinary
+//! structured field on a log entry, and as an ordinary label on a metric
+//! sample, and `app_id` stays the application.
 //!
 //! It is equally dumb about health. It stores logs and metric samples and
 //! hands them back on request; it never decides that a component is unwell,

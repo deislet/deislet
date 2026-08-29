@@ -3,10 +3,11 @@
 //! # Why `listen` defaults to loopback
 //!
 //! deis-store has no authorization of its own. It reads the tenant from the
-//! `x-deis-app-id` header and serves that app's data; it does not check that
-//! the caller is entitled to that app, because there is nothing to check
-//! against - no credential, no key, no per-app table. Whoever can open a TCP
-//! connection to this port can read and delete any app's data by naming it.
+//! `x-deis-tenant` header and serves that tenant's data; it does not check
+//! that the caller is entitled to that tenant, because there is nothing to
+//! check against - no credential, no key, no per-tenant table. Whoever can
+//! open a TCP connection to this port can read and delete any tenant's data
+//! by naming it.
 //!
 //! The containment for this round is therefore the network, not a
 //! permission check: the default address is `127.0.0.1`, so only processes
@@ -17,7 +18,7 @@
 //! Binding anything other than a loopback address publishes an unauthenticated
 //! store to that network. Before doing it, the service needs a real caller
 //! identity: mutual TLS or a signed token per node, checked against the
-//! app the call claims, plus an audit trail of refusals. The startup log
+//! tenant the call claims, plus an audit trail of refusals. The startup log
 //! warns when the configured address is not loopback, and the warning is
 //! not to be silenced by widening the address.
 
@@ -34,7 +35,7 @@ pub struct Config {
     ///
     /// Loopback by default on purpose: the service trusts the tenant header
     /// it is handed and has no way to tell one caller from another, so the
-    /// only thing keeping one app's data away from an unrelated client is
+    /// only thing keeping one tenant's data away from an unrelated client is
     /// that the client cannot reach the port. See the module docs before
     /// changing this.
     #[serde(default = "default_listen")]
@@ -46,10 +47,10 @@ pub struct Config {
     /// metadata). Also the ceiling on blocking threads those stores occupy.
     #[serde(default = "default_shared_connections")]
     pub shared_connections: usize,
-    /// Connections in the pool of one app's database file. Kept small: with
-    /// many apps, the sum is what matters.
-    #[serde(default = "default_app_connections")]
-    pub app_connections: usize,
+    /// Connections in the pool of one tenant's database file. Kept small: with
+    /// many tenants, the sum is what matters.
+    #[serde(default = "default_tenant_connections")]
+    pub tenant_connections: usize,
     /// How often expired KV entries are deleted. Expiry is already honoured
     /// by every read, so this only decides how long dead rows keep occupying
     /// disk.
@@ -79,7 +80,7 @@ fn default_shared_connections() -> usize {
     8
 }
 
-fn default_app_connections() -> usize {
+fn default_tenant_connections() -> usize {
     4
 }
 
@@ -103,7 +104,7 @@ impl Default for Config {
             listen: default_listen(),
             data_dir: default_data_dir(),
             shared_connections: default_shared_connections(),
-            app_connections: default_app_connections(),
+            tenant_connections: default_tenant_connections(),
             kv_sweep_interval_secs: default_sweep_interval_secs(),
             max_object_bytes: default_max_object_bytes(),
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
@@ -151,7 +152,7 @@ mod tests {
         assert_eq!(parsed.listen, defaults.listen);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.shared_connections, defaults.shared_connections);
-        assert_eq!(parsed.app_connections, defaults.app_connections);
+        assert_eq!(parsed.tenant_connections, defaults.tenant_connections);
         assert_eq!(
             parsed.kv_sweep_interval_secs,
             defaults.kv_sweep_interval_secs
@@ -166,7 +167,7 @@ mod tests {
     #[test]
     fn the_default_address_is_loopback() {
         // The service trusts the tenant header, so reachability is the only
-        // thing keeping an unrelated client away from an app's data.
+        // thing keeping an unrelated client away from a tenant's data.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
     }
@@ -224,7 +225,7 @@ mod tests {
         assert_eq!(parsed.listen, defaults.listen);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.shared_connections, defaults.shared_connections);
-        assert_eq!(parsed.app_connections, defaults.app_connections);
+        assert_eq!(parsed.tenant_connections, defaults.tenant_connections);
         assert_eq!(
             parsed.kv_sweep_interval_secs,
             defaults.kv_sweep_interval_secs

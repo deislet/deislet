@@ -133,7 +133,13 @@ async fn main() -> Result<(), anyhow::Error> {
             deis_control::api::static_files::serve_fallback,
         ));
 
-    deis_control::api::log_api_ready(port, api.tls_enabled, &api.auth_config, true);
+    deis_control::api::log_api_ready(
+        port,
+        api.tls_enabled,
+        &api.auth_config,
+        &api.node_auth,
+        true,
+    );
 
     let addr = format!("{}:{}", bind_addr, port);
 

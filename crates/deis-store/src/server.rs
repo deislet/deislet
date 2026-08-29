@@ -32,7 +32,7 @@ impl Stores {
         let kv = KvService::open(&config.data_dir, config.shared_connections)
             .await
             .context("cannot open the KV store")?;
-        let database = DatabaseService::open(&config.data_dir, config.app_connections)
+        let database = DatabaseService::open(&config.data_dir, config.tenant_connections)
             .context("cannot open the database service")?;
         let blob = BlobService::open(
             &config.data_dir,
@@ -213,8 +213,9 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
             %addr,
             "listening off the local host with no caller authentication; the tenant header is \
              taken at face value, so anything that can route to this port can read, overwrite and \
-             delete any app's KV, SQL and blob data by naming its app id. Bind a loopback address \
-             unless caller identity has been added first"
+             delete any tenant's KV, SQL and blob data by naming its tenant id - including one \
+             environment of an application reaching another. Bind a loopback address unless \
+             caller identity has been added first"
         );
     }
 }
@@ -222,7 +223,7 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tenant::AppId;
+    use crate::tenant::TenantId;
     use tempfile::TempDir;
 
     fn config_for(dir: &TempDir) -> Config {
@@ -242,15 +243,83 @@ mod tests {
         assert!(dir.path().join("blob").is_dir());
     }
 
+    /// A data directory written before the tenant change holds data nothing
+    /// will look for again. Opening over it would create empty stores beside
+    /// it and answer every read with "not found", so each of the three
+    /// stores refuses to open instead. One case per store, because they are
+    /// three separate pieces of evidence on disk.
+    #[tokio::test]
+    async fn a_data_directory_from_before_the_tenant_change_is_refused() {
+        for (what, plant) in [
+            ("kv.sqlite", plant_pre_tenant_kv as fn(&std::path::Path)),
+            ("blob.sqlite", plant_pre_tenant_blob_metadata),
+            ("db/<app>.sqlite", plant_pre_tenant_database_file),
+            ("blob/<app>/", plant_pre_tenant_blob_directory),
+        ] {
+            let dir = TempDir::new().unwrap();
+            plant(dir.path());
+            let error = match Stores::open(&config_for(&dir)).await {
+                Ok(_) => panic!("{what} must not be served over"),
+                Err(e) => e,
+            };
+            // `{:#}` so the whole chain is searched: the outer context only
+            // says which store failed to open.
+            assert!(
+                format!("{error:#}").contains("predates the tenant contract"),
+                "the refusal for {what} must say what is wrong: {error:#}"
+            );
+        }
+    }
+
+    fn plant_pre_tenant_kv(data_dir: &std::path::Path) {
+        let conn = rusqlite::Connection::open(data_dir.join("kv.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE kv (
+                 app_id     TEXT NOT NULL,
+                 key        TEXT NOT NULL,
+                 value      BLOB NOT NULL,
+                 metadata   TEXT,
+                 expires_at INTEGER,
+                 PRIMARY KEY (app_id, key)
+             )",
+        )
+        .unwrap();
+    }
+
+    fn plant_pre_tenant_blob_metadata(data_dir: &std::path::Path) {
+        let conn = rusqlite::Connection::open(data_dir.join("blob.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blob (
+                 app_id       TEXT NOT NULL,
+                 key          TEXT NOT NULL,
+                 sha256       TEXT NOT NULL,
+                 size         INTEGER NOT NULL,
+                 content_type TEXT,
+                 created_at   INTEGER NOT NULL,
+                 PRIMARY KEY (app_id, key)
+             )",
+        )
+        .unwrap();
+    }
+
+    fn plant_pre_tenant_database_file(data_dir: &std::path::Path) {
+        std::fs::create_dir_all(data_dir.join("db")).unwrap();
+        std::fs::write(data_dir.join("db").join("app-one.sqlite"), b"").unwrap();
+    }
+
+    fn plant_pre_tenant_blob_directory(data_dir: &std::path::Path) {
+        std::fs::create_dir_all(data_dir.join("blob").join("app-one")).unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_sweeper_reclaims_expired_entries() {
         let dir = TempDir::new().unwrap();
         let stores = Stores::open(&config_for(&dir)).await.unwrap();
-        let app = AppId::parse("app-one").unwrap();
+        let tenant = TenantId::parse("app-one.production").unwrap();
         stores
             .kv
             .set(
-                &app,
+                &tenant,
                 "stale",
                 b"v".to_vec(),
                 None,

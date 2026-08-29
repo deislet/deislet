@@ -80,6 +80,13 @@ max_pending_entries = 10000
 [control]
 # endpoint = "http://127.0.0.1:8080"
 
+# One of the control plane's node_preshared_keys. The assignment list carries
+# this node's decrypted secrets, so a control plane that has node keys
+# configured refuses to serve it - and the bundle download - to a caller that
+# cannot present one; without this the node gets 401 and never loads a version
+# it was assigned. It is only ever sent to the endpoint above.
+# secret = "the-same-value-as-the-control-plane-node_preshared_keys"
+
 # Seconds one assignment request may take before it is abandoned.
 request_timeout_secs = 30
 
@@ -94,7 +101,7 @@ retry_interval_secs = 15
 
 # Largest bundle this node accepts. A download is cut off the moment it goes
 # over, so a wrong or hostile URL cannot fill the disk.
-max_bundle_bytes = 268435456
+max_bytes = 268435456
 
 # Seconds one download may take before it is abandoned and the version already
 # running is kept.

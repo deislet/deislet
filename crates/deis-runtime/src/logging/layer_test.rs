@@ -93,3 +93,50 @@ fn an_empty_app_id_counts_as_no_application() {
          field must not look like a real tenant in memory"
     );
 }
+
+/// The isolates log the tenant - application and environment joined - because
+/// that is what identifies a running application on this node. deis-telemetry
+/// has one application dimension and no environment dimension, so a query for
+/// "demo" has to find these lines; shipping "demo.production" in that column
+/// would make the application look silent.
+#[test]
+fn a_tenant_is_shipped_as_an_application_and_an_environment_field() {
+    let entries = capture(|| {
+        tracing::info!(target: "app", app_id = "demo.preview", "greeted world");
+    });
+
+    assert_eq!(entries[0].app_id.as_deref(), Some("demo"));
+    assert_eq!(
+        entries[0].fields.get("environment").map(String::as_str),
+        Some("preview")
+    );
+}
+
+#[test]
+fn a_bare_application_id_is_left_alone() {
+    let entries = capture(|| {
+        tracing::info!(target: "app", app_id = "demo", "greeted world");
+    });
+
+    assert_eq!(entries[0].app_id.as_deref(), Some("demo"));
+    assert!(!entries[0].fields.contains_key("environment"));
+}
+
+#[test]
+fn an_environment_the_event_wrote_itself_wins() {
+    let entries = capture(|| {
+        tracing::info!(
+            target: "app",
+            app_id = "demo.production",
+            environment = "staging",
+            "greeted world"
+        );
+    });
+
+    assert_eq!(entries[0].app_id.as_deref(), Some("demo"));
+    assert_eq!(
+        entries[0].fields.get("environment").map(String::as_str),
+        Some("staging"),
+        "the value the caller recorded must not be overwritten"
+    );
+}

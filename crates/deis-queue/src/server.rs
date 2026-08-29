@@ -233,8 +233,9 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
             %addr,
             "listening off the local host with no caller authentication; the tenant header is \
              taken at face value, so anything that can route to this port can enqueue, drain and \
-             delete any app's messages by naming its app id. Bind a loopback address unless \
-             caller identity has been added first"
+             delete any tenant's messages by naming its tenant id - including one environment of \
+             an application reaching another. Bind a loopback address unless caller identity has \
+             been added first"
         );
     }
 }
@@ -243,7 +244,7 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
 mod tests {
     use super::*;
     use crate::queue::QueueLimits;
-    use crate::tenant::AppId;
+    use crate::tenant::TenantId;
     use tempfile::TempDir;
 
     fn config_for(dir: &TempDir) -> Config {
@@ -258,6 +259,41 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _queue = open(&config_for(&dir)).await.unwrap();
         assert!(dir.path().join("queue.sqlite").exists());
+    }
+
+    /// A queue.sqlite written before the tenant change holds messages that
+    /// can never be delivered under the new keying. Opening over it would
+    /// create a second, empty pair of tables and report every queue empty, so
+    /// the service refuses to open at all.
+    #[tokio::test]
+    async fn a_database_from_before_the_tenant_change_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                 app_id     TEXT    NOT NULL,
+                 queue      TEXT    NOT NULL,
+                 id         TEXT    NOT NULL,
+                 body       BLOB    NOT NULL,
+                 attempts   INTEGER NOT NULL DEFAULT 0,
+                 visible_at INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY (app_id, queue, id)
+             )",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = match open(&config_for(&dir)).await {
+            Ok(_) => panic!("an old database must not be served over"),
+            Err(e) => e,
+        };
+        // `{:#}` so the whole chain is searched: the outer context only
+        // says which store failed to open.
+        assert!(
+            format!("{error:#}").contains("predates the tenant contract"),
+            "the refusal must say what is wrong: {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -289,11 +325,11 @@ mod tests {
         .await
         .unwrap();
 
-        let app = AppId::parse("app-one").unwrap();
-        let id = queue.send(&app, "jobs", b"work".to_vec()).await.unwrap();
-        queue.pull(&app, "jobs", None, None).await.unwrap();
-        queue.nack(&app, "jobs", vec![id], None).await.unwrap();
-        assert_eq!(queue.dead_letters(&app, "jobs").await.unwrap().len(), 1);
+        let tenant = TenantId::parse("app-one.production").unwrap();
+        let id = queue.send(&tenant, "jobs", b"work".to_vec()).await.unwrap();
+        queue.pull(&tenant, "jobs", None, None).await.unwrap();
+        queue.nack(&tenant, "jobs", vec![id], None).await.unwrap();
+        assert_eq!(queue.dead_letters(&tenant, "jobs").await.unwrap().len(), 1);
 
         let sweeper = spawn_dead_letter_sweeper(queue.clone(), 1).expect("retention is on");
         clock.advance(601);
@@ -303,14 +339,14 @@ mod tests {
         // to land. Stepping rather than jumping keeps the test independent of
         // when the runtime first polls the spawned task. The loop is bounded,
         // so a sweeper that never runs fails the test instead of hanging it.
-        let mut remaining = queue.dead_letters(&app, "jobs").await.unwrap().len();
+        let mut remaining = queue.dead_letters(&tenant, "jobs").await.unwrap().len();
         for _ in 0..20 {
             if remaining == 0 {
                 break;
             }
             tokio::time::advance(Duration::from_secs(1)).await;
             tokio::task::yield_now().await;
-            remaining = queue.dead_letters(&app, "jobs").await.unwrap().len();
+            remaining = queue.dead_letters(&tenant, "jobs").await.unwrap().len();
         }
         sweeper.abort();
         assert_eq!(

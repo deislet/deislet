@@ -335,16 +335,33 @@ impl RuntimeNodeManager {
     }
 
     /// Unload (stop and remove) an application from a node.
+    ///
+    /// `environment` names which environment of the app to take off; an
+    /// empty string means every environment of it, which is what deleting
+    /// the application does. The pair is the identity of a running
+    /// application on a node, so unloading `demo` in a preview must leave
+    /// `demo` in production serving.
     pub async fn unload_app(
         &self,
         id: &str,
         app_id: &str,
+        environment: &str,
     ) -> Result<proto::UnloadAppResponse, NodeError> {
         let mut client = self.connect(id).await?;
-        info!(node = id, app_id, "Unloading app from deis_runtime node");
+        info!(
+            node = id,
+            app_id,
+            environment = if environment.is_empty() {
+                "<all>"
+            } else {
+                environment
+            },
+            "Telling a runtime node to stop serving this application; it will not come back from an assignment refresh, because the catalog no longer names it"
+        );
         let resp = client
             .unload_app(proto::UnloadAppRequest {
                 app_id: app_id.to_string(),
+                environment: environment.to_string(),
             })
             .await
             .map_err(NodeError::from_status)?;

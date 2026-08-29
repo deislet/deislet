@@ -230,6 +230,85 @@ async fn wait_for_port_closed(addr: std::net::SocketAddr) -> bool {
     false
 }
 
+/// The two credentials of the assembled router, checked where they are
+/// actually composed rather than one middleware at a time.
+///
+/// `api_auth_enabled` governs the dashboard and the human API. It must not
+/// reach the endpoints that serve nodes: one of them answers with every
+/// environment's decrypted secrets, so it authenticates with
+/// `node_preshared_keys` whatever that flag says - and it does not accept a
+/// dashboard key, because the dashboard is deliberately unable to read a
+/// secret back.
+#[tokio::test]
+async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_else() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let config = ControlConfig {
+        api_auth_enabled: true,
+        api_keys: vec!["dashboard-key".to_string()],
+        node_preshared_keys: vec!["node-psk".to_string()],
+        ..Default::default()
+    };
+    let database = Arc::new(Database::init(":memory:").await.unwrap());
+    let sessions = Arc::new(SessionManager::new());
+    let broadcaster = Arc::new(EventBroadcaster::new());
+    let config_manager = Arc::new(ConfigManager::new(
+        Arc::clone(&database),
+        Arc::clone(&sessions),
+    ));
+    let command_executor = Arc::new(CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&database),
+    ));
+    let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+    let api = deis_control::api::build_api_router(
+        sessions,
+        database,
+        broadcaster,
+        config_manager,
+        command_executor,
+        metrics_collector,
+        Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
+        Arc::new(config),
+    );
+
+    let status_of = |uri: &str, credential: Option<&str>| {
+        let router = api.router.clone();
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(credential) = credential {
+            builder = builder.header("Authorization", format!("Bearer {credential}"));
+        }
+        let request = builder.body(Body::empty()).unwrap();
+        async move { router.oneshot(request).await.unwrap().status() }
+    };
+
+    const ASSIGNMENTS: &str = "/api/nodes/node-a/assignments";
+    assert_eq!(status_of(ASSIGNMENTS, None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        status_of(ASSIGNMENTS, Some("dashboard-key")).await,
+        StatusCode::UNAUTHORIZED,
+        "an API key must not be able to read the fleet's secrets"
+    );
+    assert_eq!(
+        status_of(ASSIGNMENTS, Some("node-psk")).await,
+        StatusCode::OK,
+        "a node must reach its assignments while the API key requirement is on"
+    );
+
+    // And the other way round: the human API is the API key's, not the
+    // node's.
+    assert_eq!(
+        status_of("/api/apps", Some("dashboard-key")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of("/api/apps", Some("node-psk")).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 /// A stop signal must drain rather than kill: the listener stops taking new
 /// connections at once, but a request already inside a handler runs to
 /// completion and its caller gets the real answer. Before there was any

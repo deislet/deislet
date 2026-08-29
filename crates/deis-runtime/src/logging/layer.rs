@@ -2,13 +2,25 @@
 //!
 //! # Why the fields matter
 //!
-//! deis-telemetry stores one tenant dimension, `app_id`, and every query
+//! deis-telemetry stores one application dimension, `app_id`, and every query
 //! (`deis tail`, the log panel) filters on it. An entry that arrives with an
 //! empty `app_id` is still stored, but nothing can ever find it again: it is
 //! invisible to every per-application query while looking, from the shipper's
 //! side, like a successful delivery. So the layer reads `app_id` off the event
 //! rather than leaving the column blank, and keeps the remaining structured
 //! fields instead of discarding them.
+//!
+//! # Where the environment goes
+//!
+//! Inside this node an application is the pair (application, environment),
+//! and every isolate logs that pair as its `app_id` field - `demo.production`.
+//! deis-telemetry is not partitioned by tenant the way deis-store is; it has
+//! no isolation to protect, and asking it for "this application's logs" has
+//! to answer with every environment's. So the pair is split here, on the way
+//! out: the application goes in `app_id` and the environment becomes an
+//! ordinary structured field. Shipping the joined string instead would make
+//! a query for `demo` return nothing at all, which reads exactly like an app
+//! that never logged.
 
 use super::buffer::LogBuffer;
 use super::types::{LogEntry, LogLevel};
@@ -27,6 +39,11 @@ use tracing_subscriber::Layer;
 /// shipped, and collapsing them here keeps the in-memory form from suggesting
 /// a distinction the protocol cannot carry.
 const APP_ID_FIELD: &str = "app_id";
+
+/// Field the environment half of a tenant is shipped under, for the events
+/// whose `app_id` is a tenant. Named to match the control plane's REST field
+/// and the `x-deis-environment` header, so one word means one thing.
+const ENVIRONMENT_FIELD: &str = "environment";
 
 /// Event field holding the human-readable text, which every `tracing` macro
 /// records under this name.
@@ -60,10 +77,32 @@ where
 
         let message = visitor.message.unwrap_or_default();
         let mut entry = LogEntry::new(self.node_id.clone(), level, message);
-        entry.app_id = visitor.app_id.filter(|id| !id.is_empty());
         entry.fields = visitor.fields;
 
+        entry.app_id = match visitor.app_id.filter(|id| !id.is_empty()) {
+            Some(app_id) => Some(split_tenant_field(&app_id, &mut entry.fields)),
+            None => None,
+        };
+
         self.buffer.push(entry);
+    }
+}
+
+/// Reduce a tenant to the application it names, recording the environment as a
+/// field. A value that is not a tenant - a bare application id from an older
+/// call site - is kept as it is and adds no field.
+///
+/// An `environment` the event set itself is left alone: it was written
+/// deliberately, and overwriting it would hide what the caller meant to say.
+fn split_tenant_field(app_id: &str, fields: &mut HashMap<String, String>) -> String {
+    match deis_wire::conventions::split_tenant(app_id) {
+        Some((app, environment)) => {
+            fields
+                .entry(ENVIRONMENT_FIELD.to_string())
+                .or_insert_with(|| environment.to_string());
+            app.to_string()
+        }
+        None => app_id.to_string(),
     }
 }
 

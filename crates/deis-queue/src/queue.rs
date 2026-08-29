@@ -1,7 +1,7 @@
 //! The queue itself: enqueue, lease, acknowledge, return, dead letter.
 //!
-//! One SQLite file holds every tenant's messages, partitioned by the `app_id`
-//! column and keyed on `(app_id, queue, id)`. Two tables:
+//! One SQLite file holds every tenant's messages, partitioned by the `tenant`
+//! column and keyed on `(tenant, queue, id)`. Two tables:
 //!
 //! ```text
 //! messages     what is still to be delivered, plus what is currently leased
@@ -26,7 +26,7 @@ use crate::proto::queue::{
     SendBatchRequest, SendBatchResponse, SendRequest, SendResponse, queue_server::Queue,
 };
 use crate::sqlite::{PoolSize, SqlitePool};
-use crate::tenant::{AppId, app_id_of};
+use crate::tenant::{TenantId, tenant_of};
 use rusqlite::{OptionalExtension, Transaction};
 use tonic::{Request, Response, Status};
 
@@ -171,30 +171,36 @@ impl QueueService {
             PoolSize::new(connections),
         );
         pool.migrate(|conn| {
+            // Before anything is created: a queue.sqlite from before the
+            // tenant change would otherwise gain a second, empty pair of
+            // tables beside the rows nobody can reach any more.
+            for table in ["messages", "dead_letter"] {
+                crate::legacy::reject_pre_tenant_table(conn, table)?;
+            }
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS messages (
-                     app_id     TEXT    NOT NULL,
+                     tenant     TEXT    NOT NULL,
                      queue      TEXT    NOT NULL,
                      id         TEXT    NOT NULL,
                      body       BLOB    NOT NULL,
                      attempts   INTEGER NOT NULL DEFAULT 0,
                      visible_at INTEGER NOT NULL,
                      created_at INTEGER NOT NULL,
-                     PRIMARY KEY (app_id, queue, id)
+                     PRIMARY KEY (tenant, queue, id)
                  );
-                 -- The one index Pull needs: it looks up a single app's
+                 -- The one index Pull needs: it looks up a single tenant's
                  -- single queue and wants the rows that are ready first.
                  CREATE INDEX IF NOT EXISTS messages_ready
-                     ON messages(app_id, queue, visible_at);
+                     ON messages(tenant, queue, visible_at);
                  CREATE TABLE IF NOT EXISTS dead_letter (
-                     app_id     TEXT    NOT NULL,
+                     tenant     TEXT    NOT NULL,
                      queue      TEXT    NOT NULL,
                      id         TEXT    NOT NULL,
                      body       BLOB    NOT NULL,
                      attempts   INTEGER NOT NULL,
                      created_at INTEGER NOT NULL,
                      died_at    INTEGER NOT NULL,
-                     PRIMARY KEY (app_id, queue, id)
+                     PRIMARY KEY (tenant, queue, id)
                  );
                  CREATE INDEX IF NOT EXISTS dead_letter_died_at
                      ON dead_letter(died_at);",
@@ -221,8 +227,8 @@ impl QueueService {
     }
 
     /// Enqueue one message, visible immediately. Returns its id.
-    pub async fn send(&self, app: &AppId, queue: &str, body: Vec<u8>) -> QueueResult<String> {
-        let ids = self.send_batch(app, queue, vec![body]).await?;
+    pub async fn send(&self, tenant: &TenantId, queue: &str, body: Vec<u8>) -> QueueResult<String> {
+        let ids = self.send_batch(tenant, queue, vec![body]).await?;
         Ok(ids
             .into_iter()
             .next()
@@ -234,7 +240,7 @@ impl QueueService {
     /// given.
     pub async fn send_batch(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         queue: &str,
         bodies: Vec<Vec<u8>>,
     ) -> QueueResult<Vec<String>> {
@@ -246,7 +252,7 @@ impl QueueService {
         }
         if bodies.len() > self.limits.max_batch_messages {
             tracing::warn!(
-                app = %app,
+                tenant = %tenant,
                 queue = %queue,
                 messages = bodies.len(),
                 limit = self.limits.max_batch_messages,
@@ -265,7 +271,7 @@ impl QueueService {
         let ids: Vec<String> = (0..bodies.len())
             .map(|_| uuid::Uuid::new_v4().to_string())
             .collect();
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         let now = self.clock.now();
         let rows: Vec<(String, Vec<u8>)> = ids.iter().cloned().zip(bodies).collect();
         let bytes: usize = rows.iter().map(|(_, body)| body.len()).sum();
@@ -275,17 +281,18 @@ impl QueueService {
         self.pool
             .with_tx(move |tx| {
                 let mut insert = tx.prepare(
-                    "INSERT INTO messages (app_id, queue, id, body, attempts, visible_at, created_at)
-                          VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+                    "INSERT INTO messages
+                            (tenant, queue, id, body, attempts, visible_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
                 )?;
                 for (id, body) in &rows {
-                    insert.execute(rusqlite::params![app_id, table_queue, id, body, now])?;
+                    insert.execute(rusqlite::params![tenant_id, table_queue, id, body, now])?;
                 }
                 Ok(())
             })
             .await?;
 
-        tracing::debug!(app = %app, queue = %queue, messages = queued, bytes, "enqueued");
+        tracing::debug!(tenant = %tenant, queue = %queue, messages = queued, bytes, "enqueued");
         Ok(ids)
     }
 
@@ -298,7 +305,7 @@ impl QueueService {
     /// consumer see a message this call has already claimed.
     pub async fn pull(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         queue: &str,
         max_messages: Option<i32>,
         lease_seconds: Option<i32>,
@@ -311,7 +318,7 @@ impl QueueService {
         let ceiling = self.limits.max_attempts;
         let budget = self.limits.max_pull_response_bytes;
 
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         let table_queue = queue.clone();
         let (leased, retired) = self
             .pool
@@ -320,7 +327,7 @@ impl QueueService {
                 // is not owed another one. Retiring it here rather than
                 // handing it out means the ceiling holds even for consumers
                 // that die instead of reporting failure.
-                let retired = retire_exhausted(tx, &app_id, &table_queue, now, ceiling)?;
+                let retired = retire_exhausted(tx, &tenant_id, &table_queue, now, ceiling)?;
 
                 // Ready longest first, and among messages that became ready
                 // in the same second, the one that arrived first. `rowid` is
@@ -333,11 +340,12 @@ impl QueueService {
                 let mut select = tx.prepare(
                     "SELECT id, body, attempts, created_at
                        FROM messages
-                      WHERE app_id = ?1 AND queue = ?2 AND visible_at <= ?3
+                      WHERE tenant = ?1 AND queue = ?2 AND visible_at <= ?3
                       ORDER BY visible_at ASC, rowid ASC
                       LIMIT ?4",
                 )?;
-                let mut rows = select.query(rusqlite::params![app_id, table_queue, now, wanted])?;
+                let mut rows =
+                    select.query(rusqlite::params![tenant_id, table_queue, now, wanted])?;
 
                 let mut leased: Vec<LeasedMessage> = Vec::new();
                 let mut used = 0usize;
@@ -348,7 +356,7 @@ impl QueueService {
                     // startup, so this cannot loop forever on one message.
                     if !leased.is_empty() && used + body.len() > budget {
                         tracing::debug!(
-                            app = %app_id,
+                            tenant = %tenant_id,
                             queue = %table_queue,
                             returned = leased.len(),
                             "pull stopped at the response size budget; the rest stay ready for \
@@ -371,11 +379,11 @@ impl QueueService {
                 let mut lease_stmt = tx.prepare(
                     "UPDATE messages
                         SET visible_at = ?4, attempts = attempts + 1
-                      WHERE app_id = ?1 AND queue = ?2 AND id = ?3",
+                      WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
                 )?;
                 for message in &leased {
                     lease_stmt.execute(rusqlite::params![
-                        app_id,
+                        tenant_id,
                         table_queue,
                         message.id,
                         lease_expires_at
@@ -387,13 +395,13 @@ impl QueueService {
             .await?;
 
         for (id, attempts) in &retired {
-            warn_dead_lettered(app, &queue, id, *attempts, ceiling, "its lease lapsed");
+            warn_dead_lettered(tenant, &queue, id, *attempts, ceiling, "its lease lapsed");
         }
         if leased.is_empty() {
-            tracing::trace!(app = %app, queue = %queue, "pull found nothing ready");
+            tracing::trace!(tenant = %tenant, queue = %queue, "pull found nothing ready");
         } else {
             tracing::debug!(
-                app = %app,
+                tenant = %tenant,
                 queue = %queue,
                 returned = leased.len(),
                 lease_seconds = lease,
@@ -405,13 +413,18 @@ impl QueueService {
 
     /// Delete handled messages. Ids that are not there are ignored, so a
     /// repeated acknowledgement is harmless. Returns how many rows went away.
-    pub async fn ack(&self, app: &AppId, queue: &str, ids: Vec<String>) -> QueueResult<usize> {
+    pub async fn ack(
+        &self,
+        tenant: &TenantId,
+        queue: &str,
+        ids: Vec<String>,
+    ) -> QueueResult<usize> {
         let queue = self.check_queue(queue)?;
         if ids.is_empty() {
             return Ok(0);
         }
         self.check_id_count(&queue, ids.len())?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         let table_queue = queue.clone();
         let asked = ids.len();
 
@@ -419,10 +432,10 @@ impl QueueService {
             .pool
             .with_tx(move |tx| {
                 let mut delete = tx
-                    .prepare("DELETE FROM messages WHERE app_id = ?1 AND queue = ?2 AND id = ?3")?;
+                    .prepare("DELETE FROM messages WHERE tenant = ?1 AND queue = ?2 AND id = ?3")?;
                 let mut removed = 0usize;
                 for id in &ids {
-                    removed += delete.execute(rusqlite::params![app_id, table_queue, id])?;
+                    removed += delete.execute(rusqlite::params![tenant_id, table_queue, id])?;
                 }
                 Ok(removed)
             })
@@ -434,7 +447,7 @@ impl QueueService {
             // needs an operator. It is worth seeing, because the second one
             // means the message is being handled twice.
             tracing::info!(
-                app = %app,
+                tenant = %tenant,
                 queue = %queue,
                 acknowledged = removed,
                 asked,
@@ -442,7 +455,12 @@ impl QueueService {
                  their lease lapsed and they have been handed to another consumer"
             );
         } else {
-            tracing::debug!(app = %app, queue = %queue, acknowledged = removed, "acknowledged");
+            tracing::debug!(
+                tenant = %tenant,
+                queue = %queue,
+                acknowledged = removed,
+                "acknowledged"
+            );
         }
         Ok(removed)
     }
@@ -452,7 +470,7 @@ impl QueueService {
     /// is dead lettered instead.
     pub async fn nack(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         queue: &str,
         ids: Vec<String>,
         delay_seconds: Option<i32>,
@@ -466,7 +484,7 @@ impl QueueService {
         let now = self.clock.now();
         let visible_at = now.saturating_add(delay);
         let ceiling = self.limits.max_attempts;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         let table_queue = queue.clone();
 
         let (released, dead) = self
@@ -481,21 +499,21 @@ impl QueueService {
                     let attempts: Option<i32> = tx
                         .query_row(
                             "SELECT attempts FROM messages
-                              WHERE app_id = ?1 AND queue = ?2 AND id = ?3",
-                            rusqlite::params![app_id, table_queue, id],
+                              WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
+                            rusqlite::params![tenant_id, table_queue, id],
                             |row| row.get(0),
                         )
                         .optional()?;
                     let Some(attempts) = attempts else { continue };
 
                     if attempts >= ceiling {
-                        move_to_dead_letter(tx, &app_id, &table_queue, id, now)?;
+                        move_to_dead_letter(tx, &tenant_id, &table_queue, id, now)?;
                         dead.push((id.clone(), attempts));
                     } else {
                         tx.execute(
                             "UPDATE messages SET visible_at = ?4
-                              WHERE app_id = ?1 AND queue = ?2 AND id = ?3",
-                            rusqlite::params![app_id, table_queue, id, visible_at],
+                              WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
+                            rusqlite::params![tenant_id, table_queue, id, visible_at],
                         )?;
                         released += 1;
                     }
@@ -506,7 +524,7 @@ impl QueueService {
 
         for (id, attempts) in &dead {
             warn_dead_lettered(
-                app,
+                tenant,
                 &queue,
                 id,
                 *attempts,
@@ -515,7 +533,7 @@ impl QueueService {
             );
         }
         tracing::debug!(
-            app = %app,
+            tenant = %tenant,
             queue = %queue,
             released,
             dead_lettered = dead.len(),
@@ -528,21 +546,25 @@ impl QueueService {
         })
     }
 
-    /// Every dead letter of one app's queue, oldest death first. There is no
-    /// RPC for this yet: dead letters are read by an operator against the
-    /// database, and this is what the tests read them with.
-    pub async fn dead_letters(&self, app: &AppId, queue: &str) -> QueueResult<Vec<DeadLetter>> {
+    /// Every dead letter of one tenant's queue, oldest death first. There
+    /// is no RPC for this yet: dead letters are read by an operator against
+    /// the database, and this is what the tests read them with.
+    pub async fn dead_letters(
+        &self,
+        tenant: &TenantId,
+        queue: &str,
+    ) -> QueueResult<Vec<DeadLetter>> {
         let queue = self.check_queue(queue)?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         self.pool
             .with_conn(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT queue, id, body, attempts, created_at, died_at
                        FROM dead_letter
-                      WHERE app_id = ?1 AND queue = ?2
+                      WHERE tenant = ?1 AND queue = ?2
                       ORDER BY died_at ASC, id ASC",
                 )?;
-                let mut rows = stmt.query(rusqlite::params![app_id, queue])?;
+                let mut rows = stmt.query(rusqlite::params![tenant_id, queue])?;
                 let mut out = Vec::new();
                 while let Some(row) = rows.next()? {
                     out.push(DeadLetter {
@@ -716,16 +738,16 @@ impl QueueService {
 /// letter table. Returns the ids and attempt counts, for the caller to log.
 fn retire_exhausted(
     tx: &Transaction<'_>,
-    app_id: &str,
+    tenant: &str,
     queue: &str,
     now: i64,
     ceiling: i32,
 ) -> QueueResult<Vec<(String, i32)>> {
     let mut select = tx.prepare(
         "SELECT id, attempts FROM messages
-          WHERE app_id = ?1 AND queue = ?2 AND visible_at <= ?3 AND attempts >= ?4",
+          WHERE tenant = ?1 AND queue = ?2 AND visible_at <= ?3 AND attempts >= ?4",
     )?;
-    let mut rows = select.query(rusqlite::params![app_id, queue, now, ceiling])?;
+    let mut rows = select.query(rusqlite::params![tenant, queue, now, ceiling])?;
     let mut exhausted = Vec::new();
     while let Some(row) = rows.next()? {
         exhausted.push((row.get::<_, String>(0)?, row.get::<_, i32>(1)?));
@@ -734,7 +756,7 @@ fn retire_exhausted(
     drop(select);
 
     for (id, _) in &exhausted {
-        move_to_dead_letter(tx, app_id, queue, id, now)?;
+        move_to_dead_letter(tx, tenant, queue, id, now)?;
     }
     Ok(exhausted)
 }
@@ -743,32 +765,39 @@ fn retire_exhausted(
 /// The caller is inside the transaction, so both halves land together.
 fn move_to_dead_letter(
     tx: &Transaction<'_>,
-    app_id: &str,
+    tenant: &str,
     queue: &str,
     id: &str,
     now: i64,
 ) -> QueueResult<()> {
     tx.execute(
-        "INSERT INTO dead_letter (app_id, queue, id, body, attempts, created_at, died_at)
-              SELECT app_id, queue, id, body, attempts, created_at, ?4
+        "INSERT INTO dead_letter (tenant, queue, id, body, attempts, created_at, died_at)
+              SELECT tenant, queue, id, body, attempts, created_at, ?4
                 FROM messages
-               WHERE app_id = ?1 AND queue = ?2 AND id = ?3
-         ON CONFLICT(app_id, queue, id) DO UPDATE SET
+               WHERE tenant = ?1 AND queue = ?2 AND id = ?3
+         ON CONFLICT(tenant, queue, id) DO UPDATE SET
               attempts = excluded.attempts,
               died_at  = excluded.died_at",
-        rusqlite::params![app_id, queue, id, now],
+        rusqlite::params![tenant, queue, id, now],
     )?;
     tx.execute(
-        "DELETE FROM messages WHERE app_id = ?1 AND queue = ?2 AND id = ?3",
-        rusqlite::params![app_id, queue, id],
+        "DELETE FROM messages WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
+        rusqlite::params![tenant, queue, id],
     )?;
     Ok(())
 }
 
 /// One line per dead lettered message, saying what stops now.
-fn warn_dead_lettered(app: &AppId, queue: &str, id: &str, attempts: i32, ceiling: i32, why: &str) {
+fn warn_dead_lettered(
+    tenant: &TenantId,
+    queue: &str,
+    id: &str,
+    attempts: i32,
+    ceiling: i32,
+    why: &str,
+) {
     tracing::warn!(
-        app = %app,
+        tenant = %tenant,
         queue = %queue,
         message_id = %id,
         attempts,
@@ -782,10 +811,10 @@ fn warn_dead_lettered(app: &AppId, queue: &str, id: &str, attempts: i32, ceiling
 #[tonic::async_trait]
 impl Queue for QueueService {
     async fn send(&self, request: Request<SendRequest>) -> Result<Response<SendResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
         let id = self
-            .send(&app, &req.queue_name, req.message_body.into_bytes())
+            .send(&tenant, &req.queue_name, req.message_body.into_bytes())
             .await?;
         Ok(Response::new(SendResponse {
             success: true,
@@ -798,10 +827,10 @@ impl Queue for QueueService {
         &self,
         request: Request<SendBatchRequest>,
     ) -> Result<Response<SendBatchResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
         let bodies = req.messages.into_iter().map(String::into_bytes).collect();
-        let ids = self.send_batch(&app, &req.queue_name, bodies).await?;
+        let ids = self.send_batch(&tenant, &req.queue_name, bodies).await?;
         Ok(Response::new(SendBatchResponse {
             success: true,
             message_ids: ids,
@@ -810,11 +839,11 @@ impl Queue for QueueService {
     }
 
     async fn pull(&self, request: Request<PullRequest>) -> Result<Response<PullResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
         let leased = self
             .pull(
-                &app,
+                &tenant,
                 &req.queue_name,
                 Some(req.max_messages),
                 Some(req.lease_seconds),
@@ -839,7 +868,7 @@ impl Queue for QueueService {
                     // and its attempts keep climbing until the ceiling
                     // retires it into the dead letter table.
                     tracing::error!(
-                        app = %app,
+                        tenant = %tenant,
                         queue = %req.queue_name,
                         message_id = %message.id,
                         attempts = message.attempts,
@@ -855,20 +884,20 @@ impl Queue for QueueService {
     }
 
     async fn ack(&self, request: Request<AckRequest>) -> Result<Response<AckResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        let acknowledged = self.ack(&app, &req.queue_name, req.message_ids).await?;
+        let acknowledged = self.ack(&tenant, &req.queue_name, req.message_ids).await?;
         Ok(Response::new(AckResponse {
             acknowledged: acknowledged as i32,
         }))
     }
 
     async fn nack(&self, request: Request<NackRequest>) -> Result<Response<NackResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let req = request.into_inner();
         let outcome = self
             .nack(
-                &app,
+                &tenant,
                 &req.queue_name,
                 req.message_ids,
                 Some(req.delay_seconds),
@@ -884,7 +913,7 @@ impl Queue for QueueService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tenant::APP_ID_HEADER;
+    use crate::tenant::TENANT_HEADER;
     use tempfile::TempDir;
 
     /// A fixed instant well past 1970, so a lease never lands on a negative
@@ -914,8 +943,8 @@ mod tests {
         fixture_with(QueueLimits::default()).await
     }
 
-    fn app(name: &str) -> AppId {
-        AppId::parse(name).unwrap()
+    fn tenant(name: &str) -> TenantId {
+        TenantId::parse(name).unwrap()
     }
 
     fn bodies(messages: &[LeasedMessage]) -> Vec<String> {
@@ -927,18 +956,18 @@ mod tests {
 
     /// Stamp the tenant the way deis-runtime does, for the tests that go
     /// through the gRPC surface rather than the queue methods.
-    fn as_app<T>(app: &str, message: T) -> Request<T> {
+    fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
         let mut request = Request::new(message);
         request
             .metadata_mut()
-            .insert(APP_ID_HEADER, app.parse().unwrap());
+            .insert(TENANT_HEADER, tenant.parse().unwrap());
         request
     }
 
     #[tokio::test]
     async fn a_sent_message_is_pulled_then_acknowledged_and_never_seen_again() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
 
         let leased = f.service.pull(&a, "jobs", None, None).await.unwrap();
@@ -965,7 +994,7 @@ mod tests {
     #[tokio::test]
     async fn a_leased_message_is_invisible_until_its_lease_lapses() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
 
         let first = f.service.pull(&a, "jobs", None, Some(60)).await.unwrap();
@@ -995,7 +1024,7 @@ mod tests {
     #[tokio::test]
     async fn a_nack_with_a_delay_holds_the_message_back_for_exactly_that_long() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         f.service.pull(&a, "jobs", None, None).await.unwrap();
 
@@ -1030,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn a_nack_without_a_delay_makes_the_message_ready_at_once() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service.nack(&a, "jobs", vec![id], None).await.unwrap();
@@ -1047,7 +1076,7 @@ mod tests {
             ..QueueLimits::default()
         })
         .await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let id = f
             .service
             .send(&a, "jobs", b"poison".to_vec())
@@ -1104,7 +1133,7 @@ mod tests {
             ..QueueLimits::default()
         })
         .await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
 
         for attempt in 1..=2 {
@@ -1132,8 +1161,8 @@ mod tests {
     #[tokio::test]
     async fn tenants_cannot_see_each_other() {
         let f = fixture().await;
-        let one = app("app-one");
-        let two = app("app-two");
+        let one = tenant("app-one.production");
+        let two = tenant("app-two.production");
         let id = f.service.send(&one, "jobs", b"one".to_vec()).await.unwrap();
 
         assert!(
@@ -1143,7 +1172,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Nor can one app acknowledge another's message away.
+        // Nor can one tenant acknowledge another's message away.
         assert_eq!(
             f.service.ack(&two, "jobs", vec![id.clone()]).await.unwrap(),
             0
@@ -1164,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn queues_of_one_app_are_separate() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         f.service.send(&a, "jobs", b"job".to_vec()).await.unwrap();
         f.service
             .send(&a, "emails", b"email".to_vec())
@@ -1184,7 +1213,7 @@ mod tests {
     #[tokio::test]
     async fn messages_come_back_oldest_first_and_only_up_to_the_asked_count() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         for i in 0..5 {
             f.service
                 .send(&a, "jobs", format!("m{i}").into_bytes())
@@ -1208,7 +1237,7 @@ mod tests {
             ..QueueLimits::default()
         })
         .await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
 
         let err = f
             .service
@@ -1249,7 +1278,7 @@ mod tests {
             ..QueueLimits::default()
         })
         .await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         for _ in 0..4 {
             f.service.send(&a, "jobs", vec![b'x'; 1024]).await.unwrap();
         }
@@ -1272,7 +1301,7 @@ mod tests {
             ..QueueLimits::default()
         })
         .await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let err = f
             .service
             .send(&a, "jobs", vec![b'x'; 17])
@@ -1308,7 +1337,7 @@ mod tests {
         })
         .await;
         assert_eq!(f.service.limits().max_attempts, 1);
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         // One delivery is still one delivery: the message is not retired
         // before anyone has seen it.
@@ -1321,7 +1350,7 @@ mod tests {
     #[tokio::test]
     async fn bad_queue_names_are_refused() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         for name in ["", "with space", "slash/name", &"q".repeat(129)] {
             assert!(
                 matches!(
@@ -1344,7 +1373,7 @@ mod tests {
     #[tokio::test]
     async fn acknowledging_an_unknown_id_is_harmless() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         f.service.pull(&a, "jobs", None, None).await.unwrap();
         assert_eq!(
@@ -1363,7 +1392,7 @@ mod tests {
             ..QueueLimits::default()
         })
         .await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let ids: Vec<String> = (0..3).map(|i| format!("id-{i}")).collect();
         assert!(matches!(
             f.service.ack(&a, "jobs", ids.clone()).await,
@@ -1413,7 +1442,7 @@ mod tests {
             ..QueueLimits::default()
         })
         .await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service.nack(&a, "jobs", vec![id], None).await.unwrap();
@@ -1436,7 +1465,7 @@ mod tests {
             ..QueueLimits::default()
         })
         .await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let id = f.service.send(&a, "jobs", b"work".to_vec()).await.unwrap();
         f.service.pull(&a, "jobs", None, None).await.unwrap();
         f.service.nack(&a, "jobs", vec![id], None).await.unwrap();
@@ -1449,7 +1478,7 @@ mod tests {
     #[tokio::test]
     async fn two_consumers_pulling_at_once_never_get_the_same_message() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         for i in 0..40 {
             f.service
                 .send(&a, "jobs", format!("m{i}").into_bytes())
@@ -1460,9 +1489,9 @@ mod tests {
         let mut tasks = Vec::new();
         for _ in 0..8 {
             let svc = f.service.clone();
-            let app = a.clone();
+            let tenant = a.clone();
             tasks.push(tokio::spawn(async move {
-                svc.pull(&app, "jobs", Some(5), Some(60)).await
+                svc.pull(&tenant, "jobs", Some(5), Some(60)).await
             }));
         }
         let mut seen = std::collections::HashSet::new();
@@ -1499,8 +1528,8 @@ mod tests {
         let f = fixture().await;
         let sent = Queue::send(
             &f.service,
-            as_app(
-                "app-one",
+            as_tenant(
+                "app-one.production",
                 SendRequest {
                     queue_name: "jobs".to_string(),
                     message_body: "work".to_string(),
@@ -1515,8 +1544,8 @@ mod tests {
 
         let pulled = Queue::pull(
             &f.service,
-            as_app(
-                "app-one",
+            as_tenant(
+                "app-one.production",
                 PullRequest {
                     queue_name: "jobs".to_string(),
                     max_messages: 0,
@@ -1535,8 +1564,8 @@ mod tests {
 
         let acked = Queue::ack(
             &f.service,
-            as_app(
-                "app-one",
+            as_tenant(
+                "app-one.production",
                 AckRequest {
                     queue_name: "jobs".to_string(),
                     message_ids: vec![sent.message_id],
@@ -1555,7 +1584,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_that_cannot_be_encoded_is_withheld_without_hiding_its_neighbours() {
         let f = fixture().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         f.service.send(&a, "jobs", vec![0xff, 0xfe]).await.unwrap();
         f.service
             .send(&a, "jobs", b"readable".to_vec())
@@ -1564,8 +1593,8 @@ mod tests {
 
         let pulled = Queue::pull(
             &f.service,
-            as_app(
-                "app-one",
+            as_tenant(
+                "app-one.production",
                 PullRequest {
                     queue_name: "jobs".to_string(),
                     max_messages: 10,

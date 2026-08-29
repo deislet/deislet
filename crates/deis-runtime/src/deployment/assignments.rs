@@ -22,6 +22,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
+use super::credential::NodeCredential;
 use super::{Applied, DeploymentManager, DeploymentOrder};
 use crate::health::NodeHealth;
 
@@ -101,17 +102,31 @@ impl std::error::Error for AssignmentError {}
 pub struct AssignmentClient {
     client: reqwest::Client,
     url: String,
+    credential: Option<NodeCredential>,
 }
 
 impl AssignmentClient {
-    pub fn new(endpoint: &str, node_id: &str, timeout: Duration) -> anyhow::Result<Self> {
+    /// `credential` is the node key from `[control] secret`. Without it the
+    /// request is anonymous, which a control plane with `node_preshared_keys`
+    /// configured answers with 401 - it will not hand this node's decrypted
+    /// secrets to a caller that cannot prove it is a node.
+    pub fn new(
+        endpoint: &str,
+        node_id: &str,
+        timeout: Duration,
+        credential: Option<NodeCredential>,
+    ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder().timeout(timeout).build()?;
         let url = format!(
             "{}/api/nodes/{}/assignments",
             endpoint.trim_end_matches('/'),
             urlencode(node_id)
         );
-        Ok(Self { client, url })
+        Ok(Self {
+            client,
+            url,
+            credential,
+        })
     }
 
     pub fn url(&self) -> &str {
@@ -119,20 +134,36 @@ impl AssignmentClient {
     }
 
     pub async fn fetch(&self) -> Result<Vec<Assignment>, AssignmentError> {
-        let response =
-            self.client
-                .get(&self.url)
-                .send()
-                .await
-                .map_err(|e| AssignmentError::Transport {
-                    url: self.url.clone(),
-                    reason: e.to_string(),
-                })?;
+        let mut request = self.client.get(&self.url);
+        if let Some(credential) = &self.credential {
+            request = request.header(reqwest::header::AUTHORIZATION, credential.header_value());
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| AssignmentError::Transport {
+                url: self.url.clone(),
+                reason: e.to_string(),
+            })?;
 
         if !response.status().is_success() {
+            let code = response.status().as_u16();
+            if code == 401 || code == 403 {
+                let has_credential = self.credential.is_some();
+                error!(
+                    url = %self.url,
+                    code,
+                    has_credential,
+                    "The control plane refused this node's credential, so this node gets no \
+                     assignment list at all: it keeps serving whatever it already had and picks \
+                     up no new version. Set control.secret to one of the control plane's \
+                     node_preshared_keys"
+                );
+            }
             return Err(AssignmentError::Status {
                 url: self.url.clone(),
-                code: response.status().as_u16(),
+                code,
             });
         }
 
@@ -184,6 +215,7 @@ pub async fn sync_once(
 
     for assignment in assignments {
         let app_id = assignment.app_id.clone();
+        let environment = assignment.environment.clone();
         let version_id = assignment.version_id.clone();
         match deployer
             .apply_from_assignment(assignment.into_order())
@@ -193,6 +225,7 @@ pub async fn sync_once(
                 outcome.installed += 1;
                 info!(
                     app_id = %app_id,
+                    environment = %environment,
                     version_id = %version_id,
                     reused_bundle,
                     "Loaded an assigned version"
@@ -203,12 +236,14 @@ pub async fn sync_once(
                 outcome.failed += 1;
                 error!(
                     app_id = %app_id,
+                    environment = %environment,
                     version_id = %version_id,
                     error = %e,
-                    "Could not load assigned version {} of {}; that app is not serving on this \
-                     node",
+                    "Could not load assigned version {} of {} environment {}; that environment \
+                     is not serving on this node",
                     version_id,
-                    app_id
+                    app_id,
+                    environment
                 );
             }
         }

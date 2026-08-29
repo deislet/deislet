@@ -53,6 +53,10 @@ fn default_true() -> bool {
 #[derive(Serialize)]
 struct AppStatusView {
     app_id: String,
+    /// Which environment of that application this line is about. A node
+    /// runs production and every preview side by side, each with its own
+    /// version and counters, so the pair is what names one of them.
+    environment: String,
     state: String,
     request_count: i64,
     error_count: i64,
@@ -72,6 +76,7 @@ pub async fn node_status(
                 .iter()
                 .map(|a| AppStatusView {
                     app_id: a.app_id.clone(),
+                    environment: a.environment.clone(),
                     state: match a.state {
                         1 => "loading",
                         2 => "running",
@@ -111,22 +116,55 @@ pub async fn node_status(
     }
 }
 
-/// DELETE /api/runtime/:node/apps/:app_id — unload an app.
+#[derive(Deserialize)]
+pub struct UnloadParams {
+    /// Which environment of the application to take off this node. Omitted
+    /// means every environment of it.
+    ///
+    /// An application on a node is identified by `(app_id, environment)`:
+    /// production and a preview of the same app are two separate loads with
+    /// their own version and secrets, so unloading without naming one would
+    /// otherwise be ambiguous.
+    #[serde(default)]
+    pub environment: Option<String>,
+}
+
+/// DELETE /api/runtime/:node/apps/:app_id[?environment=NAME] — unload an app.
+///
+/// This is a node-local operation and changes nothing in the catalog: the
+/// next assignment refresh puts back whatever the catalog still says this
+/// node should run.
 pub async fn unload_app(
     State(state): State<AppsState>,
     Path((node, app_id)): Path<(String, String)>,
+    Query(params): Query<UnloadParams>,
 ) -> impl IntoResponse {
-    match state.deis_runtime.unload_app(&node, &app_id).await {
+    let environment = params.environment.unwrap_or_default();
+    match state
+        .deis_runtime
+        .unload_app(&node, &app_id, &environment)
+        .await
+    {
         Ok(resp) if resp.success => (
             StatusCode::OK,
-            Json(json!({ "success": true, "message": resp.message })),
+            Json(json!({
+                "success": true,
+                "message": resp.message,
+                "environments": resp.environments,
+            })),
         ),
         Ok(resp) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "success": false, "message": resp.message })),
         ),
         Err(e) => {
-            warn!(node = %node, app_id = %app_id, error = %e, "Unload failed");
+            warn!(
+                node = %node,
+                app_id = %app_id,
+                environment = %environment,
+                error = %e,
+                "Unload failed; this node is still serving the application"
+            );
             node_error_response(&e)
         }
     }

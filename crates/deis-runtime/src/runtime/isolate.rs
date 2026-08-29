@@ -7,7 +7,6 @@ use super::metrics::{recorder, MetricsRegistry, RequestOutcome};
 use super::ops::{AppId, EnvStore, ResponseStore};
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
-use super::queue_ops::MemoryQueue;
 use super::rate_limit::RateLimiter;
 use super::route_match::{match_routes, path_from_url};
 use super::runtime_init::{build_runtime_extensions, init_lazy_extensions};
@@ -164,7 +163,14 @@ pub struct AppRuntime {
 }
 
 impl AppRuntime {
-    /// Build an isolate for one application.
+    /// Build an isolate for one application in one environment.
+    ///
+    /// `app_id` is the identity this node runs the application under, which
+    /// is the pair spelled as a tenant: [`crate::app::AppKey::tenant_id`],
+    /// e.g. `demo.production`. It is what the storage clients are charged to,
+    /// so production and a preview of one application never share a
+    /// namespace, and it is the dimension every log line and metric of this
+    /// isolate carries.
     ///
     /// `wiring` says which platform services the app declared and where they
     /// live; only the declared ones are constructed, and none of them dials
@@ -274,9 +280,10 @@ impl AppRuntime {
             Some(Rc::new(callback) as deno_core::OpMetricsFn)
         });
 
-        // Built before the runtime so a malformed address fails the load
-        // outright rather than after V8 has been spun up. An address that is
-        // merely unreachable is not a failure here: the channels are lazy.
+        // Built before the runtime so a malformed address, or an identity
+        // that is not a tenant, fails the load outright rather than after V8
+        // has been spun up. An address that is merely unreachable is not a
+        // failure here: the channels are lazy.
         let services = AppServices::connect(&app_id, wiring)?;
         if services.is_empty() && !wiring.declaration.is_empty() {
             tracing::warn!(
@@ -354,9 +361,6 @@ impl AppRuntime {
             let response_store: ResponseStore = Rc::new(RefCell::new(None));
             state.put(response_store);
 
-            let memory_queue: MemoryQueue = Rc::new(RefCell::new(Vec::new()));
-            state.put(memory_queue);
-
             // Ops that emit logs need to say which tenant they are acting for;
             // see `AppId`.
             state.put(AppId(app_id.clone()));
@@ -364,7 +368,9 @@ impl AppRuntime {
             // The storage bindings. Only what the app declared is present;
             // an op that finds its client missing answers "service not
             // available", which is the honest answer for a service the app
-            // never asked for.
+            // never asked for. Nothing stands in for an absent client -- an
+            // app told plainly that it has no queue is better off than one
+            // handed a receipt for a message that went nowhere.
             services.install(&mut state);
         }
 
@@ -414,6 +420,40 @@ impl AppRuntime {
             rate_limit_ops_per_sec,
             metrics,
         })
+    }
+
+    /// Clear V8's termination flag, so a cut-off costs one execution and not
+    /// the isolate.
+    ///
+    /// `terminate_execution` is not spent when the execution it killed
+    /// returns. deno_core cancels the flag only long enough to build the error
+    /// object and then sets it again before handing that error back
+    /// (deno_core 0.380 `error.rs`), so an isolate is still marked for
+    /// termination after a timeout or a rate-limit cut-off. Left that way it
+    /// is finished for good: the next `execute_script` fails immediately, so
+    /// every later request answers 500, every queue batch is handed back until
+    /// its delivery attempts run out and the messages are dead lettered, and
+    /// every cron tick fails on whichever node the control plane picks. One
+    /// slow request would take the application off this node until it was
+    /// redeployed or the process restarted.
+    ///
+    /// Cancelling unconditionally, rather than only when
+    /// `is_execution_terminating()` says so, is deliberate: that predicate is
+    /// true only while JS frames are still unwinding the termination. Once an
+    /// execution has returned there are no frames left, so a flag that is set
+    /// and waiting for the next entry into JS reads as *not* terminating --
+    /// and is exactly the one that has to go. Cancelling when nothing was
+    /// terminating is a no-op.
+    ///
+    /// Called both after an execution and before the next one: the timeout
+    /// task can set the flag in the window between the execution returning and
+    /// the task being aborted, and some error paths return before the first
+    /// call is reached.
+    ///
+    /// The cut-off itself is already logged, at warn, by whichever guard fired
+    /// it; this is the cleanup, and it says nothing of its own.
+    fn clear_termination(&mut self) {
+        self.runtime.v8_isolate().cancel_terminate_execution();
     }
 
     pub async fn init_module(&mut self) -> Result<()> {
@@ -528,8 +568,15 @@ impl AppRuntime {
     ) -> Result<()> {
         let started = Instant::now();
 
+        // A flag left over from the previous execution would fail this one
+        // before a line of the app's code ran.
+        self.clear_termination();
+
         if self.module_id.is_none() {
             if let Err(e) = self.init_module().await {
+                // A rate-limit cut-off can fire while the module is still
+                // being evaluated, and leaves the same flag set as a timeout.
+                self.clear_termination();
                 self.metrics
                     .record_request(&self.app_id, started.elapsed(), RequestOutcome::Error);
                 let _ = response_tx.send(Err(e));
@@ -609,6 +656,10 @@ impl AppRuntime {
 
         // Cancel timeout task
         timeout_task.abort();
+
+        // The timeout task and the rate limiter both work by terminating the
+        // isolate, and that flag outlives the execution it killed.
+        self.clear_termination();
 
         // Check results. A terminated isolate (timeout or rate-limit cut-off)
         // and a script error both land here, and both cost the request.
@@ -727,8 +778,13 @@ impl AppRuntime {
         queue: String,
         messages: Vec<LeasedMessage>,
     ) -> Result<BatchOutcome> {
+        self.clear_termination();
+
         if self.module_id.is_none() {
-            self.init_module().await?;
+            if let Err(e) = self.init_module().await {
+                self.clear_termination();
+                return Err(e);
+            }
         }
 
         let payload = JsQueueBatch {
@@ -784,6 +840,10 @@ impl AppRuntime {
             .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
             .await;
         timeout_task.abort();
+        // Without this the batch that ran long would also be the last thing
+        // this isolate ever did: every following batch would be handed back
+        // and the app's messages would end up dead lettered.
+        self.clear_termination();
         result?;
 
         let json_str = {
@@ -841,8 +901,13 @@ impl AppRuntime {
     /// reason: a handler that never returns would pin the runtime thread its
     /// app lives on and stop every request on that thread.
     pub async fn execute_scheduled(&mut self, cron: String, scheduled_time_ms: i64) -> Result<()> {
+        self.clear_termination();
+
         if self.module_id.is_none() {
-            self.init_module().await?;
+            if let Err(e) = self.init_module().await {
+                self.clear_termination();
+                return Err(e);
+            }
         }
 
         let payload = JsScheduledEvent {
@@ -889,6 +954,7 @@ impl AppRuntime {
             .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
             .await;
         timeout_task.abort();
+        self.clear_termination();
         result?;
 
         let json_str = {
@@ -1024,6 +1090,22 @@ impl AppRuntime {
     #[cfg(test)]
     pub fn app_id(&self) -> &str {
         &self.app_id
+    }
+
+    /// Put this isolate in exactly the state a cut-off leaves it in.
+    ///
+    /// The timeout task and the rate limiter both end an execution by calling
+    /// `terminate_execution` on this isolate's handle; this is the same call.
+    /// Tests use it because neither of the real triggers is reproducible here:
+    /// the timeout is a `tokio::spawn`ed timer that a handler blocking the
+    /// thread never lets run, and the rate limiter would keep firing on the
+    /// request that is supposed to prove recovery.
+    #[cfg(test)]
+    pub fn terminate_like_a_cut_off(&mut self) {
+        self.runtime
+            .v8_isolate()
+            .thread_safe_handle()
+            .terminate_execution();
     }
 
     /// Exposes the effective execution timeout for this isolate. Behavioral

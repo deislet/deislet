@@ -11,7 +11,7 @@ use axum::routing::get;
 use axum::Router;
 
 use super::*;
-use crate::app::ApplicationManager;
+use crate::app::{AppKey, ApplicationManager};
 use crate::config::RuntimeConfig;
 
 /// A handler that answers with everything the test wants to observe from
@@ -179,10 +179,21 @@ fn order(
     sha: &str,
     env: &[(&str, &str)],
 ) -> DeploymentOrder {
+    order_for(&AppKey::production(app), version, url, sha, env)
+}
+
+/// The same, for a named environment of an app.
+fn order_for(
+    key: &AppKey,
+    version: &str,
+    url: String,
+    sha: &str,
+    env: &[(&str, &str)],
+) -> DeploymentOrder {
     DeploymentOrder {
-        app_id: app.to_string(),
+        app_id: key.app_id().to_string(),
         version_id: version.to_string(),
-        environment: "production".to_string(),
+        environment: key.environment().to_string(),
         bundle_url: url,
         bundle_sha: sha.to_string(),
         env: env
@@ -190,6 +201,11 @@ fn order(
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect(),
     }
+}
+
+/// The production copy of the app the tests deploy.
+fn demo() -> AppKey {
+    AppKey::production("demo")
 }
 
 #[tokio::test]
@@ -219,11 +235,11 @@ async fn installs_a_version_and_indexes_its_assets() {
         }
     );
     assert_eq!(
-        apps.installed_version("demo").unwrap().version_id,
+        apps.installed_version(&demo()).unwrap().version_id,
         "v1".to_string()
     );
 
-    let assets = apps.assets("demo").unwrap();
+    let assets = apps.assets(&demo()).unwrap();
     assert_eq!(assets.len(), 2);
     assert_eq!(assets.resolve("/").unwrap().path, "index.html");
     assert_eq!(assets.resolve("/css/app.css").unwrap().path, "css/app.css");
@@ -260,15 +276,17 @@ async fn a_digest_that_does_not_match_leaves_the_running_version_untouched() {
         matches!(err, DeployError::Fetch(FetchError::DigestMismatch { .. })),
         "{err}"
     );
-    assert_eq!(apps.installed_version("demo").unwrap().version_id, "v1");
-    let serving = apps.assets("demo").unwrap();
+    assert_eq!(apps.installed_version(&demo()).unwrap().version_id, "v1");
+    let serving = apps.assets(&demo()).unwrap();
     assert_eq!(
         &serving.resolve("/index.html").unwrap().bytes[..],
         b"v1",
         "the working version stopped serving its own assets"
     );
     assert!(
-        !dir.path().join("bundles/apps/demo/v2.zip").exists(),
+        !dir.path()
+            .join("bundles/apps/demo/production/v2.zip")
+            .exists(),
         "a bundle that failed verification was kept"
     );
 }
@@ -289,7 +307,7 @@ async fn a_bundle_filed_under_another_app_is_refused() {
         .unwrap_err();
 
     assert!(matches!(err, DeployError::Bundle(_)), "{err}");
-    assert!(apps.installed_version("demo").is_none());
+    assert!(apps.installed_version(&demo()).is_none());
 }
 
 #[tokio::test]
@@ -312,7 +330,7 @@ async fn a_missing_bundle_url_does_not_disturb_anything() {
         ),
         "{err}"
     );
-    assert!(apps.installed_version("demo").is_none());
+    assert!(apps.installed_version(&demo()).is_none());
 }
 
 #[tokio::test]
@@ -408,7 +426,7 @@ async fn secrets_reach_the_isolate_and_never_the_disk() {
 
     let (status, _headers, body) = apps
         .execute_app(
-            "demo",
+            &demo(),
             "http://localhost/".to_string(),
             "GET".to_string(),
             HashMap::new(),
@@ -463,7 +481,7 @@ async fn a_declared_service_gets_a_client_built_from_the_address_the_order_carri
 
     let (_, _, body) = apps
         .execute_app(
-            "demo",
+            &demo(),
             "http://localhost/".to_string(),
             "GET".to_string(),
             HashMap::new(),
@@ -514,7 +532,7 @@ async fn an_app_that_declares_no_service_is_told_so_rather_than_given_one() {
 
     let (_, _, body) = apps
         .execute_app(
-            "demo",
+            &demo(),
             "http://localhost/".to_string(),
             "GET".to_string(),
             HashMap::new(),
@@ -558,13 +576,13 @@ async fn a_version_that_will_not_load_puts_the_previous_one_back() {
 
     assert!(matches!(err, DeployError::Load(_)), "{err}");
     assert_eq!(
-        apps.installed_version("demo").unwrap().version_id,
+        apps.installed_version(&demo()).unwrap().version_id,
         "v1",
         "a deploy that could not load took the working app down with it"
     );
     let (status, _headers, _body) = apps
         .execute_app(
-            "demo",
+            &demo(),
             "http://localhost/".to_string(),
             "GET".to_string(),
             HashMap::new(),
@@ -597,8 +615,8 @@ async fn recovers_its_versions_from_disk_when_there_is_no_control_plane() {
     let recovered = deployer.recover_from_disk().await;
 
     assert_eq!(recovered, 1);
-    assert_eq!(apps.installed_version("demo").unwrap().version_id, "v1");
-    assert_eq!(apps.assets("demo").unwrap().len(), 1);
+    assert_eq!(apps.installed_version(&demo()).unwrap().version_id, "v1");
+    assert_eq!(apps.assets(&demo()).unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -615,10 +633,10 @@ async fn unloading_an_app_takes_its_bundles_and_its_record_with_it() {
         .await
         .unwrap();
 
-    deployer.unload("demo").await.unwrap();
+    deployer.unload("demo", None).await.unwrap();
 
-    assert!(apps.installed_version("demo").is_none());
-    assert!(apps.assets("demo").is_none());
+    assert!(apps.installed_version(&demo()).is_none());
+    assert!(apps.assets(&demo()).is_none());
     assert!(deployer.store().records().await.is_empty());
     // Otherwise a restart with no control plane would bring the app back.
     assert!(!dir.path().join("bundles/apps/demo").exists());
@@ -657,6 +675,219 @@ fn a_deployment_order_never_prints_a_secret_value() {
     assert!(!printed.contains("s3cr3t"), "{printed}");
     assert!(printed.contains("API_KEY"), "{printed}");
     assert!(printed.contains("redacted"), "{printed}");
+}
+
+/// Two environments of one application are two running copies, and neither
+/// may replace the other.
+///
+/// Before the node keyed on the pair, deploying a preview of an app took over
+/// production's slot: same isolate, same asset index, same bundle file, and
+/// production quietly started serving preview code with preview secrets.
+#[tokio::test]
+async fn a_preview_deployment_does_not_touch_production() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = bundle("demo", ECHO_HANDLER, &[("index.html", "live")], &[]);
+    let next = bundle("demo", ECHO_HANDLER, &[("index.html", "preview")], &[]);
+    let control = ControlPlane::serving(HashMap::from([
+        ("v1".to_string(), live.bytes.clone()),
+        ("v2".to_string(), next.bytes.clone()),
+    ]))
+    .await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+
+    let production = demo();
+    let preview = AppKey::new("demo", "preview-3");
+
+    deployer
+        .apply(order_for(
+            &production,
+            "v1",
+            control.url("v1"),
+            &live.sha256,
+            &[("API_KEY", "production-secret")],
+        ))
+        .await
+        .unwrap();
+    deployer
+        .apply(order_for(
+            &preview,
+            "v2",
+            control.url("v2"),
+            &next.sha256,
+            &[("API_KEY", "preview-secret")],
+        ))
+        .await
+        .unwrap();
+
+    // Each environment keeps its own version, its own assets and its own
+    // secrets.
+    assert_eq!(
+        apps.installed_version(&production).unwrap().version_id,
+        "v1"
+    );
+    assert_eq!(apps.installed_version(&preview).unwrap().version_id, "v2");
+    assert_eq!(
+        &apps
+            .assets(&production)
+            .unwrap()
+            .resolve("/index.html")
+            .unwrap()
+            .bytes[..],
+        b"live"
+    );
+    assert_eq!(
+        &apps
+            .assets(&preview)
+            .unwrap()
+            .resolve("/index.html")
+            .unwrap()
+            .bytes[..],
+        b"preview"
+    );
+    assert_eq!(secret_seen(&apps, &production).await, "production-secret");
+    assert_eq!(secret_seen(&apps, &preview).await, "preview-secret");
+
+    // On disk too: one directory each, and one record line each, so a restart
+    // without a control plane brings both back rather than one of them twice.
+    assert!(dir
+        .path()
+        .join("bundles/apps/demo/production/v1.zip")
+        .exists());
+    assert!(dir
+        .path()
+        .join("bundles/apps/demo/preview-3/v2.zip")
+        .exists());
+    let mut records = deployer.store().records().await;
+    records.sort_by(|a, b| a.environment.cmp(&b.environment));
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].environment, "preview-3");
+    assert_eq!(records[1].environment, "production");
+}
+
+/// Unloading names an environment or means all of them.
+#[tokio::test]
+async fn unloading_one_environment_leaves_the_others_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+
+    let production = demo();
+    let preview = AppKey::new("demo", "preview-3");
+    for key in [&production, &preview] {
+        deployer
+            .apply(order_for(key, "v1", control.url("v1"), &bundle.sha256, &[]))
+            .await
+            .unwrap();
+    }
+
+    let unloaded = deployer.unload("demo", Some("preview-3")).await.unwrap();
+
+    assert_eq!(unloaded, vec!["preview-3".to_string()]);
+    assert!(apps.installed_version(&preview).is_none());
+    assert!(apps.installed_version(&production).is_some());
+    assert!(!dir.path().join("bundles/apps/demo/preview-3").exists());
+    assert!(dir
+        .path()
+        .join("bundles/apps/demo/production/v1.zip")
+        .exists());
+    let records = deployer.store().records().await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].environment, "production");
+
+    // No environment named: everything the app has here goes.
+    let unloaded = deployer.unload("demo", None).await.unwrap();
+    assert_eq!(unloaded, vec!["production".to_string()]);
+    assert!(apps.installed_version(&production).is_none());
+    assert!(deployer.store().records().await.is_empty());
+}
+
+/// A version recovered from local disk is running the right code with an
+/// empty environment, because secret values are never written to disk. The
+/// control plane's delivery of that same version has to reinstall it.
+///
+/// Before this, the version ids matched and the delivery was skipped as
+/// redundant: the app kept serving with no secrets and no storage addresses
+/// for the life of the process, while the node reported itself ready.
+#[tokio::test]
+async fn a_version_recovered_from_disk_is_reinstalled_when_the_real_one_arrives() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    // A first life: the control plane delivers v1 with its secret.
+    {
+        let apps = Arc::new(ApplicationManager::new());
+        let deployer = deployer_in(dir.path(), apps).await;
+        deployer
+            .apply(order(
+                "demo",
+                "v1",
+                control.url("v1"),
+                &bundle.sha256,
+                &[("API_KEY", "from the control plane")],
+            ))
+            .await
+            .unwrap();
+    }
+
+    // A restart with the control plane down: the bundle is on disk, the
+    // secret is not.
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    assert_eq!(deployer.recover_from_disk().await, 1);
+    assert!(
+        !apps.installed_version(&demo()).unwrap().env_confirmed,
+        "a copy loaded from disk cannot have a confirmed environment"
+    );
+    assert_eq!(secret_seen(&apps, &demo()).await, "");
+
+    // The control plane comes back and hands out the same version id.
+    let applied = deployer
+        .apply_from_assignment(order(
+            "demo",
+            "v1",
+            control.url("v1"),
+            &bundle.sha256,
+            &[("API_KEY", "from the control plane")],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        applied,
+        Applied::Installed {
+            reused_bundle: true
+        },
+        "the delivery that carries the secrets was skipped as already running"
+    );
+    assert!(apps.installed_version(&demo()).unwrap().env_confirmed);
+    assert_eq!(secret_seen(&apps, &demo()).await, "from the control plane");
+}
+
+/// What one environment's isolate sees as `context.env.API_KEY`.
+async fn secret_seen(apps: &ApplicationManager, key: &AppKey) -> String {
+    let (_status, _headers, body) = apps
+        .execute_app(
+            key,
+            "http://localhost/".to_string(),
+            "GET".to_string(),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .expect("the app is loaded");
+    let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+    seen["env"]["API_KEY"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Whether any file under `root` contains `needle`.

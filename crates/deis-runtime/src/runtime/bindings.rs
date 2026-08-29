@@ -103,8 +103,11 @@ pub enum ServiceKind {
 }
 
 impl ServiceKind {
-    /// The name used in `manifest.services`, in `AppConfig.resources` and in
-    /// the reserved env key.
+    /// The name used in `manifest.services` and in the reserved env key
+    /// [`SERVICES_KEY`]. Those are the only two places a service is named:
+    /// `AppConfig.resources` looks like a third but nothing reads it
+    /// (`docs/architecture.zh.md` section 2 records it as undefined and
+    /// unconsumed).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Kv => "kv",
@@ -114,13 +117,17 @@ impl ServiceKind {
         }
     }
 
-    /// Parse a declared service name. `db` is accepted as a spelling of
-    /// `database` because the JS side calls it `ctx.services.database` while
-    /// older configs wrote `db`; anything else is unknown.
+    /// Parse a declared service name.
+    ///
+    /// Exactly the four spellings [`Self::as_str`] produces, because they are
+    /// the only ones anything writes: `deis_bundle::Manifest::services` keys
+    /// and [`SERVICES_KEY`], which this module writes itself in
+    /// [`ServiceWiring::write_to_env`]. An alias with no producer would only
+    /// tell a reader that some other spelling is supported somewhere.
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "kv" => Some(Self::Kv),
-            "database" | "db" | "sql" => Some(Self::Database),
+            "database" => Some(Self::Database),
             "blob" => Some(Self::Blob),
             "queue" => Some(Self::Queue),
             _ => None,
@@ -309,18 +316,18 @@ impl ServiceWiring {
     /// Returns an empty list, with the reason logged, in every case where
     /// polling could not work -- a consumer that silently fails forever is
     /// worse than one that says why it never started.
-    pub fn active_consumers(&self, app_id: &str) -> Vec<QueueConsumerSpec> {
+    pub fn active_consumers(&self, tenant: &str) -> Vec<QueueConsumerSpec> {
         if self.consumers.is_empty() {
             return Vec::new();
         }
 
         let Some(_endpoint) = self.endpoints.queue.as_ref() else {
             tracing::warn!(
-                app_id,
+                app_id = tenant,
                 queues = self.consumers.len(),
-                "App {} declares {} queue consumer(s) but the control plane sent no queue \
+                "{} declares {} queue consumer(s) but the control plane sent no queue \
                  address; nothing will be consumed and the messages will pile up in deis-queue",
-                app_id,
+                tenant,
                 self.consumers.len()
             );
             return Vec::new();
@@ -328,10 +335,10 @@ impl ServiceWiring {
 
         if !self.declaration.declares(ServiceKind::Queue) {
             tracing::warn!(
-                app_id,
-                "App {} declares queue consumers but does not declare the queue service; \
+                app_id = tenant,
+                "{} declares queue consumers but does not declare the queue service; \
                  nothing will be consumed. Add \"queue\" to the manifest's services",
-                app_id
+                tenant
             );
             return Vec::new();
         }
@@ -415,7 +422,9 @@ pub(crate) fn streaming_channel(endpoint: &str) -> Result<Channel> {
 /// The clients one application's isolate holds.
 ///
 /// Absent means "not declared" (or, for queue, "no address"), and every op
-/// that looks for a missing client answers "service not available".
+/// that looks for a missing client answers "service not available". There is
+/// no in-process stand-in for any of them: an app that believes it wrote
+/// something is worse off than one told plainly that it could not.
 #[derive(Clone, Default)]
 pub struct AppServices {
     pub kv: Option<KvClient>,
@@ -425,16 +434,24 @@ pub struct AppServices {
 }
 
 impl AppServices {
-    /// Build exactly the clients this app declared.
+    /// Build exactly the clients this app declared, all charged to `tenant`.
     ///
-    /// Fails only on things that can never work: an app id that cannot be a
-    /// gRPC header, or an address that is not a URL. A service that is merely
+    /// `tenant` is the application *and its environment*, spelled the way the
+    /// storage services read it (`demo.production`): it is
+    /// [`crate::app::AppKey::tenant_id`], which is what this node identifies a
+    /// running application by. Passing a bare application id is refused rather
+    /// than treated as production, because two environments sharing one
+    /// namespace is the failure this pair exists to prevent and it is not
+    /// recoverable once a preview has written over production's data.
+    ///
+    /// Fails only on things that can never work: a tenant that is not two
+    /// legal parts, or an address that is not a URL. A service that is merely
     /// unreachable is not an error here -- see the module docs.
     ///
     /// Must be called from inside a Tokio runtime: building a lazy channel
     /// registers a connector with the reactor. Every caller in this crate is
     /// on a runtime thread already.
-    pub fn connect(app_id: &str, wiring: &ServiceWiring) -> Result<Self> {
+    pub fn connect(tenant: &str, wiring: &ServiceWiring) -> Result<Self> {
         let mut services = Self::default();
 
         let store_kinds: Vec<ServiceKind> =
@@ -449,34 +466,35 @@ impl AppServices {
                     for kind in store_kinds {
                         match kind {
                             ServiceKind::Kv => {
-                                services.kv = Some(KvClient::connect_lazy(endpoint, app_id)?)
+                                services.kv = Some(KvClient::connect_lazy(endpoint, tenant)?)
                             }
                             ServiceKind::Database => {
-                                services.database = Some(DbClient::connect_lazy(endpoint, app_id)?)
+                                services.database = Some(DbClient::connect_lazy(endpoint, tenant)?)
                             }
                             ServiceKind::Blob => {
-                                services.blob = Some(BlobClient::connect_lazy(endpoint, app_id)?)
+                                services.blob = Some(BlobClient::connect_lazy(endpoint, tenant)?)
                             }
                             ServiceKind::Queue => unreachable!("queue is not served by the store"),
                         }
                     }
                     tracing::info!(
-                        app_id,
+                        app_id = tenant,
                         endpoint,
                         services = wiring.declaration.to_csv(),
-                        "Bound app {} to deis-store at {} for {}",
-                        app_id,
+                        "Bound {} to deis-store at {} for {}; every read and write is charged to \
+                         that tenant, so another environment of this app sees none of it",
+                        tenant,
                         endpoint,
                         wiring.declaration.to_csv()
                     );
                 }
                 None => tracing::error!(
-                    app_id,
+                    app_id = tenant,
                     services = wiring.declaration.to_csv(),
-                    "App {} declares storage services ({}) but the control plane sent no \
+                    "{} declares storage services ({}) but the control plane sent no \
                      deis-store address; every ctx.services call will fail with \"service not \
                      available\" until a deployment carries one",
-                    app_id,
+                    tenant,
                     wiring.declaration.to_csv()
                 ),
             }
@@ -485,20 +503,21 @@ impl AppServices {
         if wiring.declaration.declares(ServiceKind::Queue) {
             match wiring.endpoints.queue.as_deref() {
                 Some(endpoint) => {
-                    services.queue = Some(QueueClient::connect_lazy(endpoint, app_id)?);
+                    services.queue = Some(QueueClient::connect_lazy(endpoint, tenant)?);
                     tracing::info!(
-                        app_id,
+                        app_id = tenant,
                         endpoint,
-                        "Bound app {} to deis-queue at {}",
-                        app_id,
+                        "Bound {} to deis-queue at {}",
+                        tenant,
                         endpoint
                     );
                 }
                 None => tracing::error!(
-                    app_id,
-                    "App {} declares the queue service but the control plane sent no deis-queue \
-                     address; ctx.services.queue.send will fail until a deployment carries one",
-                    app_id
+                    app_id = tenant,
+                    "{} declares the queue service but the control plane sent no deis-queue \
+                     address; every ctx.services.queue.send will fail with \"service not \
+                     available\" -- the messages are refused, not held anywhere",
+                    tenant
                 ),
             }
         }
@@ -555,9 +574,12 @@ pub fn wire_deployment_env(manifest: &deis_bundle::Manifest, env: &mut HashMap<S
 
 /// Build a queue client for a poller, which needs one even when the app's own
 /// code never sends a message.
-pub(crate) fn consumer_queue_client(app_id: &str, endpoint: &str) -> Result<QueueClient> {
-    QueueClient::connect_lazy(endpoint, app_id)
-        .with_context(|| format!("building the queue consumer client for app {app_id}"))
+///
+/// Charged to the same tenant as the app's own client, so a preview polls its
+/// own queues and never leases a message production was meant to handle.
+pub(crate) fn consumer_queue_client(tenant: &str, endpoint: &str) -> Result<QueueClient> {
+    QueueClient::connect_lazy(endpoint, tenant)
+        .with_context(|| format!("building the queue consumer client for {tenant}"))
 }
 
 #[cfg(test)]

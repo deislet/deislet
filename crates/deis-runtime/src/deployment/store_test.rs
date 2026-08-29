@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::AppKey;
 
 async fn store() -> (tempfile::TempDir, BundleStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -24,10 +25,22 @@ fn refuses_an_identifier_that_could_escape_the_bundle_directory() {
 }
 
 #[tokio::test]
-async fn a_traversing_app_id_never_reaches_the_filesystem() {
+async fn a_traversing_identifier_never_reaches_the_filesystem() {
     let (_dir, store) = store().await;
-    assert!(store.bundle_path("../../etc", "v1").is_err());
-    assert!(store.bundle_path("app", "../../etc").is_err());
+    assert!(store
+        .bundle_path(&AppKey::production("../../etc"), "v1")
+        .is_err());
+    assert!(store
+        .bundle_path(&AppKey::new("app", "../../etc"), "v1")
+        .is_err());
+    assert!(store
+        .bundle_path(&AppKey::production("app"), "../../etc")
+        .is_err());
+    // A dot in either half would make the tenant id split into three parts,
+    // so one pair could impersonate another.
+    assert!(store
+        .bundle_path(&AppKey::production("app.preview"), "v1")
+        .is_err());
 }
 
 #[tokio::test]
@@ -36,9 +49,16 @@ async fn a_bundle_lands_under_its_app_and_version() {
     let temp = store.temp_path();
     tokio::fs::write(&temp, b"zip bytes").await.unwrap();
 
-    let path = store.adopt(&temp, "my-app", "v1").await.unwrap();
+    let path = store
+        .adopt(&temp, &AppKey::production("my-app"), "v1")
+        .await
+        .unwrap();
 
-    assert!(path.ends_with("apps/my-app/v1.zip"), "{}", path.display());
+    assert!(
+        path.ends_with("apps/my-app/production/v1.zip"),
+        "{}",
+        path.display()
+    );
     assert_eq!(store.read_bundle(&path).await.unwrap(), b"zip bytes");
     assert!(!temp.exists(), "the temp file should have been moved");
 }
@@ -81,7 +101,10 @@ async fn forgetting_an_app_removes_its_bundles_and_its_line() {
     let (_dir, store) = store().await;
     let temp = store.temp_path();
     tokio::fs::write(&temp, b"zip").await.unwrap();
-    let path = store.adopt(&temp, "my-app", "v1").await.unwrap();
+    let path = store
+        .adopt(&temp, &AppKey::production("my-app"), "v1")
+        .await
+        .unwrap();
     store
         .remember(InstalledRecord {
             app_id: "my-app".into(),
@@ -103,13 +126,22 @@ async fn pruning_keeps_only_the_version_still_in_use() {
     for version in ["v1", "v2"] {
         let temp = store.temp_path();
         tokio::fs::write(&temp, b"zip").await.unwrap();
-        store.adopt(&temp, "my-app", version).await.unwrap();
+        store
+            .adopt(&temp, &AppKey::production("my-app"), version)
+            .await
+            .unwrap();
     }
 
-    store.prune("my-app", "v2").await;
+    store.prune(&AppKey::production("my-app"), "v2").await;
 
-    assert!(!store.bundle_path("my-app", "v1").unwrap().exists());
-    assert!(store.bundle_path("my-app", "v2").unwrap().exists());
+    assert!(!store
+        .bundle_path(&AppKey::production("my-app"), "v1")
+        .unwrap()
+        .exists());
+    assert!(store
+        .bundle_path(&AppKey::production("my-app"), "v2")
+        .unwrap()
+        .exists());
 }
 
 #[tokio::test]

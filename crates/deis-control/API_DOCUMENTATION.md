@@ -55,8 +55,38 @@ curl -H "X-API-Key: your-secret-api-key-1" \
 
 ### Public Endpoints
 
-The following endpoints do not require authentication:
+The following endpoints do not require an API key:
 - `GET /health` - Health check
+- `GET /api/metrics` - Prometheus scrape
+
+### Node Endpoints Use a Different Credential
+
+Two endpoints exist for runtime nodes rather than for people:
+
+```
+GET /api/nodes/{node_id}/assignments
+GET /api/apps/{app_id}/versions/{version_id}/bundle
+```
+
+They are authenticated with `node_preshared_keys` - the same credential a
+node uses to register over gRPC - and **`api_auth_enabled` has no effect on
+them**. The reason is the first one: its response carries every
+environment's decrypted secret values, so a setting whose purpose is to
+make a dashboard convenient must not be able to leave that channel open.
+
+```bash
+curl -H "Authorization: Bearer <one of node_preshared_keys>" \
+     http://localhost:8080/api/nodes/deis-runtime-1/assignments
+```
+
+An API key is not accepted here: the dashboard and the CLI are deliberately
+unable to read a secret back.
+
+With no `node_preshared_keys` configured at all, both endpoints still
+answer - nobody could authenticate anyway - but the assignment list then
+leaves out every application that has a secret, and says so with an
+`ERROR` log line naming the application. Configure a node key to run
+applications with secrets.
 
 ### Security Recommendations
 
@@ -186,19 +216,33 @@ DELETE /api/apps/{app_id}
 ```
 
 Deleting an app removes its versions, environments, deployment history,
-routes and secrets, and drops the bundle files those versions referenced.
-The response reports how much was removed:
+routes and secrets, drops the bundle files those versions referenced, and
+tells every configured node to stop serving it. That last step matters: a
+node adds applications from its assignment list and never removes one that
+has left it, so without it a deleted app would keep running - answering
+requests, holding its decrypted secrets in memory and polling its queues -
+until the node process restarted.
+
+The response reports how much was removed and where it actually stopped:
 
 ```json
 {
   "app_id": "my-app",
   "removed": { "versions": 2, "environments": 1, "deployments": 3, "routes": 1, "secrets": 2 },
-  "bundle_files_removed": 2
+  "bundle_files_removed": 2,
+  "unloaded": {
+    "app_id": "my-app",
+    "environments": ["production"],
+    "unloaded": ["deis-runtime-1"],
+    "failed": [{ "node": "deis-runtime-2", "error": "transport error: connect ..." }],
+    "skipped": null
+  }
 }
 ```
 
-Nodes keep serving what they already loaded until their next assignment
-refresh.
+**A node listed in `unloaded.failed` is still serving the deleted
+application.** `skipped` is set instead when no nodes are configured, which
+means nothing was serving it here in the first place.
 
 ### Upload a Bundle (create a version)
 
@@ -383,17 +427,36 @@ the digest, load it, and only then report healthy.
     "version_id": "8d0a9822-...",
     "environment": "production",
     "bundle_url": "http://localhost:8080/api/apps/my-app/versions/8d0a9822-.../bundle",
-    "bundle_sha": "0026d534..."
+    "bundle_sha": "0026d534...",
+    "env": {
+      "LOG_LEVEL": "info",
+      "API_KEY": "s3cr3t",
+      "DEIS_STORE_ENDPOINT": "http://127.0.0.1:8090"
+    }
   }
 ]
 ```
 
+`(app_id, environment)` is the identity of one running application: a node
+runs production and every preview of the same app side by side, each with
+its own version, variables and secrets, and builds its storage tenant from
+that pair. `env` is exactly what an `ApplyDeployment` push would have
+carried - the manifest's variables, this environment's **decrypted**
+secrets, and the platform's storage addresses - because a node that
+restarts has to come back with the environment it had rather than with an
+empty one.
+
+That is why this endpoint authenticates the caller as a node with
+`node_preshared_keys`, whatever `api_auth_enabled` says; see
+[Authentication](#node-endpoints-use-a-different-credential). An
+environment whose secrets will not decrypt, or whose secrets may not be
+served because no node key is configured, is left out of the list entirely
+rather than sent with a hole in it - the node then does not run it, and an
+`ERROR` line says which application and why.
+
 Every runtime node runs every app, so the list is currently identical for
 all nodes. The `bundle_url` host comes from `public_base_url` when it is
 configured, otherwise from the `Host` header of the request.
-
-With `api_auth_enabled = true`, this endpoint and the bundle download are
-authenticated like any other, so nodes must be given an API key.
 
 ---
 
@@ -944,7 +1007,15 @@ curl http://localhost:8080/api/metrics
 - Catalog API: apps, versions, environments, deployments, routes and secrets
 - Bundle upload with sha256 and manifest verification, plus streamed bundle download
 - Per-node assignment list at `GET /api/nodes/{node_id}/assignments`
-- Secrets encrypted with AES-256-GCM; values are never returned by any endpoint
+- Secrets encrypted with AES-256-GCM; no endpoint returns a value to a
+  person. The assignment list returns decrypted values **to a node**, and is
+  therefore authenticated with `node_preshared_keys` independently of
+  `api_auth_enabled`
+- `DELETE /api/apps/{app_id}` now tells every node to stop serving the app
+  and reports the nodes it could not reach
+- `DELETE /api/runtime/{node}/apps/{app_id}` takes an optional
+  `?environment=`, because an application on a node is identified by
+  `(app_id, environment)`
 - Graceful shutdown on SIGINT and SIGTERM: the listener stops accepting and
   in-flight REST requests and node gRPC calls are drained before the process
   leaves

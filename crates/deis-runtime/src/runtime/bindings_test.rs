@@ -12,10 +12,10 @@ mod tests {
 
     /// `AppServices` holds gRPC clients and cannot derive `Debug`, so the
     /// `expect` family is unavailable; this keeps the failure message useful.
-    fn connect_or_panic(app_id: &str, wiring: &ServiceWiring) -> AppServices {
-        match AppServices::connect(app_id, wiring) {
+    fn connect_or_panic(tenant: &str, wiring: &ServiceWiring) -> AppServices {
+        match AppServices::connect(tenant, wiring) {
             Ok(services) => services,
-            Err(error) => panic!("connecting services for {app_id} failed: {error}"),
+            Err(error) => panic!("connecting services for {tenant} failed: {error}"),
         }
     }
 
@@ -175,7 +175,7 @@ mod tests {
             consumers: Vec::new(),
         };
 
-        let services = connect_or_panic("demo", &wiring);
+        let services = connect_or_panic("demo.production", &wiring);
         assert!(services.kv.is_some());
         assert!(services.database.is_none());
         assert!(services.blob.is_none());
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_declared_service_gets_a_client_stamped_with_the_app() {
+    async fn every_declared_service_gets_a_client_stamped_with_the_tenant() {
         let wiring = ServiceWiring {
             declaration: ServiceDeclaration::from_names(["kv", "database", "blob", "queue"]),
             endpoints: ServiceEndpoints {
@@ -193,16 +193,50 @@ mod tests {
             consumers: Vec::new(),
         };
 
-        let services = connect_or_panic("demo-app", &wiring);
-        assert_eq!(services.kv.as_ref().map(|c| c.app_id()), Some("demo-app"));
+        // Every client is charged to the pair, not to the application: a
+        // preview that stamped only "demo-app" would read and overwrite what
+        // production stored.
+        let services = connect_or_panic("demo-app.preview-7", &wiring);
         assert_eq!(
-            services.database.as_ref().map(|c| c.app_id()),
-            Some("demo-app")
+            services.kv.as_ref().map(|c| c.tenant()),
+            Some("demo-app.preview-7")
         );
-        assert_eq!(services.blob.as_ref().map(|c| c.app_id()), Some("demo-app"));
         assert_eq!(
-            services.queue.as_ref().map(|c| c.app_id()),
-            Some("demo-app")
+            services.database.as_ref().map(|c| c.tenant()),
+            Some("demo-app.preview-7")
+        );
+        assert_eq!(
+            services.blob.as_ref().map(|c| c.tenant()),
+            Some("demo-app.preview-7")
+        );
+        assert_eq!(
+            services.queue.as_ref().map(|c| c.tenant()),
+            Some("demo-app.preview-7")
+        );
+    }
+
+    #[test]
+    fn an_identity_that_is_not_a_tenant_is_refused_rather_than_sent_to_production() {
+        // The pair is the identity of a running application. A bare app id
+        // would have to be given some environment, and the only one available
+        // to guess is production -- which is exactly the namespace a preview
+        // must never touch.
+        let wiring = ServiceWiring {
+            declaration: ServiceDeclaration::from_names(["kv"]),
+            endpoints: ServiceEndpoints {
+                store: Some("http://127.0.0.1:8090".to_string()),
+                queue: None,
+            },
+            consumers: Vec::new(),
+        };
+
+        let error = match AppServices::connect("demo", &wiring) {
+            Ok(_) => panic!("a bare application id names no environment and must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("not a storage tenant"),
+            "{error}"
         );
     }
 
@@ -215,7 +249,7 @@ mod tests {
             endpoints: ServiceEndpoints::default(),
             consumers: Vec::new(),
         };
-        let services = connect_or_panic("demo", &wiring);
+        let services = connect_or_panic("demo.production", &wiring);
         assert!(services.is_empty());
     }
 
@@ -231,7 +265,7 @@ mod tests {
             },
             consumers: Vec::new(),
         };
-        let error = match AppServices::connect("demo", &wiring) {
+        let error = match AppServices::connect("demo.production", &wiring) {
             Ok(_) => panic!("an address that is not a URL must be refused"),
             Err(error) => error,
         };
@@ -251,7 +285,7 @@ mod tests {
             },
             consumers: Vec::new(),
         };
-        let services = match AppServices::connect("demo", &wiring) {
+        let services = match AppServices::connect("demo.production", &wiring) {
             Ok(services) => services,
             Err(error) => panic!("a lazy client is built even when nothing answers: {error}"),
         };
@@ -259,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn an_app_id_that_cannot_be_a_header_is_refused() {
+    fn a_tenant_that_cannot_be_a_header_is_refused() {
         let wiring = ServiceWiring {
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
@@ -268,7 +302,7 @@ mod tests {
             },
             consumers: Vec::new(),
         };
-        assert!(AppServices::connect("bad\nid", &wiring).is_err());
+        assert!(AppServices::connect("bad\nid.production", &wiring).is_err());
     }
 
     #[test]
@@ -281,7 +315,7 @@ mod tests {
                 batch_size: None,
             }],
         };
-        assert!(wiring.active_consumers("demo").is_empty());
+        assert!(wiring.active_consumers("demo.production").is_empty());
     }
 
     #[test]
@@ -297,7 +331,7 @@ mod tests {
                 batch_size: None,
             }],
         };
-        assert!(wiring.active_consumers("demo").is_empty());
+        assert!(wiring.active_consumers("demo.production").is_empty());
     }
 
     #[test]
@@ -313,7 +347,7 @@ mod tests {
                 batch_size: None,
             }],
         };
-        assert_eq!(wiring.active_consumers("demo").len(), 1);
+        assert_eq!(wiring.active_consumers("demo.production").len(), 1);
     }
 
     #[test]
@@ -351,7 +385,7 @@ mod tests {
 
         let wiring = ServiceWiring::take_from_env(&mut map);
         assert_eq!(wiring.endpoints.store.as_deref(), Some("http://store:8090"));
-        assert_eq!(wiring.active_consumers("demo").len(), 1);
+        assert_eq!(wiring.active_consumers("demo.production").len(), 1);
         assert_eq!(map, env(&[("LOG_LEVEL", "info")]));
     }
 

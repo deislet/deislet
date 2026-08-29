@@ -1,8 +1,11 @@
 //! Object storage.
 //!
 //! Content is written content-addressed under
-//! `<data_dir>/blob/<app_id>/<sha[0..2]>/<sha[2..4]>/<sha>`; the name-to-content
-//! mapping lives in `<data_dir>/blob.sqlite`. The two-level shard keeps any
+//! `<data_dir>/blob/<tenant>/<sha[0..2]>/<sha[2..4]>/<sha>`; the
+//! name-to-content mapping lives in `<data_dir>/blob.sqlite`. The tenant is
+//! the first path component, so identical bytes stored by two environments of
+//! one application are two files and deleting one leaves the other alone. The
+//! two-level shard keeps any
 //! single directory to a few hundred entries even with millions of objects,
 //! which matters on filesystems that degrade on huge directories.
 //!
@@ -17,7 +20,7 @@
 //! counts the rows pointing at content and then removes the file. Left
 //! unsynchronised they lose data - the delete counts zero before the store's
 //! row lands, unlinks the file, and the new key is left pointing at nothing.
-//! [`ContentLocks`] holds those two sections apart, per app and digest.
+//! [`ContentLocks`] holds those two sections apart, per tenant and digest.
 
 use crate::error::{StoreError, StoreResult};
 use crate::proto::blob::{
@@ -25,7 +28,7 @@ use crate::proto::blob::{
     blob_store_server::BlobStore, get_response, put_request,
 };
 use crate::sqlite::{PoolSize, SqlitePool};
-use crate::tenant::{AppId, app_id_of};
+use crate::tenant::{TenantId, tenant_of};
 use crate::unix_seconds;
 // Body slice size for `Get`, and the size clients are expected to use for
 // `Put`; see deis_wire::conventions for why it lives in one place.
@@ -41,9 +44,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 
-/// Directory under each app's blob root where in-flight uploads land. Two hex
-/// characters name a shard, so an eight-letter name can never collide with
-/// one.
+/// Directory under each tenant's blob root where in-flight uploads land. Two
+/// hex characters name a shard, so an eight-letter name can never collide
+/// with one.
 const INCOMING_DIR: &str = "incoming";
 
 /// Longest accepted object key.
@@ -100,23 +103,28 @@ impl BlobService {
     ) -> StoreResult<Self> {
         let root = data_dir.join("blob");
         std::fs::create_dir_all(&root)?;
+        // One content directory per tenant. A directory named by a bare
+        // application id belongs to the layout this change replaced, and its
+        // objects are unreachable now.
+        crate::legacy::reject_pre_tenant_blob_dirs(&root)?;
         let pool = SqlitePool::new(
             data_dir.join("blob.sqlite"),
             "blob",
             PoolSize::new(connections),
         );
         pool.migrate(|conn| {
+            crate::legacy::reject_pre_tenant_table(conn, "blob")?;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS blob (
-                     app_id       TEXT NOT NULL,
+                     tenant       TEXT NOT NULL,
                      key          TEXT NOT NULL,
                      sha256       TEXT NOT NULL,
                      size         INTEGER NOT NULL,
                      content_type TEXT,
                      created_at   INTEGER NOT NULL,
-                     PRIMARY KEY (app_id, key)
+                     PRIMARY KEY (tenant, key)
                  );
-                 CREATE INDEX IF NOT EXISTS blob_content ON blob(app_id, sha256);",
+                 CREATE INDEX IF NOT EXISTS blob_content ON blob(tenant, sha256);",
             )?;
             Ok(())
         })
@@ -152,12 +160,12 @@ impl BlobService {
     /// Remove leftover upload temporaries. Anything in an `incoming`
     /// directory at startup belongs to an upload that will never finish.
     fn discard_incoming(&self) {
-        let Ok(apps) = std::fs::read_dir(&self.root) else {
+        let Ok(tenants) = std::fs::read_dir(&self.root) else {
             return;
         };
         let mut removed = 0usize;
-        for app in apps.flatten() {
-            let incoming = app.path().join(INCOMING_DIR);
+        for tenant in tenants.flatten() {
+            let incoming = tenant.path().join(INCOMING_DIR);
             if !incoming.is_dir() {
                 continue;
             }
@@ -179,32 +187,33 @@ impl BlobService {
         }
     }
 
-    /// Where an app's content lives.
-    fn app_root(&self, app: &AppId) -> PathBuf {
-        // `AppId` is a validated single path component, so this stays inside
-        // `root` by construction.
-        self.root.join(app.as_str())
+    /// Where a tenant's content lives.
+    fn tenant_root(&self, tenant: &TenantId) -> PathBuf {
+        // A tenant id carries one dot, between its two halves, and neither
+        // half may contain a dot or a path separator - so it is a single path
+        // component and this stays inside `root` by construction.
+        self.root.join(tenant.as_str())
     }
 
     /// Content path for one digest, sharded two levels deep.
-    fn content_path(&self, app: &AppId, sha256: &str) -> PathBuf {
-        self.app_root(app)
+    fn content_path(&self, tenant: &TenantId, sha256: &str) -> PathBuf {
+        self.tenant_root(tenant)
             .join(&sha256[0..2])
             .join(&sha256[2..4])
             .join(sha256)
     }
 
     /// Metadata for one key, if it exists.
-    pub async fn head(&self, app: &AppId, key: &str) -> StoreResult<Option<ObjectMeta>> {
+    pub async fn head(&self, tenant: &TenantId, key: &str) -> StoreResult<Option<ObjectMeta>> {
         let key = check_key(key)?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         self.pool
             .with_conn(move |conn| {
                 let meta = conn
                     .query_row(
                         "SELECT sha256, size, content_type, created_at
-                           FROM blob WHERE app_id = ?1 AND key = ?2",
-                        rusqlite::params![app_id, key],
+                           FROM blob WHERE tenant = ?1 AND key = ?2",
+                        rusqlite::params![tenant_id, key],
                         |row| {
                             Ok(ObjectMeta {
                                 key: key.clone(),
@@ -227,7 +236,7 @@ impl BlobService {
     /// the whole object. Returns the digest and byte count that landed.
     pub async fn store_object<S>(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         key: &str,
         content_type: Option<String>,
         mut body: S,
@@ -236,13 +245,13 @@ impl BlobService {
         S: Stream<Item = StoreResult<Vec<u8>>> + Unpin,
     {
         let key = check_key(key)?;
-        let incoming = self.app_root(app).join(INCOMING_DIR);
+        let incoming = self.tenant_root(tenant).join(INCOMING_DIR);
         tokio::fs::create_dir_all(&incoming).await?;
         let temp = TempFile::new(incoming.join(format!("{}.part", uuid::Uuid::new_v4())));
 
-        let (sha256, size) = self.receive(app, &key, temp.path(), &mut body).await?;
+        let (sha256, size) = self.receive(tenant, &key, temp.path(), &mut body).await?;
 
-        let destination = self.content_path(app, &sha256);
+        let destination = self.content_path(tenant, &sha256);
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -259,7 +268,7 @@ impl BlobService {
         // this key's bytes live in, and must not interleave with a delete of
         // the same digest; see the module docs.
         let replaced = {
-            let _content = self.content_locks.acquire(app, &sha256).await;
+            let _content = self.content_locks.acquire(tenant, &sha256).await;
             if tokio::fs::metadata(&destination).await.is_ok() {
                 // Same bytes already stored under this digest, for this or
                 // another key. Keep what is there and let the temporary file
@@ -269,7 +278,7 @@ impl BlobService {
                 #[cfg(test)]
                 self.pause_after_dedup_check().await;
                 tracing::debug!(
-                    app = %app,
+                    tenant = %tenant,
                     key = %key,
                     sha256 = %sha256,
                     "content already present, reusing it instead of writing a second copy; this \
@@ -283,7 +292,7 @@ impl BlobService {
                 // failed leaves `temp` armed and its file is removed on drop.
                 temp.forget();
             }
-            self.record(app, &meta).await?
+            self.record(tenant, &meta).await?
         };
 
         if let Some(old) = replaced
@@ -293,10 +302,10 @@ impl BlobService {
             // last thing holding those bytes. Deliberately outside the block
             // above: this takes the lock of a different digest, and holding
             // two content locks at once is how two uploads deadlock.
-            self.drop_unreferenced(app, &old).await;
+            self.drop_unreferenced(tenant, &old).await;
         }
         tracing::info!(
-            app = %app,
+            tenant = %tenant,
             key = %meta.key,
             size = meta.size,
             sha256 = %meta.sha256,
@@ -312,7 +321,7 @@ impl BlobService {
     /// file descriptor and a full temporary file per stalled connection.
     async fn receive<S>(
         &self,
-        app: &AppId,
+        tenant: &TenantId,
         key: &str,
         temp: &Path,
         body: &mut S,
@@ -332,7 +341,7 @@ impl BlobService {
                     Ok(next) => next,
                     Err(_) => {
                         tracing::warn!(
-                            app = %app,
+                            tenant = %tenant,
                             key = %key,
                             received = size,
                             idle_timeout_secs = idle.as_secs(),
@@ -355,7 +364,7 @@ impl BlobService {
             size += chunk.len() as u64;
             if size > self.limits.max_object_bytes {
                 tracing::warn!(
-                    app = %app,
+                    tenant = %tenant,
                     key = %key,
                     limit = self.limits.max_object_bytes,
                     "upload exceeded the object size limit and was abandoned; nothing was stored"
@@ -391,10 +400,10 @@ impl BlobService {
     /// writer later is refused outright ("database is locked") the moment any
     /// other connection has committed in between - `busy_timeout` cannot wait
     /// that out, because the upgrade can never succeed. Taking the write lock
-    /// up front is what makes two apps uploading at the same time wait for
+    /// up front is what makes two tenants uploading at the same time wait for
     /// each other instead of one of them failing.
-    async fn record(&self, app: &AppId, meta: &ObjectMeta) -> StoreResult<Option<String>> {
-        let app_id = app.as_str().to_string();
+    async fn record(&self, tenant: &TenantId, meta: &ObjectMeta) -> StoreResult<Option<String>> {
+        let tenant_id = tenant.as_str().to_string();
         let meta = meta.clone();
         self.pool
             .with_conn(move |conn| {
@@ -402,21 +411,21 @@ impl BlobService {
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let previous: Option<String> = tx
                     .query_row(
-                        "SELECT sha256 FROM blob WHERE app_id = ?1 AND key = ?2",
-                        rusqlite::params![app_id, meta.key],
+                        "SELECT sha256 FROM blob WHERE tenant = ?1 AND key = ?2",
+                        rusqlite::params![tenant_id, meta.key],
                         |row| row.get(0),
                     )
                     .optional()?;
                 tx.execute(
-                    "INSERT INTO blob (app_id, key, sha256, size, content_type, created_at)
+                    "INSERT INTO blob (tenant, key, sha256, size, content_type, created_at)
                           VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(app_id, key) DO UPDATE SET
+                     ON CONFLICT(tenant, key) DO UPDATE SET
                           sha256       = excluded.sha256,
                           size         = excluded.size,
                           content_type = excluded.content_type,
                           created_at   = excluded.created_at",
                     rusqlite::params![
-                        app_id,
+                        tenant_id,
                         meta.key,
                         meta.sha256,
                         meta.size as i64,
@@ -434,9 +443,9 @@ impl BlobService {
     ///
     /// `IMMEDIATE` for the same reason as [`Self::record`]: this reads the
     /// digest and then deletes the row.
-    pub async fn remove_object(&self, app: &AppId, key: &str) -> StoreResult<bool> {
+    pub async fn remove_object(&self, tenant: &TenantId, key: &str) -> StoreResult<bool> {
         let key = check_key(key)?;
-        let app_id = app.as_str().to_string();
+        let tenant_id = tenant.as_str().to_string();
         let target = key.clone();
         let removed: Option<String> = self
             .pool
@@ -445,14 +454,14 @@ impl BlobService {
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let sha: Option<String> = tx
                     .query_row(
-                        "SELECT sha256 FROM blob WHERE app_id = ?1 AND key = ?2",
-                        rusqlite::params![app_id, target],
+                        "SELECT sha256 FROM blob WHERE tenant = ?1 AND key = ?2",
+                        rusqlite::params![tenant_id, target],
                         |row| row.get(0),
                     )
                     .optional()?;
                 tx.execute(
-                    "DELETE FROM blob WHERE app_id = ?1 AND key = ?2",
-                    rusqlite::params![app_id, target],
+                    "DELETE FROM blob WHERE tenant = ?1 AND key = ?2",
+                    rusqlite::params![tenant_id, target],
                 )?;
                 tx.commit()?;
                 Ok(sha)
@@ -461,19 +470,19 @@ impl BlobService {
 
         match removed {
             Some(sha) => {
-                self.drop_unreferenced(app, &sha).await;
-                tracing::info!(app = %app, key = %key, "deleted object");
+                self.drop_unreferenced(tenant, &sha).await;
+                tracing::info!(tenant = %tenant, key = %key, "deleted object");
                 Ok(true)
             }
             None => {
-                tracing::debug!(app = %app, key = %key, "delete found no such object");
+                tracing::debug!(tenant = %tenant, key = %key, "delete found no such object");
                 Ok(false)
             }
         }
     }
 
-    /// Delete the content file for `sha256` if no key for this app points at
-    /// it any more.
+    /// Delete the content file for `sha256` if no key of this tenant still
+    /// points at it.
     ///
     /// The count and the unlink are one critical section: a store that finds
     /// this same content already on disk is writing its row under the same
@@ -481,16 +490,16 @@ impl BlobService {
     /// the unlink (and writes the file again). Counting outside the lock is
     /// what used to leave a fresh key pointing at a file that had just been
     /// collected.
-    async fn drop_unreferenced(&self, app: &AppId, sha256: &str) {
-        let _content = self.content_locks.acquire(app, sha256).await;
-        let app_id = app.as_str().to_string();
+    async fn drop_unreferenced(&self, tenant: &TenantId, sha256: &str) {
+        let _content = self.content_locks.acquire(tenant, sha256).await;
+        let tenant_id = tenant.as_str().to_string();
         let sha = sha256.to_string();
         let referenced = self
             .pool
             .with_conn(move |conn| {
                 let count: i64 = conn.query_row(
-                    "SELECT count(*) FROM blob WHERE app_id = ?1 AND sha256 = ?2",
-                    rusqlite::params![app_id, sha],
+                    "SELECT count(*) FROM blob WHERE tenant = ?1 AND sha256 = ?2",
+                    rusqlite::params![tenant_id, sha],
                     |row| row.get(0),
                 )?;
                 Ok(count)
@@ -499,16 +508,16 @@ impl BlobService {
 
         match referenced {
             Ok(0) => {
-                let path = self.content_path(app, sha256);
+                let path = self.content_path(tenant, sha256);
                 match tokio::fs::remove_file(&path).await {
                     Ok(()) => tracing::debug!(
-                        app = %app,
+                        tenant = %tenant,
                         sha256 = %sha256,
                         "removed content no key points at any more"
                     ),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => tracing::warn!(
-                        app = %app,
+                        tenant = %tenant,
                         path = %path.display(),
                         error = %e,
                         "could not remove unreferenced content; the bytes stay on disk and the \
@@ -518,7 +527,7 @@ impl BlobService {
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(
-                app = %app,
+                tenant = %tenant,
                 sha256 = %sha256,
                 error = %e,
                 "could not check whether content is still referenced; leaving it in place, which \
@@ -528,13 +537,17 @@ impl BlobService {
     }
 
     /// Open the content file behind one key.
-    async fn open_content(&self, app: &AppId, meta: &ObjectMeta) -> StoreResult<tokio::fs::File> {
-        let path = self.content_path(app, &meta.sha256);
+    async fn open_content(
+        &self,
+        tenant: &TenantId,
+        meta: &ObjectMeta,
+    ) -> StoreResult<tokio::fs::File> {
+        let path = self.content_path(tenant, &meta.sha256);
         match tokio::fs::File::open(&path).await {
             Ok(file) => Ok(file),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::error!(
-                    app = %app,
+                    tenant = %tenant,
                     key = %meta.key,
                     path = %path.display(),
                     "metadata points at content that is not on disk; this object is unreadable \
@@ -552,11 +565,11 @@ impl BlobService {
     /// Read one whole object into memory. Only for tests and small objects;
     /// the service itself always streams.
     #[cfg(test)]
-    pub async fn get_all(&self, app: &AppId, key: &str) -> StoreResult<Option<Vec<u8>>> {
-        let Some(meta) = self.head(app, key).await? else {
+    pub async fn get_all(&self, tenant: &TenantId, key: &str) -> StoreResult<Option<Vec<u8>>> {
+        let Some(meta) = self.head(tenant, key).await? else {
             return Ok(None);
         };
-        let mut file = self.open_content(app, &meta).await?;
+        let mut file = self.open_content(tenant, &meta).await?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).await?;
         Ok(Some(buf))
@@ -628,7 +641,7 @@ impl Drop for TempFile {
     }
 }
 
-/// One `tokio::Mutex` per `(app, digest)`, created on demand and dropped
+/// One `tokio::Mutex` per `(tenant, digest)`, created on demand and dropped
 /// when the last holder lets go.
 ///
 /// A single global lock would serialise every upload in the process; a lock
@@ -641,13 +654,13 @@ struct ContentLocks {
     entries: Arc<Mutex<HashMap<ContentKey, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
-/// One app's one digest: what a content file is shared under.
+/// One tenant's one digest: what a content file is shared under.
 type ContentKey = (String, String);
 
 impl ContentLocks {
-    /// Take the lock for one app's digest, waiting for whoever holds it.
-    async fn acquire(&self, app: &AppId, sha256: &str) -> ContentGuard {
-        let key = (app.as_str().to_string(), sha256.to_string());
+    /// Take the lock for one tenant's digest, waiting for whoever holds it.
+    async fn acquire(&self, tenant: &TenantId, sha256: &str) -> ContentGuard {
+        let key = (tenant.as_str().to_string(), sha256.to_string());
         let lock = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             Arc::clone(entries.entry(key.clone()).or_default())
@@ -730,16 +743,16 @@ impl BlobStore for BlobService {
     type GetStream = Pin<Box<dyn Stream<Item = Result<GetResponse, Status>> + Send + 'static>>;
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<Self::GetStream>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let key = request.into_inner().key;
 
-        let meta = self.head(&app, &key).await?.ok_or_else(|| {
-            tracing::debug!(app = %app, key = %key, "blob get found no such object");
+        let meta = self.head(&tenant, &key).await?.ok_or_else(|| {
+            tracing::debug!(tenant = %tenant, key = %key, "blob get found no such object");
             StoreError::NotFound(format!("object {key} does not exist"))
         })?;
-        let mut file = self.open_content(&app, &meta).await?;
+        let mut file = self.open_content(&tenant, &meta).await?;
         tracing::debug!(
-            app = %app,
+            tenant = %tenant,
             key = %key,
             size = meta.size,
             "streaming object out"
@@ -814,7 +827,7 @@ impl BlobStore for BlobService {
         &self,
         request: Request<tonic::Streaming<PutRequest>>,
     ) -> Result<Response<PutResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let mut inbound = request.into_inner();
 
         // The first message names the object. Anything else is a protocol
@@ -825,7 +838,7 @@ impl BlobStore for BlobService {
             }) => header,
             Some(_) => {
                 tracing::warn!(
-                    app = %app,
+                    tenant = %tenant,
                     "blob put stream started with a body chunk instead of a header, refusing it; \
                      nothing was stored"
                 );
@@ -834,20 +847,20 @@ impl BlobStore for BlobService {
                 ));
             }
             None => {
-                tracing::warn!(app = %app, "blob put stream closed before sending a header");
+                tracing::warn!(tenant = %tenant, "blob put stream closed before sending a header");
                 return Err(Status::invalid_argument("Put stream carried no header"));
             }
         };
 
         let key = header.key.clone();
-        tracing::debug!(app = %app, key = %key, "receiving object");
+        tracing::debug!(tenant = %tenant, key = %key, "receiving object");
 
         // Turn the inbound gRPC stream into a plain chunk stream so the
         // storage layer does not have to know about protobuf.
         let body = inbound_chunks(inbound);
 
         match self
-            .store_object(&app, &key, header.content_type, body)
+            .store_object(&tenant, &key, header.content_type, body)
             .await
         {
             Ok(meta) => Ok(Response::new(PutResponse {
@@ -863,7 +876,7 @@ impl BlobStore for BlobService {
             }
             Err(other) => {
                 tracing::error!(
-                    app = %app,
+                    tenant = %tenant,
                     key = %key,
                     error = %other,
                     "storing an object failed; the upload is lost and the caller must retry"
@@ -877,9 +890,9 @@ impl BlobStore for BlobService {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let app = app_id_of(&request)?;
+        let tenant = tenant_of(&request)?;
         let key = request.into_inner().key;
-        match self.remove_object(&app, &key).await {
+        match self.remove_object(&tenant, &key).await {
             // Idempotent: "this key is gone" holds whether or not it existed.
             Ok(_) => Ok(Response::new(DeleteResponse {
                 success: true,
@@ -891,7 +904,7 @@ impl BlobStore for BlobService {
             })),
             Err(other) => {
                 tracing::error!(
-                    app = %app,
+                    tenant = %tenant,
                     key = %key,
                     error = %other,
                     "deleting an object failed; the key is still there"
@@ -977,14 +990,14 @@ mod tests {
         (dir, svc)
     }
 
-    /// How many `.part` files are waiting in an app's upload directory.
-    fn incoming_count(dir: &TempDir, app: &str) -> usize {
-        let incoming = dir.path().join("blob").join(app).join(INCOMING_DIR);
+    /// How many `.part` files are waiting in a tenant's upload directory.
+    fn incoming_count(dir: &TempDir, tenant: &str) -> usize {
+        let incoming = dir.path().join("blob").join(tenant).join(INCOMING_DIR);
         std::fs::read_dir(&incoming).map(|d| d.count()).unwrap_or(0)
     }
 
-    fn app(name: &str) -> AppId {
-        AppId::parse(name).unwrap()
+    fn tenant(name: &str) -> TenantId {
+        TenantId::parse(name).unwrap()
     }
 
     fn chunks(data: Vec<Vec<u8>>) -> impl Stream<Item = StoreResult<Vec<u8>>> + Unpin {
@@ -994,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn round_trips_an_object() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let meta = svc
             .store_object(
                 &a,
@@ -1023,14 +1036,14 @@ mod tests {
     #[tokio::test]
     async fn content_is_sharded_two_levels_deep() {
         let (dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let meta = svc
             .store_object(&a, "k", None, chunks(vec![b"abcdef".to_vec()]))
             .await
             .unwrap();
         let expected = dir
             .path()
-            .join("blob/app-one")
+            .join("blob/app-one.production")
             .join(&meta.sha256[0..2])
             .join(&meta.sha256[2..4])
             .join(&meta.sha256);
@@ -1040,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_body_stores_a_zero_length_object() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let meta = svc
             .store_object(&a, "empty", None, chunks(vec![]))
             .await
@@ -1055,7 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn overwriting_drops_the_content_nothing_points_at() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let first = svc
             .store_object(&a, "k", None, chunks(vec![b"one".to_vec()]))
             .await
@@ -1073,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn two_keys_with_the_same_bytes_share_one_file() {
         let (dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let one = svc
             .store_object(&a, "a", None, chunks(vec![b"same".to_vec()]))
             .await
@@ -1096,7 +1109,7 @@ mod tests {
         // been removed rather than left to age. Every re-upload of an
         // unchanged asset takes this path, so a leak here grows without end.
         assert_eq!(
-            incoming_count(&dir, "app-one"),
+            incoming_count(&dir, "app-one.production"),
             0,
             "the deduplicated upload left its temporary file behind"
         );
@@ -1105,8 +1118,8 @@ mod tests {
     #[tokio::test]
     async fn tenants_are_isolated() {
         let (_dir, svc) = service().await;
-        let one = app("app-one");
-        let two = app("app-two");
+        let one = tenant("app-one.production");
+        let two = tenant("app-two.production");
         svc.store_object(&one, "k", None, chunks(vec![b"private".to_vec()]))
             .await
             .unwrap();
@@ -1120,7 +1133,7 @@ mod tests {
     async fn an_oversized_upload_leaves_nothing_behind() {
         let dir = TempDir::new().unwrap();
         let svc = BlobService::open(dir.path(), 4, limits(8)).await.unwrap();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let err = svc
             .store_object(&a, "big", None, chunks(vec![vec![0u8; 9]]))
             .await
@@ -1128,7 +1141,7 @@ mod tests {
         assert!(matches!(err, StoreError::TooLarge(_)));
         assert!(svc.head(&a, "big").await.unwrap().is_none());
         assert_eq!(
-            incoming_count(&dir, "app-one"),
+            incoming_count(&dir, "app-one.production"),
             0,
             "the temporary file should have been removed"
         );
@@ -1149,7 +1162,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
 
         // One chunk, then silence: the stream is neither closed nor fed.
         use tokio_stream::StreamExt;
@@ -1171,7 +1184,7 @@ mod tests {
         assert!(matches!(err, StoreError::Stalled(_)), "got {err:?}");
         assert!(svc.head(&a, "stalled").await.unwrap().is_none());
         assert_eq!(
-            incoming_count(&dir, "app-one"),
+            incoming_count(&dir, "app-one.production"),
             0,
             "the abandoned upload's temporary file should have been removed"
         );
@@ -1190,7 +1203,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let meta = svc
             .store_object(&a, "k", None, chunks(vec![b"abcdef".to_vec()]))
             .await
@@ -1201,7 +1214,7 @@ mod tests {
     #[tokio::test]
     async fn missing_content_is_reported_as_data_loss() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let meta = svc
             .store_object(&a, "k", None, chunks(vec![b"bytes".to_vec()]))
             .await
@@ -1216,7 +1229,10 @@ mod tests {
     #[tokio::test]
     async fn startup_clears_abandoned_uploads() {
         let dir = TempDir::new().unwrap();
-        let incoming = dir.path().join("blob/app-one").join(INCOMING_DIR);
+        let incoming = dir
+            .path()
+            .join("blob/app-one.production")
+            .join(INCOMING_DIR);
         std::fs::create_dir_all(&incoming).unwrap();
         std::fs::write(incoming.join("stale.part"), b"half an object").unwrap();
 
@@ -1229,7 +1245,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_keys() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         assert!(matches!(
             svc.store_object(&a, "", None, chunks(vec![])).await,
             Err(StoreError::InvalidArgument(_))
@@ -1252,7 +1268,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_delete_cannot_collect_content_a_concurrent_put_is_claiming() {
         let (_dir, mut svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let payload = b"shared bytes".to_vec();
 
         let stored = svc
@@ -1325,7 +1341,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_uploads_of_different_objects_all_succeed() {
         let (_dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
 
         let uploads: Vec<_> = (0..16)
             .map(|n| {
@@ -1367,7 +1383,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_uploads_of_identical_bytes_agree_on_one_file() {
         let (dir, svc) = service().await;
-        let a = app("app-one");
+        let a = tenant("app-one.production");
         let payload = b"identical".to_vec();
 
         let uploads: Vec<_> = (0..8)
@@ -1390,7 +1406,7 @@ mod tests {
             );
         }
         assert_eq!(
-            incoming_count(&dir, "app-one"),
+            incoming_count(&dir, "app-one.production"),
             0,
             "the uploads that deduplicated left their temporary files behind"
         );

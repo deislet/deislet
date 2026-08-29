@@ -3,22 +3,45 @@
 //! Consumption is the other half and does not go through an op at all: the
 //! node polls deis-queue and calls the app's `queue` handler, see
 //! `super::queue_consumer`.
+//!
+//! # There is no local queue
+//!
+//! An app whose queue client is missing -- it did not declare `queue` in its
+//! manifest, or the control plane sent no deis-queue address -- gets an error
+//! from `send`, never a receipt. Until wave B this op fell back to an
+//! in-process vector and answered with a made-up message id, so the promise
+//! resolved, the app moved on, and the message vanished with the isolate. That
+//! failure is invisible from inside the application and from the queue: the
+//! producer looks healthy and the consumer simply never receives anything. A
+//! rejected send, by contrast, is something an app can retry, log, or fail on.
 
-use super::ops::{service_call_failed, service_unavailable};
+use super::ops::{service_call_failed, AppId};
 use super::queue_client::QueueClient;
 use deno_core::{extension, op2, OpState};
 use deno_error::JsErrorBox;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// In-memory queue used when no deis-queue client is bound.
+/// What `send` answers when this app has no queue client.
 ///
-/// It exists so a single-process development run can exercise a producer
-/// without a queue server. Messages pushed here are visible to nothing and
-/// vanish with the isolate, which is why binding a real queue logs and this
-/// path does not pretend to have delivered anything durable.
-pub type MemoryQueue = Rc<RefCell<Vec<(String, String)>>>;
+/// It names the consequence rather than only the condition: the application
+/// is holding a rejected promise and has to know that the message is not
+/// queued anywhere and will not be delivered later.
+fn queue_unavailable(queue_name: &str) -> JsErrorBox {
+    JsErrorBox::generic(format!(
+        "queue service is not available to this app: the message for queue {queue_name:?} was \
+         not enqueued. Either the manifest does not declare \"queue\" or the deployment carried \
+         no deis-queue address"
+    ))
+}
 
+/// Enqueue one message, answering with the id deis-queue assigned it.
+///
+/// The id comes from the server. Nothing here invents one: an id the queue
+/// never issued would let an app believe a message exists that it could never
+/// find again. The JS binding does not hand it to the application -- `send()`
+/// resolves to nothing, the way Cloudflare's does -- so what an app learns
+/// from this op is only whether the queue took the message.
 #[op2(async)]
 #[string]
 async fn op_queue_send(
@@ -26,32 +49,37 @@ async fn op_queue_send(
     #[string] queue_name: String,
     #[string] message: String,
 ) -> Result<String, JsErrorBox> {
-    let client_opt = {
+    let (client_opt, app_id) = {
         let state_borrow = state.borrow();
-        state_borrow.try_borrow::<QueueClient>().cloned()
+        (
+            state_borrow.try_borrow::<QueueClient>().cloned(),
+            state_borrow
+                .try_borrow::<AppId>()
+                .map(|app| app.0.clone())
+                .unwrap_or_default(),
+        )
     };
 
-    if let Some(client) = client_opt {
-        return client
-            .send(queue_name, message)
-            .await
-            .map_err(|e| service_call_failed("queue.send", e));
-    }
-
-    // Fallback to memory
-    let state_borrow = state.borrow();
-    if let Some(mem_queue) = state_borrow.try_borrow::<MemoryQueue>() {
-        mem_queue.borrow_mut().push((queue_name.clone(), message));
+    let Some(client) = client_opt else {
+        // Attributed like every other line an app's own code causes, so it
+        // reaches deis-telemetry under the tenant that tried to send; see
+        // `AppId`.
         tracing::warn!(
+            target: "app",
+            app_id,
             queue = %queue_name,
-            "Queue message kept in this isolate's memory and will never be consumed: no \
-             deis-queue is bound to this app. Declare \"queue\" in the manifest and give the \
-             node a queue address, or the send is a no-op"
+            "Refused a send to queue {}: no deis-queue is bound to this app, so the message was \
+             not enqueued and the app was told so. Declare \"queue\" in the manifest and give the \
+             deployment a queue address",
+            queue_name
         );
-        return Ok("mem-id".to_string());
-    }
+        return Err(queue_unavailable(&queue_name));
+    };
 
-    Err(service_unavailable("queue"))
+    client
+        .send(queue_name, message)
+        .await
+        .map_err(|e| service_call_failed("queue.send", e))
 }
 
 extension!(deis_runtime_queue_ops, ops = [op_queue_send],);

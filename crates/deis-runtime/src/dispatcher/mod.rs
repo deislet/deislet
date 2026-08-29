@@ -3,7 +3,6 @@
 pub mod handlers;
 
 use crate::app::ApplicationManager;
-use crate::app_repo::AppRepo;
 use crate::config_store::ConfigStore;
 use crate::deployment::DeploymentManager;
 use crate::health::NodeHealth;
@@ -32,13 +31,17 @@ pub struct AppState {
 pub struct ServerOptions {
     pub app_manager: Arc<ApplicationManager>,
     pub config_store: Arc<ConfigStore>,
-    pub app_repo: Arc<AppRepo>,
     /// Takes delivery of deployments pushed to this node.
     pub deployer: Arc<DeploymentManager>,
     /// Readiness, which the `HealthCheck` RPC reports.
     pub health: Arc<NodeHealth>,
     pub node_id: String,
     pub port: u16,
+
+    /// When this node's process started. Passed in rather than taken here so
+    /// that the uptime the management API reports is the process's, not the
+    /// listener's.
+    pub started_at: std::time::Instant,
 
     /// How long in-flight requests get to finish after a shutdown signal
     /// before the node stops waiting.
@@ -105,11 +108,11 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     let ServerOptions {
         app_manager,
         config_store,
-        app_repo,
         deployer,
         health,
         node_id,
         port,
+        started_at,
         shutdown_grace,
     } = options;
 
@@ -121,10 +124,10 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     let management_service = ManagementServer::create_service(
         app_manager.clone(),
         config_store,
-        app_repo,
         deployer,
         health,
         node_id,
+        started_at,
     );
     let trigger_service = TriggerServer::create_service(app_manager.clone());
 
@@ -171,7 +174,8 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         }
     });
 
-    // Build HTTP routes - all requests are routed via x-deis-app-id header.
+    // Build HTTP routes - every request is routed by the x-deis-app-id and
+    // x-deis-environment headers.
     // gRPC services must be mounted on their explicit path prefixes BEFORE
     // the wildcard, otherwise `/*path` swallows every gRPC call and the
     // management plane is unreachable.
@@ -190,11 +194,13 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // Preload system management application
+    // Preload system management application. It is not a deployment and has
+    // no previews, so it lives in the default environment and is reached by a
+    // request that names no environment at all.
     let system_app_code = include_str!("system_app.js");
     match app_manager
         .load_app(
-            "_system".to_string(),
+            crate::app::AppKey::production("_system"),
             system_app_code.to_string(),
             crate::app::AppConfig::default(),
             None,
@@ -215,7 +221,12 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         "📡 gRPC Management: localhost:{} (content-type: application/grpc)",
         port
     );
-    info!("🎯 New Routing: x-deis-app-id header based");
+    info!(
+        "🎯 Routing: {} names the application, {} the environment (absent = {})",
+        crate::APP_ID_HEADER,
+        crate::ENVIRONMENT_HEADER,
+        crate::DEFAULT_ENVIRONMENT
+    );
     info!(
         "📊 Health Check: curl -H \"x-deis-app-id: _system\" http://localhost:{}/health",
         port

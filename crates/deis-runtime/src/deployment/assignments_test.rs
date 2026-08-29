@@ -10,7 +10,7 @@ use axum::Json;
 use axum::Router;
 
 use super::*;
-use crate::app::ApplicationManager;
+use crate::app::{AppKey, ApplicationManager};
 use crate::config::RuntimeConfig;
 use crate::deployment::sha256_hex;
 
@@ -63,6 +63,21 @@ struct PlaneState {
     assignments: Arc<serde_json::Value>,
     bundle: Arc<Vec<u8>>,
     status: StatusCode,
+    /// When set, both routes answer 401 unless the request presents it, the
+    /// way deis-control does once `node_preshared_keys` is configured.
+    required_key: Option<String>,
+}
+
+impl PlaneState {
+    fn authorised(&self, headers: &axum::http::HeaderMap) -> bool {
+        let Some(required) = &self.required_key else {
+            return true;
+        };
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == format!("Bearer {required}"))
+    }
 }
 
 impl ControlPlane {
@@ -75,6 +90,18 @@ impl ControlPlane {
         bundle_sha: &str,
         status: StatusCode,
     ) -> Self {
+        Self::guarded(entries, bundle, bundle_sha, status, None).await
+    }
+
+    /// The same, but demanding a node key on both routes.
+    async fn guarded(
+        entries: &[(&str, &str, &str)],
+        bundle: Vec<u8>,
+        bundle_sha: &str,
+        status: StatusCode,
+        required_key: Option<&str>,
+    ) -> Self {
+        let required_key = required_key.map(str::to_string);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
@@ -98,12 +125,18 @@ impl ControlPlane {
             assignments: Arc::new(assignments),
             bundle: Arc::new(bundle),
             status,
+            required_key,
         };
         let router = Router::new()
             .route(
                 "/api/nodes/:id/assignments",
                 get(
-                    |State(state): State<PlaneState>, AxumPath(_id): AxumPath<String>| async move {
+                    |State(state): State<PlaneState>,
+                     AxumPath(_id): AxumPath<String>,
+                     headers: axum::http::HeaderMap| async move {
+                        if !state.authorised(&headers) {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
                         if state.status != StatusCode::OK {
                             return state.status.into_response();
                         }
@@ -113,13 +146,18 @@ impl ControlPlane {
             )
             .route(
                 "/bundle",
-                get(|State(state): State<PlaneState>| async move {
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .body(Body::from(state.bundle.as_ref().clone()))
-                        .unwrap()
-                        .into_response()
-                }),
+                get(
+                    |State(state): State<PlaneState>, headers: axum::http::HeaderMap| async move {
+                        if !state.authorised(&headers) {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Body::from(state.bundle.as_ref().clone()))
+                            .unwrap()
+                            .into_response()
+                    },
+                ),
             )
             .with_state(state);
 
@@ -135,16 +173,29 @@ impl ControlPlane {
 }
 
 async fn deployer(dir: &std::path::Path, apps: Arc<ApplicationManager>) -> Arc<DeploymentManager> {
+    deployer_for(dir, apps, None, None).await
+}
+
+/// A deployment manager configured the way a node's TOML would configure it,
+/// so the bundle download presents the same credential the real one does.
+async fn deployer_for(
+    dir: &std::path::Path,
+    apps: Arc<ApplicationManager>,
+    endpoint: Option<&str>,
+    secret: Option<&str>,
+) -> Arc<DeploymentManager> {
     let mut config = RuntimeConfig {
         data_dir: dir.to_path_buf(),
         ..Default::default()
     };
     config.bundles.dir = Some(dir.join("bundles"));
+    config.control.endpoint = endpoint.map(str::to_string);
+    config.control.secret = secret.map(str::to_string);
     Arc::new(DeploymentManager::from_config(apps, &config).await.unwrap())
 }
 
 fn client(base: &str, node_id: &str) -> AssignmentClient {
-    AssignmentClient::new(base, node_id, Duration::from_secs(10)).unwrap()
+    AssignmentClient::new(base, node_id, Duration::from_secs(10), None).unwrap()
 }
 
 #[tokio::test]
@@ -163,8 +214,9 @@ async fn a_node_loads_everything_the_control_plane_assigned_it() {
     assert_eq!(outcome.assigned, 1);
     assert_eq!(outcome.installed, 1);
     assert_eq!(outcome.failed, 0);
-    assert_eq!(apps.installed_version("demo").unwrap().version_id, "v1");
-    assert_eq!(apps.assets("demo").unwrap().len(), 1);
+    let demo = AppKey::production("demo");
+    assert_eq!(apps.installed_version(&demo).unwrap().version_id, "v1");
+    assert_eq!(apps.assets(&demo).unwrap().len(), 1);
 }
 
 #[test]
@@ -257,8 +309,12 @@ async fn one_unusable_assignment_does_not_stop_the_others() {
 
     assert_eq!(outcome.failed, 1);
     assert_eq!(outcome.installed, 1);
-    assert!(apps.installed_version("demo").is_some());
-    assert!(apps.installed_version("broken").is_none());
+    assert!(apps
+        .installed_version(&AppKey::production("demo"))
+        .is_some());
+    assert!(apps
+        .installed_version(&AppKey::production("broken"))
+        .is_none());
 }
 
 #[tokio::test]
@@ -321,4 +377,61 @@ fn retries_back_off_but_never_stop() {
     // Capped, so a long outage still gets a retry every few minutes rather
     // than drifting into hours.
     assert_eq!(retry_delay(base, 40), Duration::from_secs(300));
+}
+
+/// The control plane will not hand a node its assignment list - which carries
+/// every environment's decrypted secrets - to a caller that cannot prove it
+/// is a node. A node that sends no credential gets 401 and installs nothing;
+/// with `control.secret` set it gets the list and the bundle behind it.
+#[tokio::test]
+async fn a_node_presents_its_key_to_the_control_plane() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bytes, sha) = bundle("demo");
+    let plane = ControlPlane::guarded(
+        &[("demo", "v1", "/bundle")],
+        bytes,
+        &sha,
+        StatusCode::OK,
+        Some("node-key"),
+    )
+    .await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_for(
+        dir.path(),
+        apps.clone(),
+        Some(plane.base()),
+        Some("node-key"),
+    )
+    .await;
+
+    let anonymous = AssignmentClient::new(plane.base(), "node-a", Duration::from_secs(10), None)
+        .unwrap()
+        .fetch()
+        .await;
+    assert!(
+        matches!(anonymous, Err(AssignmentError::Status { code: 401, .. })),
+        "expected a refusal without a credential, got {anonymous:?}"
+    );
+
+    let authenticated = AssignmentClient::new(
+        plane.base(),
+        "node-a",
+        Duration::from_secs(10),
+        Some(NodeCredential::new("node-key", Some(plane.base()))),
+    )
+    .unwrap();
+    let outcome = sync_once(&authenticated, &deployer).await.unwrap();
+
+    assert_eq!(outcome.assigned, 1);
+    assert_eq!(
+        outcome.installed, 1,
+        "the bundle download has to carry the key too, or the version never installs"
+    );
+    assert_eq!(
+        apps.installed_version(&AppKey::production("demo"))
+            .unwrap()
+            .version_id,
+        "v1"
+    );
 }

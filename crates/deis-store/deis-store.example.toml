@@ -5,17 +5,23 @@
 # grpc.health.v1 service.
 #
 # Loopback on purpose. deis-store has no caller authentication: it takes the
-# tenant from the `x-deis-app-id` header and serves that app's data, so
-# anything that can reach this port can read, overwrite and delete any app's
-# data by naming its id. What keeps that contained is that only processes on
-# this host can connect, and deis-runtime is one of them. Binding elsewhere
-# publishes every app's data to that network; the service logs a warning when
-# you do, and the warning is not the thing to silence - caller identity
-# (mutual TLS, or a token issued by deis-control) has to exist first.
+# tenant from the `x-deis-tenant` header and serves that tenant's data, so
+# anything that can reach this port can read, overwrite and delete any
+# tenant's data by naming its id. What keeps that contained is that only
+# processes on this host can connect, and deis-runtime is one of them. Binding
+# elsewhere publishes every tenant's data to that network; the service logs a
+# warning when you do, and the warning is not the thing to silence - caller
+# identity (mutual TLS, or a token issued by deis-control) has to exist first.
 listen = "127.0.0.1:8090"
 
-# Directory holding kv.sqlite, blob.sqlite, db/<app_id>.sqlite and the blob
-# content tree. Back this up: it is the only copy of every app's data.
+# Directory holding kv.sqlite, blob.sqlite, db/<tenant>.sqlite and the blob
+# content tree. Back this up: it is the only copy of every tenant's data.
+#
+# A tenant is one application in one environment, spelled "<app>.<environment>"
+# (for example "demo.production"). A directory written before that was true is
+# keyed by bare application ids and cannot be read now; there is no migration,
+# and the service refuses to start on one rather than serving empty stores
+# over the top of it.
 data_dir = "./data"
 
 # Connections in the pool of each shared SQLite file (KV and blob metadata),
@@ -24,10 +30,11 @@ data_dir = "./data"
 # this says.
 shared_connections = 8
 
-# Connections in the pool of one app's database file. Kept small on purpose:
-# with many apps it is the sum across them that decides how many threads and
-# file handles the process holds.
-app_connections = 4
+# Connections in the pool of one tenant's database file. Kept small on
+# purpose: with many tenants it is the sum across them that decides how many
+# threads and file handles the process holds. Note that an application with a
+# production environment and two previews is three tenants, so three files.
+tenant_connections = 4
 
 # Seconds between sweeps of expired KV entries. Expiry is already honoured by
 # every read, so this only decides how long dead rows keep occupying disk, not

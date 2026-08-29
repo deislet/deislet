@@ -1,6 +1,6 @@
 use axum::routing::any;
 use axum::Router;
-use deis_runtime::app::ApplicationManager;
+use deis_runtime::app::{AppKey, ApplicationManager};
 use deis_runtime::dispatcher::{handlers, AppState};
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ async fn test_gateway_http_e2e() {
 
     app_manager
         .load_app(
-            "e2e_app".to_string(),
+            AppKey::production("e2e_app"),
             code.to_string(),
             Default::default(),
             None,
