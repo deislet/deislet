@@ -2,7 +2,7 @@
 // Tests the WebSocket bridging between Rust Host and JS Runtime without Network Gateway
 
 use deis_runtime::runtime::isolate::AppRuntime;
-use deis_runtime::runtime::{IsolateSpec, WsServerMessage};
+use deis_runtime::runtime::{IsolateSpec, ServiceWiring, WsServerMessage};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
@@ -50,6 +50,9 @@ async fn test_websocket_direct_bridging() {
         code.to_string(),
         None,
         IsolateSpec::default(),
+        // No storage bindings: this test exercises the WebSocket path, and an
+        // app that declares no services must still load.
+        &ServiceWiring::default(),
     )
     .expect("Failed to create runtime");
 

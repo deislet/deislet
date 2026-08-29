@@ -85,6 +85,7 @@ let result = compiler.build().await?;
 | [基础服务](./docs/basic-services.zh.md) | [Basic Services](./docs/basic-services.md) | KV 和 Cache 说明 |
 | [错误系统](./docs/error-system.zh.md) | [Error System](./docs/error-system.md) | 错误分类和处理 |
 | [贡献指南](./docs/contributing.zh.md) | - | 如何参与开发 |
+| [deislet 目标](./docs/deislet-target.zh.md) | [The deislet target](./docs/deislet-target.md) | 应用包格式与自建平台目标 Bundle format and the platform's own target |
 
 ## 📊 支持的平台 | Supported Platforms
 
@@ -93,7 +94,7 @@ let result = compiler.build().await?;
 | Cloudflare Workers | ✅ 完整支持 Full | KV, Cache | D1, R2, Queue, DO |
 | Deno Deploy | ✅ 完整支持 Full | KV, Cache | Postgres |
 | Tencent EdgeOne | ✅ 完整支持 Full | KV, Cache | - |
-| Deislet | 🚧 开发中 WIP | KV, Cache | SQL, Blob, Queue |
+| Deislet | 🚧 开发中 WIP | KV, Cache | WebSockets（SQL / Blob / Queue / Cron 声明可进包，运行时尚未接通 declared in the bundle, not served yet） |
 
 ## 🔗 相关资源 | Related Resources
 

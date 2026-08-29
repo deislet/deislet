@@ -1,3 +1,4 @@
+mod bindings;
 mod blob_client;
 mod blob_ops;
 mod bootstrap;
@@ -9,9 +10,11 @@ mod deno_telemetry_stub;
 pub mod isolate;
 mod kv_client;
 pub mod loader;
+pub mod metrics;
 mod ops;
 mod pool;
 mod queue_client;
+pub mod queue_consumer;
 mod queue_ops;
 pub mod rate_limit;
 pub mod route_match;
@@ -22,6 +25,11 @@ mod tls_ops;
 // mod ws_ops;
 mod ws_server_ops;
 
+pub use bindings::{
+    wire_deployment_env, AppServices, QueueConsumerSpec, ServiceDeclaration, ServiceEndpoints,
+    ServiceKind, ServiceWiring, QUEUE_CONSUMERS_KEY, QUEUE_ENDPOINT_KEY, RESERVED_ENV_KEYS,
+    SERVICES_KEY, STORE_ENDPOINT_KEY,
+};
 pub use blob_client::BlobClient;
 pub use blob_ops::init_blob_extension;
 pub use bootstrap::init_bootstrap_extension;
@@ -32,8 +40,10 @@ pub use deno_telemetry_stub::init_deno_telemetry_extension;
 // pub use http_ops::init_http_extension;
 pub use isolate::IsolateSpec;
 pub use kv_client::KvClient;
+pub use metrics::{MetricShipper, MetricShipperConfig, MetricsRegistry};
 pub use pool::RuntimePool;
-pub use queue_client::QueueClient;
+pub use queue_client::{LeasedMessage, NackOutcome, QueueClient};
+pub use queue_consumer::{BatchOutcome, ConsumerSettings};
 pub use queue_ops::{init_queue_extension, MemoryQueue};
 pub use runtime_init::{build_runtime_extensions, init_lazy_extensions};
 pub use snapshot::load_or_create_startup_snapshot;

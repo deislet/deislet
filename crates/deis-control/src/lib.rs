@@ -9,6 +9,7 @@ pub mod command;
 pub mod config;
 pub mod config_manager;
 pub mod database;
+pub mod delivery;
 pub mod handler;
 pub mod message;
 pub mod metrics;
@@ -21,8 +22,8 @@ pub mod tls;
 
 pub use broadcast::{BroadcastEvent, EventBroadcaster};
 pub use catalog::{
-    App, Assignment, BundleManifest, BundleStore, CatalogError, CatalogStore, Deployment,
-    Environment, Route, SecretCipher, SecretsBackend, Version,
+    App, Assignment, BundleManifest, BundleStore, CatalogError, CatalogStore, DeployedVersion,
+    Deployment, Environment, Route, SecretCipher, SecretsBackend, Version,
 };
 pub use command::{CommandExecutor, CommandRequest, CommandResponse, CommandType, ExecuteError};
 pub use config::{ControlConfig, RuntimeNodeConfig, TlsConfig};
@@ -31,6 +32,9 @@ pub use database::{
     CommandEntry, CommandStatus, ConfigEntry, Database, DatabaseError, Event, EventSeverity,
     HeartbeatEntry,
 };
+pub use delivery::{
+    DeliveryReason, DeliveryReport, DeploymentDeliverer, DeploymentPayload, PublicAddress,
+};
 pub use handler::MessageHandler;
 pub use message::{
     AuthData, AuthResponse, ConfigUpdateAck, ConfigUpdateMessage, HeartbeatAck, HeartbeatRequest,
@@ -38,7 +42,7 @@ pub use message::{
 };
 pub use metrics::{MetricsCollector, MetricsSummary, NodesMetrics, SystemMetrics};
 pub use runtime_client::RuntimeNodeManager;
-pub use scheduler::{CronScheduler, CronTask};
+pub use scheduler::{CronKey, CronScheduler, CronTask};
 pub use server::ControlServer;
 pub use session::{NodeSession, NodeState, SendError, SessionManager};
 

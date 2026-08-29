@@ -21,6 +21,16 @@ pub struct ProjectConfig {
     pub build: Option<BuildConfig>,
     #[serde(default)]
     pub limits: Option<LimitsConfig>,
+    /// Static files to carry in the bundle, served before any handler runs.
+    #[serde(default)]
+    pub assets: Option<AssetsConfig>,
+    /// Cron expressions this app wants to be triggered on. Copied verbatim
+    /// into the bundle manifest; the control plane owns the schedule.
+    #[serde(default)]
+    pub cron: Vec<String>,
+    /// Queues this app consumes from.
+    #[serde(default)]
+    pub queues: Vec<QueueConsumerConfig>,
 }
 
 fn default_function_root() -> String {
@@ -51,6 +61,10 @@ pub struct ServicesConfig {
     pub kv: Option<ServiceConfig>,
     #[serde(default)]
     pub database: Option<ServiceConfig>,
+    #[serde(default)]
+    pub blob: Option<ServiceConfig>,
+    #[serde(default)]
+    pub queue: Option<ServiceConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,8 +84,12 @@ pub struct VendorsConfig {
     pub deno: Option<VendorConfig>,
     #[serde(default)]
     pub tencent: Option<VendorConfig>,
-    #[serde(default)]
-    pub deis_runtime: Option<VendorConfig>,
+    /// This platform's own target. `deislet` is the name everywhere else -
+    /// the CLI flag, the manifest, the adapter crate - so it is the name the
+    /// config key uses too. The older spellings still parse rather than
+    /// silently disabling the target in a project that predates the rename.
+    #[serde(rename = "deislet", alias = "deis_runtime", alias = "denix", default)]
+    pub deislet: Option<VendorConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +97,37 @@ pub struct VendorConfig {
     pub enabled: bool,
     #[serde(default)]
     pub options: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Where the project's static files live.
+///
+/// The directory is copied into the bundle under `assets/` with its structure
+/// intact, so `public/css/app.css` is served at `/css/app.css`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetsConfig {
+    #[serde(default = "default_assets_dir")]
+    pub dir: String,
+}
+
+impl Default for AssetsConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_assets_dir(),
+        }
+    }
+}
+
+fn default_assets_dir() -> String {
+    "./public".to_string()
+}
+
+/// One queue this app consumes from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueConsumerConfig {
+    pub name: String,
+    /// How many messages to pull at once. Absent lets the runtime decide.
+    #[serde(rename = "batchSize", alias = "batch_size", default)]
+    pub batch_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,4 +158,67 @@ pub struct LimitsConfig {
     pub max_payload_size: Option<usize>,
     #[serde(rename = "maxConcurrency", default)]
     pub max_concurrency: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: serde_json::Value) -> ProjectConfig {
+        serde_json::from_value(json).expect("config parses")
+    }
+
+    fn minimal() -> serde_json::Value {
+        serde_json::json!({
+            "version": "1.0",
+            "name": "demo",
+            "runtime": "standard-v1",
+            "language": "typescript"
+        })
+    }
+
+    #[test]
+    fn a_config_without_the_new_fields_still_parses() {
+        // Projects predate every field added here; none of them may become
+        // required, or an existing project stops building.
+        let config = parse(minimal());
+        assert!(config.assets.is_none());
+        assert!(config.cron.is_empty());
+        assert!(config.queues.is_empty());
+    }
+
+    #[test]
+    fn the_deislet_vendor_key_accepts_its_older_spellings() {
+        for key in ["deislet", "deis_runtime", "denix"] {
+            let mut json = minimal();
+            json["vendors"] = serde_json::json!({ key: { "enabled": true } });
+            let config = parse(json);
+            let vendor = config
+                .vendors
+                .and_then(|v| v.deislet)
+                .unwrap_or_else(|| panic!("vendor key {key} maps to the deislet target"));
+            assert!(vendor.enabled);
+        }
+    }
+
+    #[test]
+    fn a_queue_consumer_takes_either_spelling_of_batch_size() {
+        let mut json = minimal();
+        json["queues"] = serde_json::json!([
+            { "name": "jobs", "batchSize": 10 },
+            { "name": "mail", "batch_size": 5 },
+            { "name": "slow" }
+        ]);
+        let config = parse(json);
+        let sizes: Vec<Option<u32>> = config.queues.iter().map(|q| q.batch_size).collect();
+        assert_eq!(sizes, vec![Some(10), Some(5), None]);
+    }
+
+    #[test]
+    fn the_assets_directory_has_a_default() {
+        let mut json = minimal();
+        json["assets"] = serde_json::json!({});
+        let config = parse(json);
+        assert_eq!(config.assets.unwrap().dir, "./public");
+    }
 }

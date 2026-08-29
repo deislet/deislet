@@ -4,9 +4,12 @@ pub use deis_wire::conventions::{APP_ID_HEADER, MAX_GRPC_MESSAGE_BYTES, STREAM_C
 
 pub mod app;
 pub mod app_repo;
+pub mod assets;
 pub mod config;
 pub mod config_store;
+pub mod deployment;
 pub mod dispatcher;
+pub mod health;
 pub mod logging;
 pub mod management;
 pub mod resource;

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::runtime::route_match::{match_route, match_routes, path_from_url};
+    use crate::runtime::route_match::{best_match, match_route, match_routes, path_from_url};
     use std::collections::HashMap;
 
     fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -138,6 +138,137 @@ mod tests {
     fn test_match_routes_no_match_returns_empty() {
         let patterns = vec!["/users/:id".to_string()];
         assert_eq!(match_routes(&patterns, "/posts/1"), HashMap::new());
+    }
+
+    // --- catch-all ---------------------------------------------------------
+    //
+    // edge-canon spells this `functions/api/[[catch]].ts`, which deis-build
+    // turns into the manifest pattern `/api/*`. Before wave B it matched
+    // nothing at all, and the only symptom was an empty `context.params`.
+
+    #[test]
+    fn test_catch_all_captures_the_remaining_path() {
+        assert_eq!(
+            match_route("/api/*", "/api/users/42"),
+            Some(params(&[("*", "users/42")]))
+        );
+    }
+
+    #[test]
+    fn test_catch_all_captures_a_single_segment() {
+        assert_eq!(
+            match_route("/api/*", "/api/health"),
+            Some(params(&[("*", "health")]))
+        );
+    }
+
+    #[test]
+    fn test_catch_all_matches_the_bare_prefix_with_an_empty_capture() {
+        // "everything that is left" includes nothing being left, which is
+        // what the generated entry module does too; the two matchers have to
+        // agree or the same request would route differently depending on
+        // whether the app was built through the adapter.
+        assert_eq!(match_route("/api/*", "/api"), Some(params(&[("*", "")])));
+    }
+
+    #[test]
+    fn test_catch_all_at_the_root_captures_everything() {
+        assert_eq!(match_route("/*", "/a/b/c"), Some(params(&[("*", "a/b/c")])));
+        assert_eq!(match_route("/*", "/"), Some(params(&[("*", "")])));
+    }
+
+    #[test]
+    fn test_catch_all_still_requires_the_literal_prefix_to_match() {
+        assert_eq!(match_route("/api/*", "/admin/users"), None);
+    }
+
+    #[test]
+    fn test_catch_all_capture_is_percent_decoded() {
+        assert_eq!(
+            match_route("/files/*", "/files/a%20b/c"),
+            Some(params(&[("*", "a b/c")]))
+        );
+    }
+
+    #[test]
+    fn test_catch_all_combines_with_placeholders_before_it() {
+        assert_eq!(
+            match_route("/users/:id/files/*", "/users/7/files/a/b"),
+            Some(params(&[("id", "7"), ("*", "a/b")]))
+        );
+    }
+
+    // --- precedence --------------------------------------------------------
+
+    #[test]
+    fn test_exact_beats_catch_all_regardless_of_order() {
+        let listed_last = vec!["/api/*".to_string(), "/api/health".to_string()];
+        let listed_first = vec!["/api/health".to_string(), "/api/*".to_string()];
+        for patterns in [listed_last, listed_first] {
+            let (index, params) = best_match(&patterns, "/api/health").expect("a pattern matches");
+            assert_eq!(patterns[index], "/api/health");
+            assert!(params.is_empty(), "an exact pattern captures nothing");
+        }
+    }
+
+    #[test]
+    fn test_placeholder_beats_catch_all_regardless_of_order() {
+        let patterns = vec!["/api/*".to_string(), "/api/:id".to_string()];
+        assert_eq!(match_routes(&patterns, "/api/42"), params(&[("id", "42")]));
+    }
+
+    #[test]
+    fn test_exact_beats_placeholder_regardless_of_order() {
+        let patterns = vec!["/users/:id".to_string(), "/users/me".to_string()];
+        let (index, _) = best_match(&patterns, "/users/me").expect("a pattern matches");
+        assert_eq!(patterns[index], "/users/me");
+    }
+
+    #[test]
+    fn test_catch_all_is_used_when_nothing_more_specific_matches() {
+        let patterns = vec!["/api/health".to_string(), "/api/*".to_string()];
+        assert_eq!(
+            match_routes(&patterns, "/api/users/1"),
+            params(&[("*", "users/1")])
+        );
+    }
+
+    #[test]
+    fn test_longer_catch_all_prefix_wins_over_shorter_one() {
+        let patterns = vec!["/*".to_string(), "/api/*".to_string()];
+        assert_eq!(
+            match_routes(&patterns, "/api/users"),
+            params(&[("*", "users")])
+        );
+    }
+
+    #[test]
+    fn test_earlier_literal_segment_decides_between_two_placeholder_patterns() {
+        let patterns = vec!["/a/:x/c".to_string(), "/a/b/:y".to_string()];
+        let (index, _) = best_match(&patterns, "/a/b/c").expect("both patterns match");
+        assert_eq!(patterns[index], "/a/b/:y");
+    }
+
+    #[test]
+    fn test_exact_prefix_beats_catch_all_over_the_same_prefix() {
+        // Both match "/api": the catch-all with an empty capture. The exact
+        // pattern is the one the app wrote for this path.
+        let patterns = vec!["/api/*".to_string(), "/api".to_string()];
+        let (index, params) = best_match(&patterns, "/api").expect("both patterns match");
+        assert_eq!(patterns[index], "/api");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_equally_specific_patterns_fall_back_to_manifest_order() {
+        let patterns = vec!["/:a".to_string(), "/:b".to_string()];
+        let (index, _) = best_match(&patterns, "/x").expect("both patterns match");
+        assert_eq!(index, 0, "the first of two equal patterns wins");
+    }
+
+    #[test]
+    fn test_best_match_reports_no_match() {
+        assert!(best_match(&["/users/:id".to_string()], "/posts/1").is_none());
     }
 
     #[test]

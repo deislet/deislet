@@ -1,7 +1,12 @@
 #[cfg(test)]
 mod tests {
     use crate::config::ExecutionLimits;
+    use crate::runtime::bindings::{ServiceDeclaration, ServiceEndpoints, ServiceWiring};
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
+    use crate::runtime::metrics::{
+        recorder, EXECUTION_MS_COUNT, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL,
+    };
+    use crate::runtime::queue_client::LeasedMessage;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
@@ -21,6 +26,7 @@ mod tests {
             ts_code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         );
         assert!(
             result.is_ok(),
@@ -41,6 +47,7 @@ mod tests {
             ts_code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         );
         assert!(
             result.is_ok(),
@@ -66,6 +73,7 @@ export default function handler(context: any): Response {
             ts_code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         );
         assert!(
             result.is_ok(),
@@ -92,6 +100,7 @@ export default function handler(context: any): Response {
             ts_code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         );
         assert!(
             result.is_ok(),
@@ -113,6 +122,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         );
         assert!(result.is_ok());
     }
@@ -125,6 +135,7 @@ export default function handler(context: any): Response {
             invalid_code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         );
         assert!(result.is_err());
     }
@@ -142,11 +153,691 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         );
         assert!(result.is_ok());
 
         let runtime = result.unwrap();
         assert_eq!(runtime.app_id(), "test_app");
+    }
+
+    // --- queue consumption -------------------------------------------------
+
+    fn leased(id: &str, body: &str, attempts: i32) -> LeasedMessage {
+        LeasedMessage {
+            id: id.to_string(),
+            body: body.to_string(),
+            attempts,
+            lease_expires_at: 0,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queue_handler_sees_the_batch_and_can_fail_single_messages() {
+        // Half a batch failing must be expressible: acknowledging everything
+        // would lose the failure, failing everything would redo work that
+        // already succeeded.
+        let code = r#"
+            export default function handler() { return new Response("unused"); }
+            export async function queue(batch, context) {
+                globalThis.seen = batch.messages.map((m) => m.id + ":" + m.body + ":" + m.attempts);
+                globalThis.queueName = batch.queue;
+                globalThis.hasServices = typeof context.services.kv === "object";
+                for (const message of batch.messages) {
+                    if (message.body.includes("poison")) message.retry();
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "queue_ok_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let outcome = runtime
+            .execute_queue_batch(
+                "jobs".to_string(),
+                vec![
+                    leased("m1", "fine", 1),
+                    leased("m2", "poison pill", 3),
+                    leased("m3", "fine too", 1),
+                ],
+            )
+            .await
+            .expect("the handler ran");
+
+        assert_eq!(outcome.failed, vec!["m2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_queue_handler_that_throws_fails_the_whole_batch() {
+        let code = r#"
+            export default function handler() { return new Response("unused"); }
+            export async function queue() { throw new Error("no database today"); }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "queue_throw_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let outcome = runtime
+            .execute_queue_batch(
+                "jobs".to_string(),
+                vec![leased("m1", "a", 1), leased("m2", "b", 1)],
+            )
+            .await
+            .expect("a throwing handler is reported, not propagated");
+
+        assert_eq!(outcome.failed, vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_app_with_no_queue_handler_hands_the_batch_back() {
+        // Dropping the messages would be silent data loss; handing them back
+        // means they are retried and eventually dead lettered, which is
+        // visible.
+        let code =
+            r#"export default function handler() { return new Response("no queue export"); }"#;
+
+        let mut runtime = AppRuntime::new(
+            "queue_missing_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let outcome = runtime
+            .execute_queue_batch("jobs".to_string(), vec![leased("m1", "a", 1)])
+            .await
+            .expect("the absence of a handler is an outcome, not an error");
+
+        assert_eq!(outcome.failed, vec!["m1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_queue_handler_that_acknowledges_everything_fails_nothing() {
+        let code = r#"
+            export default function handler() { return new Response("unused"); }
+            export async function queue(batch) {
+                for (const message of batch.messages) { message.retry(); message.ack(); }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "queue_ack_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let outcome = runtime
+            .execute_queue_batch("jobs".to_string(), vec![leased("m1", "a", 1)])
+            .await
+            .unwrap();
+        assert!(outcome.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_handler_runs_and_sees_the_expression_that_was_due() {
+        // The control plane owns the schedule and calls one node per tick;
+        // the handler has to be told which expression fired, because an app
+        // may declare several and do different work for each.
+        let code = r#"
+            export default function handler() { return new Response("unused"); }
+            export async function scheduled(event, context) {
+                if (event.cron !== "0 */6 * * *") throw new Error("wrong expression: " + event.cron);
+                if (event.scheduledTime !== 1700000000000) throw new Error("wrong time");
+                if (typeof context.services.kv !== "object") throw new Error("no services");
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "cron_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        runtime
+            .execute_scheduled("0 */6 * * *".to_string(), 1_700_000_000_000)
+            .await
+            .expect("the scheduled handler ran");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_handler_that_throws_reports_the_tick_as_failed() {
+        // A tick that silently "succeeds" turns a dead cron into no signal at
+        // all; the control plane needs the failure to try another node.
+        let code = r#"
+            export default function handler() { return new Response("unused"); }
+            export async function scheduled() { throw new Error("nightly job broke"); }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "cron_broken_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let error = runtime
+            .execute_scheduled("* * * * *".to_string(), 0)
+            .await
+            .expect_err("a throwing handler is a failed tick");
+        assert!(error.to_string().contains("nightly job broke"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_app_with_no_scheduled_handler_says_so_instead_of_reporting_success() {
+        let code = r#"
+            export default function handler() { return new Response("unused"); }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "cron_missing_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let error = runtime
+            .execute_scheduled("* * * * *".to_string(), 0)
+            .await
+            .expect_err("nothing ran, so the tick did not succeed");
+        assert!(
+            error.to_string().contains("no scheduled handler"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handler_can_read_the_request_body() {
+        // Without Request.text() every handler that reads a POST body failed
+        // with "text is not a function", which named the runtime's polyfill
+        // rather than anything the app did wrong.
+        let code = r#"
+            export default async function handler(context) {
+                const text = await context.request.text();
+                return new Response(JSON.stringify({ text, used: context.request.bodyUsed }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "body_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "POST".to_string(),
+                HashMap::new(),
+                Some("hello body".to_string()),
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 200);
+        let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+        assert_eq!(seen["text"], "hello body");
+        assert_eq!(seen["used"], true);
+    }
+
+    #[tokio::test]
+    async fn a_handler_can_read_a_json_body() {
+        let code = r#"
+            export default async function handler(context) {
+                const parsed = await context.request.json();
+                return new Response(JSON.stringify({ got: parsed.key }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "json_body_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "POST".to_string(),
+                HashMap::new(),
+                Some(r#"{"key":"value"}"#.to_string()),
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 200);
+        let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+        assert_eq!(seen["got"], "value");
+    }
+
+    #[tokio::test]
+    async fn reading_a_request_body_twice_is_refused_rather_than_answered() {
+        let code = r#"
+            export default async function handler(context) {
+                await context.request.text();
+                try {
+                    await context.request.text();
+                    return new Response("read twice");
+                } catch (e) {
+                    return new Response("refused: " + e.message);
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "double_read_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "POST".to_string(),
+                HashMap::new(),
+                Some("once".to_string()),
+                tx,
+            )
+            .await
+            .unwrap();
+        let (_, _, body) = rx.await.unwrap().unwrap();
+        assert!(body.unwrap().starts_with("refused:"));
+    }
+
+    #[tokio::test]
+    async fn an_app_can_send_to_a_queue_other_than_its_default_one() {
+        // A consumer polls a named queue, so a producer has to be able to
+        // name one; without this everything an app sends lands in "default"
+        // and nothing consuming "jobs" would ever see it.
+        let code = r#"
+            export default async function handler(ctx) {
+                await ctx.services.queue.to("jobs").send({ work: 1 });
+                let named = "accepted";
+                try {
+                    ctx.services.queue.to("");
+                    named = "an empty name was accepted";
+                } catch (e) {
+                    named = "empty name rejected";
+                }
+                return new Response(named);
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "queue_named_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(body, Some("empty name rejected".to_string()));
+    }
+
+    // --- metrics -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_served_request_is_counted_with_its_execution_time() {
+        // The app id is unique per test because the registry is process-wide
+        // and the test binary runs its tests in parallel.
+        let app_id = "metrics_ok_app";
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+
+        let mut runtime = AppRuntime::new(
+            app_id.to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let _ = rx.await.unwrap().unwrap();
+
+        assert_eq!(recorder().value(REQUESTS_TOTAL, app_id), 1.0);
+        assert_eq!(recorder().value(REQUEST_ERRORS_TOTAL, app_id), 0.0);
+        assert_eq!(recorder().value(EXECUTION_MS_COUNT, app_id), 1.0);
+    }
+
+    #[tokio::test]
+    async fn an_app_answering_5xx_is_counted_as_an_error() {
+        // This is what an operator means by "error rate": the app said it
+        // failed, even though the isolate did its job.
+        let app_id = "metrics_5xx_app";
+        let code = r#"
+            export default function handler() {
+                return new Response("broken", { status: 503 });
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            app_id.to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, _) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 503);
+        assert_eq!(recorder().value(REQUESTS_TOTAL, app_id), 1.0);
+        assert_eq!(recorder().value(REQUEST_ERRORS_TOTAL, app_id), 1.0);
+    }
+
+    // --- bindings ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_service_the_app_did_not_declare_answers_that_it_is_unavailable() {
+        // The failure has to reach the app as a catchable error, not as a
+        // dead isolate.
+        let code = r#"
+            export default async function handler(ctx) {
+                try {
+                    await ctx.services.kv.get("anything");
+                    return new Response("unexpectedly reached the store");
+                } catch (e) {
+                    return new Response(String(e.message || e));
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "no_services_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 200);
+        let body = body.unwrap_or_default();
+        assert!(
+            body.contains("not available"),
+            "an undeclared service must say so rather than hang or crash: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_service_is_bound_and_its_failure_stays_inside_the_request() {
+        // Nothing listens on port 1: the client exists, the call fails, and
+        // the isolate survives to serve the next request.
+        let wiring = ServiceWiring {
+            declaration: ServiceDeclaration::from_names(["kv"]),
+            endpoints: ServiceEndpoints {
+                store: Some("http://127.0.0.1:1".to_string()),
+                queue: None,
+            },
+            consumers: Vec::new(),
+        };
+
+        let code = r#"
+            export default async function handler(ctx) {
+                try {
+                    await ctx.services.kv.get("anything");
+                    return new Response("unexpectedly reached the store");
+                } catch (e) {
+                    return new Response("call failed: " + String(e.message || e));
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "bound_kv_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &wiring,
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        for _ in 0..2 {
+            let (tx, rx) = oneshot::channel();
+            runtime
+                .execute_fetch(
+                    "http://localhost/".to_string(),
+                    "GET".to_string(),
+                    HashMap::new(),
+                    None,
+                    tx,
+                )
+                .await
+                .unwrap();
+            let (status, _, body) = rx.await.unwrap().unwrap();
+            let body = body.unwrap_or_default();
+            assert_eq!(status, 200);
+            assert!(body.starts_with("call failed:"), "{body}");
+            assert!(
+                !body.contains("not available"),
+                "the binding exists; the failure must be the transport error, not a missing \
+                 client: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_app_reaches_a_real_store_through_its_binding() {
+        // The whole chain in one test: the manifest declares kv, the control
+        // plane's address reaches the isolate, the op finds a client, and the
+        // write carries the lifetime and metadata the app asked for. Every
+        // link of that was missing before wave B.
+        let data = tempfile::TempDir::new().expect("temp dir");
+        let config = deis_store::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            data_dir: data.path().to_path_buf(),
+            ..deis_store::config::Config::default()
+        };
+        let listener = deis_store::server::bind(&config).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            deis_store::server::serve(config, listener, async {
+                let _ = rx.await;
+            })
+            .await
+            .expect("serve");
+        });
+
+        let wiring = ServiceWiring {
+            declaration: ServiceDeclaration::from_names(["kv"]),
+            endpoints: ServiceEndpoints {
+                store: Some(format!("http://{addr}")),
+                queue: None,
+            },
+            consumers: Vec::new(),
+        };
+
+        let code = r#"
+            export default async function handler(ctx) {
+                await ctx.services.kv.put("greeting", "hello", {
+                    expirationTtl: 3600,
+                    metadata: { source: "test" },
+                });
+                const value = await ctx.services.kv.get("greeting");
+                const missing = await ctx.services.kv.get("nothing-here");
+                return new Response(JSON.stringify({ value, missing }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "e2e_kv_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &wiring,
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx2) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx2.await.unwrap().unwrap();
+        let _ = shutdown.send(());
+
+        assert_eq!(status, 200, "body: {body:?}");
+        let body = body.unwrap_or_default();
+        assert!(body.contains("\"value\":\"hello\""), "{body}");
+        assert!(
+            body.contains("\"missing\":null") || !body.contains("\"missing\":\""),
+            "a key that was never written reads back as absent: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifetime_that_is_not_a_lifetime_is_refused_before_the_store_sees_it() {
+        // A zero or negative expirationTtl would delete the value the instant
+        // it was written, which reads as the store losing data.
+        let code = r#"
+            export default async function handler(ctx) {
+                try {
+                    await ctx.services.kv.put("k", "v", { expirationTtl: 0 });
+                    return new Response("accepted");
+                } catch (e) {
+                    return new Response(String(e.message || e));
+                }
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "kv_bad_ttl_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (_, _, body) = rx.await.unwrap().unwrap();
+        let body = body.unwrap_or_default();
+        assert!(
+            body.contains("expirationTtl"),
+            "the app must be told which option it got wrong: {body}"
+        );
     }
 
     #[tokio::test]
@@ -165,6 +856,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         )
         .unwrap();
 
@@ -208,6 +900,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         )
         .unwrap();
 
@@ -244,6 +937,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         )
         .unwrap();
 
@@ -287,6 +981,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         )
         .unwrap();
 
@@ -333,6 +1028,7 @@ export default function handler(context: any): Response {
                 route_patterns: vec!["/users/:id".to_string()],
                 ..Default::default()
             },
+            &ServiceWiring::default(),
         )
         .unwrap();
 
@@ -373,6 +1069,7 @@ export default function handler(context: any): Response {
                 route_patterns: vec!["/users/:id".to_string()],
                 ..Default::default()
             },
+            &ServiceWiring::default(),
         )
         .unwrap();
 
@@ -415,6 +1112,7 @@ export default function handler(context: any): Response {
                 },
                 ..Default::default()
             },
+            &ServiceWiring::default(),
         )
         .unwrap();
 
@@ -439,6 +1137,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         )
         .unwrap();
 
@@ -475,6 +1174,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -532,6 +1232,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
+            &ServiceWiring::default(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();

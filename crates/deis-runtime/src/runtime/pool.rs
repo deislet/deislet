@@ -1,6 +1,11 @@
 // Runtime thread pool - multi-core support
 
+use super::bindings::{consumer_queue_client, ServiceWiring};
 use super::isolate::{AppRuntime, IsolateSpec};
+use super::queue_client::LeasedMessage;
+use super::queue_consumer::{
+    self, BatchInvoker, BatchOutcome, ConsumerHandle, ConsumerSettings, QueuePort,
+};
 use crate::app_repo::AppRepo;
 use anyhow::Result;
 use deno_core::JsRuntime;
@@ -8,7 +13,8 @@ use deno_core::OpMetricsSummary;
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
 use std::thread;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 /// Ensure V8 platform is initialized only once
 static V8_INIT: Once = Once::new();
@@ -31,6 +37,8 @@ pub enum RuntimeMessage {
         code: String,
         app_repo: Option<Arc<AppRepo>>,
         spec: IsolateSpec,
+        /// Which storage services this app declared and where they live.
+        wiring: ServiceWiring,
         response: oneshot::Sender<Result<()>>,
     },
     /// Unload application
@@ -46,6 +54,21 @@ pub enum RuntimeMessage {
         headers: HashMap<String, String>,
         body: Option<String>,
         response: oneshot::Sender<Result<FetchResult>>,
+    },
+    /// Hand a batch of queue messages to an app's queue handler
+    ExecuteQueueBatch {
+        app_id: String,
+        queue: String,
+        messages: Vec<LeasedMessage>,
+        response: oneshot::Sender<Result<BatchOutcome>>,
+    },
+    /// Run an app's scheduled handler for one due cron expression
+    ExecuteScheduled {
+        app_id: String,
+        cron: String,
+        /// Unix milliseconds the tick was due.
+        scheduled_time_ms: i64,
+        response: oneshot::Sender<Result<()>>,
     },
     /// Get application list
     #[allow(dead_code)]
@@ -150,19 +173,21 @@ impl RuntimeThread {
                     code,
                     app_repo,
                     spec,
+                    wiring,
                     response,
                 } => {
                     tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
-                    let result = match AppRuntime::new(app_id.clone(), code, app_repo, spec) {
-                        Ok(mut runtime) => match runtime.init_module().await {
-                            Ok(()) => {
-                                runtimes.insert(app_id.clone(), runtime);
-                                Ok(())
-                            }
+                    let result =
+                        match AppRuntime::new(app_id.clone(), code, app_repo, spec, &wiring) {
+                            Ok(mut runtime) => match runtime.init_module().await {
+                                Ok(()) => {
+                                    runtimes.insert(app_id.clone(), runtime);
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            },
                             Err(e) => Err(e),
-                        },
-                        Err(e) => Err(e),
-                    };
+                        };
                     let _ = response.send(result);
                 }
 
@@ -198,6 +223,50 @@ impl RuntimeThread {
                             let _ = response.send(Err(anyhow::anyhow!("App not found")));
                         }
                     };
+                }
+
+                RuntimeMessage::ExecuteQueueBatch {
+                    app_id,
+                    queue,
+                    messages,
+                    response,
+                } => {
+                    tracing::debug!(
+                        "Thread {}: Handling {} queue message(s) for app {} from queue {}",
+                        thread_id,
+                        messages.len(),
+                        app_id,
+                        queue
+                    );
+                    let result = match runtimes.get_mut(&app_id) {
+                        Some(runtime) => runtime.execute_queue_batch(queue, messages).await,
+                        None => Err(anyhow::anyhow!(
+                            "App {app_id} is not loaded on this node; its queue batch was not \
+                             handled and goes back to deis-queue"
+                        )),
+                    };
+                    let _ = response.send(result);
+                }
+
+                RuntimeMessage::ExecuteScheduled {
+                    app_id,
+                    cron,
+                    scheduled_time_ms,
+                    response,
+                } => {
+                    tracing::debug!(
+                        "Thread {}: Running the scheduled handler of app {} for {}",
+                        thread_id,
+                        app_id,
+                        cron
+                    );
+                    let result = match runtimes.get_mut(&app_id) {
+                        Some(runtime) => runtime.execute_scheduled(cron, scheduled_time_ms).await,
+                        None => Err(anyhow::anyhow!(
+                            "App {app_id} is not loaded on this node, so its scheduled run did                              not happen here; the control plane should try another node"
+                        )),
+                    };
+                    let _ = response.send(result);
                 }
 
                 RuntimeMessage::ListApps { response } => {
@@ -335,6 +404,11 @@ pub struct RuntimePool {
     threads: Vec<RuntimeThread>,
     app_assignments: Arc<RwLock<HashMap<String, usize>>>, // app_id -> thread_id
     app_repo: Option<Arc<AppRepo>>,
+    /// Queue pollers, per app. Held here because they must be stopped when
+    /// the app is unloaded: a poller left running would keep leasing messages
+    /// for an app that is no longer on this node, and every one of them would
+    /// fail and eventually be dead lettered.
+    consumers: Mutex<HashMap<String, Vec<ConsumerHandle>>>,
 }
 
 impl RuntimePool {
@@ -356,6 +430,7 @@ impl RuntimePool {
             threads,
             app_assignments: Arc::new(RwLock::new(HashMap::new())),
             app_repo,
+            consumers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -383,12 +458,27 @@ impl RuntimePool {
         self.app_assignments.read().await.get(app_id).copied()
     }
 
-    /// Load application
-    pub async fn load_app(&self, app_id: String, code: String, spec: IsolateSpec) -> Result<()> {
+    /// Load application.
+    ///
+    /// The platform wiring -- which storage services this app declared and
+    /// where they live -- travels in `spec.env` under the reserved keys the
+    /// control plane sets (see [`ServiceWiring`]). It is lifted out here, so
+    /// what reaches the isolate as `ctx.env` is only the application's own
+    /// variables, and the app's queue consumers are started from the same
+    /// information.
+    pub async fn load_app(
+        &self,
+        app_id: String,
+        code: String,
+        mut spec: IsolateSpec,
+    ) -> Result<()> {
         // Check if already exists
         if self.get_thread_id(&app_id).await.is_some() {
             return Err(anyhow::anyhow!("App already exists"));
         }
+
+        let wiring = ServiceWiring::take_from_env(&mut spec.env);
+        let execution_timeout = Duration::from_millis(spec.limits.timeout_ms);
 
         // Select thread
         let thread_id = self.select_thread_for_new_app().await;
@@ -401,6 +491,7 @@ impl RuntimePool {
             code,
             app_repo: self.app_repo.clone(),
             spec,
+            wiring: wiring.clone(),
             response: tx,
         })?;
 
@@ -411,10 +502,112 @@ impl RuntimePool {
 
         // Record assignment if successful
         if result.is_ok() {
-            self.app_assignments.write().await.insert(app_id, thread_id);
+            self.app_assignments
+                .write()
+                .await
+                .insert(app_id.clone(), thread_id);
+            self.start_consumers(&app_id, thread_id, &wiring, execution_timeout)
+                .await;
         }
 
         result
+    }
+
+    /// Start one poller per queue the app consumes.
+    ///
+    /// Only started for an app that is actually loaded: a poller for an app
+    /// whose isolate failed to build would lease messages it could never
+    /// handle, and every one of them would burn a delivery attempt.
+    async fn start_consumers(
+        &self,
+        app_id: &str,
+        thread_id: usize,
+        wiring: &ServiceWiring,
+        execution_timeout: Duration,
+    ) {
+        let specs = wiring.active_consumers(app_id);
+        if specs.is_empty() {
+            return;
+        }
+
+        let Some(endpoint) = wiring.endpoints.queue.as_deref() else {
+            return;
+        };
+
+        let client: Arc<dyn QueuePort> = match consumer_queue_client(app_id, endpoint) {
+            Ok(client) => Arc::new(client),
+            Err(e) => {
+                tracing::error!(
+                    app_id,
+                    endpoint,
+                    error = %e,
+                    "Cannot build a queue client for app {}; none of its queues will be \
+                     consumed and their messages will pile up in deis-queue",
+                    app_id
+                );
+                return;
+            }
+        };
+
+        let mut handles = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let invoker = self.batch_invoker(app_id, thread_id);
+            handles.push(queue_consumer::spawn(
+                app_id.to_string(),
+                spec.name,
+                client.clone(),
+                ConsumerSettings::for_app(spec.batch_size, execution_timeout),
+                invoker,
+            ));
+        }
+
+        self.consumers
+            .lock()
+            .await
+            .insert(app_id.to_string(), handles);
+    }
+
+    /// How a poller reaches the isolate: by posting the batch to the runtime
+    /// thread the app lives on, exactly like a request.
+    fn batch_invoker(&self, app_id: &str, thread_id: usize) -> BatchInvoker {
+        let sender = self.threads[thread_id].sender.clone();
+        let app_id = app_id.to_string();
+        Arc::new(move |queue: String, messages: Vec<LeasedMessage>| {
+            let sender = sender.clone();
+            let app_id = app_id.clone();
+            Box::pin(async move {
+                let (tx, rx) = oneshot::channel();
+                sender
+                    .send(RuntimeMessage::ExecuteQueueBatch {
+                        app_id: app_id.clone(),
+                        queue,
+                        messages,
+                        response: tx,
+                    })
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "the runtime thread running app {app_id} has stopped; the batch was \
+                             not handled"
+                        )
+                    })?;
+                rx.await.map_err(|_| {
+                    anyhow::anyhow!(
+                        "the runtime thread running app {app_id} dropped the batch without \
+                         answering"
+                    )
+                })?
+            })
+        })
+    }
+
+    /// Stop and forget an app's queue pollers, letting the batch in flight
+    /// finish and be acknowledged first.
+    async fn stop_consumers(&self, app_id: &str) {
+        let handles = self.consumers.lock().await.remove(app_id);
+        for handle in handles.into_iter().flatten() {
+            handle.stop().await;
+        }
     }
 
     /// Unload application
@@ -424,6 +617,10 @@ impl RuntimePool {
             .get_thread_id(app_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+
+        // Stop polling before the isolate goes away, so no batch is leased
+        // for an app that can no longer handle it.
+        self.stop_consumers(app_id).await;
 
         // Send unload message
         let (tx, rx) = oneshot::channel();
@@ -597,6 +794,62 @@ impl RuntimePool {
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
+    /// Hand a batch of queue messages to an app's queue handler.
+    ///
+    /// The pollers use this through [`RuntimePool::batch_invoker`]; it is
+    /// public so a control-plane trigger (`Trigger/OnQueue`) can drive the
+    /// same path without a poller.
+    pub async fn execute_queue_batch(
+        &self,
+        app_id: &str,
+        queue: String,
+        messages: Vec<LeasedMessage>,
+    ) -> Result<BatchOutcome> {
+        let thread_id = self
+            .get_thread_id(app_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.threads[thread_id].send(RuntimeMessage::ExecuteQueueBatch {
+            app_id: app_id.to_string(),
+            queue,
+            messages,
+            response: tx,
+        })?;
+
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+    }
+
+    /// Run an app's scheduled handler once, for one due cron expression.
+    ///
+    /// Called by `Trigger/OnScheduled`: the control plane owns the schedule
+    /// and picks exactly one healthy node per tick, so this node's only job
+    /// is to run the handler and say honestly whether it ran.
+    pub async fn execute_scheduled(
+        &self,
+        app_id: &str,
+        cron: String,
+        scheduled_time_ms: i64,
+    ) -> Result<()> {
+        let thread_id = self
+            .get_thread_id(app_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.threads[thread_id].send(RuntimeMessage::ExecuteScheduled {
+            app_id: app_id.to_string(),
+            cron,
+            scheduled_time_ms,
+            response: tx,
+        })?;
+
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+    }
+
     /// Get aggregate application OpMetrics
     pub async fn get_op_metrics(&self, app_id: &str) -> Result<OpMetricsSummary> {
         let thread_id = self
@@ -725,6 +978,116 @@ mod tests {
         for i in 0..4 {
             let _ = pool.unload_app(&format!("lb_app{}", i)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn the_platform_wiring_never_reaches_the_app_s_env() {
+        // The control plane delivers the store address in the same env map as
+        // the app's own variables. The app must see its variables and nothing
+        // else: platform wiring is not application configuration, and an app
+        // variable spelled like one of the reserved keys must not be able to
+        // point a storage client somewhere else.
+        let pool = TEST_POOL.lock().unwrap();
+
+        let code = r#"
+            export default async function handler(ctx) {
+                let kv = "no call";
+                try {
+                    await ctx.services.kv.get("k");
+                } catch (e) {
+                    kv = String(e.message || e);
+                }
+                return new Response(JSON.stringify({ env: ctx.env, kv }));
+            }
+        "#;
+
+        let env: HashMap<String, String> = [
+            ("DEIS_SERVICES", "kv"),
+            // Nothing listens on port 1: enough to prove a client was built.
+            ("DEIS_STORE_ENDPOINT", "http://127.0.0.1:1"),
+            ("LOG_LEVEL", "info"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        pool.load_app(
+            "env_wiring_app".to_string(),
+            code.to_string(),
+            IsolateSpec {
+                env,
+                ..IsolateSpec::default()
+            },
+        )
+        .await
+        .expect("the app loads");
+
+        let (status, _, body) = pool
+            .execute_request(
+                "env_wiring_app",
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("the request runs");
+        let _ = pool.unload_app("env_wiring_app").await;
+
+        assert_eq!(status, 200);
+        let body = body.unwrap_or_default();
+        assert!(body.contains("LOG_LEVEL"), "{body}");
+        assert!(
+            !body.contains("DEIS_STORE_ENDPOINT") && !body.contains("DEIS_SERVICES"),
+            "platform wiring leaked into ctx.env: {body}"
+        );
+        assert!(
+            !body.contains("not available to this app"),
+            "the declared kv service must be bound, not missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_app_declaring_queues_without_a_queue_address_still_loads() {
+        // Refusing to load would take the whole app down over a consumer that
+        // cannot run; the app serves requests and the missing address is a
+        // warning, not an outage.
+        let pool = TEST_POOL.lock().unwrap();
+
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+        let env: HashMap<String, String> = [
+            ("DEIS_SERVICES", "queue"),
+            ("DEIS_QUEUE_CONSUMERS", "jobs:5"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        pool.load_app(
+            "queueless_app".to_string(),
+            code.to_string(),
+            IsolateSpec {
+                env,
+                ..IsolateSpec::default()
+            },
+        )
+        .await
+        .expect("the app loads without a queue address");
+
+        let (status, _, _) = pool
+            .execute_request(
+                "queueless_app",
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("the request runs");
+        assert_eq!(status, 200);
+
+        // Unloading an app with no running poller is still clean.
+        pool.unload_app("queueless_app").await.expect("unload");
     }
 
     #[tokio::test]

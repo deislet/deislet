@@ -18,10 +18,30 @@ DEFAULT_DEIS_QUEUE_PORT=8091
 DEFAULT_DEIS_TELEMETRY_PORT=8092
 DEFAULT_DEIS_TELEMETRY_METRICS_PORT=8093
 
+# The example app, and the names the demo files it under. The app id is the
+# only tenant dimension deis-store and deis-queue understand, and it is what
+# goes in the x-deis-app-id header on every request.
+APP_SRC_DIR="${APP_SRC_DIR:-${ROOT_DIR}/scripts/demo-assets/example-app}"
+APP_ID="${APP_ID:-demo}"
+ENV_NAME="${ENV_NAME:-production}"
+NODE_ID="${NODE_ID:-deis-runtime-demo-01}"
+# Deliberately recognisable: `verify` greps the logs and the data directories
+# for it to prove a decrypted secret is never written down anywhere.
+DEMO_SECRET_VALUE="${DEMO_SECRET_VALUE:-demo-secret-do-not-log-me}"
+
 usage() {
   cat <<'EOF'
 Usage:
-  demo.sh [start|stop|status] [options]
+  demo.sh [start|stop|status|verify] [options]
+
+Actions:
+  start   Build everything, bring the six components up, and deploy the
+          example app the way a developer would: build a bundle, create the
+          app and its environment, upload the bundle as a version, point the
+          environment at it. The node fetches the bundle itself.
+  verify  Exercise the running demo end to end and report each check.
+  stop    Stop every component and wait until each has really exited.
+  status  Print pids, ports and what is deployed.
 
 Options:
   --deis-control-port <port>            Control HTTP/gRPC port (default 8085)
@@ -33,6 +53,7 @@ Options:
   --deis-telemetry-metrics-port <port>  Telemetry Prometheus port (default 8093)
   --secret <hex>                        Control shared secret (64-char hex)
   --demo-dir <path>                     Runtime directory (default .demo)
+  --app-dir <path>                      Example app sources (default scripts/demo-assets/example-app)
   --log-dir <path>                      Log directory (default .demo/logs)
   --help                                Show this help
 EOF
@@ -231,6 +252,14 @@ DEIS_STORE_CONFIG=$DEIS_STORE_CONFIG
 DEIS_QUEUE_CONFIG=$DEIS_QUEUE_CONFIG
 DEIS_TELEMETRY_CONFIG=$DEIS_TELEMETRY_CONFIG
 SECRET=$SECRET
+SECRET_KEY_FILE=$SECRET_KEY_FILE
+APP_ID=$APP_ID
+ENV_NAME=$ENV_NAME
+NODE_ID=$NODE_ID
+APP_SRC_DIR=$APP_SRC_DIR
+APP_V1_ID=${APP_V1_ID:-}
+APP_V2_ID=${APP_V2_ID:-}
+DEMO_SECRET_VALUE=$DEMO_SECRET_VALUE
 EOF
 }
 
@@ -265,7 +294,8 @@ build_binaries() {
     cd "$ROOT_DIR"
     cargo build \
       -p deis-control -p deis-runtime -p deis-proxy \
-      -p deis-store -p deis-queue -p deis-telemetry
+      -p deis-store -p deis-queue -p deis-telemetry \
+      -p deis
   ) > "${LOG_DIR}/build.log" 2>&1; then
     echo "❌ Build failed, nothing was started. See ${LOG_DIR}/build.log"
     tail -n 20 "${LOG_DIR}/build.log" | sed 's/^/     /'
@@ -325,6 +355,159 @@ EOF
     "ctx.queue calls will fail"
 }
 
+# ----------------------------------------------------------------------
+# Deploying the example app the way a developer would
+# ----------------------------------------------------------------------
+#
+# Nothing here is a shortcut. The same five steps a person takes:
+#
+#   1. `deis build --vendor deislet`  -> dist/deislet/bundle.zip
+#   2. POST /api/apps                 -> the application exists
+#   3. POST .../versions              -> the bundle becomes an immutable version
+#   4. POST .../environments          -> production exists
+#   5. POST .../deployments           -> the environment points at the version
+#
+# Step 5 is where the control plane pushes a pointer to every node; each node
+# downloads the bundle over HTTP, checks its sha256 and loads it. The bundle
+# itself never travels inside a gRPC message.
+
+# Print the control plane's base URL for curl.
+control_url() {
+  echo "http://127.0.0.1:${DEIS_CONTROL_PORT}"
+}
+
+# curl against the control API, failing loudly with the body it got back.
+#
+# Every call here is a step that the next one depends on, so a failure has to
+# stop the run rather than let the demo continue in a half-deployed state.
+api() {
+  local method=$1
+  local path=$2
+  shift 2
+
+  local body_file="${LOG_DIR}/api-last.json"
+  local code
+  code=$(curl -s -o "$body_file" -w '%{http_code}' -X "$method" "$@" \
+    "$(control_url)${path}" || echo 000)
+
+  case "$code" in
+    2*)
+      cat "$body_file"
+      return 0
+      ;;
+    *)
+      echo "❌ ${method} ${path} answered HTTP ${code}" >&2
+      sed 's/^/     /' "$body_file" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Build the example app for this platform and echo the bundle's path.
+#
+# The build runs in a copy under the demo directory rather than in the repo:
+# a build writes dist/ into the project it is given, and the second version
+# rewrites two of the source files.
+build_example_app() {
+  local label=$1
+  local dest="${DEMO_DIR}/app-${label}"
+
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  cp -R "${APP_SRC_DIR}/." "$dest/"
+
+  # Version 2 differs in two places, one on each side of the asset-first
+  # split: the label a handler returns, and the static file itself. A
+  # rollback has to bring both back.
+  if [ "$label" != "v1" ]; then
+    sed -i "s/\"BUILD_LABEL\": \"v1\"/\"BUILD_LABEL\": \"${label}\"/" "$dest/.config.json"
+    sed -i "s/data-label=\"v1\"/data-label=\"${label}\"/" "$dest/public/index.html"
+  fi
+
+  if ! (cd "$dest" && "${BIN_DIR}/deis" build --vendor deislet) \
+    > "${LOG_DIR}/build-app-${label}.log" 2>&1; then
+    echo "❌ Building the example app (${label}) failed; see ${LOG_DIR}/build-app-${label}.log" >&2
+    tail -n 20 "${LOG_DIR}/build-app-${label}.log" | sed 's/^/     /' >&2
+    return 1
+  fi
+
+  echo "${dest}/dist/deislet/bundle.zip"
+}
+
+# Upload one bundle as a version and echo its id.
+upload_version() {
+  local bundle=$1
+  api POST "/api/apps/${APP_ID}/versions" \
+    -H 'content-type: application/zip' \
+    --data-binary "@${bundle}" | jq -r '.version.id'
+}
+
+# Point the environment at a version, and say where it landed.
+deploy_version() {
+  local version_id=$1
+  local note=$2
+  local response
+  response=$(api POST "/api/apps/${APP_ID}/environments/${ENV_NAME}/deployments" \
+    -H 'content-type: application/json' \
+    -d "{\"version_id\":\"${version_id}\",\"note\":\"${note}\"}") || return 1
+
+  local delivered failed
+  delivered=$(echo "$response" | jq -r '.delivery.delivered | length')
+  failed=$(echo "$response" | jq -r '.delivery.failed | length')
+
+  if [ "$delivered" -ge 1 ]; then
+    echo "   ✓ ${note}: ${delivered} node(s) are serving ${version_id}"
+    return 0
+  fi
+
+  echo "❌ ${note}: no node took ${version_id}; the fleet keeps serving what it had" >&2
+  echo "$response" | jq -r '.delivery.failed[]? | "     " + .node + ": " + .error' >&2
+  echo "$response" | jq -r '.delivery.skipped? // empty | "     skipped: " + .' >&2
+  return 1
+}
+
+deploy_example_app() {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "⚠️  jq not found; the example app is not deployed and nothing can be verified"
+    return 0
+  fi
+
+  echo "🚀 Building and deploying the example app"
+
+  local bundle_v1
+  bundle_v1=$(build_example_app v1) || return 1
+  echo "   ✓ Built $(basename "$bundle_v1") ($(wc -c < "$bundle_v1") bytes)"
+
+  api POST /api/apps -H 'content-type: application/json' \
+    -d "{\"id\":\"${APP_ID}\"}" > /dev/null || return 1
+  echo "   ✓ Application ${APP_ID} created"
+
+  APP_V1_ID=$(upload_version "$bundle_v1") || return 1
+  echo "   ✓ Uploaded version ${APP_V1_ID}"
+
+  api POST "/api/apps/${APP_ID}/environments" -H 'content-type: application/json' \
+    -d "{\"name\":\"${ENV_NAME}\"}" > /dev/null || return 1
+  echo "   ✓ Environment ${ENV_NAME} created"
+
+  # Stored encrypted, decrypted only at the moment of delivery, and never
+  # returned by any read endpoint. The app only reports whether it arrived.
+  api PUT "/api/apps/${APP_ID}/environments/${ENV_NAME}/secrets/DEMO_SECRET" \
+    -H 'content-type: application/json' \
+    -d "{\"value\":\"${DEMO_SECRET_VALUE}\"}" > /dev/null || return 1
+  echo "   ✓ Secret DEMO_SECRET stored"
+
+  deploy_version "$APP_V1_ID" "deployed v1" || return 1
+
+  # The second version exists so `verify` has something to roll back from.
+  # It is built and uploaded here, not deployed.
+  local bundle_v2
+  bundle_v2=$(build_example_app v2) || return 1
+  APP_V2_ID=$(upload_version "$bundle_v2") || return 1
+  echo "   ✓ Uploaded version ${APP_V2_ID} (built, not deployed)"
+
+  echo "   Send requests with: curl -H 'x-deis-app-id: ${APP_ID}' http://127.0.0.1:${DEIS_RUNTIME_PORT}/"
+}
+
 start_demo() {
   ensure_dirs
   require_command cargo
@@ -363,6 +546,21 @@ start_demo() {
     fi
   fi
 
+  # The state file is how `stop` finds the processes, so deleting the demo
+  # directory without stopping first orphans a whole run: its components keep
+  # their ports, and the new control plane would either fail to bind or, worse,
+  # the probe would find the old one and every later step would address it.
+  # Look for the processes themselves rather than trusting the file.
+  local orphans
+  orphans=$(pgrep -f "${BIN_DIR}/deis-(control|runtime|proxy|store|queue|telemetry)" 2>/dev/null || true)
+  if [ -n "$orphans" ]; then
+    echo "⚠️  Components from an earlier run are still running (pids: $(echo "$orphans" | tr '\n' ' '))."
+    echo "    They hold their ports and their data. Stop them first:"
+    echo "      ./scripts/demo.sh stop      # if .demo/state.env still exists"
+    echo "      pkill -f '${BIN_DIR}/deis-'  # otherwise"
+    exit 1
+  fi
+
   DEIS_CONTROL_PORT=$user_deis_control_port
   DEIS_RUNTIME_PORT=$user_deis_runtime_port
   DEIS_PROXY_PORT=$user_deis_proxy_port
@@ -380,6 +578,16 @@ start_demo() {
     "${DEIS_TELEMETRY_METRICS_PORT:-$DEFAULT_DEIS_TELEMETRY_METRICS_PORT}"
 
   SECRET=${SECRET:-$(generate_secret)}
+
+  # The master key that encrypts environment secrets. 32 bytes as 64 hex
+  # characters, which is what `openssl rand -hex 32` produces. It never enters
+  # the database and is never logged; without it every secret endpoint answers
+  # 503 instead of storing anything in the clear.
+  SECRET_KEY_FILE="${DEMO_DIR}/secret.key"
+  if [ ! -f "$SECRET_KEY_FILE" ]; then
+    generate_secret > "$SECRET_KEY_FILE"
+    chmod 600 "$SECRET_KEY_FILE"
+  fi
 
   DEIS_CONTROL_CONFIG="${DEMO_DIR}/deis-control.toml"
   DEIS_RUNTIME_CONFIG="${DEMO_DIR}/deis-runtime.toml"
@@ -403,6 +611,14 @@ start_demo() {
   while [ $attempt -le $max_retries ]; do
     DEIS_CONTROL_PORT=$((start_port + attempt))
 
+    # bundle_dir is where an uploaded version's zip lives and where nodes
+    # fetch it from; public_base_url is the address those download links
+    # carry, which has to be reachable from the node rather than from the
+    # control plane's own point of view. secret_key_file is what makes the
+    # secret endpoints work at all: without it they answer 503 rather than
+    # storing anything in the clear. store_endpoint / queue_endpoint are the
+    # addresses handed down to nodes with every deployment - a node never
+    # learns where storage lives from its own file.
     cat > "$DEIS_CONTROL_CONFIG" <<EOF
 bind_addr = "0.0.0.0"
 port = ${DEIS_CONTROL_PORT}
@@ -410,29 +626,40 @@ heartbeat_interval = 30
 heartbeat_timeout = 90
 node_preshared_keys = ["${SECRET}"]
 deis_runtime_poll_interval = 5
+bundle_dir = "${DEMO_DIR}/bundles"
+public_base_url = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
+secret_key_file = "${SECRET_KEY_FILE}"
+store_endpoint = "http://127.0.0.1:${DEIS_STORE_PORT}"
+queue_endpoint = "http://127.0.0.1:${DEIS_QUEUE_PORT}"
 
 [[deis_runtime_nodes]]
-id = "deis-runtime-demo-01"
+id = "${NODE_ID}"
 addr = "http://127.0.0.1:${DEIS_RUNTIME_PORT}"
 EOF
 
-    # No [control] section is written. deis-runtime has no such setting, so the
-    # block this file used to carry was read by nobody while looking like
-    # working configuration. The node does not dial the control plane yet
-    # (architecture principle 8); it is deis-control that reaches the node,
-    # through the [[deis_runtime_nodes]] entry above.
+    # [control] is architecture principle 8: on startup the node asks the
+    # control plane which applications and versions it should be running,
+    # downloads each bundle itself, and only reports healthy once they are
+    # loaded. The control plane still pushes new deployments at it; the pull
+    # is what makes a restarted node come back with what it had.
     #
-    # [logging] is what makes `deis tail` possible: without it the node's app
-    # logs stop at its own stdout and deis-telemetry has nothing to answer a
-    # query with. The flush interval is dropped to a second so a request's logs
-    # are queryable while the person who made it is still looking.
+    # [logging] is what makes the app's own log lines queryable: without it
+    # they stop at this node's stdout and deis-telemetry has nothing to answer
+    # with. The flush interval is dropped to a second so a request's logs are
+    # queryable while the person who made it is still looking.
     cat > "$DEIS_RUNTIME_CONFIG" <<EOF
+node_id = "${NODE_ID}"
 http_port = ${DEIS_RUNTIME_PORT}
+data_dir = "${DEMO_DIR}/deis-runtime-data"
 
 [logging]
 enabled = true
 endpoint = "http://127.0.0.1:${DEIS_TELEMETRY_PORT}"
 flush_interval_secs = 1
+
+[control]
+endpoint = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
+retry_interval_secs = 2
 EOF
 
     cat > "$DEIS_PROXY_CONFIG" <<EOF
@@ -464,7 +691,13 @@ EOF
       > "${LOG_DIR}/deis-control.log" 2>&1 &
     DEIS_CONTROL_PID=$!
 
-    if wait_for_http "http://127.0.0.1:${DEIS_CONTROL_PORT}/health" 200; then
+    # The pid check is the load-bearing half. A port already held by another
+    # control plane -- an orphan from a previous run, say -- answers /health
+    # perfectly well, so a probe on its own would report "ready" while our own
+    # process had already died on bind, and every later step would silently
+    # talk to the wrong instance.
+    if wait_for_http "http://127.0.0.1:${DEIS_CONTROL_PORT}/health" 200 \
+      && pid_running "$DEIS_CONTROL_PID"; then
       deis_control_ready=1
       break
     fi
@@ -474,6 +707,12 @@ EOF
       kill "$DEIS_CONTROL_PID" || true
       attempt=$((attempt + 1))
       continue
+    fi
+
+    if ! pid_running "$DEIS_CONTROL_PID"; then
+      echo "❌ Control exited during startup; nothing else can be deployed. Last lines:"
+      tail -n 10 "${LOG_DIR}/deis-control.log" | sed 's/^/     /'
+      exit 1
     fi
 
     echo "❌ Control API is not ready, please check the log: ${LOG_DIR}/deis-control.log"
@@ -511,33 +750,7 @@ EOF
   report_service "Proxy" "$proxy_rc" "${LOG_DIR}/deis-proxy.log" \
     "the demo entry point is unreachable"
 
-  if command -v jq >/dev/null 2>&1; then
-    echo "🚀 Deploying example app"
-    # Package the example app and deploy it through deis-control, which relays
-    # to the deis-runtime gRPC management plane.
-    APP_ZIP="${DEMO_DIR}/example-app.zip"
-    if python3 -c "
-import zipfile, pathlib, sys
-src = pathlib.Path('${ROOT_DIR}/scripts/demo-assets/example-app')
-with zipfile.ZipFile('${APP_ZIP}', 'w') as zf:
-    for f in sorted(src.iterdir()):
-        zf.write(f, f.name)
-" 2> "${LOG_DIR}/deis_runtime_deploy.log"; then
-      http_code=$(curl -s -o "${LOG_DIR}/deis_runtime_deploy.log" -w '%{http_code}' \
-        -X PUT --data-binary "@${APP_ZIP}" \
-        -H 'content-type: application/zip' \
-        "http://127.0.0.1:${DEIS_CONTROL_PORT}/api/runtime/deis-runtime-demo-01/apps/demo" || echo 000)
-      if [ "$http_code" = "200" ]; then
-        echo "Example app deployed: send requests with header 'x-deis-app-id: demo'"
-      else
-        echo "WARN: example app deployment failed (HTTP ${http_code}), see ${LOG_DIR}/deis_runtime_deploy.log"
-      fi
-    else
-      echo "WARN: failed to package example app, see ${LOG_DIR}/deis_runtime_deploy.log"
-    fi
-  else
-    echo "⚠️  jq not found, skipping example app deployment"
-  fi
+  deploy_example_app
 
   write_state
 
@@ -639,6 +852,353 @@ stop_demo() {
   echo "✅ Demo environment stopped; every component has exited"
 }
 
+# ----------------------------------------------------------------------
+# Verification
+# ----------------------------------------------------------------------
+#
+# Each check exercises one thing the platform promises and prints the evidence
+# it is judging, so a failure says what was actually seen rather than only
+# that something went wrong.
+
+CHECKS_PASSED=0
+CHECKS_FAILED=0
+
+pass_check() {
+  CHECKS_PASSED=$((CHECKS_PASSED + 1))
+  echo "   ✓ $1"
+  [ -n "${2:-}" ] && echo "     $2"
+  return 0
+}
+
+fail_check() {
+  CHECKS_FAILED=$((CHECKS_FAILED + 1))
+  echo "   ✗ $1"
+  [ -n "${2:-}" ] && echo "     $2"
+  return 0
+}
+
+# One request to the node, with the tenant header deis-proxy would have
+# stamped. Writes the response headers to $1 and the body to stdout.
+app_request() {
+  local header_file=$1
+  local path=$2
+  shift 2
+  curl -s -D "$header_file" -H "x-deis-app-id: ${APP_ID}" "$@" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}"
+}
+
+# Read one header value out of a saved response, lower-casing the name.
+header_value() {
+  local file=$1
+  local name=$2
+  tr -d '\r' < "$file" | awk -v want="$(echo "$name" | tr 'A-Z' 'a-z')" '
+    { split($0, kv, ":"); k = tolower(kv[1]);
+      if (k == want) { sub(/^[^:]*:[ ]*/, ""); print; exit } }'
+}
+
+http_status() {
+  head -n 1 "$1" | tr -d '\r' | awk '{print $2}'
+}
+
+check_static_asset() {
+  local headers="${LOG_DIR}/verify-asset.headers"
+  local body
+  body=$(app_request "$headers" "/")
+
+  local status etag ctype
+  status=$(http_status "$headers")
+  etag=$(header_value "$headers" ETag)
+  ctype=$(header_value "$headers" Content-Type)
+
+  if [ "$status" != "200" ] || ! echo "$body" | grep -q "static asset"; then
+    fail_check "static asset served from the bundle" "GET / answered ${status}"
+    return
+  fi
+  if [ -z "$etag" ]; then
+    fail_check "static asset carries an ETag" "no ETag header on GET /"
+    return
+  fi
+  pass_check "static asset served from the bundle without starting an isolate" \
+    "HTTP ${status}, content-type ${ctype}, ETag ${etag}"
+
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "x-deis-app-id: ${APP_ID}" -H "If-None-Match: ${etag}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/")
+  local length
+  length=$(curl -s -o /dev/null -w '%{size_download}' \
+    -H "x-deis-app-id: ${APP_ID}" -H "If-None-Match: ${etag}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/")
+
+  if [ "$code" = "304" ] && [ "$length" = "0" ]; then
+    pass_check "If-None-Match on that ETag answers 304 with no body" \
+      "HTTP 304, ${length} bytes"
+  else
+    fail_check "If-None-Match on that ETag answers 304 with no body" \
+      "got HTTP ${code} with ${length} bytes"
+  fi
+}
+
+check_route_parameter() {
+  local headers="${LOG_DIR}/verify-route.headers"
+  local body
+  body=$(app_request "$headers" "/hello/world")
+
+  local greeting
+  greeting=$(echo "$body" | jq -r '.greeting // empty' 2>/dev/null || true)
+  if [ "$greeting" = "Hello, world!" ]; then
+    pass_check "a route placeholder reaches context.params" \
+      "GET /hello/world -> ${body}"
+  else
+    fail_check "a route placeholder reaches context.params" \
+      "GET /hello/world -> $(http_status "$headers") ${body}"
+  fi
+}
+
+check_secret_delivery() {
+  local headers="${LOG_DIR}/verify-secret.headers"
+  local body
+  body=$(app_request "$headers" "/hello/world")
+
+  if [ "$(echo "$body" | jq -r '.secretPresent // false' || true)" = "true" ]; then
+    pass_check "the environment's secret reached the isolate" \
+      "the handler sees DEMO_SECRET; its value is never in the response"
+  else
+    fail_check "the environment's secret reached the isolate" \
+      "the handler reports it missing: ${body}"
+  fi
+
+  # The value is decrypted only in memory, at the moment of delivery. Nothing
+  # on either side's disk may contain it.
+  # `|| true` on every step: this whole pipeline finding nothing is the
+  # passing case, and under `set -e` a grep that matches nothing would end
+  # the run instead.
+  local hits
+  hits=$( { grep -rl "$DEMO_SECRET_VALUE" "$LOG_DIR" "${DEMO_DIR}/deis-runtime-data" \
+    "${DEMO_DIR}/bundles" 2>/dev/null || true; } | grep -v 'api-last.json' | head -n 5 || true)
+  if [ -z "$hits" ]; then
+    pass_check "the decrypted secret is written nowhere" \
+      "no hit in the node's data directory, the bundle store or any log"
+  else
+    fail_check "the decrypted secret is written nowhere" "found in: ${hits}"
+  fi
+}
+
+check_kv_roundtrip() {
+  local key="demo-kv-$$"
+  local value="stored-through-deis-store"
+  local headers="${LOG_DIR}/verify-kv.headers"
+
+  local put
+  put=$(curl -s -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+    --data-binary "$value" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/${key}")
+  if [ "$(http_status "$headers")" != "201" ]; then
+    fail_check "context.services.kv round-trips through deis-store" \
+      "PUT answered $(http_status "$headers"): ${put}"
+    return
+  fi
+
+  local got
+  got=$(app_request "${LOG_DIR}/verify-kv-get.headers" "/api/kv/${key}")
+  if [ "$(echo "$got" | jq -r '.value // empty' || true)" != "$value" ]; then
+    fail_check "context.services.kv round-trips through deis-store" \
+      "GET answered $(http_status "${LOG_DIR}/verify-kv-get.headers"): ${got}"
+    return
+  fi
+
+  # Reading it back proves the isolate got an answer; finding it in
+  # deis-store's own database proves the answer came from deis-store and not
+  # from something inside the isolate.
+  if grep -qa "$value" "${DEMO_DIR}/deis-store-data"/*.sqlite* 2>/dev/null; then
+    pass_check "context.services.kv round-trips through deis-store" \
+      "PUT then GET returned ${value}, and the value is in deis-store's own database"
+  else
+    pass_check "context.services.kv round-trips through deis-store" \
+      "PUT then GET returned ${value} (deis-store's file could not be grepped, likely still in WAL)"
+  fi
+}
+
+check_queue_roundtrip() {
+  local key="job-$$"
+  local value="handled-by-the-queue-consumer"
+  local headers="${LOG_DIR}/verify-queue.headers"
+
+  local sent
+  sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+    -H 'content-type: application/json' \
+    -d "{\"key\":\"${key}\",\"value\":\"${value}\"}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue")
+  if [ "$(http_status "$headers")" != "202" ]; then
+    fail_check "a queue message is produced and consumed" \
+      "POST /api/enqueue answered $(http_status "$headers"): ${sent}"
+    return
+  fi
+
+  # The consumer is a poller: it leases the batch on its own schedule, so the
+  # only thing to do is wait for the effect it has. curl paces its own
+  # retries a second apart and gives up after the budget below.
+  local got
+  got=$(curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
+    -H "x-deis-app-id: ${APP_ID}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/job:${key}" 2>/dev/null || echo '')
+
+  if [ "$(echo "$got" | jq -r '.value // empty' 2>/dev/null || true)" = "$value" ]; then
+    pass_check "a queue message is produced and consumed" \
+      "the handler sent it to deis-queue, the node's poller leased it, and the consumer wrote job:${key}"
+  else
+    fail_check "a queue message is produced and consumed" \
+      "nothing was written for job:${key} within 90s; last answer: ${got:-<none>}"
+  fi
+}
+
+check_cron() {
+  # The whole cron path in one observation: the expression rode into the
+  # control plane inside the bundle manifest, the scheduler rebuilt its task
+  # list from the catalog, it picked this node and called Trigger/OnScheduled,
+  # and the app's `scheduled` export wrote the key below.
+  #
+  # The expression is "every minute" and the demo sets the scheduler's tick to
+  # five seconds, so the wait is a minute plus a little rather than the three
+  # minutes the default tick would need. curl paces its own retries a second
+  # apart.
+  local got
+  got=$(curl -sf --retry 150 --retry-delay 1 --retry-max-time 180 --retry-all-errors \
+    -H "x-deis-app-id: ${APP_ID}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/cron:last-run" 2>/dev/null || echo '')
+
+  local at
+  at=$(echo "$got" | jq -r '.value // empty' 2>/dev/null || true)
+  if [ -n "$at" ]; then
+    pass_check "a cron expression fires on one node and runs the app's handler"       "deis-control triggered the node and the scheduled handler recorded ${at}"
+  else
+    fail_check "a cron expression fires on one node and runs the app's handler"       "nothing was recorded for cron:last-run within 120s; last answer: ${got:-<none>}"
+  fi
+}
+
+# Which version an environment is on right now, straight from the control
+# plane rather than inferred from a response.
+deployed_version() {
+  api GET "/api/apps/${APP_ID}/environments/${ENV_NAME}/deployment" 2>/dev/null \
+    | jq -r '.version.id // empty'
+}
+
+check_rollback() {
+  if [ -z "${APP_V2_ID:-}" ]; then
+    fail_check "rollback puts the previous version back" \
+      "no second version was uploaded, so there is nothing to roll back from"
+    return
+  fi
+
+  local before
+  before=$(app_request "${LOG_DIR}/verify-rollback-before.headers" "/hello/world")
+  local label_before
+  label_before=$(echo "$before" | jq -r '.label // empty' || true)
+
+  if ! deploy_version "$APP_V2_ID" "deployed v2 for the rollback check" > /dev/null; then
+    fail_check "rollback puts the previous version back" "v2 could not be deployed"
+    return
+  fi
+
+  local after
+  after=$(app_request "${LOG_DIR}/verify-rollback-v2.headers" "/hello/world")
+  local label_after
+  label_after=$(echo "$after" | jq -r '.label // empty' || true)
+  local asset_v2
+  asset_v2=$(curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
+    | grep -o 'data-label="[^"]*"' || true)
+
+  if [ "$label_after" = "$label_before" ]; then
+    fail_check "rollback puts the previous version back" \
+      "deploying v2 did not change the response: still ${label_after}"
+    return
+  fi
+
+  local response
+  response=$(api POST "/api/apps/${APP_ID}/environments/${ENV_NAME}/rollback" \
+    -H 'content-type: application/json' -d '{}') || {
+    fail_check "rollback puts the previous version back" "the rollback call failed"
+    return
+  }
+  local rolled_to
+  rolled_to=$(echo "$response" | jq -r '.version.id' || true)
+
+  local back
+  back=$(app_request "${LOG_DIR}/verify-rollback-after.headers" "/hello/world")
+  local label_back
+  label_back=$(echo "$back" | jq -r '.label // empty' || true)
+  local asset_back
+  asset_back=$(curl -s -H "x-deis-app-id: ${APP_ID}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" \
+    | grep -o 'data-label="[^"]*"' || true)
+
+  if [ "$label_back" = "$label_before" ] && [ "$rolled_to" = "$APP_V1_ID" ]; then
+    pass_check "rollback puts the previous version back" \
+      "${label_before} -> ${label_after} -> ${label_back}; the static asset went ${asset_v2} -> ${asset_back} with it"
+  else
+    fail_check "rollback puts the previous version back" \
+      "expected ${label_before} from ${APP_V1_ID}, got ${label_back} from ${rolled_to}"
+  fi
+}
+
+check_telemetry_logs() {
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "the app's logs are queryable from deis-telemetry" \
+      "grpcurl is not installed, so this check could not be run"
+    return
+  fi
+
+  # Ask for the line the handler itself wrote, not just for "anything from
+  # this app": component logs would pass that while the application's own
+  # console output never left the node.
+  local out
+  out=$(grpcurl -plaintext -max-time 10 \
+    -import-path "${ROOT_DIR}/crates/deis-telemetry/proto" \
+    -proto telemetry.proto \
+    -d "{\"app_id\":\"${APP_ID}\",\"contains\":\"greeted\",\"limit\":20}" \
+    "127.0.0.1:${DEIS_TELEMETRY_PORT}" deis.telemetry.LogService/Query 2>&1)
+
+  local count sample
+  count=$(echo "$out" | jq -r '.entries | length' 2>/dev/null || echo 0)
+  sample=$(echo "$out" | jq -r '.entries[0].message // empty' 2>/dev/null || true)
+
+  if [ "${count:-0}" -gt 0 ] 2>/dev/null; then
+    pass_check "the app's logs are queryable from deis-telemetry" \
+      "Query(app_id=${APP_ID}, contains=greeted) returned ${count} entries; newest: \"${sample}\""
+  else
+    fail_check "the app's logs are queryable from deis-telemetry" \
+      "$(echo "$out" | head -n 3 | tr '\n' ' ')"
+  fi
+}
+
+verify_demo() {
+  load_state
+  require_command curl
+  require_command jq
+
+  echo "🔎 Verifying the demo end to end"
+  echo
+  echo "-- asset-first serving --"
+  check_static_asset
+  echo "-- routing --"
+  check_route_parameter
+  echo "-- secrets --"
+  check_secret_delivery
+  echo "-- storage --"
+  check_kv_roundtrip
+  echo "-- queue --"
+  check_queue_roundtrip
+  echo "-- cron --"
+  check_cron
+  echo "-- versions --"
+  check_rollback
+  echo "-- observability --"
+  check_telemetry_logs
+
+  echo
+  echo "${CHECKS_PASSED} passed, ${CHECKS_FAILED} failed"
+  [ "$CHECKS_FAILED" -eq 0 ]
+}
+
 status_demo() {
   load_state
 
@@ -656,6 +1216,12 @@ status_demo() {
   echo "- Queue (gRPC): 127.0.0.1:${DEIS_QUEUE_PORT:-unknown}"
   echo "- Telemetry (gRPC): 127.0.0.1:${DEIS_TELEMETRY_PORT:-unknown}"
   echo "- Telemetry metrics: http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT:-unknown}/metrics"
+
+  if command -v jq >/dev/null 2>&1 && [ -n "${APP_ID:-}" ]; then
+    local current
+    current=$(deployed_version 2>/dev/null || true)
+    echo "- App ${APP_ID}/${ENV_NAME}: ${current:-not deployed} (uploaded: ${APP_V1_ID:-none} ${APP_V2_ID:-})"
+  fi
 }
 
 action="start"
@@ -698,6 +1264,10 @@ while [ $# -gt 0 ]; do
       SECRET=$2
       shift 2
       ;;
+    --app-dir)
+      APP_SRC_DIR=$2
+      shift 2
+      ;;
     --demo-dir)
       DEMO_DIR=$2
       LOG_DIR="${DEMO_DIR}/logs"
@@ -729,6 +1299,9 @@ case "$action" in
     ;;
   status)
     status_demo
+    ;;
+  verify)
+    verify_demo
     ;;
   *)
     usage

@@ -7,6 +7,9 @@ authors = ["kookyleo <kookyleo@gmail.com>"]
 
 [dependencies]
 deis-wire = { workspace = true }
+# The bundle format: deis-build writes it, deis-control verifies it, this crate
+# loads it. One definition for all three.
+deis-bundle = { path = "../deis-bundle" }
 # Async runtime
 tokio = { version = "1.48", features = ["full"] }
 
@@ -66,7 +69,9 @@ tonic = "0.12"
 prost = "0.13"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json"] }
+# "stream" is what lets a bundle be hashed and written to disk as it
+# arrives, instead of being buffered whole in memory first.
+reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # WebSocket client
 tokio-tungstenite = { version = "0.21", features = ["__rustls-tls"] }
@@ -75,12 +80,18 @@ futures-util = "0.3"
 # Base64 encoding
 base64 = "0.22"
 
+# Reference-counted byte buffers. Static assets are held once per version and
+# handed to a response per request; `Bytes` makes that a refcount bump instead
+# of copying the file for every hit.
+bytes = "1"
+
 
 # System information
 hostname = "0.4"
 
 # Cryptography and hashing
 sha2 = "0.10"
+hex = "0.4"
 
 # ZIP archive handling
 zip = "0.6"

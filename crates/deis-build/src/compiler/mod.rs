@@ -220,7 +220,27 @@ impl Compiler {
                 }
             }
             "deislet" => {
-                // Runtime verification logic (e.g. deis validate)
+                // Read the archive back the way the control plane will, with
+                // the shared reader. A bundle that this rejects would be
+                // rejected at upload instead, a long way from the build that
+                // produced it.
+                let bundle = output_dir.join(deis_build_adapter_deislet::BUNDLE_FILE_NAME);
+                let bytes = fs::read(&bundle)
+                    .map_err(|e| anyhow::anyhow!("cannot read back {}: {e}", bundle.display()))?;
+                let parsed = deis_bundle::read_manifest(&bytes).map_err(|e| {
+                    anyhow::anyhow!("the bundle this build produced is not loadable: {e}")
+                })?;
+                println!(
+                    "{}",
+                    format!(
+                        "  ✓ Bundle verified: app {}, entry {}, {} route(s), {} asset(s)",
+                        parsed.manifest.app,
+                        parsed.manifest.entry,
+                        parsed.manifest.routes.len(),
+                        parsed.manifest.assets.len()
+                    )
+                    .green()
+                );
             }
             _ => {}
         }
@@ -241,6 +261,14 @@ impl Compiler {
     ) -> anyhow::Result<Vec<String>> {
         let functions_dir = project_dir.join(&config.function_root);
         let mut handlers = Vec::new();
+
+        // A project with no function root is a site made only of static files,
+        // which is a shape the platform serves on purpose (asset-first). The
+        // walk below would otherwise fail on the missing directory and the
+        // whole build would stop with a bare "No such file or directory".
+        if !functions_dir.exists() {
+            return Ok(handlers);
+        }
 
         for entry in WalkDir::new(functions_dir) {
             let entry = entry?;
@@ -276,8 +304,8 @@ impl Compiler {
                     vendors.push("tencent".to_string());
                 }
             }
-            if let Some(ref deis_runtime) = vendor_config.deis_runtime {
-                if deis_runtime.enabled {
+            if let Some(ref deislet) = vendor_config.deislet {
+                if deislet.enabled {
                     vendors.push("deislet".to_string());
                 }
             }
@@ -300,10 +328,26 @@ impl Compiler {
                     features.push(Feature::SQLDatabase);
                 }
             }
-            // More extended service detection can be added in the future
-            // - ObjectStorage
-            // - Queues
-            // - etc.
+            if let Some(ref blob) = services.blob {
+                if blob.enabled {
+                    features.push(Feature::ObjectStorage);
+                }
+            }
+            if let Some(ref queue) = services.queue {
+                if queue.enabled {
+                    features.push(Feature::Queues);
+                }
+            }
+        }
+
+        // A declared consumer or schedule is a use of the feature just as much
+        // as a binding is: an app whose cron never fires is broken whether or
+        // not it also calls a service.
+        if !config.queues.is_empty() && !features.contains(&Feature::Queues) {
+            features.push(Feature::Queues);
+        }
+        if !config.cron.is_empty() {
+            features.push(Feature::CronJobs);
         }
 
         // Detect runtime features
@@ -322,26 +366,42 @@ impl Compiler {
     }
 
     /// Validate that the platform supports the required features
+    ///
+    /// Returns the warnings the build should carry: features the target is
+    /// specified to have and has not wired up yet. Those do not stop a build -
+    /// the declaration still belongs in the bundle, where the control plane
+    /// records it - but the person building has to be told what will not work
+    /// when they deploy.
     fn validate_platform_capabilities(
         &self,
         vendor: &str,
         features: &[Feature],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         let platform = match vendor {
             "cloudflare" => Platform::Cloudflare,
             "deno" => Platform::Deno,
             "tencent" => Platform::Tencent,
+            "deislet" => Platform::Deislet,
             _ => {
                 // Unknown platform, skip validation
-                return Ok(());
+                return Ok(Vec::new());
             }
         };
 
         let caps = PlatformCapabilities::new(platform);
+        let (errors, pending) = caps.partition_unsupported(features);
 
-        // Check all features
-        match caps.check_features(features) {
-            Ok(_) => Ok(()),
+        let warnings: Vec<String> = pending.iter().map(|p| p.to_string()).collect();
+        for warning in &warnings {
+            println!("{}", format!("  ⚠ {warning}").yellow());
+        }
+
+        match if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        } {
+            Ok(_) => Ok(warnings),
             Err(errors) => {
                 // Show detailed error information
                 eprintln!(
@@ -377,11 +437,23 @@ impl Compiler {
 
         // Validate platform capabilities
         let required_features = self.detect_required_features(config);
-        self.validate_platform_capabilities(vendor, &required_features)?;
+        let mut warnings = self.validate_platform_capabilities(vendor, &required_features)?;
 
         let output_mode = self.options.output_mode;
         let should_write_files = matches!(output_mode, OutputMode::Files | OutputMode::Both);
         let should_collect_memory = matches!(output_mode, OutputMode::Memory | OutputMode::Both);
+
+        // The deislet target's artefact is an archive, and assembling one
+        // means staging the handlers where the module bundler can resolve
+        // their imports against the project's own dependencies. Failing here
+        // is better than emitting a bundle whose entry module could not import
+        // half the app.
+        if vendor == "deislet" && !should_write_files {
+            return Err(anyhow::anyhow!(
+                "the deislet target produces a bundle archive and needs a staging directory on \
+                 disk; build it in Files or Both output mode"
+            ));
+        }
 
         let output_dir = project_dir
             .join(
@@ -470,24 +542,7 @@ impl Compiler {
             "cloudflare" => deis_build_adapter_cf::generate(&routes, config)?,
             "deno" => deis_build_adapter_dc::generate(&routes, config)?,
             "tencent" => deis_build_adapter_eo::generate(&routes, config)?,
-            "deislet" => {
-                // Runtime pass-through: Generate a simple router that exports the first handler
-                // Assumption: Runtime single entry point
-                let entry_import = if !routes.is_empty() {
-                    routes[0].1.clone()
-                } else {
-                    "".to_string()
-                };
-                AdapterArtifacts {
-                    router_code: format!(
-                        "import handler from '{}'; export default handler;",
-                        entry_import
-                    ),
-                    context_builder_code: "".to_string(),
-                    kv_adapter_code: None,
-                    config_files: vec![],
-                }
-            }
+            "deislet" => deis_build_adapter_deislet::generate(&routes, config)?,
             _ => return Err(anyhow::anyhow!("Unknown vendor: {vendor}")),
         };
 
@@ -559,6 +614,7 @@ impl Compiler {
             // Bundle
             let platform = match vendor {
                 "tencent" => TargetPlatform::EdgeOne,
+                "deislet" => TargetPlatform::Deislet,
                 _ => TargetPlatform::Cloudflare,
             };
 
@@ -577,17 +633,34 @@ impl Compiler {
             };
 
             println!("{}", format!("  ⚡ Bundling for {}...", vendor).dimmed());
-            let bundler = BuildBundler::new(temp_router_path.to_str().unwrap(), platform);
+            let mut bundler = BuildBundler::new(temp_router_path.to_str().unwrap(), platform);
 
-            match bundler.bundle().await {
+            // A bundle is content-addressed, so its bytes may not depend on
+            // where the build was launched from. Pinning the bundler's working
+            // directory to the project makes the module paths it writes into
+            // the output relative to the project root and nothing else.
+            if vendor == "deislet" {
+                bundler = bundler.with_cwd(project_dir.to_path_buf());
+            }
+
+            // `bundle()` writes the chunks out as a side effect; the deislet
+            // target packs them into an archive instead and wants no loose
+            // copy left beside it.
+            let bundled = if vendor == "deislet" {
+                bundler.generate().await
+            } else {
+                bundler.bundle().await
+            };
+
+            match bundled {
                 Ok(bundled_code) => {
-                    let filename = if vendor == "tencent" {
-                        "edge-functions/index.js".to_string()
-                    } else {
-                        "index.js".to_string()
+                    let filename = match vendor {
+                        "tencent" => "edge-functions/index.js".to_string(),
+                        "deislet" => deis_build_adapter_deislet::WORKER_ENTRY.to_string(),
+                        _ => "index.js".to_string(),
                     };
 
-                    if should_write_files {
+                    if should_write_files && vendor != "deislet" {
                         let output_file = if vendor == "tencent" {
                             let ef_dir = output_dir.join("edge-functions");
                             if !ef_dir.exists() {
@@ -642,7 +715,12 @@ impl Compiler {
 
             // Cleanup source files in src/ but keep assets
             let src_dir = output_dir.join("src");
-            if src_dir.exists() {
+            if vendor == "deislet" && src_dir.exists() {
+                // Nothing loose survives a deislet build: the archive carries
+                // the whole app, and a leftover copy of the sources next to it
+                // is stale the moment the next build runs.
+                fs::remove_dir_all(&src_dir)?;
+            } else if src_dir.exists() {
                 for entry in WalkDir::new(&src_dir).contents_first(true) {
                     let entry = entry?;
                     if entry.file_type().is_file() {
@@ -657,6 +735,15 @@ impl Compiler {
                     }
                 }
             }
+        }
+
+        // Pack the deislet target's real artefact.
+        if vendor == "deislet" {
+            let bundle =
+                self.emit_bundle(project_dir, &output_dir, config, &entry_code, &routes)?;
+            total_size = bundle.size;
+            files.push(bundle.path.to_string_lossy().to_string());
+            warnings.extend(bundle.warnings);
         }
 
         // Build BuildArtifacts (Memory/Both modes)
@@ -677,8 +764,118 @@ impl Compiler {
             output_path: output_dir.to_string_lossy().to_string(),
             files,
             size: total_size,
-            warnings: Vec::new(),
+            warnings,
             artifacts: build_artifacts,
         })
     }
+
+    /// Pack a finished deislet build into the application bundle.
+    ///
+    /// This is the point where a build stops being a directory of files and
+    /// becomes a version: the archive's sha256 is what the control plane
+    /// records and what a node checks after downloading it. See
+    /// `docs/implementation-plan.zh.md` section 2 for the format.
+    fn emit_bundle(
+        &self,
+        project_dir: &Path,
+        output_dir: &Path,
+        config: &ProjectConfig,
+        worker_js: &str,
+        routes: &[(String, String)],
+    ) -> anyhow::Result<BundleOutcome> {
+        // The same planner the entry module was generated from. It is a pure
+        // function of the route list, so the manifest describes exactly the
+        // table that ended up in the bundled code.
+        let plan = deis_build_adapter_deislet::plan_routes(routes);
+        let mut warnings = plan.warnings.clone();
+
+        // A queue declared with nothing to handle it is the expensive kind of
+        // mistake: deis-runtime starts a poller, leases every message, finds
+        // no handler, hands the batch back, and the messages burn their
+        // delivery attempts until they land in the dead-letter table.
+        if !config.queues.is_empty() && plan.queue.is_none() {
+            warnings.push(format!(
+                "this app declares {} queue consumer(s) but has no {}/{}.ts handler; \
+                 deis-runtime will lease its messages, find nothing to run, and hand every \
+                 batch back until the messages are dead-lettered",
+                config.queues.len(),
+                config.function_root.trim_start_matches("./"),
+                deis_build_adapter_deislet::QUEUE_HANDLER_STEM,
+            ));
+        }
+        if !config.cron.is_empty() && plan.scheduled.is_none() {
+            warnings.push(format!(
+                "this app declares {} cron expression(s) but has no {}/{}.ts handler; the \
+                 control plane will trigger a node on schedule and nothing will run",
+                config.cron.len(),
+                config.function_root.trim_start_matches("./"),
+                deis_build_adapter_deislet::SCHEDULED_HANDLER_STEM,
+            ));
+        }
+
+        for warning in &warnings {
+            println!("{}", format!("  ⚠ {warning}").yellow());
+        }
+
+        // A project with no `assets` key still gets the conventional
+        // directory: shipping static files should not require configuring
+        // anything, and an absent directory simply means no assets.
+        let assets_dir = project_dir.join(
+            config
+                .assets
+                .as_ref()
+                .map(|a| a.dir.as_str())
+                .unwrap_or("./public"),
+        );
+        let assets = deis_build_adapter_deislet::collect_assets(&assets_dir)?;
+
+        let manifest = deis_build_adapter_deislet::build_manifest(config, &plan.routes, &assets)?;
+        let bytes = deis_build_adapter_deislet::write_bundle(&manifest, worker_js, &assets)?;
+        let digest = deis_build_adapter_deislet::bundle_sha256(&bytes);
+
+        let path = output_dir.join(deis_build_adapter_deislet::BUNDLE_FILE_NAME);
+        fs::write(&path, &bytes)?;
+
+        // A .wasm module beside the handlers has nowhere to go: the format
+        // carries a single bundled entry and static assets, and a loose module
+        // is neither. Silently dropping it would leave an app importing a file
+        // that is not there.
+        let wasm_count = self
+            .discover_handlers(project_dir, config)
+            .map(|handlers| handlers.iter().filter(|h| h.ends_with(".wasm")).count())
+            .unwrap_or(0);
+        if wasm_count > 0 {
+            warnings.push(format!(
+                "{wasm_count} .wasm file(s) under the function root are not carried in a deislet \
+                 bundle; put them under the assets directory to have them served"
+            ));
+            println!("{}", format!("  ⚠ {}", warnings.last().unwrap()).yellow());
+        }
+
+        println!(
+            "{}",
+            format!(
+                "  ✓ Bundled {} route(s) and {} asset(s) into {} ({} bytes, sha256 {})",
+                manifest.routes.len(),
+                manifest.assets.len(),
+                deis_build_adapter_deislet::BUNDLE_FILE_NAME,
+                bytes.len(),
+                &digest[..12]
+            )
+            .green()
+        );
+
+        Ok(BundleOutcome {
+            path,
+            size: bytes.len(),
+            warnings,
+        })
+    }
+}
+
+/// What packing a deislet bundle produced.
+struct BundleOutcome {
+    path: std::path::PathBuf,
+    size: usize,
+    warnings: Vec<String>,
 }

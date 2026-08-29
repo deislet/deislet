@@ -127,7 +127,13 @@ fn normalise(path: &str) -> String {
 /// Deliberately a short table rather than a full mime database: these are the
 /// types a bundled site actually ships, and anything else is served as opaque
 /// bytes, which browsers download rather than misinterpret.
-fn guess_content_type(path: &str) -> &'static str {
+///
+/// Public because both sides of the bundle need the same answer: deis-build
+/// writes it into `assets[].content_type`, and deis-runtime falls back to it
+/// when a manifest entry has none. A second copy of this table would drift,
+/// and the symptom - one file served as two different types depending on who
+/// built it - is the kind that takes a browser cache to notice.
+pub fn guess_content_type(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",

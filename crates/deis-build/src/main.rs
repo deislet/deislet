@@ -25,7 +25,7 @@ enum Commands {
 
     /// Build project for target platforms
     Build {
-        /// Target vendors (cloudflare, deno, tencent, or all)
+        /// Target vendors (cloudflare, deno, tencent, deislet, or all)
         #[arg(short, long, default_values_t = vec!["all".to_string()])]
         vendor: Vec<String>,
 

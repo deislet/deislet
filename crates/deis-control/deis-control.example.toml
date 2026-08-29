@@ -56,6 +56,30 @@ bundle_dir = "data/bundles"
 # secret_key_file = "/etc/deis/secret.key"
 
 # ========================================
+# Storage services and cron
+# ========================================
+
+# gRPC addresses of deis-store and deis-queue, as a node has to dial them.
+# The control plane owns these and hands them down with every deployment;
+# they are deliberately not written into a node's own file, so moving a
+# service does not mean editing every node.
+#
+# Leave them unset and applications that declare kv / database / blob /
+# queue still load, but every ctx.services call they make answers "service
+# not available" and their declared queue consumers never start.
+#
+# They are addresses, not credentials, and are logged like any variable.
+# store_endpoint = "http://127.0.0.1:8090"
+# queue_endpoint = "http://127.0.0.1:8091"
+
+# Seconds between cron scheduler ticks (1..=60). A tick rebuilds the task
+# list from the catalog and fires whatever came due, so the default means a
+# newly deployed schedule is noticed within a minute and fires within a
+# minute of being due. Lower it when a deployment should start ticking
+# promptly, at the cost of one catalog read per tick.
+# cron_tick_seconds = 60
+
+# ========================================
 # TLS configuration (optional)
 # ========================================
 

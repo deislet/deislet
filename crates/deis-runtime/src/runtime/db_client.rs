@@ -57,6 +57,26 @@ impl DbClient {
         })
     }
 
+    /// Build a client that dials deis-store on its first call; see
+    /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
+    /// rather than connecting eagerly.
+    pub fn connect_lazy(endpoint: &str, app_id: impl Into<String>) -> Result<Self> {
+        let tenant = Tenant::new(app_id)?;
+        let channel = super::bindings::unary_channel(endpoint)?;
+        let client = DatabaseClient::new(channel)
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
+        tracing::debug!(
+            endpoint,
+            app_id = tenant.app_id(),
+            "database client prepared; it will dial on the first call"
+        );
+        Ok(Self {
+            client: Arc::new(Mutex::new(client)),
+            tenant,
+        })
+    }
+
     /// The application every call of this client is charged to.
     pub fn app_id(&self) -> &str {
         self.tenant.app_id()

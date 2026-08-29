@@ -27,36 +27,17 @@ impl Transformer {
         Ok(code.to_string())
     }
 
+    /// The route a handler file answers.
+    ///
+    /// Every target has to agree on this, or an app routes differently
+    /// depending on where it was deployed, so the derivation itself lives in
+    /// `deis_build_core::routes` and this is only the call site that strips
+    /// the function root off the path first.
     pub fn filename_to_route(filename: &str, function_root: &str) -> String {
-        // Remove function root prefix
         let relative = filename
             .trim_start_matches(function_root)
             .trim_start_matches('/');
 
-        // Remove file extension
-        let without_ext = relative
-            .trim_end_matches(".ts")
-            .trim_end_matches(".js")
-            .trim_end_matches(".tsx")
-            .trim_end_matches(".jsx");
-
-        // Handle index files
-        let route = if without_ext == "index" || without_ext.is_empty() {
-            "/"
-        } else if without_ext.ends_with("/index") {
-            without_ext.trim_end_matches("/index")
-        } else {
-            without_ext
-        };
-
-        // Convert dynamic parameters: [id] -> :id
-        let route = route.replace("[", ":").replace("]", "");
-
-        // Ensure leading slash
-        if route.starts_with('/') {
-            route.to_string()
-        } else {
-            format!("/{route}")
-        }
+        deis_build_core::routes::route_pattern(relative)
     }
 }

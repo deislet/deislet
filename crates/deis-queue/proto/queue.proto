@@ -2,13 +2,49 @@ syntax = "proto3";
 
 package deis.queue;
 
-// Queue Service (Producer Interface)
+// A durable message queue with lease-based consumption.
+//
+// The tenant is not a field on any message here: it travels out of band in
+// the `x-deis-app-id` gRPC metadata header, the same header deis-proxy stamps
+// on the HTTP data path. A call that arrives without it is refused rather
+// than served from some default namespace.
+//
+// DELIVERY IS AT-LEAST-ONCE. A message handed out by Pull stays in the queue
+// until it is acknowledged; a consumer that crashes, is restarted, or simply
+// never answers gets the same message again once its lease lapses. There is
+// no way to make that "exactly once" from this side, so the application's
+// queue handler MUST be idempotent - handling the same message twice has to
+// leave the same result as handling it once.
+//
+// Consumption is a pull: the runtime asks for work on its own schedule. The
+// queue never pushes to a node, because pushing would require the queue to
+// know which node runs which app, and it deliberately knows nothing but the
+// app id.
 service Queue {
-  // Send a message
+  // Enqueue one message. It is visible to the next Pull immediately.
   rpc Send(SendRequest) returns (SendResponse);
-  
-  // Send a batch
+
+  // Enqueue several messages as one unit: either all of them are stored or
+  // none are.
   rpc SendBatch(SendBatchRequest) returns (SendBatchResponse);
+
+  // Lease up to `max_messages` messages.
+  //
+  // Every message returned is hidden from other consumers until its lease
+  // expires, and its attempt counter has already been incremented. The call
+  // answers straight away, with an empty list when the queue has nothing
+  // ready - it never waits for work to arrive, so a consumer that stops
+  // calling pins nothing on the server.
+  rpc Pull(PullRequest) returns (PullResponse);
+
+  // Report messages as handled. They are deleted and never delivered again.
+  rpc Ack(AckRequest) returns (AckResponse);
+
+  // Hand messages back unhandled, optionally after a delay.
+  //
+  // A message whose attempts have reached the queue's ceiling is dead
+  // lettered here instead of being made visible again.
+  rpc Nack(NackRequest) returns (NackResponse);
 }
 
 message SendRequest {
@@ -17,8 +53,14 @@ message SendRequest {
 }
 
 message SendResponse {
+  // Always true when the call returns OK. A refused send arrives as a gRPC
+  // status (InvalidArgument, ResourceExhausted, PermissionDenied), not as a
+  // flag in the body; the field is kept because the existing producer client
+  // reads it.
   bool success = 1;
+  // Server-assigned message id, the handle Ack and Nack take.
   string message_id = 2;
+  // Always empty. See `success`.
   string error = 3;
 }
 
@@ -28,7 +70,85 @@ message SendBatchRequest {
 }
 
 message SendBatchResponse {
+  // Always true when the call returns OK; see SendResponse.success.
   bool success = 1;
+  // One id per message, in the order the messages were given.
   repeated string message_ids = 2;
+  // Always empty. See `success`.
   string error = 3;
+}
+
+message PullRequest {
+  string queue_name = 1;
+  // Upper bound on the messages returned. Zero or less means the server's
+  // default; the server also caps it, so ask for what can be processed
+  // within the lease rather than for everything.
+  int32 max_messages = 2;
+  // How long the returned messages stay hidden from other consumers. Zero or
+  // less means the server's default, and the server caps it. Pick a lease
+  // longer than the handler's worst-case run time: a lease that lapses while
+  // the handler is still working causes a second delivery of a message that
+  // is already being handled.
+  int32 lease_seconds = 3;
+}
+
+message QueueMessage {
+  // Handle for Ack and Nack. Stable across redeliveries, so it is also the
+  // key an idempotent handler can deduplicate on.
+  string id = 1;
+  string body = 2;
+  // How many times this message has been handed out, including this one. It
+  // starts at 1, and when it reaches the queue's ceiling the next failure
+  // dead letters the message instead of retrying it.
+  int32 attempts = 3;
+  // Unix second at which this lease lapses and the message becomes visible
+  // to other consumers again.
+  int64 lease_expires_at = 4;
+  // Unix second the message was enqueued.
+  int64 created_at = 5;
+}
+
+message PullResponse {
+  // Empty when nothing is ready. Never a failure: an idle queue is the
+  // normal case for a poller.
+  repeated QueueMessage messages = 1;
+}
+
+message AckRequest {
+  string queue_name = 1;
+  // Ids from a previous Pull. Unknown ids are ignored, so acknowledging the
+  // same message twice is harmless.
+  repeated string message_ids = 2;
+}
+
+message AckResponse {
+  // How many messages were actually removed. A lower number than was asked
+  // for means those messages were already acknowledged, or their lease had
+  // lapsed and they were dead lettered in the meantime.
+  int32 acknowledged = 1;
+}
+
+message NackRequest {
+  string queue_name = 1;
+  // Ids from a previous Pull. Unknown ids are ignored.
+  //
+  // There is no lease token, so a message is identified only by its id: a
+  // consumer whose lease already lapsed, and whose message has since been
+  // handed to somebody else, still acts on the row. Answer promptly, and
+  // above all pick a lease longer than the handler can run for.
+  repeated string message_ids = 2;
+  // Wait this many seconds before the message is handed out again. Zero
+  // makes it visible immediately, which will usually mean the same consumer
+  // picks it straight back up; use a delay for a failure worth backing off
+  // from. The server caps it.
+  int32 delay_seconds = 3;
+}
+
+message NackResponse {
+  // Messages that will be delivered again.
+  int32 released = 1;
+  // Messages that had used up their attempts and were moved to the dead
+  // letter table instead. These will never be delivered again and need an
+  // operator to look at them.
+  int32 dead_lettered = 2;
 }

@@ -3,9 +3,30 @@
 
 use super::kv_client::KvClient;
 use deno_core::{extension, op2, OpState};
+use deno_error::JsErrorBox;
+use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// The error an app sees when it calls a service it does not have.
+///
+/// Errors returned from an op reach JavaScript through `deno_error`, which
+/// only keeps the message of a `JsErrorBox`: a `std::io::Error` arrives as
+/// `TypeError: invalid_argument` with the real text discarded, so an app
+/// whose store is down could not tell that from a bad argument. Every message
+/// below therefore says both what failed and why it might have.
+pub(super) fn service_unavailable(service: &str) -> JsErrorBox {
+    JsErrorBox::generic(format!(
+        "{service} service is not available to this app: its manifest does not declare \"{service}\", \
+         or the control plane sent no address for it"
+    ))
+}
+
+/// A call that reached the client but did not come back.
+pub(super) fn service_call_failed(call: &str, error: impl std::fmt::Display) -> JsErrorBox {
+    JsErrorBox::generic(format!("{call} failed: {error}"))
+}
 
 /// KV Get operation
 #[op2(async)]
@@ -13,20 +34,44 @@ use std::rc::Rc;
 async fn op_kv_get(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
-) -> Result<Option<String>, std::io::Error> {
+) -> Result<Option<String>, JsErrorBox> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
-    if let Some(client) = client_opt {
-        return client.get(key).await.map_err(std::io::Error::other);
-    }
+    let Some(client) = client_opt else {
+        return Err(service_unavailable("kv"));
+    };
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "KV service not available",
-    ))
+    client
+        .get(key)
+        .await
+        .map_err(|e| service_call_failed("kv.get", e))
+}
+
+/// What `ctx.services.kv.put` may attach to a write.
+///
+/// deis-store has accepted both since wave A; until now nothing sent them, so
+/// every value written through the runtime was permanent and metadata-less no
+/// matter what the app asked for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvSetOptions {
+    /// Lifetime in seconds from the moment the store accepts the write.
+    /// `None` never lapses.
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
+
+    /// Opaque string kept alongside the value. Stored and returned untouched
+    /// by deis-store.
+    ///
+    /// It cannot be read back yet: `GetResponse` carries only the value and
+    /// `ListResponse` only the keys, so there is nowhere for the store to
+    /// return it. Writing it is still worth doing -- the data is kept -- but
+    /// an app cannot see it again until deis-store's proto grows the field.
+    #[serde(default)]
+    pub metadata: Option<String>,
 }
 
 /// KV Set operation
@@ -35,20 +80,31 @@ async fn op_kv_set(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
     #[string] value: String,
-) -> Result<(), std::io::Error> {
+    #[serde] options: KvSetOptions,
+) -> Result<(), JsErrorBox> {
+    if let Some(ttl) = options.ttl_seconds {
+        // The store refuses this too, but refusing it here says which key and
+        // saves a round trip.
+        if ttl <= 0 {
+            return Err(JsErrorBox::type_error(format!(
+                "kv.put({key:?}): expirationTtl must be greater than 0 seconds, got {ttl}; the                  value was not written"
+            )));
+        }
+    }
+
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
-    if let Some(client) = client_opt {
-        return client.set(key, value).await.map_err(std::io::Error::other);
-    }
+    let Some(client) = client_opt else {
+        return Err(service_unavailable("kv"));
+    };
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "KV service not available",
-    ))
+    client
+        .set_with_options(key, value, options.ttl_seconds, options.metadata)
+        .await
+        .map_err(|e| service_call_failed("kv.put", e))
 }
 
 /// KV Delete operation
@@ -56,20 +112,20 @@ async fn op_kv_set(
 async fn op_kv_delete(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
-) -> Result<(), std::io::Error> {
+) -> Result<(), JsErrorBox> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
-    if let Some(client) = client_opt {
-        return client.delete(key).await.map_err(std::io::Error::other);
-    }
+    let Some(client) = client_opt else {
+        return Err(service_unavailable("kv"));
+    };
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "KV service not available",
-    ))
+    client
+        .delete(key)
+        .await
+        .map_err(|e| service_call_failed("kv.delete", e))
 }
 
 /// KV List operation
@@ -78,24 +134,21 @@ async fn op_kv_delete(
 async fn op_kv_list(
     state: Rc<RefCell<OpState>>,
     #[string] prefix: String,
-) -> Result<Vec<String>, std::io::Error> {
+) -> Result<Vec<String>, JsErrorBox> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
     };
 
-    if let Some(client) = client_opt {
-        return client
-            .list(prefix, None)
-            .await
-            .map(|(keys, _)| keys)
-            .map_err(std::io::Error::other);
-    }
+    let Some(client) = client_opt else {
+        return Err(service_unavailable("kv"));
+    };
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "KV service not available",
-    ))
+    client
+        .list(prefix, None)
+        .await
+        .map(|(keys, _)| keys)
+        .map_err(|e| service_call_failed("kv.list", e))
 }
 
 /// The application this isolate is running.

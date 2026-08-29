@@ -12,7 +12,7 @@ pub mod static_files;
 
 use axum::{
     Router, middleware as axum_middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
 use std::future::Future;
@@ -27,7 +27,9 @@ use crate::{
     config::ControlConfig,
     config_manager::ConfigManager,
     database::Database,
+    delivery::{DeploymentDeliverer, PublicAddress, StorageEndpoints},
     metrics::MetricsCollector,
+    runtime_client::RuntimeNodeManager,
     session::SessionManager,
 };
 
@@ -54,7 +56,7 @@ pub fn build_api_router(
     config_manager: Arc<ConfigManager>,
     command_executor: Arc<CommandExecutor>,
     metrics_collector: Arc<MetricsCollector>,
-    deis_runtime_manager: Arc<crate::runtime_client::RuntimeNodeManager>,
+    deis_runtime_manager: Arc<RuntimeNodeManager>,
     config: Arc<ControlConfig>,
 ) -> ApiRouter {
     let app_state = AppState {
@@ -84,7 +86,11 @@ pub fn build_api_router(
         deis_runtime: Arc::clone(&deis_runtime_manager),
     };
 
-    let catalog_state = build_catalog_state(Arc::clone(&database), &config);
+    let catalog_state = build_catalog_state(
+        Arc::clone(&database),
+        Arc::clone(&deis_runtime_manager),
+        &config,
+    );
 
     let auth_config = middleware::AuthConfig::from_control_config(&config);
 
@@ -156,7 +162,6 @@ pub fn build_api_router(
         .with_state(metrics_state)
         .route("/api/runtime", get(apps::list_nodes))
         .route("/api/runtime/:node/status", get(apps::node_status))
-        .route("/api/runtime/:node/apps/:app_id", put(apps::deploy_app))
         .route("/api/runtime/:node/apps/:app_id", delete(apps::unload_app))
         .with_state(apps_state)
         // The catalog brings its own state, so it is merged as a
@@ -194,7 +199,11 @@ pub fn build_api_router(
 /// Both fallible pieces - the bundle directory and the secret master key -
 /// are resolved once here so a misconfiguration shows up in the startup
 /// log instead of on a request hours later.
-fn build_catalog_state(database: Arc<Database>, config: &ControlConfig) -> catalog::CatalogState {
+fn build_catalog_state(
+    database: Arc<Database>,
+    nodes: Arc<RuntimeNodeManager>,
+    config: &ControlConfig,
+) -> catalog::CatalogState {
     let bundles = BundleStore::new(config.bundle_dir.clone());
     match bundles.ensure_root() {
         Ok(()) => info!(
@@ -221,17 +230,41 @@ fn build_catalog_state(database: Arc<Database>, config: &ControlConfig) -> catal
     } else {
         config.bind_addr.as_str()
     };
-    let address = catalog::PublicAddress {
+    let address = Arc::new(PublicAddress {
         configured: config.public_base_url.clone(),
         scheme,
         fallback: format!("{}://{}:{}", scheme, host, config.port),
-    };
+    });
+    if config.public_base_url.is_none() && !nodes.is_empty() {
+        warn!(
+            fallback = %address.fallback,
+            "public_base_url is not configured; bundle download links are derived from each request's Host header, which is wrong as soon as a proxy rewrites it and leaves nodes unable to fetch a version"
+        );
+    }
+
+    let endpoints = StorageEndpoints::from_config(config);
+    if endpoints.is_empty() {
+        warn!(
+            "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so every ctx.services.kv / database / blob / queue call an application makes answers \"service not available\" and declared queue consumers never start"
+        );
+    } else {
+        info!(
+            store_endpoint = ?endpoints.store,
+            queue_endpoint = ?endpoints.queue,
+            "Storage addresses will be handed to nodes with every deployment"
+        );
+    }
+
+    let store = Arc::new(CatalogStore::new(database));
+    let secrets = Arc::new(secrets);
 
     catalog::CatalogState {
-        store: Arc::new(CatalogStore::new(database)),
+        store: Arc::clone(&store),
         bundles: Arc::new(bundles),
-        secrets: Arc::new(secrets),
-        address: Arc::new(address),
+        secrets: Arc::clone(&secrets),
+        deliverer: Arc::new(DeploymentDeliverer::new(
+            store, secrets, nodes, address, endpoints,
+        )),
     }
 }
 

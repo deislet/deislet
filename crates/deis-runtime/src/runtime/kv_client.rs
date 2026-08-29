@@ -55,6 +55,31 @@ impl KvClient {
         })
     }
 
+    /// Build a client that dials deis-store on its first call.
+    ///
+    /// This is what an application binding uses: constructing it cannot fail
+    /// because the store is down, so a store outage never stops an app from
+    /// loading or takes the node with it. The first call after an outage
+    /// dials again, so the binding recovers on its own once the store is
+    /// back. Only an address that is not a URL, or an app id that cannot be
+    /// a gRPC header, is refused here -- neither would ever start working.
+    pub fn connect_lazy(endpoint: &str, app_id: impl Into<String>) -> Result<Self> {
+        let tenant = Tenant::new(app_id)?;
+        let channel = super::bindings::unary_channel(endpoint)?;
+        let client = KvStoreClient::new(channel)
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
+        tracing::debug!(
+            endpoint,
+            app_id = tenant.app_id(),
+            "KV client prepared; it will dial on the first call"
+        );
+        Ok(Self {
+            client: Arc::new(Mutex::new(client)),
+            tenant,
+        })
+    }
+
     /// The application every call of this client is charged to.
     pub fn app_id(&self) -> &str {
         self.tenant.app_id()
@@ -196,70 +221,198 @@ impl KvClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deis_store::config::Config;
+    use deis_store::server;
+    use tempfile::TempDir;
+    use tokio::sync::oneshot;
 
-    /// These tests need a live deis-store; they stay #[ignore] until an
-    /// integration environment provides one.
+    /// A running deis-store plus the temp directory holding its data.
     ///
-    /// The address below is a deliberate placeholder, not configuration:
-    /// port 1 is reserved and nothing listens there, so a run that forgets
-    /// the #[ignore] fails as a connection error instead of quietly talking
-    /// to whatever happens to be on a real port. deis-store's actual default
-    /// is 127.0.0.1:8090.
-    #[tokio::test]
-    #[ignore]
-    async fn test_kv_client_connect() {
-        let result = KvClient::connect("http://127.0.0.1:1", "test_app").await;
-        // Should return connection error if service is not running
-        // Only testing client code compilation and basic logic here
-        assert!(result.is_err() || result.is_ok());
+    /// `ttl_seconds` and `metadata` are fields deis-store owns and this client
+    /// fills in; a unit test of either half alone would not notice if the two
+    /// stopped agreeing, so these run the real client over a real socket.
+    struct Store {
+        _data: TempDir,
+        endpoint: String,
+        shutdown: Option<oneshot::Sender<()>>,
+    }
+
+    impl Store {
+        async fn start() -> Self {
+            let data = TempDir::new().expect("temp dir");
+            let config = Config {
+                listen: "127.0.0.1:0".to_string(),
+                data_dir: data.path().to_path_buf(),
+                ..Config::default()
+            };
+            // Bind before spawning, so the port is known and no test has to
+            // wait for the server to come up.
+            let listener = server::bind(&config).await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let (shutdown, rx) = oneshot::channel();
+            tokio::spawn(async move {
+                server::serve(config, listener, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve");
+            });
+            Self {
+                _data: data,
+                endpoint: format!("http://{addr}"),
+                shutdown: Some(shutdown),
+            }
+        }
+
+        async fn client(&self, app_id: &str) -> KvClient {
+            KvClient::connect(self.endpoint.clone(), app_id)
+                .await
+                .expect("connect kv client")
+        }
+    }
+
+    impl Drop for Store {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
     }
 
     #[tokio::test]
-    #[ignore]
-    async fn test_kv_client_operations() {
-        // This test requires a real deis-control server
-        let client = KvClient::connect("http://127.0.0.1:1", "test_app")
-            .await
-            .expect("Failed to connect");
+    async fn a_value_written_with_a_lifetime_is_readable_until_it_lapses() {
+        let store = Store::start().await;
+        let client = store.client("demo").await;
 
-        // Set
         client
-            .set("test_key".to_string(), "test_value".to_string())
+            .set_with_options("session".to_string(), "abc".to_string(), Some(3600), None)
             .await
-            .expect("Failed to set");
+            .expect("write with a lifetime");
 
-        // Get
-        let value = client
-            .get("test_key".to_string())
-            .await
-            .expect("Failed to get");
-        assert_eq!(value, Some("test_value".to_string()));
+        assert_eq!(
+            client.get("session".to_string()).await.expect("read back"),
+            Some("abc".to_string())
+        );
+    }
 
-        // Has
-        let exists = client
-            .has("test_key".to_string())
-            .await
-            .expect("Failed to check has");
-        assert!(exists);
+    #[tokio::test]
+    async fn metadata_reaches_the_store_but_has_no_way_back() {
+        // The store accepts and keeps it; there is no field on GetResponse or
+        // ListResponse to return it, so an app can write metadata and never
+        // see it again. Adding that field is deis-store's to do -- this test
+        // pins the half that does work, so the gap is a missing read path and
+        // not a silently dropped write.
+        let store = Store::start().await;
+        let client = store.client("demo").await;
 
-        // List
-        let (keys, _) = client
-            .list("test".to_string(), Some(10))
-            .await
-            .expect("Failed to list");
-        assert!(keys.contains(&"test_key".to_string()));
-
-        // Delete
         client
-            .delete("test_key".to_string())
+            .set_with_options(
+                "avatar".to_string(),
+                "png-bytes".to_string(),
+                None,
+                Some(r#"{"contentType":"image/png"}"#.to_string()),
+            )
             .await
-            .expect("Failed to delete");
+            .expect("write with metadata");
 
-        // Verify deleted
-        let value = client
-            .get("test_key".to_string())
+        assert_eq!(
+            client.get("avatar".to_string()).await.expect("read back"),
+            Some("png-bytes".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_positive_lifetime_is_refused_rather_than_stored_expired() {
+        // Zero is a caller bug, not a request to store something that has
+        // already lapsed; honouring it would delete the write immediately and
+        // look like the store losing data.
+        let store = Store::start().await;
+        let client = store.client("demo").await;
+
+        let error = client
+            .set_with_options("k".to_string(), "v".to_string(), Some(0), None)
             .await
-            .expect("Failed to get after delete");
-        assert_eq!(value, None);
+            .expect_err("a zero lifetime is refused");
+        assert!(error.to_string().contains("ttl"), "{error}");
+
+        assert_eq!(
+            client.get("k".to_string()).await.expect("read back"),
+            None,
+            "the refused write must not have stored anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_write_never_lapses_and_carries_no_metadata() {
+        let store = Store::start().await;
+        let client = store.client("demo").await;
+
+        client
+            .set("greeting".to_string(), "hello".to_string())
+            .await
+            .expect("plain write");
+
+        assert_eq!(
+            client.get("greeting".to_string()).await.expect("read back"),
+            Some("hello".to_string())
+        );
+        assert!(client.has("greeting".to_string()).await.expect("has"));
+    }
+
+    #[tokio::test]
+    async fn one_app_cannot_see_another_app_s_keys() {
+        // The tenant travels in the header, not in the message; a client that
+        // stopped stamping it would read another application's data.
+        let store = Store::start().await;
+        let first = store.client("app-one").await;
+        let second = store.client("app-two").await;
+
+        first
+            .set("shared-name".to_string(), "one".to_string())
+            .await
+            .expect("write as app-one");
+
+        assert_eq!(
+            second
+                .get("shared-name".to_string())
+                .await
+                .expect("read as app-two"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lazy_client_reports_the_transport_error_on_the_call() {
+        // Nothing listens on port 1. Building the client must succeed -- an
+        // app may not be blocked from loading by a store outage -- and the
+        // call must fail with something an operator can act on.
+        let client = KvClient::connect_lazy("http://127.0.0.1:1", "demo").expect("client is built");
+        let error = client
+            .get("anything".to_string())
+            .await
+            .expect_err("nothing is listening");
+        assert!(
+            error.to_string().to_lowercase().contains("transport")
+                || error.to_string().contains("tcp connect error"),
+            "the failure must name the transport, not look like a missing key: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lazy_client_recovers_once_the_store_answers() {
+        // The binding must not be poisoned by an outage: the next call dials
+        // again. Without this an app whose store restarted would keep failing
+        // until the app itself was reloaded.
+        let store = Store::start().await;
+        let client = KvClient::connect_lazy(&store.endpoint, "demo").expect("client is built");
+
+        client
+            .set("k".to_string(), "v".to_string())
+            .await
+            .expect("write over a lazily dialled channel");
+        assert_eq!(
+            client.get("k".to_string()).await.expect("read back"),
+            Some("v".to_string())
+        );
     }
 }

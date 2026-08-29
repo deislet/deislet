@@ -10,13 +10,15 @@
 //! contract nodes are written against, and because per-node placement
 //! would change only this query.
 
+use std::collections::BTreeMap;
+
 use axum::{
     Json,
     extract::{Path, State},
     http::HeaderMap,
 };
 use serde::Serialize;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use super::CatalogState;
 use crate::api::error::ApiResult;
@@ -35,6 +37,15 @@ pub struct AssignmentView {
     pub bundle_url: String,
     /// Digest the node must verify after downloading.
     pub bundle_sha: String,
+    /// Exactly what a push would have carried: the manifest's variables,
+    /// this environment's decrypted secrets, and the storage addresses.
+    ///
+    /// Without it a node that restarts comes back running the right code
+    /// with an empty environment - no secrets, and no address for
+    /// deis-store or deis-queue - and stays that way until somebody
+    /// deploys again. Secrets are decrypted here, for this response only,
+    /// and are never stored or logged decrypted.
+    pub env: BTreeMap<String, String>,
 }
 
 /// GET /api/nodes/:id/assignments
@@ -44,18 +55,43 @@ pub async fn for_node(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<AssignmentView>>> {
     let assignments = state.store.list_assignments().await?;
-    let base = state.address.resolve(&headers);
+    let base = state.deliverer.base_url(&headers);
 
-    let views: Vec<AssignmentView> = assignments
-        .iter()
-        .map(|assignment| AssignmentView {
-            bundle_url: super::bundle_url(&base, &assignment.app_id, &assignment.version_id),
+    let mut views: Vec<AssignmentView> = Vec::with_capacity(assignments.len());
+    for assignment in &assignments {
+        // One environment whose secrets will not decrypt must not cost the
+        // node every other application on the list, so it is dropped from
+        // this answer with the reason said out loud. The node then simply
+        // does not run it, which is the same outcome a refused deployment
+        // has, rather than running it with a hole in its environment.
+        let env = match state.deliverer.assignment_payload(assignment, &base).await {
+            Ok(payload) => payload.env_for_wire(),
+            Err(e) => {
+                error!(
+                    node = %node_id,
+                    app_id = %assignment.app_id,
+                    environment = %assignment.environment,
+                    version_id = %assignment.version_id,
+                    error = %e,
+                    "Could not build the environment for this assignment, so it is left out of the list; the node will not run this application until the problem is fixed and it asks again"
+                );
+                continue;
+            }
+        };
+
+        views.push(AssignmentView {
+            bundle_url: crate::delivery::bundle_url(
+                &base,
+                &assignment.app_id,
+                &assignment.version_id,
+            ),
             app_id: assignment.app_id.clone(),
             version_id: assignment.version_id.clone(),
             environment: assignment.environment.clone(),
             bundle_sha: assignment.bundle_sha.clone(),
-        })
-        .collect();
+            env,
+        });
+    }
 
     if views.is_empty() {
         info!(

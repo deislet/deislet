@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod assets;
 
-pub use assets::{AssetIndex, AssetMatch};
+pub use assets::{AssetIndex, AssetMatch, guess_content_type};
 
 /// Manifest schema this version of the platform understands.
 pub const SUPPORTED_SCHEMA: u32 = 1;
@@ -33,6 +33,14 @@ pub const MANIFEST_ENTRY: &str = "manifest.json";
 
 /// Directory inside the archive holding static assets.
 pub const ASSETS_PREFIX: &str = "assets/";
+
+/// Where the bundled entry module sits inside the archive.
+///
+/// The manifest's `entry` field names it, so nothing reads this constant to
+/// *find* the code. It is here because it is what a builder writes there, and
+/// a builder that spelled it differently would produce a bundle no node could
+/// load - the same reason [`MANIFEST_ENTRY`] and [`ASSETS_PREFIX`] live here.
+pub const WORKER_ENTRY: &str = "worker/index.js";
 
 /// What went wrong with a bundle.
 ///

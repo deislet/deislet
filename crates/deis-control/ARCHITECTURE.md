@@ -226,7 +226,7 @@ SQLite database wrapper.
 - `commands` - Command history
 - `events` - Event logs
 - `heartbeats` - Heartbeat records
-- `cron_tasks` - Scheduled tasks
+- `apps` / `versions` / `environments` / `deployments` / `routes` / `secrets` - the catalog
 
 **Features**:
 - **Asynchronous API**: Uses `tokio::task::spawn_blocking`
@@ -235,22 +235,33 @@ SQLite database wrapper.
 
 ### 8. **Scheduler** (`src/scheduler/`)
 
-Cron task scheduling system.
+Cron for applications. A trigger belongs to an app, never to a node.
 
 **Architecture**:
 ```rust
 pub struct CronScheduler {
-    tasks: Arc<DashMap<String, DashMap<String, CronTask>>>,
-    command_executor: Arc<CommandExecutor>,
-    db: Option<Arc<Database>>,
-    tick_interval: u64,
+    store: Arc<CatalogStore>,
+    nodes: Arc<RuntimeNodeManager>,
+    tasks: Arc<DashMap<CronKey, Vec<CronTask>>>,   // key: (app_id, environment)
+    tick_interval: Duration,
+    rotation: AtomicUsize,
 }
 ```
 
 **How it Works**:
-1. Check all tasks every N seconds
-2. Execute commands for due tasks
-3. Update next execution time
+1. Rebuild the task list from the catalog: the expressions are whatever
+   `manifest.cron` of each environment's currently deployed version declares,
+   so they follow deploys and rollbacks and are never persisted separately
+2. Fire everything due, one occurrence to exactly one node, trying the next
+   node when one refuses; an occurrence nobody takes is skipped, not retried
+3. Advance to the next occurrence
+
+### 8b. **Delivery** (`src/delivery/`)
+
+Turns a catalog change into an `ApplyDeployment` call on every node: app,
+version, environment, bundle URL, digest, and the env map (manifest variables
+plus secrets decrypted at send time). The bundle itself is fetched by the node
+over HTTP. Deploy, rollback and secret change all end here.
 
 ### 9. **Monitoring Metrics** (`src/metrics/`)
 

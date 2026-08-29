@@ -8,7 +8,7 @@ use axum::{
     Json,
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -17,6 +17,7 @@ use super::CatalogState;
 use super::versions::VersionView;
 use crate::api::error::{ApiError, ApiResult};
 use crate::catalog::{Deployment, Environment, Version};
+use crate::delivery::{DeliveryReason, DeliveryReport};
 
 /// Default and maximum number of history rows returned at once.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -56,6 +57,10 @@ pub struct DeploymentResponse {
     pub deployment: Deployment,
     pub environment: String,
     pub version: VersionView,
+    /// Which nodes took this version. Absent when the response only reads
+    /// back an existing pointer, because then nothing was pushed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,9 +70,16 @@ pub struct DeploymentHistoryResponse {
 }
 
 /// POST /api/apps/:app_id/environments/:env/deployments
+///
+/// Three steps, in this order: build what the nodes will be sent, record
+/// the pointer, push it. Building first is the point of the ordering - an
+/// environment whose secrets cannot be decrypted is refused outright,
+/// rather than recorded as deployed and then delivered with half its
+/// environment missing.
 pub async fn deploy(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(request): Json<DeployRequest>,
 ) -> ApiResult<(StatusCode, Json<DeploymentResponse>)> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
@@ -79,10 +91,30 @@ pub async fn deploy(
     )
     .await?;
 
+    let base = state.deliverer.base_url(&headers);
+    let payload = state
+        .deliverer
+        .payload(&env, &version, &base)
+        .await
+        .inspect_err(|e| {
+            warn!(
+                app_id = %app_id,
+                environment = %env_name,
+                version_id = %version.id,
+                error = %e,
+                "Refused the deployment before recording it; the environment still runs the version it ran before"
+            );
+        })?;
+
     let deployment = state.store.deploy(&env, &version.id, request.note).await?;
+    let delivery = state
+        .deliverer
+        .push(&payload, DeliveryReason::Deployment)
+        .await;
+
     Ok((
         StatusCode::CREATED,
-        Json(response(&env, deployment, &version)),
+        Json(response(&env, deployment, &version, Some(delivery))),
     ))
 }
 
@@ -93,6 +125,7 @@ pub async fn deploy(
 pub async fn rollback(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<DeploymentResponse>)> {
     let request = parse_rollback_body(&body).map_err(|detail| {
@@ -126,21 +159,41 @@ pub async fn rollback(
             state.store.get_version(&app_id, &previous).await?
         };
 
+    let base = state.deliverer.base_url(&headers);
+    let payload = state
+        .deliverer
+        .payload(&env, &version, &base)
+        .await
+        .inspect_err(|e| {
+            warn!(
+                app_id = %app_id,
+                environment = %env_name,
+                version_id = %version.id,
+                error = %e,
+                "Refused the rollback before recording it; the environment still runs the version it ran before"
+            );
+        })?;
+
     let note = request
         .note
         .unwrap_or_else(|| format!("rollback to version {}", version.number));
     let deployment = state.store.deploy(&env, &version.id, Some(note)).await?;
+    let delivery = state
+        .deliverer
+        .push(&payload, DeliveryReason::Rollback)
+        .await;
 
     info!(
         app_id = %app_id,
         environment = %env_name,
         version_id = %version.id,
         number = version.number,
+        nodes = delivery.delivered.len(),
         "Rollback recorded as a new deployment; the previous pointer stays in the history"
     );
     Ok((
         StatusCode::CREATED,
-        Json(response(&env, deployment, &version)),
+        Json(response(&env, deployment, &version, Some(delivery))),
     ))
 }
 
@@ -165,7 +218,7 @@ pub async fn current_deployment(
         .store
         .get_version(&app_id, &deployment.version_id)
         .await?;
-    Ok(Json(response(&env, deployment, &version)))
+    Ok(Json(response(&env, deployment, &version, None)))
 }
 
 /// GET /api/apps/:app_id/environments/:env/deployments
@@ -224,11 +277,17 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-fn response(env: &Environment, deployment: Deployment, version: &Version) -> DeploymentResponse {
+fn response(
+    env: &Environment,
+    deployment: Deployment,
+    version: &Version,
+    delivery: Option<DeliveryReport>,
+) -> DeploymentResponse {
     DeploymentResponse {
         deployment,
         environment: env.name.clone(),
         version: VersionView::from(version),
+        delivery,
     }
 }
 
@@ -331,6 +390,69 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// Recording a deployment and pushing it to the nodes are one step
+    /// from outside: the answer says where the version landed, so a caller
+    /// never has to guess whether the fleet actually took it.
+    #[tokio::test]
+    async fn a_deployment_reports_where_it_was_delivered() {
+        let (h, _v1, v2) = deployed_twice().await;
+
+        let (status, body) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/deployments",
+            serde_json::json!({"version_id": v2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["delivery"]["reason"], "deployment");
+        assert_eq!(body["delivery"]["version_id"], v2);
+        assert_eq!(body["delivery"]["app_id"], "demo");
+        assert_eq!(body["delivery"]["environment"], "production");
+        // This harness configures no runtime nodes, so nothing was pushed
+        // and the answer says so instead of implying success.
+        assert!(
+            body["delivery"]["skipped"]
+                .as_str()
+                .unwrap()
+                .contains("no runtime nodes are configured")
+        );
+        assert_eq!(body["delivery"]["delivered"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_is_delivered_too_and_says_it_was_a_rollback() {
+        let (h, v1, _v2) = deployed_twice().await;
+
+        let (status, body) = json(
+            &h.router,
+            "POST",
+            "/api/apps/demo/environments/production/rollback",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["delivery"]["reason"], "rollback");
+        assert_eq!(body["delivery"]["version_id"], v1);
+    }
+
+    /// Reading the current pointer pushes nothing, so it must not pretend
+    /// a delivery happened.
+    #[tokio::test]
+    async fn reading_the_current_deployment_carries_no_delivery() {
+        let (h, _v1, _v2) = deployed_twice().await;
+
+        let (status, body) = json(
+            &h.router,
+            "GET",
+            "/api/apps/demo/environments/production/deployment",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("delivery").is_none(), "{body}");
     }
 
     /// A body that does not parse must be refused. Treating it as "no body

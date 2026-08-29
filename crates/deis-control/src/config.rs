@@ -51,6 +51,39 @@ pub struct ControlConfig {
     /// 503 instead of storing anything in the clear.
     #[serde(default)]
     pub secret_key_file: Option<PathBuf>,
+    /// gRPC address of deis-store, as a node must dial it, for instance
+    /// "http://127.0.0.1:8090".
+    ///
+    /// The control plane owns this address and hands it down with every
+    /// deployment (docs/architecture.zh.md section 6); it is deliberately not
+    /// a node-side setting, so moving deis-store does not mean editing every
+    /// node's file. Leave it unset and applications that declare `kv`,
+    /// `database` or `blob` load fine but every `ctx.services` call they make
+    /// answers "service not available".
+    ///
+    /// It is an address, not a credential: it is logged like any other
+    /// variable.
+    #[serde(default)]
+    pub store_endpoint: Option<String>,
+    /// gRPC address of deis-queue, same contract as [`Self::store_endpoint`].
+    /// Without it an app's `ctx.services.queue` fails and its declared queue
+    /// consumers never start, so messages pile up in deis-queue unread.
+    #[serde(default)]
+    pub queue_endpoint: Option<String>,
+    /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).
+    ///
+    /// A tick does two things: it rebuilds the task list from the catalog,
+    /// and it fires whatever came due. Both are bounded by this, so the
+    /// default means a newly deployed schedule can take up to a minute to be
+    /// noticed and then fires within a minute of being due. Lower it when a
+    /// deployment should start ticking promptly - a demo, a test - at the
+    /// cost of one catalog read per tick.
+    #[serde(default = "default_cron_tick_seconds")]
+    pub cron_tick_seconds: u64,
+}
+
+fn default_cron_tick_seconds() -> u64 {
+    60
 }
 
 fn default_deis_runtime_poll_interval() -> u64 {
@@ -99,6 +132,9 @@ impl Default for ControlConfig {
             bundle_dir: default_bundle_dir(),
             public_base_url: None,
             secret_key_file: None,
+            store_endpoint: None,
+            queue_endpoint: None,
+            cron_tick_seconds: default_cron_tick_seconds(),
         }
     }
 }

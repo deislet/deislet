@@ -163,20 +163,18 @@ mod tests {
         }
     }
 
+    /// Built by deserialising rather than by naming every field: a config is
+    /// only ever produced from `.config.json`, and an exhaustive literal here
+    /// would break every time the format grows an optional key.
     fn create_mock_config() -> ProjectConfig {
-        ProjectConfig {
-            version: "0.1.0".to_string(),
-            name: "test".to_string(),
-            runtime: "edge".to_string(),
-            language: "typescript".to_string(),
-            function_root: "functions".to_string(),
-            routing: None,
-            environment: None,
-            services: None,
-            vendors: None,
-            build: None,
-            limits: None,
-        }
+        serde_json::from_value(serde_json::json!({
+            "version": "0.1.0",
+            "name": "test",
+            "runtime": "edge",
+            "language": "typescript",
+            "functionRoot": "functions"
+        }))
+        .expect("the mock project config parses")
     }
 
     #[test]

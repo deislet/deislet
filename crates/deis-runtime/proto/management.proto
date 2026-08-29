@@ -7,8 +7,10 @@ service RuntimeManagement {
     // Control pushes configuration
     rpc PushConfig(PushConfigRequest) returns (PushConfigResponse);
 
-    // Control deploys an app
-    rpc DeployApp(DeployAppRequest) returns (DeployAppResponse);
+    // Control tells the node which version of an app that node should be
+    // running. Small message, pointer only: the node fetches the bundle
+    // itself over HTTP (docs/implementation-plan.zh.md section 4).
+    rpc ApplyDeployment(ApplyDeploymentRequest) returns (ApplyDeploymentResponse);
 
     // Control unloads an app
     rpc UnloadApp(UnloadAppRequest) returns (UnloadAppResponse);
@@ -78,16 +80,59 @@ message PushConfigResponse {
 
 // ============ Application management ============
 
-// Deploy app request
-message DeployAppRequest {
-    // Application ID
+// Apply one deployment on this node.
+//
+// This carries a pointer, never a payload. The control plane decides which
+// version an environment should run and says so here; the node downloads
+// `bundle_url` itself, checks it against `bundle_sha`, and only then loads
+// it. Pushing the zip through gRPC instead - which is what the removed
+// DeployApp did - put a whole application inside one message and hit the
+// tonic size ceiling as soon as an app carried real assets.
+message ApplyDeploymentRequest {
+    // Application this deployment belongs to; the only tenant dimension
+    // the storage services ever see.
     string app_id = 1;
 
-    // Application ZIP package data
-    bytes package_data = 2;
+    // Immutable version being deployed. Echoed back in the response so the
+    // control plane can tell an applied version from a stale one.
+    string version_id = 2;
 
-    // Application config (optional; overrides the config in the manifest)
-    AppConfig config = 3;
+    // Environment name, "production" or a preview name. Never an id: this
+    // is the name the application code branches on.
+    string environment = 3;
+
+    // Absolute HTTP URL the node downloads the bundle from, on the control
+    // plane that sent this request.
+    string bundle_url = 4;
+
+    // Hex sha256 of the bundle. The node must verify the bytes it
+    // downloaded against this before loading anything from them.
+    string bundle_sha = 5;
+
+    // Environment variables plus decrypted secret values, merged into one
+    // dictionary and injected as `context.env`.
+    //
+    // Secret values exist in the clear only here, in flight, and in the
+    // node's memory. They are never written to the bundle, never stored
+    // decrypted, never returned by a read API, and must never be logged -
+    // logging this message as a whole would print every one of them.
+    map<string, string> env = 6;
+}
+
+// Apply deployment response
+message ApplyDeploymentResponse {
+    // False means the node is still running whatever it ran before.
+    bool success = 1;
+
+    // What happened, for the control plane's log and API answer. Must not
+    // echo any value from the env map.
+    string message = 2;
+
+    // Version the node is running for this app and environment now. Equal
+    // to the requested version_id on success; on failure it is whatever
+    // the node kept running, which is what makes a rejected deployment
+    // readable rather than merely failed.
+    string version_id = 3;
 }
 
 // Application configuration
@@ -146,13 +191,6 @@ message RouteRule {
     // Currently ignored by the runtime: a request reaches the app whatever its
     // method, and the app decides. Method-aware route selection is wave B work.
     repeated string methods = 2;
-}
-
-// Deploy app response
-message DeployAppResponse {
-    bool success = 1;
-    string message = 2;
-    string app_id = 3;
 }
 
 // Unload app request

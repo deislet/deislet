@@ -1,8 +1,14 @@
-//! REST endpoints for managing deis-runtime nodes through their gRPC management
-//! plane. Replaces the former proxy onto the retired deis-runtime HTTP API.
+//! REST endpoints for inspecting deis-runtime nodes through their gRPC
+//! management plane, and for taking an app off one.
+//!
+//! Deploying is deliberately *not* here. An application reaches a node
+//! because an environment points at a version (`POST
+//! /api/apps/:app_id/environments/:env/deployments`) and the control plane
+//! then pushes that pointer to every node; there is no endpoint that
+//! deploys to one node out of band, because the result would not be
+//! recorded anywhere and the next assignment refresh would undo it.
 
 use axum::{
-    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
@@ -13,10 +19,6 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::runtime_client::{NodeError, RuntimeNodeManager};
-
-/// Hard cap for uploaded app packages. Keeps a misbehaving client from
-/// buffering arbitrary amounts of memory in the control.
-const MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppsState {
@@ -104,46 +106,6 @@ pub async fn node_status(
         }
         Err(e) => {
             warn!(node = %node, error = %e, "Status query failed");
-            node_error_response(&e)
-        }
-    }
-}
-
-/// PUT /api/runtime/:node/apps/:app_id — deploy a ZIP package (raw body).
-pub async fn deploy_app(
-    State(state): State<AppsState>,
-    Path((node, app_id)): Path<(String, String)>,
-    body: Bytes,
-) -> impl IntoResponse {
-    if body.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "empty package body; expected a ZIP archive" })),
-        );
-    }
-    if body.len() > MAX_PACKAGE_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({
-                "error": format!("package exceeds {} byte limit", MAX_PACKAGE_BYTES)
-            })),
-        );
-    }
-    match state
-        .deis_runtime
-        .deploy_app(&node, &app_id, body.to_vec())
-        .await
-    {
-        Ok(resp) if resp.success => (
-            StatusCode::OK,
-            Json(json!({ "success": true, "app_id": resp.app_id, "message": resp.message })),
-        ),
-        Ok(resp) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "success": false, "message": resp.message })),
-        ),
-        Err(e) => {
-            warn!(node = %node, app_id = %app_id, error = %e, "Deploy failed");
             node_error_response(&e)
         }
     }

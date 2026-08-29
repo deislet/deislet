@@ -1,8 +1,12 @@
 // V8 Runtime Isolate wrapper
 
+use super::bindings::{AppServices, ServiceWiring};
 use super::cache_ops::{create_cache_store, CacheStore};
 use super::loader::DbModuleLoader;
+use super::metrics::{recorder, MetricsRegistry, RequestOutcome};
 use super::ops::{AppId, EnvStore, ResponseStore};
+use super::queue_client::LeasedMessage;
+use super::queue_consumer::BatchOutcome;
 use super::queue_ops::MemoryQueue;
 use super::rate_limit::RateLimiter;
 use super::route_match::{match_routes, path_from_url};
@@ -23,6 +27,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use sys_traits::impls::RealSys;
 use tokio::sync::oneshot;
 
@@ -38,6 +43,57 @@ struct JsRequest {
     /// the app's configured route patterns. Empty when no pattern matches, or
     /// when the app has no route patterns configured yet.
     params: HashMap<String, String>,
+}
+
+/// One leased message as the JS side sees it.
+#[derive(Serialize)]
+struct JsQueueMessage {
+    id: String,
+    body: String,
+    /// Deliveries so far, including this one. Above 1 means the app has seen
+    /// this message before and its handler has to be idempotent.
+    attempts: i32,
+    /// Unix second the message was enqueued.
+    timestamp: i64,
+}
+
+#[derive(Serialize)]
+struct JsQueueBatch {
+    queue: String,
+    messages: Vec<JsQueueMessage>,
+}
+
+/// What `__deis_runtime_invoke_queue` reports back.
+#[derive(Deserialize)]
+struct JsQueueResult {
+    /// Ids the handler did not complete; everything else is acknowledged.
+    #[serde(default)]
+    failed: Vec<String>,
+    /// Set when the whole batch failed: a handler that threw, or an app that
+    /// declares a queue consumer but exports no handler.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// What the runtime hands `__deis_runtime_invoke_scheduled`.
+#[derive(Serialize)]
+struct JsScheduledEvent {
+    cron: String,
+    /// Unix milliseconds the tick was due, so a handler can tell a late run
+    /// from an on-time one.
+    #[serde(rename = "scheduledTime")]
+    scheduled_time: i64,
+}
+
+/// What `__deis_runtime_invoke_scheduled` reports back.
+#[derive(Deserialize)]
+struct JsScheduledResult {
+    #[serde(default)]
+    ok: bool,
+    /// Set when the handler threw, or when the app declares a cron
+    /// expression and exports no handler to run on it.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -102,14 +158,26 @@ pub struct AppRuntime {
     /// this isolate; not read outside of `#[cfg(test)]`.
     #[cfg_attr(not(test), allow(dead_code))]
     rate_limit_ops_per_sec: f64,
+    /// Where this isolate's request, error, execution-time and cut-off
+    /// counters go. See `super::metrics`.
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl AppRuntime {
+    /// Build an isolate for one application.
+    ///
+    /// `wiring` says which platform services the app declared and where they
+    /// live; only the declared ones are constructed, and none of them dials
+    /// anything until the app makes a call. Pass
+    /// [`ServiceWiring::default()`] for an isolate that should reach no
+    /// storage at all -- every `ctx.services` call then answers "service not
+    /// available", which is what an app that declared nothing should get.
     pub fn new(
         app_id: String,
         code: String,
         app_repo: Option<Arc<crate::app_repo::AppRepo>>,
         spec: IsolateSpec,
+        wiring: &ServiceWiring,
     ) -> Result<Self> {
         let IsolateSpec {
             entry_point,
@@ -158,6 +226,8 @@ impl AppRuntime {
 
         // Rate limiter: platform default, or this app's configured override.
         let limiter = Arc::new(Mutex::new(RateLimiter::new(rate_limit_ops_per_sec)));
+        let metrics = recorder().clone();
+        let metrics_for_limiter = metrics.clone();
         let isolate_handle_cell = Arc::new(OnceCell::<deno_core::v8::IsolateHandle>::new());
         let isolate_handle_cell_clone = isolate_handle_cell.clone();
         let app_id_clone = app_id.clone();
@@ -171,6 +241,7 @@ impl AppRuntime {
             let limiter = limiter.clone();
             let handle_cell = isolate_handle_cell_clone.clone();
             let app_id = app_id_clone.clone();
+            let metrics = metrics_for_limiter.clone();
             let op_name = decl.name.to_string();
 
             let callback = move |ctx: &_,
@@ -185,6 +256,7 @@ impl AppRuntime {
                 if event == deno_core::OpMetricsEvent::Dispatched {
                     let mut limiter = limiter.lock().unwrap();
                     if !limiter.check() {
+                        metrics.record_rate_limit_cutoff(&app_id);
                         tracing::warn!(
                             target: "app",
                             app_id = %app_id,
@@ -201,6 +273,21 @@ impl AppRuntime {
 
             Some(Rc::new(callback) as deno_core::OpMetricsFn)
         });
+
+        // Built before the runtime so a malformed address fails the load
+        // outright rather than after V8 has been spun up. An address that is
+        // merely unreachable is not a failure here: the channels are lazy.
+        let services = AppServices::connect(&app_id, wiring)?;
+        if services.is_empty() && !wiring.declaration.is_empty() {
+            tracing::warn!(
+                app_id = %app_id,
+                declared = %wiring.declaration.to_csv(),
+                "App {} declared services ({}) but none could be bound; ctx.services calls will \
+                 fail with \"service not available\"",
+                app_id,
+                wiring.declaration.to_csv()
+            );
+        }
 
         let startup_snapshot = load_or_create_startup_snapshot()?;
         let snapshot_loaded = startup_snapshot.is_some();
@@ -273,6 +360,12 @@ impl AppRuntime {
             // Ops that emit logs need to say which tenant they are acting for;
             // see `AppId`.
             state.put(AppId(app_id.clone()));
+
+            // The storage bindings. Only what the app declared is present;
+            // an op that finds its client missing answers "service not
+            // available", which is the honest answer for a service the app
+            // never asked for.
+            services.install(&mut state);
         }
 
         if let Some(limit) = resource_table_max {
@@ -319,6 +412,7 @@ impl AppRuntime {
             route_patterns,
             timeout_ms,
             rate_limit_ops_per_sec,
+            metrics,
         })
     }
 
@@ -367,6 +461,12 @@ impl AppRuntime {
                 globalThis.user_module = {{ default: mod.default }};
                 if (mod.fetch) {{
                     globalThis.user_module.fetch = mod.fetch;
+                }}
+                if (mod.queue) {{
+                    globalThis.user_module.queue = mod.queue;
+                }}
+                if (mod.scheduled) {{
+                    globalThis.user_module.scheduled = mod.scheduled;
                 }}
             }})();
         "#,
@@ -426,8 +526,12 @@ impl AppRuntime {
         body: Option<String>,
         response_tx: oneshot::Sender<Result<FetchResult>>,
     ) -> Result<()> {
+        let started = Instant::now();
+
         if self.module_id.is_none() {
             if let Err(e) = self.init_module().await {
+                self.metrics
+                    .record_request(&self.app_id, started.elapsed(), RequestOutcome::Error);
                 let _ = response_tx.send(Err(e));
                 return Ok(());
             }
@@ -481,10 +585,12 @@ impl AppRuntime {
         let timeout_ms = self.timeout_ms;
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
         let app_id_for_timeout = self.app_id.clone();
+        let metrics_for_timeout = self.metrics.clone();
 
         // Start timeout monitoring task
         let timeout_task = tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
+            metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
             tracing::warn!(
                 target: "app",
                 app_id = %app_id_for_timeout,
@@ -504,7 +610,19 @@ impl AppRuntime {
         // Cancel timeout task
         timeout_task.abort();
 
-        // Check results
+        // Check results. A terminated isolate (timeout or rate-limit cut-off)
+        // and a script error both land here, and both cost the request.
+        if let Err(e) = &result {
+            self.metrics
+                .record_request(&self.app_id, started.elapsed(), RequestOutcome::Error);
+            tracing::debug!(
+                target: "app",
+                app_id = %self.app_id,
+                error = %e,
+                "Isolate execution for app {} did not complete",
+                self.app_id
+            );
+        }
         result?;
 
         let json_str = {
@@ -512,10 +630,38 @@ impl AppRuntime {
             let state = op_state.borrow();
             let response_store = state.borrow::<ResponseStore>().clone();
             let response = response_store.borrow_mut().take();
-            response.ok_or_else(|| anyhow::anyhow!("No response received from app"))?
+            match response {
+                Some(json) => json,
+                None => {
+                    self.metrics.record_request(
+                        &self.app_id,
+                        started.elapsed(),
+                        RequestOutcome::Error,
+                    );
+                    anyhow::bail!("No response received from app");
+                }
+            }
         };
 
-        let response: JsResponse = serde_json::from_str(&json_str)?;
+        let response: JsResponse = match serde_json::from_str::<JsResponse>(&json_str) {
+            Ok(response) => response,
+            Err(e) => {
+                self.metrics
+                    .record_request(&self.app_id, started.elapsed(), RequestOutcome::Error);
+                return Err(e.into());
+            }
+        };
+
+        // A 5xx is the app reporting its own failure, and it is the number an
+        // operator means by "error rate", so it counts here as well as a
+        // crash does.
+        let outcome = if response.status >= 500 {
+            RequestOutcome::Error
+        } else {
+            RequestOutcome::Ok
+        };
+        self.metrics
+            .record_request(&self.app_id, started.elapsed(), outcome);
 
         let _ = response_tx.send(Ok((response.status, response.headers, response.body)));
 
@@ -550,19 +696,236 @@ impl AppRuntime {
             }
         }
 
-        let metrics = self.op_metrics.aggregate();
+        let op_summary = self.op_metrics.aggregate();
         tracing::debug!(
             target: "app",
             app_id = %self.app_id,
             "OpMetrics summary: app_id={}, sync={}, async={}, fast={}, completed_async={}",
             self.app_id,
-            metrics.ops_dispatched_sync,
-            metrics.ops_dispatched_async,
-            metrics.ops_dispatched_fast,
-            metrics.ops_completed_async
+            op_summary.ops_dispatched_sync,
+            op_summary.ops_dispatched_async,
+            op_summary.ops_dispatched_fast,
+            op_summary.ops_completed_async
         );
 
         Ok(())
+    }
+
+    /// Hand one batch of leased queue messages to the app's `queue` handler.
+    ///
+    /// Returns which message ids the handler did not complete; the poller
+    /// acknowledges the rest. An error here means the batch never ran (or the
+    /// isolate was terminated part-way), and the caller hands the whole batch
+    /// back to deis-queue rather than silently dropping it.
+    ///
+    /// The same wall-clock timeout that bounds a request bounds a batch: a
+    /// queue handler that never returns would otherwise pin the runtime
+    /// thread its app lives on, and every request for every app on that
+    /// thread would stop being served.
+    pub async fn execute_queue_batch(
+        &mut self,
+        queue: String,
+        messages: Vec<LeasedMessage>,
+    ) -> Result<BatchOutcome> {
+        if self.module_id.is_none() {
+            self.init_module().await?;
+        }
+
+        let payload = JsQueueBatch {
+            queue: queue.clone(),
+            messages: messages
+                .iter()
+                .map(|message| JsQueueMessage {
+                    id: message.id.clone(),
+                    body: message.body.clone(),
+                    attempts: message.attempts,
+                    timestamp: message.created_at,
+                })
+                .collect(),
+        };
+
+        let code = format!(
+            r#"
+            (async () => {{
+                const batch = {};
+                const result = await __deis_runtime_invoke_queue(batch);
+                __deis_runtime_set_response(JSON.stringify(result));
+            }})()
+            "#,
+            serde_json::to_string(&payload)?
+        );
+
+        let promise = self.runtime.execute_script("<queue>", code)?;
+
+        let timeout_ms = self.timeout_ms;
+        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let app_id_for_timeout = self.app_id.clone();
+        let queue_for_timeout = queue.clone();
+        let metrics_for_timeout = self.metrics.clone();
+        let timeout_task = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
+            metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
+            tracing::warn!(
+                target: "app",
+                app_id = %app_id_for_timeout,
+                queue = %queue_for_timeout,
+                "App {} took longer than {}ms on a batch from queue {}. Terminating the isolate; \
+                 the whole batch goes back to deis-queue and will be delivered again",
+                app_id_for_timeout,
+                timeout_ms,
+                queue_for_timeout
+            );
+            isolate_handle.terminate_execution();
+        });
+
+        let resolve_future = self.runtime.resolve(promise);
+        let result = self
+            .runtime
+            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
+            .await;
+        timeout_task.abort();
+        result?;
+
+        let json_str = {
+            let op_state = self.runtime.op_state();
+            let state = op_state.borrow();
+            let response_store = state.borrow::<ResponseStore>().clone();
+            let response = response_store.borrow_mut().take();
+            response.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No result received from the queue handler of app {}",
+                    self.app_id
+                )
+            })?
+        };
+
+        let result: JsQueueResult = serde_json::from_str(&json_str)?;
+        if let Some(error) = &result.error {
+            tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                queue = %queue,
+                error = %error,
+                "Queue handler of app {} rejected the whole batch from queue {}: {}",
+                self.app_id,
+                queue,
+                error
+            );
+        }
+
+        // Anything the handler awaited through waitUntil still has to finish
+        // before the batch counts as settled; a message acknowledged while
+        // its follow-up work is still pending would be lost if the node went
+        // away right after.
+        let wait_promise = self
+            .runtime
+            .execute_script("<queue_wait_until>", "__deis_runtime_wait_until_all()")?;
+        let wait_resolve = self.runtime.resolve(wait_promise);
+        self.runtime
+            .with_event_loop_promise(wait_resolve, PollEventLoopOptions::default())
+            .await?;
+
+        Ok(BatchOutcome {
+            failed: result.failed,
+        })
+    }
+
+    /// Run the app's `scheduled` handler once, for one due cron expression.
+    ///
+    /// A tick is fire-and-forget by design: the control plane picks one node,
+    /// calls this, and does not make up a missed run later. Anything that has
+    /// to survive a failure belongs on a queue the handler fills, which is
+    /// retried and dead-lettered.
+    ///
+    /// Bounded by the same wall-clock timeout as a request, and for the same
+    /// reason: a handler that never returns would pin the runtime thread its
+    /// app lives on and stop every request on that thread.
+    pub async fn execute_scheduled(&mut self, cron: String, scheduled_time_ms: i64) -> Result<()> {
+        if self.module_id.is_none() {
+            self.init_module().await?;
+        }
+
+        let payload = JsScheduledEvent {
+            cron: cron.clone(),
+            scheduled_time: scheduled_time_ms,
+        };
+
+        let code = format!(
+            r#"
+            (async () => {{
+                const event = {};
+                const result = await __deis_runtime_invoke_scheduled(event);
+                __deis_runtime_set_response(JSON.stringify(result));
+            }})()
+            "#,
+            serde_json::to_string(&payload)?
+        );
+
+        let promise = self.runtime.execute_script("<scheduled>", code)?;
+
+        let timeout_ms = self.timeout_ms;
+        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let app_id_for_timeout = self.app_id.clone();
+        let cron_for_timeout = cron.clone();
+        let metrics_for_timeout = self.metrics.clone();
+        let timeout_task = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
+            metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
+            tracing::warn!(
+                target: "app",
+                app_id = %app_id_for_timeout,
+                cron = %cron_for_timeout,
+                "App {} took longer than {}ms on the scheduled run for {}. Terminating the                  isolate; this tick did not finish and is not retried",
+                app_id_for_timeout,
+                timeout_ms,
+                cron_for_timeout
+            );
+            isolate_handle.terminate_execution();
+        });
+
+        let resolve_future = self.runtime.resolve(promise);
+        let result = self
+            .runtime
+            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
+            .await;
+        timeout_task.abort();
+        result?;
+
+        let json_str = {
+            let op_state = self.runtime.op_state();
+            let state = op_state.borrow();
+            let response_store = state.borrow::<ResponseStore>().clone();
+            let response = response_store.borrow_mut().take();
+            response.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No result received from the scheduled handler of app {}",
+                    self.app_id
+                )
+            })?
+        };
+
+        let outcome: JsScheduledResult = serde_json::from_str(&json_str)?;
+
+        // Follow-up work the handler started must finish before the tick is
+        // called done, or it would be cut off when the isolate goes idle.
+        let wait_promise = self
+            .runtime
+            .execute_script("<scheduled_wait_until>", "__deis_runtime_wait_until_all()")?;
+        let wait_resolve = self.runtime.resolve(wait_promise);
+        self.runtime
+            .with_event_loop_promise(wait_resolve, PollEventLoopOptions::default())
+            .await?;
+
+        if outcome.ok {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "{}",
+            outcome
+                .error
+                .unwrap_or_else(|| "the scheduled handler did not report why it failed".to_string())
+        ))
     }
 
     pub async fn register_ws_connection(

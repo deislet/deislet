@@ -88,6 +88,32 @@ impl BlobClient {
         })
     }
 
+    /// Build a client that dials deis-store on its first call; see
+    /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
+    /// rather than connecting eagerly.
+    ///
+    /// Unlike the KV and database clients this one gets no per-call deadline:
+    /// a blob transfer is a stream whose honest duration depends on the size
+    /// of the object, so a fixed deadline would cut off large-but-healthy
+    /// downloads. [`DEFAULT_MAX_OBJECT_BYTES`] bounds the cost instead.
+    pub fn connect_lazy(endpoint: &str, app_id: impl Into<String>) -> Result<Self> {
+        let tenant = Tenant::new(app_id)?;
+        let channel = super::bindings::streaming_channel(endpoint)?;
+        let client = GrpcBlobClient::new(channel)
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
+        tracing::debug!(
+            endpoint,
+            app_id = tenant.app_id(),
+            "blob client prepared; it will dial on the first call"
+        );
+        Ok(Self {
+            client,
+            tenant,
+            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+        })
+    }
+
     /// Change the largest object [`BlobClient::get`] will assemble in memory.
     ///
     /// Raising it raises what one read can cost this node; see

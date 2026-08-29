@@ -89,7 +89,11 @@ assets/                  # 静态资产，原样保留目录结构
 - `secrets` 只列名字，值永远不进包。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
 - `routes[].pattern` 用 `:name` 占位，运行时据此填 `context.params`；`methods` 为空数组表示任意方法。字段名与 `management.proto` 的 `RouteRule.pattern` / `RouteRule.methods` 一一对应。
-- **通配捕获尚未实现**：edge-canon 规定 `functions/api/[[catch]].ts` 映射到 `/api/*`，但当前匹配器只支持精确段与 `:name`，这类模式匹配不到任何东西，且唯一症状是 `context.params` 为空。补齐属波次 B。
+- 通配捕获 `/api/*`（来自 `functions/api/[[catch]].ts`）由运行时匹配器支持，捕获到的剩余路径以 `*` 为键放进 `context.params`，同时也以文件里写的名字（上例是 `catch`）放一份。
+- **函数根下以下划线开头的文件不是路由**，而是平台自己调用的处理函数，由入口模块以具名导出的形式暴露：
+  - `functions/_queue.ts` → `export const queue`，运行时按批调用（`§5.2`）
+  - `functions/_scheduled.ts` → `export const scheduled`，控制面到点触发（`§7`）
+  它们不进 `manifest.routes`，也不占用任何 URL。声明了 `queues` / `cron` 却没有对应文件时构建只告警不拦截，但告警会说清后果（消息领走后无人处理、最终进死信；到点触发打在空处）。函数根下其它以下划线开头的文件既不是路由也不会被调用，构建同样告警。
 - 包的 sha256 就是版本标识的一部分；同样的输入应产出同样的包（构建可复现）。
 
 ---
@@ -183,10 +187,25 @@ CREATE TABLE secrets (
 
 ```
 GET /api/nodes/{node_id}/assignments
-→ [ { app_id, version_id, environment, bundle_url, bundle_sha } ]
+→ [ { app_id, version_id, environment, bundle_url, bundle_sha, env } ]
 ```
 
+`env` 与 `ApplyDeployment.env` 是同一张表（manifest 变量 + 当场解密的密钥 + 存储地址），因为**重启回来的节点必须拿到和推送时一样的环境**：只发指针的话，声明了密钥的应用会带着空密钥跑，声明了存储的应用连 deis-store 的地址都没有，而后者的唯一症状是每次 `ctx.services.*` 调用失败。某个环境的密钥解不开时，该行被整条剔出清单并打 error，而不是发一份残缺环境下去。
+
 拉完、加载完才向控制面报 healthy。
+
+### 存储地址走 env 的保留键
+
+控制面是唯一知道 deis-store / deis-queue 在哪的角色（架构文档第 6 节），地址随每次下发走 `env`，不写进节点配置。键名在 `deis_wire::conventions` 里定义一次，两侧共用：
+
+| 键 | 内容 | 谁写 | 谁读 |
+|---|---|---|---|
+| `DEIS_STORE_ENDPOINT` | deis-store 的 gRPC 地址 | deis-control（配置项 `store_endpoint`） | deis-runtime |
+| `DEIS_QUEUE_ENDPOINT` | deis-queue 的 gRPC 地址 | deis-control（配置项 `queue_endpoint`） | deis-runtime |
+| `DEIS_SERVICES` | 本应用声明了哪些服务 | deis-runtime（读包内 manifest 时补） | deis-runtime |
+| `DEIS_QUEUE_CONSUMERS` | 要消费哪些队列及批大小 | 同上 | deis-runtime |
+
+这四个键在进 Isolate 之前被**取出**而不是读取，所以应用的 `ctx.env` 里只剩它自己的变量；应用也无法用同名变量把存储客户端指到别处（拼装 payload 时平台值最后写入，覆盖 manifest 里的同名变量并告警）。
 
 `DeployApp` 删除。gRPC 消息上限统一提到 16 MB（服务端 `max_decoding_message_size`、客户端 `max_encoding_message_size` 都要设），给 manifest 和批量消息留余量。
 
@@ -239,6 +258,8 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 
 ## 6. 运行时要补的四件事
 
+（四条均已实现，保留在这里作为契约描述。）
+
 1. **资产优先**：加载版本时把 `manifest.assets` 读成内存索引。请求进来先按路径查索引，命中直接返回（带 `ETag`、`Content-Type`、`Cache-Control`），未命中才进 Isolate。
 2. **`context.params`**：`JsRequest` 现在没有 `params` 字段，所以 `context.params` 永远是空对象。按 manifest 的 `routes[].pattern` 匹配，把占位符解析结果填进去。
 3. **`context.env`**：从 `ApplyDeployment` 带来的 `env` map 注入，变量与密钥合并成一个字符串字典。密钥只留在内存，不落盘、不进日志。
@@ -290,12 +311,30 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 - **Blob 下行没有空闲保护**：客户端拉一半不读，服务端发送任务卡在满通道上占着文件描述符，有内存上限没有时间上限。deis-queue 的 `Pull`、telemetry 的 `Tail` 大概率同形（并入 B5）
 - **控制面另外 28 个数据库方法**仍在异步线程上跑 rusqlite 并跨 await 持锁，与已修的那处同源
 
+### 波次 B 收尾（B1–B7 已合入，2026-08-29）
+
+`scripts/demo.sh start` 起全部六个进程并按真实路径部署（`deis build --vendor deislet` → 建应用 → 传版本 → 建环境 → 存密钥 → 切指针 → 节点自取），`scripts/demo.sh verify` 逐项跑通并打印证据：静态资产（含 ETag 与 `If-None-Match` 回 304）、路由占位符、密钥下发且不落盘、KV 经 deis-store 往返、队列产出与消费、cron 到点在单个节点上执行、回滚（函数与资产一起回到上一版）、日志可从 deis-telemetry 查回。
+
+合入时补齐的三处：`wire_deployment_env` 此前无人调用（存储绑定全部落空）；`MetricShipper` 无人启动；节点的 `Trigger.OnScheduled` 是个只回 success 的桩，控制面每次触发都被当成成功。
+
+`PLATFORM_MATRIX` 对应更新：deislet 的 SQL / Blob / Queue / Cron 从「暂缺」转正，能力表里已无 pending 项；剩下不支持的（Durable Objects、Node 内置、SSR/ISR、Workers AI、BroadcastChannel）是形态上就没有，构建直接失败而不是告警。
+
+仍然开着的（不阻塞本波验收）：
+
+- **KV 的 metadata 只能写不能读**：`GetResponse` 只有 value、`ListResponse` 只有 keys，需要 deis-store 加字段；在那之前不提供 `getWithMetadata`。
+- **`ScheduledEvent.scheduled_time` 送的是 tick 时刻不是应到时刻**：调度器用 `Utc::now()` 而不是任务的 `next_run`，处理函数拿它做幂等键会看到最多一个 tick 间隔的抖动。
+- **队列没有租约令牌**：租约过期的消费者仍能 Ack/Nack 已经交给别人的那条消息；死信表也没有对外 RPC。
+- **控制面另外 28 个数据库方法**仍在异步线程上跑 rusqlite 并跨 await 持锁。
+- **`UpdateApp` 仍带 `bytes package_data`**，和被删掉的 `DeployApp` 是同一个毛病，目前无人调用。
+- **节点仍不向控制面注册自己**：原则 8 的「拉」通了，但控制面认识哪些节点仍只来自配置文件。
+- **`RuntimePool` 没有「先装好再切」的接口**：换版期间有一个等于 Isolate 构建耗时的不可用窗口。
+
 ### 波次 C
 
 | 编号 | 内容 |
 |---|---|
-| C1 | `deis` CLI 闭环：`deploy` / `rollback` / `versions` / `tail` / `dev` 接真运行时 |
-| C2 | 端到端演示扩展：demo 脚本拉起全部六个进程，跑通资产 + KV + 队列 + cron |
+| C1 | `deis` CLI 闭环：`deploy` / `rollback` / `versions` / `tail` / `dev` 接真运行时（`deis build` 已可产出 deislet 包，其余仍走 REST） |
+| C2 | ~~端到端演示扩展~~：`scripts/demo.sh` 已在波次 B 收尾时完成 |
 | C3 | 文档与能力矩阵回填（`PLATFORM_MATRIX.md` 的 ⚠️ 逐项转正） |
 
 ---

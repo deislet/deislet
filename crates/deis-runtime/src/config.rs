@@ -53,6 +53,13 @@ const MIN_TIMEOUT_MS: u64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
+    /// How this node names itself to the control plane. Unset means "use the
+    /// hostname", which is what a single node per host wants; two nodes on one
+    /// host must each be given a distinct id, or they would ask for and report
+    /// on the same assignment list.
+    #[serde(default)]
+    pub node_id: Option<String>,
+
     /// Port serving both HTTP traffic and the gRPC management interface.
     #[serde(default = "default_http_port")]
     pub http_port: u16,
@@ -76,6 +83,18 @@ pub struct RuntimeConfig {
     /// Where this node's `target: "app"` logs are shipped, if anywhere.
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// How this node reaches the control plane to ask what it should run.
+    #[serde(default)]
+    pub control: ControlConfig,
+
+    /// Where downloaded application bundles live and how large one may be.
+    #[serde(default)]
+    pub bundles: BundleConfig,
+
+    /// How static assets out of a bundle are served.
+    #[serde(default)]
+    pub assets: AssetsConfig,
 }
 
 fn default_http_port() -> u16 {
@@ -93,11 +112,133 @@ fn default_shutdown_grace_period_secs() -> u64 {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            node_id: None,
             http_port: default_http_port(),
             data_dir: default_data_dir(),
             shutdown_grace_period_secs: default_shutdown_grace_period_secs(),
             default_execution_limits: ExecutionLimits::default(),
             logging: LoggingConfig::default(),
+            control: ControlConfig::default(),
+            bundles: BundleConfig::default(),
+            assets: AssetsConfig::default(),
+        }
+    }
+}
+
+/// Reaching the control plane.
+///
+/// On startup the node asks the control plane which versions it should be
+/// running (`GET /api/nodes/{node_id}/assignments`), fetches each bundle and
+/// loads it, and only then reports healthy. That direction matters: the node
+/// pulls, the control plane does not have to know how to reach every node
+/// before anything can run.
+///
+/// With `endpoint` unset the node never asks anyone. It then runs whatever is
+/// still in its own bundle directory from a previous life, plus whatever the
+/// control plane pushes at it later, and it reports healthy immediately
+/// because there is no list it could be missing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlConfig {
+    /// Base URL of the control plane, e.g. `http://127.0.0.1:8080`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Seconds one assignment request may take before it is abandoned.
+    #[serde(default = "default_control_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
+    /// Seconds between retries after the control plane could not be reached.
+    /// The node keeps serving what it has while it retries.
+    #[serde(default = "default_control_retry_interval_secs")]
+    pub retry_interval_secs: u64,
+}
+
+fn default_control_request_timeout_secs() -> u64 {
+    30
+}
+
+fn default_control_retry_interval_secs() -> u64 {
+    15
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            request_timeout_secs: default_control_request_timeout_secs(),
+            retry_interval_secs: default_control_retry_interval_secs(),
+        }
+    }
+}
+
+/// Bundle download and local storage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BundleConfig {
+    /// Directory holding downloaded bundles. Unset means `<data_dir>/bundles`.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+
+    /// Largest bundle this node will accept. A download is abandoned the
+    /// moment it goes over, so a wrong or hostile URL cannot fill the disk.
+    #[serde(default = "default_max_bundle_bytes")]
+    pub max_bundle_bytes: u64,
+
+    /// Seconds one bundle download may take before it is abandoned and the
+    /// currently running version is kept.
+    #[serde(default = "default_download_timeout_secs")]
+    pub download_timeout_secs: u64,
+}
+
+fn default_max_bundle_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_download_timeout_secs() -> u64 {
+    300
+}
+
+impl Default for BundleConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            max_bundle_bytes: default_max_bundle_bytes(),
+            download_timeout_secs: default_download_timeout_secs(),
+        }
+    }
+}
+
+/// Serving the static files a bundle carries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AssetsConfig {
+    /// `Cache-Control` sent with every asset.
+    ///
+    /// The default revalidates on every request and lets the `ETag` (the
+    /// asset's sha256) turn that into a 304 with no body. Bundle paths are not
+    /// content-addressed, so a long `max-age` here would pin a stale file in
+    /// browser caches across a deploy.
+    #[serde(default = "default_asset_cache_control")]
+    pub cache_control: String,
+
+    /// Ceiling on the assets of one version, which are held in memory so that
+    /// serving one does not reopen the zip. A version above it is refused and
+    /// whatever is already running stays up.
+    #[serde(default = "default_max_asset_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_asset_cache_control() -> String {
+    "public, max-age=0, must-revalidate".to_string()
+}
+
+fn default_max_asset_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+impl Default for AssetsConfig {
+    fn default() -> Self {
+        Self {
+            cache_control: default_asset_cache_control(),
+            max_bytes: default_max_asset_bytes(),
         }
     }
 }
@@ -262,6 +403,10 @@ impl RuntimeConfig {
     }
 
     fn apply_env_overrides(&mut self) -> Result<()> {
+        if let Some(value) = env_var("DEIS_RUNTIME_NODE_ID") {
+            self.node_id = Some(value);
+        }
+
         if let Some(value) = env_var("DEIS_RUNTIME_HTTP_PORT") {
             self.http_port = parse_env(&value, "DEIS_RUNTIME_HTTP_PORT", "a TCP port")?;
         }
@@ -334,7 +479,79 @@ impl RuntimeConfig {
             )?;
         }
 
+        if let Some(value) = env_var("DEIS_RUNTIME_CONTROL_ENDPOINT") {
+            self.control.endpoint = Some(value);
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_CONTROL_REQUEST_TIMEOUT_SECS") {
+            self.control.request_timeout_secs = parse_env(
+                &value,
+                "DEIS_RUNTIME_CONTROL_REQUEST_TIMEOUT_SECS",
+                "a whole number of seconds",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_CONTROL_RETRY_INTERVAL_SECS") {
+            self.control.retry_interval_secs = parse_env(
+                &value,
+                "DEIS_RUNTIME_CONTROL_RETRY_INTERVAL_SECS",
+                "a whole number of seconds",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_BUNDLES_DIR") {
+            self.bundles.dir = Some(PathBuf::from(value));
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES") {
+            self.bundles.max_bundle_bytes = parse_env(
+                &value,
+                "DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES",
+                "a whole number of bytes",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_BUNDLES_DOWNLOAD_TIMEOUT_SECS") {
+            self.bundles.download_timeout_secs = parse_env(
+                &value,
+                "DEIS_RUNTIME_BUNDLES_DOWNLOAD_TIMEOUT_SECS",
+                "a whole number of seconds",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_ASSETS_CACHE_CONTROL") {
+            self.assets.cache_control = value;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_ASSETS_MAX_BYTES") {
+            self.assets.max_bytes = parse_env(
+                &value,
+                "DEIS_RUNTIME_ASSETS_MAX_BYTES",
+                "a whole number of bytes",
+            )?;
+        }
+
         Ok(())
+    }
+
+    /// Directory holding downloaded bundles, resolved against `data_dir` when
+    /// the operator did not name one.
+    pub fn bundle_dir(&self) -> PathBuf {
+        self.bundles
+            .dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("bundles"))
+    }
+
+    /// The id this node answers to. Falls back to the hostname.
+    pub fn resolved_node_id(&self) -> String {
+        match self.node_id.as_deref() {
+            Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+            _ => hostname::get()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+        }
     }
 
     /// Reject configurations the node cannot serve traffic on.
@@ -380,6 +597,87 @@ impl RuntimeConfig {
         }
 
         self.logging.validate()?;
+        self.control.validate()?;
+        self.bundles.validate()?;
+        self.assets.validate()?;
+
+        Ok(())
+    }
+}
+
+impl ControlConfig {
+    fn validate(&self) -> Result<()> {
+        if let Some(endpoint) = self.endpoint.as_deref() {
+            if endpoint.trim().is_empty() {
+                return Err(anyhow!(
+                    "control.endpoint is empty; either remove it or set it to the control plane \
+                     base URL, e.g. http://127.0.0.1:8080. An empty value would make this node \
+                     start with no idea what it should be running"
+                ));
+            }
+            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                return Err(anyhow!(
+                    "control.endpoint {endpoint:?} has no http:// or https:// scheme; the node \
+                     builds an absolute URL from it and would never reach the control plane"
+                ));
+            }
+        }
+
+        if self.request_timeout_secs == 0 {
+            return Err(anyhow!(
+                "control.request_timeout_secs must be greater than 0; 0 would abandon the \
+                 assignment request before it could be sent, so the node would never learn what \
+                 to run"
+            ));
+        }
+
+        if self.retry_interval_secs == 0 {
+            return Err(anyhow!(
+                "control.retry_interval_secs must be greater than 0; 0 spins the retry loop on a \
+                 hot loop against the control plane"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl BundleConfig {
+    fn validate(&self) -> Result<()> {
+        if self.max_bundle_bytes == 0 {
+            return Err(anyhow!(
+                "bundles.max_bundle_bytes must be greater than 0; 0 rejects every bundle, so no \
+                 deployment could ever be applied on this node"
+            ));
+        }
+
+        if self.download_timeout_secs == 0 {
+            return Err(anyhow!(
+                "bundles.download_timeout_secs must be greater than 0; 0 abandons every download \
+                 before a byte arrives"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl AssetsConfig {
+    fn validate(&self) -> Result<()> {
+        if self.max_bytes == 0 {
+            return Err(anyhow!(
+                "assets.max_bytes must be greater than 0; 0 refuses every version that carries a \
+                 single static file, which is most of them"
+            ));
+        }
+
+        if self.cache_control.trim().is_empty() {
+            return Err(anyhow!(
+                "assets.cache_control is empty; set a directive, e.g. \
+                 \"public, max-age=0, must-revalidate\". An empty header value would be sent \
+                 verbatim and caches would be free to invent their own freshness"
+            ));
+        }
 
         Ok(())
     }
@@ -741,6 +1039,151 @@ mod tests {
         assert!(
             err.contains("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_toml_delivery_sections() {
+        let toml_str = r#"
+            node_id = "node-a"
+
+            [control]
+            endpoint = "http://127.0.0.1:8080"
+            request_timeout_secs = 5
+            retry_interval_secs = 3
+
+            [bundles]
+            dir = "/var/lib/deis/bundles"
+            max_bundle_bytes = 1048576
+            download_timeout_secs = 60
+
+            [assets]
+            cache_control = "public, max-age=60"
+            max_bytes = 2048
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.node_id.as_deref(), Some("node-a"));
+        assert_eq!(
+            config.control.endpoint.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(config.control.request_timeout_secs, 5);
+        assert_eq!(config.bundles.max_bundle_bytes, 1_048_576);
+        assert_eq!(config.assets.cache_control, "public, max-age=60");
+        assert_eq!(config.assets.max_bytes, 2048);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_bundle_dir_defaults_under_the_data_dir() {
+        let config = RuntimeConfig {
+            data_dir: PathBuf::from("/srv/deis"),
+            ..Default::default()
+        };
+        assert_eq!(config.bundle_dir(), PathBuf::from("/srv/deis/bundles"));
+    }
+
+    #[test]
+    fn test_bundle_dir_honours_an_explicit_setting() {
+        let mut config = RuntimeConfig::default();
+        config.bundles.dir = Some(PathBuf::from("/mnt/bundles"));
+        assert_eq!(config.bundle_dir(), PathBuf::from("/mnt/bundles"));
+    }
+
+    #[test]
+    fn test_node_id_falls_back_to_the_hostname() {
+        let mut config = RuntimeConfig::default();
+        assert!(!config.resolved_node_id().is_empty());
+        config.node_id = Some("  spaced-node  ".to_string());
+        assert_eq!(config.resolved_node_id(), "spaced-node");
+    }
+
+    #[test]
+    fn test_validate_rejects_a_control_endpoint_without_a_scheme() {
+        let mut config = RuntimeConfig::default();
+        config.control.endpoint = Some("127.0.0.1:8080".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("http://"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_an_empty_control_endpoint() {
+        let mut config = RuntimeConfig::default();
+        config.control.endpoint = Some("   ".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_a_zero_bundle_ceiling() {
+        let mut config = RuntimeConfig::default();
+        config.bundles.max_bundle_bytes = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_bundle_bytes"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_a_zero_asset_ceiling() {
+        let mut config = RuntimeConfig::default();
+        config.assets.max_bytes = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_an_empty_cache_control() {
+        let mut config = RuntimeConfig::default();
+        config.assets.cache_control = String::new();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_a_zero_retry_interval() {
+        let mut config = RuntimeConfig::default();
+        config.control.retry_interval_secs = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_env_overrides_delivery_settings() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+
+        env::set_var("DEIS_RUNTIME_NODE_ID", "node-from-env");
+        env::set_var("DEIS_RUNTIME_CONTROL_ENDPOINT", "http://control:8080");
+        env::set_var("DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES", "4096");
+        env::set_var("DEIS_RUNTIME_ASSETS_MAX_BYTES", "8192");
+
+        let mut config = RuntimeConfig::default();
+        let result = config.apply_env_overrides();
+
+        env::remove_var("DEIS_RUNTIME_NODE_ID");
+        env::remove_var("DEIS_RUNTIME_CONTROL_ENDPOINT");
+        env::remove_var("DEIS_RUNTIME_BUNDLES_MAX_BUNDLE_BYTES");
+        env::remove_var("DEIS_RUNTIME_ASSETS_MAX_BYTES");
+
+        result.unwrap();
+        assert_eq!(config.node_id.as_deref(), Some("node-from-env"));
+        assert_eq!(
+            config.control.endpoint.as_deref(),
+            Some("http://control:8080")
+        );
+        assert_eq!(config.bundles.max_bundle_bytes, 4096);
+        assert_eq!(config.assets.max_bytes, 8192);
+    }
+
+    #[test]
+    fn test_the_shipped_example_config_is_loadable() {
+        // The file next to this crate is what an operator copies. A setting
+        // documented there that this build does not accept - a renamed key, a
+        // value outside its range - would only show up when someone tried to
+        // start a node with it.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("deis-runtime.toml");
+        let config = RuntimeConfig::load_from(&path).expect("deis-runtime.toml must parse");
+        config
+            .validate()
+            .expect("deis-runtime.toml must pass validation");
+        assert_eq!(config.http_port, 8000);
+        assert_eq!(
+            config.assets.cache_control,
+            "public, max-age=0, must-revalidate"
         );
     }
 

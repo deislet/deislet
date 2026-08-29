@@ -71,6 +71,19 @@ if (typeof globalThis.Headers === "undefined") {
   globalThis.Headers = Headers;
 }
 
+// Render whatever the runtime handed down as a body into text. It is a
+// string today, but a clone or a handler-built Request can carry bytes.
+function bodyToText(body) {
+  if (body === null || body === undefined) return "";
+  if (typeof body === "string") return body;
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+  if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+  if (ArrayBuffer.isView(body)) {
+    return new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+  }
+  return String(body);
+}
+
 if (typeof globalThis.Request === "undefined") {
   class Request {
     constructor(url, init = {}) {
@@ -78,6 +91,35 @@ if (typeof globalThis.Request === "undefined") {
       this.method = (init.method || "GET").toUpperCase();
       this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
       this._body = init.body ?? null;
+      this._bodyUsed = false;
+    }
+    // Reading the body. A handler that posts JSON has no other way in: the
+    // runtime hands the body down as a string, and without these a call to
+    // request.text() threw "not a function" and the whole request failed
+    // with a 500 that named the polyfill rather than the app.
+    //
+    // `bodyUsed` follows the standard: a body may be read once, and a second
+    // read is a bug in the handler worth surfacing rather than answering with
+    // the same bytes twice.
+    async text() {
+      if (this._bodyUsed) {
+        throw new TypeError("Request body has already been read");
+      }
+      this._bodyUsed = true;
+      return bodyToText(this._body);
+    }
+    async json() {
+      return JSON.parse(await this.text());
+    }
+    async arrayBuffer() {
+      const text = await this.text();
+      return new TextEncoder().encode(text).buffer;
+    }
+    get bodyUsed() {
+      return this._bodyUsed;
+    }
+    get body() {
+      return this._body;
     }
     clone() {
       return new Request(this.url, { method: this.method, headers: this.headers, body: this._body });
@@ -97,7 +139,10 @@ if (typeof globalThis.Response === "undefined") {
       }
     }
     async text() {
-      return this._body == null ? "" : String(this._body);
+      return bodyToText(this._body);
+    }
+    async json() {
+      return JSON.parse(await this.text());
     }
     clone() {
       return new Response(this._body, { status: this.status, headers: this.headers });
@@ -341,8 +386,38 @@ class NativeKV {
   async get(key) {
     return await DenoCore.ops.op_kv_get(key);
   }
-  async put(key, value) {
-    await DenoCore.ops.op_kv_set(key, value); 
+  // put(key, value, { expirationTtl, metadata })
+  //
+  // expirationTtl is a lifetime in whole seconds, counted from the moment
+  // deis-store accepts the write; leave it out and the entry never lapses.
+  // metadata is stored alongside the value and returned untouched.
+  //
+  // NOTE: metadata can be written but not read back. deis-store's GetResponse
+  // carries only the value and ListResponse only the keys, so there is no
+  // getWithMetadata here - offering one that always answered null would be
+  // worse than not having it. Reading it back needs a field on those two
+  // messages, which is deis-store's to add.
+  async put(key, value, options) {
+    const opts = options || {};
+    let ttl = null;
+    if (opts.expirationTtl !== undefined && opts.expirationTtl !== null) {
+      ttl = Number(opts.expirationTtl);
+      if (!Number.isFinite(ttl) || Math.floor(ttl) !== ttl || ttl <= 0) {
+        throw new TypeError(
+          "kv.put: expirationTtl must be a whole number of seconds greater than 0, got " +
+            String(opts.expirationTtl)
+        );
+      }
+    }
+
+    let metadata = null;
+    if (opts.metadata !== undefined && opts.metadata !== null) {
+      metadata = typeof opts.metadata === "string"
+        ? opts.metadata
+        : JSON.stringify(opts.metadata);
+    }
+
+    await DenoCore.ops.op_kv_set(key, value, { ttlSeconds: ttl, metadata: metadata });
   }
   async delete(key) {
     await DenoCore.ops.op_kv_delete(key);
@@ -350,12 +425,28 @@ class NativeKV {
 }
 
 class NativeDB {
+  // The database ops report failure as an `error` field rather than by
+  // throwing, so a caller that did not look for it would see `undefined`
+  // rows and no reason why. Turn it into an exception, which is what the
+  // other services do and what a handler's try/catch expects.
+  #check(result, call) {
+    if (result && result.error) {
+      throw new Error("database." + call + " failed: " + result.error);
+    }
+    return result;
+  }
   async execute(sql, params = []) {
-    return await DenoCore.ops.op_db_execute(sql, JSON.stringify(params));
+    return this.#check(
+      await DenoCore.ops.op_db_execute(sql, JSON.stringify(params)),
+      "execute"
+    );
   }
   async query(sql, params = []) {
-    const res = await DenoCore.ops.op_db_query(sql, JSON.stringify(params));
-    return res.rows; 
+    const res = this.#check(
+      await DenoCore.ops.op_db_query(sql, JSON.stringify(params)),
+      "query"
+    );
+    return res.rows;
   }
   async transaction(callback) {
     // Not implemented in op layer yet
@@ -398,6 +489,17 @@ class Queue {
     const msgStr = typeof message === "string" ? message : JSON.stringify(message);
     await DenoCore.ops.op_queue_send(this.name, msgStr);
   }
+  // A queue other than this app's default one, e.g.
+  // ctx.services.queue.to("jobs").send({ ... }).
+  //
+  // The name has to match a queue some app declares as a consumer, or the
+  // messages are stored and never read.
+  to(name) {
+    if (typeof name !== "string" || name === "") {
+      throw new TypeError("queue.to: a queue name is required");
+    }
+    return new Queue(name);
+  }
 }
 
 // ---------------------------------------------------------
@@ -420,15 +522,13 @@ function redact(obj) {
   return newObj;
 }
 
-function createContext(requestData) {
+// The half of the context that does not depend on there being a request:
+// the environment, the platform services and waitUntil. Shared by the fetch
+// path and the queue path so a queue handler reaches storage exactly the same
+// way a request handler does.
+function createServiceContext() {
   return {
-    request: new Request(requestData.url, {
-      method: requestData.method,
-      headers: requestData.headers,
-      body: requestData.body
-    }),
-    env: DenoCore.ops.op_get_env() || {}, 
-    params: requestData.params || {},      
+    env: DenoCore.ops.op_get_env() || {},
     services: {
       kv: new NativeKV(),
       database: new NativeDB(),
@@ -440,6 +540,20 @@ function createContext(requestData) {
       globalThis.__pending_wait_until.push(promise);
     }
   };
+}
+
+// The request context: the service half above plus the request itself and
+// whatever the route matcher captured. Built on createServiceContext so a
+// service added to one path cannot go missing from the other.
+function createContext(requestData) {
+  return Object.assign(createServiceContext(), {
+    request: new Request(requestData.url, {
+      method: requestData.method,
+      headers: requestData.headers,
+      body: requestData.body
+    }),
+    params: requestData.params || {},
+  });
 }
 
 globalThis.__deis_runtime_wait_until_all = async function() {
@@ -455,6 +569,116 @@ globalThis.__deis_runtime_wait_until_all = async function() {
       await globalThis.__deis_runtime_wait_until_all();
     }
   }
+};
+
+// ---------------------------------------------------------
+// Queue consumption
+// ---------------------------------------------------------
+//
+// The node polls deis-queue for the queues an app declared (see
+// runtime/queue_consumer.rs) and hands each batch here. The handler is the
+// module's `queue` export:
+//
+//   export async function queue(batch, context) { ... }
+//
+// `batch` is { queue, messages: [...] }; each message carries id, body,
+// attempts and timestamp, plus json() for a JSON body. Delivery is
+// at-least-once, so a handler MUST be idempotent: `attempts` above 1 means
+// this message has been delivered before.
+//
+// A message counts as handled unless it says otherwise. `message.retry()`
+// marks one message for redelivery; a handler that throws marks the whole
+// batch. The returned `failed` list is what the node hands back to
+// deis-queue; everything else is acknowledged and never delivered again.
+globalThis.__deis_runtime_invoke_queue = async function(payload) {
+  const messages = (payload && payload.messages) || [];
+  const allIds = messages.map((m) => m.id);
+
+  let handler = globalThis.user_module && globalThis.user_module.queue;
+  if (typeof handler !== "function") {
+    const dflt = globalThis.user_module && globalThis.user_module.default;
+    if (dflt && typeof dflt.queue === "function") handler = dflt.queue;
+  }
+
+  if (typeof handler !== "function") {
+    console.error(
+      "Queue batch for '" + payload.queue + "' dropped: this app declares a queue consumer " +
+      "but exports no `queue` handler, so its messages cannot be processed"
+    );
+    return { failed: allIds, error: "no queue handler exported" };
+  }
+
+  const failed = new Set();
+  const batch = {
+    queue: payload.queue,
+    messages: messages.map((m) => ({
+      id: m.id,
+      body: m.body,
+      attempts: m.attempts,
+      timestamp: m.timestamp,
+      json() { return JSON.parse(m.body); },
+      retry() { failed.add(m.id); },
+      ack() { failed.delete(m.id); },
+    })),
+    retryAll() { for (const id of allIds) failed.add(id); },
+  };
+
+  try {
+    await handler(batch, createServiceContext());
+  } catch (e) {
+    const errorText = e && e.stack ? e.stack : String(e);
+    console.error("Queue handler error on '" + payload.queue + "':", errorText);
+    return { failed: allIds, error: errorText };
+  }
+
+  return { failed: Array.from(failed) };
+};
+
+// ---------------------------------------------------------
+// Scheduled execution (cron)
+// ---------------------------------------------------------
+//
+// A cron expression belongs to an application, not to a node: the control
+// plane keeps the schedule and, when one is due, picks a single healthy node
+// and calls its Trigger/OnScheduled. That lands here.
+//
+// The handler is the module's `scheduled` export:
+//
+//   export async function scheduled(event, context) { ... }
+//
+// `event` is { cron, scheduledTime, type }. A tick is fire-and-forget: it is
+// not retried and it is not made up later if it fails, so anything that must
+// not be missed belongs on a queue that the handler fills.
+globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
+  let handler = globalThis.user_module && globalThis.user_module.scheduled;
+  if (typeof handler !== "function") {
+    const dflt = globalThis.user_module && globalThis.user_module.default;
+    if (dflt && typeof dflt.scheduled === "function") handler = dflt.scheduled;
+  }
+
+  if (typeof handler !== "function") {
+    console.error(
+      "Scheduled trigger for '" + payload.cron + "' did nothing: this app declares a cron " +
+      "expression but exports no `scheduled` handler"
+    );
+    return { ok: false, error: "no scheduled handler exported" };
+  }
+
+  const event = {
+    cron: payload.cron,
+    scheduledTime: payload.scheduledTime,
+    type: "scheduled",
+  };
+
+  try {
+    await handler(event, createServiceContext());
+  } catch (e) {
+    const errorText = e && e.stack ? e.stack : String(e);
+    console.error("Scheduled handler error on '" + payload.cron + "':", errorText);
+    return { ok: false, error: errorText };
+  }
+
+  return { ok: true };
 };
 
 globalThis.__deis_runtime_invoke = async function(requestPayload) {

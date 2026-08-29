@@ -10,9 +10,17 @@ pub enum AppState {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
-    #[serde(default)]
+    /// What the app sees as `context.env`: the plain variables from its
+    /// manifest merged with the secret values the control plane decrypted at
+    /// delivery time.
+    ///
+    /// The values are secrets. They are never serialised (hence
+    /// `skip_serializing`) and never printed (hence the hand-written `Debug`
+    /// below), because this type is reachable from anything that logs or
+    /// returns an [`App`].
+    #[serde(default, skip_serializing)]
     pub env: std::collections::HashMap<String, String>,
 
     pub limits: Option<ResourceLimits>,
@@ -25,6 +33,24 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub permissions: AppPermissions,
+}
+
+/// Prints the shape of the configuration and the *names* of the environment
+/// entries, never a value. One `{:?}` on an `App` somewhere in the crate is
+/// all it would take to put every decrypted secret in the node's log and,
+/// from there, in deis-telemetry.
+impl std::fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&str> = self.env.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        f.debug_struct("AppConfig")
+            .field("env", &format_args!("{names:?} = <redacted>"))
+            .field("limits", &self.limits)
+            .field("resources", &self.resources)
+            .field("routes", &self.routes)
+            .field("permissions", &self.permissions)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -80,6 +80,7 @@ let result = compiler.build().await?;
 | [错误系统](./docs/error-system.zh.md) | 错误分类和处理 |
 | [贡献指南](./docs/contributing.zh.md) | 如何参与项目开发 |
 | [适配器规范](./docs/adapter-specs.zh.md) | 平台适配器开发规范 |
+| [deislet 目标](./docs/deislet-target.zh.md) | 应用包格式与自建平台目标 |
 
 ## 📊 支持的平台
 
@@ -88,7 +89,7 @@ let result = compiler.build().await?;
 | Cloudflare Workers | ✅ 完整支持 | KV, Cache | D1, R2, Queue, Durable Objects |
 | Deno Deploy | ✅ 完整支持 | KV, Cache | - |
 | Tencent EdgeOne | ✅ 完整支持 | KV, Cache | - |
-| Deislet | 🚧 开发中 | KV, Cache | SQL, Blob, Queue |
+| Deislet | 🚧 开发中 | KV, Cache | WebSockets（SQL / Blob / Queue / Cron 可写进包，运行时尚未接通） |
 
 ## 🔗 相关资源
 

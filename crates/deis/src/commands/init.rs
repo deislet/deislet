@@ -27,9 +27,26 @@ pub async fn execute(name: String, _template: String) -> Result<()> {
         },
         "services": {
             "kv": { "enabled": true },
-            "database": { "enabled": false }
+            "database": { "enabled": false },
+            "blob": { "enabled": false },
+            "queue": { "enabled": false }
         },
+        // Static files carried inside the version bundle. A request whose
+        // path names one of them is answered from it without starting an
+        // isolate, and they roll back with the version they belong to.
+        "assets": { "dir": "./public" },
+        // Cron expressions this app wants to be triggered on. Each one needs
+        // a functions/_scheduled.ts handler, or the trigger arrives and
+        // nothing runs.
+        "cron": [],
+        // Queues this app consumes. Each entry needs a functions/_queue.ts
+        // handler, or its messages are leased, handed back, and eventually
+        // dead-lettered.
+        "queues": [],
         "vendors": {
+            // This platform's own target, on by default: a new project should
+            // be deployable to it without editing configuration first.
+            "deislet": { "enabled": true },
             "cloudflare": { "enabled": true },
             "deno": { "enabled": true },
             "tencent": { "enabled": false }
@@ -131,6 +148,20 @@ interface Context {
 
     fs::write(project_dir.join("functions/api/hello.ts"), hello_handler)?;
 
+    // A static file, so a new project shows asset-first working rather than
+    // only describing it: this is what GET / answers with, and no isolate is
+    // started for it.
+    fs::create_dir_all(project_dir.join("public"))?;
+    fs::write(
+        project_dir.join("public/index.html"),
+        format!(
+            "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"utf-8\" />\n    \
+             <title>{name}</title>\n  </head>\n  <body>\n    <h1>{name}</h1>\n    \
+             <p>This page is a static asset in the version bundle. Handlers live under \
+             functions/.</p>\n  </body>\n</html>\n"
+        ),
+    )?;
+
     // Create .env
     fs::write(
         project_dir.join(".env"),
@@ -196,10 +227,24 @@ npm run deploy
 │   ├── index.ts       # Default route (/)
 │   └── api/
 │       └── hello.ts   # API endpoint (/api/hello)
+├── public/             # Static assets, served before any handler runs
+│   └── index.html
 ├── .config.json       # Project configuration
 ├── .env               # Development environment variables
 └── package.json
 ```
+
+A file under `functions/` whose name starts with an underscore is not a route:
+it is a handler the platform calls. Two are recognised, both at the function
+root:
+
+| File | Exported as | Called by |
+|---|---|---|
+| `_queue.ts` | `queue` | the node, with a batch it leased from deis-queue |
+| `_scheduled.ts` | `scheduled` | the control plane, when a `cron` expression is due |
+
+Declare the queue or the schedule in `.config.json` as well; a declaration
+without a handler builds, but warns, because the symptom is otherwise silent.
 "#,
         name, name
     );

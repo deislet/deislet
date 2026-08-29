@@ -1,0 +1,64 @@
+# deis-queue configuration. Every key is optional; the values below are the
+# defaults, so an empty file behaves exactly like this one.
+
+# Address the gRPC server binds to.
+#
+# Loopback on purpose. The service trusts the `x-deis-app-id` header it is
+# handed and has no way to tell one caller from another, so the only thing
+# keeping an unrelated client away from an app's messages is that it cannot
+# reach the port. Binding anything else publishes every app's queue to that
+# network; the service warns at startup when you do.
+listen = "127.0.0.1:8091"
+
+# Directory holding queue.sqlite.
+data_dir = "./data"
+
+# Connections in the SQLite pool, and the ceiling on blocking threads this
+# service occupies.
+connections = 8
+
+# Largest single message body, in bytes. A queue message is a job description,
+# not a payload: anything large belongs in blob storage, with only its key
+# sent through the queue.
+max_body_bytes = 1048576
+
+# Most messages one SendBatch may carry. The batch is one transaction, so this
+# also bounds how long a producer can hold the write lock.
+max_batch_messages = 100
+
+# Lease used when a Pull does not ask for one, in seconds. Pick a lease longer
+# than the handler's worst-case run time: a lease that lapses while the handler
+# is still working causes a second delivery of a message already being handled.
+default_lease_secs = 30
+
+# Ceiling on a requested lease, and on a Nack redelivery delay. Both say how
+# long a message stays invisible.
+max_lease_secs = 3600
+
+# Messages returned when a Pull does not ask for a count, and the ceiling on
+# what it may ask for. The pull ceiling is also the most ids one Ack or Nack
+# may name.
+default_pull_messages = 10
+max_pull_messages = 100
+
+# How many times a message may be delivered before it is dead lettered instead
+# of retried. Delivery is at-least-once, so a handler must be idempotent; this
+# is what stops a message that always fails from being retried forever.
+max_attempts = 5
+
+# How long a dead lettered message is kept, in seconds. Zero keeps it forever,
+# which is the default: dead letters exist to be looked at, and deleting them
+# on a timer would quietly destroy the evidence of why a queue failed. The cost
+# is that the table grows until an operator prunes it.
+dead_letter_retention_secs = 0
+
+# How often expired dead letters are deleted. Only consulted when
+# dead_letter_retention_secs is non-zero.
+dead_letter_sweep_interval_secs = 3600
+
+# Ceiling on how long the server spends on one request before answering with an
+# error, in seconds. Every call is a bounded query against a local SQLite file,
+# so anything approaching this is a wedged writer; without the ceiling such a
+# call would hold a connection pool permit until the process was restarted.
+# Zero disables it, and the service warns at startup when you do.
+request_timeout_secs = 30

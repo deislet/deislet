@@ -11,6 +11,11 @@
 # Values are validated at startup; an out-of-range value stops the node with an
 # explanation instead of failing every request later.
 
+# How this node names itself to the control plane. Unset means "use the
+# hostname". Two nodes on one host must each be given a distinct id, or they
+# would ask for and report on the same assignment list.
+# node_id = "node-a"
+
 # Port serving both HTTP traffic and the gRPC management interface.
 http_port = 8000
 
@@ -60,3 +65,51 @@ max_retries = 3
 # a telemetry outage costs old logs rather than memory. Must be at least
 # batch_size.
 max_pending_entries = 10000
+
+# How this node reaches the control plane to ask what it should be running.
+#
+# On startup it calls GET <endpoint>/api/nodes/<node_id>/assignments, downloads
+# and loads every version named there, and only then reports healthy. With no
+# endpoint set the node never asks anyone: it runs what is already in its bundle
+# directory plus whatever is pushed to it, and reports healthy immediately.
+#
+# A node that cannot reach the control plane keeps serving what it recovered
+# from its own disk, says so at error level, reports UNHEALTHY, and retries with
+# a growing delay. Bundles on disk carry no secrets, so an app that declares any
+# runs without them until the control plane redelivers.
+[control]
+# endpoint = "http://127.0.0.1:8080"
+
+# Seconds one assignment request may take before it is abandoned.
+request_timeout_secs = 30
+
+# Seconds before the first retry after a failure. Later retries back off from
+# here, up to twenty times this value.
+retry_interval_secs = 15
+
+# Downloaded application bundles.
+[bundles]
+# Directory holding them. Unset means "<data_dir>/bundles".
+# dir = "./data/bundles"
+
+# Largest bundle this node accepts. A download is cut off the moment it goes
+# over, so a wrong or hostile URL cannot fill the disk.
+max_bundle_bytes = 268435456
+
+# Seconds one download may take before it is abandoned and the version already
+# running is kept.
+download_timeout_secs = 300
+
+# Serving the static files a bundle carries. A request whose path names one of
+# them is answered from it and never reaches an isolate.
+[assets]
+# Sent with every asset. The default revalidates on each request and lets the
+# ETag (the asset's sha256) turn that into a 304 with no body. Bundle paths are
+# not content-addressed, so a long max-age here would pin a stale file in
+# browser caches across a deploy.
+cache_control = "public, max-age=0, must-revalidate"
+
+# Ceiling on the assets of one version, which are held in memory so that serving
+# one does not reopen the zip. A version above it is refused and whatever is
+# already running stays up.
+max_bytes = 134217728

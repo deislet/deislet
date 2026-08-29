@@ -106,6 +106,23 @@ pub struct Assignment {
     pub bundle_sha: String,
 }
 
+/// One environment's current version together with the manifest text that
+/// version carried.
+///
+/// This is what the cron scheduler works from: which cron expressions an
+/// application wants is a property of the version an environment currently
+/// runs, so it moves with every deploy and rollback and disappears with
+/// the last deployment.
+#[derive(Debug, Clone)]
+pub struct DeployedVersion {
+    pub app_id: String,
+    /// Environment name, `production` or a preview name.
+    pub environment: String,
+    pub version_id: String,
+    /// Verbatim `manifest.json` text of that version.
+    pub manifest: String,
+}
+
 /// Everything deleting an app removed. Returned so the caller can clean up
 /// the bundle files on disk and log exactly how much history was destroyed.
 #[derive(Debug, Clone, Default, Serialize)]

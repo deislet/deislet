@@ -5,6 +5,8 @@ use tracing::{error, info, warn};
 use crate::app::{AppConfig as InternalAppConfig, ApplicationManager};
 use crate::app_repo::{AppPackageStatus, AppRepo};
 use crate::config_store::{ConfigEntry, ConfigStore};
+use crate::deployment::{Applied, DeploymentManager, DeploymentOrder};
+use crate::health::NodeHealth;
 
 use super::proto::runtime_management_server::RuntimeManagement;
 use super::proto::*;
@@ -14,6 +16,8 @@ pub struct RuntimeManagementService {
     app_manager: Arc<ApplicationManager>,
     config_store: Arc<ConfigStore>,
     app_repo: Arc<AppRepo>,
+    deployer: Arc<DeploymentManager>,
+    health: Arc<NodeHealth>,
     node_id: String,
 }
 
@@ -109,14 +113,29 @@ impl RuntimeManagementService {
         app_manager: Arc<ApplicationManager>,
         config_store: Arc<ConfigStore>,
         app_repo: Arc<AppRepo>,
+        deployer: Arc<DeploymentManager>,
+        health: Arc<NodeHealth>,
         node_id: String,
     ) -> Self {
         Self {
             app_manager,
             config_store,
             app_repo,
+            deployer,
+            health,
             node_id,
         }
+    }
+
+    /// The version this node is running for an app, for the "what did you
+    /// keep" half of an `ApplyDeploymentResponse`. Empty when the app is not
+    /// loaded at all, which is what distinguishes "the deploy failed and the
+    /// old version is still up" from "this app is down".
+    fn running_version(&self, app_id: &str) -> String {
+        self.app_manager
+            .installed_version(app_id)
+            .map(|v| v.version_id)
+            .unwrap_or_default()
     }
 }
 
@@ -175,98 +194,80 @@ impl RuntimeManagement for RuntimeManagementService {
         }
     }
 
-    async fn deploy_app(
+    /// Take delivery of one deployment.
+    ///
+    /// The request is a pointer, not a payload: this node downloads the
+    /// bundle, checks it against `bundle_sha`, unpacks it and loads it. Every
+    /// failure short of the final isolate swap leaves the app serving the
+    /// version it was already on, and the response says which version that is.
+    ///
+    /// The request carries decrypted secrets in `env`. It is never logged as a
+    /// whole, and neither is anything derived from it; see
+    /// [`crate::deployment::DeploymentOrder`].
+    async fn apply_deployment(
         &self,
-        request: Request<DeployAppRequest>,
-    ) -> Result<Response<DeployAppResponse>, Status> {
+        request: Request<ApplyDeploymentRequest>,
+    ) -> Result<Response<ApplyDeploymentResponse>, Status> {
         let req = request.into_inner();
         info!(
-            "Deploying app: {} (package size: {} bytes)",
-            req.app_id,
-            req.package_data.len()
+            app_id = %req.app_id,
+            version_id = %req.version_id,
+            environment = %req.environment,
+            bundle_sha = %req.bundle_sha,
+            env_entries = req.env.len(),
+            "Control plane asked this node to run a version"
         );
 
-        let package = match self
-            .app_repo
-            .install_package(req.app_id.clone(), req.package_data)
-            .await
-        {
-            Ok(pkg) => pkg,
-            Err(e) => {
-                error!("Failed to install app package: {}", e);
-                return Ok(Response::new(DeployAppResponse {
-                    success: false,
-                    message: format!("Failed to install app package: {}", e),
-                    app_id: req.app_id,
-                }));
-            }
+        let order = DeploymentOrder {
+            app_id: req.app_id.clone(),
+            version_id: req.version_id.clone(),
+            environment: req.environment,
+            bundle_url: req.bundle_url,
+            bundle_sha: req.bundle_sha,
+            env: req.env,
         };
 
-        let entry_point = &package.manifest.entry_point;
-        let entry_code = match self.app_repo.get_file(&req.app_id, entry_point).await {
-            Ok(Some(bytes)) => match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Entry file is not valid UTF-8: {}", e);
-                    return Ok(Response::new(DeployAppResponse {
-                        success: false,
-                        message: format!("Entry file is not valid UTF-8: {}", e),
-                        app_id: req.app_id,
-                    }));
-                }
-            },
-            Ok(None) => {
-                error!("Entry file does not exist: {}", entry_point);
-                return Ok(Response::new(DeployAppResponse {
-                    success: false,
-                    message: format!("Entry file does not exist: {}", entry_point),
-                    app_id: req.app_id,
-                }));
-            }
-            Err(e) => {
-                error!("Failed to read entry file: {}", e);
-                return Ok(Response::new(DeployAppResponse {
-                    success: false,
-                    message: format!("Failed to read entry file: {}", e),
-                    app_id: req.app_id,
-                }));
-            }
-        };
-
-        let config = map_proto_config(req.config);
-
-        match self
-            .app_manager
-            .load_app(
-                req.app_id.clone(),
-                entry_code,
-                config,
-                Some(entry_point.clone()),
-            )
-            .await
-        {
-            Ok(_) => {
-                info!("App {} deployed successfully", req.app_id);
+        match self.deployer.apply(order).await {
+            Ok(Applied::Installed { reused_bundle }) => {
+                info!(
+                    app_id = %req.app_id,
+                    version_id = %req.version_id,
+                    reused_bundle,
+                    "Deployment applied"
+                );
                 let _ = self
                     .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Deployed)
                     .await;
-                Ok(Response::new(DeployAppResponse {
+                Ok(Response::new(ApplyDeploymentResponse {
                     success: true,
-                    message: "App deployed successfully".to_string(),
-                    app_id: req.app_id,
+                    message: "Deployment applied".to_string(),
+                    version_id: req.version_id,
                 }))
             }
+            Ok(Applied::AlreadyRunning) => Ok(Response::new(ApplyDeploymentResponse {
+                success: true,
+                message: "Already running this version".to_string(),
+                version_id: req.version_id,
+            })),
             Err(e) => {
-                error!("App {} deployment failed: {}", req.app_id, e);
+                let kept = self.running_version(&req.app_id);
+                error!(
+                    app_id = %req.app_id,
+                    version_id = %req.version_id,
+                    kept_version = %kept,
+                    error = %e,
+                    "Deployment rejected; this node did not switch to version {}",
+                    req.version_id
+                );
                 let _ = self
                     .app_repo
                     .update_status(&req.app_id, AppPackageStatus::Failed)
                     .await;
-                Ok(Response::new(DeployAppResponse {
+                Ok(Response::new(ApplyDeploymentResponse {
                     success: false,
-                    message: format!("App deployment failed: {}", e),
-                    app_id: req.app_id,
+                    message: e.to_string(),
+                    version_id: kept,
                 }))
             }
         }
@@ -278,7 +279,10 @@ impl RuntimeManagement for RuntimeManagementService {
     ) -> Result<Response<UnloadAppResponse>, Status> {
         let req = request.into_inner();
         info!("Uninstalling app: {}", req.app_id);
-        match self.app_manager.unload_app(&req.app_id).await {
+        // Through the deployer, so the bundle files and the installed-version
+        // record go with the isolate; otherwise a restart without a reachable
+        // control plane would bring the app back from disk.
+        match self.deployer.unload(&req.app_id).await {
             Ok(_) => {
                 info!("App {} uninstalled successfully", req.app_id);
                 Ok(Response::new(UnloadAppResponse {
@@ -499,14 +503,22 @@ impl RuntimeManagement for RuntimeManagementService {
         }
     }
 
+    /// Report readiness, not liveness.
+    ///
+    /// `healthy` is true only once this node has the control plane's
+    /// assignment list and has loaded everything in it (principle 8). A node
+    /// that is up and serving versions it recovered from its own disk answers
+    /// false with the reason in `details`, so that the control plane never
+    /// mistakes "still running yesterday's version" for "running what I told
+    /// it to".
     async fn health_check(
         &self,
         _request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckResponse>, Status> {
         Ok(Response::new(HealthCheckResponse {
-            healthy: true,
+            healthy: self.health.is_healthy(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            details: Default::default(),
+            details: self.health.details(),
         }))
     }
 }

@@ -52,6 +52,10 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6.0"
 structopt = "0.3"
+
+# Cron expression parsing (5 fields, Quartz-like), the same crate the
+# runtime's own cron support is built on.
+saffron = "0.1"
 hex = "0.4"
 sha2 = "0.10"
 rand = "0.8"

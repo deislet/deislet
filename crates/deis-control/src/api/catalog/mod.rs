@@ -20,55 +20,16 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::{HeaderMap, header},
     routing::{get, post, put},
 };
-use tracing::warn;
 
 use crate::catalog::{BundleStore, CatalogStore, SecretsBackend};
+use crate::delivery::DeploymentDeliverer;
 
 /// Largest bundle the control plane will accept in one upload. Bundles
 /// carry the worker code plus every static asset, so this is generous;
 /// what it stops is a client streaming an unbounded body into memory.
 pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
-
-/// How the control plane names itself to nodes.
-///
-/// Nodes fetch bundles over HTTP from an absolute URL, so the assignment
-/// list has to contain an address that is reachable from the node, not
-/// from the control plane's own point of view.
-#[derive(Debug, Clone)]
-pub struct PublicAddress {
-    /// Explicit `public_base_url` from the config. Always wins.
-    pub configured: Option<String>,
-    /// Scheme to pair with the request's Host header.
-    pub scheme: &'static str,
-    /// Last resort, derived from the bind address.
-    pub fallback: String,
-}
-
-impl PublicAddress {
-    /// Resolve the base URL bundle links are built from.
-    ///
-    /// Preference order: the configured value, then the `Host` header of
-    /// the request being served (whatever the caller used to reach us is
-    /// by definition reachable for them), then the bind address.
-    pub fn resolve(&self, headers: &HeaderMap) -> String {
-        if let Some(configured) = &self.configured {
-            return configured.trim_end_matches('/').to_string();
-        }
-        if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok())
-            && !host.is_empty()
-        {
-            return format!("{}://{}", self.scheme, host);
-        }
-        warn!(
-            fallback = %self.fallback,
-            "Request carried no usable Host header and public_base_url is unset; bundle URLs fall back to the bind address, which nodes on another host cannot reach"
-        );
-        self.fallback.clone()
-    }
-}
 
 /// Shared state of every catalog endpoint.
 #[derive(Clone)]
@@ -76,12 +37,9 @@ pub struct CatalogState {
     pub store: Arc<CatalogStore>,
     pub bundles: Arc<BundleStore>,
     pub secrets: Arc<SecretsBackend>,
-    pub address: Arc<PublicAddress>,
-}
-
-/// Absolute URL a node uses to download one version's bundle.
-pub fn bundle_url(base: &str, app_id: &str, version_id: &str) -> String {
-    format!("{base}/api/apps/{app_id}/versions/{version_id}/bundle")
+    /// Pushes a deployment out to the nodes. Deploy, rollback and secret
+    /// change all end here; see [`crate::delivery`].
+    pub deliverer: Arc<DeploymentDeliverer>,
 }
 
 /// Build the catalog half of the API router. The caller merges it into the
@@ -158,6 +116,8 @@ pub(crate) mod tests {
     use crate::catalog::bundle::tests::sample_bundle;
     use crate::catalog::{SecretCipher, secrets::MASTER_KEY_LEN};
     use crate::database::Database;
+    use crate::delivery::PublicAddress;
+    use crate::runtime_client::RuntimeNodeManager;
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -179,15 +139,30 @@ pub(crate) mod tests {
         } else {
             SecretsBackend::Unavailable("no key file in this test".to_string())
         };
+        let store = Arc::new(CatalogStore::new(database));
+        let secrets = Arc::new(secrets);
+        let address = Arc::new(PublicAddress {
+            configured: Some("http://control.test".to_string()),
+            scheme: "http",
+            fallback: "http://127.0.0.1:8080".to_string(),
+        });
         let state = CatalogState {
-            store: Arc::new(CatalogStore::new(database)),
+            store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
-            secrets: Arc::new(secrets),
-            address: Arc::new(PublicAddress {
-                configured: Some("http://control.test".to_string()),
-                scheme: "http",
-                fallback: "http://127.0.0.1:8080".to_string(),
-            }),
+            secrets: Arc::clone(&secrets),
+            // No runtime nodes: a delivery is reported as skipped, which
+            // is exactly the shape these tests want to see travel through
+            // the deploy and secret endpoints.
+            deliverer: Arc::new(DeploymentDeliverer::new(
+                store,
+                secrets,
+                Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
+                address,
+                crate::delivery::StorageEndpoints {
+                    store: Some("http://127.0.0.1:8090".to_string()),
+                    queue: None,
+                },
+            )),
         };
         Harness {
             router: router(state),
@@ -363,6 +338,13 @@ pub(crate) mod tests {
             format!("http://control.test/api/apps/demo/versions/{v2}/bundle")
         );
         assert!(assignments[0]["bundle_sha"].as_str().unwrap().len() == 64);
+        // The list carries the environment a push would have carried. Without
+        // it a node that restarts loads the right code with no storage
+        // address and no secret, and only its ctx.services calls tell it so.
+        assert_eq!(
+            assignments[0]["env"][deis_wire::conventions::STORE_ENDPOINT_ENV],
+            "http://127.0.0.1:8090"
+        );
 
         // Rollback without a target goes back to the previous version and
         // leaves both deployment rows in place.
@@ -632,25 +614,5 @@ pub(crate) mod tests {
 
         let (_, body) = json(router, "GET", "/api/nodes/node-a/assignments", Value::Null).await;
         assert_eq!(body.as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn public_address_prefers_configuration_then_host_header() {
-        let address = PublicAddress {
-            configured: Some("https://deis.example.com/".to_string()),
-            scheme: "http",
-            fallback: "http://127.0.0.1:8080".to_string(),
-        };
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "node-view:9000".parse().unwrap());
-        assert_eq!(address.resolve(&headers), "https://deis.example.com");
-
-        let address = PublicAddress {
-            configured: None,
-            scheme: "http",
-            fallback: "http://127.0.0.1:8080".to_string(),
-        };
-        assert_eq!(address.resolve(&headers), "http://node-view:9000");
-        assert_eq!(address.resolve(&HeaderMap::new()), "http://127.0.0.1:8080");
     }
 }

@@ -3,6 +3,8 @@ use std::sync::Arc;
 use crate::app::ApplicationManager;
 use crate::app_repo::AppRepo;
 use crate::config_store::ConfigStore;
+use crate::deployment::DeploymentManager;
+use crate::health::NodeHealth;
 
 use super::proto::runtime_management_server::RuntimeManagementServer as ProtoServer;
 use super::service::RuntimeManagementService;
@@ -15,9 +17,18 @@ impl ManagementServer {
         app_manager: Arc<ApplicationManager>,
         config_store: Arc<ConfigStore>,
         app_repo: Arc<AppRepo>,
+        deployer: Arc<DeploymentManager>,
+        health: Arc<NodeHealth>,
         node_id: String,
     ) -> ProtoServer<RuntimeManagementService> {
-        let service = RuntimeManagementService::new(app_manager, config_store, app_repo, node_id);
+        let service = RuntimeManagementService::new(
+            app_manager,
+            config_store,
+            app_repo,
+            deployer,
+            health,
+            node_id,
+        );
         ProtoServer::new(service)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)

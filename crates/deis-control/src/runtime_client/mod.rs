@@ -5,9 +5,19 @@
 //! like deis-proxy does. This module keeps the list of configured deis-runtime nodes,
 //! polls their health in the background, and offers typed helpers used by
 //! the REST API layer.
+//!
+//! This is the transport half of talking to a node. What to send and when
+//! is decided next door: [`crate::delivery`] for deployments,
+//! [`crate::scheduler`] for cron fires.
 
 pub mod proto {
     tonic::include_proto!("deis.management");
+}
+
+/// The invocation API of a node: queue and scheduled events. Only the cron
+/// half is used from here.
+pub mod trigger {
+    tonic::include_proto!("deis.trigger");
 }
 
 use std::sync::Arc;
@@ -21,13 +31,24 @@ use tracing::{debug, info, warn};
 
 use crate::config::RuntimeNodeConfig;
 use proto::runtime_management_client::RuntimeManagementClient;
+use trigger::trigger_client::TriggerClient;
 
 /// Connection timeout for a single management call. Nodes are on the same
 /// network segment as the control; anything slower than this is down.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// Per-RPC deadline. Deploys upload a package, so it is more generous.
+/// Per-RPC deadline for the small calls: health, status, unload.
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
-const DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Deadline for applying a deployment. The message itself is a pointer,
+/// but the node downloads and verifies the bundle before it answers, so
+/// this has to cover fetching a version over HTTP.
+const APPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Deadline for a scheduled trigger.
+///
+/// Deliberately longer than the node's own execution ceiling (30s by
+/// default). A shorter deadline would report a slow-but-successful cron
+/// run as a failure, and the scheduler would hand the same fire to another
+/// node - running the job twice, which is worse than reporting it late.
+const TRIGGER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Raise both message limits from the tonic default of 4 MB.
 ///
@@ -97,6 +118,54 @@ impl RuntimeNodeManager {
         self.nodes.iter().find(|n| n.id == id)
     }
 
+    /// Every configured node id, in configuration order.
+    ///
+    /// This is the delivery fan-out: every node runs every application
+    /// (architecture principle 2), so a deployment goes to all of them.
+    pub fn ids(&self) -> Vec<String> {
+        self.nodes.iter().map(|n| n.id.clone()).collect()
+    }
+
+    /// Node ids ordered for a call that only needs to reach *one* node.
+    ///
+    /// Nodes last seen healthy come first, rotated by `rotation` so
+    /// repeated fires spread over the fleet instead of always landing on
+    /// the first entry. Nodes not currently known to be healthy are kept
+    /// at the back rather than dropped: the health cache is up to one poll
+    /// interval old, and at startup nothing has been probed yet, so
+    /// dropping them would silently skip work a live node could have done.
+    pub fn call_order(&self, rotation: usize) -> Vec<String> {
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
+        let healthy: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|n| self.health.get(&n.id).map(|h| h.healthy).unwrap_or(false))
+            .map(|n| n.id.clone())
+            .collect();
+        let unhealthy: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|n| !self.health.get(&n.id).map(|h| h.healthy).unwrap_or(false))
+            .map(|n| n.id.clone())
+            .collect();
+
+        let mut ordered = Vec::with_capacity(self.nodes.len());
+        if !healthy.is_empty() {
+            let start = rotation % healthy.len();
+            ordered.extend(healthy[start..].iter().cloned());
+            ordered.extend(healthy[..start].iter().cloned());
+        }
+        ordered.extend(unhealthy);
+        ordered
+    }
+
+    /// Whether this node was healthy at the last probe.
+    pub fn is_healthy(&self, id: &str) -> bool {
+        self.health.get(id).map(|h| h.healthy).unwrap_or(false)
+    }
+
     /// Snapshot of all nodes with their cached health for the REST API.
     pub fn list(&self) -> Vec<NodeView> {
         self.nodes
@@ -113,16 +182,20 @@ impl RuntimeNodeManager {
             .collect()
     }
 
-    async fn connect(&self, id: &str) -> Result<RuntimeManagementClient<Channel>, NodeError> {
+    /// Open a channel to one node with the deadline this kind of call needs.
+    async fn channel(&self, id: &str, rpc_timeout: Duration) -> Result<Channel, NodeError> {
         let node = self.node(id).ok_or(NodeError::UnknownNode)?;
-        let endpoint = Endpoint::from_shared(node.addr.clone())
+        Endpoint::from_shared(node.addr.clone())
             .map_err(|e| NodeError::Transport(format!("invalid endpoint {}: {e}", node.addr)))?
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(RPC_TIMEOUT);
-        let channel = endpoint
+            .timeout(rpc_timeout)
             .connect()
             .await
-            .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))?;
+            .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))
+    }
+
+    async fn connect(&self, id: &str) -> Result<RuntimeManagementClient<Channel>, NodeError> {
+        let channel = self.channel(id, RPC_TIMEOUT).await?;
         Ok(with_message_limits(RuntimeManagementClient::new(channel)))
     }
 
@@ -171,44 +244,93 @@ impl RuntimeNodeManager {
         Ok(resp.into_inner())
     }
 
-    /// Deploy an application package (ZIP with a manifest.json) to a node.
-    pub async fn deploy_app(
+    /// Tell one node which version of an app it should be running.
+    ///
+    /// Only the pointer travels: the node downloads the bundle from
+    /// `bundle_url` itself and checks it against `bundle_sha`
+    /// (docs/implementation-plan.zh.md section 4). The request is built by
+    /// [`crate::delivery`], which is where variables and decrypted secrets
+    /// are merged.
+    ///
+    /// Never log, print or store `request` as a whole: its `env` map holds
+    /// secret values in the clear and prost's `Debug` would render every
+    /// one of them. The individual fields logged below are all safe.
+    pub async fn apply_deployment(
+        &self,
+        id: &str,
+        request: proto::ApplyDeploymentRequest,
+    ) -> Result<proto::ApplyDeploymentResponse, NodeError> {
+        let channel = self.channel(id, APPLY_TIMEOUT).await?;
+        let mut client = with_message_limits(RuntimeManagementClient::new(channel));
+
+        let (app_id, environment, version_id) = (
+            request.app_id.clone(),
+            request.environment.clone(),
+            request.version_id.clone(),
+        );
+        debug!(
+            node = id,
+            app_id = %app_id,
+            environment = %environment,
+            version_id = %version_id,
+            bundle_sha = %request.bundle_sha,
+            env_entries = request.env.len(),
+            "Sending deployment pointer to runtime node; it downloads the bundle itself"
+        );
+
+        let resp = client
+            .apply_deployment(request)
+            .await
+            .map_err(NodeError::from_status)?
+            .into_inner();
+
+        if resp.success {
+            info!(
+                node = id,
+                app_id = %app_id,
+                environment = %environment,
+                version_id = %version_id,
+                "Node applied the deployment and now serves this version"
+            );
+        } else {
+            warn!(
+                node = id,
+                app_id = %app_id,
+                environment = %environment,
+                version_id = %version_id,
+                running_version = %resp.version_id,
+                message = %resp.message,
+                "Node rejected the deployment; it keeps serving the version it had"
+            );
+        }
+        Ok(resp)
+    }
+
+    /// Fire one scheduled event on one node.
+    ///
+    /// Exactly one node runs a given cron occurrence (architecture
+    /// principle 6); picking which one is the scheduler's job.
+    pub async fn trigger_scheduled(
         &self,
         id: &str,
         app_id: &str,
-        package: Vec<u8>,
-    ) -> Result<proto::DeployAppResponse, NodeError> {
-        let node = self.node(id).ok_or(NodeError::UnknownNode)?;
-        let endpoint = Endpoint::from_shared(node.addr.clone())
-            .map_err(|e| NodeError::Transport(format!("invalid endpoint {}: {e}", node.addr)))?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(DEPLOY_TIMEOUT);
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))?;
-        let mut client = with_message_limits(RuntimeManagementClient::new(channel));
+        cron: &str,
+        scheduled_time: DateTime<Utc>,
+    ) -> Result<trigger::TriggerResponse, NodeError> {
+        let channel = self.channel(id, TRIGGER_TIMEOUT).await?;
+        let mut client = TriggerClient::new(channel)
+            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
-        info!(
-            node = id,
-            app_id,
-            package_bytes = package.len(),
-            "Deploying app to deis_runtime node"
-        );
         let resp = client
-            .deploy_app(proto::DeployAppRequest {
+            .on_scheduled(trigger::ScheduledEvent {
                 app_id: app_id.to_string(),
-                package_data: package,
-                config: None,
+                scheduled_time: scheduled_time.timestamp_millis(),
+                cron: cron.to_string(),
             })
             .await
             .map_err(NodeError::from_status)?
             .into_inner();
-        if resp.success {
-            info!(node = id, app_id, "App deployed");
-        } else {
-            warn!(node = id, app_id, message = %resp.message, "Deploy rejected by node");
-        }
         Ok(resp)
     }
 
@@ -284,5 +406,64 @@ pub enum NodeError {
 impl NodeError {
     fn from_status(status: tonic::Status) -> Self {
         NodeError::Rpc(format!("{}: {}", status.code(), status.message()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager(ids: &[&str]) -> RuntimeNodeManager {
+        RuntimeNodeManager::new(
+            ids.iter()
+                .map(|id| RuntimeNodeConfig {
+                    id: (*id).to_string(),
+                    addr: format!("http://127.0.0.1:{}", 9000 + id.len()),
+                })
+                .collect(),
+            15,
+        )
+    }
+
+    fn mark_healthy(manager: &RuntimeNodeManager, id: &str, healthy: bool) {
+        manager.health.insert(
+            id.to_string(),
+            NodeHealth {
+                healthy,
+                version: None,
+                last_checked: Some(Utc::now()),
+                last_error: None,
+            },
+        );
+    }
+
+    #[test]
+    fn call_order_puts_healthy_nodes_first_and_rotates_them() {
+        let manager = manager(&["a", "bb", "ccc"]);
+        mark_healthy(&manager, "a", true);
+        mark_healthy(&manager, "bb", false);
+        mark_healthy(&manager, "ccc", true);
+
+        // Healthy first, unhealthy still listed so a stale cache never
+        // means "do not run this at all".
+        assert_eq!(manager.call_order(0), vec!["a", "ccc", "bb"]);
+        assert_eq!(manager.call_order(1), vec!["ccc", "a", "bb"]);
+        assert_eq!(manager.call_order(2), vec!["a", "ccc", "bb"]);
+    }
+
+    #[test]
+    fn call_order_falls_back_to_every_node_when_none_is_known_healthy() {
+        let manager = manager(&["a", "bb"]);
+        // Nothing probed yet: both are "not checked yet", not "dead".
+        assert_eq!(manager.call_order(0), vec!["a", "bb"]);
+        assert!(manager.ids() == vec!["a".to_string(), "bb".to_string()]);
+        assert!(!manager.is_healthy("a"));
+    }
+
+    #[test]
+    fn call_order_of_an_empty_fleet_is_empty() {
+        let manager = manager(&[]);
+        assert!(manager.call_order(0).is_empty());
+        assert!(manager.is_empty());
     }
 }

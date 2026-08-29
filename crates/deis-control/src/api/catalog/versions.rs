@@ -127,8 +127,8 @@ pub async fn upload_version(
         "Bundle upload accepted"
     );
 
-    let base = state.address.resolve(&headers);
-    let bundle_url = super::bundle_url(&base, &app_id, &version.id);
+    let base = state.deliverer.base_url(&headers);
+    let bundle_url = crate::delivery::bundle_url(&base, &app_id, &version.id);
     let status = if created {
         StatusCode::CREATED
     } else {

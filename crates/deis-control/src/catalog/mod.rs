@@ -34,7 +34,10 @@ pub mod store;
 
 pub use bundle::{BundleStore, StoredBundle};
 pub use deis_bundle::Manifest as BundleManifest;
-pub use model::{App, Assignment, DeletedApp, Deployment, Environment, Route, SecretMeta, Version};
+pub use model::{
+    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, Route, SecretMeta,
+    Version,
+};
 pub use secrets::{SecretCipher, SecretsBackend};
 pub use store::CatalogStore;
 

@@ -5,6 +5,8 @@ pub mod handlers;
 use crate::app::ApplicationManager;
 use crate::app_repo::AppRepo;
 use crate::config_store::ConfigStore;
+use crate::deployment::DeploymentManager;
+use crate::health::NodeHealth;
 use crate::management::ManagementServer;
 use crate::trigger::TriggerServer;
 use anyhow::Result;
@@ -31,6 +33,10 @@ pub struct ServerOptions {
     pub app_manager: Arc<ApplicationManager>,
     pub config_store: Arc<ConfigStore>,
     pub app_repo: Arc<AppRepo>,
+    /// Takes delivery of deployments pushed to this node.
+    pub deployer: Arc<DeploymentManager>,
+    /// Readiness, which the `HealthCheck` RPC reports.
+    pub health: Arc<NodeHealth>,
     pub node_id: String,
     pub port: u16,
 
@@ -100,6 +106,8 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         app_manager,
         config_store,
         app_repo,
+        deployer,
+        health,
         node_id,
         port,
         shutdown_grace,
@@ -110,8 +118,14 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     };
 
     // Create gRPC services
-    let management_service =
-        ManagementServer::create_service(app_manager.clone(), config_store, app_repo, node_id);
+    let management_service = ManagementServer::create_service(
+        app_manager.clone(),
+        config_store,
+        app_repo,
+        deployer,
+        health,
+        node_id,
+    );
     let trigger_service = TriggerServer::create_service(app_manager.clone());
 
     // Combine gRPC services
@@ -194,25 +208,6 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         }
     }
 
-    // Preload test application (optional)
-    let test_app_code = r#"
- export default function handler(context) {
-   return new Response("Hello from x-deis-app-id: hello! Path: " + context.request.url);
- }
-"#;
-    match app_manager
-        .load_app(
-            "hello".to_string(),
-            test_app_code.to_string(),
-            crate::app::AppConfig::default(),
-            None,
-        )
-        .await
-    {
-        Ok(_) => info!("✅ Test application loaded (app_id: hello)"),
-        Err(e) => tracing::warn!("⚠️ Failed to load test application: {}", e),
-    }
-
     info!("====================================");
     info!("✅ Runtime Platform is ready!");
     info!("📡 HTTP Server: http://localhost:{}", port);
@@ -277,3 +272,7 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "handlers_test.rs"]
+mod handlers_test;

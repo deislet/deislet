@@ -18,9 +18,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::model::{
-    App, Assignment, DeletedApp, Deployment, Environment, Route, SecretMeta, Version, now_secs,
-    validate_app_id, validate_environment_name, validate_host, validate_path_prefix,
-    validate_secret_name,
+    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, Route, SecretMeta,
+    Version, now_secs, validate_app_id, validate_environment_name, validate_host,
+    validate_path_prefix, validate_secret_name,
 };
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
@@ -812,6 +812,42 @@ impl CatalogStore {
             "Assembled the current assignment list"
         );
         Ok(assignments)
+    }
+
+    /// The same set of environments as [`Self::list_assignments`], but
+    /// carrying each version's manifest text instead of its digest.
+    ///
+    /// The cron scheduler reads its whole task list from this: a cron
+    /// expression belongs to an application, and which expressions are
+    /// active is whatever the currently deployed version declares.
+    pub async fn list_deployed_versions(&self) -> CatalogResult<Vec<DeployedVersion>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT e.app_id, e.name, d.version_id, v.manifest
+                 FROM environments e
+                 JOIN deployments d ON d.id = (
+                     SELECT inner_d.id FROM deployments inner_d
+                     WHERE inner_d.env_id = e.id
+                     ORDER BY inner_d.created_at DESC, inner_d.rowid DESC LIMIT 1
+                 )
+                 JOIN versions v ON v.id = d.version_id
+                 ORDER BY e.app_id, e.name",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(DeployedVersion {
+                    app_id: row.get(0)?,
+                    environment: row.get(1)?,
+                    version_id: row.get(2)?,
+                    manifest: row.get(3)?,
+                })
+            })?;
+            let mut deployed = Vec::new();
+            for row in rows {
+                deployed.push(row?);
+            }
+            Ok(deployed)
+        })
+        .await
     }
 }
 

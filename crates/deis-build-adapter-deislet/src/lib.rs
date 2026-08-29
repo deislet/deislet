@@ -1,0 +1,98 @@
+//! The Deislet adapter: build an app for the platform this toolchain belongs
+//! to.
+//!
+//! The other three adapters translate an edge-canon project into someone
+//! else's deployable - a Worker, a Deno Deploy project, an EdgeOne function.
+//! This one targets deis-runtime, and its output is the application bundle
+//! defined in `docs/implementation-plan.zh.md` section 2:
+//!
+//! ```text
+//! manifest.json        what the app is, and everything a node needs before it loads it
+//! worker/index.js      the bundled entry module, one ESM file
+//! assets/              static files, directory structure preserved
+//! ```
+//!
+//! Two properties are load-bearing and are what most of this crate is about:
+//!
+//! * **One definition of the format.** The manifest is built from
+//!   [`deis_bundle::Manifest`], the same type deis-control parses and
+//!   deis-runtime loads. A private copy of the shape would drift, and the
+//!   symptom would be a bundle that uploads and then refuses to run.
+//! * **Reproducibility.** The bundle's digest is part of a version's identity,
+//!   so the same input has to produce the same bytes. See [`archive`].
+//!
+
+mod archive;
+mod assets;
+mod entry;
+mod manifest;
+mod routing;
+
+pub use archive::{bundle_sha256, write_bundle, BUNDLE_FILE_NAME};
+pub use assets::{collect_assets, StagedAsset};
+pub use entry::generate_entry_module;
+pub use manifest::{build_manifest, RUNTIME_PROFILE, WORKER_ENTRY};
+pub use routing::{plan_routes, RouteEntry, RoutePlan, QUEUE_HANDLER_STEM, SCHEDULED_HANDLER_STEM};
+
+use deis_build_core::{AdapterArtifacts, ProjectConfig};
+
+/// Generate the entry module for a set of handlers.
+///
+/// Same shape as every other adapter's `generate`, so the compiler can call
+/// them uniformly: it takes `(route pattern, import path)` pairs and returns
+/// the sources to bundle.
+///
+/// Two of `AdapterArtifacts`' fields stay empty here, and that is deliberate
+/// rather than unfinished:
+///
+/// * `context_builder_code` - deis-runtime builds the context itself and hands
+///   it to the entry module, so the bridging code lives inside the entry
+///   rather than in a module the entry imports.
+/// * `config_files` - a bundle has no per-vendor configuration file. Everything
+///   a node needs is in `manifest.json`, which is built separately because it
+///   has to describe the *bundled* output, including assets the compiler has
+///   not collected yet at this point.
+pub fn generate(
+    routes: &[(String, String)],
+    _config: &ProjectConfig,
+) -> anyhow::Result<AdapterArtifacts> {
+    let plan = plan_routes(routes);
+
+    Ok(AdapterArtifacts {
+        router_code: generate_entry_module(&plan),
+        context_builder_code: String::new(),
+        kv_adapter_code: None,
+        config_files: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> ProjectConfig {
+        serde_json::from_value(serde_json::json!({
+            "version": "1.0",
+            "name": "demo",
+            "runtime": "standard-v1",
+            "language": "typescript"
+        }))
+        .expect("config parses")
+    }
+
+    #[test]
+    fn generate_returns_an_entry_module_and_nothing_else() {
+        let routes = vec![("/".to_string(), "../src/index.ts".to_string())];
+        let artifacts = generate(&routes, &config()).unwrap();
+
+        assert!(artifacts.router_code.contains("export default"));
+        assert!(
+            artifacts.context_builder_code.is_empty(),
+            "the runtime builds the context; the entry module refines it in place"
+        );
+        assert!(
+            artifacts.config_files.is_empty(),
+            "a bundle has no vendor config file"
+        );
+    }
+}

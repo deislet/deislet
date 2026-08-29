@@ -97,19 +97,21 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let metrics_collector = Arc::new(deis_control::MetricsCollector::new(Arc::clone(&sessions)));
 
-    let scheduler = Arc::new(deis_control::CronScheduler::new(
-        Arc::clone(&command_executor),
-        Some(Arc::clone(&db)),
-        60,
-    ));
-    let scheduler_task = Arc::clone(&scheduler).start().await;
-    info!("Cron scheduler started");
-
     let deis_runtime_manager = Arc::new(deis_control::RuntimeNodeManager::new(
         api_config.deis_runtime_nodes.clone(),
         api_config.deis_runtime_poll_interval,
     ));
     let runtime_poll_task = tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop());
+
+    // Cron tasks are derived from the catalog - the manifest of whatever
+    // version each environment currently runs - and fired directly at one
+    // runtime node, so the scheduler needs both of those and nothing else.
+    let scheduler = Arc::new(deis_control::CronScheduler::new(
+        Arc::new(deis_control::CatalogStore::new(Arc::clone(&db))),
+        Arc::clone(&deis_runtime_manager),
+        api_config.cron_tick_seconds,
+    ));
+    let scheduler_task = Arc::clone(&scheduler).start().await;
 
     let api = deis_control::api::build_api_router(
         sessions,

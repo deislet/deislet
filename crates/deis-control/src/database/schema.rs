@@ -189,37 +189,15 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Cron tasks table
-    conn.execute(
-        r#"
-        CREATE TABLE IF NOT EXISTS cron_tasks (
-            id TEXT PRIMARY KEY,
-            node_id TEXT NOT NULL,
-            cron_expr TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            last_run TEXT,
-            next_run TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
-        )
-        "#,
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cron_tasks_node ON cron_tasks(node_id)",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cron_tasks_next_run ON cron_tasks(next_run)",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cron_tasks_enabled ON cron_tasks(enabled)",
-        [],
-    )?;
+    // The cron_tasks table this schema used to create is deliberately gone.
+    //
+    // It keyed a schedule by node_id, which was the wrong object: a cron
+    // trigger belongs to an application, and which node runs an occurrence
+    // is decided when it fires (architecture principle 6). The expressions
+    // now come from the manifest of the version each environment currently
+    // runs, so they are derived from the catalog and there is nothing to
+    // persist. An old database keeps the empty table; nothing reads it.
+    conn.execute("DROP TABLE IF EXISTS cron_tasks", [])?;
 
     // ------------------------------------------------------------------
     // Catalog tables, the product model of docs/implementation-plan.zh.md
@@ -406,7 +384,6 @@ mod tests {
             "heartbeats",
             "commands",
             "events",
-            "cron_tasks",
             "apps",
             "versions",
             "environments",

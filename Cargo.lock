@@ -1858,20 +1858,26 @@ dependencies = [
  "colored",
  "deis-build-adapter-cf",
  "deis-build-adapter-dc",
+ "deis-build-adapter-deislet",
  "deis-build-adapter-eo",
  "deis-build-core",
+ "deis-bundle",
+ "hex",
  "indicatif",
  "serde",
  "serde_json",
+ "sha2",
  "swc_common 18.0.1",
  "swc_core",
  "swc_ecma_ast 20.0.1",
  "swc_ecma_parser 33.0.1",
  "swc_ecma_visit 20.0.0",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "walkdir",
+ "zip",
 ]
 
 [[package]]
@@ -1895,6 +1901,21 @@ dependencies = [
  "serde",
  "serde_json",
  "walkdir",
+]
+
+[[package]]
+name = "deis-build-adapter-deislet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deis-build-core",
+ "deis-bundle",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "walkdir",
+ "zip",
 ]
 
 [[package]]
@@ -1955,6 +1976,7 @@ dependencies = [
  "rust-embed",
  "rustls 0.23.28",
  "rustls-pemfile",
+ "saffron",
  "serde",
  "serde_json",
  "sha2",
@@ -2014,8 +2036,9 @@ dependencies = [
  "prost",
  "rusqlite",
  "serde",
- "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tonic-build",
@@ -2033,8 +2056,10 @@ dependencies = [
  "arc-swap",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "dashmap 5.5.3",
+ "deis-bundle",
  "deis-store",
  "deis-wire",
  "deno_ast",
@@ -2042,6 +2067,7 @@ dependencies = [
  "deno_error",
  "deno_runtime",
  "futures-util",
+ "hex",
  "hostname",
  "http-body-util",
  "hyper 1.8.1",
@@ -8425,6 +8451,7 @@ dependencies = [
  "bytes",
  "encoding_rs",
  "futures-core",
+ "futures-util",
  "h2 0.4.13",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -8446,12 +8473,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-util",
  "tower 0.5.2",
  "tower-http 0.6.8",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -11680,6 +11709,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbc538057e648b67f72a982e708d485b2efa771e1ac05fec311f9f63e5800db4"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

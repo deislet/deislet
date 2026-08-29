@@ -75,6 +75,7 @@ pub use deis_build_core::{
 // Re-export adapters
 pub use deis_build_adapter_cf as adapter_cf;
 pub use deis_build_adapter_dc as adapter_dc;
+pub use deis_build_adapter_deislet as adapter_deislet;
 pub use deis_build_adapter_eo as adapter_eo;
 
 // Export the main compiler interface

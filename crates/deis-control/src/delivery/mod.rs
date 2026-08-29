@@ -1,0 +1,1001 @@
+//! Deployment delivery: telling nodes what to run.
+//!
+//! The rule is small message, large data fetched by the receiver
+//! (docs/implementation-plan.zh.md section 4). The control plane sends a
+//! pointer - app, version, environment, bundle URL, digest, environment
+//! variables - and the node downloads the bundle over HTTP itself. The
+//! bundle never travels inside a gRPC message: an application with real
+//! static assets is megabytes, and one call carrying all of it hit the
+//! tonic message ceiling instead of failing gracefully.
+//!
+//! Three things start a delivery:
+//!
+//! * a deployment, which moves an environment onto another version;
+//! * a rollback, which is the same operation aimed backwards;
+//! * a secret change, which produces no new version at all but must still
+//!   reach the nodes, because the value they hold in memory is now stale.
+//!
+//! Secrets are decrypted here and nowhere else, at the moment of sending.
+//! They are never stored decrypted, never returned by a read API, and
+//! never logged - which is why [`DeploymentPayload`] has a hand-written
+//! `Debug` and why the proto request built from it must not be printed.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use axum::http::{HeaderMap, header};
+use serde::Serialize;
+use tracing::{debug, error, info, warn};
+
+use crate::catalog::secrets::secret_aad;
+use crate::catalog::{
+    CatalogError, CatalogResult, CatalogStore, Environment, SecretsBackend, Version,
+};
+use crate::runtime_client::{RuntimeNodeManager, proto};
+
+/// How the control plane names itself to nodes.
+///
+/// Nodes fetch bundles over HTTP from an absolute URL, so both the
+/// assignment list and every deployment push have to carry an address that
+/// is reachable from the node, not from the control plane's own point of
+/// view.
+#[derive(Debug, Clone)]
+pub struct PublicAddress {
+    /// Explicit `public_base_url` from the config. Always wins.
+    pub configured: Option<String>,
+    /// Scheme to pair with the request's Host header.
+    pub scheme: &'static str,
+    /// Last resort, derived from the bind address.
+    pub fallback: String,
+}
+
+impl PublicAddress {
+    /// Resolve the base URL bundle links are built from.
+    ///
+    /// Preference order: the configured value, then the `Host` header of
+    /// the request being served (whatever the caller used to reach us is
+    /// by definition reachable for them), then the bind address.
+    pub fn resolve(&self, headers: &HeaderMap) -> String {
+        if let Some(configured) = &self.configured {
+            return configured.trim_end_matches('/').to_string();
+        }
+        if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok())
+            && !host.is_empty()
+        {
+            return format!("{}://{}", self.scheme, host);
+        }
+        warn!(
+            fallback = %self.fallback,
+            "Request carried no usable Host header and public_base_url is unset; bundle URLs fall back to the bind address, which nodes on another host cannot reach"
+        );
+        self.fallback.clone()
+    }
+}
+
+/// Absolute URL a node uses to download one version's bundle.
+pub fn bundle_url(base: &str, app_id: &str, version_id: &str) -> String {
+    format!("{base}/api/apps/{app_id}/versions/{version_id}/bundle")
+}
+
+/// Where the platform's storage services live, as a node has to dial them.
+///
+/// The control plane owns these addresses; a node never reads them from its
+/// own file (docs/architecture.zh.md section 6). They travel in the same `env`
+/// map as an application's variables, under the two reserved keys spelled once
+/// in [`deis_wire::conventions`], and deis-runtime lifts them back out before
+/// the application sees the map.
+///
+/// Unset means "this platform has no such service": the deployment still goes
+/// out, the application still loads, and only its `ctx.services` calls fail -
+/// which is better than refusing to deploy an application that declared a
+/// service it never actually calls.
+#[derive(Debug, Clone, Default)]
+pub struct StorageEndpoints {
+    /// deis-store: KV, per-app SQL and blobs.
+    pub store: Option<String>,
+    /// deis-queue.
+    pub queue: Option<String>,
+}
+
+impl StorageEndpoints {
+    /// Read them off the control plane's configuration, dropping blank
+    /// entries so an empty string in the file does not become an address
+    /// nothing can dial.
+    pub fn from_config(config: &crate::config::ControlConfig) -> Self {
+        let clean = |value: &Option<String>| {
+            value
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            store: clean(&config.store_endpoint),
+            queue: clean(&config.queue_endpoint),
+        }
+    }
+
+    /// Add the addresses to a deployment's environment map.
+    ///
+    /// Platform wiring wins over an application variable of the same name:
+    /// letting an application overwrite it would point its storage client at
+    /// an address of its own choosing.
+    fn write_into(&self, app_id: &str, env: &mut BTreeMap<String, String>) {
+        let mut put = |key: &str, value: &Option<String>| {
+            let Some(value) = value else { return };
+            if let Some(previous) = env.insert(key.to_string(), value.clone())
+                && previous != *value
+            {
+                warn!(
+                    app_id = %app_id,
+                    key = %key,
+                    "The manifest declares a variable named like a reserved platform key; the platform address is used and the manifest's value never reaches the application"
+                );
+            }
+        };
+        put(deis_wire::conventions::STORE_ENDPOINT_ENV, &self.store);
+        put(deis_wire::conventions::QUEUE_ENDPOINT_ENV, &self.queue);
+    }
+
+    /// True when nothing is configured, which is worth saying once at
+    /// startup rather than discovering per deployment.
+    pub fn is_empty(&self) -> bool {
+        self.store.is_none() && self.queue.is_none()
+    }
+}
+
+/// Why a delivery is happening. Only used for logs and for the answer the
+/// API gives, but it is the difference between "someone deployed" and "a
+/// secret changed under a version that did not move".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryReason {
+    Deployment,
+    Rollback,
+    SecretChange,
+}
+
+impl DeliveryReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryReason::Deployment => "deployment",
+            DeliveryReason::Rollback => "rollback",
+            DeliveryReason::SecretChange => "secret change",
+        }
+    }
+}
+
+/// Everything one node needs in order to run one environment of one app.
+///
+/// `env` holds decrypted secret values. That is the whole reason this type
+/// exists instead of a bare proto message: it does not derive `Debug`,
+/// `Serialize` or `Clone`-into-a-log, and the only way out of it is
+/// [`Self::to_request`], which is consumed immediately by the RPC.
+pub struct DeploymentPayload {
+    pub app_id: String,
+    pub version_id: String,
+    /// Environment *name*, never the id: this is what application code
+    /// branches on.
+    pub environment: String,
+    pub bundle_url: String,
+    pub bundle_sha: String,
+    /// Plain variables from the manifest merged with decrypted secrets.
+    /// The application's own environment, and nothing the platform added.
+    env: BTreeMap<String, String>,
+    /// Which of the `env` keys came from a secret. Names only - they are
+    /// safe to log, the values are not.
+    secret_names: Vec<String>,
+    /// Storage addresses the node needs. Kept apart from `env` so the
+    /// report and the log lines stay about the application, and merged in
+    /// only when the wire message is built.
+    endpoints: StorageEndpoints,
+}
+
+impl std::fmt::Debug for DeploymentPayload {
+    /// Renders the shape, never the contents. A payload that printed its
+    /// `env` map would put every secret of an environment into whatever
+    /// log line touched it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeploymentPayload")
+            .field("app_id", &self.app_id)
+            .field("version_id", &self.version_id)
+            .field("environment", &self.environment)
+            .field("bundle_url", &self.bundle_url)
+            .field("bundle_sha", &self.bundle_sha)
+            .field("variables", &self.variable_names())
+            .field("secrets", &self.secret_names)
+            .field("values", &"<redacted>")
+            .field("store_endpoint", &self.endpoints.store)
+            .field("queue_endpoint", &self.endpoints.queue)
+            .finish()
+    }
+}
+
+impl DeploymentPayload {
+    /// Names of the entries that came from the manifest rather than from a
+    /// secret. Safe to log.
+    pub fn variable_names(&self) -> Vec<&str> {
+        self.env
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !self.secret_names.iter().any(|s| s == name))
+            .collect()
+    }
+
+    pub fn secret_names(&self) -> &[String] {
+        &self.secret_names
+    }
+
+    pub fn variable_count(&self) -> usize {
+        self.env.len() - self.secret_names.len()
+    }
+
+    pub fn secret_count(&self) -> usize {
+        self.secret_names.len()
+    }
+
+    /// The complete environment a node should see: the application's own
+    /// variables and secrets plus the platform's storage addresses.
+    ///
+    /// Carries secret values in the clear. Hand it to the node and nowhere
+    /// else - never to a log line and never to a read API.
+    pub fn env_for_wire(&self) -> BTreeMap<String, String> {
+        let mut env: BTreeMap<String, String> = self.env.clone();
+        // Written last, so an application variable spelled like a reserved
+        // key cannot point the app's storage client somewhere else.
+        self.endpoints.write_into(&self.app_id, &mut env);
+        env
+    }
+
+    /// Build the wire message. The result carries secret values in the
+    /// clear: hand it straight to the RPC and never log it.
+    pub fn to_request(&self) -> proto::ApplyDeploymentRequest {
+        let env = self.env_for_wire();
+
+        proto::ApplyDeploymentRequest {
+            app_id: self.app_id.clone(),
+            version_id: self.version_id.clone(),
+            environment: self.environment.clone(),
+            bundle_url: self.bundle_url.clone(),
+            bundle_sha: self.bundle_sha.clone(),
+            env: env.into_iter().collect(),
+        }
+    }
+}
+
+/// One node that did not take the deployment.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeFailure {
+    pub node: String,
+    /// Transport error or the node's own rejection message. Never carries
+    /// anything from the env map.
+    pub error: String,
+}
+
+/// What came of one delivery. Returned to the API caller so a deploy says
+/// where it actually landed instead of only that a row was written.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryReport {
+    pub reason: DeliveryReason,
+    pub app_id: String,
+    pub environment: String,
+    pub version_id: String,
+    /// Nodes that applied the version and now serve it.
+    pub delivered: Vec<String>,
+    /// Nodes that did not. They keep serving whatever they had until they
+    /// refetch their assignments.
+    pub failed: Vec<NodeFailure>,
+    /// Set when nothing was sent at all, with the reason. Not an error:
+    /// a control plane with no configured nodes is a valid setup, and
+    /// nodes pull their assignments on startup anyway.
+    pub skipped: Option<String>,
+}
+
+impl DeliveryReport {
+    /// True when every node that was asked took the version.
+    pub fn fully_delivered(&self) -> bool {
+        self.failed.is_empty() && self.skipped.is_none()
+    }
+}
+
+/// Builds deployment payloads and pushes them to the fleet.
+///
+/// Every node runs every application (architecture principle 2), so a
+/// delivery goes to all configured nodes; there is no placement decision
+/// to make here.
+pub struct DeploymentDeliverer {
+    store: Arc<CatalogStore>,
+    secrets: Arc<SecretsBackend>,
+    nodes: Arc<RuntimeNodeManager>,
+    address: Arc<PublicAddress>,
+    endpoints: StorageEndpoints,
+}
+
+impl DeploymentDeliverer {
+    pub fn new(
+        store: Arc<CatalogStore>,
+        secrets: Arc<SecretsBackend>,
+        nodes: Arc<RuntimeNodeManager>,
+        address: Arc<PublicAddress>,
+        endpoints: StorageEndpoints,
+    ) -> Self {
+        Self {
+            store,
+            secrets,
+            nodes,
+            address,
+            endpoints,
+        }
+    }
+
+    /// The base URL bundle links in this delivery should carry.
+    pub fn base_url(&self, headers: &HeaderMap) -> String {
+        self.address.resolve(headers)
+    }
+
+    /// Assemble what the nodes need for one version of one environment.
+    ///
+    /// Fails - before anything is pushed and, at the deploy call site,
+    /// before the deployment pointer is even written - when the secrets of
+    /// this environment cannot be decrypted. Delivering an application
+    /// with half its secrets missing is worse than not deploying: the code
+    /// runs and misbehaves instead of the operator seeing a clear error.
+    pub async fn payload(
+        &self,
+        env: &Environment,
+        version: &Version,
+        base_url: &str,
+    ) -> CatalogResult<DeploymentPayload> {
+        let version_id = version.id.as_str();
+        let manifest = deis_bundle::Manifest::parse(&version.manifest).map_err(|e| {
+            error!(
+                app_id = %env.app_id,
+                environment = %env.name,
+                version_id = %version_id,
+                error = %e,
+                "Stored manifest of this version no longer parses, so its declared variables cannot be built; the deployment is refused rather than sent with an empty environment"
+            );
+            CatalogError::BundleStorage(format!(
+                "stored manifest of version {version_id} no longer parses: {e}"
+            ))
+        })?;
+
+        let mut env_map: BTreeMap<String, String> = manifest.env.clone();
+
+        let ciphertexts = self.store.secret_ciphertexts(&env.id).await?;
+        let mut secret_names = Vec::with_capacity(ciphertexts.len());
+        if !ciphertexts.is_empty() {
+            // Resolved only when there is something to decrypt, so an
+            // application without secrets deploys on a control plane that
+            // has no master key configured.
+            let cipher = self.secrets.cipher()?;
+            for (name, blob) in ciphertexts {
+                let plaintext = cipher.decrypt(&blob, &secret_aad(&env.id, &name))?;
+                let value = String::from_utf8(plaintext).map_err(|_| {
+                    CatalogError::SecretsUnavailable(format!(
+                        "secret {name} does not decrypt to text and cannot be injected as an environment variable"
+                    ))
+                })?;
+                if env_map.insert(name.clone(), value).is_some() {
+                    warn!(
+                        app_id = %env.app_id,
+                        environment = %env.name,
+                        name = %name,
+                        "A stored secret has the same name as a manifest variable; the secret wins, so the value in the bundle's manifest never reaches the application"
+                    );
+                }
+                secret_names.push(name);
+            }
+        }
+
+        for declared in &manifest.secrets {
+            if !secret_names.iter().any(|name| name == declared) {
+                warn!(
+                    app_id = %env.app_id,
+                    environment = %env.name,
+                    version_id = %version_id,
+                    secret = %declared,
+                    "The manifest declares this secret but no value is stored for this environment; the application will read it as missing"
+                );
+            }
+        }
+
+        Ok(DeploymentPayload {
+            app_id: env.app_id.clone(),
+            version_id: version_id.to_string(),
+            environment: env.name.clone(),
+            bundle_url: bundle_url(base_url, &env.app_id, version_id),
+            bundle_sha: version.bundle_sha.clone(),
+            env: env_map,
+            secret_names,
+            endpoints: self.endpoints.clone(),
+        })
+    }
+
+    /// Build the payload for one assignment row, the way a push would.
+    ///
+    /// The assignment list is the other half of a node's life: a node that
+    /// restarts asks for it and loads what it names. Until it carried an
+    /// environment, an app that came back this way came back with no secrets
+    /// and - worse, because it is silent - no storage addresses, so its
+    /// `ctx.services` calls failed until someone deployed again.
+    ///
+    /// Errors are the caller's to report per row: one environment whose
+    /// secrets will not decrypt must not stop a node from loading the rest.
+    pub async fn assignment_payload(
+        &self,
+        assignment: &crate::catalog::Assignment,
+        base_url: &str,
+    ) -> CatalogResult<DeploymentPayload> {
+        let env = Environment {
+            id: assignment.environment_id.clone(),
+            app_id: assignment.app_id.clone(),
+            name: assignment.environment.clone(),
+            // Not read by `payload`; the row's own timestamp is of no use to
+            // a node and is deliberately not carried in the assignment.
+            created_at: 0,
+        };
+        let version = self
+            .store
+            .get_version(&assignment.app_id, &assignment.version_id)
+            .await?;
+        self.payload(&env, &version, base_url).await
+    }
+
+    /// Push a payload to every configured node, concurrently.
+    ///
+    /// Never fails as a whole: a node that is down is reported, not
+    /// propagated, because the deployment itself is already recorded and
+    /// the node will pick the version up when it refetches its
+    /// assignments.
+    pub async fn push(
+        &self,
+        payload: &DeploymentPayload,
+        reason: DeliveryReason,
+    ) -> DeliveryReport {
+        let mut report = DeliveryReport {
+            reason,
+            app_id: payload.app_id.clone(),
+            environment: payload.environment.clone(),
+            version_id: payload.version_id.clone(),
+            delivered: Vec::new(),
+            failed: Vec::new(),
+            skipped: None,
+        };
+
+        let node_ids = self.nodes.ids();
+        if node_ids.is_empty() {
+            let reason_text = "no runtime nodes are configured on this control plane; \
+                 the deployment is recorded and any node that starts later picks it up \
+                 from its assignment list"
+                .to_string();
+            info!(
+                app_id = %payload.app_id,
+                environment = %payload.environment,
+                version_id = %payload.version_id,
+                reason = reason.as_str(),
+                "{reason_text}"
+            );
+            report.skipped = Some(reason_text);
+            return report;
+        }
+
+        debug!(
+            app_id = %payload.app_id,
+            environment = %payload.environment,
+            version_id = %payload.version_id,
+            reason = reason.as_str(),
+            nodes = node_ids.len(),
+            variables = payload.variable_count(),
+            secrets = ?payload.secret_names(),
+            "Delivering a deployment to every runtime node"
+        );
+
+        let results = futures::future::join_all(node_ids.iter().map(|node| {
+            let request = payload.to_request();
+            async move {
+                (
+                    node.clone(),
+                    self.nodes.apply_deployment(node, request).await,
+                )
+            }
+        }))
+        .await;
+
+        for (node, result) in results {
+            match result {
+                Ok(resp) if resp.success => report.delivered.push(node),
+                Ok(resp) => report.failed.push(NodeFailure {
+                    node,
+                    error: if resp.message.is_empty() {
+                        "node rejected the deployment without saying why".to_string()
+                    } else {
+                        resp.message
+                    },
+                }),
+                Err(e) => report.failed.push(NodeFailure {
+                    node,
+                    error: e.to_string(),
+                }),
+            }
+        }
+
+        let failed_nodes: Vec<&str> = report.failed.iter().map(|f| f.node.as_str()).collect();
+        if report.failed.is_empty() {
+            info!(
+                app_id = %payload.app_id,
+                environment = %payload.environment,
+                version_id = %payload.version_id,
+                reason = reason.as_str(),
+                nodes = report.delivered.len(),
+                "Every runtime node is serving this version"
+            );
+        } else if report.delivered.is_empty() {
+            error!(
+                app_id = %payload.app_id,
+                environment = %payload.environment,
+                version_id = %payload.version_id,
+                reason = reason.as_str(),
+                nodes = ?failed_nodes,
+                errors = ?report.failed.iter().map(|f| f.error.as_str()).collect::<Vec<_>>(),
+                "No runtime node took this version; the whole fleet still serves the previous one until a node refetches its assignments"
+            );
+        } else {
+            warn!(
+                app_id = %payload.app_id,
+                environment = %payload.environment,
+                version_id = %payload.version_id,
+                reason = reason.as_str(),
+                delivered = report.delivered.len(),
+                failed = ?failed_nodes,
+                "Part of the fleet took this version; the listed nodes still serve the previous one, so requests hit two different versions until they catch up"
+            );
+        }
+
+        report
+    }
+
+    /// Build and push in one step for the version an environment runs now.
+    ///
+    /// This is the secret-change path: nothing about the version moved, but
+    /// the values the nodes hold in memory are stale, so the same version
+    /// is delivered again with a fresh env map.
+    ///
+    /// Never fails: the change that triggered it is already recorded, so
+    /// anything that goes wrong here is reported in the returned report
+    /// and in the log rather than handed back to the caller as if the
+    /// change had not happened.
+    pub async fn reload_current(
+        &self,
+        env: &Environment,
+        base_url: &str,
+        reason: DeliveryReason,
+    ) -> DeliveryReport {
+        let skipped = |version_id: String, text: String| DeliveryReport {
+            reason,
+            app_id: env.app_id.clone(),
+            environment: env.name.clone(),
+            version_id,
+            delivered: Vec::new(),
+            failed: Vec::new(),
+            skipped: Some(text),
+        };
+
+        let deployment = match self.store.current_deployment(&env.id).await {
+            Ok(Some(deployment)) => deployment,
+            Ok(None) => {
+                let text = format!(
+                    "environment {} of app {} has never been deployed, so there is nothing to reload; the change takes effect on its first deployment",
+                    env.name, env.app_id
+                );
+                info!(
+                    app_id = %env.app_id,
+                    environment = %env.name,
+                    reason = reason.as_str(),
+                    "{text}"
+                );
+                return skipped(String::new(), text);
+            }
+            Err(e) => {
+                error!(
+                    app_id = %env.app_id,
+                    environment = %env.name,
+                    reason = reason.as_str(),
+                    error = %e,
+                    "Could not read which version this environment runs, so the nodes were not updated; they keep serving the values they already hold until the next deployment"
+                );
+                return skipped(String::new(), e.to_string());
+            }
+        };
+
+        let version = match self
+            .store
+            .get_version(&env.app_id, &deployment.version_id)
+            .await
+        {
+            Ok(version) => version,
+            Err(e) => {
+                error!(
+                    app_id = %env.app_id,
+                    environment = %env.name,
+                    version_id = %deployment.version_id,
+                    error = %e,
+                    "The version this environment points at could not be read, so the nodes were not updated and keep serving the values they already hold"
+                );
+                return skipped(deployment.version_id.clone(), e.to_string());
+            }
+        };
+
+        match self.payload(env, &version, base_url).await {
+            Ok(payload) => self.push(&payload, reason).await,
+            Err(e) => {
+                error!(
+                    app_id = %env.app_id,
+                    environment = %env.name,
+                    version_id = %version.id,
+                    reason = reason.as_str(),
+                    error = %e,
+                    "The change is recorded but could not be turned into a deployment payload, so no node was updated; every node keeps the environment it already had"
+                );
+                skipped(version.id.clone(), e.to_string())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::SecretCipher;
+    use crate::catalog::secrets::MASTER_KEY_LEN;
+    use crate::database::Database;
+
+    const MANIFEST: &str = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+        "env":{"LOG_LEVEL":"info","API_KEY":"placeholder-from-manifest"},
+        "secrets":["API_KEY","MISSING_ONE"]}"#;
+
+    /// A version row as the catalog would have written it. Never inserted
+    /// here: these tests exercise what is built from one, not the store.
+    fn version(manifest: &str) -> Version {
+        Version {
+            id: "v-1".to_string(),
+            app_id: "demo".to_string(),
+            number: 1,
+            bundle_sha: "abc123".to_string(),
+            bundle_path: "/tmp/never-read.zip".to_string(),
+            manifest: manifest.to_string(),
+            created_at: 0,
+        }
+    }
+
+    async fn deliverer(secrets_ready: bool) -> (DeploymentDeliverer, Arc<CatalogStore>) {
+        deliverer_with(
+            secrets_ready,
+            StorageEndpoints {
+                store: Some("http://127.0.0.1:8090".to_string()),
+                queue: Some("http://127.0.0.1:8091".to_string()),
+            },
+        )
+        .await
+    }
+
+    async fn deliverer_with(
+        secrets_ready: bool,
+        endpoints: StorageEndpoints,
+    ) -> (DeploymentDeliverer, Arc<CatalogStore>) {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let store = Arc::new(CatalogStore::new(database));
+        let secrets = if secrets_ready {
+            SecretsBackend::Ready(Box::new(
+                SecretCipher::from_key_bytes(&[42u8; MASTER_KEY_LEN]).unwrap(),
+            ))
+        } else {
+            SecretsBackend::Unavailable("no key file in this test".to_string())
+        };
+        let deliverer = DeploymentDeliverer::new(
+            Arc::clone(&store),
+            Arc::new(secrets),
+            // No nodes: these tests are about what gets built, not about
+            // what a node does with it.
+            Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
+            Arc::new(PublicAddress {
+                configured: Some("http://control.test".to_string()),
+                scheme: "http",
+                fallback: "http://127.0.0.1:8080".to_string(),
+            }),
+            endpoints,
+        );
+        (deliverer, store)
+    }
+
+    async fn environment(store: &CatalogStore) -> Environment {
+        store.create_app("demo").await.unwrap();
+        store
+            .create_environment("demo", "production")
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn payload_merges_manifest_variables_with_decrypted_secrets() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let cipher = deliverer.secrets.cipher().unwrap();
+        let blob = cipher
+            .encrypt(b"s3cr3t", &secret_aad(&env.id, "API_KEY"))
+            .unwrap();
+        store.put_secret(&env, "API_KEY", blob).await.unwrap();
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+
+        assert_eq!(payload.app_id, "demo");
+        assert_eq!(payload.environment, "production");
+        assert_eq!(
+            payload.bundle_url,
+            "http://control.test/api/apps/demo/versions/v-1/bundle"
+        );
+        assert_eq!(payload.secret_names(), ["API_KEY"]);
+        assert_eq!(payload.variable_names(), ["LOG_LEVEL"]);
+
+        let request = payload.to_request();
+        assert_eq!(request.env.get("LOG_LEVEL").unwrap(), "info");
+        // The secret wins over the placeholder the manifest carried.
+        assert_eq!(request.env.get("API_KEY").unwrap(), "s3cr3t");
+        assert_eq!(request.bundle_sha, "abc123");
+    }
+
+    #[tokio::test]
+    async fn the_wire_message_carries_the_storage_addresses_the_app_never_declared() {
+        // Without these two keys deis-runtime builds no storage client at
+        // all and every ctx.services call answers "service not available".
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+
+        // The report stays about the application: the addresses are the
+        // platform's, not a variable someone wrote in a manifest. No secret
+        // is stored here, so API_KEY is still a plain manifest variable.
+        assert_eq!(payload.variable_names(), ["API_KEY", "LOG_LEVEL"]);
+
+        let request = payload.to_request();
+        assert_eq!(
+            request.env.get(deis_wire::conventions::STORE_ENDPOINT_ENV),
+            Some(&"http://127.0.0.1:8090".to_string())
+        );
+        assert_eq!(
+            request.env.get(deis_wire::conventions::QUEUE_ENDPOINT_ENV),
+            Some(&"http://127.0.0.1:8091".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_cannot_point_its_storage_client_somewhere_else() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let manifest = format!(
+            r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"http://attacker.invalid"}}}}"#,
+            deis_wire::conventions::STORE_ENDPOINT_ENV
+        );
+
+        let request = deliverer
+            .payload(&env, &version(&manifest), "http://control.test")
+            .await
+            .unwrap()
+            .to_request();
+
+        assert_eq!(
+            request.env.get(deis_wire::conventions::STORE_ENDPOINT_ENV),
+            Some(&"http://127.0.0.1:8090".to_string()),
+            "the platform address must win over anything the bundle declared"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_without_storage_configured_sends_no_addresses() {
+        // A valid setup: the deployment still goes out, and only the app's
+        // ctx.services calls fail.
+        let (deliverer, store) = deliverer_with(true, StorageEndpoints::default()).await;
+        let env = environment(&store).await;
+
+        let request = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap()
+            .to_request();
+
+        assert!(
+            !request
+                .env
+                .contains_key(deis_wire::conventions::STORE_ENDPOINT_ENV)
+        );
+        assert!(
+            !request
+                .env
+                .contains_key(deis_wire::conventions::QUEUE_ENDPOINT_ENV)
+        );
+    }
+
+    /// The payload is passed around and may end up in an error path; its
+    /// debug rendering must never carry a value.
+    #[tokio::test]
+    async fn debug_output_never_carries_a_secret_value() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let blob = deliverer
+            .secrets
+            .cipher()
+            .unwrap()
+            .encrypt(b"s3cr3t", &secret_aad(&env.id, "API_KEY"))
+            .unwrap();
+        store.put_secret(&env, "API_KEY", blob).await.unwrap();
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+        let rendered = format!("{payload:?}");
+        assert!(!rendered.contains("s3cr3t"), "got {rendered}");
+        assert!(
+            !rendered.contains("placeholder-from-manifest"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("API_KEY"), "names are safe to show");
+        assert!(rendered.contains("redacted"));
+    }
+
+    /// An app with no stored secrets must deploy even when the control
+    /// plane has no master key, or a misconfiguration nobody needs would
+    /// block every deployment.
+    #[tokio::test]
+    async fn an_app_without_secrets_needs_no_master_key() {
+        let (deliverer, store) = deliverer(false).await;
+        let env = environment(&store).await;
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+        assert_eq!(payload.secret_count(), 0);
+        assert_eq!(payload.variable_count(), 2);
+    }
+
+    /// With a secret stored but no usable key, the deployment must fail
+    /// rather than reach the node with the secret silently absent.
+    #[tokio::test]
+    async fn a_stored_secret_without_a_master_key_refuses_to_deliver() {
+        let (ready, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let blob = ready
+            .secrets
+            .cipher()
+            .unwrap()
+            .encrypt(b"s3cr3t", &secret_aad(&env.id, "API_KEY"))
+            .unwrap();
+        store.put_secret(&env, "API_KEY", blob).await.unwrap();
+
+        let broken = DeploymentDeliverer::new(
+            Arc::clone(&store),
+            Arc::new(SecretsBackend::Unavailable(
+                "key file went away".to_string(),
+            )),
+            Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
+            Arc::clone(&ready.address),
+            StorageEndpoints::default(),
+        );
+        let err = broken
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CatalogError::SecretsUnavailable(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_manifest_refuses_to_deliver() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let err = deliverer
+            .payload(&env, &version("{not json"), "http://control.test")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::BundleStorage(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fleet_of_no_nodes_reports_the_push_as_skipped() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+
+        let report = deliverer.push(&payload, DeliveryReason::Deployment).await;
+        assert!(report.skipped.is_some());
+        assert!(report.delivered.is_empty());
+        assert!(report.failed.is_empty());
+        assert!(!report.fully_delivered());
+    }
+
+    /// A node that cannot be reached is reported, not propagated: the
+    /// deployment is already recorded and the node will pick the version
+    /// up from its assignment list.
+    #[tokio::test]
+    async fn an_unreachable_node_is_reported_and_never_fails_the_push() {
+        let (ready, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let deliverer = DeploymentDeliverer::new(
+            Arc::clone(&store),
+            Arc::new(SecretsBackend::Ready(Box::new(
+                SecretCipher::from_key_bytes(&[42u8; MASTER_KEY_LEN]).unwrap(),
+            ))),
+            Arc::new(RuntimeNodeManager::new(
+                vec![crate::config::RuntimeNodeConfig {
+                    id: "node-a".to_string(),
+                    // Nothing listens here, so the connection is refused
+                    // immediately rather than waiting out a timeout.
+                    addr: "http://127.0.0.1:1".to_string(),
+                }],
+                15,
+            )),
+            Arc::clone(&ready.address),
+            StorageEndpoints::default(),
+        );
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+        let report = deliverer.push(&payload, DeliveryReason::Deployment).await;
+
+        assert!(report.delivered.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].node, "node-a");
+        assert!(report.skipped.is_none(), "a node was contacted");
+        assert!(!report.fully_delivered());
+        // The report travels back to an API caller; it must not leak the
+        // environment it was built from.
+        let rendered = serde_json::to_string(&report).unwrap();
+        assert!(!rendered.contains("s3cr3t"));
+    }
+
+    #[tokio::test]
+    async fn reloading_an_environment_that_was_never_deployed_is_not_an_error() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let report = deliverer
+            .reload_current(&env, "http://control.test", DeliveryReason::SecretChange)
+            .await;
+        assert!(report.skipped.unwrap().contains("never been deployed"));
+    }
+
+    #[test]
+    fn public_address_prefers_configuration_then_host_header() {
+        let address = PublicAddress {
+            configured: Some("https://deis.example.com/".to_string()),
+            scheme: "http",
+            fallback: "http://127.0.0.1:8080".to_string(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "node-view:9000".parse().unwrap());
+        assert_eq!(address.resolve(&headers), "https://deis.example.com");
+
+        let address = PublicAddress {
+            configured: None,
+            scheme: "http",
+            fallback: "http://127.0.0.1:8080".to_string(),
+        };
+        assert_eq!(address.resolve(&headers), "http://node-view:9000");
+        assert_eq!(address.resolve(&HeaderMap::new()), "http://127.0.0.1:8080");
+    }
+}

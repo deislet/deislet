@@ -1,0 +1,27 @@
+{
+  "version": "1.0.0",
+  "name": "demo",
+  "runtime": "standard-v1",
+  "language": "typescript",
+  "functionRoot": "./functions",
+  "environment": {
+    "variables": {
+      "BUILD_LABEL": "v1",
+      "LOG_LEVEL": "info"
+    },
+    "secrets": ["DEMO_SECRET"]
+  },
+  "services": {
+    "kv": { "enabled": true },
+    "queue": { "enabled": true }
+  },
+  "queues": [{ "name": "jobs", "batchSize": 10 }],
+  "cron": ["* * * * *"],
+  "assets": { "dir": "./public" },
+  "vendors": {
+    "deislet": { "enabled": true }
+  },
+  "build": {
+    "outDir": "./dist"
+  }
+}
