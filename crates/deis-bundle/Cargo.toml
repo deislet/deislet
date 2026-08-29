@@ -1,0 +1,15 @@
+[package]
+name = "deis-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Deislet application bundle format: manifest, asset index and archive layout"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+zip = "0.6"

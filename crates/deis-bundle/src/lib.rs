@@ -1,0 +1,333 @@
+//! The Deislet application bundle format.
+//!
+//! A bundle is the zip that `deis build --vendor deislet` produces, and it is
+//! the only carrier of a version (see `docs/implementation-plan.zh.md`
+//! section 2):
+//!
+//! ```text
+//! manifest.json
+//! worker/index.js      the bundled function code, one ESM file
+//! assets/              static files, directory structure preserved
+//! ```
+//!
+//! Three components handle this format: deis-build writes it, deis-control
+//! verifies and stores it, deis-runtime loads it. They must agree exactly on
+//! what a manifest means, so the definition lives here rather than being
+//! spelled out once per component - two copies of a format drift, and the
+//! symptom is a bundle that one side accepts and another rejects.
+
+use std::collections::BTreeMap;
+use std::io::{Cursor, Read};
+
+use serde::{Deserialize, Serialize};
+
+pub mod assets;
+
+pub use assets::{AssetIndex, AssetMatch};
+
+/// Manifest schema this version of the platform understands.
+pub const SUPPORTED_SCHEMA: u32 = 1;
+
+/// Name of the manifest at the root of the archive.
+pub const MANIFEST_ENTRY: &str = "manifest.json";
+
+/// Directory inside the archive holding static assets.
+pub const ASSETS_PREFIX: &str = "assets/";
+
+/// What went wrong with a bundle.
+///
+/// Every variant is a rejection of untrusted input, so each message says what
+/// was wrong in terms the person who ran the build can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleError {
+    /// The bytes are not a readable zip.
+    NotAnArchive(String),
+    /// The archive is missing something the format requires.
+    Malformed(String),
+    /// The manifest parsed but describes something unusable.
+    InvalidManifest(String),
+    /// The manifest is from a schema this build does not know.
+    UnsupportedSchema { found: u32, supported: u32 },
+}
+
+impl std::fmt::Display for BundleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnArchive(m) => write!(f, "bundle is not a readable zip archive: {m}"),
+            Self::Malformed(m) => write!(f, "bundle is malformed: {m}"),
+            Self::InvalidManifest(m) => write!(f, "bundle {MANIFEST_ENTRY} is invalid: {m}"),
+            Self::UnsupportedSchema { found, supported } => write!(
+                f,
+                "bundle manifest schema {found} is not supported; this build understands schema {supported}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BundleError {}
+
+pub type Result<T> = std::result::Result<T, BundleError>;
+
+/// `manifest.json`.
+///
+/// Unknown fields are accepted on purpose: a newer builder may add keys, and
+/// the raw text is stored verbatim alongside the parsed form, so nothing is
+/// lost by a component that does not understand a field yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Manifest {
+    pub schema: u32,
+    /// Application this bundle belongs to. Must match the upload target.
+    pub app: String,
+    /// Bundled entry point inside the archive, for example `worker/index.js`.
+    pub entry: String,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    /// Which platform services the app declares it uses. Absent means false.
+    #[serde(default)]
+    pub services: BTreeMap<String, bool>,
+    /// Plain environment variables. Secret values never appear here.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Secret names only; the values are held by the control plane and
+    /// delivered to a node at deploy time, never carried in a bundle.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<Route>,
+    /// Cron expressions this app wants to be triggered on.
+    #[serde(default)]
+    pub cron: Vec<String>,
+    #[serde(default)]
+    pub queues: Vec<QueueConsumer>,
+    #[serde(default)]
+    pub assets: Vec<Asset>,
+}
+
+/// A route pattern the runtime matches against to fill `context.params`.
+///
+/// This does not select the app - deis-proxy does that - and it does not gate
+/// a request. A pattern that matches nothing shows up only as empty params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Route {
+    /// Exact segments plus `:name` placeholders, for example
+    /// `/api/users/:id`. Spelled the same way in `RouteRule.pattern`.
+    pub pattern: String,
+    /// Methods this route applies to. Empty means any method.
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+/// A queue this app consumes from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueConsumer {
+    pub name: String,
+    /// How many messages to pull at once. None lets the runtime decide.
+    #[serde(default)]
+    pub batch_size: Option<u32>,
+}
+
+/// One static file carried in the bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Asset {
+    /// Path relative to `assets/`, with no leading slash.
+    pub path: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+impl Manifest {
+    /// Parse and check a manifest on its own, without an archive around it.
+    pub fn parse(json: &str) -> Result<Self> {
+        let manifest: Manifest = serde_json::from_str(json)
+            .map_err(|e| BundleError::InvalidManifest(format!("does not parse: {e}")))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Checks that hold regardless of who is reading the bundle.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != SUPPORTED_SCHEMA {
+            return Err(BundleError::UnsupportedSchema {
+                found: self.schema,
+                supported: SUPPORTED_SCHEMA,
+            });
+        }
+        if self.app.trim().is_empty() {
+            return Err(BundleError::InvalidManifest("\"app\" is empty".into()));
+        }
+        if self.entry.trim().is_empty() {
+            return Err(BundleError::InvalidManifest("\"entry\" is empty".into()));
+        }
+        for asset in &self.assets {
+            if asset.path.starts_with('/') {
+                return Err(BundleError::InvalidManifest(format!(
+                    "asset path {:?} has a leading slash; paths are relative to {ASSETS_PREFIX}",
+                    asset.path
+                )));
+            }
+            // A path that climbs out of the assets directory would let a
+            // bundle address files outside its own tree once unpacked.
+            if asset.path.split('/').any(|seg| seg == "..") {
+                return Err(BundleError::InvalidManifest(format!(
+                    "asset path {:?} escapes the assets directory",
+                    asset.path
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject a bundle filed under the wrong application.
+    ///
+    /// Without this check an upload could file one app's code under another
+    /// app's versions, which is both a correctness and an isolation problem.
+    pub fn check_app(&self, app_id: &str) -> Result<()> {
+        if self.app != app_id {
+            return Err(BundleError::InvalidManifest(format!(
+                "manifest declares app {:?} but the bundle was uploaded to app {:?}",
+                self.app, app_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the app declared it uses a given platform service.
+    pub fn uses_service(&self, name: &str) -> bool {
+        self.services.get(name).copied().unwrap_or(false)
+    }
+
+    /// Route patterns in declaration order, which is what the runtime's
+    /// matcher consumes.
+    pub fn route_patterns(&self) -> Vec<String> {
+        self.routes.iter().map(|r| r.pattern.clone()).collect()
+    }
+}
+
+/// A manifest read out of an archive, together with the exact text it came
+/// from.
+///
+/// The verbatim text matters: the control plane stores it in the version row,
+/// so a field this build does not understand still survives a round trip.
+#[derive(Debug, Clone)]
+pub struct ParsedManifest {
+    pub json: String,
+    pub manifest: Manifest,
+}
+
+/// Read and validate `manifest.json` out of a zip held in memory.
+///
+/// Also confirms the declared entry point is actually present, so a bundle
+/// that would fail at load time is rejected at upload time instead.
+pub fn read_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| BundleError::NotAnArchive(e.to_string()))?;
+
+    let json = {
+        let mut entry = archive.by_name(MANIFEST_ENTRY).map_err(|e| {
+            BundleError::Malformed(format!(
+                "no {MANIFEST_ENTRY} at the archive root ({e}); it was not produced by a deislet build"
+            ))
+        })?;
+        let mut text = String::new();
+        entry
+            .read_to_string(&mut text)
+            .map_err(|e| BundleError::Malformed(format!("{MANIFEST_ENTRY} is not UTF-8: {e}")))?;
+        text
+    };
+
+    let manifest = Manifest::parse(&json)?;
+
+    if archive.by_name(&manifest.entry).is_err() {
+        return Err(BundleError::InvalidManifest(format!(
+            "entry {:?} is not in the archive",
+            manifest.entry
+        )));
+    }
+
+    Ok(ParsedManifest { json, manifest })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn zip_with(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            for (name, body) in files {
+                w.start_file(*name, zip::write::FileOptions::default())
+                    .unwrap();
+                w.write_all(body.as_bytes()).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    const MINIMAL: &str = r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#;
+
+    #[test]
+    fn reads_a_minimal_bundle() {
+        let z = zip_with(&[(MANIFEST_ENTRY, MINIMAL), ("worker/index.js", "export {}")]);
+        let parsed = read_manifest(&z).unwrap();
+        assert_eq!(parsed.manifest.app, "demo");
+        assert_eq!(parsed.json, MINIMAL, "the verbatim text must survive");
+    }
+
+    #[test]
+    fn keeps_fields_it_does_not_understand() {
+        let json = r#"{"schema":1,"app":"demo","entry":"e.js","futureKey":{"a":1}}"#;
+        let z = zip_with(&[(MANIFEST_ENTRY, json), ("e.js", "")]);
+        let parsed = read_manifest(&z).unwrap();
+        assert!(parsed.json.contains("futureKey"));
+    }
+
+    #[test]
+    fn rejects_a_missing_entry_point() {
+        let z = zip_with(&[(MANIFEST_ENTRY, MINIMAL)]);
+        let err = read_manifest(&z).unwrap_err();
+        assert!(matches!(err, BundleError::InvalidManifest(_)), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_future_schema() {
+        let json = r#"{"schema":99,"app":"demo","entry":"e.js"}"#;
+        assert_eq!(
+            Manifest::parse(json).unwrap_err(),
+            BundleError::UnsupportedSchema {
+                found: 99,
+                supported: SUPPORTED_SCHEMA
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_an_asset_path_that_escapes_the_bundle() {
+        let json = r#"{"schema":1,"app":"d","entry":"e.js","assets":[{"path":"../etc/passwd"}]}"#;
+        assert!(matches!(
+            Manifest::parse(json).unwrap_err(),
+            BundleError::InvalidManifest(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_bundle_filed_under_another_app() {
+        let m = Manifest::parse(MINIMAL).unwrap();
+        assert!(m.check_app("demo").is_ok());
+        assert!(m.check_app("other").is_err());
+    }
+
+    #[test]
+    fn rejects_bytes_that_are_not_a_zip() {
+        assert!(matches!(
+            read_manifest(b"not a zip").unwrap_err(),
+            BundleError::NotAnArchive(_)
+        ));
+    }
+}

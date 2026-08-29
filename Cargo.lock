@@ -1920,6 +1920,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "deis-bundle"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
+ "zip",
+]
+
+[[package]]
 name = "deis-control"
 version = "0.1.0"
 dependencies = [
@@ -1930,6 +1942,7 @@ dependencies = [
  "axum-server",
  "chrono",
  "dashmap 6.1.0",
+ "deis-bundle",
  "deis-wire",
  "futures",
  "futures-util",

@@ -9,75 +9,20 @@
 //! A bundle that fails any of those checks is never written, so the
 //! version table can never point at a file the runtime would choke on.
 
-use std::io::{Cursor, Read, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+use deis_bundle::MANIFEST_ENTRY;
+use deis_bundle::{Manifest, read_manifest};
+
 use super::model::validate_app_id;
 use super::{CatalogError, CatalogResult};
-
-/// Manifest schema this control plane understands.
-pub const SUPPORTED_MANIFEST_SCHEMA: u32 = 1;
-/// Name of the manifest inside the zip.
-pub const MANIFEST_ENTRY: &str = "manifest.json";
-
-/// `manifest.json` as described in the implementation plan.
-///
-/// Unknown fields are accepted on purpose: a newer builder may add keys,
-/// and the raw text is what gets stored, so nothing is lost.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BundleManifest {
-    pub schema: u32,
-    /// App this bundle belongs to. Must match the upload target.
-    pub app: String,
-    /// Bundled worker entry point inside the zip, e.g. `worker/index.js`.
-    pub entry: String,
-    #[serde(default)]
-    pub runtime: Option<String>,
-    #[serde(default)]
-    pub services: std::collections::BTreeMap<String, bool>,
-    #[serde(default)]
-    pub env: std::collections::BTreeMap<String, String>,
-    /// Secret names only. Values never travel inside a bundle.
-    #[serde(default)]
-    pub secrets: Vec<String>,
-    #[serde(default)]
-    pub routes: Vec<ManifestRoute>,
-    #[serde(default)]
-    pub cron: Vec<String>,
-    #[serde(default)]
-    pub queues: Vec<ManifestQueue>,
-    #[serde(default)]
-    pub assets: Vec<ManifestAsset>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestRoute {
-    pub pattern: String,
-    #[serde(default)]
-    pub method: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestQueue {
-    pub name: String,
-    #[serde(default)]
-    pub batch_size: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestAsset {
-    pub path: String,
-    #[serde(default)]
-    pub sha256: Option<String>,
-    #[serde(default)]
-    pub content_type: Option<String>,
-    #[serde(default)]
-    pub size: Option<u64>,
-}
 
 /// A bundle that passed every check and now lives on disk.
 #[derive(Debug)]
@@ -87,7 +32,7 @@ pub struct StoredBundle {
     pub size: u64,
     /// Verbatim manifest text, stored in the version row.
     pub manifest_json: String,
-    pub manifest: BundleManifest,
+    pub manifest: Manifest,
     /// True when the identical file was already on disk, so nothing was
     /// written. The version row may still be new.
     pub already_present: bool,
@@ -162,19 +107,17 @@ impl BundleStore {
             }
         }
 
-        let (manifest_json, manifest) = read_manifest(bytes)?;
+        let parsed = read_manifest(bytes).map_err(|e| CatalogError::invalid(e.to_string()))?;
+        let (manifest_json, manifest) = (parsed.json, parsed.manifest);
 
-        if manifest.app != app_id {
+        if let Err(e) = manifest.check_app(app_id) {
             warn!(
                 app_id,
                 manifest_app = %manifest.app,
                 bundle_sha = %sha256,
                 "Rejected bundle upload: the manifest declares a different app, which would have filed one app's code under another app's versions"
             );
-            return Err(CatalogError::invalid(format!(
-                "bundle manifest declares app {:?} but it was uploaded to app {:?}",
-                manifest.app, app_id
-            )));
+            return Err(CatalogError::invalid(e.to_string()));
         }
 
         let path = self.path_for(app_id, &sha256);
@@ -223,56 +166,6 @@ impl BundleStore {
             Err(e) => Err(e),
         }
     }
-}
-
-/// Read and validate `manifest.json` out of a zip in memory.
-pub fn read_manifest(bytes: &[u8]) -> CatalogResult<(String, BundleManifest)> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| CatalogError::invalid(format!("bundle is not a readable zip archive: {e}")))?;
-
-    let manifest_json = {
-        let mut entry = archive.by_name(MANIFEST_ENTRY).map_err(|e| {
-            CatalogError::invalid(format!(
-                "bundle has no {MANIFEST_ENTRY} at its root ({e}); it was not produced by a deislet build"
-            ))
-        })?;
-        let mut text = String::new();
-        entry.read_to_string(&mut text).map_err(|e| {
-            CatalogError::invalid(format!(
-                "bundle {MANIFEST_ENTRY} is not valid UTF-8 text: {e}"
-            ))
-        })?;
-        text
-    };
-
-    let manifest: BundleManifest = serde_json::from_str(&manifest_json).map_err(|e| {
-        CatalogError::invalid(format!("bundle {MANIFEST_ENTRY} does not parse: {e}"))
-    })?;
-
-    if manifest.schema != SUPPORTED_MANIFEST_SCHEMA {
-        return Err(CatalogError::invalid(format!(
-            "bundle manifest schema {} is not supported; this control plane understands schema {}",
-            manifest.schema, SUPPORTED_MANIFEST_SCHEMA
-        )));
-    }
-    if manifest.app.is_empty() {
-        return Err(CatalogError::invalid(
-            "bundle manifest has an empty \"app\"",
-        ));
-    }
-    if manifest.entry.is_empty() {
-        return Err(CatalogError::invalid(
-            "bundle manifest has an empty \"entry\"",
-        ));
-    }
-    if archive.by_name(&manifest.entry).is_err() {
-        return Err(CatalogError::invalid(format!(
-            "bundle manifest points at entry {:?}, which is not in the archive",
-            manifest.entry
-        )));
-    }
-
-    Ok((manifest_json, manifest))
 }
 
 /// Write through a temporary file in the same directory, then rename, so a
