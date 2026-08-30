@@ -55,13 +55,24 @@ pub struct ServicesConfig {
     pub queue: Option<ServiceConfig>,
 }
 
+/// Whether a project declares one of the platform services.
+///
+/// One field, and deliberately so. This struct used to carry `namespace` and
+/// `connectionString` as well, and nothing in the workspace ever read either
+/// of them: the bundle manifest records services as plain booleans, and a
+/// tenant is already uniquely `(application, environment)`, so an
+/// application's KV is its own and has nothing to be named apart from. A
+/// field an author can set and no component reads is worse than no field,
+/// because it reads as a supported knob.
+///
+/// An application that wants two logical stores prefixes its keys and
+/// enumerates a prefix with `kv.list({ prefix })`; where a boundary the
+/// platform actually enforces is wanted, that is a second environment or a
+/// second application. Unknown keys in the project file are still accepted,
+/// so a config that carries the old two does not fail to parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub enabled: bool,
-    #[serde(default)]
-    pub namespace: Option<String>,
-    #[serde(rename = "connectionString", default)]
-    pub connection_string: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

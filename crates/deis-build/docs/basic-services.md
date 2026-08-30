@@ -63,21 +63,27 @@ const parsed = await kv.get('user:123', { type: 'json' }); // same as JSON.parse
 | Tencent | EdgeKV | ≤ 2MB |
 | Deislet | Runtime KV | ≤ 10MB |
 
-### Configuration (Optional)
-
-Some platforms require specifying a namespace:
+### Configuration
 
 ```json
 {
   "services": {
-    "kv": {
-      "namespace": "MY_KV_STORE"
-    }
+    "kv": { "enabled": true }
   }
 }
 ```
 
-**Note**: `enabled: true` is not needed; this field is deprecated.
+`enabled` is the only field. `namespace` and `connectionString` were here until
+2026-08-30 and were removed because **nothing in the workspace ever read
+either**. The bundle manifest records services as booleans, and a tenant is
+already uniquely `(application, environment)`, so an application's KV is its
+own and has nothing to be named apart from.
+
+An application that wants two logical stores prefixes its keys and enumerates
+one prefix with `kv.list({ prefix })`. Where a boundary the platform actually
+enforces is wanted rather than a way to organise keys, that is a second
+environment or a second application - the tenant boundary deis-store checks on
+every call.
 
 ---
 
@@ -195,34 +201,35 @@ Alternatives:
 
 ## Migration Guide
 
-### Old Configuration (Deprecated)
+### Old Configuration
 
 ```json
 {
   "services": {
     "kv": {
-      "enabled": true,     // ← No longer needed
-      "namespace": "MY_KV"
+      "enabled": true,
+      "namespace": "MY_KV"      // ← removed; no component ever read it
     },
     "cache": {
-      "enabled": true      // ← No longer needed
+      "enabled": true           // ← not needed: the cache is a basic feature
     }
   }
 }
 ```
 
-### New Configuration (Recommended)
+### Now
 
 ```json
 {
   "services": {
-    "kv": {
-      "namespace": "MY_KV"  // Only keep platform-specific config
-    }
-    // cache needs no configuration
+    "kv": { "enabled": true }
   }
 }
 ```
+
+Unknown keys are still accepted rather than rejected, so a project file
+carrying the old two still parses - those fields simply have no effect, and
+never had one.
 
 ---
 

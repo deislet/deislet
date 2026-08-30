@@ -58,21 +58,19 @@ const parsed = await kv.get('user:123', { type: 'json' }); // 等价于 JSON.par
 | Tencent | EdgeKV | ≤ 2MB |
 | Deislet | Runtime KV | ≤ 10MB |
 
-### 配置（可选）
-
-某些平台需要指定 namespace：
+### 配置
 
 ```json
 {
   "services": {
-    "kv": {
-      "namespace": "MY_KV_STORE"
-    }
+    "kv": { "enabled": true }
   }
 }
 ```
 
-**注意**：无需 `enabled: true`，该字段已废弃。
+`enabled` 是唯一的字段。这里曾经还有 `namespace` 和 `connectionString`，两个都在 2026-08-30 删掉了：**全仓没有一个组件读过它们**。构建产出的 bundle manifest 把服务记成布尔值，而一个租户已经由 `(应用, 环境)` 唯一确定，所以一个应用的 KV 天然就是它自己的，没有第二个东西需要起名字来区分。
+
+一个应用想要两个逻辑上分开的存储，就给键加前缀，然后用 `kv.list({ prefix })` 按前缀列举——前缀之间互不干扰。如果要的是**平台强制保证的边界**而不只是组织方式，那就是另一个环境或另一个应用，那才是 deis-store 每次调用都会校验的租户边界。
 
 ---
 
@@ -185,34 +183,33 @@ Alternatives:
 
 ## 迁移指南
 
-### 旧配置（已废弃）
+### 旧配置
 
 ```json
 {
   "services": {
     "kv": {
-      "enabled": true,     // ← 不再需要
-      "namespace": "MY_KV"
+      "enabled": true,
+      "namespace": "MY_KV"      // ← 已删除，从来没有组件读过
     },
     "cache": {
-      "enabled": true      // ← 不再需要
+      "enabled": true           // ← 不需要：cache 是基本能力，无需声明
     }
   }
 }
 ```
 
-### 新配置（推荐）
+### 现在
 
 ```json
 {
   "services": {
-    "kv": {
-      "namespace": "MY_KV"  // 仅保留平台特定配置
-    }
-    // cache 无需任何配置
+    "kv": { "enabled": true }
   }
 }
 ```
+
+未知的键仍然会被接受而不是报错，所以带着旧字段的项目配置照样能解析——那两个字段只是不再有任何作用，而且此前也没有。
 
 ---
 
