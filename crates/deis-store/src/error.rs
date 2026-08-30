@@ -38,6 +38,12 @@ pub enum StoreError {
     /// caller is owed the difference between "that never existed" and "your
     /// work was rolled back and here is why".
     Expired(String),
+    /// The caller sent SQL that the store will not run against a tenant's
+    /// file at all - `ATTACH`, `VACUUM`, a PRAGMA outside the allowlist. Not
+    /// [`StoreError::InvalidArgument`], which is a request the store cannot
+    /// act on: this one is understood perfectly well and declined. See
+    /// [`crate::database`] for what is allowed and why.
+    Refused(String),
     /// SQLite refused or failed.
     Sqlite(rusqlite::Error),
     /// The filesystem refused or failed - or an inbound stream broke, which
@@ -67,6 +73,7 @@ impl fmt::Display for StoreError {
             Self::TooLarge(m) => write!(f, "too large: {m}"),
             Self::Exhausted(m) => write!(f, "at capacity: {m}"),
             Self::Expired(m) => write!(f, "expired: {m}"),
+            Self::Refused(m) => write!(f, "refused: {m}"),
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::BlockingTask(m) => write!(f, "blocking task: {m}"),
@@ -113,6 +120,11 @@ impl From<StoreError> for Status {
             // one, not ask for wider access with the one it has.
             StoreError::Unauthenticated(_) => Code::Unauthenticated,
             StoreError::InvalidArgument(_) => Code::InvalidArgument,
+            // The caller is who it says it is and the statement parses; it
+            // is simply not something a tenant may run. Same code as naming
+            // another tenant's handle, and for the same reason: retrying it
+            // or getting a fresh token changes nothing.
+            StoreError::Refused(_) => Code::PermissionDenied,
             StoreError::NotFound(_) => Code::NotFound,
             // The row exists but the bytes it points at do not: the caller
             // will never get this object back without operator repair.
@@ -165,6 +177,7 @@ mod tests {
             (StoreError::Exhausted("x".into()), Code::ResourceExhausted),
             (StoreError::Stalled("x".into()), Code::DeadlineExceeded),
             (StoreError::Expired("x".into()), Code::DeadlineExceeded),
+            (StoreError::Refused("x".into()), Code::PermissionDenied),
             (
                 StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
                 Code::Internal,

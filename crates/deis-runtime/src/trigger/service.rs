@@ -127,7 +127,9 @@ impl Trigger for TriggerServiceImpl {
             .into_iter()
             .map(|message| LeasedMessage {
                 id: message.id,
-                body: message.body,
+                // trigger.proto still types this leg's body as a string, so
+                // a push can only carry text; the queue itself carries bytes.
+                body: message.body.into_bytes(),
                 attempts: message.attempts,
                 // This node never leased these messages, so it has no lease to
                 // report and nothing it could ack or nack: no expiry and no

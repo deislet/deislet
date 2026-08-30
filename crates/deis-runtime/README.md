@@ -106,15 +106,16 @@ Measured inside a real isolate by asking `typeof globalThis[name]`:
 **Present:** `fetch`, `crypto`, `Headers`, `Request`, `Response`, `URL`,
 `URLSearchParams`, `ReadableStream`, `WritableStream`, `TransformStream`,
 `AbortController`, `AbortSignal`, `DOMException`, `setTimeout`,
-`clearTimeout`, `setInterval`, `clearInterval`, `EventTarget`,
-`queueMicrotask`, `console`, `caches`, `WebSocketPair`, `WebSocketServer`,
-`TextEncoder`, `TextDecoder`, `atob`, `btoa`.
+`clearTimeout`, `setInterval`, `clearInterval`, `EventTarget`, `Event`,
+`CustomEvent`, `queueMicrotask`, `console`, `caches`, `WebSocketPair`,
+`WebSocketServer`, `WebSocket` (the client, policed by the same outbound
+egress policy as `fetch` — see below), `Blob`, `File`, `FormData`,
+`URLPattern`, `structuredClone`, `performance`, `navigator`, `TextEncoder`,
+`TextDecoder`, `atob`, `btoa`.
 
-**Absent:** `Deno`, `__bootstrap`, `Blob`, `File`, `FormData`, `URLPattern`,
-`WebSocket` (the client), `BroadcastChannel`, `structuredClone`, `Event`,
-`performance`, `navigator`, `addEventListener`, `MessageChannel`, `MessagePort`,
-`CompressionStream`, `DecompressionStream`, `EventSource`, `FileReader`,
-`reportError`.
+**Absent:** `Deno`, `__bootstrap`, `BroadcastChannel`, `addEventListener`,
+`MessageChannel`, `MessagePort`, `CompressionStream`, `DecompressionStream`,
+`EventSource`, `FileReader`, `reportError`.
 
 `Deno` and `__bootstrap` are the two that are removed for a security reason,
 not a tidiness one: `deno_core` publishes its op table on both of them
@@ -126,12 +127,22 @@ code runs. The wrapper's captured references were taken at module load, so the
 `fetch` an application calls keeps working while the door to the raw ops is
 shut.
 
-That covers all of SPECIFICATION_BASIC.md section 8.1. Several of the absent
-names are loaded and working *inside* the isolate — `deno_fetch` needs `Blob`
-and `FormData`, `deno_web` needs `Event` — and are simply not bound to a global
-name, so `response.blob()` returns a `Blob` that an application cannot name.
-The line is deliberate: section 8.1, plus what section 8.1 needs in order to be
-usable, and nothing further.
+That covers all of SPECIFICATION_BASIC.md section 8.1, plus what section 8.1's
+own surface needs in order to be usable (`AbortController`/`AbortSignal` to
+cancel an outbound call, `DOMException` for the errors that throws), plus a
+handful more that are absent nowhere else that matters: `Blob`/`File`/
+`FormData` (without them `request.formData()` could receive a multipart
+upload but not read or forward it), `URLPattern` (the first thing a routing
+library reaches for), `structuredClone`, `Event`/`CustomEvent` (an
+`EventTarget` with nothing to dispatch through it), `performance` (coarsened
+to whole milliseconds and a fixed `timeOrigin` of 0, against a cross-isolate
+timing side channel — several tenants' isolates share one OS thread on this
+node), `navigator` (this runtime's own frozen object, one property,
+`userAgent`) and the client `WebSocket` (routed through
+`runtime/ws_client_ops.rs`, which puts every destination through the same
+`fetch_policy.rs` decision point `fetch` does, rather than deno_websocket's
+own connector). The line is still deliberate — not "whatever deno_web
+happens to load" — it is just longer than section 8.1 alone.
 
 That measurement is not a one-off. `the_isolate_global_surface_is_the_one_the_documents_describe`
 in `src/runtime/isolate_test.rs` walks both lists in a real isolate and
@@ -156,8 +167,13 @@ platform's own:
   happened to work here on `iso-8859-1` would be relying on something the canon
   does not promise.
 
-Request and response bodies still cross the Rust/JS boundary as strings, so a
-binary payload is not carried through as a request or response body.
+Request and response bodies cross the Rust/JS boundary as bytes
+(`ops.rs::PendingRequestBody` / `PendingResponseBody`, both `Option<Vec<u8>>`,
+`#[buffer]`/`ToJsBuffer` at the op boundary — see `blob_ops.rs` for why a
+`#[serde] Vec<u8>` is the wrong type on either side), so a binary upload or a
+binary upstream response survives the trip intact. `context.services.kv`,
+`context.services.blob`, the Cache API and `context.services.queue` carry
+bytes the same way.
 
 ### Outbound `fetch` is policed
 

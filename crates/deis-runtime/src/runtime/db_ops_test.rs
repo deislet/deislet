@@ -128,11 +128,11 @@ mod tests {
     // These tests only verify the basic structure and error handling of ops
     // Real Database operation tests are in db_client.rs, marked as #[ignore]
 
-    // The transaction tests below go the whole way instead: a real isolate
-    // running `js/runtime.js` against a real deis-store. Nothing less would
-    // prove anything about `ctx.services.database.transaction`, because what
-    // it promises is a property of three things at once -- the JavaScript
-    // wrapper, the ops, and the connection deis-store pins on the far side.
+    // The tests below go the whole way instead: a real isolate running
+    // `js/runtime.js` against a real deis-store. Nothing less would prove
+    // anything about `ctx.services.database.batch` or `.transaction`, because
+    // what each promises is a property of three things at once -- the
+    // JavaScript wrapper, the ops, and what deis-store does on the far side.
 
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::test_store::TestStore;
@@ -148,7 +148,7 @@ mod tests {
     /// handler's body. The handlers below answer with JSON describing what
     /// they saw, so a failure inside one shows up as an assertion here rather
     /// than as a 500 with no detail.
-    async fn transaction_probe(app_id: &str, store: &TestStore, body_js: &str) -> String {
+    async fn database_probe(app_id: &str, store: &TestStore, body_js: &str) -> String {
         let code = format!("export default async function handler(ctx) {{\n{body_js}\n}}");
         let mut runtime = AppRuntime::new(
             app_id.to_string(),
@@ -179,13 +179,271 @@ mod tests {
         body
     }
 
+    // `ctx.services.database.batch` had the same problem the whole brief is
+    // about: `op_db_batch` was written, registered in the extension, and
+    // called by no line of JavaScript anywhere. These are the first calls it
+    // has ever had from an application, so they go the whole way through.
+
+    #[tokio::test]
+    async fn a_batch_applies_every_statement_and_reports_one_result_per_statement() {
+        // The case a batch exists for: take the stock and record the order,
+        // with no moment in between at which one is true and the other is
+        // not.
+        let store = TestStore::start().await;
+        let body = database_probe(
+            "db_batch_commit_app.production",
+            &store,
+            r#"const db = ctx.services.database;
+                await db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, stock INTEGER)");
+                await db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, item INTEGER, buyer TEXT)");
+                await db.execute("INSERT INTO items (id, stock) VALUES (?, ?)", [1, 5]);
+
+                const results = await db.batch([
+                    { sql: "UPDATE items SET stock = stock - 1 WHERE id = ? AND stock > 0", params: [1] },
+                    { sql: "INSERT INTO orders (item, buyer) VALUES (?, ?)", params: [1, "ada"] },
+                ]);
+
+                const items = await db.query("SELECT stock FROM items WHERE id = 1");
+                const orders = await db.query("SELECT item, buyer FROM orders");
+                return new Response(JSON.stringify({
+                    resultCount: results.length,
+                    affected: results.map((r) => r.rows_affected),
+                    stock: items[0].stock,
+                    orders,
+                }));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            seen["resultCount"], 2,
+            "a batch answers with one result per statement: {body}"
+        );
+        assert_eq!(
+            seen["affected"],
+            serde_json::json!([1, 1]),
+            "each result reports what its own statement did: {body}"
+        );
+        assert_eq!(seen["stock"], 4, "the stock was not taken: {body}");
+        assert_eq!(
+            seen["orders"],
+            serde_json::json!([{ "item": 1, "buyer": "ada" }]),
+            "the parameters a batch statement carried have to reach the store and bind in \
+             order: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_fails_halfway_leaves_nothing_behind() {
+        // The whole reason to use one. The first statement succeeds and the
+        // second violates a constraint; if the first survived, an application
+        // would have taken the stock for an order that does not exist.
+        let store = TestStore::start().await;
+        let body = database_probe(
+            "db_batch_rollback_app.production",
+            &store,
+            r#"const db = ctx.services.database;
+                await db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, stock INTEGER)");
+                await db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, buyer TEXT NOT NULL)");
+                await db.execute("INSERT INTO items (id, stock) VALUES (?, ?)", [1, 5]);
+
+                let caught = null;
+                try {
+                    await db.batch([
+                        { sql: "UPDATE items SET stock = stock - 1 WHERE id = ?", params: [1] },
+                        { sql: "INSERT INTO orders (buyer) VALUES (?)", params: [null] },
+                    ]);
+                } catch (e) {
+                    caught = e.message;
+                }
+
+                const items = await db.query("SELECT stock FROM items WHERE id = 1");
+                const orders = await db.query("SELECT id FROM orders");
+                return new Response(JSON.stringify({
+                    caught,
+                    stock: items[0].stock,
+                    orderCount: orders.length,
+                }));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let caught = seen["caught"].as_str().unwrap_or_default();
+        assert!(
+            caught.contains("rolled back"),
+            "the handler has to be told the batch was rolled back: {body}"
+        );
+        assert!(
+            caught.contains("statement 1"),
+            "and which statement did it, counted the way the array is: {body}"
+        );
+        assert_eq!(
+            seen["stock"], 5,
+            "the statement that had already succeeded must have been taken back with the rest: \
+             {body}"
+        );
+        assert_eq!(seen["orderCount"], 0, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_statement_that_would_return_rows_is_refused() {
+        // A batch is one round trip and nothing reads its rows, so a SELECT
+        // in one could only be a mistake. deis-store refuses it, and it costs
+        // the batch: this is why a read that a later statement depends on
+        // belongs in `transaction`, not here.
+        let store = TestStore::start().await;
+        let body = database_probe(
+            "db_batch_select_app.production",
+            &store,
+            r#"const db = ctx.services.database;
+                await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+                let caught = null;
+                try {
+                    await db.batch([
+                        { sql: "INSERT INTO t (v) VALUES (?)", params: ["a"] },
+                        { sql: "SELECT v FROM t" },
+                    ]);
+                } catch (e) {
+                    caught = e.message;
+                }
+                const rows = await db.query("SELECT v FROM t");
+                return new Response(JSON.stringify({ caught, rows: rows.map((r) => r.v) }));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let caught = seen["caught"].as_str().unwrap_or_default();
+        assert!(
+            caught.contains("statement 1") && caught.contains("rolled back"),
+            "a row-returning statement in a batch has to be named and take the batch with it: \
+             {body}"
+        );
+        assert!(
+            caught.contains("did you mean to call query"),
+            "and the refusal has to point at the call that would have worked: {body}"
+        );
+        assert_eq!(
+            seen["rows"],
+            serde_json::json!([]),
+            "and it takes the rest of the batch down with it: {body}"
+        );
+    }
+
+    #[test]
+    fn a_batch_takes_parameters_as_an_array_or_as_the_encoded_string_execute_takes() {
+        // Two callers, one op. `js/runtime.js` sends the array; anything
+        // holding what `op_db_execute` takes sends the JSON string. Reading
+        // only one of the two is how a statement reaches the store with
+        // nothing bound. An application cannot reach `Deno.core.ops`, so the
+        // second form is checked here, where the decoding lives; the array
+        // form is proved end to end by the batch tests above.
+        use crate::runtime::db_ops::decode_batch_statements;
+
+        let decoded = decode_batch_statements(
+            r#"[
+                { "sql": "INSERT INTO t (v, n) VALUES (?, ?)", "params": ["array", 1] },
+                { "sql": "INSERT INTO t (v, n) VALUES (?, ?)", "params": "[\"string\", 2]" },
+                { "sql": "DELETE FROM t" },
+                { "sql": "DELETE FROM u", "params": null }
+            ]"#,
+        )
+        .expect("every one of these is a legal statement");
+
+        let params: Vec<Option<&str>> = decoded
+            .iter()
+            .map(|(_, params)| params.as_deref())
+            .collect();
+        assert_eq!(
+            params,
+            vec![Some(r#"["array",1]"#), Some(r#"["string", 2]"#), None, None,],
+            "an array has to be encoded and an already-encoded one passed through untouched"
+        );
+    }
+
+    #[test]
+    fn a_batch_statement_that_could_not_run_is_named_by_its_place_in_the_array() {
+        use crate::runtime::db_ops::decode_batch_statements;
+
+        let refusal = decode_batch_statements(r#"[{ "sql": "DELETE FROM t" }, { "params": [] }]"#)
+            .expect_err("a statement with no sql cannot be sent");
+        let message = refusal["error"].as_str().expect("a refusal says why");
+        assert!(message.contains("statement 1"), "{message}");
+
+        let refusal = decode_batch_statements(r#"[{ "sql": "DELETE FROM t", "params": 7 }]"#)
+            .expect_err("a number is not a parameter list");
+        let message = refusal["error"].as_str().expect("a refusal says why");
+        assert!(
+            message.contains("statement 0") && message.contains("params"),
+            "{message}"
+        );
+
+        let refusal = decode_batch_statements(r#"{ "sql": "DELETE FROM t" }"#)
+            .expect_err("one statement is not a batch");
+        assert!(
+            refusal["error"]
+                .as_str()
+                .expect("a refusal says why")
+                .contains("array"),
+            "{refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_could_not_be_a_batch_is_refused_before_anything_is_sent() {
+        // Named by index, because a batch is an array an application built in
+        // a loop and "one of your statements is wrong" is not enough to find
+        // the bug.
+        let store = TestStore::start().await;
+        let body = database_probe(
+            "db_batch_refusal_app.production",
+            &store,
+            r#"const db = ctx.services.database;
+                const caught = {};
+                for (const [name, call] of [
+                    ["notAnArray", () => db.batch({ sql: "SELECT 1" })],
+                    ["noSql", () => db.batch([{ params: [1] }])],
+                    ["badParams", () => db.batch([{ sql: "SELECT 1", params: "1" }])],
+                ]) {
+                    try {
+                        await call();
+                        caught[name] = "not refused";
+                    } catch (e) {
+                        caught[name] = e.constructor.name + ": " + e.message;
+                    }
+                }
+                const empty = await db.batch([]);
+                return new Response(JSON.stringify({ caught, emptyLength: empty.length }));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        for name in ["notAnArray", "noSql", "badParams"] {
+            let caught = seen["caught"][name].as_str().unwrap_or_default();
+            assert!(
+                caught.starts_with("TypeError"),
+                "{name} was not refused: {body}"
+            );
+        }
+        assert!(
+            seen["caught"]["noSql"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("statement 0"),
+            "a refusal has to name the statement it is about: {body}"
+        );
+        assert_eq!(
+            seen["emptyLength"], 0,
+            "an empty batch is nothing to do, not an error: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn a_transaction_commits_when_the_callback_returns_and_resolves_to_its_value() {
         // Two things at once, because they are the same promise: what the
         // callback returned is what the caller gets, and everything the
         // callback wrote is there afterwards.
         let store = TestStore::start().await;
-        let body = transaction_probe(
+        let body = database_probe(
             "db_tx_commit_app.production",
             &store,
             &format!(
@@ -222,7 +480,7 @@ mod tests {
         // Anything else and it cannot tell what went wrong, let alone branch
         // on it.
         let store = TestStore::start().await;
-        let body = transaction_probe(
+        let body = database_probe(
             "db_tx_throw_app.production",
             &store,
             &format!(
@@ -266,7 +524,7 @@ mod tests {
         // already ended the transaction, so the rollback is refused. The
         // handler must still see the error its own code raised.
         let store = TestStore::start().await;
-        let body = transaction_probe(
+        let body = database_probe(
             "db_tx_rollback_fails_app.production",
             &store,
             &format!(
@@ -309,7 +567,7 @@ mod tests {
         // more; the only thing it could do is run outside one and commit on
         // its own, which is exactly what the caller did not ask for.
         let store = TestStore::start().await;
-        let body = transaction_probe(
+        let body = database_probe(
             "db_tx_escaped_app.production",
             &store,
             &format!(
@@ -356,7 +614,7 @@ mod tests {
         // another connection and sees the database as it was before the
         // transaction opened.
         let store = TestStore::start().await;
-        let body = transaction_probe(
+        let body = database_probe(
             "db_tx_outer_handle_app.production",
             &store,
             &format!(
@@ -398,7 +656,7 @@ mod tests {
         // or a bare "unknown handle", would send an application looking for a
         // bug it does not have.
         let store = TestStore::start().await;
-        let body = transaction_probe(
+        let body = database_probe(
             "db_tx_deadline_app.production",
             &store,
             &format!(
@@ -446,7 +704,7 @@ mod tests {
         // write lock. A call that could never have used one is turned away
         // here rather than opening one and leaking it until its deadline.
         let store = TestStore::start().await;
-        let body = transaction_probe(
+        let body = database_probe(
             "db_tx_no_callback_app.production",
             &store,
             r#"const db = ctx.services.database;

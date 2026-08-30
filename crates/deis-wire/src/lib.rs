@@ -20,11 +20,17 @@ pub use client::WireClient;
 pub use config::{ControlConfig, NodeInfo, NodeRole};
 pub use error::{SdkResult, WireError};
 
-// Re-export the cross-component conventions
-pub use conventions::{
-    APP_ID_HEADER, DEFAULT_ENVIRONMENT, ENVIRONMENT_HEADER, MAX_GRPC_MESSAGE_BYTES,
-    STREAM_CHUNK_BYTES, TENANT_HEADER, split_tenant, tenant_id,
-};
+// Re-export the cross-component conventions.
+//
+// All of them, and by glob rather than by name. This was a hand-written list,
+// and a hand-written list drifts: the storage capability token arrived with
+// three names that were never added to it, so call sites ended up writing
+// `deis_wire::tenant_id(..)` beside `deis_wire::conventions::storage_token(..)`
+// and reading the second as a lesser kind of name. Every convention is a name
+// the whole platform has to spell identically, so every one of them is
+// reachable the same way, and the next one added is reachable without anyone
+// remembering to come here.
+pub use conventions::*;
 
 // Re-export models
 pub use models::{AuthData, HeartbeatRequest, InstanceDetails, InstanceStatus, RegisterRequest};

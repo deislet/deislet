@@ -71,7 +71,12 @@ service Queue {
 
 message SendRequest {
   string queue_name = 1;
-  string message_body = 2;
+  // Bytes, not a string. A queue carries whatever the application put on it -
+  // a compressed record, a protobuf, an image - and the dead letter table has
+  // always been typed as bytes for exactly that reason. Typing this half as a
+  // string meant such a body could never be enqueued in the first place, so
+  // the operator's view could only ever show bodies that were text anyway.
+  bytes message_body = 2;
 }
 
 message SendResponse {
@@ -88,7 +93,9 @@ message SendResponse {
 
 message SendBatchRequest {
   string queue_name = 1;
-  repeated string messages = 2;
+  // One body per message; see SendRequest.message_body for why these are
+  // bytes.
+  repeated bytes messages = 2;
 }
 
 message SendBatchResponse {
@@ -118,7 +125,10 @@ message QueueMessage {
   // Handle for Ack and Nack. Stable across redeliveries, so it is also the
   // key an idempotent handler can deduplicate on.
   string id = 1;
-  string body = 2;
+  // The bytes that were sent, handed back untouched. A consumer that knows
+  // its own messages are text decodes them itself; the queue does not, so a
+  // body that is not UTF-8 is delivered rather than withheld.
+  bytes body = 2;
   // How many times this message has been handed out, including this one. It
   // starts at 1, and when it reaches the queue's ceiling the next failure
   // dead letters the message instead of retrying it.

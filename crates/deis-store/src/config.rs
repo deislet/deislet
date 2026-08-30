@@ -67,6 +67,12 @@ pub struct Config {
     pub shared_connections: usize,
     /// Connections in the pool of one tenant's database file. Kept small: with
     /// many tenants, the sum is what matters.
+    ///
+    /// Never fewer than [`crate::database::MIN_TENANT_CONNECTIONS`], which is
+    /// two: an interactive transaction pins a connection for its whole life,
+    /// so a pool of one would leave that tenant's ordinary queries with
+    /// nowhere to run until the transaction's deadline released it. A smaller
+    /// value is raised at startup, with a `warn` saying so.
     #[serde(default = "default_tenant_connections")]
     pub tenant_connections: usize,
     /// How often expired KV entries are deleted. Expiry is already honoured
@@ -127,6 +133,9 @@ fn default_shared_connections() -> usize {
     8
 }
 
+/// Four: two above the minimum, so the default install has room for the
+/// per-tenant transaction ceiling and still keeps connections for ordinary
+/// queries, without every tenant costing a large handful of file handles.
 fn default_tenant_connections() -> usize {
     4
 }
@@ -286,6 +295,13 @@ mod tests {
         // startup rather than served, so this default is load-bearing.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
+    }
+
+    /// The default has to be usable, which here means big enough that a
+    /// transaction can be open while ordinary queries keep running.
+    #[test]
+    fn the_default_tenant_pool_can_spare_a_connection() {
+        assert!(default_tenant_connections() > crate::database::MIN_TENANT_CONNECTIONS);
     }
 
     #[test]

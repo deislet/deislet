@@ -36,6 +36,13 @@ listen = "127.0.0.1:8090"
 # Directory holding kv.sqlite, blob.sqlite, db/<tenant>.sqlite and the blob
 # content tree. Back this up: it is the only copy of every tenant's data.
 #
+# One SQLite file per tenant is the boundary between tenants, and it is held
+# by SQLite's own authorizer rather than by the layout: an application's SQL
+# cannot ATTACH another file, cannot VACUUM a copy of itself anywhere, and
+# cannot run the pragmas that would disclose these paths. So the directory
+# layout is not a secret, but the process still must not be able to write
+# outside this tree for any other reason - run it as a user that cannot.
+#
 # A tenant is one application in one environment, spelled "<app>.<environment>"
 # (for example "demo.production"). A directory written before that was true is
 # keyed by bare application ids and cannot be read now; there is no migration,
@@ -53,6 +60,11 @@ shared_connections = 8
 # purpose: with many tenants it is the sum across them that decides how many
 # threads and file handles the process holds. Note that an application with a
 # production environment and two previews is three tenants, so three files.
+#
+# Two is the minimum and anything lower is raised to it at startup, with a
+# warning. An interactive transaction pins one connection for as long as it
+# stays open, so a pool of one would leave that tenant's ordinary queries
+# waiting for the transaction's deadline before they could run at all.
 tenant_connections = 4
 
 # Seconds between sweeps of expired KV entries. Expiry is already honoured by

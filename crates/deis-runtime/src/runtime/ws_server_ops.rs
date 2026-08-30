@@ -1,7 +1,13 @@
 // WebSocket Server Ops definitions
 // Provides server-side WebSocket functionality, allowing JavaScript apps to receive client connections
+//
+// These ops are the outbound half: what the application sends back to the
+// client. The inbound half -- a frame the client sent, and the stamp that says
+// whether it was TEXT or BINARY -- is framed in `dispatcher/handlers.rs`
+// (`ws_frame`) and read in `js/runtime.js` (`WebSocketServer._handleMessage`),
+// because the bridge that owns the socket lives there.
 
-use deno_core::{extension, op2, OpState};
+use deno_core::{extension, op2, JsBuffer, OpState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
@@ -106,6 +112,63 @@ async fn op_ws_server_send(
     }
 }
 
+/// WebSocket server send a BINARY frame.
+///
+/// Separate from [`op_ws_server_send`] rather than a mode of it because the
+/// two carry different things: a text frame is a string and a binary frame is
+/// bytes, and bytes crossing from V8 must come over as a buffer. Without this
+/// op an application could not send a binary frame at all --
+/// `WebSocketServer.send` fell back to `JSON.stringify`, so
+/// `send(new Uint8Array([1, 2, 3]))` reached the client as the TEXT frame
+/// `{"0":1,"1":2,"2":3}` and [`WsServerMessage::Binary`] was a variant nothing
+/// in the crate ever constructed.
+///
+/// # Parameters
+/// - ws_id: WebSocket connection ID
+/// - data: the frame's bytes
+///
+/// # Returns
+/// - JSON object: { success: bool, error?: string }
+#[op2(async)]
+#[serde]
+async fn op_ws_server_send_binary(
+    state: Rc<RefCell<OpState>>,
+    #[string] ws_id: String,
+    #[buffer] data: JsBuffer,
+) -> JsonValue {
+    let ws_manager = {
+        let state_borrow = state.borrow();
+        match state_borrow.try_borrow::<WsServerManager>() {
+            Some(mgr) => mgr.clone(),
+            None => {
+                return serde_json::json!({
+                    "success": false,
+                    "error": "WebSocket server manager not available"
+                });
+            }
+        }
+    };
+
+    let manager = ws_manager.read().await;
+    match manager.get(&ws_id) {
+        Some(tx) => {
+            if tx.send(WsServerMessage::Binary(data.to_vec())).is_err() {
+                return serde_json::json!({
+                    "success": false,
+                    "error": "Connection closed"
+                });
+            }
+            serde_json::json!({
+                "success": true
+            })
+        }
+        None => serde_json::json!({
+            "success": false,
+            "error": "WebSocket connection not found"
+        }),
+    }
+}
+
 /// WebSocket close request
 #[derive(Debug, Deserialize)]
 struct WsCloseRequest {
@@ -178,7 +241,12 @@ async fn op_ws_server_close(
 // Define ws_server extension
 extension!(
     deis_runtime_ws_server_ops,
-    ops = [op_ws_server_accept, op_ws_server_send, op_ws_server_close],
+    ops = [
+        op_ws_server_accept,
+        op_ws_server_send,
+        op_ws_server_send_binary,
+        op_ws_server_close
+    ],
 );
 
 /// Initialize ws_server ops extension

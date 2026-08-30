@@ -1261,7 +1261,7 @@ impl Queue for QueueService {
         let tenant = tenant_of(&request)?;
         let req = request.into_inner();
         let id = self
-            .send(&tenant, &req.queue_name, req.message_body.into_bytes())
+            .send(&tenant, &req.queue_name, req.message_body)
             .await?;
         Ok(Response::new(SendResponse {
             success: true,
@@ -1276,8 +1276,9 @@ impl Queue for QueueService {
     ) -> Result<Response<SendBatchResponse>, Status> {
         let tenant = tenant_of(&request)?;
         let req = request.into_inner();
-        let bodies = req.messages.into_iter().map(String::into_bytes).collect();
-        let ids = self.send_batch(&tenant, &req.queue_name, bodies).await?;
+        let ids = self
+            .send_batch(&tenant, &req.queue_name, req.messages)
+            .await?;
         Ok(Response::new(SendBatchResponse {
             success: true,
             message_ids: ids,
@@ -1297,37 +1298,22 @@ impl Queue for QueueService {
             )
             .await?;
 
-        let mut messages = Vec::with_capacity(leased.len());
-        for message in leased {
-            match String::from_utf8(message.body) {
-                Ok(body) => messages.push(QueueMessage {
-                    id: message.id,
-                    body,
-                    attempts: message.attempts,
-                    lease_expires_at: message.lease_expires_at,
-                    created_at: message.created_at,
-                    lease_token: message.lease_token,
-                }),
-                Err(e) => {
-                    // queue.proto types the body as a string, so bytes that
-                    // are not UTF-8 cannot be handed back at all. Dropping
-                    // this one message rather than failing the whole pull
-                    // keeps its healthy neighbours moving; it stays leased,
-                    // and its attempts keep climbing until the ceiling
-                    // retires it into the dead letter table.
-                    tracing::error!(
-                        tenant = %tenant,
-                        queue = %req.queue_name,
-                        message_id = %message.id,
-                        attempts = message.attempts,
-                        error = %e,
-                        "stored message body is not valid UTF-8 and cannot be delivered; it is \
-                         withheld from this pull and will be dead lettered once its attempts run \
-                         out"
-                    );
-                }
-            }
-        }
+        // Every leased message is handed back, whatever its bytes are.
+        // `QueueMessage.body` was a string until the queue learned to carry
+        // bytes, and a body that was not UTF-8 was withheld from the pull and
+        // left to climb its attempt count until the ceiling dead lettered a
+        // message nothing was ever wrong with.
+        let messages = leased
+            .into_iter()
+            .map(|message| QueueMessage {
+                id: message.id,
+                body: message.body,
+                attempts: message.attempts,
+                lease_expires_at: message.lease_expires_at,
+                created_at: message.created_at,
+                lease_token: message.lease_token,
+            })
+            .collect();
         Ok(Response::new(PullResponse { messages }))
     }
 
@@ -2615,7 +2601,7 @@ mod tests {
             &f.service,
             Request::new(SendRequest {
                 queue_name: "jobs".to_string(),
-                message_body: "work".to_string(),
+                message_body: b"work".to_vec(),
             }),
         )
         .await
@@ -2632,7 +2618,7 @@ mod tests {
                 "app-one.production",
                 SendRequest {
                     queue_name: "jobs".to_string(),
-                    message_body: "work".to_string(),
+                    message_body: b"work".to_vec(),
                 },
             ),
         )
@@ -2658,7 +2644,7 @@ mod tests {
         .into_inner();
         assert_eq!(pulled.messages.len(), 1);
         assert_eq!(pulled.messages[0].id, sent.message_id);
-        assert_eq!(pulled.messages[0].body, "work");
+        assert_eq!(pulled.messages[0].body, b"work");
         assert_eq!(pulled.messages[0].attempts, 1);
         assert_eq!(pulled.messages[0].lease_expires_at, T0 + 30);
         assert!(!pulled.messages[0].lease_token.is_empty());
@@ -2683,11 +2669,15 @@ mod tests {
         assert_eq!(acked.stale_leases, 0);
     }
 
-    /// A body that is not UTF-8 cannot be put on the wire at all, and the
-    /// only way one gets into the table is damage. It must not take the
-    /// whole pull down with it.
+    /// A body that is not UTF-8 is delivered like any other.
+    ///
+    /// It used to be withheld from the pull, because `QueueMessage.body` was
+    /// a string: the message stayed leased, its attempts climbed, and the
+    /// ceiling eventually dead lettered a message nothing was wrong with. The
+    /// dead letter table has always typed its bodies as bytes for exactly
+    /// this case; now the whole path does.
     #[tokio::test]
-    async fn a_message_that_cannot_be_encoded_is_withheld_without_hiding_its_neighbours() {
+    async fn a_body_that_is_not_utf8_is_delivered_rather_than_withheld() {
         let f = fixture().await;
         let a = tenant("app-one.production");
         f.service.send(&a, "jobs", vec![0xff, 0xfe]).await.unwrap();
@@ -2710,7 +2700,44 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
+        let bodies: Vec<Vec<u8>> = pulled.messages.iter().map(|m| m.body.clone()).collect();
+        assert_eq!(bodies, vec![vec![0xff, 0xfe], b"readable".to_vec()]);
+    }
+
+    /// The producer half, over the generated types: bytes that are not text
+    /// go in through Send and come back out of Pull unchanged.
+    #[tokio::test]
+    async fn the_grpc_surface_round_trips_a_body_that_is_not_text() {
+        let f = fixture().await;
+        let body = vec![0x00, 0x1f, 0x80, 0xff, 0xfe];
+        Queue::send(
+            &f.service,
+            as_tenant(
+                "app-one.production",
+                SendRequest {
+                    queue_name: "jobs".to_string(),
+                    message_body: body.clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let pulled = Queue::pull(
+            &f.service,
+            as_tenant(
+                "app-one.production",
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 10,
+                    lease_seconds: 0,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
         assert_eq!(pulled.messages.len(), 1);
-        assert_eq!(pulled.messages[0].body, "readable");
+        assert_eq!(pulled.messages[0].body, body);
     }
 }

@@ -247,7 +247,13 @@ function nextRequest(current, status, from, to) {
     FunctionPrototypeCall(urlOrigin, new NativeURL(to)) !==
       FunctionPrototypeCall(urlOrigin, new NativeURL(from));
 
+  // `__proto__: null` because this init is a dictionary, and a dictionary is
+  // read member by member with an ordinary property get: every member this
+  // literal does not spell would otherwise be answered by whatever the
+  // application had put on `Object.prototype`. This hop is one the
+  // application never named, so what it carries is decided here alone.
   return new NativeRequest(to, {
+    __proto__: null,
     method,
     headers: nextHeaderList(current, becomesAGet, crossesOrigin),
     body,
@@ -311,7 +317,15 @@ async function fetch(input, init = undefined) {
   const signal = boundedByExecutionBudget(current.signal);
 
   for (let hops = 0; ; hops++) {
-    const hop = await nativeFetch(current, { redirect: "manual", signal });
+    // Same reason as the init in `nextRequest`: read as a dictionary, so
+    // nothing an application left on `Object.prototype` gets to fill in the
+    // members that keep this loop -- and therefore the policy check on every
+    // hop -- in charge of the redirect.
+    const hop = await nativeFetch(current, {
+      __proto__: null,
+      redirect: "manual",
+      signal,
+    });
     const inner = toInnerResponse(hop);
 
     // `manual` is the application asking to be handed the redirect itself,
@@ -636,7 +650,10 @@ const performance = ObjectFreeze({
 // lie is worse than one that is missing. It is frozen so that a handler cannot
 // bolt one on either -- an isolate is reused across requests, so a property
 // written onto a platform global during one request would still be there,
-// looking like platform surface, during the next.
+// looking like platform surface, during the next. Freezing the object is only
+// half of that; the *binding* is sealed where the globals are defined, because
+// a frozen object reached by a name that can be redefined is no protection at
+// all.
 
 const navigator = ObjectFreeze({
   userAgent: "Deislet",
@@ -650,6 +667,35 @@ const navigator = ObjectFreeze({
 // names are defined in a browser and in Deno; an application that assigns over
 // `globalThis.fetch` to install its own instrumentation is doing something
 // ordinary and should not get a silent no-op.
+//
+// # Read-only is not the same as unreplaceable
+//
+// `core.propReadOnly` is `{ writable: false, configurable: true }`, which
+// protects the *value* and leaves the *binding* open: plain assignment throws
+// in a module's strict mode, and then `Object.defineProperty(globalThis,
+// "navigator", { value: mine })` and `delete globalThis.navigator` both
+// succeed. That is not an application lying to itself for one request. An
+// isolate is reused across every request for the same application on this
+// node, so whatever a handler installed was still standing for the next
+// request: a `performance.now()` with a fractional part and an invented
+// `timeOrigin` -- which is the sub-millisecond clock the coarse one exists to
+// withhold -- and a `navigator.userAgent` of the handler's choosing, both
+// looking like platform surface to code that had never touched them.
+//
+// So the names that describe the platform rather than serve the application
+// are sealed: no write, no redefinition, no delete. The two internal hooks are
+// sealed for a harder reason -- `__deis_runtime_sweep_intervals` is what ends
+// an application's `setInterval` when its request does, and an application
+// that could replace it with a no-op would leave callbacks running on a
+// runtime thread its request no longer owns.
+
+function propSealed(value) {
+  return { value, writable: false, enumerable: true, configurable: false };
+}
+
+function propSealedNonEnumerable(value) {
+  return { value, writable: false, enumerable: false, configurable: false };
+}
 //
 // What is deliberately *not* here is as much a decision as what is, and each
 // name left out has its own reason rather than a shared one: `Deno` and
@@ -671,8 +717,12 @@ ObjectDefineProperties(globalThis, {
   URLSearchParams: core.propNonEnumerable(url.URLSearchParams),
 
   // Section 8.1: Web Crypto, which is `crypto.getRandomValues`,
-  // `crypto.randomUUID` and the whole of `crypto.subtle`.
-  crypto: core.propReadOnly(crypto.crypto),
+  // `crypto.randomUUID` and the whole of `crypto.subtle`. Sealed: a
+  // `getRandomValues` an application had swapped for a counter would still be
+  // there on the next request through this isolate, and everything that then
+  // asked for a random number -- a session id, a nonce, a token -- would get
+  // the application's number instead.
+  crypto: propSealed(crypto.crypto),
 
   // Section 8.1: the stream types. The readers, writers, controllers and
   // queuing strategies are not bound as globals: an application reaches them
@@ -731,19 +781,18 @@ ObjectDefineProperties(globalThis, {
   // that store later is a test failure rather than a silent change.
   structuredClone: core.propWritable(messagePort.structuredClone),
 
-  // Events. `EventTarget` is bound (in `js/runtime.js`) and an EventTarget
-  // with no Event to fire is furniture: `dispatchEvent` has to be handed
-  // something, and every handler written elsewhere hands it one of these.
-  // `CustomEvent` comes with it because carrying a payload is the only reason
-  // an application dispatches an event of its own.
+  // Events, and one implementation of them for the whole isolate.
   //
-  // These are deno_web's classes while the `EventTarget` they are dispatched
-  // through is the small one in `js/runtime.js`, which calls listeners with
-  // the event object exactly as given. That combination works -- it reads
-  // `event.type` and nothing else -- but it does not fill in `event.target`.
-  // deno_web's own `EventTarget` is not bound in its place because the
-  // WebSocket bridge in `js/runtime.js` dispatches plain `{ type, data }`
-  // objects, which deno_web's `dispatchEvent` rejects outright.
+  // There used to be two. These classes are deno_web's, while `EventTarget`
+  // was a small hand-written one in `js/runtime.js` that dispatched plain
+  // `{ type, data }` literals -- so an outbound `WebSocket`, which extends
+  // deno_web's `EventTarget`, was not an instance of the `EventTarget` an
+  // application could name. Listeners worked; the `instanceof` guard a
+  // library runs *before* attaching one saw false and took its other branch.
+  // Now deno_web's is the only one, `js/runtime.js` builds real events for
+  // the inbound socket out of `__deis_runtime_events` below, and every
+  // dispatch fills in `event.target` the way the specification says.
+  EventTarget: core.propNonEnumerable(event.EventTarget),
   Event: core.propNonEnumerable(event.Event),
   CustomEvent: core.propNonEnumerable(event.CustomEvent),
 
@@ -761,13 +810,34 @@ ObjectDefineProperties(globalThis, {
 
   // Not deno_web's `performance`, and one property of `navigator`. Both are
   // built above; the section there says why the clock is coarse and why
-  // `navigator` answers with a name and nothing else.
-  performance: core.propReadOnly(performance),
-  navigator: core.propReadOnly(navigator),
+  // `navigator` answers with a name and nothing else. Both sealed: freezing
+  // the object protects what is on it and not the name it is reached by, and
+  // the name is what the next request through this isolate resolves.
+  performance: propSealed(performance),
+  navigator: propSealed(navigator),
 
   // Internal, not part of the platform's promise to applications: see the
   // timers section above and the execution-budget section further up. Both
-  // are called by `js/runtime.js` at the end of every invocation.
-  __deis_runtime_sweep_intervals: core.propNonEnumerable(sweepIntervals),
-  __deis_runtime_sweep_fetch_budgets: core.propNonEnumerable(sweepBudgetTimers),
+  // are called by `js/runtime.js` at the end of every invocation, so both are
+  // sealed -- a no-op in place of either is an application keeping work
+  // running past the request that started it.
+  __deis_runtime_sweep_intervals: propSealedNonEnumerable(sweepIntervals),
+  __deis_runtime_sweep_fetch_budgets: propSealedNonEnumerable(sweepBudgetTimers),
+
+  // The event classes `js/runtime.js` builds its WebSocket events out of.
+  // That file runs through `execute_script`, so it cannot import from
+  // `ext:deno_web/02_event.js` the way this module can, and it must not build
+  // its events out of whatever `globalThis.Event` happens to be by the time a
+  // frame arrives. `MessageEvent` and `CloseEvent` are not bound under their
+  // own names because the platform's global list is a promise the documents
+  // and `isolate_test.rs` hold this file to; this is plumbing between two
+  // files of the runtime, and it is sealed for the same reason the sweeps
+  // are.
+  __deis_runtime_events: propSealedNonEnumerable(ObjectFreeze({
+    Event: event.Event,
+    MessageEvent: event.MessageEvent,
+    CloseEvent: event.CloseEvent,
+    ErrorEvent: event.ErrorEvent,
+    defineEventHandler: event.defineEventHandler,
+  })),
 });

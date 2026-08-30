@@ -11,13 +11,20 @@
 //! 2. Disabled applications get a 403. Plain HTTP requests for an application
 //!    whose certificate is actually loaded are redirected to HTTPS when the
 //!    policy says so.
-//! 3. A backend is picked from the shared upstream pool and the request is
+//! 3. A request body larger than `max_request_body_bytes` is answered 413,
+//!    either from what the client declared in `Content-Length` (before an
+//!    upstream is picked at all) or from the bytes as they stream past. The
+//!    body is not buffered here, so without this the whole over-large upload
+//!    would be carried across the edge-to-node hop before the node refused it.
+//!    An upgraded connection is exempt: its frames are a conversation with no
+//!    total size, not a body a node will buffer.
+//! 4. A backend is picked from the shared upstream pool and the request is
 //!    forwarded. `x-deis-app-id` is set to the id deis-proxy decided on and
 //!    `x-deis-environment` to that app's configured environment (defaulting
 //!    to production when the route names none), replacing whatever the
 //!    client sent for either header, so deis-runtime only ever sees values
 //!    that passed the checks above.
-//! 4. A request the upstream upgrades (a WebSocket handshake) becomes a
+//! 5. A request the upstream upgrades (a WebSocket handshake) becomes a
 //!    tunnel: everything after the 101 is relayed in both directions until
 //!    one end closes. The upstream read timeout is a bound on how long a
 //!    reply may take and is not applied to that tunnel, so a connection is
@@ -46,7 +53,7 @@ use pingora::{Error, ErrorType};
 use tracing::{debug, warn};
 
 use crate::config::routes::{RouteTable, normalize_host};
-use crate::config::system::CompressionAlgo;
+use crate::config::system::{CompressionAlgo, DEFAULT_MAX_REQUEST_BODY_BYTES};
 use crate::config::{AppConfig, ConfigManager};
 
 pub use access_log::AccessLog;
@@ -60,7 +67,6 @@ pub struct DeisProxy {
 }
 
 /// Per-request state shared between proxy phases.
-#[derive(Default)]
 pub struct RequestCtx {
     started: Option<Instant>,
     /// Normalized request host (no port, lowercase).
@@ -74,11 +80,47 @@ pub struct RequestCtx {
     pub upstream: Option<String>,
     /// Whether the client connection is TLS.
     pub tls: bool,
+    /// Ceiling on this request's body, taken from the configuration once when
+    /// the request starts so a hot reload cannot change the answer half way
+    /// through a stream.
+    pub max_request_body_bytes: usize,
+    /// Request body bytes carried so far, counted as they stream past.
+    /// `Content-Length` is a claim; this is what actually arrived.
+    body_bytes: usize,
+}
+
+/// Written out rather than derived so the ceiling is the documented default in
+/// a context built any other way than [`DeisProxy::new_ctx`]. A derived
+/// `Default` would make it 0, which reads as "refuse every body".
+impl Default for RequestCtx {
+    fn default() -> Self {
+        Self {
+            started: None,
+            host: String::new(),
+            app_id: None,
+            environment: None,
+            upstream: None,
+            tls: false,
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            body_bytes: 0,
+        }
+    }
 }
 
 impl RequestCtx {
     pub fn elapsed(&self) -> Duration {
         self.started.map(|t| t.elapsed()).unwrap_or_default()
+    }
+
+    /// Account for one streamed chunk of request body.
+    ///
+    /// `false` means this request has now gone past the ceiling and must not
+    /// be carried any further. The count is of bytes that actually arrived, so
+    /// it catches a chunked body (which declares no length at all) and one
+    /// whose `Content-Length` under-declared.
+    fn carry_body(&mut self, chunk_len: usize) -> bool {
+        self.body_bytes = self.body_bytes.saturating_add(chunk_len);
+        self.body_bytes <= self.max_request_body_bytes
     }
 }
 
@@ -94,6 +136,25 @@ impl DeisProxy {
             access_log,
         }
     }
+}
+
+/// What the client says it is about to send, when it says anything usable.
+///
+/// A `Content-Length` that is missing, not a number, or negative is not read as
+/// zero: such a request still has its bytes counted as they arrive.
+fn declared_body_length(session: &Session) -> Option<usize> {
+    session
+        .get_header("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+/// The refusal a client gets, naming the ceiling so the number is actionable
+/// rather than a bare 413.
+fn over_the_body_ceiling(limit: usize) -> Bytes {
+    Bytes::from(format!(
+        "request body is larger than this proxy carries: the limit is {limit} bytes\n"
+    ))
 }
 
 /// Host the client asked for: the URI authority (HTTP/2) or the `Host`
@@ -190,6 +251,7 @@ impl ProxyHttp for DeisProxy {
     fn new_ctx(&self) -> RequestCtx {
         RequestCtx {
             started: Some(Instant::now()),
+            max_request_body_bytes: self.config.get_system_config().max_request_body_bytes(),
             ..Default::default()
         }
     }
@@ -232,6 +294,26 @@ impl ProxyHttp for DeisProxy {
             .and_then(|digest| digest.ssl_digest.as_ref())
             .is_some();
         ctx.host = request_host(session);
+
+        // Checked before the route table, because refusing here costs nothing:
+        // no upstream has been picked and not a byte of the body has been
+        // read. A client that declares an over-large upload is told so on the
+        // connection it already has.
+        if let Some(declared) = declared_body_length(session)
+            && declared > ctx.max_request_body_bytes
+        {
+            warn!(
+                host = %ctx.host,
+                declared,
+                limit = ctx.max_request_body_bytes,
+                "refusing a request that declares a body larger than this proxy carries; it was \
+                 not forwarded to any node"
+            );
+            session
+                .respond_error_with_body(413, over_the_body_ceiling(ctx.max_request_body_bytes))
+                .await?;
+            return Ok(true);
+        }
 
         let routes = self.config.routes();
         let requested_id = session
@@ -299,6 +381,54 @@ impl ProxyHttp for DeisProxy {
         }
 
         Ok(false)
+    }
+
+    /// The ceiling on a body that declared nothing, or that declared less than
+    /// it sends.
+    ///
+    /// `Content-Length` is refused in `request_filter`, before an upstream
+    /// exists. This is the other half: a chunked body announces no length at
+    /// all, and a header that under-declares is the obvious way past a check
+    /// that only reads the header. Nothing is buffered here -- the bytes are
+    /// counted as they stream through -- so the cost of the refusal is the
+    /// chunk that crossed the line, not the upload.
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut RequestCtx,
+    ) -> pingora::Result<()> {
+        // Pingora runs the client-to-upstream half of an upgraded connection
+        // through this same filter, so the frames of a WebSocket arrive here
+        // as "request body". They are not one: a request body is a bounded
+        // thing a node buffers whole, while a socket is a conversation with no
+        // total size, and counting it would close every chat that ever carried
+        // more than the ceiling -- mid-sentence, for no fault. The same
+        // reasoning takes the upstream read timeout off a tunnel in
+        // `upstream_peer`.
+        if session.is_upgrade_req() {
+            return Ok(());
+        }
+
+        let Some(chunk) = body.as_ref() else {
+            return Ok(());
+        };
+        if !ctx.carry_body(chunk.len()) {
+            warn!(
+                host = %ctx.host,
+                app_id = ?ctx.app_id,
+                carried = ctx.body_bytes,
+                limit = ctx.max_request_body_bytes,
+                "a request body went past the ceiling while streaming; the rest of the upload is \
+                 not carried and the request is refused"
+            );
+            return Err(Error::explain(
+                ErrorType::HTTPStatus(413),
+                "request body is larger than this proxy carries",
+            ));
+        }
+        Ok(())
     }
 
     async fn upstream_peer(
@@ -571,6 +701,66 @@ mod tests {
         assert_eq!(
             header_str(&upstream_request, ENVIRONMENT_HEADER).as_deref(),
             Some("client-env")
+        );
+    }
+
+    #[test]
+    fn a_context_built_any_other_way_still_carries_a_ceiling() {
+        // A derived `Default` would make this 0, which reads as "refuse every
+        // body"; the hand-written one keeps the documented default.
+        assert_eq!(
+            RequestCtx::default().max_request_body_bytes,
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+    }
+
+    #[test]
+    fn a_body_inside_the_ceiling_streams_through_chunk_by_chunk() {
+        let mut ctx = RequestCtx {
+            max_request_body_bytes: 1024,
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            assert!(
+                ctx.carry_body(256),
+                "1 KiB in 256-byte chunks is inside 1 KiB"
+            );
+        }
+        assert_eq!(ctx.body_bytes, 1024);
+    }
+
+    #[test]
+    fn a_body_is_refused_at_the_chunk_that_crosses_the_ceiling() {
+        // The point of counting as the bytes stream: the refusal lands on the
+        // chunk that crosses the line, so what the proxy carried is one chunk
+        // over the limit rather than the whole upload.
+        let mut ctx = RequestCtx {
+            max_request_body_bytes: 1024,
+            ..Default::default()
+        };
+        assert!(ctx.carry_body(1024));
+        assert!(!ctx.carry_body(1), "one byte past the ceiling is past it");
+    }
+
+    #[test]
+    fn an_undeclared_body_is_still_counted() {
+        // A chunked upload declares no length, so `Content-Length` never sees
+        // it; only the streaming count does.
+        let mut ctx = RequestCtx {
+            max_request_body_bytes: 8,
+            ..Default::default()
+        };
+        assert!(ctx.carry_body(8));
+        assert!(!ctx.carry_body(8));
+    }
+
+    #[test]
+    fn the_refusal_names_the_ceiling_that_was_applied() {
+        let body = over_the_body_ceiling(33_554_432);
+        let text = String::from_utf8(body.to_vec()).expect("the refusal is text");
+        assert!(
+            text.contains("33554432"),
+            "a refusal has to say what the limit is; it said {text:?}"
         );
     }
 

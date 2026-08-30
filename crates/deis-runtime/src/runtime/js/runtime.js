@@ -40,6 +40,45 @@ delete globalThis.Deno;
 delete globalThis.__bootstrap;
 
 // ---------------------------------------------------------
+// Reading an options object the application handed in
+// ---------------------------------------------------------
+//
+// An ordinary property read walks the prototype chain, and every options bag
+// on this platform used to be read that way -- `init.status`,
+// `opts.expirationTtl`, `m.body.text`. An application may write to its own
+// `Object.prototype`; nothing can stop it, and nothing should. But the
+// isolate is reused across requests, so one line of
+// `Object.prototype.status = 418` in a handler decided the status of every
+// later response built with no init at all, on every later request, including
+// requests belonging to somebody else's traffic through the same isolate.
+// With `Object.prototype.status = 101` and a forged `webSocket` beside it,
+// the same line made a plain GET answer 101, which is the dispatcher's signal
+// to start a WebSocket bridge.
+//
+// So the platform reads only what the application actually passed. `optionOf`
+// is that read: own properties, and `undefined` for a bag that was never
+// given. What it deliberately does not do is narrow the bags an application
+// passes on purpose -- `new Response(body, upstream)` puts the members on a
+// prototype and means them -- so the dictionaries themselves are still handed
+// on whole, and only the members the *platform* acts on are read this way.
+//
+// Captured here rather than reached for at each call: `Object.hasOwn` and the
+// rest are on the global object, and an application can replace them.
+const ObjectAssign = Object.assign;
+const ObjectCreate = Object.create;
+const hasOwn = typeof Object.hasOwn === "function"
+  ? Object.hasOwn
+  : (target, key) => Object.prototype.hasOwnProperty.call(target, key);
+
+// One member of an options bag, or undefined when the caller did not pass it.
+function optionOf(source, name) {
+  if (source === null || source === undefined) return undefined;
+  const kind = typeof source;
+  if (kind !== "object" && kind !== "function") return undefined;
+  return hasOwn(source, name) ? source[name] : undefined;
+}
+
+// ---------------------------------------------------------
 // 0. Encoding
 // ---------------------------------------------------------
 //
@@ -135,15 +174,15 @@ if (typeof globalThis.TextDecoder === "undefined") {
   const UTF8_LABELS = new Set(["utf-8", "utf8", "unicode-1-1-utf-8"]);
 
   class TextDecoder {
-    constructor(label = "utf-8", options = {}) {
+    constructor(label = "utf-8", options = undefined) {
       const encoding = String(label).trim().toLowerCase();
       if (!UTF8_LABELS.has(encoding)) {
         throw new RangeError(
           "TextDecoder on this platform decodes UTF-8 only; '" + label + "' is not supported",
         );
       }
-      this._fatal = !!options.fatal;
-      this._ignoreBOM = !!options.ignoreBOM;
+      this._fatal = !!optionOf(options, "fatal");
+      this._ignoreBOM = !!optionOf(options, "ignoreBOM");
     }
 
     get encoding() { return "utf-8"; }
@@ -279,35 +318,60 @@ if (typeof globalThis.btoa === "undefined") {
 // 1. WebSocket Support (Custom Bridge)
 // ---------------------------------------------------------
 
-if (typeof globalThis.EventTarget === "undefined") {
-  class EventTarget {
-    constructor() {
-      this.__listeners = new Map();
-    }
-    addEventListener(type, listener) {
-      if (!listener) return;
-      const listeners = this.__listeners.get(type) || new Set();
-      listeners.add(listener);
-      this.__listeners.set(type, listeners);
-    }
-    removeEventListener(type, listener) {
-      const listeners = this.__listeners.get(type);
-      if (!listeners) return;
-      listeners.delete(listener);
-      if (listeners.size === 0) this.__listeners.delete(type);
-    }
-    dispatchEvent(event) {
-      if (!event || !event.type) return false;
-      const listeners = this.__listeners.get(event.type);
-      if (!listeners) return false;
-      for (const listener of listeners) {
-        listener.call(this, event);
-      }
-      return true;
-    }
-  }
-  globalThis.EventTarget = EventTarget;
+// One `EventTarget` for the isolate, and it is deno_web's, bound as a global
+// by `js/bootstrap.js`.
+//
+// This file used to declare a small one of its own and install it under that
+// name, which left the isolate with two: the outbound `WebSocket` in
+// `js/ws_client.js` extends deno_web's, so `ws instanceof EventTarget` --
+// the guard a library runs before it attaches a listener -- answered false
+// against the class an application could actually name. Listeners still
+// fired, so nothing failed loudly; the library simply took its other branch.
+//
+// Captured here rather than read off the global object at dispatch time,
+// along with the event classes, so that a frame arriving mid-request is
+// turned into an event by the platform's constructors and not by whatever an
+// application has since put on `globalThis`.
+const PlatformEventTarget = globalThis.EventTarget;
+const platformEvents = globalThis.__deis_runtime_events;
+if (!PlatformEventTarget || !platformEvents) {
+  // Said out loud rather than left to fail as "class extends undefined" three
+  // lines later. The one way to reach here is an isolate restored from a
+  // startup snapshot taken before `js/bootstrap.js` bound these, since a
+  // snapshot skips bootstrap entirely; the snapshot file carries no version,
+  // so the fix is to delete it and let it be taken again.
+  throw new Error(
+    "js/runtime.js: the platform's EventTarget and event classes are missing from this " +
+      "isolate. It was restored from a startup snapshot taken before js/bootstrap.js bound " +
+      "them; delete the file named by DEIS_RUNTIME_SNAPSHOT_PATH so the snapshot is retaken."
+  );
 }
+const {
+  Event: PlatformEvent,
+  MessageEvent: PlatformMessageEvent,
+  CloseEvent: PlatformCloseEvent,
+  ErrorEvent: PlatformErrorEvent,
+  defineEventHandler,
+} = platformEvents;
+
+// Base64 as it is before any application code runs; a frame carrying bytes is
+// decoded with this and not with a replacement.
+const decodeBase64 = globalThis.atob;
+
+// How the kind of an inbound frame reaches this file.
+//
+// `dispatcher/handlers.rs` stamps one of these characters in front of every
+// payload it forwards, and `runtime/ws_server_ops.rs` is where the two are
+// spelled on the Rust side. The kind travels in front of the payload rather
+// than inside it because the payload is the client's: the bridge used to wrap
+// a binary frame as `{"type":"binary","data":"<base64>"}` and this file
+// `JSON.parse`d *every* text frame and believed any object shaped like that
+// one, so a client could choose which kind the application saw, and an
+// application whose own protocol happened to use those field names had its
+// messages silently turned into bytes. A leading character is a position the
+// client's own bytes can never occupy.
+const WS_FRAME_TEXT = "\u0001";
+const WS_FRAME_BINARY = "\u0002";
 
 // The Response an application returns, and the one it gets back from
 // `fetch()`, are both the standard `Response` that `js/bootstrap.js` binds
@@ -341,9 +405,32 @@ const NativeResponse = globalThis.Response;
 
 class Response extends NativeResponse {
   constructor(body = null, init = undefined) {
-    const options = init ?? {};
-    const upgrading = Number(options.status) === 101;
-    super(body, upgrading ? { ...options, status: 200 } : options);
+    // No init means no init. This read `init ?? {}`, and an empty object
+    // literal inherits from `Object.prototype` -- so both decisions below, the
+    // upgrade status and the `webSocket` that goes with it, were answered by
+    // whatever the application had left there, for every response built with
+    // no init for the rest of the isolate's life. `Object.prototype.status =
+    // 101` with a forged `webSocket` beside it made a plain GET come back as
+    // the upgrade `dispatcher/handlers.rs` acts on.
+    const options = init === null || init === undefined ? undefined : init;
+
+    // Own members, both of them. An init the application really did pass is
+    // handed to `super` as it stands -- `new Response(body, upstream)`, where
+    // the members are getters on `Response.prototype`, is how a handler
+    // rewrites a response it fetched, and copying own members only would
+    // quietly drop the status and the headers it meant to keep. The two read
+    // here are read the narrow way regardless: an upgrade is spelled with a
+    // literal, and `webSocket` is not a member of any dictionary the web
+    // defines, so neither has a reason to arrive down a prototype chain.
+    const upgrading = Number(optionOf(options, "status")) === 101;
+    super(
+      body,
+      // 101 is outside the range the native constructor accepts, so it is
+      // built as 200 and written over below.
+      upgrading
+        ? ObjectAssign(ObjectCreate(null), options, { status: 200 })
+        : options,
+    );
     if (upgrading) {
       Object.defineProperty(this, "status", {
         value: 101,
@@ -352,8 +439,9 @@ class Response extends NativeResponse {
         configurable: true,
       });
     }
-    if (options.webSocket) {
-      this.webSocket = options.webSocket;
+    const socket = optionOf(options, "webSocket");
+    if (socket) {
+      this.webSocket = socket;
     }
   }
 
@@ -366,7 +454,7 @@ globalThis.Response = Response;
 
 // BridgeWebSocket: A placeholder WebSocket for the client side of a WebSocketPair.
 // It mainly serves to carry the ws_id back to the platform via Response.
-class BridgeWebSocket extends EventTarget {
+class BridgeWebSocket extends PlatformEventTarget {
   constructor() {
     super();
     this.ws_id = `ws-bridge-${Date.now()}-${Math.random()}`;
@@ -382,12 +470,13 @@ if (!globalThis.__deis_runtime_ws_servers) {
   globalThis.__deis_runtime_ws_servers = {};
 }
 
-class WebSocketServer extends EventTarget {
+class WebSocketServer extends PlatformEventTarget {
   constructor(ws_id) {
     super();
     this.ws_id = ws_id;
     this.readyState = 0; // CONNECTING
     this._accepted = false;
+    this._closeDispatched = false;
     // Register global reference for Rust ops to find
     globalThis.__deis_runtime_ws_servers[ws_id] = this;
   }
@@ -399,46 +488,97 @@ class WebSocketServer extends EventTarget {
     this.readyState = 1; // OPEN
     const result = DenoCore.ops.op_ws_server_accept(this.ws_id);
     if (result.success) {
-      const event = { type: "open" };
-      if (this.onopen) this.onopen(event);
-      this.dispatchEvent(event);
+      this.dispatchEvent(new PlatformEvent("open"));
     } else {
-      if (this.onerror) this.onerror({ type: "error", error: result.error });
+      this.dispatchEvent(
+        new PlatformErrorEvent("error", {
+          message: result.error,
+          error: result.error,
+        })
+      );
     }
   }
 
-  // Called by Rust when message received from client
+  // Called by Rust when a frame arrives from the client.
+  //
+  // The leading character says which kind of frame it was; see the constants
+  // above for why that cannot be read out of the payload. A payload with no
+  // stamp is text, which is the only reading that is safe: nothing a client
+  // sends reaches this branch, because the bridge stamps every frame it
+  // forwards.
   _handleMessage(message) {
-    let data = message;
-    try {
-      const json = JSON.parse(message);
-      if (json.type === "binary" && json.data) {
-        const binaryString = atob(json.data);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        data = bytes.buffer;
+    const payload = String(message);
+    const kind = payload.charAt(0);
+    let data;
+    if (kind === WS_FRAME_BINARY) {
+      const binaryString = decodeBase64(payload.slice(1));
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
       }
-    } catch (e) {}
+      data = bytes.buffer;
+    } else if (kind === WS_FRAME_TEXT) {
+      data = payload.slice(1);
+    } else {
+      data = payload;
+    }
 
-    const event = { type: "message", data };
-    if (this.onmessage) this.onmessage(event);
-    this.dispatchEvent(event);
+    this.dispatchEvent(new PlatformMessageEvent("message", { data }));
   }
 
   // Called by Rust when connection closed
   _handleClose(code, reason) {
     this.readyState = 3; // CLOSED
-    const event = { type: "close", code, reason };
-    if (this.onclose) this.onclose(event);
-    this.dispatchEvent(event);
+    // 1006 is the code a connection that ended without a close frame is
+    // reported under, and it is the one case that is not a clean shutdown.
+    this._dispatchClose(code, reason, code !== 1006);
   }
 
+  // A socket closes once, however many paths reach the closing.
+  _dispatchClose(code, reason, wasClean) {
+    if (this._closeDispatched) return;
+    this._closeDispatched = true;
+    this.dispatchEvent(
+      new PlatformCloseEvent("close", { code, reason, wasClean })
+    );
+  }
+
+  // A frame back to the client, of the kind the argument is.
+  //
+  // Bytes go out as a BINARY frame. They used to go through
+  // `JSON.stringify`, so `send(new Uint8Array([1, 2, 3]))` reached the client
+  // as the TEXT frame `{"0":1,"1":2,"2":3}` -- an application on this
+  // platform could not send a binary frame at all, and the `Binary` arm of
+  // `WsServerMessage` was written, compiled and never constructed.
   async send(data) {
     if (this.readyState !== 1) throw new Error("WebSocket is not open");
-    const message = typeof data === "string" ? data : JSON.stringify(data);
-    const result = await DenoCore.ops.op_ws_server_send(this.ws_id, message);
+
+    let result;
+    if (typeof data === "string") {
+      result = await DenoCore.ops.op_ws_server_send(this.ws_id, data);
+    } else if (data instanceof ArrayBuffer) {
+      result = await DenoCore.ops.op_ws_server_send_binary(
+        this.ws_id,
+        new Uint8Array(data)
+      );
+    } else if (ArrayBuffer.isView(data)) {
+      // The view's own window, not the whole buffer behind it: a subarray
+      // must send its own bytes and not the neighbours it shares storage
+      // with.
+      result = await DenoCore.ops.op_ws_server_send_binary(
+        this.ws_id,
+        new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+      );
+    } else {
+      // Anything else keeps the shape this platform has always sent: JSON in
+      // a TEXT frame, which is what applications written against it expect
+      // from `send({ ... })`.
+      result = await DenoCore.ops.op_ws_server_send(
+        this.ws_id,
+        JSON.stringify(data)
+      );
+    }
+
     if (!result.success) throw new Error(`Failed to send: ${result.error}`);
   }
 
@@ -447,9 +587,20 @@ class WebSocketServer extends EventTarget {
     const request = { ws_id: this.ws_id, code, reason };
     await DenoCore.ops.op_ws_server_close(JSON.stringify(request));
     this.readyState = 3; // CLOSED
-    if (this.onclose) this.onclose({ type: "close", code, reason });
+    this._dispatchClose(code, reason, true);
   }
 }
+
+// `onopen`, `onmessage`, `onclose` and `onerror` as event handler attributes
+// rather than plain properties, so that assigning one and calling
+// `addEventListener` are the same mechanism -- which is what they are on the
+// outbound `WebSocket` and everywhere else. They used to be plain properties
+// called by hand next to `dispatchEvent`, so a handler that did both was
+// invoked twice for one frame.
+defineEventHandler(WebSocketServer.prototype, "open");
+defineEventHandler(WebSocketServer.prototype, "message");
+defineEventHandler(WebSocketServer.prototype, "close");
+defineEventHandler(WebSocketServer.prototype, "error");
 
 globalThis.WebSocketServer = WebSocketServer;
 
@@ -550,21 +701,37 @@ class Cache {
 
     // Clone first: reading the body of the response the handler is about to
     // return would leave the caller with an empty one.
-    const body = await response.clone().text();
+    //
+    // Bytes, not text. `caches.default` exists in every isolate whether the
+    // application asked for it or not, so this is the path an image, a
+    // protobuf or a gzip frame takes; decoding it as UTF-8 on the way in
+    // turned every byte in 0x80..0xff into U+FFFD and the application got
+    // mojibake back with nothing reporting an error. The status and the
+    // headers are text and still travel as JSON beside the body.
+    const body = new Uint8Array(await response.clone().arrayBuffer());
     const meta = {
       status: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
-      body: body
+      headers: Object.fromEntries(response.headers.entries())
     };
-    await DenoCore.ops.op_cache_set(key, JSON.stringify(meta), freshnessSeconds(response));
+    await DenoCore.ops.op_cache_set(
+      key,
+      JSON.stringify(meta),
+      body,
+      freshnessSeconds(response)
+    );
   }
   async match(request) {
     const key = cacheKeyOf(request);
-    const val = await DenoCore.ops.op_cache_get(key);
-    if (!val) return undefined;
+    const hit = await DenoCore.ops.op_cache_get(key);
+    if (!hit) return undefined;
     try {
-      const meta = JSON.parse(val);
-      return new Response(meta.body, {
+      const meta = JSON.parse(hit.meta);
+      // A 204 or a 304 may not carry a body at all, and the constructor
+      // refuses an empty buffer as loudly as a full one -- so an entry with
+      // nothing in it is rebuilt with a null body rather than a zero-length
+      // one, which is also what a bodiless response was to begin with.
+      const body = hit.body.byteLength === 0 ? null : hit.body;
+      return new Response(body, {
         status: meta.status,
         headers: meta.headers
       });
@@ -603,7 +770,7 @@ const KV_VALUE_TYPES = new Set(["text", "json", "arrayBuffer"]);
 
 function kvValueType(options) {
   const requested =
-    typeof options === "string" ? options : options && options.type;
+    typeof options === "string" ? options : optionOf(options, "type");
   if (requested === undefined || requested === null) return "text";
   if (KV_VALUE_TYPES.has(requested)) return requested;
   if (requested === "stream") {
@@ -679,19 +846,27 @@ class NativeKV {
     const type = kvValueType(options);
     const read = await DenoCore.ops.op_kv_get_with_metadata(key);
     if (!read) return null;
-    let metadata = null;
-    if (read.metadata !== undefined && read.metadata !== null) {
-      try {
-        metadata = JSON.parse(read.metadata);
-      } catch {
-        metadata = read.metadata;
-      }
-    }
     return {
       value: kvDecode(read.value, type),
-      metadata: metadata,
+      metadata: this.#metadata(read.metadata),
       expiration: read.expiration === undefined ? null : read.expiration
     };
+  }
+  // What put() stored, read back as what the application put in.
+  //
+  // Shared with list(), so a key's metadata means the same thing whichever
+  // call reported it. null both when nothing was stored and when the store
+  // sent nothing. A string that does not parse is handed back as it was
+  // found rather than thrown over: metadata written before put() encoded
+  // strings as JSON is stored unquoted, and losing an app's own data to a
+  // parse error would be worse than handing it back raw.
+  #metadata(raw) {
+    if (raw === undefined || raw === null) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
   }
   // put(key, value, { expirationTtl, metadata })
   //
@@ -707,21 +882,25 @@ class NativeKV {
   // strings included, so that decoding it there is a plain JSON.parse and an
   // object, a number and a string all round-trip as themselves.
   async put(key, value, options) {
-    const opts = options || {};
+    // Own members only: read the ordinary way, an `Object.prototype`
+    // an application wrote to would have given a lifetime to every later
+    // write on this isolate that asked for none.
+    const askedTtl = optionOf(options, "expirationTtl");
     let ttl = null;
-    if (opts.expirationTtl !== undefined && opts.expirationTtl !== null) {
-      ttl = Number(opts.expirationTtl);
+    if (askedTtl !== undefined && askedTtl !== null) {
+      ttl = Number(askedTtl);
       if (!Number.isFinite(ttl) || Math.floor(ttl) !== ttl || ttl <= 0) {
         throw new TypeError(
           "kv.put: expirationTtl must be a whole number of seconds greater than 0, got " +
-            String(opts.expirationTtl)
+            String(askedTtl)
         );
       }
     }
 
+    const askedMetadata = optionOf(options, "metadata");
     let metadata = null;
-    if (opts.metadata !== undefined && opts.metadata !== null) {
-      metadata = JSON.stringify(opts.metadata);
+    if (askedMetadata !== undefined && askedMetadata !== null) {
+      metadata = JSON.stringify(askedMetadata);
     }
 
     await DenoCore.ops.op_kv_set(key, kvEncode(value), {
@@ -731,6 +910,104 @@ class NativeKV {
   }
   async delete(key) {
     await DenoCore.ops.op_kv_delete(key);
+  }
+  // list() -> every key this application has
+  // list("session:") -> the keys under a prefix
+  // list({ prefix, limit, cursor }) -> one page of them
+  //
+  // Resolves to { keys, list_complete, cursor }:
+  //
+  //   keys           an array of { name, expiration, metadata }, in key
+  //                  order. The stored value is not in a listing -- a page
+  //                  may hold thousands of keys -- so a value is fetched by
+  //                  name afterwards. expiration is the absolute unix second
+  //                  the key lapses at, null when it never does; metadata is
+  //                  what put() attached, decoded, null when it attached
+  //                  nothing.
+  //   list_complete  true when this page was the end of the scan.
+  //   cursor         what to pass back as `cursor` to get the next page, and
+  //                  undefined once list_complete is true.
+  //
+  // Page until list_complete, not until a page comes back short:
+  //
+  //   const all = [];
+  //   let page = { list_complete: false, cursor: undefined };
+  //   while (!page.list_complete) {
+  //     page = await kv.list({ prefix: "session:", limit: 100, cursor: page.cursor });
+  //     all.push(...page.keys);
+  //   }
+  //
+  // deis-store answers with a cursor whenever it filled the page to the
+  // limit, which is not the same as knowing there is more: four keys listed
+  // two at a time give two full pages and then an empty third one. A loop
+  // that stopped at the first short page would be right by luck; a loop that
+  // stops when the cursor is gone is right always.
+  //
+  // limit is a request, not a guarantee. deis-store substitutes its own page
+  // size (1000) when none is given and caps anything larger than its ceiling
+  // (10000), so asking for a million yields ten thousand keys and a cursor
+  // rather than an error.
+  async list(options) {
+    const bag = typeof options === "string" ? { prefix: options } : options;
+
+    const askedPrefix = optionOf(bag, "prefix");
+    let prefix = null;
+    if (askedPrefix !== undefined && askedPrefix !== null) {
+      if (typeof askedPrefix !== "string") {
+        throw new TypeError(
+          "kv.list: prefix must be a string, got " + typeof askedPrefix
+        );
+      }
+      prefix = askedPrefix;
+    }
+
+    const askedLimit = optionOf(bag, "limit");
+    let limit = null;
+    if (askedLimit !== undefined && askedLimit !== null) {
+      limit = Number(askedLimit);
+      if (!Number.isFinite(limit) || Math.floor(limit) !== limit || limit <= 0) {
+        throw new TypeError(
+          "kv.list: limit must be a whole number of keys greater than 0, got " +
+            String(askedLimit)
+        );
+      }
+      // The op takes a 32-bit count, and a number past that would be refused
+      // by the argument decoder with a message about integers rather than
+      // about keys. Hand over the largest one it can hold instead: deis-store
+      // caps every limit at its own ceiling anyway, so an absurd request has
+      // always answered with the ceiling and a cursor, and that stays true.
+      if (limit > 2147483647) limit = 2147483647;
+    }
+
+    const askedCursor = optionOf(bag, "cursor");
+    let cursor = null;
+    if (askedCursor !== undefined && askedCursor !== null) {
+      if (typeof askedCursor !== "string") {
+        throw new TypeError(
+          "kv.list: cursor must be the string a previous page answered with, got " +
+            typeof askedCursor
+        );
+      }
+      cursor = askedCursor;
+    }
+
+    const page = await DenoCore.ops.op_kv_list({
+      prefix: prefix,
+      limit: limit,
+      cursor: cursor
+    });
+
+    const next =
+      page.cursor === undefined || page.cursor === null ? undefined : page.cursor;
+    return {
+      keys: page.keys.map((key) => ({
+        name: key.name,
+        expiration: key.expiration === undefined ? null : key.expiration,
+        metadata: this.#metadata(key.metadata)
+      })),
+      list_complete: next === undefined,
+      cursor: next
+    };
   }
 }
 
@@ -754,7 +1031,7 @@ function checkDbResult(result, call) {
 // Validated here so a nonsense value is refused before deis-store pins a
 // connection for it.
 function transactionTimeout(options) {
-  const asked = options === undefined || options === null ? null : options.timeoutMs;
+  const asked = optionOf(options, "timeoutMs");
   if (asked === undefined || asked === null) return null;
   const ms = Number(asked);
   if (!Number.isFinite(ms) || Math.floor(ms) !== ms || ms <= 0) {
@@ -842,6 +1119,79 @@ class NativeDB {
     );
     return res.rows;
   }
+  // Runs several statements as one transaction, in one round trip.
+  //
+  //   const [stock, order] = await ctx.services.database.batch([
+  //     { sql: "UPDATE items SET stock = stock - 1 WHERE id = ? AND stock > 0", params: [id] },
+  //     { sql: "INSERT INTO orders (item, buyer) VALUES (?, ?)", params: [id, buyer] }
+  //   ]);
+  //
+  // Each element is the same statement `execute` takes, written as an object:
+  // `sql`, and `params` as the array of values its `?` placeholders bind to.
+  // Resolves to one result per statement, in order, each the
+  // `{ rows_affected, last_insert_id }` `execute` resolves to.
+  //
+  // What it guarantees. deis-store opens a transaction, runs the statements
+  // in order, and commits. If any one of them fails the transaction is rolled
+  // back and NOTHING is applied -- not even the statements that had already
+  // succeeded -- and this call throws, naming the statement by its index in
+  // the array. So the two statements above cannot leave an order for stock
+  // that was never taken.
+  //
+  // How it differs from `transaction`. Both are all-or-nothing; the
+  // difference is who decides what to run.
+  //
+  //   batch        every statement is decided before anything is sent. One
+  //                request, one answer, no connection held between them, and
+  //                it cannot branch: there is no point at which the
+  //                application sees a result and chooses the next statement.
+  //                Row-returning statements are refused -- a SELECT belongs
+  //                in `query`, or in a transaction -- so a batch is writes.
+  //   transaction  the callback reads, decides, and writes. It can branch on
+  //                what it read, because deis-store keeps one of the tenant's
+  //                connections pinned to the transaction for as long as the
+  //                callback runs. That connection is the cost, which is why
+  //                the store puts a deadline on it and bounds how many may be
+  //                open at once.
+  //
+  // Reach for `batch` first. Use `transaction` when, and only when, a later
+  // statement depends on what an earlier one returned.
+  async batch(statements) {
+    if (!Array.isArray(statements)) {
+      throw new TypeError(
+        "database.batch: expects an array of { sql, params } statements, got " +
+          (statements === null ? "null" : typeof statements)
+      );
+    }
+
+    const encoded = statements.map((statement, index) => {
+      const sql = optionOf(statement, "sql");
+      if (typeof sql !== "string") {
+        throw new TypeError(
+          "database.batch: statement " + index +
+            " has no sql string; each statement is { sql, params }"
+        );
+      }
+      const params = optionOf(statement, "params");
+      if (params !== undefined && params !== null && !Array.isArray(params)) {
+        throw new TypeError(
+          "database.batch: statement " + index +
+            " has params that are not an array; they bind to the statement's ? " +
+            "placeholders in order"
+        );
+      }
+      // The array itself, not the JSON string execute() sends. There is one
+      // JSON encoding around the whole batch already, and nesting a second
+      // one inside it buys nothing; op_db_batch encodes each array for the
+      // wire, where a parameter list travels as a string.
+      return { sql: sql, params: params ?? [] };
+    });
+
+    return checkDbResult(
+      await DenoCore.ops.op_db_batch(JSON.stringify(encoded)),
+      "batch"
+    );
+  }
   // Runs `callback` inside one interactive transaction and resolves to
   // whatever the callback returned.
   //
@@ -871,6 +1221,10 @@ class NativeDB {
   // before this transaction opened; writes on it will sit and wait for the
   // write lock this transaction is holding, and fail. Use `tx` for
   // everything that belongs to the transaction.
+  //
+  // When not to use it. A set of statements that is decided up front is a
+  // `batch`: same all-or-nothing guarantee, one round trip, and no connection
+  // held while the application thinks.
   //
   // Deadline. An open transaction is holding one of the tenant's few
   // connections, so deis-store gives it a hard deadline -- five seconds
@@ -975,9 +1329,26 @@ class Queue {
   constructor(name = "default") {
     this.name = name;
   }
+  // The queue carries bytes, so this is where a message becomes bytes.
+  //
+  // A string is UTF-8 encoded and an object is JSON encoded first, which is
+  // what an application already expected: `queue.send("text")` and
+  // `queue.send({ json: true })` reach the consumer as they always did. A
+  // buffer is sent as it stands, byte for byte -- the case the queue could
+  // not carry at all while its wire type was a string, even though the dead
+  // letter table has always been able to show one.
   async send(message) {
-    const msgStr = typeof message === "string" ? message : JSON.stringify(message);
-    await DenoCore.ops.op_queue_send(this.name, msgStr);
+    let bytes;
+    if (typeof message === "string") {
+      bytes = new TextEncoder().encode(message);
+    } else if (message instanceof ArrayBuffer) {
+      bytes = new Uint8Array(message);
+    } else if (ArrayBuffer.isView(message)) {
+      bytes = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+    } else {
+      bytes = new TextEncoder().encode(JSON.stringify(message));
+    }
+    await DenoCore.ops.op_queue_send(this.name, bytes);
   }
   // A queue other than this app's default one, e.g.
   // ctx.services.queue.to("jobs").send({ ... }).
@@ -1065,7 +1436,11 @@ function createContext(requestData) {
       headers: requestData.headers,
       body: body ?? null
     }),
-    params: requestData.params || {},
+    // Own members only: a `params` an application had planted on
+    // `Object.prototype` would otherwise be handed to the next request as if
+    // the router had captured it. The object itself is an ordinary one --
+    // handlers do reach for `Object.prototype` methods on what they are given.
+    params: ObjectAssign({}, optionOf(requestData, "params")),
   });
 }
 
@@ -1129,10 +1504,18 @@ globalThis.__deis_runtime_wait_until_all = async function() {
 // `context.services` off the environment table.
 //
 // `batch` is { queue, messages: [...] }; each message carries id, body,
-// attempts and timestamp, plus json() for a JSON body. `body` is the message
+// attempts and timestamp, plus bytes() and json(). `body` is the message
 // exactly as it was sent - text, not a parsed object - and `json()` is the
 // parse. Delivery is at-least-once, so a handler MUST be idempotent:
 // `attempts` above 1 means this message has been delivered before.
+//
+// A body that is not text: the queue carries bytes now, so a message can
+// arrive that has no text form at all. Such a message has `body === null`,
+// and `bytes()` is the only way to read it; `json()` says so rather than
+// throwing a parse error about a body it never saw. `bytes()` works for every
+// message, text or not, so a handler that always wants bytes can just call
+// it. Nothing an application used to be able to send reaches the null case:
+// until this change a body that was not UTF-8 could not be enqueued.
 //
 // A message counts as handled unless it says otherwise. `message.retry()`
 // marks one message for redelivery and `message.ack()` takes that mark back;
@@ -1160,15 +1543,44 @@ globalThis.__deis_runtime_invoke_queue = async function(payload) {
   const failed = new Set();
   const batch = {
     queue: payload.queue,
-    messages: messages.map((m) => ({
-      id: m.id,
-      body: m.body,
-      attempts: m.attempts,
-      timestamp: m.timestamp,
-      json() { return JSON.parse(m.body); },
-      retry() { failed.add(m.id); },
-      ack() { failed.delete(m.id); },
-    })),
+    messages: messages.map((m) => {
+      // The payload is JSON written into the source of this invocation, and
+      // JSON cannot spell a byte that is not text: a body that is valid UTF-8
+      // arrives as `{ text }` and anything else as `{ base64 }`. Which one it
+      // is comes from the Rust side (runtime/queue_client.rs), never from
+      // looking at the string - a text body that happened to look like base64
+      // would otherwise be decoded into something nobody sent.
+      // Which of the two it is comes from the Rust side, so it is read as
+      // the Rust side wrote it: an inherited `text` would turn a binary body
+      // into a string nobody sent.
+      const carried = optionOf(m, "body");
+      const carriedText = optionOf(carried, "text");
+      const text = typeof carriedText === "string" ? carriedText : null;
+      return {
+        id: m.id,
+        body: text,
+        attempts: m.attempts,
+        timestamp: m.timestamp,
+        bytes() {
+          if (text !== null) return new TextEncoder().encode(text);
+          const binary = decodeBase64(optionOf(carried, "base64") || "");
+          const out = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+          return out;
+        },
+        json() {
+          if (text === null) {
+            throw new TypeError(
+              "message " + m.id + " has a body that is not text, so it cannot be parsed as " +
+              "JSON; read it with message.bytes()"
+            );
+          }
+          return JSON.parse(text);
+        },
+        retry() { failed.add(m.id); },
+        ack() { failed.delete(m.id); },
+      };
+    }),
     retryAll() { for (const id of allIds) failed.add(id); },
   };
 
@@ -1314,10 +1726,14 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     
     // Check for WebSocket upgrade
     // Check if user attached webSocket to the response object dynamically
+    // An own property, which is where the `Response` constructor above puts
+    // it and where a handler that attaches one afterwards puts it too. Read
+    // the ordinary way, a `webSocket` on `Object.prototype` would have turned
+    // every later plain response on this isolate into an upgrade.
     let webSocketId = undefined;
-    
-    if (resp.webSocket && resp.webSocket.ws_id) {
-        webSocketId = resp.webSocket.ws_id;
+    const attached = optionOf(resp, "webSocket");
+    if (attached && optionOf(attached, "ws_id")) {
+        webSocketId = attached.ws_id;
         headers["X-Runtime-WebSocket-ID"] = webSocketId;
     }
 
@@ -1409,5 +1825,37 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
 }
 
 globalThis.user_module = {}; globalThis.__deis_runtime_set_response = (json) => DenoCore.ops.op_set_response(json);
+
+// The names the Rust side calls by, sealed in one place now that they all
+// exist.
+//
+// These are not the application's surface, and an application that could put
+// its own function under one of them would not merely be lying to itself.
+// `__deis_runtime_invoke` is what runs an invocation *and what sweeps up
+// after one*: it calls `__deis_runtime_sweep_intervals` and
+// `__deis_runtime_sweep_fetch_budgets` at the end, which is where an
+// application's `setInterval` callbacks and outbound-fetch deadlines stop.
+// `js/bootstrap.js` seals those two, and that is not enough on its own while
+// the function that calls them can be replaced with one that does not --
+// timers would then go on firing on a runtime thread shared with every other
+// application on it, long after the request that created them.
+//
+// `user_module` is deliberately not in this list: `runtime/isolate.rs` writes
+// the application's exports there once the module has evaluated.
+for (const name of [
+  "__deis_runtime_invoke",
+  "__deis_runtime_invoke_queue",
+  "__deis_runtime_invoke_scheduled",
+  "__deis_runtime_wait_until_all",
+  "__deis_runtime_set_response",
+  "__deis_runtime_ws_servers",
+]) {
+  Object.defineProperty(globalThis, name, {
+    value: globalThis[name],
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+}
 
 })();

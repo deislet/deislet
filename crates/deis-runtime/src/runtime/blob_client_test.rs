@@ -6,66 +6,25 @@
 //! its own. These tests run the real client over a real socket against the
 //! real server, so a change to that contract fails here rather than the first
 //! time an application reads an object back.
+//!
+//! They were an integration test under `tests/` until the eager `connect`
+//! constructor they used was removed; a test module inside the crate reaches
+//! `connect_lazy`, which is how an application binding is actually built.
 
-use deis_runtime::runtime::BlobClient;
-use deis_store::config::Config;
-use deis_store::server;
-use tempfile::TempDir;
-use tokio::sync::oneshot;
+use super::BlobClient;
+use crate::runtime::bindings::StorageIdentity;
+use crate::runtime::test_store::TestStore;
 
 /// Larger than the 1 MiB chunk the two sides agree on, and deliberately not a
 /// multiple of it, so the last chunk is a short one.
 const MULTI_CHUNK_LEN: usize = 2 * 1024 * 1024 + 4242;
 
-/// A running deis-store plus the temp directory holding its data.
-struct Store {
-    _data: TempDir,
-    endpoint: String,
-    shutdown: Option<oneshot::Sender<()>>,
-}
-
-impl Store {
-    async fn start() -> Self {
-        let data = TempDir::new().expect("temp dir");
-        let config = Config {
-            listen: "127.0.0.1:0".to_string(),
-            data_dir: data.path().to_path_buf(),
-            ..Config::default()
-        };
-        // Bind before spawning, so the port is known and no test has to wait
-        // for the server to come up.
-        let listener = server::bind(&config).await.expect("bind");
-        let addr = listener.local_addr().expect("local addr");
-        let (shutdown, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            server::serve(config, listener, async {
-                let _ = rx.await;
-            })
-            .await
-            .expect("serve");
-        });
-        Self {
-            _data: data,
-            endpoint: format!("http://{addr}"),
-            shutdown: Some(shutdown),
-        }
-    }
-
-    /// `tenant` is the composite `<app>.<environment>` key the store partitions
-    /// by; a bare application id is refused by the client.
-    async fn client(&self, tenant: &str) -> BlobClient {
-        BlobClient::connect(self.endpoint.clone(), tenant)
-            .await
-            .expect("connect blob client")
-    }
-}
-
-impl Drop for Store {
-    fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-    }
+/// A client wired the way an application binding is: dialled on first use,
+/// speaking for the `<app>.<environment>` pair the store partitions by. A
+/// bare application id is refused by [`StorageIdentity`].
+fn client(store: &TestStore, tenant: &str) -> BlobClient {
+    let identity = StorageIdentity::new(tenant, None).expect("a legal tenant");
+    BlobClient::connect_lazy(&store.endpoint, &identity).expect("client is built")
 }
 
 /// Deterministic filler, so a mismatch says which byte moved.
@@ -75,8 +34,8 @@ fn body(len: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn small_object_round_trips() {
-    let store = Store::start().await;
-    let client = store.client("demo.production").await;
+    let store = TestStore::start().await;
+    let client = client(&store, "demo.production");
 
     client
         .put("greeting".to_string(), b"hello".to_vec())
@@ -89,8 +48,8 @@ async fn small_object_round_trips() {
 
 #[tokio::test]
 async fn multi_chunk_object_round_trips_byte_for_byte() {
-    let store = Store::start().await;
-    let client = store.client("demo.production").await;
+    let store = TestStore::start().await;
+    let client = client(&store, "demo.production");
     let data = body(MULTI_CHUNK_LEN);
 
     client
@@ -109,8 +68,8 @@ async fn multi_chunk_object_round_trips_byte_for_byte() {
 
 #[tokio::test]
 async fn empty_object_round_trips() {
-    let store = Store::start().await;
-    let client = store.client("demo.production").await;
+    let store = TestStore::start().await;
+    let client = client(&store, "demo.production");
 
     client
         .put("nothing".to_string(), Vec::new())
@@ -127,8 +86,8 @@ async fn empty_object_round_trips() {
 
 #[tokio::test]
 async fn a_missing_key_reads_as_none_rather_than_an_error() {
-    let store = Store::start().await;
-    let client = store.client("demo.production").await;
+    let store = TestStore::start().await;
+    let client = client(&store, "demo.production");
 
     let got = client.get("never-written".to_string()).await.expect("get");
 
@@ -137,8 +96,8 @@ async fn a_missing_key_reads_as_none_rather_than_an_error() {
 
 #[tokio::test]
 async fn delete_removes_the_object_and_is_idempotent() {
-    let store = Store::start().await;
-    let client = store.client("demo.production").await;
+    let store = TestStore::start().await;
+    let client = client(&store, "demo.production");
 
     client
         .put("temp".to_string(), b"bye".to_vec())
@@ -155,9 +114,9 @@ async fn delete_removes_the_object_and_is_idempotent() {
 
 #[tokio::test]
 async fn one_application_cannot_read_another_ones_objects() {
-    let store = Store::start().await;
-    let owner = store.client("owner-app.production").await;
-    let other = store.client("other-app.production").await;
+    let store = TestStore::start().await;
+    let owner = client(&store, "owner-app.production");
+    let other = client(&store, "other-app.production");
 
     owner
         .put("shared-name".to_string(), b"owner data".to_vec())
@@ -176,9 +135,9 @@ async fn one_application_cannot_read_another_ones_objects() {
 /// production object cannot be undone by rolling the version back.
 #[tokio::test]
 async fn two_environments_of_one_app_do_not_share_objects() {
-    let store = Store::start().await;
-    let production = store.client("demo.production").await;
-    let preview = store.client("demo.preview").await;
+    let store = TestStore::start().await;
+    let production = client(&store, "demo.production");
+    let preview = client(&store, "demo.preview");
 
     production
         .put("report.txt".to_string(), b"production".to_vec())

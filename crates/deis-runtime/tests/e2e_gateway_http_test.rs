@@ -7,9 +7,10 @@ use std::sync::Arc;
 #[tokio::test]
 async fn test_gateway_http_e2e() {
     let app_manager = Arc::new(ApplicationManager::new());
-    let state = AppState {
-        app_manager: app_manager.clone(),
-    };
+    let state = AppState::new(
+        app_manager.clone(),
+        deis_runtime::config::default_max_request_body_bytes(),
+    );
 
     let code = r#"
         export default function handler(context) {

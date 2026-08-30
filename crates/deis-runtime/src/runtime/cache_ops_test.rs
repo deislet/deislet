@@ -6,10 +6,31 @@ mod tests {
     use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
     use std::time::Duration;
 
+    /// Turn an ASCII string into the `Uint8Array` `op_cache_set` now takes,
+    /// and back again.
+    ///
+    /// Written out rather than reached for: these run on a bare `JsRuntime`
+    /// carrying the cache extension and nothing else, so there is no
+    /// `TextEncoder` in the isolate.
+    const BYTES: &str = r#"
+        const bytes = (s) => {
+            const out = new Uint8Array(s.length);
+            for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+            return out;
+        };
+        const text = (u8) => {
+            let out = "";
+            for (let i = 0; i < u8.length; i++) out += String.fromCharCode(u8[i]);
+            return out;
+        };
+    "#;
+
     /// Run one script to completion, driving the event loop the async ops
     /// need.
-    async fn run(runtime: &mut JsRuntime, code: &'static str) {
-        let result = runtime.execute_script("<test>", code).unwrap();
+    async fn run(runtime: &mut JsRuntime, code: &str) {
+        let result = runtime
+            .execute_script("<test>", format!("{BYTES}\n{code}"))
+            .unwrap();
         let promise_future = runtime.resolve(result);
         runtime
             .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
@@ -46,16 +67,12 @@ mod tests {
         // Set and get value
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("test_key", "test_value", 0);
+                await Deno.core.ops.op_cache_set(
+                    "test_key", "{\"status\":200}", bytes("test_value"), 0);
             })()
         "#;
 
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
+        run(&mut runtime, code).await;
 
         // Verify by directly accessing CacheStore
         let cache = {
@@ -64,11 +81,9 @@ mod tests {
             state.borrow::<CacheStore>().clone()
         };
 
-        let value = cache.get("test_key").await;
-        assert_eq!(
-            value.map(|entry| entry.payload),
-            Some("test_value".to_string())
-        );
+        let value = cache.get("test_key").await.expect("the entry was written");
+        assert_eq!(value.meta, "{\"status\":200}");
+        assert_eq!(value.body, b"test_value".to_vec());
     }
 
     #[tokio::test]
@@ -81,12 +96,7 @@ mod tests {
             })()
         "#;
 
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
+        run(&mut runtime, code).await;
 
         let cache = {
             let op_state = runtime.op_state();
@@ -104,17 +114,12 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("key_to_delete", "value", 0);
+                await Deno.core.ops.op_cache_set("key_to_delete", "{}", bytes("value"), 0);
                 await Deno.core.ops.op_cache_delete("key_to_delete");
             })()
         "#;
 
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
+        run(&mut runtime, code).await;
 
         let cache = {
             let op_state = runtime.op_state();
@@ -132,16 +137,11 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("exists_key", "value", 0);
+                await Deno.core.ops.op_cache_set("exists_key", "{}", bytes("value"), 0);
             })()
         "#;
 
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
+        run(&mut runtime, code).await;
 
         let cache = {
             let op_state = runtime.op_state();
@@ -162,18 +162,13 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("key1", "value1", 0);
-                await Deno.core.ops.op_cache_set("key2", "value2", 0);
+                await Deno.core.ops.op_cache_set("key1", "{}", bytes("value1"), 0);
+                await Deno.core.ops.op_cache_set("key2", "{}", bytes("value2"), 0);
                 await Deno.core.ops.op_cache_clear();
             })()
         "#;
 
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
+        run(&mut runtime, code).await;
 
         let cache = {
             let op_state = runtime.op_state();
@@ -193,18 +188,13 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("stat_key1", "value1", 0);
-                await Deno.core.ops.op_cache_set("stat_key2", "value2", 0);
-                await Deno.core.ops.op_cache_set("stat_key3", "value3", 0);
+                await Deno.core.ops.op_cache_set("stat_key1", "{}", bytes("value1"), 0);
+                await Deno.core.ops.op_cache_set("stat_key2", "{}", bytes("value2"), 0);
+                await Deno.core.ops.op_cache_set("stat_key3", "{}", bytes("value3"), 0);
             })()
         "#;
 
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
+        run(&mut runtime, code).await;
 
         let cache = {
             let op_state = runtime.op_state();
@@ -224,19 +214,14 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("multi1", "value1", 0);
-                await Deno.core.ops.op_cache_set("multi2", "value2", 0);
-                await Deno.core.ops.op_cache_set("multi3", "value3", 0);
+                await Deno.core.ops.op_cache_set("multi1", "{}", bytes("value1"), 0);
+                await Deno.core.ops.op_cache_set("multi2", "{}", bytes("value2"), 0);
+                await Deno.core.ops.op_cache_set("multi3", "{}", bytes("value3"), 0);
                 await Deno.core.ops.op_cache_delete("multi2");
             })()
         "#;
 
-        let result = runtime.execute_script("<test>", code).unwrap();
-        let promise_future = runtime.resolve(result);
-        runtime
-            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
-            .await
-            .unwrap();
+        run(&mut runtime, code).await;
 
         let cache = {
             let op_state = runtime.op_state();
@@ -248,9 +233,9 @@ mod tests {
         let v2 = cache.get("multi2").await;
         let v3 = cache.get("multi3").await;
 
-        assert_eq!(v1.map(|entry| entry.payload), Some("value1".to_string()));
+        assert_eq!(v1.map(|entry| entry.body), Some(b"value1".to_vec()));
         assert!(v2.is_none());
-        assert_eq!(v3.map(|entry| entry.payload), Some("value3".to_string()));
+        assert_eq!(v3.map(|entry| entry.body), Some(b"value3".to_vec()));
     }
     #[tokio::test]
     async fn a_lifetime_the_response_asked_for_is_stored_with_the_entry() {
@@ -263,8 +248,8 @@ mod tests {
             &mut runtime,
             r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("with_ttl", "value", 120);
-                await Deno.core.ops.op_cache_set("without_ttl", "value", 0);
+                await Deno.core.ops.op_cache_set("with_ttl", "{}", bytes("value"), 120);
+                await Deno.core.ops.op_cache_set("without_ttl", "{}", bytes("value"), 0);
             })()
         "#,
         )
@@ -295,11 +280,13 @@ mod tests {
         let key = "http://example/x".to_string();
 
         let asked = CacheEntry {
-            payload: "body".to_string(),
+            meta: "{}".to_string(),
+            body: b"body".to_vec(),
             ttl: Some(Duration::from_secs(30)),
         };
         let silent = CacheEntry {
-            payload: "body".to_string(),
+            meta: "{}".to_string(),
+            body: b"body".to_vec(),
             ttl: None,
         };
 
@@ -338,13 +325,13 @@ mod tests {
             &mut runtime,
             r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("present", "value", 0);
+                await Deno.core.ops.op_cache_set("present", "{}", bytes("value"), 0);
                 const removedPresent = await Deno.core.ops.op_cache_delete("present");
                 const removedAbsent = await Deno.core.ops.op_cache_delete("never_written");
                 // Parked in the cache itself rather than read back through a
                 // v8 scope: the answer under test is a value the op returned.
                 await Deno.core.ops.op_cache_set(
-                    "answers", removedPresent + "," + removedAbsent, 0);
+                    "answers", "{}", bytes(removedPresent + "," + removedAbsent), 0);
             })()
         "#,
         )
@@ -352,10 +339,100 @@ mod tests {
 
         let cache = store(&runtime);
         assert_eq!(
-            cache.get("answers").await.unwrap().payload,
-            "true,false",
+            cache.get("answers").await.unwrap().body,
+            b"true,false".to_vec(),
             "delete() must report a hit as true and a miss as false"
         );
         assert!(cache.get("present").await.is_none());
+    }
+
+    /// A cached body that is not text comes back byte for byte.
+    ///
+    /// `caches.default` is in every isolate whether the application declared
+    /// anything or not, so this is the path an image or a protobuf takes.
+    /// `put` used to read the body with `response.clone().text()` and `match`
+    /// rebuilt it from that string, so every byte in `0x80..=0xff` came back
+    /// as the UTF-8 replacement character `ef bf bd` -- an application caching
+    /// a PNG served mojibake and nothing raised an error. Driven through a
+    /// real `AppRuntime` because the corruption was in the JavaScript half of
+    /// the Cache API, not in the store.
+    #[tokio::test]
+    async fn a_cached_body_that_is_not_text_survives_the_round_trip() {
+        use crate::runtime::isolate::{AppRuntime, IsolateSpec};
+        use crate::runtime::ServiceWiring;
+        use std::collections::HashMap;
+
+        let code = r#"
+            const ALL = new Uint8Array(256);
+            for (let i = 0; i < 256; i++) ALL[i] = i;
+            const hex = (u8) => {
+                let out = "";
+                for (let i = 0; i < u8.length; i++) out += u8[i].toString(16).padStart(2, "0");
+                return out;
+            };
+
+            export default async function handler() {
+                const key = "https://example.invalid/an-image.png";
+                await caches.default.put(
+                    key,
+                    new Response(ALL, { headers: { "content-type": "image/png" } })
+                );
+                const hit = await caches.default.match(key);
+                const back = new Uint8Array(await hit.arrayBuffer());
+
+                // An empty body is its own case: a cached 204 may not carry
+                // one, and rebuilding it from a zero-length buffer would throw
+                // inside `match` rather than answering a miss.
+                await caches.default.put(
+                    "https://example.invalid/nothing",
+                    new Response(null, { status: 204 })
+                );
+                const empty = await caches.default.match("https://example.invalid/nothing");
+
+                return new Response(JSON.stringify({
+                    expected: hex(ALL),
+                    cached: hex(back),
+                    contentType: hit.headers.get("content-type"),
+                    status: hit.status,
+                    emptyStatus: empty.status,
+                    emptyLength: (await empty.arrayBuffer()).byteLength,
+                }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "cache_bytes_app.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = String::from_utf8(body.unwrap_or_default()).unwrap();
+        assert_eq!(status, 200, "the handler failed: {body}");
+
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            seen["cached"], seen["expected"],
+            "the cache did not hand back the bytes it was given"
+        );
+        assert_eq!(seen["contentType"], "image/png");
+        assert_eq!(seen["status"], 200);
+        assert_eq!(seen["emptyStatus"], 204);
+        assert_eq!(seen["emptyLength"], 0);
     }
 }

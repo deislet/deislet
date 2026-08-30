@@ -91,11 +91,12 @@ let result = compiler.build().await?;
 | Cloudflare Workers | ✅ 完整支持 | KV, Cache | D1, R2, Queue, Durable Objects |
 | Deno Deploy | ✅ 完整支持 | KV, Cache | - |
 | Tencent EdgeOne | ✅ 完整支持 | KV, Cache | - |
-| Deislet | ✅ 目标可用 | KV, Cache | SQL, Blob, Queue, Cron, WebSockets（WebSocket 两端尚未端到端验证） |
+| Deislet | ✅ 目标可用 | KV, Cache | SQL, Blob, Queue, Cron, WebSockets |
 
 Deislet 那一行说的是**编译目标**：`--vendor deislet` 产出的应用包能被 `deis deploy`
-上传、被节点装载并服务。运行时里 Web 标准全局装得很不全（连 `fetch` 都没有），那是
-运行时的实情，不是这个编译器的：见 `docs/architecture.zh.md` 第 12 节。
+上传、被节点装载并服务。运行时里 SPECIFICATION_BASIC.md 8.1 节要求的 Web 标准全局
+现在一个不缺，`fetch`、WebSocket 客户端与服务端在内的扩展能力也都已实现并验证：见
+`docs/architecture.zh.md` 第 12 节与 `PLATFORM_MATRIX.md`。
 
 ## 🔗 相关资源
 

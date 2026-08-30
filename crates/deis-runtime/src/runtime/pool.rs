@@ -1434,6 +1434,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_module_whose_top_level_never_returns_fails_the_load_and_frees_the_thread() {
+        // Top-level code is application code, and this is where it runs. The
+        // LoadApp message is awaited on the runtime thread's own message loop,
+        // so before module evaluation had a ceiling a bundle like this one
+        // took a thread out of the node for the life of the process *and* left
+        // the deployment waiting forever -- the response was never sent
+        // because the loop that would have sent it never came back. Observed:
+        // still spinning eight seconds into a 500ms request budget.
+        //
+        // The spin is synchronous on purpose. A top-level `await` that never
+        // settles already failed cleanly in a few milliseconds; a loop that
+        // never yields is the one a timer spawned on the same thread can never
+        // interrupt, which is why the cut-off waits on a thread of its own.
+        let pool = pool();
+
+        let spinning = r#"
+            let n = 0;
+            while (true) { n++; }
+            export default async function handler() { return new Response("never"); }
+        "#;
+
+        let started = std::time::Instant::now();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            pool.load_app(
+                "spin_app.production".to_string(),
+                spinning.to_string(),
+                IsolateSpec::default(),
+            ),
+        )
+        .await
+        .expect(
+            "the load never answered: the runtime thread is still inside module evaluation and \
+             will not process another message",
+        )
+        .expect_err("a module whose top level never returns must not load");
+
+        let took = started.elapsed();
+        let message = refused.to_string();
+        assert!(
+            message.contains("spin_app.production"),
+            "the refusal must name the application: {message}"
+        );
+        assert!(
+            message.contains("module evaluation"),
+            "the refusal must say what was cut off: {message}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "the load was refused after {took:?}, which is not the ceiling doing it"
+        );
+
+        // And the pool is serving again. A thread still spinning inside the
+        // refused load would be one thread short, and the isolate left behind
+        // would answer nothing.
+        let good = r#"export default function handler() { return new Response("ok"); }"#;
+        pool.load_app(
+            "after_spin_app.production".to_string(),
+            good.to_string(),
+            IsolateSpec::default(),
+        )
+        .await
+        .expect("an application must still load after a refused one");
+
+        let (status, _headers, body) = pool
+            .execute_request(
+                "after_spin_app.production",
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("and it must serve");
+        assert_eq!(status, 200);
+        assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+
+        pool.unload_app("after_spin_app.production").await.unwrap();
+    }
+
+    #[tokio::test]
     async fn each_app_gets_a_thread_to_itself() {
         let pool = pool();
 

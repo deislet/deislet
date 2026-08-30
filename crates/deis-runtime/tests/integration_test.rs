@@ -17,9 +17,10 @@ use tower::ServiceExt; // for oneshot
 async fn test_gateway_execution() {
     // Setup
     let app_manager = Arc::new(ApplicationManager::new());
-    let state = AppState {
-        app_manager: app_manager.clone(),
-    };
+    let state = AppState::new(
+        app_manager.clone(),
+        deis_runtime::config::default_max_request_body_bytes(),
+    );
 
     // Create a test app
     let code = r#"
@@ -71,9 +72,10 @@ async fn test_gateway_execution() {
 #[tokio::test]
 async fn the_environment_header_picks_which_copy_of_an_app_answers() {
     let app_manager = Arc::new(ApplicationManager::new());
-    let state = AppState {
-        app_manager: app_manager.clone(),
-    };
+    let state = AppState::new(
+        app_manager.clone(),
+        deis_runtime::config::default_max_request_body_bytes(),
+    );
 
     for (environment, body) in [
         ("production", "from production"),

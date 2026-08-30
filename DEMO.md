@@ -35,8 +35,10 @@ curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
 **8086 是节点的端口，不是 deis-proxy 的。** 演示里 deis-proxy 起着，但没有给它配
 任何应用，所以它处在「透传」模式：一个上游（就是节点），头原样转发。走
 `http://127.0.0.1:8087/hello/world` 也能通，只是它证明的是「pingora 在转发」，
-不是「deis-proxy 选对了应用」。下面 `verify` 里发请求的各项全部直接打节点，原因也在这里
-——要验的是控制面与节点这条线，让请求先绕一跳只会把失败点变多。
+不是「deis-proxy 选对了应用」。下面 `verify` 里发请求的各项，除了 WebSocket 那两项，
+都直接打节点，原因也在这里——要验的是控制面与节点这条线，让请求先绕一跳只会把失败点
+变多。WebSocket 那两项反过来专走 deis-proxy：升级是反向代理最容易弄坏的一种交换，
+这一跳需要单独证明代理没有把它搞砸，见下文「websockets」一节。
 
 ## 部署走的是真实路径
 
@@ -74,9 +76,19 @@ scripts/demo-assets/example-app/
   functions/api/enqueue.ts         -> /api/enqueue   往 jobs 队列投一条消息
   functions/api/fetch.ts           -> /api/fetch     按 ?url= 往外打一发 fetch，回报结果
   functions/api/crypto.ts          -> /api/crypto    跑一遍 Web Crypto，把值本身回出来
+  functions/api/ws.ts              -> /api/ws        WebSocket 回声，见下文
   functions/_queue.ts              队列消费函数（下划线开头 = 平台调用，不是路由）
   functions/_scheduled.ts          cron 处理函数，同上
 ```
+
+`functions/api/ws.ts` 不在仓库里：`start` 发现示例应用自己没有这个文件时才会写一份
+进已构建好的副本（`scripts/demo.sh::add_websocket_route`），一旦示例应用自己带了同名
+文件，脚本就不再写，部署的是应用自己那份。它接一对 `WebSocketPair`，把收到的文本帧
+原样加前缀送回；收到的二进制帧则描述成「长度 + 十六进制」、用文本帧送回，而不是把
+原始字节原样送回去——`verify` 那边只比对回声的内容，不看回声帧本身是文本还是二进制，
+所以证明的是二进制帧完整抵达了 Isolate（没被当成文本、没有丢字节），不是服务端向外
+发二进制帧的能力；后者另有独立的机制（`op_ws_server_send_binary`），这个示例处理函数
+没有用到它。
 
 `BUILD_LABEL` 是回滚那一项的抓手：v2 把它改成 `v2` 并顺手改了静态页面，回滚之后
 两样要一起变回 `v1`。
@@ -103,11 +115,12 @@ deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条�
 演示据此摆了一个最小的对照组：脚本自己起一个上游（默认 8094），节点配置里
 `[fetch] allow` 只写这一个地址；deis-store 在同一块回环网卡的另一个端口上，不写。
 然后让**同一个处理函数**先后打这两个地址——一发通、一发不通，两者之间差的是策略而
-不是网络。这也是 `verify` 里唯一一项「成功了反而算失败」的检查。
+不是网络。`verify` 里「成功了反而算失败」的检查一共两项，这是第一项；第二项在下文
+「存储」小节，验的是缺一张凭据令牌照样能不能问到 deis-store。
 
 ## verify 检查什么
 
-`./scripts/demo.sh verify` 分十二组跑二十二项，每项打印它据以判断的证据：
+`./scripts/demo.sh verify` 分十三组跑二十五项，每项打印它据以判断的证据：
 
 | 组 | 检查 | 证明了什么 |
 |---|---|---|
@@ -116,13 +129,16 @@ deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条�
 | 资产优先 | `GET /` | 返回的是包里那个文件本身，没起 Isolate；ETag 是资产自身的 sha256 |
 | | 带 `If-None-Match` 再打一次 | 回 304 且零字节 |
 | 路由 | `GET /hello/world` | 路由占位符进了 `context.params` |
+| WebSocket | 经 `deis-proxy` 亲手做一次握手（自己拼字节，不借客户端库） | 101 状态行、`Upgrade`/`Connection` 头与 `Sec-WebSocket-Accept` 都对得上 RFC 6455 给那个握手键定好的答案——升级是节点应的、经代理原样转发，不是代理自己应了 101 又或者把它压扁成一个普通响应 |
+| | 握手成功后各发一帧文本、一帧二进制 | 两帧都完整抵达了 Isolate：二进制帧里特意塞了几个非法 UTF-8 字节（`0xff`、`0xfe`、开头的 `0x80`），处理函数把收到的字节数与十六进制原样报回来（不是替换字符），证明这条链路没有把它当文本处理、也没有在中途丢字节。验的是字节完整送达 Isolate，不是服务端向外发二进制帧的能力——处理函数把两种输入都回成文本帧，见上文示例应用一节 |
 | Web 标准 | 处理函数里 `fetch` 打演示自己起的那个上游 | Isolate 里真有 `fetch`（`available`），而且这一发确实打了出去并把上游的响应体原样带回来了 |
-| | 同一个处理函数改打 `http://127.0.0.1:<deis-store 端口>` | **打不通**。它和刚刚打通的那个上游在同一块回环网卡上，只是端口不同，所以拦住它的是出网策略不是网络。这一项是唯一一条「成功了算失败」的检查：应用只要连得上 deis-store，换个租户头就能读别的应用的数据。不校验措辞、状态码或错误文本——只看这一发有没有打出去 |
+| | 同一个处理函数改打 `http://127.0.0.1:<deis-store 端口>` | **打不通**。它和刚刚打通的那个上游在同一块回环网卡上，只是端口不同，所以拦住它的是出网策略不是网络。这一项和存储小节里「不带凭据令牌」的那条，是 `verify` 里仅有的两条「成功了算失败」的检查：应用只要连得上 deis-store，换个租户头就能读别的应用的数据。不校验措辞、状态码或错误文本——只看这一发有没有打出去 |
 | | `crypto.randomUUID()` 与 `crypto.subtle.digest()` | 值本身被检查：UUID 要是 v4 形状且两次不同；摘要要等于字符串 `deislet` 的已知 SHA-256。凭空造出的合法字节能过「没抛异常」，过不了这一项 |
 | 密钥 | `deis secret list` | 只列出名字与最后修改时间；JSON 与人读两种输出都不含值，也没有任何命令能打印值 |
 | | 同一响应的 `secretPresent` | 加密存库的密钥被解开、随下发进了 Isolate |
 | | 递归 grep 数据目录与全部日志 | 解开后的明文哪儿都没落下 |
-| 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的 |
+| 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
+| | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
 | 队列 | `POST /api/enqueue` 后轮询 `/api/kv/job:<key>` | 消息进了 deis-queue，节点的轮询任务领到并交给 `_queue.ts` |
 | cron | 轮询 `/api/kv/cron:last-run` | 控制面到点挑了**一个**节点触发，应用的 `_scheduled.ts` 真的跑了 |
 | 环境 | 同一应用的 production 与 preview 各打一发 | 两个环境在同一台节点上并行，各返回各自版本的标签 |
@@ -134,12 +150,17 @@ deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条�
 | | 拿节点凭据给一个**没写在** `deis_runtime_nodes` 里的 id 也发一次 `PUT .../registration` | 机队里真的多出这个 id，且 `source` 是 `registered` 而非 `configured`——证明一台配置文件从未提过的机器，光靠自己登记就能加入机队，而不是全靠这行演示脚本里唯一的节点本来就在配置文件里、这条登记路径从没被真正走过 |
 | | `deis status` | 节点是健康的、问得到的，而且它自己报出正在服务哪些环境——「目录说该跑什么」与「节点说在跑什么」是两回事 |
 
-日志那一项和存储那一项都需要 `grpcurl`：分别用来直接问 deis-telemetry 和
+日志那一项和存储小节的两项都需要 `grpcurl`：分别用来直接问 deis-telemetry 和
 deis-store，缺了会各自报为失败并说明原因，而不是悄悄跳过或者放宽标准去凑一个通过。
-两项 `fetch` 检查同理需要 `python3`——上游是 `python3 -m http.server` 起的，没有它
-`start` 会说一声、照常把别的都拉起来，然后这两项各自报失败并写明原因。其余各项除
-`curl` 与 `jq` 外没有额外依赖。cron 那一项最长要等一个 tick 加一分钟，所以整体会跑
-一两分钟。
+存储小节里直接问 `KvStore.Get` 那一项还需要 `openssl`——它要用来铸造 deis-store 现在
+要求的凭据令牌、再把答案里的 base64 值解出来比较，缺了同样报失败并说明原因；旁边
+「不带令牌」那一项不用铸令牌，没有 `openssl` 也能跑。`fetch` 那两项里只有打得通上游
+的那一项需要 `python3`——上游是 `python3 -m http.server` 起的，没有它 `start` 会说
+一声、照常把别的都拉起来，这一项因为连不上上游而报失败；打 deis-store 那一项打的是
+平台自己的服务，不经上游，没有 `python3` 也照样通过。两项 WebSocket 检查是另一种依赖：
+`verify` 自己在这一步直接调用 `python3` 去拼字节做握手、收发帧，缺了它这两项同样各自
+报失败并写明原因。其余各项除 `curl` 与 `jq` 外没有额外依赖。cron 那一项最长要等一个
+tick 加一分钟，所以整体会跑一两分钟。
 
 ## 验证日志链路（手工）
 
@@ -222,18 +243,22 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
 ## 注意事项
 
 - 需要本地安装 `cargo`、`curl`、`jq`，并确保 `ss`/`lsof`/`nc` 其一可用；
-  `stop` 用 `timeout` 与 `tail --pid` 等进程退出（GNU coreutils）；`python3` 只用来
-  起那个给应用 `fetch` 的上游，缺了不影响其余各项
+  `stop` 用 `timeout` 与 `tail --pid` 等进程退出（GNU coreutils）；`python3` 一处
+  用来起那个给应用 `fetch` 的上游，另一处被 `verify` 自己直接调用去拼字节做
+  WebSocket 握手，缺了会影响这几项，其余各项不受影响
 - **第一次跑之前要先构建控制面的 Web 面板**：`crates/deis-control/web/dist` 被
   gitignore 掉了，而 `deis-control` 在编译期把它嵌进二进制，所以少了它
   `cargo build` 直接失败。`demo.sh` 不会替你做这一步：
   `cd crates/deis-control/web && npm ci && npm run build`
-- `verify` 里查日志、以及直接向 deis-store 求证 KV 那两项需要 `grpcurl`；缺了它这两项
-  各自报失败，其余照跑
+- `verify` 里查日志的那一项，以及存储小节里直接问 deis-store 的两项，一共三项需要
+  `grpcurl`；其中直接问 `KvStore.Get` 那一项还需要 `openssl` 铸造 deis-store 现在
+  要求的凭据令牌。缺了 `grpcurl` 这三项各自报失败，缺了 `openssl` 单独影响那一项；
+  其余照跑
 - 出网只开了上游那一个地址（`[fetch] allow`）。想让示例应用够到别处，加
   `--deis-origin-port` 换端口或者自己改节点配置里的这一行；平台自己那几个服务地址
   改不动——它们在 allow 之后再被拒一次
-- `verify` 里发请求的各项都直接打节点端口，不经 deis-proxy（原因见上文）
+- `verify` 里发请求的各项，除 WebSocket 那两项要经 deis-proxy 之外（原因见上文
+  「websockets」一节），都直接打节点端口，不经 deis-proxy
 - 节点这次是自己去连控制面的：`[control] endpoint` 一配，节点启动就去拉自己的清单
   （`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`），把里面每一版拉下来装好才报
   healthy（原则 8）。节点也会用同一套凭据向控制面登记自己

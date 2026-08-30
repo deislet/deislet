@@ -131,12 +131,15 @@ async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
     let app_manager = Arc::new(
         ApplicationManager::new_with_repo(app_repo.clone())
             .with_limits(config.default_execution_limits.clone())
+            .with_memory_limit_mb(config.default_memory_limit_mb)
             .with_fetch_policy(fetch_policy.clone()),
     );
     info!(
-        "Application manager initialized (default timeout={}ms, default rate limit={} ops/sec)",
+        "Application manager initialized (default timeout={}ms, default rate limit={} ops/sec, \
+         default heap ceiling={}MB)",
         config.default_execution_limits.timeout_ms,
-        config.default_execution_limits.rate_limit_ops_per_sec
+        config.default_execution_limits.rate_limit_ops_per_sec,
+        config.default_memory_limit_mb
     );
     // The entries themselves are not logged: an allowlist is a map of the
     // internal network, and this line goes to the same place application logs
@@ -237,6 +240,7 @@ async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
         port,
         started_at,
         shutdown_grace: config.shutdown_grace_period(),
+        max_request_body_bytes: config.max_request_body_bytes,
     })
     .await?;
 

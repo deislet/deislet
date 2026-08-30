@@ -148,7 +148,7 @@ async fn send(client: &mut QueueClient<Channel>, tenant: &str, queue: &str, body
             tenant,
             SendRequest {
                 queue_name: queue.to_string(),
-                message_body: body.to_string(),
+                message_body: body.as_bytes().to_vec(),
             },
         ))
         .await
@@ -281,7 +281,7 @@ async fn send_pull_ack_and_the_message_is_gone() {
     let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].id, id);
-    assert_eq!(leased[0].body, "work");
+    assert_eq!(leased[0].body, b"work");
     assert_eq!(leased[0].attempts, 1);
     assert!(
         leased[0].lease_expires_at >= leased[0].created_at + 30,
@@ -318,7 +318,7 @@ async fn a_batch_is_sent_and_pulled_in_order() {
             "app-one.production",
             SendBatchRequest {
                 queue_name: "jobs".to_string(),
-                messages: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+                messages: vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
             },
         ))
         .await
@@ -328,8 +328,11 @@ async fn a_batch_is_sent_and_pulled_in_order() {
     assert_eq!(ids.len(), 3);
 
     let leased = pull(&mut client, "app-one.production", "jobs", 10, 30).await;
-    let bodies: Vec<&str> = leased.iter().map(|m| m.body.as_str()).collect();
-    assert_eq!(bodies, vec!["one", "two", "three"]);
+    let bodies: Vec<Vec<u8>> = leased.iter().map(|m| m.body.clone()).collect();
+    assert_eq!(
+        bodies,
+        vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+    );
 }
 
 #[tokio::test]
@@ -357,7 +360,7 @@ async fn a_message_whose_lease_lapses_is_delivered_again() {
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].id, id);
     assert_eq!(again[0].attempts, 2, "the redelivery is a second attempt");
-    assert_eq!(again[0].body, "work");
+    assert_eq!(again[0].body, b"work");
 }
 
 #[tokio::test]
@@ -675,7 +678,7 @@ async fn a_call_without_the_tenant_header_is_refused() {
     let status = client
         .send(Request::new(SendRequest {
             queue_name: "jobs".to_string(),
-            message_body: "work".to_string(),
+            message_body: b"work".to_vec(),
         }))
         .await
         .expect_err("a call with no tenant must be refused");
@@ -756,7 +759,7 @@ async fn two_environments_of_one_application_share_no_queue() {
         "production must see only its own message"
     );
     assert_eq!(live_lease[0].id, live);
-    assert_eq!(live_lease[0].body, "live-work");
+    assert_eq!(live_lease[0].body, b"live-work");
 
     let draft_lease = pull(&mut client, &preview, "jobs", 10, 30).await;
     assert_eq!(
@@ -765,7 +768,7 @@ async fn two_environments_of_one_application_share_no_queue() {
         "the preview must see only its own message"
     );
     assert_eq!(draft_lease[0].id, draft);
-    assert_eq!(draft_lease[0].body, "draft-work");
+    assert_eq!(draft_lease[0].body, b"draft-work");
 
     // Nor can one acknowledge the other's message, even holding its id and
     // the lease token it was handed.
@@ -793,7 +796,7 @@ async fn an_oversized_message_is_refused_and_nothing_is_queued() {
             "app-one.production",
             SendRequest {
                 queue_name: "jobs".to_string(),
-                message_body: "x".repeat(MAX_BODY_BYTES + 1),
+                message_body: vec![b'x'; MAX_BODY_BYTES + 1],
             },
         ))
         .await
@@ -882,7 +885,7 @@ async fn a_signed_call_is_served_when_a_secret_is_configured() {
             &tenant,
             SendRequest {
                 queue_name: "jobs".to_string(),
-                message_body: "work".to_string(),
+                message_body: b"work".to_vec(),
             },
         ))
         .await

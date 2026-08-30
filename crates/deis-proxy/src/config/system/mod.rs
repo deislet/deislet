@@ -40,6 +40,19 @@ pub const DEFAULT_UPSTREAM_READ_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_GRACE_PERIOD_SECS: u64 = 10;
 /// Seconds allowed for the worker runtimes to wind down after the grace period.
 pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+/// Largest request body carried to an upstream, in bytes.
+///
+/// The same number as deis-runtime's own `max_request_body_bytes`, and it has
+/// to stay that way: a node buffers a body whole before its handler sees it and
+/// answers 413 above its own ceiling, so a proxy that let more through would
+/// stream a body across the whole edge-to-node hop for a request the node was
+/// always going to refuse. Set both when either is changed.
+///
+/// Nothing enforces that today -- the two constants are declared in two crates
+/// that do not depend on each other, which is the shape
+/// `deis_wire::conventions` exists to fix. Until it moves there, this is a
+/// convention held up by these two comments.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// System configuration.
 ///
@@ -96,6 +109,13 @@ pub struct SystemConfig {
     pub log: Option<LoggingConfig>,
     /// Downstream response compression.
     pub compression: Option<CompressionConfig>,
+    /// Largest request body carried to an upstream, in bytes. A request that
+    /// declares more, or that turns out to send more, is answered 413 here and
+    /// never reaches a node.
+    ///
+    /// Mirrors deis-runtime's setting of the same name; see
+    /// [`DEFAULT_MAX_REQUEST_BODY_BYTES`] for why the two belong together.
+    pub max_request_body_bytes: Option<usize>,
     /// Control (deis-control) connection. Absent means standalone mode.
     pub control: Option<ControlConfig>,
 }
@@ -128,6 +148,7 @@ impl SystemConfig {
             log: Some(LoggingConfig::default()),
             compression: Some(CompressionConfig::default()),
             control: None,
+            max_request_body_bytes: Some(DEFAULT_MAX_REQUEST_BODY_BYTES),
         }
     }
 
@@ -211,6 +232,12 @@ impl SystemConfig {
             self.upstream_read_timeout_secs
                 .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_SECS),
         )
+    }
+
+    /// Largest request body this instance carries to an upstream.
+    pub fn max_request_body_bytes(&self) -> usize {
+        self.max_request_body_bytes
+            .unwrap_or(DEFAULT_MAX_REQUEST_BODY_BYTES)
     }
 
     /// Make every file path in this layer absolute by resolving relative
@@ -310,6 +337,14 @@ impl Validatable for SystemConfig {
                 });
             }
         }
+        if self.max_request_body_bytes == Some(0) {
+            return Err(ConfigError::ValidationError {
+                message: "max_request_body_bytes must be at least 1; 0 answers 413 to every \
+                          request that carries a body, so no form post or upload would reach \
+                          any application"
+                    .to_string(),
+            });
+        }
         if let Some(cache) = &self.cache {
             cache.validate()?;
         }
@@ -366,6 +401,7 @@ impl Add<SystemConfig> for SystemConfig {
             log: other.log.or(self.log),
             compression: other.compression.or(self.compression),
             control: other.control.or(self.control),
+            max_request_body_bytes: other.max_request_body_bytes.or(self.max_request_body_bytes),
         }
     }
 }
@@ -412,6 +448,45 @@ ports = [443]
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn an_instance_with_no_body_ceiling_configured_still_has_one() {
+        // Both the empty layer and the baseline answer with the documented
+        // default, so a bare instance carries a ceiling rather than none.
+        //
+        // That the number equals deis-runtime's own `max_request_body_bytes`
+        // is a coupling this crate cannot check: the two constants are
+        // declared in two crates that do not depend on each other. It is
+        // stated on `DEFAULT_MAX_REQUEST_BODY_BYTES` and belongs in
+        // `deis_wire::conventions` alongside the other names both sides must
+        // spell the same way.
+        assert_eq!(
+            SystemConfig::baseline().max_request_body_bytes(),
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+        assert_eq!(
+            SystemConfig::default().max_request_body_bytes(),
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+    }
+
+    #[test]
+    fn a_configured_body_ceiling_wins_over_the_baseline() {
+        let local: SystemConfig = toml::from_str("max_request_body_bytes = 1048576\n").unwrap();
+        let merged = SystemConfig::baseline() + local;
+        assert_eq!(merged.max_request_body_bytes(), 1_048_576);
+        merged.validate().expect("a positive ceiling is usable");
+    }
+
+    #[test]
+    fn a_zero_body_ceiling_is_refused() {
+        let config = SystemConfig {
+            max_request_body_bytes: Some(0),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_request_body_bytes"), "{err}");
     }
 
     #[test]

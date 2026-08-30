@@ -100,15 +100,18 @@ version coming soon"; the content is in the Chinese column.
 | Cloudflare Workers | ✅ 完整支持 Full | KV, Cache | D1, R2, Queue, DO |
 | Deno Deploy | ✅ 完整支持 Full | KV, Cache | Postgres |
 | Tencent EdgeOne | ✅ 完整支持 Full | KV, Cache | - |
-| Deislet | ✅ 目标可用 Usable | KV, Cache | SQL, Blob, Queue, Cron, WebSockets（WebSocket 两端未端到端验证 WebSocket not verified end to end） |
+| Deislet | ✅ 目标可用 Usable | KV, Cache | SQL, Blob, Queue, Cron, WebSockets |
 
 Deislet 那一行说的是**编译目标**：`--vendor deislet` 产出的应用包能被 `deis deploy`
-上传、被节点装载并服务。运行时里 Web 标准全局装得很不全（没有 `fetch`），那是运行时
-的实情，不是这个编译器的：见 `docs/architecture.zh.md` 第 12 节。
+上传、被节点装载并服务。运行时里 SPECIFICATION_BASIC.md 8.1 节要求的 Web 标准全局
+现在一个不缺，`fetch`、WebSocket 客户端与服务端都已实现并验证：见
+`docs/architecture.zh.md` 第 12 节与 `PLATFORM_MATRIX.md`。
 That row is about the **compile target**: `--vendor deislet` produces a bundle
 that `deis deploy` uploads and a node loads and serves. The runtime's Web
-standard globals are another matter entirely — `fetch` is not among them; see
-section 12 of `docs/architecture.zh.md`.
+standard globals required by SPECIFICATION_BASIC.md section 8.1 are all
+present now, including `fetch`, and both the client and server halves of
+WebSocket are implemented and verified; see section 12 of
+`docs/architecture.zh.md` and `PLATFORM_MATRIX.md`.
 
 ## 🔗 相关资源 | Related Resources
 

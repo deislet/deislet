@@ -128,9 +128,10 @@ async fn a_bundled_site_is_served_from_its_assets_and_falls_through_on_a_miss() 
     let router = Router::new()
         .route("/*path", any(handlers::handle_request))
         .route("/", any(handlers::handle_request))
-        .with_state(AppState {
-            app_manager: app_manager.clone(),
-        });
+        .with_state(AppState::new(
+            app_manager.clone(),
+            deis_runtime::config::default_max_request_body_bytes(),
+        ));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

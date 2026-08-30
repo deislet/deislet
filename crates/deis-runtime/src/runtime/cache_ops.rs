@@ -22,10 +22,24 @@
 //! passes it here as whole seconds; zero means the response said nothing and
 //! the store's own default applies. Expiry is from the write, not from the
 //! last read: reading a cached response does not make it fresher.
+//!
+//! # Why a body is bytes and the rest is a string
+//!
+//! An entry is split in two on purpose. The status and the headers are text
+//! and travel as one JSON string; the body travels as a buffer, because a
+//! response body is whatever the application put in it -- a PNG, a protobuf,
+//! a gzip frame -- and a byte outside the ASCII range is not a character.
+//! Carrying the body through a string meant `Cache.put` had to decode it as
+//! UTF-8 first, which replaces every ill-formed sequence with U+FFFD: bytes
+//! `0x80..=0xff` all came back as `ef bf bd`, and `caches.default` exists in
+//! every isolate whether the application asked for it or not, so an image put
+//! in the cache was served back as mojibake with nothing reporting an error.
+//! Buffers in and out, the way `blob_ops.rs` carries bytes.
 
-use deno_core::{extension, op2, OpState};
+use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
 use moka::future::Cache;
 use moka::Expiry;
+use serde::Serialize;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -34,12 +48,26 @@ use std::time::{Duration, Instant};
 /// One cached response, plus how long it asked to stay fresh.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheEntry {
-    /// The serialised response, exactly as the JavaScript side wrote it.
-    pub payload: String,
+    /// Everything about the response that is text: the status and the headers,
+    /// serialised by the JavaScript side as one JSON object.
+    pub meta: String,
+    /// The response body, byte for byte as the application wrote it.
+    pub body: Vec<u8>,
     /// Whole seconds of freshness taken from the response's `Cache-Control`.
     /// `None` means the response named no lifetime, so the store's default
     /// applies.
     pub ttl: Option<Duration>,
+}
+
+/// A hit, as `Cache.match` receives it.
+///
+/// Two fields rather than one because they are two different kinds of thing:
+/// `meta` is JSON the JavaScript side parses, `body` arrives as a
+/// `Uint8Array` and is handed straight to the `Response` constructor.
+#[derive(Serialize)]
+struct CachedResponse {
+    meta: String,
+    body: ToJsBuffer,
 }
 
 /// Cache storage type.
@@ -86,27 +114,37 @@ impl Expiry<String, CacheEntry> for ResponseFreshness {
 /// Read a cached response.
 ///
 /// # Returns
-/// - `Some(payload)`: hit, and still fresh.
+/// - `Some({ meta, body })`: hit, and still fresh.
 /// - `None`: never written, evicted, or past its lifetime.
 #[op2(async)]
-#[string]
-async fn op_cache_get(state: Rc<RefCell<OpState>>, #[string] key: String) -> Option<String> {
+#[serde]
+async fn op_cache_get(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+) -> Option<CachedResponse> {
     let cache = {
         let state_borrow = state.borrow();
         state_borrow.borrow::<CacheStore>().clone()
     };
-    cache.get(&key).await.map(|entry| entry.payload)
+    cache.get(&key).await.map(|entry| CachedResponse {
+        meta: entry.meta,
+        body: ToJsBuffer::from(entry.body),
+    })
 }
 
 /// Write a cached response.
 ///
-/// `ttl_seconds` is the freshness the response asked for; zero means it asked
-/// for none and the store's default applies.
+/// `meta` is the JSON the JavaScript side built out of the status and the
+/// headers; `body` is the response body as a `Uint8Array`, taken as a buffer
+/// so that a body which is not text survives. `ttl_seconds` is the freshness
+/// the response asked for; zero means it asked for none and the store's
+/// default applies.
 #[op2(async)]
 async fn op_cache_set(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
-    #[string] value: String,
+    #[string] meta: String,
+    #[buffer] body: JsBuffer,
     ttl_seconds: u32,
 ) {
     let cache = {
@@ -115,7 +153,8 @@ async fn op_cache_set(
     };
 
     let entry = CacheEntry {
-        payload: value,
+        meta,
+        body: body.to_vec(),
         ttl: if ttl_seconds == 0 {
             None
         } else {

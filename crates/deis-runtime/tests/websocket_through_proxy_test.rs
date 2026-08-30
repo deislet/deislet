@@ -92,9 +92,10 @@ struct Node {
 impl Node {
     async fn start() -> Node {
         let app_manager = Arc::new(ApplicationManager::new());
-        let state = AppState {
-            app_manager: app_manager.clone(),
-        };
+        let state = AppState::new(
+            app_manager.clone(),
+            deis_runtime::config::default_max_request_body_bytes(),
+        );
         app_manager
             .load_app(
                 AppKey::production(APP),

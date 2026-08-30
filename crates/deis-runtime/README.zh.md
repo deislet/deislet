@@ -88,15 +88,15 @@ TOML 路径大写、用下划线连起来、前面加 `DEIS_RUNTIME_`。
 **有：** `fetch`、`crypto`、`Headers`、`Request`、`Response`、`URL`、
 `URLSearchParams`、`ReadableStream`、`WritableStream`、`TransformStream`、
 `AbortController`、`AbortSignal`、`DOMException`、`setTimeout`、`clearTimeout`、
-`setInterval`、`clearInterval`、`EventTarget`、`queueMicrotask`、`console`、
-`caches`、`WebSocketPair`、`WebSocketServer`、`TextEncoder`、`TextDecoder`、
-`atob`、`btoa`。
+`setInterval`、`clearInterval`、`EventTarget`、`Event`、`CustomEvent`、
+`queueMicrotask`、`console`、`caches`、`WebSocketPair`、`WebSocketServer`、
+客户端 `WebSocket`（走的是和 `fetch` 同一道出网策略，见下文）、`Blob`、`File`、
+`FormData`、`URLPattern`、`structuredClone`、`performance`、`navigator`、
+`TextEncoder`、`TextDecoder`、`atob`、`btoa`。
 
-**没有：** `Deno`、`__bootstrap`、`Blob`、`File`、`FormData`、`URLPattern`、客户端
-`WebSocket`、`BroadcastChannel`、`structuredClone`、`Event`、`performance`、
-`navigator`、`addEventListener`、`MessageChannel`、`MessagePort`、
-`CompressionStream`、`DecompressionStream`、`EventSource`、`FileReader`、
-`reportError`。
+**没有：** `Deno`、`__bootstrap`、`BroadcastChannel`、`addEventListener`、
+`MessageChannel`、`MessagePort`、`CompressionStream`、`DecompressionStream`、
+`EventSource`、`FileReader`、`reportError`。
 
 `Deno` 和 `__bootstrap` 这两个是为了安全才删的，不是为了整洁：`deno_core` 把它的
 op 表同时挂在这两个上（`Deno.core.ops` 和 `__bootstrap.core.ops`），而其中一个 op
@@ -105,11 +105,18 @@ Deno 启动会在 `99_main.js` 里删掉 `__bootstrap`，而这个运行时不�
 `js/runtime.js` 在任何应用代码跑起来之前把两个都手动删掉。包装器捕获的引用是在模块
 加载时就拿到的，所以应用调用的那个 `fetch` 照常能用，通往裸 op 的门却关上了。
 
-SPECIFICATION_BASIC.md 第 8.1 节要求的名字现在一个不缺。「没有」那列里有几个其实在
-Isolate 内部是活的——`deno_fetch` 自己要用 `Blob` 和 `FormData`，`deno_web` 要用
-`Event`——只是没有挂成全局名，所以 `response.blob()` 拿回来的 `Blob` 应用叫不出
-它的名字。这条线是有意画的：第 8.1 节，加上让第 8.1 节真正能用起来的那几个，别的
-不加，好让这个平台承诺的表面是运维能一眼说清的。
+SPECIFICATION_BASIC.md 第 8.1 节要求的名字现在一个不缺，另外还挂了让第 8.1 节自己
+能用起来的那几个（`AbortController` / `AbortSignal` 用来取消出网调用，
+`DOMException` 是它抛出的错误类型），再加上少数几个不给就等于这个能力不存在的：
+`Blob` / `File` / `FormData`（没有它们，`request.formData()` 能收下一个多部件
+上传，却读不出、也转发不走）、`URLPattern`（路由库要做的第一件事）、
+`structuredClone`、`Event` / `CustomEvent`（`EventTarget` 挂着却没有事件可以往里
+发，等于摆设）、`performance`（截到整毫秒、`timeOrigin` 钉死在 0，为的是防跨
+Isolate 的时间侧信道——这个节点上好几个租户的 Isolate 共用一条 OS 线程）、
+`navigator`（运行时自己的冻结对象，只有一个 `userAgent`），以及客户端 `WebSocket`
+（走 `runtime/ws_client_ops.rs`，每个目标都过一遍 `fetch` 也在过的那道
+`fetch_policy.rs` 判定，而不是 deno_websocket 自己的连接器）。这条线仍然是有意
+画的——不是「deno_web 装了什么就给什么」——只是比单纯的第 8.1 节长一些。
 
 这份清单不是一次性探针的结果。`src/runtime/isolate_test.rs` 里的
 `the_isolate_global_surface_is_the_one_the_documents_describe` 会在真 Isolate 里
@@ -128,7 +135,11 @@ Isolate 内部是活的——`deno_fetch` 自己要用 `Blob` 和 `FormData`，`
   不冒充成 UTF-8 解。canon 只要求 UTF-8，而一个碰巧在这里靠 `iso-8859-1` 跑通的
   应用，依赖的是 canon 没有承诺的东西。
 
-请求与响应体过 Rust/JS 边界时仍然是字符串，所以二进制主体过不了请求体和响应体这条路。
+请求与响应体过 Rust/JS 边界时是字节（`ops.rs::PendingRequestBody` /
+`PendingResponseBody`，都是 `Option<Vec<u8>>`，op 边界上是 `#[buffer]` /
+`ToJsBuffer`——`blob_ops.rs` 里写了为什么两个方向都不能用 `#[serde] Vec<u8>`），
+所以二进制上传或二进制上游响应都能原样穿过去。`context.services.kv`、
+`context.services.blob`、Cache API 与 `context.services.queue` 同样是按字节走的。
 
 ### 出站 fetch 是有策略的
 

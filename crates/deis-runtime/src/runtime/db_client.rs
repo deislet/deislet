@@ -19,9 +19,7 @@
 //! it, checked on every use, and spent once the transaction ends.
 
 use super::bindings::StorageIdentity;
-use anyhow::{Context, Result};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use anyhow::Result;
 use tonic::transport::Channel;
 
 // Import generated proto code
@@ -48,48 +46,23 @@ fn transaction_refusal(error: Option<String>) -> anyhow::Error {
     }))
 }
 
-/// Database client wrapper
+/// SQL client for one tenant.
 ///
-/// Wrapped in Arc<Mutex> to support sharing and internal mutability across async operations
+/// Cloning is cheap and every call clones: the inner tonic client wraps an
+/// HTTP/2 `Channel`, which is a reference-counted handle that multiplexes
+/// concurrent calls over one connection. One shared client behind a lock
+/// would put every call of this application in one queue, so a transaction
+/// waiting on the file's write lock inside deis-store would also hold up the
+/// unrelated `SELECT` issued next to it -- and, worse, hold up the COMMIT of
+/// the transaction already in flight, which is how a handler that finished on
+/// time lost its writes to a deadline it had not exceeded.
 #[derive(Clone)]
 pub struct DbClient {
-    client: Arc<Mutex<DatabaseClient<Channel>>>,
+    client: DatabaseClient<Channel>,
     identity: StorageIdentity,
 }
 
 impl DbClient {
-    /// Connect to remote Database service
-    ///
-    /// # Parameters
-    /// - endpoint: deis-store gRPC address (e.g., "http://127.0.0.1:8090",
-    ///   deis-store's default listen address)
-    /// - tenant: the `<app>.<environment>` every call of this client is
-    ///   charged to; see [`StorageIdentity`]
-    ///
-    /// Carries no capability token, so it can only speak to a deis-store that
-    /// has no `auth_secret`; application bindings use [`Self::connect_lazy`].
-    ///
-    /// # Returns
-    /// - Ok(DbClient): Connection successful
-    /// - Err: Connection failed
-    pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
-        let endpoint = endpoint.into();
-        let identity = StorageIdentity::new(tenant, None)?;
-        tracing::info!(%endpoint, app_id = identity.tenant(), "connecting to database");
-
-        let client = DatabaseClient::connect(endpoint.clone())
-            .await
-            .with_context(|| format!("connecting to database at {endpoint}"))?
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
-
-        tracing::info!(%endpoint, app_id = identity.tenant(), "database client connected");
-        Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            identity,
-        })
-    }
-
     /// Build a client that dials deis-store on its first call; see
     /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
     /// rather than connecting eagerly.
@@ -104,7 +77,7 @@ impl DbClient {
             "database client prepared; it will dial on the first call"
         );
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client,
             identity: identity.clone(),
         })
     }
@@ -131,7 +104,7 @@ impl DbClient {
 
         tracing::debug!("DB Execute: {}", sql);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.execute(request).await?;
         let exec_response = response.into_inner();
 
@@ -165,7 +138,7 @@ impl DbClient {
 
         tracing::debug!("DB Query: {}", sql);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.query(request).await?;
         let query_response = response.into_inner();
 
@@ -204,7 +177,7 @@ impl DbClient {
             request.get_ref().statements.len()
         );
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.batch(request).await?;
         let batch_response = response.into_inner();
 
@@ -236,7 +209,7 @@ impl DbClient {
 
         tracing::debug!("DB Prepare: {}", sql);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.prepare(request).await?;
         let prepare_response = response.into_inner();
 
@@ -270,7 +243,7 @@ impl DbClient {
 
         tracing::debug!("DB ExecutePrepared");
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.execute_prepared(request).await?;
         let exec_response = response.into_inner();
 
@@ -304,7 +277,7 @@ impl DbClient {
 
         tracing::debug!("DB QueryPrepared");
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.query_prepared(request).await?;
         let query_response = response.into_inner();
 
@@ -339,7 +312,7 @@ impl DbClient {
 
         tracing::debug!(timeout_ms, "DB BeginTransaction");
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.begin_transaction(request).await?;
         let begun = response.into_inner();
 
@@ -376,7 +349,7 @@ impl DbClient {
 
         tracing::debug!("DB ExecuteInTransaction: {}", sql);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.execute_in_transaction(request).await?;
         let exec_response = response.into_inner();
 
@@ -411,7 +384,7 @@ impl DbClient {
 
         tracing::debug!("DB QueryInTransaction: {}", sql);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.query_in_transaction(request).await?;
         let query_response = response.into_inner();
 
@@ -433,7 +406,7 @@ impl DbClient {
 
         tracing::debug!("DB CommitTransaction");
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.commit_transaction(request).await?;
         let committed = response.into_inner();
 
@@ -452,7 +425,7 @@ impl DbClient {
 
         tracing::debug!("DB RollbackTransaction");
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.rollback_transaction(request).await?;
         let rolled_back = response.into_inner();
 
@@ -468,16 +441,13 @@ impl DbClient {
 mod tests {
     use super::*;
     use crate::runtime::test_store::TestStore;
+    use std::time::{Duration, Instant};
 
-    #[tokio::test]
-    async fn connecting_to_nothing_is_an_error_rather_than_a_client_that_fails_later() {
-        // Port 1 is reserved and nothing listens there, so this cannot
-        // accidentally reach a real store on a developer's machine.
-        let result = DbClient::connect("http://127.0.0.1:1", "test_app.production").await;
-        assert!(
-            result.is_err(),
-            "a client built against an address nobody answers must fail here, not on first use"
-        );
+    /// A client wired the way an application binding is: dialled on first
+    /// use, carrying whatever proof the node was handed for this tenant.
+    fn client(store: &TestStore, tenant: &str) -> DbClient {
+        let identity = StorageIdentity::new(tenant, None).expect("a legal tenant");
+        DbClient::connect_lazy(&store.endpoint, &identity).expect("client is built")
     }
 
     #[tokio::test]
@@ -487,9 +457,7 @@ mod tests {
         // the contract - parameter encoding, the row/column shape, the batch
         // atomicity, prepared-statement handles - is owned by the other side.
         let store = TestStore::start().await;
-        let client = DbClient::connect(&store.endpoint, "db_client_test.production")
-            .await
-            .expect("the store is listening");
+        let client = client(&store, "db_client_test.production");
 
         client
             .execute(
@@ -559,9 +527,7 @@ mod tests {
         // and does not: deis-store runs a batch atomically, so a statement
         // that fails takes the earlier ones in the same batch with it.
         let store = TestStore::start().await;
-        let client = DbClient::connect(&store.endpoint, "db_batch_test.production")
-            .await
-            .expect("the store is listening");
+        let client = client(&store, "db_batch_test.production");
 
         client
             .execute(
@@ -603,9 +569,7 @@ mod tests {
         // checks that a read on any other connection cannot see it until the
         // commit.
         let store = TestStore::start().await;
-        let client = DbClient::connect(&store.endpoint, "db_tx_commit_test.production")
-            .await
-            .expect("the store is listening");
+        let client = client(&store, "db_tx_commit_test.production");
 
         client
             .execute(
@@ -668,9 +632,7 @@ mod tests {
     #[tokio::test]
     async fn a_rolled_back_transaction_leaves_nothing_and_its_handle_is_spent() {
         let store = TestStore::start().await;
-        let client = DbClient::connect(&store.endpoint, "db_tx_rollback_test.production")
-            .await
-            .expect("the store is listening");
+        let client = client(&store, "db_tx_rollback_test.production");
 
         client
             .execute(
@@ -726,9 +688,7 @@ mod tests {
         // message through unchanged is what lets `runtime.js` hand an
         // application a sentence it can act on.
         let store = TestStore::start().await;
-        let client = DbClient::connect(&store.endpoint, "db_tx_errors_test.production")
-            .await
-            .expect("the store is listening");
+        let client = client(&store, "db_tx_errors_test.production");
 
         let refused = client
             .begin_transaction(Some(0))
@@ -761,5 +721,91 @@ mod tests {
         assert!(bad_sql.to_string().contains("nonexistent"), "{bad_sql}");
 
         client.rollback_transaction(id).await.expect("rollback");
+    }
+
+    /// Two calls on one client must overlap, not queue behind each other.
+    ///
+    /// This client used to hold its tonic client in an `Arc<Mutex<_>>` and
+    /// lock it across the whole RPC, which made a transaction waiting for the
+    /// file's write lock inside deis-store stall every other database call the
+    /// application made -- including the COMMIT of a transaction that had
+    /// finished on time, whose work was then thrown away for exceeding a
+    /// deadline it had not exceeded. A `Channel` multiplexes concurrent calls
+    /// over one connection, so cloning it per call is what the transport is
+    /// for.
+    #[tokio::test]
+    async fn a_call_blocked_in_the_store_does_not_hold_up_the_rest_of_the_client() {
+        let store = TestStore::start().await;
+        let client = client(&store, "db_concurrency_test.production");
+
+        client
+            .execute("CREATE TABLE t (v INTEGER)".to_string(), None)
+            .await
+            .expect("create table");
+
+        // The first transaction holds the file's write lock until it ends.
+        let (first, _) = client.begin_transaction(Some(10_000)).await.expect("begin");
+        client
+            .execute_in_transaction(first.clone(), "INSERT INTO t VALUES (1)".to_string(), None)
+            .await
+            .expect("insert");
+
+        // The second blocks server-side in BEGIN IMMEDIATE, for as long as
+        // SQLite's busy timeout allows.
+        let (in_flight, blocked_started) = tokio::sync::oneshot::channel();
+        let blocked = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                // Sent immediately before the call, so the query below is
+                // ordered behind it rather than racing it.
+                let _ = in_flight.send(());
+                client.begin_transaction(Some(10_000)).await
+            })
+        };
+        blocked_started.await.expect("the blocked task started");
+
+        // Under one shared lock this could not be answered until the blocked
+        // BeginTransaction gave the lock back, five seconds later.
+        let started = Instant::now();
+        let (rows, _) = client
+            .query("SELECT 1 AS one".to_string(), None)
+            .await
+            .expect("a plain query is served while a transaction waits");
+        let waited = started.elapsed();
+        assert!(rows.contains('1'), "{rows}");
+        assert!(
+            waited < Duration::from_secs(2),
+            "an unrelated query waited {waited:?} behind a blocked transaction; the client is \
+             serialising its calls again"
+        );
+
+        // And the transaction that was already open can still be committed:
+        // its COMMIT was not queued behind the blocked call either.
+        let started = Instant::now();
+        client
+            .commit_transaction(first)
+            .await
+            .expect("the first transaction commits");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a commit that waits behind another call loses the work it was committing"
+        );
+
+        // The blocked call gets the write lock once the first transaction
+        // releases it; roll it back so the store is not left holding one.
+        let (second, _) = blocked
+            .await
+            .expect("the blocked task")
+            .expect("the second transaction begins once the first commits");
+        client
+            .rollback_transaction(second)
+            .await
+            .expect("rollback the second");
+
+        let (after, _) = client
+            .query("SELECT v FROM t".to_string(), None)
+            .await
+            .expect("read after the commit");
+        assert!(after.contains('1'), "the commit must have applied: {after}");
     }
 }

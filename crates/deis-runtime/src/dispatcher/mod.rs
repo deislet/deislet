@@ -21,6 +21,23 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 pub struct AppState {
     pub app_manager: Arc<ApplicationManager>,
+
+    /// Largest request body this node will read into memory, from
+    /// `max_request_body_bytes`. It reaches the handler through the state
+    /// because that is the only thing a handler is given besides the request
+    /// itself; it used to be read from the process environment inside the
+    /// handler, which put a node setting somewhere `RuntimeConfig` could not
+    /// reach and the node's TOML could not set.
+    pub max_request_body_bytes: usize,
+}
+
+impl AppState {
+    pub fn new(app_manager: Arc<ApplicationManager>, max_request_body_bytes: usize) -> Self {
+        Self {
+            app_manager,
+            max_request_body_bytes,
+        }
+    }
 }
 
 /// Everything `start_server` needs to stand the node up.
@@ -44,6 +61,12 @@ pub struct ServerOptions {
     /// How long in-flight requests get to finish after a shutdown signal
     /// before the node stops waiting.
     pub shutdown_grace: Duration,
+
+    /// Largest request body this node will read into memory, from
+    /// `max_request_body_bytes`. Carried here rather than read where it is
+    /// used so that the value the node serves on is the one its configuration
+    /// was validated against.
+    pub max_request_body_bytes: usize,
 }
 
 /// Wait for the first shutdown signal and name it.
@@ -111,11 +134,10 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         port,
         started_at,
         shutdown_grace,
+        max_request_body_bytes,
     } = options;
 
-    let state = AppState {
-        app_manager: app_manager.clone(),
-    };
+    let state = AppState::new(app_manager.clone(), max_request_body_bytes);
 
     // Create gRPC services
     let management_service = ManagementServer::create_service(
@@ -226,6 +248,10 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     info!(
         "📊 Health Check: curl -H \"x-deis-app-id: _system\" http://localhost:{}/health",
         port
+    );
+    info!(
+        max_request_body_bytes,
+        "📦 Request bodies larger than this are answered 413 and never reach an application"
     );
     info!(
         "📚 Platform Info: curl -H \"x-deis-app-id: _system\" http://localhost:{}/",

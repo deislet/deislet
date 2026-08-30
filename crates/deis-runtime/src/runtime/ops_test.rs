@@ -54,4 +54,285 @@ mod tests {
 
         assert_eq!(env.get("ENV_KEY"), Some(&"env_value".to_string()));
     }
+
+    // `ctx.services.kv.list` is a property of three things at once -- the
+    // JavaScript wrapper, `op_kv_list`, and the `List` RPC deis-store answers
+    // -- and it was reachable from none of them until now: the op was
+    // registered and no line of JavaScript called it. A test that mocked the
+    // store would prove only that the wrapper calls the op, which was never
+    // the part in doubt. So these run a real isolate against a real store.
+
+    use crate::runtime::isolate::{AppRuntime, IsolateSpec};
+    use crate::runtime::test_store::TestStore;
+    use tokio::sync::oneshot;
+
+    /// Run one GET through a real isolate wired to `store`'s KV, and return
+    /// the handler's body. The handlers below answer with JSON describing
+    /// what they saw, so a failure inside one shows up as an assertion here
+    /// rather than as a 500 with nothing in it.
+    async fn kv_probe(app_id: &str, store: &TestStore, body_js: &str) -> String {
+        let code = format!("export default async function handler(ctx) {{\n{body_js}\n}}");
+        let mut runtime = AppRuntime::new(
+            app_id.to_string(),
+            code,
+            None,
+            IsolateSpec::default(),
+            &store.kv_wiring(),
+        )
+        .expect("the isolate is built");
+        runtime.init_module().await.expect("the module loads");
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (status, _, body) = rx.await.expect("a response").expect("a response");
+        let body = body
+            .map(|bytes| String::from_utf8(bytes).expect("these handlers answer with JSON"))
+            .unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
+    #[tokio::test]
+    async fn a_listing_reports_each_key_with_what_was_stored_beside_it() {
+        // The shape an application written for this platform expects:
+        // `keys` of `{ name, expiration, metadata }`, a `list_complete` flag,
+        // and the metadata decoded exactly the way `getWithMetadata` decodes
+        // it -- an object goes in with put(), the same object comes out of a
+        // listing.
+        let store = TestStore::start().await;
+        let body = kv_probe(
+            "kv_list_shape_app.production",
+            &store,
+            r#"const kv = ctx.services.kv;
+                await kv.put("session:a", "one", { metadata: { user: 7 } });
+                await kv.put("session:b", "two", { expirationTtl: 3600 });
+                const page = await kv.list({ prefix: "session:" });
+                return new Response(JSON.stringify({
+                    names: page.keys.map((k) => k.name),
+                    metadata: page.keys.map((k) => k.metadata),
+                    hasExpiration: page.keys.map((k) => k.expiration !== null),
+                    list_complete: page.list_complete,
+                    cursor: page.cursor === undefined ? "absent" : page.cursor,
+                }));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            seen["names"],
+            serde_json::json!(["session:a", "session:b"]),
+            "a listing is in key order: {body}"
+        );
+        assert_eq!(
+            seen["metadata"],
+            serde_json::json!([{ "user": 7 }, null]),
+            "metadata has to come back as the object put() was handed: {body}"
+        );
+        assert_eq!(
+            seen["hasExpiration"],
+            serde_json::json!([false, true]),
+            "a key written with a lifetime reports when it lapses: {body}"
+        );
+        assert_eq!(
+            seen["list_complete"], true,
+            "a listing that reached the end says so: {body}"
+        );
+        assert_eq!(
+            seen["cursor"], "absent",
+            "a finished listing hands back no cursor to follow: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_sees_only_the_keys_under_its_prefix_and_only_its_own_tenant() {
+        // Without a prefix a listing is the whole application, which is the
+        // widest it can ever be: the tenant is the boundary, and there is no
+        // argument that reaches past it.
+        let store = TestStore::start().await;
+        let body = kv_probe(
+            "kv_list_prefix_app.production",
+            &store,
+            r#"const kv = ctx.services.kv;
+                await kv.put("user:1", "a");
+                await kv.put("user:2", "b");
+                await kv.put("order:1", "c");
+                const users = await kv.list("user:");
+                const everything = await kv.list();
+                return new Response(JSON.stringify({
+                    users: users.keys.map((k) => k.name),
+                    everything: everything.keys.map((k) => k.name),
+                }));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            seen["users"],
+            serde_json::json!(["user:1", "user:2"]),
+            "a prefix must not pull in a neighbouring one: {body}"
+        );
+        assert_eq!(
+            seen["everything"],
+            serde_json::json!(["order:1", "user:1", "user:2"]),
+            "no prefix lists everything this application has: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_pages_through_a_cursor_until_it_reports_itself_complete() {
+        // The reason `list_complete` exists rather than "was the page
+        // short?": deis-store answers with a cursor whenever it filled a page
+        // to the limit, so five keys taken two at a time give pages of 2, 2
+        // and 1, and four keys taken two at a time give 2, 2 and then an
+        // empty page. Both loops have to terminate with everything collected,
+        // and only the flag makes that true.
+        let store = TestStore::start().await;
+        let body = kv_probe(
+            "kv_list_paging_app.production",
+            &store,
+            r#"const kv = ctx.services.kv;
+                for (const n of ["1", "2", "3", "4"]) await kv.put("k:" + n, n);
+
+                async function drain(limit) {
+                    const names = [];
+                    const sizes = [];
+                    let page = { list_complete: false, cursor: undefined };
+                    let guard = 0;
+                    while (!page.list_complete) {
+                        if (++guard > 10) throw new Error("the loop did not terminate");
+                        page = await kv.list({ prefix: "k:", limit, cursor: page.cursor });
+                        names.push(...page.keys.map((k) => k.name));
+                        sizes.push(page.keys.length);
+                    }
+                    return { names, sizes };
+                }
+
+                const byTwo = await drain(2);
+                const byThree = await drain(3);
+                return new Response(JSON.stringify({ byTwo, byThree }));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let all = serde_json::json!(["k:1", "k:2", "k:3", "k:4"]);
+        assert_eq!(
+            seen["byTwo"]["names"], all,
+            "paging must not drop or repeat a key: {body}"
+        );
+        assert_eq!(
+            seen["byTwo"]["sizes"],
+            serde_json::json!([2, 2, 0]),
+            "four keys two at a time end on an empty page, which is why a short page is not \
+             the end signal: {body}"
+        );
+        assert_eq!(
+            seen["byThree"]["names"], all,
+            "paging must not drop or repeat a key: {body}"
+        );
+        assert_eq!(
+            seen["byThree"]["sizes"],
+            serde_json::json!([3, 1]),
+            "a page that came back short is the last one: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_argument_that_could_not_work_is_refused_before_the_store_is_asked() {
+        // A limit of zero or half a key is a caller bug. deis-store would
+        // quietly substitute its default page size for it, so the application
+        // would get a thousand keys back and no hint that the number it
+        // passed meant nothing.
+        let store = TestStore::start().await;
+        let body = kv_probe(
+            "kv_list_refusal_app.production",
+            &store,
+            r#"const kv = ctx.services.kv;
+                const caught = {};
+                for (const [name, call] of [
+                    ["zero", () => kv.list({ limit: 0 })],
+                    ["fraction", () => kv.list({ limit: 1.5 })],
+                    ["prefix", () => kv.list({ prefix: 7 })],
+                    ["cursor", () => kv.list({ cursor: 7 })],
+                ]) {
+                    try {
+                        await call();
+                        caught[name] = "not refused";
+                    } catch (e) {
+                        caught[name] = e.constructor.name;
+                    }
+                }
+                // A limit past what the op's argument can hold is not a
+                // caller bug, it is just more than the store will give: it
+                // has to answer, not refuse.
+                await kv.put("k", "v");
+                const absurd = await kv.list({ limit: 1e12 });
+                caught.absurd = absurd.keys.length === 1 ? "listed" : "wrong page";
+                return new Response(JSON.stringify(caught));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        for name in ["zero", "fraction", "prefix", "cursor"] {
+            assert_eq!(seen[name], "TypeError", "{name} was not refused: {body}");
+        }
+        assert_eq!(
+            seen["absurd"], "listed",
+            "a limit larger than the wire can hold is the store's ceiling, not an error: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_by_an_app_without_kv_says_the_service_is_not_there() {
+        // Every other KV call says this; a `list` that answered with an empty
+        // page instead would read as "you have stored nothing", which is the
+        // one answer an application must not be given when the truth is that
+        // it has no store at all.
+        let store = TestStore::start().await;
+        let mut runtime = AppRuntime::new(
+            "kv_list_undeclared_app.production".to_string(),
+            r#"export default async function handler(ctx) {
+                try {
+                    await ctx.services.kv.list("anything");
+                    return new Response("listed");
+                } catch (e) {
+                    return new Response(e.message);
+                }
+            }"#
+            .to_string(),
+            None,
+            IsolateSpec::default(),
+            // The store is running and reachable; this application simply
+            // never declared that it uses KV.
+            &store.wiring_for(["database"]),
+        )
+        .expect("the isolate is built");
+        runtime.init_module().await.expect("the module loads");
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (_, _, body) = rx.await.expect("a response").expect("a response");
+        let body = String::from_utf8(body.unwrap_or_default()).expect("text");
+        assert!(
+            body.contains("kv service is not available"),
+            "an undeclared service must say so rather than list nothing: {body}"
+        );
+    }
 }

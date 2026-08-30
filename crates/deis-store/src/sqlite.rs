@@ -27,9 +27,23 @@
 //! connection back while a transaction is still open on it: an unfinished
 //! `BEGIN` returned to the pool would carry its write lock into whichever
 //! unrelated request picked the connection up next.
+//!
+//! # Pools that run SQL nobody here wrote
+//!
+//! The KV and blob pools only ever run this crate's own statements. A
+//! tenant's SQL database pool runs whatever the application sent, so it is
+//! built with [`SqlitePool::new_guarded`]: every connection it opens carries
+//! an authorizer callback and has `SQLITE_LIMIT_ATTACHED` set to zero. What
+//! that authorizer decides is [`crate::database`]'s business; this module
+//! only makes sure it is installed on every connection, that it is installed
+//! *after* the pool's own settings, and that a refusal comes back as
+//! something the caller can read.
 
 use crate::error::{StoreError, StoreResult};
 use rusqlite::Connection;
+use rusqlite::hooks::{AuthContext, Authorization};
+use rusqlite::limits::Limit;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,6 +55,59 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// checkpoint and short enough that a wedged writer surfaces as an error
 /// instead of a hung request.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The policy a guarded pool applies to every statement prepared on it.
+///
+/// A bare function pointer rather than a closure: the decision is a pure
+/// function of one action, and every connection in the pool - including the
+/// ones opened long after the pool was created - has to carry the same one.
+pub type SqlAuthorizer = fn(AuthContext<'_>) -> Authorization;
+
+thread_local! {
+    /// Why the authorizer last refused something on this thread.
+    ///
+    /// SQLite reports a denied statement as a bare "not authorized", which
+    /// tells an application nothing it can act on. The callback runs
+    /// synchronously on the thread preparing the statement, and every
+    /// statement in this crate runs inside `spawn_blocking`, so the reason
+    /// can be left here and collected a few frames up by
+    /// [`explaining_refusals`] - which is the only reason this is a
+    /// thread-local rather than something threaded through the callback,
+    /// which SQLite gives no room for.
+    static LAST_REFUSAL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Refuse the action, and leave behind the sentence the caller should see.
+pub fn refuse(reason: String) -> Authorization {
+    LAST_REFUSAL.with(|slot| *slot.borrow_mut() = Some(reason));
+    Authorization::Deny
+}
+
+/// Take what the authorizer refused on this thread, if anything.
+///
+/// For the one caller that has to build its own message - a batch reports
+/// which statement failed rather than failing outright.
+pub fn take_refusal() -> Option<String> {
+    LAST_REFUSAL.with(|slot| slot.borrow_mut().take())
+}
+
+/// Run `f`, and turn SQLite's "not authorized" into what was actually
+/// refused.
+///
+/// Applied to every pooled statement, guarded pool or not: a connection with
+/// no authorizer never fills the slot, so wrapping the KV and blob pools too
+/// costs one thread-local clear and means no future call site has to
+/// remember this exists.
+pub fn explaining_refusals<T>(f: impl FnOnce() -> StoreResult<T>) -> StoreResult<T> {
+    // Cleared first: this thread is reused for unrelated statements, and a
+    // reason left over from an earlier one would be attached to this one.
+    take_refusal();
+    let outcome = f();
+    match (outcome, take_refusal()) {
+        (Err(StoreError::Sqlite(_)), Some(reason)) => Err(StoreError::Refused(reason)),
+        (outcome, _) => outcome,
+    }
+}
 
 /// Connections handed out concurrently, per pool.
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +125,9 @@ struct Inner {
     path: PathBuf,
     /// What this pool is for, used only in logs (`kv`, `blob`, `db:<tenant>`).
     label: String,
+    /// Installed on every connection this pool opens, when the SQL that will
+    /// run here is not this crate's own. `None` for the KV and blob pools.
+    authorizer: Option<SqlAuthorizer>,
     /// Connections not currently checked out. Guarded by a std mutex that is
     /// only ever locked inside a blocking task, never across an await.
     idle: Mutex<Vec<Connection>>,
@@ -75,18 +145,44 @@ impl SqlitePool {
     /// caller pays for it, so a per-tenant database costs nothing until that
     /// tenant actually stores something.
     pub fn new(path: impl Into<PathBuf>, label: impl Into<String>, size: PoolSize) -> Self {
+        Self::build(path, label, size, None)
+    }
+
+    /// Create a pool whose connections run SQL this crate did not write.
+    ///
+    /// `authorizer` is consulted for every statement prepared on every
+    /// connection, and `SQLITE_LIMIT_ATTACHED` is pinned to zero on each one,
+    /// so an `ATTACH` cannot succeed even if that policy is ever loosened by
+    /// mistake. Only [`crate::database`] uses this.
+    pub fn new_guarded(
+        path: impl Into<PathBuf>,
+        label: impl Into<String>,
+        size: PoolSize,
+        authorizer: SqlAuthorizer,
+    ) -> Self {
+        Self::build(path, label, size, Some(authorizer))
+    }
+
+    fn build(
+        path: impl Into<PathBuf>,
+        label: impl Into<String>,
+        size: PoolSize,
+        authorizer: Option<SqlAuthorizer>,
+    ) -> Self {
         let path = path.into();
         let label = label.into();
         tracing::debug!(
             pool = %label,
             path = %path.display(),
             connections = size.0,
+            guarded = authorizer.is_some(),
             "sqlite pool created, connections open lazily"
         );
         Self {
             inner: Arc::new(Inner {
                 path,
                 label,
+                authorizer,
                 idle: Mutex::new(Vec::new()),
                 permits: Arc::new(Semaphore::new(size.0)),
             }),
@@ -116,7 +212,7 @@ impl SqlitePool {
             let mut conn = PooledConnection::take(inner, permit)?;
             // The guard is dropped here, on the blocking thread, because
             // releasing a connection may have to talk to SQLite.
-            f(&mut conn)
+            explaining_refusals(|| f(&mut conn))
         })
         .await?
     }
@@ -202,7 +298,7 @@ impl PooledConnection {
         };
         let conn = match idle {
             Some(conn) => conn,
-            None => open(&inner.path, &inner.label)?,
+            None => open(&inner.path, &inner.label, inner.authorizer)?,
         };
         Ok(Self {
             inner,
@@ -272,8 +368,9 @@ impl Drop for PooledConnection {
     }
 }
 
-/// Open one connection with the settings every Deislet SQLite file uses.
-fn open(path: &Path, label: &str) -> StoreResult<Connection> {
+/// Open one connection with the settings every Deislet SQLite file uses,
+/// plus the authorizer if this pool has one.
+fn open(path: &Path, label: &str, authorizer: Option<SqlAuthorizer>) -> StoreResult<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -297,6 +394,25 @@ fn open(path: &Path, label: &str) -> StoreResult<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+
+    // Last, and deliberately so: the settings above are the pool's own and
+    // several of them are PRAGMAs the authorizer refuses a tenant. Installing
+    // it here means the connection arrives configured and then locked down,
+    // rather than having to carve an exemption for this function.
+    if let Some(authorizer) = authorizer {
+        // Zero attached databases. The authorizer already refuses `ATTACH`;
+        // this is the floor under it, so a loosened decision still cannot
+        // open a second file - and it catches `VACUUM`, which attaches its
+        // destination without the parser ever spelling the word.
+        conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
+        conn.authorizer(Some(authorizer));
+        tracing::debug!(
+            pool = %label,
+            path = %path.display(),
+            "opened a guarded sqlite connection: authorizer installed, no database may be attached"
+        );
+        return Ok(conn);
+    }
 
     tracing::debug!(pool = %label, path = %path.display(), "opened sqlite connection");
     Ok(conn)

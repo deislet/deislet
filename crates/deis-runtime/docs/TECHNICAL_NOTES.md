@@ -1,16 +1,7 @@
 # Runtime 技术方案说明
 
-## ✅ 当前状态
-
-**核心链路已通，全部测试通过。**
-
-- ✅ 单元测试与集成测试全绿（`cargo test -p deis-runtime`）
-- ✅ `cargo clippy -p deis-runtime --all-targets` 零警告
-- ✅ V8 HandleScope 问题已解决
-- ✅ 适配 deno_core 0.380
-
-具体数字不写死在这里：测试会一直加，写死的数字过两周就是错的，跑一次命令
-比读一句过期的话准。
+具体版本号、测试数量不写死在这里：依赖会升级，测试会一直加，写死的数字过两周就是
+错的，`cargo test -p deis-runtime`、`cargo tree -p deis-runtime` 比读一句过期的话准。
 
 ---
 
@@ -18,7 +9,7 @@
 
 ### 最终架构
 
-**一条 OS 线程只放一个 isolate** —— 这不是调度偏好，是 V8 的硬要求：
+**一条 OS 线程只放一个 isolate**——这不是调度偏好，是 V8 的硬要求：
 `v8::OwnedIsolate` 在创建时进入自己那个 isolate、销毁时退出，所以同一条线程上
 建第二个会把第一个盖住；先建的那个再被用到就 panic，线程当场死掉，它上面的应用
 一起停。类型上用 `Option<HostedApp>`（不是 map）把这条钉死。
@@ -39,19 +30,23 @@
 
 ### 实现要点
 
-- **线程池**: 启动时先起 N 条（默认 = CPU 核心数）。N 是「先起多少」不是上限：
-  应用比线程多就再起一条，应用卸载后线程留着给下一个用。
-- **单线程 Runtime**: 每条线程跑独立的 `tokio::runtime::Builder::new_current_thread()`
-- **应用与线程一一对应**: 一条线程最多一个应用，一个应用只在一条线程上
-- **Channel 通信**: HTTP 请求通过 `oneshot` channel 路由到对应线程
-- **换版本先装后切**: 新 isolate 装在另一条线程上，装好了再把「谁在服务」这一项
-  原子地换过去，最后退役旧的。所以换版期间请求要么落到旧版、要么落到新版，
-  没有空窗；代价是这段时间该应用同时占两条线程、两个 isolate。
+- **线程池**: 启动时先起 N 条（默认等于 CPU 核心数，见 `RuntimePool::new` /
+  `ApplicationManager::with_threads` 里 `num_cpus::get()` 那一行）。N 是「先起
+  多少」不是上限：应用比线程多就再起一条，应用卸载后线程留着给下一个用。
+- **单线程 Runtime**: 每条线程跑独立的 `tokio::runtime::Builder::new_current_thread()`。
+- **应用与线程一一对应**: 一条线程最多一个正在服务的应用，一个应用只在一条线程上服务。
+- **Channel 通信**: HTTP 请求通过 `oneshot` channel 路由到对应线程。
+- **换版本先装后切**: 新 isolate 装在另一条线程上（`staging`），装好了再把「谁在
+  服务」这一项原子地换过去（`activate`），最后退役旧的（`retiring`）。所以换版期间
+  请求要么落到旧版、要么落到新版，没有空窗；代价是这段时间该应用同时占两条线程、
+  两个 isolate。
 
-### 核心代码
+### 核心结构
+
+`crates/deis-runtime/src/runtime/pool.rs` 里的 `Placement`：一条线程在任意时刻
+只可能出现在下面三个集合之一，`idle_thread()` 就是靠这三个集合并起来找空位：
 
 ```rust
-// src/runtime/pool.rs
 struct Placement {
     threads: Vec<RuntimeThread>,
     /// 正在服务：请求按这里分发
@@ -61,27 +56,11 @@ struct Placement {
     /// 已被换下、isolate 还没析构：不能算空闲
     retiring: HashSet<usize>,
 }
-
-// 每个线程独立的 current_thread runtime
-thread::spawn(move || {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime");
-
-    rt.block_on(async move {
-        run_event_loop(thread_id, rx).await;
-    });
-});
 ```
 
-### 优势
-
-- ✅ **多核利用**: 不同应用在不同核心上并行
-- ✅ **V8 兼容**: 一条线程一个 isolate，正是 V8 的模型
-- ✅ **故障隔离**: 一个应用把自己的线程搞死，不牵连别的应用
-- ✅ **换版无空窗**: 先装后切，旧版一直答到切换那一刻
-- ✅ **应用隔离**: 每个应用在独立的 V8 isolate
+三个集合放在同一把锁后面而不是分开管，是因为「给新应用挑一条空闲线程」必须是
+单个原子步骤：分开的话，两次同时到达的部署都可能读到「3 号线程空着」，都被派过去，
+第二个 isolate 就会把第一个盖掉——回到最上面那条 V8 硬要求。
 
 ### 多核利用说明
 
@@ -89,120 +68,65 @@ thread::spawn(move || {
 
 | 场景 | 多核利用 | 说明 |
 |------|---------|------|
-| **多个不同应用并发请求** | ✅ **充分利用** | 不同应用在不同线程上并行执行 |
-| **单个应用的多个并发请求** | ⚠️ **受限** | 同一应用的请求串行执行（在同一线程） |
-| **应用内部的异步操作** | ✅ **高效** | 单线程 tokio 处理 I/O 并发 |
+| **多个不同应用并发请求** | 充分利用 | 不同应用（或同一应用的不同环境，因为一个「租户」是 `app.environment`）在不同线程上并行执行 |
+| **单个应用单个环境的多个并发请求** | 受限 | 同一租户的请求串行执行（在同一线程上，一个 isolate 一次只能跑一段 JS） |
+| **应用内部的异步操作** | 高效 | 单线程 tokio 处理该 isolate 自己的 I/O 并发（`fetch`、存储调用等） |
 
-**扩展方案**：同一应用起多个 isolate，各占一条线程，请求在它们之间分发。
-现在没有做——一条线程一个 isolate 的约束还在，多开的是线程数不是每线程的
-isolate 数；`Placement` 现在按租户（应用 + 环境）只记一条，要多实例得先把它
-改成一对多。
+**若要提升单租户内的并发**：现在的路数是同一租户仍然只对应一条线程一个 isolate，
+`Placement::of_app` 就是按租户存一条记录；要让一个租户跑在多条线程上，需要先把
+这张表从「一对一」改成「一对多」，再决定新请求怎么在这几个 isolate 之间挑一个——
+这件事没有已立项的设计，也没有代码在朝这个方向搭骨架，值得做的话应从这张表的
+数据结构开始想，而不是先造一个独立的「负载均衡器」组件。
 
 ---
 
 ## 已解决的技术难题
 
-### 1. V8 Runtime 的线程安全性
+以下是这套线程池模型在搭建过程中处理过的几类问题，记录下来是因为原因不直观，
+不是因为还需要为它们做什么。
 
-**问题**：deno_core 的 `JsRuntime` **不是 `Send`**，因为：
-- 包含 `Rc<>` (非线程安全的引用计数)
-- V8 isolate 本身设计为单线程
+### V8 Runtime 的线程安全性
 
-这导致无法在 axum 的多线程环境中直接共享 JsRuntime。
+`deno_core` 的 `JsRuntime` 不是 `Send`：一是它内部用 `Rc<>`（非线程安全的引用
+计数），二是 V8 isolate 本身的模型就是单线程的。这意味着不能在 axum 的多线程
+环境里直接共享一个 `JsRuntime`。做法是每条线程自己拥有一个 `JsRuntime`，跨线程
+只传消息（`RuntimeMessage`），V8 操作永远不跨线程边界。
 
-**解决方案**：
-1. 每个线程拥有自己的 JsRuntime 实例
-2. 通过 channel 消息传递进行跨线程通信
-3. V8 操作永远不跨线程边界
+### V8 Platform 初始化
 
-### 2. V8 Platform 初始化
+V8 要求同一进程里所有 isolate 共享同一份已初始化的 platform，且只能初始化一次。
+这里用 `std::sync::Once`（`pool.rs` 里的 `V8_INIT`）保证 `JsRuntime::init_platform`
+全局只跑一次，所有工作线程从主线程派生、直接用这份已经初始化好的 platform，不再
+各自调用初始化。
 
-**问题**：V8 11.6+ 要求所有 runtimes 必须有一个共同的父线程来初始化 V8 platform。
+### 测试中的 HandleScope 问题
 
-**解决方案**：
-- V8 platform **只在主线程**初始化（`pool.rs:193`）
-- 使用 `std::sync::Once` 确保全局只初始化一次
-- Worker 线程从主线程派生，不再调用 `init_v8_platform()`
+反复创建/销毁线程池会违反 V8 对「所有 isolate 从同一批线程派生」的期待，表现
+为 `Cannot create a handle without a HandleScope`。测试里的解法是用一个全局单例
+（`ApplicationManager` / `RuntimePool` 的 `Lazy` 静态实例，具体位置见
+`src/app/manager_test.rs`、`src/runtime/pool.rs` 里的测试模块），每个测试用完
+自己清理创建的应用，而不是每个测试各起一套线程池。
 
-```rust
-static V8_INIT: Once = Once::new();
+### deno_core 的 API 变动
 
-fn init_v8_platform() {
-    V8_INIT.call_once(|| {
-        JsRuntime::init_platform(None, false);
-        tracing::debug!("V8 platform initialized");
-    });
-}
-```
-
-### 3. V8 HandleScope 错误
-
-**问题**：测试中出现 `Cannot create a handle without a HandleScope` 错误。
-
-**根本原因**：
-- 多次创建/销毁 RuntimePool 违反了 V8 的线程模型要求
-- V8 期望所有 isolates 从同一批从 parent thread 派生的线程中运行
-
-**解决方案**：
-1. 测试中使用全局单例 RuntimePool（`pool.rs:355-357`）
-   ```rust
-   static TEST_POOL: Lazy<Mutex<RuntimePool>> = Lazy::new(|| {
-       Mutex::new(RuntimePool::new(Some(4)))
-   });
-   ```
-2. 测试中使用全局单例 ApplicationManager（`manager_test.rs:11-13`）
-3. 每个测试完成后清理自己创建的 apps
-4. 移除 `serial_test` 依赖，测试可完全并行运行
-
-**结果**：
-- ✅ 所有 21 个测试稳定通过
-- ✅ 测试可并行执行
-- ✅ 无需 `--test-threads=1` 限制
-
-### 4. deno_core 0.367 API 适配
-
-**版本升级**：
-- **0.240** → **0.367**: 升级到 V8 130.0.7
-
-**API 变化**：
-1. **错误处理**: `anyhow::Error` 不再自动实现 `JsErrorClass`
-   - 解决：在 ops 中返回 `Result<T, AnyError>` 并正确处理
-2. **Extension API**: `init_ops()` → `init()`
-3. **Runtime API**: `resolve_value()` → `resolve()`
-
-**适配结果**：✅ 完全适配，所有测试通过
+deno_core 升级过几次大版本（V8 版本、`Extension` 的初始化方式、`JsRuntime` 的
+求值方法都变过），当前实际锁定的版本以 `Cargo.toml` 为准。这里只记一条经验：
+升级后先把 ops 的错误类型对齐（`anyhow::Error` 是否自动实现所需的错误 trait
+在不同版本间变化过），这是每次升级最先炸的地方。
 
 ---
 
 ## 技术栈
 
-### 核心依赖
-
-```toml
-[dependencies]
-# Web 框架
-axum = "0.7"
-tokio = { version = "1.43", features = ["full"] }
-
-# V8 运行时
-deno_core = "0.367"
-
-# 序列化
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# 工具
-anyhow = "1.0"
-tracing = "0.1"
-once_cell = "1.21"
-num_cpus = "1.17"
-```
+核心依赖（axum、tokio、deno_core、serde、tracing、num_cpus 等）与其版本号见
+`crates/deis-runtime/Cargo.toml`，不在此复述——复述一遍只会制造第二个需要跟着
+改的地方。
 
 ### 测试覆盖
 
-- **单元测试**: 21 个（runtime, ops, isolate, pool, manager）
-- **集成测试**: 6 个（完整的 HTTP 请求流程）
-- **测试策略**: 全局单例避免重复创建 RuntimePool
+单元测试覆盖 runtime、ops、isolate、pool、manager 等模块，集成测试覆盖完整的
+HTTP 请求流程；具体到多少个、哪些文件，`cargo test -p deis-runtime` 的输出与
+`crates/deis-runtime/src/` 下以 `_test.rs` 结尾的文件列表就是准确来源。
 
 ---
 
@@ -210,81 +134,52 @@ num_cpus = "1.17"
 
 ### 多核利用
 
-- **默认线程数**: 等于 CPU 核心数（通过 `num_cpus::get()`）
-- **可配置**: `RuntimePool::new(Some(n))` 指定线程数
-- **负载均衡**: 新应用分配到应用数最少的线程
+- **默认线程数**: 等于 CPU 核心数（`num_cpus::get()`），可用 `RuntimePool::new(Some(n))`
+  / `ApplicationManager::with_threads(Some(n))` 指定。
+- **负载均衡**: 新应用分配到当前空闲的线程；没有空闲线程时按需要新起一条。
 
-### 内存效率
+### 内存与并发模型
 
-- **Zero-copy**: deno_core 提供 Rust ↔ JS 零拷贝通信
-- **V8 Isolate**: 每个应用独立的内存空间
-- **共享 V8 Platform**: 所有 isolates 共享 V8 平台实例
-
-### 并发模型
-
-- **OS 线程**: N 个（默认 = CPU 核心数）
-- **每线程 Runtime**: `tokio::current_thread` - 单线程异步
-- **V8 Isolate**: 每个应用一个 isolate
-- **Channel 通信**: 跨线程请求路由
+- **Zero-copy**: Rust ↔ JS 之间的字节传递走 `#[buffer] JsBuffer` / `ToJsBuffer`
+  （见 `crates/deis-runtime/src/runtime/blob_ops.rs`），不经过 `#[serde] Vec<u8>`
+  那条会整体拷贝一遍的路。
+- **V8 Isolate**: 每个租户（`app.environment`）独立的内存空间与全局作用域。
+- **共享 V8 Platform**: 所有 isolate 共享同一个已初始化的 V8 platform 实例，
+  isolate 本身互相隔离。
+- **OS 线程**: N 个（默认等于 CPU 核心数），每条线程一个 `tokio::current_thread`
+  运行时，跨线程只靠 channel 传消息。
 
 ---
 
 ## 技术参考
 
-- **Deno**: 使用类似的 Worker 线程模型
-- **Cloudflare Workers**: Isolate 池 + 工作线程架构
-- **V8 设计**: 每个 isolate 必须在单个线程中运行
+- **Deno**: 使用类似的 Worker 线程模型。
+- **Cloudflare Workers**: Isolate 池 + 工作线程架构。
+- **V8 设计**: 每个 isolate 必须在单个线程中运行。
 - **deno_core**: [官方文档](https://docs.rs/deno_core/latest/deno_core/)
 
 ---
 
-## 未来增强方向
+## 还没做、也还没有设计的方向
 
-### 应用多实例支持
+记这一节是为了别把「有人想过」和「已经在建」混在一起——下面每一条现在都没有
+对应的代码在往这个方向搭骨架：
 
-**目标**：提升单应用的并发处理能力
+- **单租户内的多实例/多副本**：见上文「多核利用说明」结尾那段，需要先改
+  `Placement` 的数据结构。
+- **更多 Web API**：`MessageChannel`/`MessagePort`、`CompressionStream`/
+  `DecompressionStream`、`EventSource`、`FileReader` 现在还没有绑定。
+  `fetch`、`crypto`、流、定时器、客户端与服务端的 `WebSocket`、
+  `Blob`/`File`/`FormData`、`URLPattern`、`structuredClone`、
+  `Event`/`CustomEvent`、`performance`、`navigator` 已经有了，具体清单见
+  `crates/deis-runtime/README.md` 的全局作用域一节，那份清单和
+  `isolate_test.rs::the_isolate_global_surface_is_the_one_the_documents_describe`
+  两边互相校验，不会各说各的。
+- **认证授权**（应用面向自己用户的 API key / JWT / OAuth2）：这是应用要自己
+  实现的东西，平台目前不提供现成组件。
+- **WebAssembly**：没有 WASM 模块支持。
+- **多地域部署**：没有跨地域同步机制；一个节点连一份控制面、服务一份配置表。
 
-```
-app1-instance-1 → thread 0
-app1-instance-2 → thread 1  ← 同一应用的多个实例
-app1-instance-3 → thread 2
-app2-instance-1 → thread 3
-```
-
-**需要的组件**：
-1. **ApplicationManager 扩展**: 管理应用的多实例部署
-2. **LoadBalancer**: 在实例间分发请求（轮询、最少连接等）
-3. **AutoScaler**: 根据负载动态调整实例数量
-4. **HealthChecker**: 实例健康检查和故障恢复
-
-### 其他可选功能
-
-- 📈 **监控和指标**: Prometheus metrics, tracing
-- 🗄️ **持久化存储**: KV 后端支持 (Redis, PostgreSQL)
-- 🌐 **更多 Web APIs**: 客户端 `WebSocket`、`Blob`/`FormData`、`URLPattern`（`fetch`、`crypto`、几个流和定时器已经有了，见 README 的全局作用域一节）
-- 🔐 **认证授权**: API key, JWT, OAuth2
-- 📦 **WebAssembly**: WASM 模块支持
-- 🚀 **边缘部署**: 多地域部署和同步
-
----
-
-## 项目状态总结
-
-✅ **核心功能完整**
-- 多租户应用管理
-- V8 隔离执行
-- 多核并行处理
-- KV 存储 API
-- HTTP Gateway
-
-✅ **测试覆盖完整**
-- 所有单元测试通过
-- 集成测试验证
-- 并行测试稳定
-
-✅ **生产就绪**
-- 无已知 bug
-- Release 构建成功
-- 架构清晰可扩展
-
-**当前版本可直接用于生产环境！** 🎉
+KV/SQL/Blob 的持久化已经是真的——`crates/deis-store` 用每租户一个 SQLite 文件
+落盘，不是内存态或者占位实现，所以「给 KV 换一个持久化后端」不在上面这份清单里；
+需要的是别的东西（比如多副本一致性），到那时候再单独写清楚要解决什么问题。

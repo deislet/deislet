@@ -63,6 +63,15 @@ const REMOVED_CONFIG_KEYS: &[(&str, &str)] = &[("bundles.max_bundle_bytes", "bun
 /// discovered from failing traffic.
 const MIN_TIMEOUT_MS: u64 = 100;
 
+/// Smallest V8 heap ceiling that can be configured, in MB.
+///
+/// The isolate's own bootstrap -- the runtime's JavaScript, the module it
+/// loads, the structures deno_core builds around them -- lives in this heap
+/// before a single request arrives. Below this floor the near-heap-limit
+/// callback fires during startup, so the node would refuse every application
+/// it was assigned and the reason would look like an application fault.
+const MIN_MEMORY_LIMIT_MB: usize = 32;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     /// How this node names itself to the control plane. Unset means "use the
@@ -84,6 +93,34 @@ pub struct RuntimeConfig {
     /// the node stops waiting and exits anyway.
     #[serde(default = "default_shutdown_grace_period_secs")]
     pub shutdown_grace_period_secs: u64,
+
+    /// Largest request body this node will read, in bytes.
+    ///
+    /// The body is buffered whole before a handler sees it -- application code
+    /// is given a `Request` it can call `arrayBuffer()` on, not a stream -- so
+    /// this is the ceiling on what one request can cost this node in resident
+    /// memory, and a node runs many requests at once beside every tenant's
+    /// isolates. Without it a single upload decides how much memory the node
+    /// has left.
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+
+    /// Ceiling on the V8 heap of one isolate, in MB, for every application on
+    /// this node.
+    ///
+    /// The floor every application is held to. An application's own
+    /// `ResourceLimits.memory_mb` may ask for *less* (see
+    /// `crate::app::types::ResourceLimits`); one asking for more is refused
+    /// and held here, because the node's memory is what is being protected and
+    /// no tenant gets to widen it.
+    ///
+    /// Not part of [`ExecutionLimits`] even though it reads like a sibling of
+    /// the timeout: those bound one *invocation* and are re-armed per request,
+    /// while a heap belongs to the isolate and outlives every request that
+    /// runs in it. Mixing the two would suggest the heap is reset between
+    /// requests, which it is not.
+    #[serde(default = "default_memory_limit_mb")]
+    pub default_memory_limit_mb: usize,
 
     /// Platform-wide defaults for per-app execution limits. An app may override
     /// `timeout_ms` and `rate_limit_ops_per_sec` via its `ResourceLimits`
@@ -126,6 +163,28 @@ fn default_shutdown_grace_period_secs() -> u64 {
     30
 }
 
+/// 32 MiB: comfortably above the uploads an edge handler is written for (a
+/// form post, a JSON document, an image) and far below what would put the node
+/// process under memory pressure. An application that needs more than this
+/// belongs behind object storage, which takes the bytes directly.
+///
+/// deis-proxy carries the same number as its own
+/// `config::system::DEFAULT_MAX_REQUEST_BODY_BYTES`, so an over-large upload
+/// is refused at the edge instead of being streamed across the whole
+/// proxy-to-node hop first. Nothing enforces the two agreeing yet: they are
+/// declared in two crates that do not depend on each other. Change one and
+/// change the other.
+pub fn default_max_request_body_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+/// 256 MB: several times what a request-shaped handler ever holds live, so no
+/// honest application meets it, and small enough that a node sized for a
+/// handful of concurrent isolates survives one of them running away.
+pub fn default_memory_limit_mb() -> usize {
+    256
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -133,6 +192,8 @@ impl Default for RuntimeConfig {
             http_port: default_http_port(),
             data_dir: default_data_dir(),
             shutdown_grace_period_secs: default_shutdown_grace_period_secs(),
+            max_request_body_bytes: default_max_request_body_bytes(),
+            default_memory_limit_mb: default_memory_limit_mb(),
             default_execution_limits: ExecutionLimits::default(),
             logging: LoggingConfig::default(),
             control: ControlPlaneConfig::default(),
@@ -590,6 +651,22 @@ impl RuntimeConfig {
             )?;
         }
 
+        if let Some(value) = env_var("DEIS_RUNTIME_MAX_REQUEST_BODY_BYTES") {
+            self.max_request_body_bytes = parse_env(
+                &value,
+                "DEIS_RUNTIME_MAX_REQUEST_BODY_BYTES",
+                "a whole number of bytes",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_DEFAULT_MEMORY_LIMIT_MB") {
+            self.default_memory_limit_mb = parse_env(
+                &value,
+                "DEIS_RUNTIME_DEFAULT_MEMORY_LIMIT_MB",
+                "a whole number of megabytes",
+            )?;
+        }
+
         if let Some(value) = env_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS") {
             self.default_execution_limits.timeout_ms = parse_env(
                 &value,
@@ -780,6 +857,24 @@ impl RuntimeConfig {
             return Err(anyhow!(
                 "shutdown_grace_period_secs must be greater than 0; 0 would kill in-flight \
                  requests the instant a signal arrives"
+            ));
+        }
+
+        if self.max_request_body_bytes == 0 {
+            return Err(anyhow!(
+                "max_request_body_bytes must be greater than 0; 0 answers 413 to every request \
+                 that carries a body, so no form post, upload or JSON document would reach an \
+                 application on this node"
+            ));
+        }
+
+        if self.default_memory_limit_mb < MIN_MEMORY_LIMIT_MB {
+            return Err(anyhow!(
+                "default_memory_limit_mb is {}, which is below the {}MB floor; a heap that small \
+                 is exhausted by the runtime's own bootstrap, so every isolate on this node would \
+                 be terminated before it ever ran application code",
+                self.default_memory_limit_mb,
+                MIN_MEMORY_LIMIT_MB
             ));
         }
 
@@ -1398,6 +1493,56 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(config.default_execution_limits.timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn the_two_node_ceilings_can_be_set_from_the_environment() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+
+        env::set_var("DEIS_RUNTIME_MAX_REQUEST_BODY_BYTES", "1048576");
+        env::set_var("DEIS_RUNTIME_DEFAULT_MEMORY_LIMIT_MB", "64");
+        let mut config = RuntimeConfig::default();
+        let result = config.apply_env_overrides();
+        env::remove_var("DEIS_RUNTIME_MAX_REQUEST_BODY_BYTES");
+        env::remove_var("DEIS_RUNTIME_DEFAULT_MEMORY_LIMIT_MB");
+
+        result.expect("both overrides parse");
+        assert_eq!(config.max_request_body_bytes, 1_048_576);
+        assert_eq!(config.default_memory_limit_mb, 64);
+    }
+
+    #[test]
+    fn the_two_node_ceilings_come_out_of_the_toml() {
+        let config: RuntimeConfig =
+            toml::from_str("max_request_body_bytes = 8192\ndefault_memory_limit_mb = 512\n")
+                .expect("the keys parse");
+        assert_eq!(config.max_request_body_bytes, 8192);
+        assert_eq!(config.default_memory_limit_mb, 512);
+        config.validate().expect("both values are usable");
+    }
+
+    #[test]
+    fn a_zero_request_body_ceiling_is_refused() {
+        let config = RuntimeConfig {
+            max_request_body_bytes: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_request_body_bytes"), "{err}");
+    }
+
+    #[test]
+    fn a_heap_ceiling_below_the_floor_is_refused() {
+        // Small enough that the isolate's own bootstrap would exhaust it, so
+        // the node would refuse every application it was assigned and the
+        // reason would read like an application fault.
+        let config = RuntimeConfig {
+            default_memory_limit_mb: 1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("default_memory_limit_mb"), "{err}");
+        assert!(err.contains(&MIN_MEMORY_LIMIT_MB.to_string()), "{err}");
     }
 
     #[test]

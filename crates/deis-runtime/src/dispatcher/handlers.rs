@@ -16,6 +16,110 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 
+/// How the kind of an inbound WebSocket frame reaches the isolate.
+///
+/// `crate::runtime::AppRuntime::dispatch_ws_message` carries one string per
+/// frame, and the isolate has to know whether the client sent TEXT or BINARY.
+/// The bridge used to say so *inside* the payload -- a binary frame went over
+/// as `{"type":"binary","data":"<base64>"}` while a text frame went bare --
+/// and `WebSocketServer._handleMessage` believed any text frame shaped like
+/// that object. The payload is the client's, so the client chose which kind
+/// the application saw, and an application protocol that happened to use those
+/// two field names had its own messages silently turned into bytes.
+///
+/// So the kind is one character in front of the payload, in a position the
+/// client's own bytes can never occupy, and everything after it is passed
+/// through untouched. `js/runtime.js` spells the same two characters.
+pub(crate) mod ws_frame {
+    /// A TEXT frame; the client's text follows verbatim.
+    pub(crate) const TEXT: char = '\u{1}';
+
+    /// A BINARY frame; the client's bytes follow as base64, because what
+    /// crosses into the isolate is a string and arbitrary bytes are not text.
+    pub(crate) const BINARY: char = '\u{2}';
+
+    fn stamped(kind: char, payload: &str) -> String {
+        let mut framed = String::with_capacity(payload.len() + kind.len_utf8());
+        framed.push(kind);
+        framed.push_str(payload);
+        framed
+    }
+
+    /// One TEXT frame, as the isolate receives it.
+    pub(crate) fn text(text: &str) -> String {
+        stamped(TEXT, text)
+    }
+
+    /// One BINARY frame, as the isolate receives it.
+    pub(crate) fn binary(data: &[u8]) -> String {
+        stamped(
+            BINARY,
+            &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data),
+        )
+    }
+}
+
+/// Why a request body was not read.
+#[derive(Debug)]
+pub(crate) enum BodyRefusal {
+    /// Over the node's `max_request_body_bytes`. Answered 413.
+    TooLarge,
+    /// The client stopped sending, or the connection failed part way through.
+    /// Answered 400: nothing about the request was wrong, but there is no
+    /// complete request to run.
+    Unreadable(String),
+}
+
+/// Read a request body, refusing one that is over the ceiling.
+///
+/// Two checks, not one. `Content-Length` is a claim and is checked first, so
+/// that a body announcing itself as too large is refused before a byte of it
+/// is read. The bytes are then counted as they arrive as well, because a
+/// chunked body announces nothing and a header that under-declares is the
+/// obvious way past the first check.
+///
+/// Collected chunk by chunk rather than in one call so the read stops at the
+/// chunk that crosses the ceiling. Collecting first and measuring afterwards
+/// would mean the node had already taken the memory it is refusing.
+pub(crate) async fn read_body_within_limit(
+    body: Body,
+    declared: Option<usize>,
+    limit: usize,
+) -> Result<Bytes, BodyRefusal> {
+    if let Some(declared) = declared {
+        if declared > limit {
+            return Err(BodyRefusal::TooLarge);
+        }
+    }
+
+    let mut stream = body.into_data_stream();
+    // Sized from what the client declared, so an honest upload is one
+    // allocation; capped at the limit so a dishonest one cannot ask this node
+    // to reserve more than it will ever accept.
+    let mut collected = bytes::BytesMut::with_capacity(declared.unwrap_or(0).min(limit));
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return Err(BodyRefusal::Unreadable(e.to_string())),
+        };
+        if collected.len() + chunk.len() > limit {
+            return Err(BodyRefusal::TooLarge);
+        }
+        collected.extend_from_slice(&chunk);
+    }
+
+    Ok(collected.freeze())
+}
+
+/// What the client says it is about to send, when it says anything.
+pub(crate) fn declared_body_length(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
 /// Unified request handler - routes to applications via the tenant headers.
 ///
 /// Two headers, because a running application is an application *in an
@@ -34,10 +138,17 @@ pub async fn handle_request(
     uri: Uri,
     headers: HeaderMap,
     ws: Option<WebSocketUpgrade>,
+    // The body is taken unread, and read below against the node's
+    // `max_request_body_bytes`.
+    //
     // Bytes, not `String`: an upload is whatever the client sent. Extracting
     // it as text made axum reject every request whose body is not valid UTF-8
     // -- a file upload, a protobuf, an image -- before the application saw it.
-    body: Bytes,
+    // Taking `Bytes` here instead would read it in full with only axum's own
+    // 2 MiB default standing between this node and an upload of any size, and
+    // would refuse an over-large one with a bare rejection that names no
+    // limit and logs nothing.
+    body: Body,
 ) -> impl IntoResponse {
     // Get app_id from header
     let app_id = match headers.get(APP_ID_HEADER).and_then(|v| v.to_str().ok()) {
@@ -155,6 +266,44 @@ pub async fn handle_request(
     if ws.is_some() {
         header_map.insert("upgrade".to_string(), "websocket".to_string());
     }
+
+    let limit = state.max_request_body_bytes;
+    let declared = declared_body_length(&headers);
+    let body = match read_body_within_limit(body, declared, limit).await {
+        Ok(body) => body,
+        Err(BodyRefusal::TooLarge) => {
+            tracing::warn!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                limit,
+                declared = declared.unwrap_or_default(),
+                method = %method,
+                path = uri.path(),
+                "Refusing a request body larger than this node will hold in memory; the \
+                 application never saw the request. Raise max_request_body_bytes in this \
+                 node's configuration if uploads of this size are expected, or have the \
+                 application take them through blob storage instead"
+            );
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Request body is larger than this node accepts: the limit is {limit} bytes"
+                ),
+            )
+                .into_response();
+        }
+        Err(BodyRefusal::Unreadable(e)) => {
+            tracing::warn!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                method = %method,
+                path = uri.path(),
+                "Could not read the request body, so the application was not called: {}",
+                e
+            );
+            return (StatusCode::BAD_REQUEST, "Could not read the request body").into_response();
+        }
+    };
 
     // Empty stays absent: a request with no body and a request with a
     // zero-length one are the same thing to a handler, and `new Request(url,
@@ -362,8 +511,13 @@ async fn handle_websocket_bridged(
             match msg {
                 Ok(Message::Text(text)) => {
                     tracing::debug!("Client -> JS: {} (ws_id: {})", text, ws_id_clone);
+                    // Stamped as TEXT whatever it says. A client used to be
+                    // able to spell the binary envelope by hand and have the
+                    // application receive an `ArrayBuffer`; the stamp is
+                    // outside the payload, so what the payload says about
+                    // itself no longer decides anything.
                     if let Err(e) = app_manager_clone
-                        .send_ws_message(&key_clone, ws_id_clone.clone(), text)
+                        .send_ws_message(&key_clone, ws_id_clone.clone(), ws_frame::text(&text))
                         .await
                     {
                         tracing::error!("Failed to send message to JavaScript: {}", e);
@@ -376,12 +530,8 @@ async fn handle_websocket_bridged(
                         data.len(),
                         ws_id_clone
                     );
-                    // Convert binary data to base64 string
-                    let base64_data =
-                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
-                    let json_message = format!(r#"{{"type":"binary","data":"{}"}}"#, base64_data);
                     if let Err(e) = app_manager_clone
-                        .send_ws_message(&key_clone, ws_id_clone.clone(), json_message)
+                        .send_ws_message(&key_clone, ws_id_clone.clone(), ws_frame::binary(&data))
                         .await
                     {
                         tracing::error!("Failed to send binary message to JavaScript: {}", e);

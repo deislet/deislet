@@ -90,6 +90,79 @@ mod tests {
             .unwrap();
     }
 
+    /// A binary frame an application sends reaches the bridge as bytes.
+    ///
+    /// `WsServerMessage::Binary` was a variant nothing in the crate ever
+    /// constructed: `WebSocketServer.send` put everything that was not a
+    /// string through `JSON.stringify`, so `send(new Uint8Array([1, 2, 3]))`
+    /// left the node as the TEXT frame `{"0":1,"1":2,"2":3}`. This drives the
+    /// op an application now reaches and reads what came out the other end of
+    /// the channel the bridge holds.
+    #[tokio::test]
+    async fn a_binary_frame_leaves_the_isolate_as_bytes() {
+        use crate::runtime::WsServerMessage;
+
+        let mut runtime = setup_test_runtime();
+
+        // Stand in for the bridge: whatever the op sends arrives here.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // The clone is taken and the borrow dropped before the await: an
+        // `OpState` borrow held across one would still be held when the
+        // isolate next reaches for it.
+        let manager = {
+            let op_state = runtime.op_state();
+            let state = op_state.borrow();
+            state.borrow::<crate::runtime::WsServerManager>().clone()
+        };
+        manager.write().await.insert("bound-ws".to_string(), tx);
+
+        let code = r#"
+            (async () => {
+                // 0x00 and 0xff are the two a JSON round trip could not carry.
+                const frame = new Uint8Array([0, 1, 2, 255]);
+                const result = await Deno.core.ops.op_ws_server_send_binary("bound-ws", frame);
+                if (result.success !== true) {
+                    throw new Error("send failed: " + result.error);
+                }
+            })()
+        "#;
+
+        let result = runtime.execute_script("<test>", code).unwrap();
+        let promise_future = runtime.resolve(result);
+        runtime
+            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
+            .await
+            .unwrap();
+
+        match rx.recv().await.expect("the bridge received a frame") {
+            WsServerMessage::Binary(bytes) => assert_eq!(bytes, vec![0u8, 1, 2, 255]),
+            other => panic!("a binary send arrived at the bridge as {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_binary_send_to_a_connection_that_is_gone_says_so() {
+        let mut runtime = setup_test_runtime();
+
+        let code = r#"
+            (async () => {
+                const result = await Deno.core.ops.op_ws_server_send_binary(
+                    "nonexistent-ws", new Uint8Array([1]));
+                if (result.success === false && result.error.includes("not found")) {
+                    return "ok";
+                }
+                throw new Error("Expected error about connection not found");
+            })()
+        "#;
+
+        let result = runtime.execute_script("<test>", code).unwrap();
+        let promise_future = runtime.resolve(result);
+        runtime
+            .with_event_loop_promise(promise_future, PollEventLoopOptions::default())
+            .await
+            .unwrap();
+    }
+
     /// The WebSocket classes are reachable from an application.
     ///
     /// Driven through a real `AppRuntime` rather than by evaluating

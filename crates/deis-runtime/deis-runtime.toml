@@ -26,6 +26,38 @@ data_dir = "./data"
 # stops waiting and exits anyway.
 shutdown_grace_period_secs = 30
 
+# Largest request body this node will read, in bytes. A request that declares
+# more in Content-Length, or that turns out to send more, is answered 413 and
+# never reaches an application.
+#
+# The body is buffered whole before a handler sees it -- application code is
+# given a Request it can call arrayBuffer() on, not a stream -- so this number
+# is the ceiling on what one request can cost this node in resident memory, and
+# a node runs many requests at once beside every tenant's isolates. Without it
+# a single upload decides how much memory the node has left. An application
+# that needs to take larger uploads should take them through blob storage,
+# which receives the bytes directly instead of through the node.
+#
+# Must be greater than 0; 0 would answer 413 to every request carrying a body.
+max_request_body_bytes = 33554432
+
+# Ceiling on the V8 heap of one isolate, in MB. Every application on this node
+# is held to it, including one whose deployment sets no limits at all: without
+# a value here an application that allocates without bound grows until the node
+# process is killed, and every other application in that process dies with it.
+#
+# An application's own ResourceLimits.memory_mb may ask for less than this and
+# gets what it asked for. One asking for more is refused and held to this
+# value: the node's memory is what is being protected, so no tenant widens it.
+#
+# It is not part of [default_execution_limits] because those bound a single
+# invocation and are re-armed per request, while a heap belongs to the isolate
+# and outlives every request that runs in it.
+#
+# Must be at least 32; below that the runtime's own bootstrap exhausts the heap
+# and no application would ever run.
+default_memory_limit_mb = 256
+
 # Default execution limits applied to each app's isolate. An individual app may
 # override either value through its own ResourceLimits; these are the fallback
 # used when it does not.

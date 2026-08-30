@@ -64,7 +64,23 @@ pub struct AppPermissions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceLimits {
+    /// Narrowing override of `crate::config::RuntimeConfig`'s
+    /// `default_memory_limit_mb`: the V8 heap ceiling this app's isolate runs
+    /// with, in MB.
+    ///
+    /// `0` means "no override" -- the app is held to the node's default. It is
+    /// a sentinel rather than an `Option` because this struct arrives over the
+    /// wire in an `ApplyDeployment`, where an absent field and a zero are the
+    /// same thing to every producer, and because a heap of 0 MB has no useful
+    /// reading of its own: it would refuse the app before it ran a line.
+    ///
+    /// A value *above* the node default is refused and the node default is
+    /// used instead. The ceiling protects the node's memory, which every other
+    /// tenant on it is sharing, so it narrows only -- the same direction
+    /// `timeout_ms` and `rate_limit_ops_per_sec` are meant to move in.
+    #[serde(default)]
     pub memory_mb: usize,
+    #[serde(default)]
     pub cpu_milli: u32,
     #[serde(default)]
     pub resource_table_max: Option<usize>,

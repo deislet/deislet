@@ -24,6 +24,20 @@
 // settles, not until the loop is empty -- so a handler that leaves a socket
 // open still returns its response at the usual moment, and the socket itself
 // is closed by the deadline the ops hold it to.
+//
+// Which is why every state this class reports, and every event it dispatches,
+// is gated on the invocation still being the one that opened the socket. The
+// end-of-invocation sweep runs in `runtime/ws_client_ops.rs`, on the other
+// side of the op boundary; an object here outlives it, on a heap the next
+// request reuses. Left ungated, a socket the sweep had already closed went on
+// answering `readyState: 1` while `send()` on it threw -- so the ordinary
+// guard, `if (ws.readyState === WebSocket.OPEN)`, chose the branch that
+// raises -- and the read that was pending when the sweep ran rejected inside
+// the *next* invocation, where the catch below turned it into `error` and
+// `close` events and ran the application's listeners on a request that had
+// nothing to do with them. `op_deis_ws_invocation` is how the object learns
+// what happened: it records the number when it is built and compares before
+// it answers.
 
 import { primordials } from "ext:core/mod.js";
 import {
@@ -31,6 +45,7 @@ import {
   op_deis_ws_buffered_amount,
   op_deis_ws_close,
   op_deis_ws_connect,
+  op_deis_ws_invocation,
   op_deis_ws_next_event,
   op_deis_ws_send_binary,
   op_deis_ws_send_text,
@@ -155,6 +170,11 @@ class WebSocket extends event.EventTarget {
   // What `close()` asked for while the handshake was still in flight; acted on
   // as soon as there is a socket to close.
   #closeRequested = null;
+  // The invocation this socket belongs to. Taken here rather than when the
+  // handshake finishes: a handler that constructs a socket and answers without
+  // awaiting it leaves the connect in flight, and the socket belongs to the
+  // request that asked for it either way.
+  #openedIn = op_deis_ws_invocation();
 
   constructor(url, protocols = []) {
     super();
@@ -162,12 +182,25 @@ class WebSocket extends event.EventTarget {
     this.#connect(subprotocolsOf(protocols));
   }
 
+  // Whether the invocation that opened this socket has ended.
+  //
+  // When it has, the socket behind this object is already closed -- the sweep
+  // in `runtime/ws_client_ops.rs` did that -- and nothing about it is this
+  // object's to report or to act on any more.
+  #reclaimed() {
+    return op_deis_ws_invocation() !== this.#openedIn;
+  }
+
   get url() {
     return this.#url;
   }
 
   get readyState() {
-    return this.#readyState;
+    // CLOSED, and not the state this object last set for itself: the socket is
+    // gone, and an application guarding its `send()` with
+    // `readyState === WebSocket.OPEN` has to be told the truth or it takes the
+    // branch that throws.
+    return this.#reclaimed() ? CLOSED : this.#readyState;
   }
 
   get protocol() {
@@ -181,7 +214,13 @@ class WebSocket extends event.EventTarget {
   // Bytes handed to `send()` that are not on the wire yet. Answered by the op
   // that owns the queue, so it is the real number rather than a placeholder.
   get bufferedAmount() {
-    return this.#rid === null ? 0 : op_deis_ws_buffered_amount(this.#rid);
+    // Nothing is waiting on a socket that is gone, and asking the op layer
+    // about a handle it has reclaimed would log a warning for what is only a
+    // property read.
+    if (this.#rid === null || this.#reclaimed()) {
+      return 0;
+    }
+    return op_deis_ws_buffered_amount(this.#rid);
   }
 
   get binaryType() {
@@ -198,7 +237,10 @@ class WebSocket extends event.EventTarget {
   }
 
   send(data) {
-    if (this.#readyState === CONNECTING) {
+    // Through the getter, so a reclaimed socket reads CLOSED and takes the
+    // drop below rather than the throw above.
+    const state = this.readyState;
+    if (state === CONNECTING) {
       throw new DOMException(
         "The WebSocket is still connecting; wait for the open event",
         "InvalidStateError",
@@ -206,7 +248,7 @@ class WebSocket extends event.EventTarget {
     }
     // After `close()` a send is dropped rather than refused, which is what the
     // specification says to do with it.
-    if (this.#readyState !== OPEN || this.#rid === null) {
+    if (state !== OPEN || this.#rid === null) {
       return;
     }
 
@@ -225,7 +267,9 @@ class WebSocket extends event.EventTarget {
       // is what would have happened to a frame queued behind it anyway.
       data.arrayBuffer().then(
         (bytes) => {
-          if (this.#readyState === OPEN && this.#rid !== null) {
+          // Read back through the getter: these bytes can arrive after the
+          // invocation that queued them has ended.
+          if (this.readyState === OPEN && this.#rid !== null) {
             op_deis_ws_send_binary(this.#rid, new Uint8Array(bytes));
           }
         },
@@ -255,10 +299,13 @@ class WebSocket extends event.EventTarget {
       );
     }
 
-    if (this.#readyState === CLOSING || this.#readyState === CLOSED) {
+    // The getter again: closing a socket the platform has already reclaimed is
+    // a no-op, not a call into the op layer with a dead handle.
+    const state = this.readyState;
+    if (state === CLOSING || state === CLOSED) {
       return;
     }
-    if (this.#readyState === CONNECTING) {
+    if (state === CONNECTING) {
       this.#readyState = CLOSING;
       this.#closeRequested = { code: code ?? NORMAL_CLOSURE, reason };
       return;
@@ -288,6 +335,15 @@ class WebSocket extends event.EventTarget {
       return;
     }
 
+    // The handshake finished, but not necessarily inside the invocation that
+    // started it. The op refuses to register a socket in that case and this is
+    // the same judgement on this side of the boundary: no `open` event, no
+    // read loop, nothing running in a request that did not ask for any of it.
+    if (this.#reclaimed()) {
+      this.#readyState = CLOSED;
+      return;
+    }
+
     this.#rid = opened.rid;
     this.#protocol = opened.protocol;
     this.#extensions = opened.extensions;
@@ -313,6 +369,16 @@ class WebSocket extends event.EventTarget {
         // The platform took the socket away: the invocation that opened it has
         // ended, or there is nothing behind the handle any more.
         this.#failed(e.message);
+        return;
+      }
+
+      // The one await in this class that routinely settles in a different
+      // invocation from the one that started it, and everything below
+      // dispatches into the application. A socket the sweep reclaimed has no
+      // events left that belong to anybody.
+      if (this.#reclaimed()) {
+        this.#rid = null;
+        this.#readyState = CLOSED;
         return;
       }
 
@@ -358,13 +424,27 @@ class WebSocket extends event.EventTarget {
   // The end of a socket that never opened, or that failed while open. Both are
   // reported as the specification reports them: an error event first, so a
   // handler that only listens for errors sees the reason, then a close so that
-  // the state machine ends where it should.
+  // the state machine ends where it should -- unless the invocation that owned
+  // the socket has ended, in which case the state machine still ends there and
+  // nothing is dispatched. See below.
   #failed(message) {
     if (this.#readyState === CLOSED) {
       return;
     }
+    const reclaimed = this.#reclaimed();
     this.#rid = null;
     this.#readyState = CLOSED;
+    // Every way into this method can be reached after the invocation that
+    // owned the socket has ended -- the pending read rejecting, the connect
+    // rejecting, a Blob resolving late -- and all three of those rejections
+    // say only that the platform took the socket back. Dispatching here would
+    // run the application's `error` and `close` listeners inside whatever
+    // invocation is running now, on its budget and beside its request. The
+    // state machine still ends where it should; nobody is told, because there
+    // is nobody left to tell.
+    if (reclaimed) {
+      return;
+    }
     this.dispatchEvent(new event.ErrorEvent("error", { message }));
     this.dispatchEvent(
       new event.CloseEvent("close", {

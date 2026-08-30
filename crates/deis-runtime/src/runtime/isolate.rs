@@ -28,10 +28,402 @@ use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use sys_traits::impls::RealSys;
 use tokio::sync::oneshot;
+
+/// How long the top level of an application's module may run before the load
+/// is abandoned.
+///
+/// Evaluating a module is not serving a request, and it does not get the
+/// request's budget. It happens once per isolate, it is a deployment cost
+/// rather than a per-request one, and a legitimately large bundle -- a few
+/// megabytes of transpiled JavaScript building its tables and compiling its
+/// patterns -- takes longer at it than any handler should be allowed to take
+/// answering. Five seconds is roughly two orders of magnitude above what that
+/// costs in practice, which leaves room for a cold V8 on a loaded node, and it
+/// is also what a load that never finishes costs: `RuntimePool` awaits the
+/// LoadApp message on the runtime thread's own message loop, so until module
+/// evaluation returns that thread serves nobody. Five seconds of one thread
+/// per refused deployment is a bounded loss. No ceiling at all was a permanent
+/// one -- a `while (true)` at the top level took a runtime thread out of the
+/// node for as long as the process lived.
+///
+/// Deliberately not configurable per application: an application that could
+/// raise its own ceiling could raise it to forever, which is the hole this
+/// closes.
+const MODULE_EVALUATION_BUDGET_MS: u64 = 5_000;
+
+/// The isolate's outbound WebSockets, as the invocation lifecycle sees them.
+///
+/// `runtime/ws_client_ops.rs` owns the sockets and installs the implementation
+/// in the isolate's `OpState`; this trait is the whole of what this file asks
+/// of them. It is declared here rather than there because the module holding
+/// the sockets is assembled privately inside `runtime/runtime_init.rs` and
+/// cannot be named from this one -- so the calls travel as a value instead.
+///
+/// Nothing installs it until the application opens its first socket, which is
+/// also the first moment any of it matters: an isolate that never opened one
+/// has nothing to begin, publish or close.
+pub trait OutboundSockets {
+    /// A new invocation is starting. Nothing opened before it belongs to it,
+    /// and every op that touches a socket will say so.
+    fn begin_invocation(&self);
+
+    /// The instant the invocation running now runs out. Published on every
+    /// arming, the `waitUntil` tail included: the tail runs under a budget of
+    /// its own and is where a socket opened by the request may still be open.
+    fn deadline_is(&self, at: Instant);
+
+    /// Close every socket this isolate holds, and answer how many there were.
+    fn close_all(&self) -> usize;
+}
+
+/// Which kind of application code a cut-off is watching.
+///
+/// Only used to word the warning. An operator reading "cut off" needs to know
+/// what died, because the consequences differ: a request fails and the caller
+/// sees it, a queue batch is redelivered, a cron tick is simply lost, and a
+/// `waitUntil` tail dies behind a response that already said 200.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Watched {
+    ModuleEvaluation,
+    Request,
+    WaitUntilTail,
+    QueueBatch,
+    ScheduledRun,
+    WebSocketMessage,
+}
+
+/// One armed cut-off, as the watchdog thread sees it.
+struct Watch {
+    generation: u64,
+    deadline: Instant,
+    what: Watched,
+    /// The queue, cron expression or socket the work belongs to, when there
+    /// is one; it is what an operator needs to find the cause.
+    detail: Option<String>,
+    budget_ms: u64,
+}
+
+enum WatchCommand {
+    Arm(Watch),
+    Disarm,
+    /// Sent when the isolate goes away. An explicit order rather than letting
+    /// the channel close, because an [`Armed`] guard holds a sender too and
+    /// the thread must not be waiting on a handle to a disposed isolate.
+    Stop,
+}
+
+/// What the runtime thread and the watchdog thread agree on.
+#[derive(Default)]
+struct WatchState {
+    /// Bumped on every arm. A cut-off that wakes late compares it and
+    /// terminates nothing when the invocation it was watching is already over
+    /// -- otherwise it would kill whatever the isolate went on to do next.
+    generation: u64,
+    armed: bool,
+    /// The generation the cut-off last fired on, so the runtime thread can
+    /// tell a cut-off apart from an ordinary error.
+    fired_on: Option<u64>,
+}
+
+/// The cut-off behind every execution budget in this file.
+///
+/// # Why this is an OS thread and not a timer
+///
+/// The obvious way to enforce a budget here is `tokio::spawn` a sleep that
+/// calls `terminate_execution`, and that is what this file used to do on five
+/// of its six paths. It does not work, and the way it fails is the worst one:
+/// it works in every test that awaits something and fails on exactly the code
+/// an attacker writes.
+///
+/// Each isolate runs on its own OS thread with a `current_thread` tokio
+/// runtime (see `super::pool`). A spawned timer on that runtime only runs when
+/// the thread polls it, and the thread only polls when the JavaScript yields.
+/// `export default function handler() { while (true) {} }` never yields, so
+/// the timer never runs, and the 30-second budget the operator configured is
+/// simply not enforced: measured at 75 seconds and still going, with one core
+/// pinned. The same held for a `waitUntil` tail, a queue batch, a cron tick
+/// and a WebSocket message.
+///
+/// V8 accepts `terminate_execution` from any thread, so the cut-off waits on a
+/// thread that is not the one being blocked. One such thread per isolate,
+/// started when the isolate is built and living exactly as long: an isolate
+/// already owns a thread, and a thread per *invocation* would put a spawn and
+/// a join on the hot path of every request.
+struct Watchdog {
+    /// Only so the one error path below can name the isolate; the thread has
+    /// its own copy because it outlives borrows of this struct.
+    app_id: String,
+    /// Shared with [`Armed`] rather than borrowed by it. A guard that borrowed
+    /// the watchdog would borrow the whole `AppRuntime`, and every one of them
+    /// is held across a `&mut self` call -- which is the point: the guard has
+    /// to outlive the execution it is watching.
+    orders: Arc<WatchOrders>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+/// The half of the watchdog an [`Armed`] guard keeps a hold of.
+struct WatchOrders {
+    state: Mutex<WatchState>,
+    commands: std::sync::mpsc::Sender<WatchCommand>,
+}
+
+impl Watchdog {
+    /// Start the thread that watches `isolate`.
+    ///
+    /// Failing to start it fails the isolate. An isolate whose budgets are not
+    /// enforced is the defect this type exists for, and a node that quietly
+    /// served requests without them would look healthy right up to the first
+    /// application that loops.
+    fn start(
+        isolate: deno_core::v8::IsolateHandle,
+        app_id: String,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Result<Self> {
+        let (commands, orders) = std::sync::mpsc::channel::<WatchCommand>();
+        let shared = Arc::new(WatchOrders {
+            state: Mutex::new(WatchState::default()),
+            commands,
+        });
+        let state_in_thread = shared.clone();
+        let app_id_in_thread = app_id.clone();
+
+        let thread = thread::Builder::new()
+            .name(format!("deis-watchdog-{app_id}"))
+            .spawn(move || {
+                let mut pending: Option<Watch> = None;
+                loop {
+                    let watch = match pending.take() {
+                        Some(watch) => watch,
+                        // Idle. Blocks until something is armed, or until the
+                        // isolate is dropped and the sender with it.
+                        None => match orders.recv() {
+                            Ok(WatchCommand::Arm(watch)) => watch,
+                            // The disarm that follows a cut-off this thread
+                            // already delivered.
+                            Ok(WatchCommand::Disarm) => continue,
+                            Ok(WatchCommand::Stop) | Err(_) => return,
+                        },
+                    };
+
+                    let remaining = watch.deadline.saturating_duration_since(Instant::now());
+                    match orders.recv_timeout(remaining) {
+                        Ok(WatchCommand::Disarm) => continue,
+                        // An arm with no disarm before it: the invocation that
+                        // armed the previous one is over, so watch the newer.
+                        Ok(WatchCommand::Arm(next)) => pending = Some(next),
+                        Ok(WatchCommand::Stop) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Held across the terminate so that a disarm
+                            // arriving now either happens entirely before it
+                            // -- and then the generation check below refuses
+                            // to fire -- or entirely after, and reads
+                            // `fired_on`. Without the lock the cut-off could
+                            // land on the next invocation.
+                            let mut state = state_in_thread
+                                .state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if !state.armed || state.generation != watch.generation {
+                                continue;
+                            }
+                            state.fired_on = Some(watch.generation);
+                            metrics.record_timeout_cutoff(&app_id_in_thread);
+                            warn_cut_off(&app_id_in_thread, &watch);
+                            isolate.terminate_execution();
+                        }
+                    }
+                }
+            })
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "no watchdog thread could be started for {app_id}, so the isolate is refused \
+                     rather than run with budgets nothing enforces: {e}"
+                )
+            })?;
+
+        Ok(Self {
+            app_id,
+            orders: shared,
+            thread: Some(thread),
+        })
+    }
+
+    /// Watch the execution that is about to start.
+    ///
+    /// The returned guard gives the budget back when it is dropped, so a path
+    /// that returns early -- a script that fails to start, an error carried out
+    /// with `?` -- cannot leave a cut-off armed on the next invocation.
+    fn arm(
+        &self,
+        deadline: Instant,
+        what: Watched,
+        detail: Option<String>,
+        budget_ms: u64,
+    ) -> Armed {
+        let generation = {
+            let mut state = self
+                .orders
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.generation += 1;
+            state.armed = true;
+            state.generation
+        };
+
+        let sent = self.orders.commands.send(WatchCommand::Arm(Watch {
+            generation,
+            deadline,
+            what,
+            detail,
+            budget_ms,
+        }));
+        if sent.is_err() {
+            // Only reachable if the thread ended, which it does only when this
+            // struct is dropped. Said out loud because the consequence is that
+            // this one execution runs unbounded.
+            tracing::error!(
+                target: "app",
+                app_id = %self.app_id,
+                "the watchdog thread of {} is gone; this execution runs with no cut-off",
+                self.app_id
+            );
+        }
+
+        Armed {
+            orders: self.orders.clone(),
+            generation,
+            stopped: false,
+        }
+    }
+}
+
+impl WatchOrders {
+    /// Stop watching generation `generation`, and say whether it had fired.
+    fn stop(&self, generation: u64) -> bool {
+        let fired = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.generation == generation {
+                state.armed = false;
+            }
+            state.fired_on == Some(generation)
+        };
+        let _ = self.commands.send(WatchCommand::Disarm);
+        fired
+    }
+}
+
+impl Drop for Watchdog {
+    /// The order wakes the thread at once, so this is not a wait. It is joined
+    /// rather than detached because the thread holds an `IsolateHandle` for an
+    /// isolate that is about to be dropped, and using one after disposal is
+    /// not something V8 forgives.
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = self.orders.commands.send(WatchCommand::Stop);
+            let _ = thread.join();
+        }
+    }
+}
+
+/// One armed cut-off, from the runtime thread's side.
+struct Armed {
+    orders: Arc<WatchOrders>,
+    generation: u64,
+    stopped: bool,
+}
+
+impl Armed {
+    /// Stop watching, and say whether the cut-off had already fired -- which
+    /// is how a caller tells "the application threw" from "the platform killed
+    /// it", two things that reach the runtime thread as the same error.
+    fn disarm(mut self) -> bool {
+        self.stopped = true;
+        self.orders.stop(self.generation)
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        if !self.stopped {
+            self.orders.stop(self.generation);
+        }
+    }
+}
+
+/// The line an operator reads when application code was killed.
+///
+/// One place rather than six, so the six paths cannot drift into saying the
+/// same thing six ways -- and so that every one of them says what the cut-off
+/// costs, which differs per path and is the part that matters.
+fn warn_cut_off(app_id: &str, watch: &Watch) {
+    let budget_ms = watch.budget_ms;
+    let detail = watch.detail.as_deref().unwrap_or("");
+    match watch.what {
+        Watched::ModuleEvaluation => tracing::warn!(
+            target: "app",
+            app_id = %app_id,
+            budget_ms,
+            "The module evaluation of app {app_id} was still running after {budget_ms}ms and has \
+             been cut off. The load fails and the runtime thread goes back to serving; until this \
+             was bounded, top-level code that never returned held that thread for the life of the \
+             process"
+        ),
+        Watched::Request => tracing::warn!(
+            target: "app",
+            app_id = %app_id,
+            budget_ms,
+            "App {app_id} was still running {budget_ms}ms into a request and has been cut off. \
+             The request fails. A handler that never yields is only stopped here, so this line is \
+             also the only sign that one exists"
+        ),
+        Watched::WaitUntilTail => tracing::warn!(
+            target: "app",
+            app_id = %app_id,
+            budget_ms,
+            "The waitUntil tail of app {app_id} was still running {budget_ms}ms after its \
+             invocation was answered, and has been cut off. The invocation itself succeeded, so \
+             this line is the only sign of it: background work this application started is being \
+             killed"
+        ),
+        Watched::QueueBatch => tracing::warn!(
+            target: "app",
+            app_id = %app_id,
+            queue = %detail,
+            budget_ms,
+            "App {app_id} took longer than {budget_ms}ms on a batch from queue {detail}. \
+             Terminating the isolate; the whole batch goes back to deis-queue and will be \
+             delivered again"
+        ),
+        Watched::ScheduledRun => tracing::warn!(
+            target: "app",
+            app_id = %app_id,
+            cron = %detail,
+            budget_ms,
+            "App {app_id} took longer than {budget_ms}ms on the scheduled run for {detail}. \
+             Terminating the isolate; this tick did not finish and is not retried"
+        ),
+        Watched::WebSocketMessage => tracing::warn!(
+            target: "app",
+            app_id = %app_id,
+            ws_id = %detail,
+            budget_ms,
+            "App {app_id} took longer than {budget_ms}ms on one message from WebSocket {detail}. \
+             Terminating the isolate; that message is dropped and the gateway closes the \
+             connection, while the application keeps serving everything else on this thread"
+        ),
+    }
+}
 
 /// Status, headers and body of one answered request.
 ///
@@ -61,7 +453,10 @@ struct JsRequest {
 #[derive(Serialize)]
 struct JsQueueMessage {
     id: String,
-    body: String,
+    /// Either the body's text or its base64, tagged by which; see
+    /// [`LeasedMessage::js_body`], and `js/runtime.js` for what a queue
+    /// handler is then handed.
+    body: super::queue_client::JsBody,
     /// Deliveries so far, including this one. Above 1 means the app has seen
     /// this message before and its handler has to be idempotent.
     attempts: i32,
@@ -161,6 +556,10 @@ pub struct IsolateSpec {
 }
 
 pub struct AppRuntime {
+    /// The thread that enforces every budget below. Declared before `runtime`
+    /// so that it is joined before the isolate it holds a handle to is
+    /// dropped; see [`Watchdog`] for why the cut-off cannot be a timer.
+    watchdog: Watchdog,
     runtime: JsRuntime,
     app_id: String,
     module_id: Option<deno_core::ModuleId>,
@@ -191,6 +590,13 @@ pub struct AppRuntime {
     /// with the isolate's `OpState` so `js/bootstrap.js` can bound an outbound
     /// `fetch` by it. See [`ExecutionDeadline`].
     execution_deadline: ExecutionDeadline,
+    /// Whether the timers this invocation armed have already been cleared.
+    ///
+    /// `js/runtime.js` clears them itself at the end of the `waitUntil` tail,
+    /// which is the ordinary path; this says so, so that `end_invocation` does
+    /// not run the sweep a second time on every successful request. Reset when
+    /// an invocation begins.
+    timers_swept: bool,
 }
 
 impl AppRuntime {
@@ -525,7 +931,14 @@ impl AppRuntime {
             });
         }
 
+        let watchdog = Watchdog::start(
+            runtime.v8_isolate().thread_safe_handle(),
+            app_id.clone(),
+            metrics.clone(),
+        )?;
+
         Ok(Self {
+            watchdog,
             runtime,
             app_id,
             module_id: None,
@@ -539,6 +952,7 @@ impl AppRuntime {
             rate_limit_ops_per_sec,
             metrics,
             execution_deadline,
+            timers_swept: false,
         })
     }
 
@@ -572,7 +986,118 @@ impl AppRuntime {
     fn arm_budget(&self, budget_ms: u64) -> Instant {
         let deadline = Instant::now() + Duration::from_millis(budget_ms);
         self.execution_deadline.set(Some(deadline));
+        // The open sockets are held to this too, and the tail's arming is why
+        // they are told rather than handed a copy at connect time: a socket
+        // opened by the request is allowed to live into the tail, under the
+        // tail's budget.
+        if let Some(sockets) = self.outbound_sockets() {
+            sockets.deadline_is(deadline);
+        }
         deadline
+    }
+
+    /// The hook `runtime/ws_client_ops.rs` installs the first time this
+    /// application opens an outbound socket. Absent means none was ever
+    /// opened, and there is nothing for any of these calls to do.
+    fn outbound_sockets(&self) -> Option<Rc<dyn OutboundSockets>> {
+        let op_state = self.runtime.op_state();
+        let state = op_state.borrow();
+        state.try_borrow::<Rc<dyn OutboundSockets>>().cloned()
+    }
+
+    /// Start one invocation: a request, a queue batch, a cron tick, one
+    /// inbound WebSocket message, or the evaluation of the module itself.
+    ///
+    /// Everything an earlier invocation left behind stops belonging to this
+    /// one here. Paired with [`Self::end_invocation`] on every path out.
+    fn begin_invocation(&mut self) {
+        self.timers_swept = false;
+        if let Some(sockets) = self.outbound_sockets() {
+            sockets.begin_invocation();
+        }
+    }
+
+    /// Give back everything one invocation was allowed to hold.
+    ///
+    /// Called on every path out of one -- the answered request, the handler
+    /// that threw, and the cut-off, which is the path an application chooses
+    /// by deliberately overrunning its budget and therefore the one that has
+    /// to work. What an invocation is allowed to hold, it holds *inside* the
+    /// isolate every other request to this application will run in.
+    fn end_invocation(&mut self) {
+        self.disarm_execution_budget();
+        // The sweep below is script, so a termination flag left by a cut-off
+        // has to go first or the sweep is what it kills.
+        self.clear_termination();
+
+        if let Some(sockets) = self.outbound_sockets() {
+            let closed = sockets.close_all();
+            if closed > 0 {
+                tracing::debug!(
+                    target: "app",
+                    app_id = %self.app_id,
+                    closed,
+                    "Closed {} outbound WebSocket(s) of app {} that were still open when the \
+                     invocation ended",
+                    closed,
+                    self.app_id
+                );
+            }
+        }
+
+        self.sweep_invocation_timers();
+    }
+
+    /// Clear the timers this invocation left armed.
+    ///
+    /// `js/runtime.js` does this at the end of `__deis_runtime_wait_until_all`
+    /// -- and that runs only when the invocation reached its tail. A cut-off
+    /// returns before it, so "an interval cannot outlive the request that
+    /// created it" held for every invocation except the one an application
+    /// controls: 138 interval callbacks of a deliberately overrun request were
+    /// observed firing inside the next one, on that request's budget. So the
+    /// sweep is done from here as well, on every path.
+    ///
+    /// Both swept functions are this runtime's own bookkeeping, defined in
+    /// `js/bootstrap.js`; neither runs a line of the application's code. A
+    /// module that never finished loading has neither, which is what the
+    /// `typeof` guard is for.
+    ///
+    /// Silent: the count is reported by `js/runtime.js` on the path that
+    /// reaches it, and the paths that reach this one instead have already
+    /// logged, at warn, why the invocation ended where it did.
+    fn sweep_invocation_timers(&mut self) {
+        if self.timers_swept {
+            return;
+        }
+        self.timers_swept = true;
+
+        const SOURCE: &str = r#"
+            (() => {
+                if (typeof globalThis.__deis_runtime_sweep_intervals !== "function") return;
+                globalThis.__deis_runtime_sweep_fetch_budgets();
+                globalThis.__deis_runtime_sweep_intervals();
+            })()
+        "#;
+
+        match self.runtime.execute_script("<sweep>", SOURCE) {
+            Ok(_) => tracing::trace!(
+                target: "app",
+                app_id = %self.app_id,
+                "Swept the timers of app {} at the end of an invocation that did not reach its \
+                 own cleanup",
+                self.app_id
+            ),
+            Err(e) => tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                error = %e,
+                "The end-of-invocation timer sweep of app {} did not run: {}. An interval this \
+                 invocation left armed will keep firing inside later requests to this application",
+                self.app_id,
+                e
+            ),
+        }
     }
 
     /// Stop the clock. Anything that runs after this point makes outbound
@@ -636,36 +1161,28 @@ impl AppRuntime {
     async fn run_wait_until_tail(&mut self, script_name: &'static str) -> Result<()> {
         let deadline = self.arm_wait_until_budget();
 
-        let budget_ms = self.wait_until_timeout_ms;
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
-        let app_id_for_cut_off = self.app_id.clone();
-        let metrics_for_cut_off = self.metrics.clone();
         // Armed before the tail starts rather than after it has been handed to
         // the event loop: `execute_script` runs the tail's first synchronous
-        // stretch itself, so a cut-off task spawned only once it returned would
-        // not cover the part of the tail that runs inside it.
-        let cut_off = tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-            metrics_for_cut_off.record_timeout_cutoff(&app_id_for_cut_off);
-            tracing::warn!(
-                target: "app",
-                app_id = %app_id_for_cut_off,
-                "The waitUntil tail of app {} was still running {}ms after its invocation was \
-                 answered, and has been cut off. The invocation itself succeeded, so this line is \
-                 the only sign of it: background work this application started is being killed",
-                app_id_for_cut_off,
-                budget_ms
-            );
-            isolate_handle.terminate_execution();
-        });
+        // stretch itself, so a cut-off armed once it returned would not cover
+        // the part of the tail that runs inside it.
+        let cut_off = self.watchdog.arm(
+            deadline,
+            Watched::WaitUntilTail,
+            None,
+            self.wait_until_timeout_ms,
+        );
 
         let outcome = self
             .settle_script(script_name, "__deis_runtime_wait_until_all()".to_string())
             .await;
 
-        cut_off.abort();
+        cut_off.disarm();
         self.disarm_execution_budget();
         self.clear_termination();
+        // The tail's last act is `js/runtime.js`'s own sweep, so on this path
+        // `end_invocation` has nothing left to clear. A tail that was cut off
+        // did not get there, and leaves the flag alone.
+        self.timers_swept = outcome.is_ok();
         outcome
     }
 
@@ -686,11 +1203,71 @@ impl AppRuntime {
         Ok(())
     }
 
+    /// Load and evaluate the application's module.
+    ///
+    /// Under a budget of its own, because the top level of a module is
+    /// application code like any other and this is where it runs. It used to
+    /// run with nothing watching the clock at all: `while (true) {}` before
+    /// the default export took the runtime thread out of the node for the life
+    /// of the process, and because `RuntimePool` awaits the load on that same
+    /// thread's message loop, the deployment never got an answer either.
+    ///
+    /// See [`MODULE_EVALUATION_BUDGET_MS`] for the ceiling and why it is not
+    /// the request's, and [`Watchdog`] for why the cut-off cannot be a
+    /// `tokio::spawn`ed timer the way every other one here is.
     pub async fn init_module(&mut self) -> Result<()> {
         if self.module_id.is_some() {
             return Ok(());
         }
 
+        // A flag left set by whatever ran before would fail this evaluation
+        // before a line of the module was read.
+        self.clear_termination();
+        self.begin_invocation();
+        let deadline = self.arm_budget(MODULE_EVALUATION_BUDGET_MS);
+        let watchdog = self.watchdog.arm(
+            deadline,
+            Watched::ModuleEvaluation,
+            None,
+            MODULE_EVALUATION_BUDGET_MS,
+        );
+
+        let outcome = self.evaluate_module().await;
+
+        let cut_off = watchdog.disarm();
+        // Top-level code can arm a timer and open a socket like any handler,
+        // and a module that was cut off leaves both behind.
+        self.end_invocation();
+
+        match outcome {
+            Ok(module_id) => {
+                self.module_id = Some(module_id);
+                Ok(())
+            }
+            Err(e) if cut_off => {
+                tracing::debug!(
+                    target: "app",
+                    app_id = %self.app_id,
+                    error = %e,
+                    "Module evaluation of app {} ended in the cut-off",
+                    self.app_id
+                );
+                Err(anyhow::anyhow!(
+                    "the module evaluation of {} exceeded the {}ms ceiling and was cut off; the \
+                     application is not loaded. Top-level code runs once, before any request, and \
+                     has to finish -- work that takes longer belongs inside the handler, where it \
+                     has the request's own budget",
+                    self.app_id,
+                    MODULE_EVALUATION_BUDGET_MS
+                ))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Everything the load does, with no bookkeeping of its own: the caller
+    /// arms the budget around this and gives it back on both paths.
+    async fn evaluate_module(&mut self) -> Result<deno_core::ModuleId> {
         // Skip bootstrap load if snapshot is already loaded
         if !self.snapshot_loaded {
             let bootstrap_specifier =
@@ -749,9 +1326,7 @@ impl AppRuntime {
             .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
             .await?;
 
-        self.module_id = Some(mod_id);
-
-        Ok(())
+        Ok(mod_id)
     }
 
     /// Connect debugger
@@ -814,6 +1389,30 @@ impl AppRuntime {
             }
         }
 
+        self.begin_invocation();
+        let outcome = self
+            .answer_one_request(started, url, method, headers, body, response_tx)
+            .await;
+        // On the path where the request answered, the tail below has already
+        // done most of this; on the path where it was cut off, nothing has.
+        self.end_invocation();
+        outcome
+    }
+
+    /// One request, from the invocation script to the `waitUntil` tail.
+    ///
+    /// Split out so that every way of leaving it -- the answer, the handler
+    /// that threw, the cut-off, the malformed response -- passes through the
+    /// caller's `end_invocation`.
+    async fn answer_one_request(
+        &mut self,
+        started: Instant,
+        url: String,
+        method: String,
+        headers: HashMap<String, String>,
+        body: Option<Vec<u8>>,
+        response_tx: oneshot::Sender<Result<FetchResult>>,
+    ) -> Result<()> {
         let pathname = path_from_url(&url);
         let params = match_routes(&self.route_patterns, &pathname);
         if !params.is_empty() {
@@ -877,42 +1476,38 @@ impl AppRuntime {
         // Set execution timeout: platform default, or this app's configured
         // override. Armed before the script runs; see `arm_execution_budget`.
         let deadline = self.arm_execution_budget();
-        let promise = self
-            .runtime
-            .execute_script("<fetch>", code)
-            // The budget is armed above, so a script that never starts has to give
-            // it back: nothing else runs on this isolate between invocations, but
-            // a WebSocket message dispatched afterwards would otherwise be told
-            // that a budget it never had has already run out.
-            .inspect_err(|_| self.disarm_execution_budget())?;
 
-        let timeout_ms = self.timeout_ms;
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
-        let app_id_for_timeout = self.app_id.clone();
-        let metrics_for_timeout = self.metrics.clone();
+        // The cut-off is armed before `execute_script`, not after it returns,
+        // and that ordering is the whole of the defence. `execute_script` runs
+        // the script's first synchronous stretch itself, and for
+        // `export default function handler() { while (true) {} }` that stretch
+        // is the entire handler -- it never returns, so a cut-off armed on the
+        // next line would never be armed at all. Measured at 75 seconds
+        // against a 300ms budget with the arming one line too late.
+        //
+        // The guard gives the budget back on every path out of this function,
+        // including the `?` below, so a script that fails to start cannot
+        // leave a cut-off watching the next invocation.
+        let cut_off = self
+            .watchdog
+            .arm(deadline, Watched::Request, None, self.timeout_ms);
 
-        // Start timeout monitoring task
-        let timeout_task = tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-            metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
-            tracing::warn!(
-                target: "app",
-                app_id = %app_id_for_timeout,
-                "App {} execution timed out after {}ms. Terminating isolate execution; the request will fail.",
-                app_id_for_timeout,
-                timeout_ms
-            );
-            isolate_handle.terminate_execution();
-        });
+        let result = match self.runtime.execute_script("<fetch>", code) {
+            Ok(promise) => {
+                let resolve_future = self.runtime.resolve(promise);
+                self.runtime
+                    .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
+                    .await
+            }
+            // A script that never started and one that was killed mid-flight
+            // arrive here the same way, and both have to be answered: a
+            // handler cut off inside `execute_script` used to return through
+            // `?` with nothing ever sent on `response_tx`, leaving the caller
+            // waiting on a channel that would never carry anything.
+            Err(e) => Err(e.into()),
+        };
 
-        let resolve_future = self.runtime.resolve(promise);
-        let result = self
-            .runtime
-            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
-            .await;
-
-        // Cancel timeout task
-        timeout_task.abort();
+        cut_off.disarm();
         self.disarm_execution_budget();
 
         // The timeout task and the rate limiter both work by terminating the
@@ -1066,13 +1661,26 @@ impl AppRuntime {
             }
         }
 
+        self.begin_invocation();
+        let outcome = self.run_one_batch(queue, messages).await;
+        self.end_invocation();
+        outcome
+    }
+
+    /// One batch, split out so that the cut-off path gives back what the
+    /// settled path gives back; see [`Self::answer_one_request`].
+    async fn run_one_batch(
+        &mut self,
+        queue: String,
+        messages: Vec<LeasedMessage>,
+    ) -> Result<BatchOutcome> {
         let payload = JsQueueBatch {
             queue: queue.clone(),
             messages: messages
                 .iter()
                 .map(|message| JsQueueMessage {
                     id: message.id.clone(),
-                    body: message.body.clone(),
+                    body: message.js_body(),
                     attempts: message.attempts,
                     timestamp: message.created_at,
                 })
@@ -1091,42 +1699,26 @@ impl AppRuntime {
         );
 
         let deadline = self.arm_execution_budget();
-        let promise = self
-            .runtime
-            .execute_script("<queue>", code)
-            // The budget is armed above, so a script that never starts has to give
-            // it back: nothing else runs on this isolate between invocations, but
-            // a WebSocket message dispatched afterwards would otherwise be told
-            // that a budget it never had has already run out.
-            .inspect_err(|_| self.disarm_execution_budget())?;
+        // Armed before the script starts, for the reason spelled out in
+        // `execute_fetch`: the handler's first synchronous stretch runs inside
+        // `execute_script`, and a handler that never yields never leaves it.
+        let cut_off = self.watchdog.arm(
+            deadline,
+            Watched::QueueBatch,
+            Some(queue.clone()),
+            self.timeout_ms,
+        );
 
-        let timeout_ms = self.timeout_ms;
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
-        let app_id_for_timeout = self.app_id.clone();
-        let queue_for_timeout = queue.clone();
-        let metrics_for_timeout = self.metrics.clone();
-        let timeout_task = tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-            metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
-            tracing::warn!(
-                target: "app",
-                app_id = %app_id_for_timeout,
-                queue = %queue_for_timeout,
-                "App {} took longer than {}ms on a batch from queue {}. Terminating the isolate; \
-                 the whole batch goes back to deis-queue and will be delivered again",
-                app_id_for_timeout,
-                timeout_ms,
-                queue_for_timeout
-            );
-            isolate_handle.terminate_execution();
-        });
-
-        let resolve_future = self.runtime.resolve(promise);
-        let result = self
-            .runtime
-            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
-            .await;
-        timeout_task.abort();
+        let result = match self.runtime.execute_script("<queue>", code) {
+            Ok(promise) => {
+                let resolve_future = self.runtime.resolve(promise);
+                self.runtime
+                    .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
+                    .await
+            }
+            Err(e) => Err(e.into()),
+        };
+        cut_off.disarm();
         self.disarm_execution_budget();
         // Without this the batch that ran long would also be the last thing
         // this isolate ever did: every following batch would be handed back
@@ -1194,6 +1786,14 @@ impl AppRuntime {
             }
         }
 
+        self.begin_invocation();
+        let outcome = self.run_one_tick(cron, scheduled_time_ms).await;
+        self.end_invocation();
+        outcome
+    }
+
+    /// One tick, split out for the same reason as [`Self::run_one_batch`].
+    async fn run_one_tick(&mut self, cron: String, scheduled_time_ms: i64) -> Result<()> {
         let payload = JsScheduledEvent {
             cron: cron.clone(),
             scheduled_time: scheduled_time_ms,
@@ -1211,41 +1811,24 @@ impl AppRuntime {
         );
 
         let deadline = self.arm_execution_budget();
-        let promise = self
-            .runtime
-            .execute_script("<scheduled>", code)
-            // The budget is armed above, so a script that never starts has to give
-            // it back: nothing else runs on this isolate between invocations, but
-            // a WebSocket message dispatched afterwards would otherwise be told
-            // that a budget it never had has already run out.
-            .inspect_err(|_| self.disarm_execution_budget())?;
+        // Armed before the script starts; see `execute_fetch`.
+        let cut_off = self.watchdog.arm(
+            deadline,
+            Watched::ScheduledRun,
+            Some(cron.clone()),
+            self.timeout_ms,
+        );
 
-        let timeout_ms = self.timeout_ms;
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
-        let app_id_for_timeout = self.app_id.clone();
-        let cron_for_timeout = cron.clone();
-        let metrics_for_timeout = self.metrics.clone();
-        let timeout_task = tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-            metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
-            tracing::warn!(
-                target: "app",
-                app_id = %app_id_for_timeout,
-                cron = %cron_for_timeout,
-                "App {} took longer than {}ms on the scheduled run for {}. Terminating the                  isolate; this tick did not finish and is not retried",
-                app_id_for_timeout,
-                timeout_ms,
-                cron_for_timeout
-            );
-            isolate_handle.terminate_execution();
-        });
-
-        let resolve_future = self.runtime.resolve(promise);
-        let result = self
-            .runtime
-            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
-            .await;
-        timeout_task.abort();
+        let result = match self.runtime.execute_script("<scheduled>", code) {
+            Ok(promise) => {
+                let resolve_future = self.runtime.resolve(promise);
+                self.runtime
+                    .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
+                    .await
+            }
+            Err(e) => Err(e.into()),
+        };
+        cut_off.disarm();
         self.disarm_execution_budget();
         self.clear_termination();
         result?;
@@ -1316,6 +1899,7 @@ impl AppRuntime {
         // A flag left over from a previous cut-off would fail this message
         // before a line of the application's code ran.
         self.clear_termination();
+        self.begin_invocation();
 
         let code = format!(
             r#"
@@ -1336,46 +1920,40 @@ impl AppRuntime {
         // Armed before the script runs; see `arm_execution_budget`.
         let deadline = self.arm_execution_budget();
 
-        let timeout_ms = self.timeout_ms;
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
-        let app_id_for_timeout = self.app_id.clone();
-        let ws_id_for_timeout = ws_id.clone();
-        let metrics_for_timeout = self.metrics.clone();
-        // Spawned before the dispatch, unlike the request path's: a message
+        // Armed before the dispatch, unlike the request path's: a message
         // handler is called synchronously by the script below, so all of it
         // runs inside `execute_script` and a cut-off armed afterwards would
         // never cover any of it.
-        let timeout_task = tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-            metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
-            tracing::warn!(
-                target: "app",
-                app_id = %app_id_for_timeout,
-                ws_id = %ws_id_for_timeout,
-                "App {} took longer than {}ms on one message from WebSocket {}. Terminating the \
-                 isolate; that message is dropped and the gateway closes the connection, while \
-                 the application keeps serving everything else on this thread",
-                app_id_for_timeout,
-                timeout_ms,
-                ws_id_for_timeout
-            );
-            isolate_handle.terminate_execution();
-        });
+        let cut_off = self.watchdog.arm(
+            deadline,
+            Watched::WebSocketMessage,
+            Some(ws_id.clone()),
+            self.timeout_ms,
+        );
 
         let outcome = self.settle_script("<ws_message>", code).await;
 
-        timeout_task.abort();
+        cut_off.disarm();
         // A budget armed and never given back is spent by whatever runs next in
         // this isolate -- the next message, or a request -- which would be told
-        // its time was already gone. Same trap as `execute_fetch`.
-        self.disarm_execution_budget();
-        // And without this a cut-off message would be the last thing this
-        // isolate ever did: every later message and every later request would
-        // fail on the flag this one left behind.
-        self.clear_termination();
+        // its time was already gone. Same trap as `execute_fetch`. The rest of
+        // what this message may have left armed goes back with it: a message
+        // handler can set an interval and open a socket exactly as a request
+        // handler can, and there is no `waitUntil` tail here to clean up after
+        // it.
+        self.end_invocation();
         outcome
     }
 
+    /// Tell the application one of its WebSocket clients has gone.
+    ///
+    /// This runs the application's `close` listener, so it is application code
+    /// and it is bounded like any other -- with the same cut-off, for the same
+    /// reason. It is not a request, nothing downstream is waiting on it and
+    /// the socket is already gone, so a `close` handler that loops would
+    /// otherwise take the runtime thread with nothing to show for it: no
+    /// request timing out, no client noticing, just a thread that stops
+    /// answering for every other application on it.
     pub async fn close_ws_connection(
         &mut self,
         ws_id: String,
@@ -1401,11 +1979,24 @@ impl AppRuntime {
             ws_id
         );
 
-        let promise = self.runtime.execute_script("<ws_close>", js_code)?;
-        let resolve_future = self.runtime.resolve(promise);
-        self.runtime
-            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
-            .await?;
+        self.begin_invocation();
+        let deadline = self.arm_execution_budget();
+        let cut_off = self.watchdog.arm(
+            deadline,
+            Watched::WebSocketMessage,
+            Some(ws_id.clone()),
+            self.timeout_ms,
+        );
+
+        let outcome = self.settle_script("<ws_close>", js_code).await;
+
+        cut_off.disarm();
+        self.disarm_execution_budget();
+        self.clear_termination();
+        // A close listener can arm a timer and open a socket exactly as a
+        // message listener can, and there is no tail here to sweep after it.
+        self.end_invocation();
+        outcome?;
 
         let ws_manager_opt = {
             let op_state = self.runtime.op_state();
@@ -1429,12 +2020,13 @@ impl AppRuntime {
 
     /// Put this isolate in exactly the state a cut-off leaves it in.
     ///
-    /// The timeout task and the rate limiter both end an execution by calling
+    /// The watchdog and the rate limiter both end an execution by calling
     /// `terminate_execution` on this isolate's handle; this is the same call.
-    /// Tests use it because neither of the real triggers is reproducible here:
-    /// the timeout is a `tokio::spawn`ed timer that a handler blocking the
-    /// thread never lets run, and the rate limiter would keep firing on the
-    /// request that is supposed to prove recovery.
+    /// Tests use it for the rate-limit case, which is not reproducible on its
+    /// own terms: the limiter would keep firing on the very request that is
+    /// supposed to prove recovery. The timeout no longer needs it -- see
+    /// `a_handler_that_never_yields_is_still_cut_off`, which drives the real
+    /// cut-off end to end.
     #[cfg(test)]
     pub fn terminate_like_a_cut_off(&mut self) {
         self.runtime
@@ -1443,16 +2035,16 @@ impl AppRuntime {
             .terminate_execution();
     }
 
-    /// Exposes the effective execution timeout for this isolate. Behavioral
-    /// termination tests are unreliable here: `execute_fetch`'s timeout is
-    /// enforced by a `tokio::spawn`ed sleep-and-terminate task, which on the
-    /// `current_thread` runtime this isolate runs on only gets scheduled once
-    /// the polling task yields -- something a JS handler that never performs
-    /// a genuine async Rust op (only synchronous work or microtasks) may
-    /// never do, no matter how long it runs. That is a pre-existing
-    /// characteristic of the timeout mechanism itself, not something this
-    /// accessor works around; it exists so tests can assert the *value*
-    /// reached the isolate without depending on that timing.
+    /// Exposes the effective execution timeout for this isolate, so a test can
+    /// assert the configured value arrived here without also waiting it out.
+    ///
+    /// This used to carry a paragraph saying the timeout could not be tested
+    /// behaviourally, because it was a `tokio::spawn`ed timer that a handler
+    /// blocking the thread never let run. That was true, and it was a
+    /// description of the defect rather than of the mechanism: the budget an
+    /// operator configured was simply not enforced against a handler that did
+    /// not yield. [`Watchdog`] is the mechanism now, and the behaviour is
+    /// tested directly.
     #[cfg(test)]
     pub fn timeout_ms(&self) -> u64 {
         self.timeout_ms

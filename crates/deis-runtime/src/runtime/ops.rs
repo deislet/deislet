@@ -188,13 +188,71 @@ async fn op_kv_delete(
         .map_err(|e| service_call_failed("kv.delete", e))
 }
 
-/// KV List operation
+/// What `ctx.services.kv.list` may ask a listing for.
+///
+/// All three are optional and every combination is legal: no prefix lists the
+/// whole tenant, no limit takes deis-store's page size, no cursor starts at
+/// the beginning.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvListOptions {
+    /// Only keys starting with this. Absent or empty lists every key this
+    /// application has -- the tenant is already the boundary, so there is
+    /// nothing wider to reach.
+    #[serde(default)]
+    pub prefix: Option<String>,
+
+    /// How many keys this page may hold. deis-store substitutes its default
+    /// for an absent one and caps anything above its ceiling, so a caller
+    /// that asks for more than the ceiling gets the ceiling and a cursor
+    /// rather than a refusal.
+    #[serde(default)]
+    pub limit: Option<i32>,
+
+    /// The `cursor` a previous page answered with. Absent starts a new scan.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// One listed key, as `ctx.services.kv.list` reports it.
+///
+/// `name` rather than `key`, because that is the member applications written
+/// for this shape already read. `metadata` stays the string deis-store
+/// stored: `js/runtime.js` decodes it, in the one place that also decodes
+/// what `getWithMetadata` returns, so the two can never disagree about what a
+/// stored metadata string means.
+#[derive(Serialize)]
+pub struct KvListedKey {
+    pub name: String,
+    pub metadata: Option<String>,
+    pub expiration: Option<i64>,
+}
+
+/// One page of a listing.
+///
+/// `cursor` is what to resume from, and `null` means the scan is finished.
+/// It is deliberately the only signal: a page can come back full and still be
+/// the last one, so "was this page short?" is not an answer to "is there
+/// more?". `js/runtime.js` turns the same fact into the `list_complete` flag
+/// an application expects.
+#[derive(Serialize)]
+pub struct KvListPageResult {
+    pub keys: Vec<KvListedKey>,
+    pub cursor: Option<String>,
+}
+
+/// KV List operation: one page of this application's keys under a prefix.
+///
+/// Paged rather than exhaustive because a tenant may hold far more keys than
+/// fit in one gRPC message, and an op that promised "all of them" would work
+/// in development and fail against the store on exactly the applications big
+/// enough to need it.
 #[op2(async)]
 #[serde]
 async fn op_kv_list(
     state: Rc<RefCell<OpState>>,
-    #[string] prefix: String,
-) -> Result<Vec<String>, JsErrorBox> {
+    #[serde] options: KvListOptions,
+) -> Result<KvListPageResult, JsErrorBox> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
@@ -204,11 +262,27 @@ async fn op_kv_list(
         return Err(service_unavailable("kv"));
     };
 
-    client
-        .list(prefix, None)
+    let page = client
+        .list(
+            options.prefix.unwrap_or_default(),
+            options.limit,
+            options.cursor,
+        )
         .await
-        .map(|(keys, _)| keys)
-        .map_err(|e| service_call_failed("kv.list", e))
+        .map_err(|e| service_call_failed("kv.list", e))?;
+
+    Ok(KvListPageResult {
+        keys: page
+            .keys
+            .into_iter()
+            .map(|entry| KvListedKey {
+                name: entry.name,
+                metadata: entry.metadata,
+                expiration: entry.expiration,
+            })
+            .collect(),
+        cursor: page.cursor,
+    })
 }
 
 /// The application this isolate is running.

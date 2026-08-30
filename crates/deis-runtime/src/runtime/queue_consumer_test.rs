@@ -12,7 +12,7 @@ mod tests {
     fn message(id: &str) -> LeasedMessage {
         LeasedMessage {
             id: id.to_string(),
-            body: format!("body-of-{id}"),
+            body: format!("body-of-{id}").into_bytes(),
             attempts: 1,
             lease_expires_at: 0,
             created_at: 0,

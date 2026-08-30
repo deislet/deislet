@@ -1,14 +1,91 @@
 //! SQL database service, one SQLite file per tenant.
 //!
-//! `<data_dir>/db/<tenant>.sqlite`. File-level isolation is the cheapest
-//! correct answer here: a tenant cannot name another tenant's table, cannot
-//! lock another tenant's rows, and a `DROP TABLE` blast radius stops at its
-//! own file. Two environments of one application are two tenants, so a
-//! preview deployment cannot drop production's tables either.
+//! `<data_dir>/db/<tenant>.sqlite`. Two environments of one application are
+//! two tenants, so a preview deployment gets its own file and cannot drop
+//! production's tables.
 //!
 //! The price is that the tenant id becomes a filename, which is why
 //! [`TenantId`] refuses anything the wire conventions do not accept as
 //! exactly two plain identifiers.
+//!
+//! # A separate file is not by itself isolation
+//!
+//! Giving each tenant its own file only isolates tenants if their SQL cannot
+//! name a second file, and plain SQLite very much can. `PRAGMA
+//! database_list` hands the caller the absolute path of its own database,
+//! which is every other tenant's path with one component changed; `ATTACH
+//! DATABASE` then opens that path for reading *and writing*; `VACUUM INTO`
+//! writes a copy of the tenant's data anywhere the process can write. All
+//! three are ordinary SQL, reachable from any application through
+//! `ctx.services.database`.
+//!
+//! So the file boundary is held by two things underneath the SQL, both
+//! installed on every connection of a tenant's pool by
+//! [`SqlitePool::new_guarded`]:
+//!
+//! * **SQLite's authorizer callback** ([`tenant_sql_authorizer`]), which sits
+//!   under the parser and is consulted per action rather than per spelling.
+//!   It cannot be talked around by comments, case, whitespace or the
+//!   eponymous `pragma_*` table forms, because by the time it runs SQLite has
+//!   already decided what the statement *does*.
+//! * **`SQLITE_LIMIT_ATTACHED` at 0**, which is the floor under it: with no
+//!   attach slots, `ATTACH` fails even if an authorizer decision is ever
+//!   loosened by mistake. A floor and nothing more - it reports "too many
+//!   attached databases", which tells an application nothing and an operator
+//!   less, and it stops the statement at run time rather than while it is
+//!   prepared. So the authorizer has to recognise every spelling of an
+//!   `ATTACH` itself; anything it lets through lands here silently.
+//!
+//! ## What a tenant's SQL may do
+//!
+//! Everything ordinary - `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`,
+//! `DROP`, `ALTER`, triggers, views, indexes, the built-in functions, and the
+//! virtual table modules this build compiles in (FTS3, FTS4, FTS5,
+//! `fts5vocab`, R*Tree and `dbstat` - none of which can name a file) -
+//! against its own database and its own temporary tables. That list is a
+//! claim about behaviour, not about a compile flag, so
+//! `every_compiled_in_virtual_table_module_is_usable` creates one table with
+//! each of them: tightening the PRAGMA allowlist below breaks a test rather
+//! than an application. Specifically refused:
+//!
+//! * **`ATTACH`**, whatever it names, and whether or not it names it in a
+//!   way SQLite can show the authorizer: a filename built by an expression
+//!   (`'<path>' || ''`, `(SELECT '<path>')`) reaches the callback with the
+//!   name missing, and is refused on the action alone. This is also what
+//!   stops `VACUUM INTO`: SQLite implements it by attaching the destination,
+//!   so the authorizer sees an `Attach` carrying the caller's path.
+//! * **`DETACH`**, for symmetry - nothing but the tenant's own file is ever
+//!   attached, so a `DETACH` that made sense would mean the layer above had
+//!   already failed.
+//! * **`VACUUM`, refused a second time in [`check_sql`]** before it reaches
+//!   SQLite at all. Both layers are needed and neither replaces the other:
+//!   the authorizer sees `VACUUM INTO` only as its `Attach`, and only while
+//!   the statement *runs*, so `Prepare` would otherwise hand back a handle
+//!   for one and the refusal would surface at whatever executed it later,
+//!   saying `ATTACH` about a statement that never spelled the word. The
+//!   keyword check names `VACUUM` at the call that sent it, and reads the
+//!   first word SQLite would read rather than the first characters it was
+//!   given - past comments and empty statements - because that call is the
+//!   only place a `Prepare` can be told. It is still one word rather than a
+//!   parse tree, which is why it is the message and the authorizer is the
+//!   boundary.
+//! * **Every `PRAGMA` outside [`TENANT_PRAGMAS`]**, an allowlist rather than
+//!   a list of the dangerous ones, plus [`TENANT_READ_ONLY_PRAGMAS`] which
+//!   may be read and not set. `database_list` is the disclosure that started
+//!   this, but a denylist would age badly: SQLite adds PRAGMAs between
+//!   releases and a list written today silently admits whatever arrives
+//!   tomorrow.
+//! * **`load_extension()`**, which would run native code inside the store.
+//!   SQLite already refuses it - the extension loader is off unless
+//!   `sqlite3_enable_load_extension` is called, and nothing here calls it,
+//!   because rusqlite's `load_extension` feature is not enabled in
+//!   `Cargo.toml`. The authorizer refuses it as well so the caller is told
+//!   what was refused rather than getting SQLite's bare "not authorized".
+//!
+//! A refusal reaches the application as [`StoreError::Refused`] naming the
+//! statement or PRAGMA, and is logged at `warn` against the tenant: a tenant
+//! attempting `ATTACH` is either a broken library or an attack, and an
+//! operator wants to see it either way.
 //!
 //! "Prepared" statements are prepared per call, not held open. A pooled
 //! connection cannot own a live `rusqlite::Statement` across requests, so
@@ -16,6 +93,14 @@
 //! later use re-prepares it on whichever connection it lands on. Callers get
 //! the property they actually want from `Prepare` - the SQL is parsed once,
 //! up front, and parameters are always bound rather than interpolated.
+//!
+//! That validation is a real prepare on a real connection, so the authorizer
+//! runs and `Prepare` refuses everything above at the call that sent it,
+//! naming it. The one action SQLite does not raise while preparing is the
+//! `Attach` inside a vacuum, and there is no way to raise it early: it is
+//! raised by *running* the vacuum, which is the thing being refused. So the
+//! keyword check carries that one, which is why it has to see the same first
+//! word SQLite does.
 //!
 //! # Interactive transactions
 //!
@@ -50,7 +135,12 @@
 //! * **A bound on how many may be open at once**, per tenant and in total.
 //!   The per-tenant bound is additionally clamped to one below the tenant's
 //!   pool size, so a client looping on `BeginTransaction` can never take the
-//!   last connection its own ordinary queries need.
+//!   last connection its own ordinary queries need. That clamp is only
+//!   meaningful if the pool has a connection to spare, which is why a
+//!   tenant's pool is never opened with fewer than
+//!   [`MIN_TENANT_CONNECTIONS`]: with one connection, "one below the pool
+//!   size" is none at all, and a single abandoned transaction would starve
+//!   every plain `Execute` and `Query` until the deadline reaped it.
 //!
 //! SQLite still allows one writer per file. A second interactive transaction
 //! on the same tenant therefore waits at `BEGIN IMMEDIATE` for the first to
@@ -66,8 +156,10 @@ use crate::proto::storage::{
     QueryInTransactionRequest, QueryPreparedRequest, QueryRequest, QueryResponse,
     RollbackTransactionRequest, RollbackTransactionResponse, database_server::Database,
 };
-use crate::sqlite::{PoolSize, PooledConnection, SqlitePool};
+use crate::sqlite::{self, PoolSize, PooledConnection, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
+use rusqlite::ffi;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{HashMap, VecDeque};
@@ -76,6 +168,210 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
+
+/// The PRAGMAs a tenant's SQL may run, in either the `PRAGMA x` or the
+/// `SELECT * FROM pragma_x` spelling - SQLite reports both to the authorizer
+/// as the same `Pragma` action, so one list covers both.
+///
+/// An allowlist, and short on purpose. What is here is what an application
+/// legitimately needs against its own file: reading back the schema it
+/// created, checking its own foreign keys, and the two counters SQLite
+/// reserves for an application's own use. What is not here divides into two
+/// kinds. Some of it discloses the store's layout - `database_list` gives the
+/// absolute path of the tenant's file, which is every other tenant's path
+/// with one component changed, and `compile_options` describes the build.
+/// The rest - journal mode, cache size, checkpoints, `foreign_keys` - are the
+/// pool's settings, applied once when a connection is opened; a tenant that
+/// changed one would be changing it on a pooled connection that outlives the
+/// request, for whichever of its own later requests happened to land there.
+const TENANT_PRAGMAS: &[&str] = &[
+    "application_id",
+    "collation_list",
+    "foreign_key_check",
+    "foreign_key_list",
+    "function_list",
+    "index_info",
+    "index_list",
+    "index_xinfo",
+    "table_info",
+    "table_list",
+    "table_xinfo",
+    "user_version",
+];
+
+/// PRAGMAs a tenant may read but not set.
+///
+/// Neither is here because an application asked for it. Both are here
+/// because the virtual table modules the docs above promise read them from
+/// inside their own implementations, so refusing them does not narrow what a
+/// tenant may write - it breaks a module:
+///
+/// * **`page_size`** is read by R*Tree's `xCreate` to size its index nodes,
+///   and refusing it fails `CREATE VIRTUAL TABLE ... USING rtree(...)`
+///   outright. FTS3 and FTS4 read it too, at create; they treat a refusal as
+///   1024 and carry on, so they worked either way and sized their segment
+///   nodes against a guess.
+/// * **`data_version`** is read by FTS5 on the first write through a
+///   connection, to notice a commit made by another one. Refusing it fails
+///   the `INSERT`, which is worse than the R*Tree case: the table is created
+///   happily and only breaks when the application starts using it.
+///
+/// Reading either discloses nothing. Both are properties of the caller's own
+/// file, say nothing about any other tenant or about where the file lives,
+/// and `page_size` is already legible through `dbstat`'s `pgsize` column,
+/// which is allowed. Setting is another matter and stays refused:
+/// `PRAGMA page_size = N` rewrites the physical layout of a file that
+/// outlives the request, which belongs with the pool's own settings above
+/// rather than with what one statement may do. (`data_version` is read-only
+/// to SQLite as well, so its write form is refused twice.)
+///
+/// Split from [`TENANT_PRAGMAS`] rather than folded into it because the
+/// read/write distinction is only sound for names with no argument form.
+/// `PRAGMA table_info('people')` reaches the authorizer carrying `'people'`
+/// as its value, exactly as `PRAGMA user_version = 7` carries `7`, so
+/// "has a value" means "is a write" only for the names listed here.
+const TENANT_READ_ONLY_PRAGMAS: &[&str] = &["data_version", "page_size"];
+
+/// What a tenant's SQL may do, decided under the parser.
+///
+/// Installed on every connection of every tenant pool; see the module docs
+/// for the reasoning and [`crate::sqlite`] for the mechanism. Refusals leave
+/// a sentence behind through [`sqlite::refuse`], because SQLite's own report
+/// for a denied statement is the bare string "not authorized".
+///
+/// Called once per action while a statement is prepared, so it is on the hot
+/// path of every query: matching and one short list scan, nothing allocated
+/// unless something is actually refused.
+fn tenant_sql_authorizer(ctx: AuthContext<'_>) -> Authorization {
+    match ctx.action {
+        // `VACUUM INTO '<path>'` arrives here too, as an attach of the file
+        // it was asked to write: SQLite implements the copy by attaching the
+        // destination. That is the whole of the "write a file the caller
+        // names" hole, and this is where it closes.
+        AuthAction::Attach { filename } => refuse_attach(Some(filename)),
+        // The same ATTACH, spelled so that SQLite cannot hand the filename
+        // over: it passes the authorizer a null argument whenever the
+        // filename is an expression rather than a string literal - `ATTACH
+        // ('<path>' || '')`, `ATTACH (SELECT '<path>')` - and rusqlite has no
+        // `Attach` variant to put a missing filename in, so the raw action
+        // code arrives here instead. Without this arm those two spellings
+        // fall through to the catch-all, are allowed, and are then stopped by
+        // `SQLITE_LIMIT_ATTACHED` at run time - which refuses them as "too
+        // many attached databases", says nothing about why, and leaves no
+        // line behind for an operator watching for exactly this.
+        AuthAction::Unknown {
+            code: ffi::SQLITE_ATTACH,
+            ..
+        } => refuse_attach(None),
+        AuthAction::Detach { database_name } => refuse_detach(Some(database_name)),
+        AuthAction::Unknown {
+            code: ffi::SQLITE_DETACH,
+            ..
+        } => refuse_detach(None),
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } if !is_tenant_pragma(pragma_name, pragma_value) => sqlite::refuse(format!(
+            "PRAGMA {pragma_name}, because a tenant may run only {}, and may only read {}",
+            TENANT_PRAGMAS.join(", "),
+            TENANT_READ_ONLY_PRAGMAS.join(", ")
+        )),
+        // Already impossible - the extension loader is off unless
+        // `sqlite3_enable_load_extension` is called and nothing here calls
+        // it, because rusqlite's `load_extension` feature is not enabled in
+        // this crate's Cargo.toml. Refused here as well so the caller is told
+        // what was refused instead of "not authorized".
+        AuthAction::Function { function_name }
+            if function_name.eq_ignore_ascii_case("load_extension") =>
+        {
+            sqlite::refuse(
+                "load_extension(), because it would load a shared library and run native \
+                 code inside the store"
+                    .to_string(),
+            )
+        }
+        // Everything else is ordinary SQL against the tenant's own file. The
+        // one thing checked on the way through is which database it names:
+        // unreachable while ATTACH is refused, and the point of writing it
+        // down is that it stays refused if ATTACH ever is not.
+        _ => match ctx.database_name {
+            Some(name) if name != "main" && name != "temp" => sqlite::refuse(format!(
+                "reading or writing the database {name:?}, because a tenant's SQL reaches \
+                 its own file and its own temporary tables, and nothing else"
+            )),
+            _ => Authorization::Allow,
+        },
+    }
+}
+
+/// Log a refusal against the tenant whose SQL caused it.
+///
+/// `warn`, not `debug`: a tenant reaching for `ATTACH` or `PRAGMA
+/// database_list` is either a library doing something nobody meant it to or
+/// somebody trying the other tenants' files, and an operator wants to see it
+/// either way. Everything else passes through untouched - a SQL typo is not
+/// an operator's problem.
+fn note_refusal(tenant: &TenantId, error: &StoreError) {
+    if let StoreError::Refused(what) = error {
+        tracing::warn!(
+            tenant = %tenant,
+            refused = %what,
+            "refused a statement from this tenant; nothing outside this tenant's own database \
+             file was read or written"
+        );
+    }
+}
+
+/// Refuse an `ATTACH`, whether or not SQLite could say what it named.
+///
+/// `None` is the expression spelling: SQLite only passes the filename to the
+/// authorizer when it is a string literal, so a caller that hides it behind
+/// `||` or a subquery is refused on the action alone. Naming the spelling in
+/// the message keeps the log line honest about what the operator can and
+/// cannot see.
+fn refuse_attach(filename: Option<&str>) -> Authorization {
+    let named = match filename {
+        Some(filename) => format!("this statement named {filename:?}"),
+        None => "this statement built the filename from an expression, so SQLite did not pass \
+                 it to the authorizer"
+            .to_string(),
+    };
+    sqlite::refuse(format!(
+        "ATTACH, because a tenant's SQL reaches its own database file and nothing else; \
+         {named}. VACUUM arrives here too, because SQLite attaches the file it writes"
+    ))
+}
+
+/// Refuse a `DETACH`, whether or not SQLite could say what it named. See
+/// [`refuse_attach`] for why the name can be missing.
+fn refuse_detach(database_name: Option<&str>) -> Authorization {
+    let named = match database_name {
+        Some(name) => format!("{name:?} is not a database this connection has open"),
+        None => "no database this connection has open could be the one it means".to_string(),
+    };
+    sqlite::refuse(format!(
+        "DETACH, because nothing but this tenant's own file is ever attached, so {named}"
+    ))
+}
+
+/// Whether this PRAGMA, in this form, is one a tenant may run.
+///
+/// Case-insensitive, because SQLite hands the authorizer the PRAGMA name as
+/// the caller spelled it. `value` is what follows `=` or sits in the
+/// parentheses, and it is only consulted for [`TENANT_READ_ONLY_PRAGMAS`],
+/// where its absence is what makes the statement a read.
+fn is_tenant_pragma(name: &str, value: Option<&str>) -> bool {
+    if TENANT_PRAGMAS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    value.is_none()
+        && TENANT_READ_ONLY_PRAGMAS
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(name))
+}
 
 /// How many statements the whole process will remember at once. Handles are
 /// small (an id and the SQL text) but a client that prepares in a loop and
@@ -180,6 +476,16 @@ pub const DEFAULT_MAX_OPEN_TRANSACTIONS_PER_TENANT: usize = 2;
 /// the ceiling on what a crowd of tenants can pin between them.
 pub const DEFAULT_MAX_OPEN_TRANSACTIONS: usize = 64;
 
+/// The smallest pool a tenant may be given, whatever the configuration says.
+///
+/// An interactive transaction pins one connection for its whole life, so a
+/// pool of one has nothing left to run the tenant's ordinary `Execute` and
+/// `Query` on while a transaction is open - and "abandon a transaction and
+/// every plain query blocks until the deadline reaps it" is a foot-gun an
+/// operator can arm by typing `tenant_connections = 1`. Two is the smallest
+/// number for which [`clamp_to_pool`] can do what it claims.
+pub const MIN_TENANT_CONNECTIONS: usize = 2;
+
 /// How many finished handles are remembered, so a caller that uses one gets
 /// "committed" or "rolled back at the deadline" instead of "unknown".
 const REMEMBERED_ENDED_TRANSACTIONS: usize = 1024;
@@ -231,12 +537,18 @@ impl TransactionLimits {
 /// every connection and then block its own ordinary queries behind its own
 /// transactions. Leaving one back means the plain `Execute`/`Query` path
 /// always has somewhere to run.
+///
+/// One below a pool of one is zero, and this returns exactly that rather than
+/// rounding up to one: with a single connection there is no ceiling at which
+/// the sentence above is true, so the honest answer is that no transaction
+/// may be opened. [`DatabaseService::open`] makes that unreachable by
+/// refusing to build a pool smaller than [`MIN_TENANT_CONNECTIONS`], which is
+/// where an operator gets told, rather than here, where nobody would see it.
 fn clamp_to_pool(limits: TransactionLimits, connections_per_tenant: usize) -> TransactionLimits {
     TransactionLimits {
         max_open_per_tenant: limits
             .max_open_per_tenant
-            .min(connections_per_tenant.saturating_sub(1).max(1))
-            .max(1),
+            .min(connections_per_tenant.saturating_sub(1)),
         max_open_total: limits.max_open_total.max(1),
         ..limits
     }
@@ -580,7 +892,9 @@ where
     tokio::task::spawn_blocking(move || {
         let mut guard = entry.conn.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
-            Some(pinned) => f(pinned),
+            // Wrapped here as well as in `SqlitePool::with_conn`, because a
+            // pinned connection runs its statements without going through it.
+            Some(pinned) => sqlite::explaining_refusals(|| f(pinned)),
             // Only reachable by racing a commit, a rollback or the deadline:
             // the handle was still open when it was looked up and had ended by
             // the time this statement got the connection.
@@ -628,7 +942,24 @@ impl DatabaseService {
         // to the layout this change replaced, and the tables in it would
         // never be opened again.
         crate::legacy::reject_pre_tenant_database_files(&root)?;
-        tracing::info!(path = %root.display(), "database service ready, one file per tenant");
+        let connections_per_tenant = if connections_per_tenant < MIN_TENANT_CONNECTIONS {
+            tracing::warn!(
+                configured = connections_per_tenant,
+                using = MIN_TENANT_CONNECTIONS,
+                "tenant_connections is below the minimum and has been raised; an interactive \
+                 transaction pins a connection for its whole life, so a pool this small would \
+                 leave a tenant's ordinary queries with nowhere to run until the transaction's \
+                 deadline released it"
+            );
+            MIN_TENANT_CONNECTIONS
+        } else {
+            connections_per_tenant
+        };
+        tracing::info!(
+            path = %root.display(),
+            connections_per_tenant,
+            "database service ready, one file per tenant"
+        );
         Ok(Self {
             root,
             pools: Arc::new(Mutex::new(HashMap::new())),
@@ -671,10 +1002,13 @@ impl DatabaseService {
             path = %path.display(),
             "opening this tenant's database file"
         );
-        let pool = SqlitePool::new(
+        // Guarded, not plain: everything that runs on these connections is
+        // SQL an application sent. See the module docs.
+        let pool = SqlitePool::new_guarded(
             path,
             format!("db:{tenant}"),
             PoolSize::new(self.connections_per_tenant),
+            tenant_sql_authorizer,
         );
         pools.insert(tenant.clone(), pool.clone());
         pool
@@ -687,7 +1021,7 @@ impl DatabaseService {
         sql: &str,
         params: &[SqlValue],
     ) -> StoreResult<ExecOutcome> {
-        let sql = check_sql(sql)?;
+        let sql = check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let params = params.to_vec();
         self.pool(tenant)
             .with_conn(move |conn| {
@@ -698,6 +1032,7 @@ impl DatabaseService {
                 })
             })
             .await
+            .inspect_err(|e| note_refusal(tenant, e))
     }
 
     /// Run one statement and collect its rows.
@@ -707,7 +1042,7 @@ impl DatabaseService {
         sql: &str,
         params: &[SqlValue],
     ) -> StoreResult<ResultSet> {
-        let sql = check_sql(sql)?;
+        let sql = check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let params = params.to_vec();
         self.pool(tenant)
             .with_conn(move |conn| {
@@ -732,6 +1067,7 @@ impl DatabaseService {
                 })
             })
             .await
+            .inspect_err(|e| note_refusal(tenant, e))
     }
 
     /// Run several statements inside one transaction: either all of them
@@ -742,7 +1078,7 @@ impl DatabaseService {
         statements: Vec<(String, Vec<SqlValue>)>,
     ) -> StoreResult<Result<Vec<ExecOutcome>, BatchFailure>> {
         for (sql, _) in &statements {
-            check_sql(sql)?;
+            check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         }
         self.pool(tenant)
             .with_conn(move |conn| {
@@ -760,10 +1096,16 @@ impl DatabaseService {
                             last_insert_id: tx.last_insert_rowid(),
                         }),
                         Err(e) => {
+                            // A batch names the statement that failed rather
+                            // than failing outright, so the refusal is
+                            // collected here instead of by the pool's
+                            // `explaining_refusals`, which only rewrites an
+                            // error that came all the way out.
+                            let message = sqlite::take_refusal().unwrap_or_else(|| e.to_string());
                             // Dropping the transaction rolls it back.
                             return Ok(Err(BatchFailure {
                                 index,
-                                message: e.to_string(),
+                                message,
                                 partial: done,
                             }));
                         }
@@ -777,16 +1119,19 @@ impl DatabaseService {
 
     /// Validate `sql` and remember it under a handle.
     pub async fn register_statement(&self, tenant: &TenantId, sql: &str) -> StoreResult<String> {
-        let sql = check_sql(sql)?;
+        let sql = check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let owned = sql.clone();
         // Prepare it once for real so a syntax error is reported now, at the
-        // call that can explain it, rather than at some later execution.
+        // call that can explain it, rather than at some later execution. A
+        // statement the authorizer refuses is refused here too, for the same
+        // reason and at the same call.
         self.pool(tenant)
             .with_conn(move |conn| {
                 conn.prepare(&owned)?;
                 Ok(())
             })
-            .await?;
+            .await
+            .inspect_err(|e| note_refusal(tenant, e))?;
         let id = self.statements.insert(tenant.clone(), sql);
         tracing::debug!(tenant = %tenant, statement = %id, "prepared statement registered");
         Ok(id)
@@ -892,7 +1237,7 @@ impl DatabaseService {
         sql: &str,
         params: &[SqlValue],
     ) -> StoreResult<ExecOutcome> {
-        let sql = check_transaction_sql(sql)?;
+        let sql = check_transaction_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let entry = self.transactions.resolve(tenant, id)?;
         let params = params.to_vec();
         on_transaction(entry, id.to_string(), move |conn| {
@@ -903,6 +1248,7 @@ impl DatabaseService {
             })
         })
         .await
+        .inspect_err(|e| note_refusal(tenant, e))
     }
 
     /// Run a query inside an open transaction. It sees that transaction's own
@@ -915,7 +1261,7 @@ impl DatabaseService {
         sql: &str,
         params: &[SqlValue],
     ) -> StoreResult<ResultSet> {
-        let sql = check_transaction_sql(sql)?;
+        let sql = check_transaction_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let entry = self.transactions.resolve(tenant, id)?;
         let params = params.to_vec();
         on_transaction(entry, id.to_string(), move |conn| {
@@ -940,6 +1286,7 @@ impl DatabaseService {
             })
         })
         .await
+        .inspect_err(|e| note_refusal(tenant, e))
     }
 
     /// Apply everything the transaction did and release its connection.
@@ -1024,12 +1371,77 @@ pub struct BatchFailure {
 }
 
 /// Refuse SQL that is empty or nothing but whitespace before it reaches the
-/// database, where it would come back as a confusing parse error.
+/// database, where it would come back as a confusing parse error - and refuse
+/// `VACUUM`, which is the one statement whose refusal wants to be said here
+/// rather than left to the authorizer.
+///
+/// The authorizer does refuse `VACUUM INTO`, as the `ATTACH` of the file it
+/// writes, and that is the layer that holds; this one only improves what the
+/// caller is told. It has to, for two reasons the authorizer cannot cover.
+/// The `Attach` action for a vacuum arrives while the statement *runs*, not
+/// while it is prepared, so `Prepare` would accept a `VACUUM INTO`, hand back
+/// a handle, and let the refusal surface at whatever executed it later. And
+/// the sentence it would produce says `ATTACH` about a statement that never
+/// spelled the word.
+///
+/// Which is why [`leading_keyword`] looks past comments and empty statements
+/// rather than reading the first characters it is given: this check is the
+/// only thing standing between `Prepare` and a handle for a statement that
+/// can never run, so a spelling that walks past it costs a caller a refusal
+/// at the wrong call. It is still a keyword check and still not the boundary
+/// - it reads one word, not a parse tree.
 fn check_sql(sql: &str) -> StoreResult<String> {
     if sql.trim().is_empty() {
         return Err(StoreError::InvalidArgument("sql is empty".to_string()));
     }
+    if leading_keyword(sql) == "VACUUM" {
+        return Err(StoreError::Refused(
+            "VACUUM: `VACUUM INTO` writes a copy of this tenant's database wherever the \
+             statement points, and a plain VACUUM rewrites the whole file while holding one of \
+             this tenant's few connections"
+                .to_string(),
+        ));
+    }
     Ok(sql.to_string())
+}
+
+/// The first word of a statement, upper-cased, for the two keyword checks
+/// above and below. Stops at whitespace, `;` or `(`, so `BEGIN;` and
+/// `VACUUM(` are the same word as `BEGIN` and `VACUUM`.
+///
+/// What comes before that word is skipped rather than read: whitespace,
+/// `--` line comments, `/* */` block comments and empty statements. SQLite
+/// ignores all four, so a caller writing `/* x */ VACUUM INTO '<path>'` is
+/// sending a vacuum however it looks to a naive reader, and the checks built
+/// on this exist to name what was refused at the call that sent it. An
+/// unterminated block comment is left where it is: SQLite will reject the
+/// statement, and guessing what it meant to say would be worse than letting
+/// it.
+fn leading_keyword(sql: &str) -> String {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
+        if let Some(after) = rest.strip_prefix("--") {
+            // A line comment runs to the newline, or to the end if there is
+            // none - in which case there is no keyword to find.
+            rest = after.find('\n').map_or("", |end| &after[end + 1..]);
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*") {
+            match after.find("*/") {
+                Some(end) => {
+                    rest = &after[end + 2..];
+                    continue;
+                }
+                None => return String::new(),
+            }
+        }
+        break;
+    }
+    rest.split(|c: char| c.is_whitespace() || c == ';' || c == '(')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase()
 }
 
 /// The same check as [`check_sql`], plus a refusal of the statements that
@@ -1042,12 +1454,7 @@ fn check_sql(sql: &str) -> StoreResult<String> {
 /// four RPCs, and only those.
 fn check_transaction_sql(sql: &str) -> StoreResult<String> {
     let sql = check_sql(sql)?;
-    let leading = sql
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == ';' || c == '(')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase();
+    let leading = leading_keyword(&sql);
     if matches!(
         leading.as_str(),
         "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
@@ -1179,6 +1586,9 @@ fn is_caller_visible(error: &StoreError) -> bool {
             | StoreError::NotFound(_)
             | StoreError::Expired(_)
             | StoreError::Exhausted(_)
+            // The application is the only one who can act on this: it sent
+            // SQL a tenant may not run, and the message names which part.
+            | StoreError::Refused(_)
     )
 }
 
@@ -1221,7 +1631,9 @@ impl DatabaseService {
                 tracing::debug!(tenant = %tenant, error = %e, "sql execute rejected by sqlite");
                 Ok(failed_execute(e.to_string()))
             }
-            Err(e @ StoreError::InvalidArgument(_)) => Ok(failed_execute(e.to_string())),
+            Err(e @ (StoreError::InvalidArgument(_) | StoreError::Refused(_))) => {
+                Ok(failed_execute(e.to_string()))
+            }
             Err(other) => {
                 tracing::error!(
                     tenant = %tenant,
@@ -1258,7 +1670,9 @@ impl DatabaseService {
                 tracing::debug!(tenant = %tenant, error = %e, "sql query rejected by sqlite");
                 Ok(failed_query(e.to_string()))
             }
-            Err(e @ StoreError::InvalidArgument(_)) => Ok(failed_query(e.to_string())),
+            Err(e @ (StoreError::InvalidArgument(_) | StoreError::Refused(_))) => {
+                Ok(failed_query(e.to_string()))
+            }
             Err(other) => {
                 tracing::error!(
                     tenant = %tenant,
@@ -2214,11 +2628,17 @@ mod tests {
     #[tokio::test]
     async fn a_begin_that_never_finishes_gives_its_slot_back() {
         let dir = TempDir::new().unwrap();
-        // One connection, so taking it is enough to park any later caller on
-        // the pool for as long as the test likes.
         let svc = DatabaseService::open(dir.path(), 1).unwrap();
         let a = tenant("app-one.production");
-        let hog = svc.pool(&a).checkout().await.unwrap();
+        // Every connection the pool has, so a later caller parks on the
+        // pool's semaphore for as long as the test likes. All of them, not
+        // one: `open` raises the pool to `MIN_TENANT_CONNECTIONS`, and with a
+        // connection still free the call below can get all the way through
+        // before its deadline is looked at, which is a race, not a test.
+        let mut hogs = Vec::new();
+        for _ in 0..svc.connections_per_tenant {
+            hogs.push(svc.pool(&a).checkout().await.unwrap());
+        }
 
         // A zero timeout polls the call exactly once - long enough to take a
         // slot and park on the pool - and then drops it, which is what tonic
@@ -2234,7 +2654,7 @@ mod tests {
             "the slot taken by a call that never finished has to be given back"
         );
 
-        drop(hog);
+        drop(hogs);
         let tx = svc.open_transaction(&a, None).await.unwrap();
         svc.commit(&a, &tx.id).await.unwrap();
     }
@@ -2380,13 +2800,621 @@ mod tests {
         };
         assert_eq!(clamp_to_pool(asked, 4).max_open_per_tenant, 3);
         assert_eq!(clamp_to_pool(asked, 2).max_open_per_tenant, 1);
-        // A one-connection pool has nothing to hold back, so the clamp stops
-        // at one rather than at zero, which would refuse every transaction.
-        assert_eq!(clamp_to_pool(asked, 1).max_open_per_tenant, 1);
+        // A one-connection pool has nothing to hold back, so the honest
+        // answer is zero: no transaction may pin the only connection its
+        // tenant has. `DatabaseService::open` never builds such a pool.
+        assert_eq!(clamp_to_pool(asked, 1).max_open_per_tenant, 0);
         assert_eq!(
             clamp_to_pool(TransactionLimits::default(), 4).max_open_per_tenant,
             DEFAULT_MAX_OPEN_TRANSACTIONS_PER_TENANT
         );
+    }
+
+    // -----------------------------------------------------------------
+    // A tenant's SQL cannot leave its own file
+    // -----------------------------------------------------------------
+
+    /// What the message has to be for a refusal to be worth anything: the
+    /// caller has to be able to read what it may not do.
+    fn refusal(error: StoreError) -> String {
+        match error {
+            StoreError::Refused(what) => what,
+            other => panic!("expected a refusal, got {other}"),
+        }
+    }
+
+    /// The whole attack, end to end: learn your own path, edit one component,
+    /// open the neighbour's file, read it, write it.
+    #[tokio::test]
+    async fn one_tenant_cannot_attach_another_tenants_file() {
+        let (dir, svc) = service();
+        let victim = tenant("victim.production");
+        let attacker = tenant("attacker.production");
+
+        svc.exec_statement(&victim, "CREATE TABLE secrets(v TEXT)", &[])
+            .await
+            .unwrap();
+        svc.exec_statement(&victim, "INSERT INTO secrets VALUES('card-number')", &[])
+            .await
+            .unwrap();
+
+        // Step one is already refused: the store does not tell a tenant where
+        // its file is, so there is no path to edit.
+        let disclosed = svc
+            .fetch_rows(&attacker, "PRAGMA database_list", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            refusal(disclosed).contains("database_list"),
+            "the refusal has to name the pragma"
+        );
+
+        // Step two is refused even when the path is handed over anyway, which
+        // is the case that matters: knowing the layout must not be enough.
+        let path = dir.path().join("db").join("victim.production.sqlite");
+        let attach = svc
+            .exec_statement(
+                &attacker,
+                &format!("ATTACH DATABASE '{}' AS stolen", path.display()),
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert!(refusal(attach).contains("ATTACH"));
+
+        // Prepare refuses it as well. Unlike VACUUM, this one is the
+        // authorizer speaking: it is consulted while the statement is being
+        // prepared, so there is no handle to come back with later.
+        let prepared = svc
+            .register_statement(
+                &attacker,
+                &format!("ATTACH DATABASE '{}' AS stolen", path.display()),
+            )
+            .await
+            .unwrap_err();
+        assert!(refusal(prepared).contains("ATTACH"));
+
+        // And the victim's rows are still only the victim's.
+        let rows = svc
+            .fetch_rows(&victim, "SELECT v FROM secrets", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.rows, serde_json::json!([{ "v": "card-number" }]));
+    }
+
+    /// The eponymous virtual table spelling of a pragma reaches the same
+    /// authorizer action, so one allowlist covers both. Case too: SQLite
+    /// hands the name over as the caller wrote it.
+    #[tokio::test]
+    async fn the_other_spellings_of_a_refused_pragma_are_refused_too() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        for sql in [
+            "SELECT * FROM pragma_database_list",
+            "PRAGMA DATABASE_LIST",
+            "  \n\t pragma database_list",
+            "PRAGMA main.database_list",
+            "PRAGMA compile_options",
+        ] {
+            let error = svc.fetch_rows(&app, sql, &[]).await.unwrap_err();
+            assert!(
+                matches!(error, StoreError::Refused(_)),
+                "{sql} was not refused: {error}"
+            );
+        }
+    }
+
+    /// Writing a file the caller names, which is the other half of the hole:
+    /// nothing is created outside the tenant's own file.
+    #[tokio::test]
+    async fn a_tenant_cannot_write_a_file_it_names() {
+        let (_dir, svc) = service();
+        let elsewhere = TempDir::new().unwrap();
+        let app = tenant("app-one.production");
+        svc.exec_statement(&app, "CREATE TABLE t(v TEXT)", &[])
+            .await
+            .unwrap();
+
+        let vacuumed = elsewhere.path().join("vacuumed.db");
+        let error = svc
+            .exec_statement(&app, &format!("VACUUM INTO '{}'", vacuumed.display()), &[])
+            .await
+            .unwrap_err();
+        assert!(refusal(error).contains("VACUUM"));
+
+        // Prepare has to refuse it as well, or the handle it returns is a way
+        // to run it later. This is the case the keyword check exists for: the
+        // authorizer only sees the attach while the statement runs.
+        let error = svc
+            .register_statement(&app, &format!("VACUUM INTO '{}'", vacuumed.display()))
+            .await
+            .unwrap_err();
+        assert!(refusal(error).contains("VACUUM"));
+
+        // ATTACH creates the file it names, so it is a second way to write
+        // one; it is refused whether or not the target exists.
+        let created = elsewhere.path().join("created-by-attach.db");
+        let error = svc
+            .exec_statement(
+                &app,
+                &format!("ATTACH DATABASE '{}' AS made", created.display()),
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert!(refusal(error).contains("ATTACH"));
+
+        assert!(
+            !vacuumed.exists(),
+            "VACUUM INTO wrote {}",
+            vacuumed.display()
+        );
+        assert!(!created.exists(), "ATTACH created {}", created.display());
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).unwrap().count(),
+            0,
+            "nothing at all may appear outside the data directory"
+        );
+    }
+
+    /// The floor under the authorizer. Even with the callback removed, a
+    /// connection from a tenant's pool has no attach slot to spend.
+    #[tokio::test]
+    async fn a_tenant_pool_has_no_attach_slots_at_all() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        let attached: i32 = svc
+            .pool(&app)
+            .with_conn(|conn| Ok(conn.limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED)?))
+            .await
+            .unwrap();
+        assert_eq!(attached, 0);
+    }
+
+    /// Refused however they are dressed up, and nothing reaches the file
+    /// system. Which layer catches which of these is deliberately not
+    /// asserted here - the keyword check takes the ones it can name and the
+    /// authorizer takes the rest, and the property that matters is that no
+    /// spelling gets through either.
+    #[tokio::test]
+    async fn creative_spelling_does_not_get_past_the_authorizer() {
+        let (_dir, svc) = service();
+        let elsewhere = TempDir::new().unwrap();
+        let app = tenant("app-one.production");
+        svc.exec_statement(&app, "CREATE TABLE t(v TEXT)", &[])
+            .await
+            .unwrap();
+
+        let copy = elsewhere.path().join("copy.db");
+        let attached = elsewhere.path().join("attached.db");
+        for sql in [
+            format!(
+                "/* not a vacuum, honest */ VACUUM INTO '{}'",
+                copy.display()
+            ),
+            format!("-- a comment\nvAcUuM iNtO '{}'", copy.display()),
+            format!("/* x */ attach database '{}' as made", attached.display()),
+        ] {
+            let error = svc.exec_statement(&app, &sql, &[]).await.unwrap_err();
+            assert!(
+                matches!(error, StoreError::Refused(_)),
+                "{sql} was not refused: {error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).unwrap().count(),
+            0,
+            "a comment must not be enough to write a file"
+        );
+    }
+
+    /// The module docs promise these six by name. They are only available if
+    /// the PRAGMA allowlist lets them build themselves - R*Tree's `xCreate`
+    /// reads `PRAGMA page_size` and fails outright without it - so the
+    /// promise is checked by creating one table with each module and using
+    /// it, not by trusting a compile flag. A future tightening of
+    /// [`TENANT_PRAGMAS`] or [`TENANT_READ_ONLY_PRAGMAS`] breaks this test
+    /// instead of somebody's application.
+    #[tokio::test]
+    async fn every_compiled_in_virtual_table_module_is_usable() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        for sql in [
+            "CREATE VIRTUAL TABLE notes3 USING fts3(body)",
+            "CREATE VIRTUAL TABLE notes4 USING fts4(body)",
+            "CREATE VIRTUAL TABLE notes5 USING fts5(body)",
+            "CREATE VIRTUAL TABLE notes5_terms USING fts5vocab(notes5, 'row')",
+            "CREATE VIRTUAL TABLE pages USING dbstat",
+            "CREATE VIRTUAL TABLE places USING rtree(id, min_x, max_x, min_y, max_y)",
+        ] {
+            svc.exec_statement(&app, sql, &[])
+                .await
+                .unwrap_or_else(|e| panic!("{sql} was refused: {e}"));
+        }
+
+        // Created is not the same as working: each one is written to and read
+        // back through the index it maintains.
+        for table in ["notes3", "notes4", "notes5"] {
+            svc.exec_statement(
+                &app,
+                &format!("INSERT INTO {table}(body) VALUES('a haystack')"),
+                &[],
+            )
+            .await
+            .unwrap();
+            let hits = svc
+                .fetch_rows(
+                    &app,
+                    &format!("SELECT count(*) AS n FROM {table} WHERE body MATCH 'haystack'"),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(hits.rows, serde_json::json!([{ "n": 1 }]), "{table}");
+        }
+        let terms = svc
+            .fetch_rows(&app, "SELECT term FROM notes5_terms ORDER BY term", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            terms.rows,
+            serde_json::json!([{ "term": "a" }, { "term": "haystack" }])
+        );
+
+        svc.exec_statement(
+            &app,
+            "INSERT INTO places(id, min_x, max_x, min_y, max_y) VALUES(1, 0.0, 1.0, 0.0, 1.0)",
+            &[],
+        )
+        .await
+        .unwrap();
+        let inside = svc
+            .fetch_rows(
+                &app,
+                "SELECT id FROM places WHERE min_x <= 0.5 AND max_x >= 0.5",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(inside.rows, serde_json::json!([{ "id": 1 }]));
+
+        // dbstat reports on the tenant's own pages, which is also where the
+        // page size it may read is visible anyway.
+        let pages = svc
+            .fetch_rows(&app, "SELECT count(*) AS n FROM pages", &[])
+            .await
+            .unwrap();
+        assert!(
+            pages.rows[0]["n"].as_i64().unwrap_or_default() > 0,
+            "dbstat returned nothing: {:?}",
+            pages.rows
+        );
+    }
+
+    /// `page_size` is readable because R*Tree needs it and it discloses
+    /// nothing - the caller's own page size, already in `dbstat.pgsize`.
+    /// Setting it is a different statement and stays refused.
+    #[tokio::test]
+    async fn a_read_only_pragma_may_be_read_and_not_set() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        for name in TENANT_READ_ONLY_PRAGMAS {
+            let read = svc
+                .fetch_rows(&app, &format!("PRAGMA {name}"), &[])
+                .await
+                .unwrap_or_else(|e| panic!("PRAGMA {name} was refused: {e}"));
+            let before = read.rows[0][*name].as_i64();
+            assert!(before.is_some(), "PRAGMA {name} returned {:?}", read.rows);
+
+            for sql in [
+                format!("PRAGMA {name} = 8192"),
+                format!("PRAGMA main.{name} = 8192"),
+            ] {
+                let what = refusal(svc.exec_statement(&app, &sql, &[]).await.unwrap_err());
+                assert!(
+                    what.starts_with(&format!("PRAGMA {name}")) && what.contains("may only read"),
+                    "{sql} was not refused as a write: {what}"
+                );
+            }
+            // And the write did not take: the file is what it was.
+            let again = svc
+                .fetch_rows(&app, &format!("PRAGMA {name}"), &[])
+                .await
+                .unwrap();
+            assert_eq!(again.rows[0][*name].as_i64(), before, "PRAGMA {name}");
+        }
+    }
+
+    /// SQLite only shows the authorizer an `ATTACH` filename when it is a
+    /// string literal, so these two spellings arrive with the name missing.
+    /// They have to be refused on the action alone: left to
+    /// `SQLITE_LIMIT_ATTACHED` they come back as "too many attached
+    /// databases", which tells the caller nothing and - because it is not a
+    /// [`StoreError::Refused`], the one variant [`note_refusal`] logs - puts
+    /// no line in front of an operator watching for a tenant probing at this.
+    #[tokio::test]
+    async fn an_attach_that_hides_its_filename_is_refused_like_any_other() {
+        let (dir, svc) = service();
+        let elsewhere = TempDir::new().unwrap();
+        let app = tenant("app-one.production");
+        let victim = dir.path().join("db").join("victim.production.sqlite");
+        let created = elsewhere.path().join("made.db");
+
+        for sql in [
+            format!("ATTACH DATABASE ('{}' || '') AS stolen", victim.display()),
+            format!("ATTACH DATABASE (SELECT '{}') AS stolen", victim.display()),
+            format!("ATTACH DATABASE ('{}' || '') AS made", created.display()),
+            "ATTACH DATABASE (SELECT char(47)) AS made".to_string(),
+            "DETACH DATABASE ('stolen' || '')".to_string(),
+        ] {
+            let error = svc.exec_statement(&app, &sql, &[]).await.unwrap_err();
+            let what = refusal(error);
+            assert!(
+                what.starts_with("ATTACH") || what.starts_with("DETACH"),
+                "{sql} said: {what}"
+            );
+            // The message has to admit the filename is missing rather than
+            // print an empty one as if SQLite had handed it over.
+            assert!(
+                !what.contains("named \"\""),
+                "{sql} claimed a filename it never had: {what}"
+            );
+        }
+
+        // Prepare refuses them too, because the authorizer runs while the
+        // statement is prepared: no handle comes back to run later.
+        let prepared = svc
+            .register_statement(
+                &app,
+                &format!("ATTACH DATABASE (SELECT '{}') AS x", victim.display()),
+            )
+            .await
+            .unwrap_err();
+        assert!(refusal(prepared).starts_with("ATTACH"));
+
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).unwrap().count(),
+            0,
+            "an expression filename must not be enough to create a file"
+        );
+    }
+
+    /// `Prepare` is where a caller can still do something about a refusal,
+    /// and it is the only call that ever sees a `VACUUM INTO` before it runs:
+    /// the authorizer is shown the vacuum's `ATTACH` by *running* the vacuum.
+    /// So the keyword check has to read the word SQLite would read, past
+    /// whatever the caller put in front of it - and say `VACUUM`, not
+    /// `ATTACH`, about a statement that never spelled `ATTACH`.
+    #[tokio::test]
+    async fn prepare_refuses_a_vacuum_however_it_is_spelled() {
+        let (_dir, svc) = service();
+        let elsewhere = TempDir::new().unwrap();
+        let app = tenant("app-one.production");
+        let copy = elsewhere.path().join("copy.db");
+
+        for sql in [
+            format!("VACUUM INTO '{}'", copy.display()),
+            format!("/* x */ VACUUM INTO '{}'", copy.display()),
+            format!("-- x\nvacuum into '{}'", copy.display()),
+            format!("; VACUUM INTO '{}'", copy.display()),
+            format!("/* a */ /* b */\n\t;-- c\nVACUUM INTO '{}'", copy.display()),
+            "VACUUM".to_string(),
+        ] {
+            let error = svc.register_statement(&app, &sql).await.unwrap_err();
+            let what = refusal(error);
+            assert!(what.starts_with("VACUUM"), "Prepare of {sql} said: {what}");
+        }
+
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).unwrap().count(),
+            0,
+            "no vacuum may have run"
+        );
+        assert_eq!(
+            svc.statements.len(),
+            0,
+            "no handle may have been handed out for a statement that can never run"
+        );
+    }
+
+    /// The word the checks above are reading. An unterminated block comment
+    /// is left alone on purpose: SQLite rejects the statement, and there is
+    /// no keyword to guess at.
+    #[test]
+    fn the_leading_keyword_is_the_one_sqlite_would_read() {
+        for (sql, want) in [
+            ("VACUUM", "VACUUM"),
+            ("  vacuum into 'x'", "VACUUM"),
+            ("/* c */VACUUM", "VACUUM"),
+            ("-- c\nVACUUM", "VACUUM"),
+            ("--c", ""),
+            (";;\n/* a */ ; -- b\n\tVACUUM", "VACUUM"),
+            ("/* unterminated VACUUM", ""),
+            ("SELECT 1; VACUUM", "SELECT"),
+            ("BEGIN;", "BEGIN"),
+            ("VACUUM(", "VACUUM"),
+            ("", ""),
+        ] {
+            assert_eq!(leading_keyword(sql), want, "{sql:?}");
+        }
+    }
+
+    /// The refusal an application actually sees, spelled out. A message that
+    /// only said "not authorized" would send a developer to the wrong place.
+    #[tokio::test]
+    async fn a_refusal_says_what_was_refused() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        for (sql, wanted) in [
+            (
+                "ATTACH DATABASE '/tmp/other.sqlite' AS x",
+                "refused: ATTACH, because a tenant's SQL reaches its own database file",
+            ),
+            (
+                "PRAGMA database_list",
+                "refused: PRAGMA database_list, because a tenant may run only",
+            ),
+            (
+                "VACUUM INTO '/tmp/copy.db'",
+                "refused: VACUUM: `VACUUM INTO` writes a copy of this tenant's database",
+            ),
+        ] {
+            let text = svc
+                .exec_statement(&app, sql, &[])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(text.starts_with(wanted), "{sql} said: {text}");
+        }
+    }
+
+    /// Still refused, and now with a message that says what it was.
+    #[tokio::test]
+    async fn load_extension_stays_refused() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        let error = svc
+            .fetch_rows(&app, "SELECT load_extension('/tmp/anything.so')", &[])
+            .await
+            .unwrap_err();
+        assert!(refusal(error).contains("load_extension"));
+    }
+
+    /// The allowlist has to leave an ordinary application working: its own
+    /// schema, its own version counter, its own temporary tables.
+    #[tokio::test]
+    async fn the_ordinary_things_an_application_does_still_work() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        svc.exec_statement(
+            &app,
+            "CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
+        svc.exec_statement(&app, "CREATE INDEX by_name ON people(name)", &[])
+            .await
+            .unwrap();
+        svc.exec_statement(&app, "PRAGMA user_version = 7", &[])
+            .await
+            .unwrap();
+        svc.exec_statement(&app, "CREATE TEMP TABLE scratch(v TEXT)", &[])
+            .await
+            .unwrap();
+
+        let version = svc
+            .fetch_rows(&app, "PRAGMA user_version", &[])
+            .await
+            .unwrap();
+        assert_eq!(version.rows, serde_json::json!([{ "user_version": 7 }]));
+
+        let columns = svc
+            .fetch_rows(&app, "SELECT name FROM pragma_table_info('people')", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            columns.rows,
+            serde_json::json!([{ "name": "id" }, { "name": "name" }])
+        );
+
+        let indexes = svc
+            .fetch_rows(&app, "PRAGMA index_list('people')", &[])
+            .await
+            .unwrap();
+        assert_eq!(indexes.rows.as_array().map(Vec::len), Some(1));
+    }
+
+    /// A refusal reaches the application through the response body, not as a
+    /// transport fault: the store is not down, this application asked for
+    /// something it may not have.
+    #[tokio::test]
+    async fn a_refusal_comes_back_in_the_response_the_application_reads() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        let response = svc
+            .query(tagged(
+                &app,
+                QueryRequest {
+                    sql: "PRAGMA database_list".to_string(),
+                    params: None,
+                },
+            ))
+            .await
+            .expect("a refused statement is not a transport failure")
+            .into_inner();
+        assert!(!response.success);
+        let message = response.error.expect("a failed query carries its reason");
+        assert!(message.contains("database_list"), "{message}");
+    }
+
+    /// Inside a batch the refusal has to name the statement it belongs to,
+    /// and nothing before it may survive.
+    #[tokio::test]
+    async fn a_refused_statement_inside_a_batch_names_itself_and_rolls_the_batch_back() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        svc.exec_statement(&app, "CREATE TABLE t(v TEXT)", &[])
+            .await
+            .unwrap();
+        let failure = svc
+            .exec_batch(
+                &app,
+                vec![
+                    ("INSERT INTO t VALUES('kept?')".to_string(), Vec::new()),
+                    (
+                        "ATTACH DATABASE '/tmp/whatever.db' AS x".to_string(),
+                        Vec::new(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap()
+            .expect_err("the batch must fail");
+        assert_eq!(failure.index, 1);
+        assert!(failure.message.contains("ATTACH"), "{}", failure.message);
+
+        let rows = svc.fetch_rows(&app, "SELECT v FROM t", &[]).await.unwrap();
+        assert_eq!(rows.rows, serde_json::json!([]));
+    }
+
+    /// The same policy applies on a pinned connection, which does not go
+    /// through the pool's ordinary path.
+    #[tokio::test]
+    async fn an_interactive_transaction_is_held_to_the_same_policy() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        let handle = svc.open_transaction(&app, None).await.unwrap();
+        let error = svc
+            .fetch_rows_in_transaction(&app, &handle.id, "PRAGMA database_list", &[])
+            .await
+            .unwrap_err();
+        assert!(refusal(error).contains("database_list"));
+        svc.roll_back(&app, &handle.id).await.unwrap();
+    }
+
+    /// The configured value is raised rather than believed, so the clamp
+    /// above can actually leave a connection back.
+    #[tokio::test]
+    async fn a_pool_too_small_to_spare_a_connection_is_raised() {
+        let dir = TempDir::new().unwrap();
+        let svc = DatabaseService::open(dir.path(), 1).unwrap();
+        assert_eq!(svc.connections_per_tenant, MIN_TENANT_CONNECTIONS);
+        assert_eq!(svc.transaction_limits().max_open_per_tenant, 1);
+
+        // And that spare connection is real: a transaction that is opened and
+        // never ended does not stop the tenant's ordinary queries.
+        let app = tenant("app-one.production");
+        svc.exec_statement(&app, "CREATE TABLE t(v INTEGER)", &[])
+            .await
+            .unwrap();
+        let abandoned = svc.open_transaction(&app, None).await.unwrap();
+        let rows = svc
+            .fetch_rows(&app, "SELECT count(*) AS n FROM t", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.rows, serde_json::json!([{ "n": 0 }]));
+        svc.roll_back(&app, &abandoned.id).await.unwrap();
     }
 
     #[tokio::test]

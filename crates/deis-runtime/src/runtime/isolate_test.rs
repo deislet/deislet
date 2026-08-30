@@ -181,7 +181,7 @@ export default function handler(context: any): Response {
     fn leased(id: &str, body: &str, attempts: i32) -> LeasedMessage {
         LeasedMessage {
             id: id.to_string(),
-            body: body.to_string(),
+            body: body.as_bytes().to_vec(),
             attempts,
             lease_expires_at: 0,
             created_at: 1_700_000_000,
@@ -2046,6 +2046,91 @@ export default function handler(context: any): Response {
         "BroadcastChannel",
     ];
 
+    /// The budget has to hold against code that never lets the runtime thread
+    /// go, which is the only version an attacker writes.
+    ///
+    /// This is the case a `tokio::spawn`ed timer cannot cover, and it was not
+    /// covered for a long time: each isolate runs on a `current_thread`
+    /// runtime, and a handler that never awaits never lets that runtime poll
+    /// the timer that was supposed to stop it. Measured at 75 seconds against
+    /// a 300 ms budget. A test that spun on `await` instead would have passed
+    /// the whole time, which is why the loop below is deliberately
+    /// synchronous, and why the same handler serves a second, ordinary path:
+    /// a cut-off that took the isolate with it would be no better than one
+    /// that never fired.
+    #[tokio::test]
+    async fn a_handler_that_never_yields_is_still_cut_off() {
+        let code = r#"
+            export default function handler(context) {
+                if (new URL(context.request.url).pathname === "/spin") {
+                    while (true) {}
+                }
+                return new Response("ok");
+            }
+        "#;
+        let mut runtime = AppRuntime::new(
+            "spinning_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec {
+                limits: ExecutionLimits {
+                    timeout_ms: 300,
+                    ..ExecutionLimits::default()
+                },
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let (tx, rx) = oneshot::channel();
+        let outcome = runtime
+            .execute_fetch(
+                "http://localhost/spin".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "a handler that was cut off must fail the invocation, not answer it"
+        );
+        // Generous against a loaded machine, and still two orders of magnitude
+        // below the failure it guards: unbounded meant minutes, not
+        // milliseconds.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the 300ms budget did not stop a synchronous loop; it ran for {elapsed:?}"
+        );
+        assert!(
+            rx.await.is_err(),
+            "the response channel must be closed rather than left open forever"
+        );
+
+        // The same isolate goes back to serving. A cut-off that left the
+        // termination flag set would be spent on the next request instead,
+        // which is how one handler's loop becomes every request's problem.
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the isolate serves again after a cut-off");
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+    }
+
     #[tokio::test]
     async fn the_isolate_global_surface_is_the_one_the_documents_describe() {
         let names: Vec<&str> = CANON_GLOBALS_PRESENT
@@ -3132,6 +3217,87 @@ export default function handler(context: any): Response {
         assert_eq!(
             seen[1]["after"], seen[1]["before"],
             "an interval from the first request was still firing during the second: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interval_does_not_outlive_a_request_that_was_cut_off() {
+        // The sweep the test above relies on lives at the end of
+        // `__deis_runtime_wait_until_all`, and that is reached only by an
+        // invocation that settles. A request that overruns its budget returns
+        // before it -- and overrunning is the one thing an application decides
+        // for itself, so the guarantee was off on exactly the path an
+        // application controls. Measured before this was fixed: 138 interval
+        // callbacks of the cut-off request firing inside the next one, on the
+        // next request's budget.
+        let code = r#"
+            globalThis.__ticks = 0;
+            export default async function handler(ctx) {
+                if (new URL(ctx.request.url).pathname === "/arm") {
+                    setInterval(() => { globalThis.__ticks++; }, 1);
+                    // Never settles: this invocation ends in its budget.
+                    await new Promise(() => {});
+                    return new Response("unreachable");
+                }
+                const before = globalThis.__ticks;
+                await new Promise((resolve) => setTimeout(resolve, 100));
+                return new Response(JSON.stringify({ before, after: globalThis.__ticks }));
+            }
+        "#;
+
+        let spec = IsolateSpec {
+            limits: ExecutionLimits {
+                timeout_ms: 500,
+                ..ExecutionLimits::default()
+            },
+            ..IsolateSpec::default()
+        };
+        let mut runtime = AppRuntime::new(
+            "interval-cutoff.production".to_string(),
+            code.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        let armed = runtime
+            .execute_fetch(
+                "http://localhost/arm".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await;
+        assert!(
+            armed.is_err(),
+            "the invocation was expected to be cut off by its execution budget"
+        );
+        drop(rx);
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/check".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the isolate must serve again after a request was cut off");
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body).unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            seen["after"], seen["before"],
+            "an interval armed by a request that was cut off was still firing inside the next \
+             request: {seen}"
         );
     }
 

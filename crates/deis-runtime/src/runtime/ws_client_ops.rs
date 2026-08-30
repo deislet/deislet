@@ -52,17 +52,49 @@
 //! An isolate is reused across requests, so a socket that outlives the request
 //! that opened it becomes a socket the *next* request finds already open --
 //! charged to the node, attached to no one, and reachable from a handler
-//! serving somebody else's traffic. Two things prevent that, and neither
-//! depends on the application being well behaved:
+//! serving somebody else's traffic. Three things prevent that, and none of
+//! them depends on the application being well behaved:
 //!
-//! * a socket may only be opened while an invocation is in flight, and it is
-//!   force-closed no later than that invocation's execution deadline. The
-//!   pump task below owns the connection and drops it at that instant, which
-//!   is the same instant the isolate itself would be cut off;
+//! * a socket may only be opened while an invocation is in flight, so there is
+//!   always something whose end it can be tied to;
+//! * [`WsState::close_all`] closes every socket this isolate holds when that
+//!   invocation ends, and `runtime/isolate.rs` calls it on every path out of
+//!   one -- the answered request, the `waitUntil` tail that follows it, a
+//!   handler that threw, and the cut-off. This is the guarantee the rest rests
+//!   on: the connection is gone before anything else runs in this isolate, so
+//!   no frame can arrive while no invocation is running;
 //! * every op that touches a socket checks that the invocation which opened it
-//!   is still the one running. A handler that stashed a socket on `globalThis`
-//!   and reached for it during a later request gets an error saying so, and
-//!   the socket is closed rather than reused.
+//!   is still the one running -- [`op_deis_ws_next_event`] *after* its wait as
+//!   well as before it, because a read that was already pending when the
+//!   invocation ended would otherwise hand the next request a frame the peer
+//!   addressed to its predecessor, and run that request's message listener on
+//!   that request's budget. A handler that stashed a socket on `globalThis`
+//!   and reached for it during a later request gets an error saying so.
+//!
+//! The object in the isolate has to know it too, which is what
+//! [`op_deis_ws_invocation`] is for. The sweep happens out here, and a
+//! `WebSocket` that was never told about it went on reporting `readyState: 1`
+//! into the next request while `send()` on it threw -- so the ordinary guard,
+//! `if (ws.readyState === WebSocket.OPEN)`, took the branch that raises rather
+//! than the branch that does nothing. Worse, the rejection of the read that
+//! was pending when the sweep ran arrived *inside the next invocation*, and
+//! `js/ws_client.js` turned it into `error` and `close` events -- the
+//! application's listeners, running on a request that had nothing to do with
+//! them. The class compares the invocation number it was built in against the
+//! one this op reports, so a reclaimed socket reads CLOSED from the first line
+//! of the next request and dispatches nothing at all.
+//!
+//! The pump task keeps a deadline of its own as a backstop, for the case where
+//! the runtime thread never comes back to close anything. It follows the
+//! invocation rather than one fixed instant: the `waitUntil` tail runs under a
+//! budget of its own and is the one place a socket may legitimately still be
+//! open after the response has gone out, so once the tail starts its deadline
+//! is the one the socket is held to.
+//!
+//! "The same invocation" is a number and not the execution deadline: the tail
+//! arms a second deadline and is nonetheless the same invocation, so a socket
+//! opened during the request would have looked like a stranger's the moment
+//! the tail began. See [`WsState`].
 //!
 //! # A cap on how many
 //!
@@ -72,7 +104,7 @@
 //! the connection is refused with a message that names the limit, rather than
 //! being queued behind sockets that may never close.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
@@ -90,7 +122,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -99,6 +131,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::runtime::fetch_policy::{loggable, FetchPolicy};
+use crate::runtime::isolate::OutboundSockets;
 use crate::runtime::ops::{AppId, ExecutionDeadline};
 
 /// How many outbound sockets one isolate may hold open at once.
@@ -240,10 +273,10 @@ struct OpenSocket {
     /// Bytes handed to the pump task and not yet written. Shared with it:
     /// this op layer adds, the pump subtracts once a frame is on the wire.
     buffered: Arc<AtomicUsize>,
-    /// The execution deadline that was in force when this socket was opened.
-    /// It identifies the invocation: a different deadline means a different
-    /// request, and this socket does not belong to it.
-    opened_under: Instant,
+    /// Which invocation opened this socket. A different number means a
+    /// different request, and this socket does not belong to it. See
+    /// [`WsState::epoch`] for why the execution deadline cannot say this.
+    opened_in: u64,
     /// The destination, with any credentials stripped, for the log line when
     /// this socket is closed out from under the application.
     destination: String,
@@ -254,6 +287,13 @@ struct OpenSocket {
 struct WsClients {
     next_rid: u32,
     open: HashMap<u32, OpenSocket>,
+    /// The handles the last invocation left open when it ended, and where each
+    /// went. Kept only so that a handler reaching for one is told what became
+    /// of it instead of the flat "there is no connection behind it any more",
+    /// which is true but says nothing about why. Refilled from scratch by
+    /// [`Self::revoke_all`], so it never holds more than one invocation's
+    /// worth of entries.
+    revoked: HashMap<u32, String>,
 }
 
 impl WsClients {
@@ -273,36 +313,96 @@ impl WsClients {
     fn forget_closed(&mut self) {
         self.open.retain(|_, socket| !socket.outgoing.is_closed());
     }
+
+    /// Close every socket, and answer how many there were.
+    ///
+    /// Dropping an entry drops the only handle on its pump task's command
+    /// channel, which ends the task, which drops the connection: closing a
+    /// socket here *is* removing it from this map. What is left behind is the
+    /// destination, for the error the application gets if it reaches for the
+    /// socket afterwards.
+    fn revoke_all(&mut self) -> usize {
+        self.revoked.clear();
+        for (rid, socket) in self.open.drain() {
+            self.revoked.insert(rid, socket.destination);
+        }
+        self.revoked.len()
+    }
 }
 
-/// The registry for this isolate, created on first use.
+/// One isolate's outbound sockets, and what they need to know about the
+/// invocation that owns them.
+struct WsState {
+    clients: RefCell<WsClients>,
+
+    /// Which invocation is running, counted rather than timed.
+    ///
+    /// The execution deadline cannot serve as this identity. The `waitUntil`
+    /// tail arms a second deadline of its own -- it has to, the request's is
+    /// spent by the time the tail starts -- and the tail is still the same
+    /// invocation, the one place where a socket opened during the request may
+    /// legitimately still be open. Compared against a deadline, every such
+    /// socket became a stranger's the instant the tail began.
+    epoch: Cell<u64>,
+
+    /// When the invocation running now runs out, as the pump tasks read it.
+    ///
+    /// A watch rather than a copy handed out at connect time so the pumps
+    /// follow the invocation into its tail instead of cutting their sockets
+    /// off at a budget that is already spent.
+    deadline: watch::Sender<Instant>,
+}
+
+impl WsState {
+    fn new() -> Self {
+        // Stands in only until the first `op_deis_ws_connect`, which republishes
+        // the deadline actually in force before any pump subscribes.
+        let (deadline, _) = watch::channel(Instant::now());
+        Self {
+            clients: RefCell::new(WsClients::default()),
+            epoch: Cell::new(0),
+            deadline,
+        }
+    }
+}
+
+impl OutboundSockets for WsState {
+    fn begin_invocation(&self) {
+        self.epoch.set(self.epoch.get().wrapping_add(1));
+    }
+
+    fn deadline_is(&self, at: Instant) {
+        self.deadline.send_replace(at);
+    }
+
+    fn close_all(&self) -> usize {
+        self.clients.borrow_mut().revoke_all()
+    }
+}
+
+/// This isolate's socket state, created on first use.
 ///
 /// Installed lazily rather than in the extension's state closure so that no op
 /// can ever find it missing: an op that panicked reaching for absent state
 /// would panic inside a V8 callback, which cannot unwind, and would take the
 /// whole node process down with every other application on it.
-fn clients(state: &mut OpState) -> Rc<RefCell<WsClients>> {
-    if let Some(existing) = state.try_borrow::<Rc<RefCell<WsClients>>>() {
+///
+/// Stored twice, as the same allocation: under its own type for the ops here,
+/// and as [`OutboundSockets`] for `runtime/isolate.rs`, which ends invocations
+/// and has no path by which to name the rest of this module.
+fn ws_state(state: &mut OpState) -> Rc<WsState> {
+    if let Some(existing) = state.try_borrow::<Rc<WsState>>() {
         return existing.clone();
     }
-    let created = Rc::new(RefCell::new(WsClients::default()));
+    let created = Rc::new(WsState::new());
+    state.put::<Rc<dyn OutboundSockets>>(created.clone());
     state.put(created.clone());
     created
 }
 
 /// Whether the invocation that opened a socket is still the one running.
-///
-/// `None` -- no deadline armed -- is read as "still the same invocation": that
-/// is the `waitUntil` tail, which runs with the clock stopped and is the same
-/// request finishing its work. A *different* deadline is a different request.
-fn still_the_same_invocation(state: &OpState, opened_under: Instant) -> bool {
-    match state
-        .try_borrow::<ExecutionDeadline>()
-        .and_then(|slot| slot.get())
-    {
-        None => true,
-        Some(current) => current == opened_under,
-    }
+fn still_the_same_invocation(state: &mut OpState, opened_in: u64) -> bool {
+    ws_state(state).epoch.get() == opened_in
 }
 
 /// Why one outbound socket was not opened.
@@ -579,24 +679,47 @@ async fn dial(
 /// application, the invocation's execution deadline, and the registry entry
 /// going away. Whichever it is, the task returns and the connection is dropped
 /// with it.
+///
+/// The registry entry going away is the ordinary end of a socket, not the
+/// exceptional one: `runtime/isolate.rs` drops every entry when the invocation
+/// ends. `deadline` is the backstop for the case where it never gets to.
 async fn pump(
     mut socket: ClientSocket,
     mut outgoing: mpsc::UnboundedReceiver<Outgoing>,
     incoming: mpsc::UnboundedSender<Incoming>,
     buffered: Arc<AtomicUsize>,
-    deadline: Instant,
+    mut deadline: watch::Receiver<Instant>,
     app_id: String,
     destination: String,
 ) {
-    let cutoff = tokio::time::sleep_until(deadline.into());
+    let mut cut_off_at = *deadline.borrow_and_update();
+    // Watched only while there is somebody to hear from: a sender that has
+    // gone away leaves the last deadline in force, and a `changed()` on a
+    // closed watch is ready forever, which would spin this loop.
+    let mut following = true;
+
+    let cutoff = tokio::time::sleep_until(cut_off_at.into());
     tokio::pin!(cutoff);
 
     loop {
         tokio::select! {
-            // The invocation's budget. Terminating V8 does nothing to a socket
-            // this task holds, so without this branch a connection an
-            // application opened and then stopped waiting for would outlive
-            // the request by however long the peer felt like keeping it.
+            // The invocation moved on -- to its `waitUntil` tail, which has a
+            // budget of its own and is where a socket opened by the request is
+            // still allowed to be open. The socket is held to that instead.
+            changed = deadline.changed(), if following => {
+                match changed {
+                    Ok(()) => {
+                        cut_off_at = *deadline.borrow_and_update();
+                        cutoff.as_mut().reset(cut_off_at.into());
+                    }
+                    Err(_) => following = false,
+                }
+            }
+
+            // The backstop. Terminating V8 does nothing to a socket this task
+            // holds, so without this branch a connection an application opened
+            // and then stopped waiting for would outlive the request by
+            // however long the peer felt like keeping it.
             _ = &mut cutoff => {
                 tracing::warn!(
                     target: "app",
@@ -623,7 +746,7 @@ async fn pump(
                     // budget to say it in.
                     None => {
                         let _ = tokio::time::timeout_at(
-                            deadline.into(),
+                            cut_off_at.into(),
                             socket.close(Some(CloseFrame {
                                 code: CloseCode::Away,
                                 reason: "the invocation that opened this socket has ended".into(),
@@ -633,7 +756,7 @@ async fn pump(
                     }
                     Some(Outgoing::Close { code, reason }) => {
                         let frame = CloseFrame { code: CloseCode::from(code), reason: reason.clone().into() };
-                        let _ = tokio::time::timeout_at(deadline.into(), socket.close(Some(frame))).await;
+                        let _ = tokio::time::timeout_at(cut_off_at.into(), socket.close(Some(frame))).await;
                         let _ = incoming.send(Incoming::Close { code, reason });
                         break;
                     }
@@ -648,7 +771,7 @@ async fn pump(
                         // that accepts a connection and then stops reading
                         // would otherwise hold this task -- and the socket --
                         // past the request it belongs to.
-                        let written = tokio::time::timeout_at(deadline.into(), socket.send(frame)).await;
+                        let written = tokio::time::timeout_at(cut_off_at.into(), socket.send(frame)).await;
                         buffered.fetch_sub(queued, Ordering::Relaxed);
                         match written {
                             Ok(Ok(())) => {}
@@ -746,7 +869,7 @@ async fn op_deis_ws_connect(
     budget_ms: f64,
     #[serde] protocols: Vec<String>,
 ) -> Result<Opened, JsErrorBox> {
-    let (policy, app_id, deadline, registry) = {
+    let (policy, app_id, deadline, sockets, asked_in) = {
         let mut state = state.borrow_mut();
         let policy = state.try_borrow::<FetchPolicy>().cloned();
         let app_id = state
@@ -756,8 +879,9 @@ async fn op_deis_ws_connect(
         let deadline = state
             .try_borrow::<ExecutionDeadline>()
             .and_then(|slot| slot.get());
-        let registry = clients(&mut state);
-        (policy, app_id, deadline, registry)
+        let sockets = ws_state(&mut state);
+        let asked_in = sockets.epoch.get();
+        (policy, app_id, deadline, sockets, asked_in)
     };
 
     let destination = loggable(&url);
@@ -801,7 +925,7 @@ async fn op_deis_ws_connect(
     };
 
     {
-        let mut registry = registry.borrow_mut();
+        let mut registry = sockets.clients.borrow_mut();
         registry.forget_closed();
         let open = registry.open.len();
         if open >= MAX_OPEN_SOCKETS {
@@ -898,26 +1022,55 @@ async fn op_deis_ws_connect(
         }
     };
 
+    // The dial can outlast the invocation that asked for it. The event loop is
+    // driven until the handler's promise settles, not until it is idle, so a
+    // handler that constructed a `WebSocket` and answered without awaiting it
+    // leaves this op in flight; the sweep at the end of that invocation cannot
+    // see a socket that does not exist yet, and registering it here would hand
+    // the *next* request a live connection nobody asked for. Dropping `opened`
+    // closes it, which is the whole of the cleanup.
+    if sockets.epoch.get() != asked_in {
+        tracing::warn!(
+            target: "app",
+            app_id = %app_id,
+            destination = %destination,
+            "Dropped an outbound WebSocket from {} to {}: the connection came up after the \
+             invocation that asked for it had ended, so there was nothing left to charge it to. \
+             Await the open event inside the request that opens the socket",
+            app_id,
+            destination
+        );
+        return Err(JsErrorBox::type_error(format!(
+            "the WebSocket to {destination} came up after the invocation that opened it had \
+             ended, and was closed: a socket does not outlive the request that opened it"
+        )));
+    }
+
     let (socket, protocol, extensions) = opened;
     let (to_socket, from_js) = mpsc::unbounded_channel();
     let (to_js, from_socket) = mpsc::unbounded_channel();
     let buffered = Arc::new(AtomicUsize::new(0));
+
+    // The watch is seeded here rather than trusted to have been published
+    // already: this is the one moment where the deadline in force and the
+    // socket about to be held to it are both in hand.
+    sockets.deadline_is(deadline);
 
     tokio::spawn(pump(
         socket,
         from_js,
         to_js,
         buffered.clone(),
-        deadline,
+        sockets.deadline.subscribe(),
         app_id.clone(),
         destination.clone(),
     ));
 
-    let rid = registry.borrow_mut().insert(OpenSocket {
+    let rid = sockets.clients.borrow_mut().insert(OpenSocket {
         outgoing: to_socket,
         incoming: Rc::new(Mutex::new(from_socket)),
         buffered,
-        opened_under: deadline,
+        opened_in: asked_in,
         destination: destination.clone(),
     });
 
@@ -940,23 +1093,18 @@ async fn op_deis_ws_connect(
 
 /// The error an application gets for a socket that is no longer its own.
 ///
-/// Closing it here rather than merely refusing the call is the point: a
-/// handler that kept a socket across requests must not be able to keep it
-/// *open* across them either.
-fn not_this_invocation(
-    registry: &Rc<RefCell<WsClients>>,
-    app_id: &str,
-    rid: u32,
-    destination: &str,
-) -> JsErrorBox {
-    registry.borrow_mut().open.remove(&rid);
+/// The socket itself is already closed by the time anyone can see this --
+/// `close_all` ran when the invocation ended. What is left to do is to say so,
+/// once, in terms the application can act on.
+fn not_this_invocation(app_id: &str, destination: &str) -> JsErrorBox {
     tracing::warn!(
         target: "app",
         app_id = %app_id,
         destination = %destination,
-        "Closed {}'s outbound WebSocket to {}: it was opened by an earlier invocation and used \
-         from a later one. An isolate is reused across requests, so a socket that outlived the \
-         request that opened it would be shared with somebody else's traffic",
+        "App {} reached for its outbound WebSocket to {} from a later invocation than the one \
+         that opened it; the socket was closed when that invocation ended. An isolate is reused \
+         across requests, so a socket that outlived the request that opened it would be shared \
+         with somebody else's traffic",
         app_id,
         destination
     );
@@ -965,6 +1113,21 @@ fn not_this_invocation(
          a socket does not outlive the request that opened it. Open one inside the request that \
          uses it"
     ))
+}
+
+/// The error for a handle with nothing behind it.
+///
+/// Which of the two answers it is matters to the application: a socket the
+/// platform reclaimed at the end of an invocation is a different mistake from
+/// one the peer closed, and only the first has an instruction attached.
+fn no_socket_behind(sockets: &Rc<WsState>, app_id: &str, rid: u32) -> JsErrorBox {
+    let destination = sockets.clients.borrow_mut().revoked.remove(&rid);
+    match destination {
+        Some(destination) => not_this_invocation(app_id, &destination),
+        None => JsErrorBox::type_error(
+            "this WebSocket is closed: there is no connection behind it any more",
+        ),
+    }
 }
 
 /// Look one socket up and confirm it still belongs to the invocation running.
@@ -981,24 +1144,27 @@ fn borrow_socket<T>(
         .try_borrow::<AppId>()
         .map(|app| app.0.clone())
         .unwrap_or_default();
-    let registry = clients(state);
+    let sockets = ws_state(state);
 
-    let (taken, belongs, destination) = {
-        let registry_ref = registry.borrow();
-        let Some(socket) = registry_ref.open.get(&rid) else {
-            return Err(JsErrorBox::type_error(
-                "this WebSocket is closed: there is no connection behind it any more",
-            ));
-        };
-        (
-            take(socket),
-            still_the_same_invocation(state, socket.opened_under),
-            socket.destination.clone(),
-        )
+    let found = {
+        let registry = sockets.clients.borrow();
+        registry
+            .open
+            .get(&rid)
+            .map(|socket| (take(socket), socket.opened_in, socket.destination.clone()))
     };
 
-    if !belongs {
-        return Err(not_this_invocation(&registry, &app_id, rid, &destination));
+    let Some((taken, opened_in, destination)) = found else {
+        return Err(no_socket_behind(&sockets, &app_id, rid));
+    };
+
+    // The registry is swept when an invocation ends, so a socket that is still
+    // here and still belongs to an earlier one means a path out of an
+    // invocation that did not sweep. Close it and say so rather than trusting
+    // that the sweep covered every path.
+    if !still_the_same_invocation(state, opened_in) {
+        sockets.clients.borrow_mut().open.remove(&rid);
+        return Err(not_this_invocation(&app_id, &destination));
     }
     Ok(taken)
 }
@@ -1061,6 +1227,24 @@ fn queue(
     })
 }
 
+/// Which invocation is running, as a number `js/ws_client.js` can compare.
+///
+/// The end-of-invocation sweep closes sockets from out here, where the isolate
+/// cannot see it happen. A `WebSocket` object survives the sweep -- it is an
+/// ordinary object on a heap that is reused -- so it records what this op
+/// answered when it was built and asks again before it reports its state or
+/// dispatches anything. A different answer means the socket behind it is gone
+/// and the invocation that owned it is over.
+///
+/// Counted, not timed, for the reason [`WsState::epoch`] gives. The count is a
+/// `u64` and is reported as a double, which is exact for the first 2^53
+/// invocations of one isolate; an isolate is retired long before that, and the
+/// only thing asked of the number is whether it changed.
+#[op2(fast)]
+fn op_deis_ws_invocation(state: &mut OpState) -> f64 {
+    ws_state(state).epoch.get() as f64
+}
+
 /// How many queued bytes are still unwritten, for `bufferedAmount`.
 ///
 /// A socket that has gone away answers zero rather than failing: reading a
@@ -1099,21 +1283,53 @@ fn op_deis_ws_close(
 /// The read loop in `js/ws_client.js` awaits this and turns each answer into a
 /// DOM event. A terminal event takes the socket out of the registry, which
 /// drops the last handle on the pump task's command channel and ends it.
+///
+/// This is the one op whose answer can arrive in a different invocation from
+/// the one that asked: it is awaited across the end of a request by design,
+/// and the event loop that resolves it next runs inside whatever comes after.
+/// So the invocation is checked again on the way out. A frame the peer sent to
+/// the request that opened the socket is dropped there rather than dispatched
+/// as a `message` event inside the next request, on the next request's budget.
 #[op2(async)]
 #[serde]
 async fn op_deis_ws_next_event(
     state: Rc<RefCell<OpState>>,
     rid: u32,
 ) -> Result<IncomingJs, JsErrorBox> {
-    let incoming = {
+    let (incoming, opened_in, destination) = {
         let mut state = state.borrow_mut();
-        borrow_socket(&mut state, rid, |socket| socket.incoming.clone())?
+        borrow_socket(&mut state, rid, |socket| {
+            (
+                socket.incoming.clone(),
+                socket.opened_in,
+                socket.destination.clone(),
+            )
+        })?
     };
 
     let event = {
         let mut incoming = incoming.lock().await;
         incoming.recv().await
     };
+
+    {
+        let mut state = state.borrow_mut();
+        if !still_the_same_invocation(&mut state, opened_in) {
+            let app_id = state
+                .try_borrow::<AppId>()
+                .map(|app| app.0.clone())
+                .unwrap_or_default();
+            let sockets = ws_state(&mut state);
+            let mut registry = sockets.clients.borrow_mut();
+            registry.open.remove(&rid);
+            registry.revoked.remove(&rid);
+            drop(registry);
+            // Whatever arrived is dropped with `event`: it was addressed to an
+            // invocation that is over.
+            drop(event);
+            return Err(not_this_invocation(&app_id, &destination));
+        }
+    }
 
     let event = event.unwrap_or(Incoming::Close {
         code: 1006,
@@ -1122,7 +1338,8 @@ async fn op_deis_ws_next_event(
 
     if event.is_terminal() {
         let mut state = state.borrow_mut();
-        clients(&mut state).borrow_mut().open.remove(&rid);
+        let sockets = ws_state(&mut state);
+        sockets.clients.borrow_mut().open.remove(&rid);
     }
 
     Ok(event.into())
@@ -1132,6 +1349,7 @@ extension!(
     deis_runtime_ws_client_ops,
     ops = [
         op_deis_ws_connect,
+        op_deis_ws_invocation,
         op_deis_ws_send_text,
         op_deis_ws_send_binary,
         op_deis_ws_buffered_amount,

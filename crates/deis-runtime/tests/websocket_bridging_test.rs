@@ -45,9 +45,10 @@ async fn a_websocket_message_crosses_the_dispatcher_in_both_directions() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let app_manager = Arc::new(ApplicationManager::new());
-    let state = AppState {
-        app_manager: app_manager.clone(),
-    };
+    let state = AppState::new(
+        app_manager.clone(),
+        deis_runtime::config::default_max_request_body_bytes(),
+    );
     app_manager
         .load_app(
             AppKey::production("ws_bridge_app"),
@@ -135,9 +136,10 @@ async fn a_plain_request_to_a_websocket_app_is_answered_as_http() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let app_manager = Arc::new(ApplicationManager::new());
-    let state = AppState {
-        app_manager: app_manager.clone(),
-    };
+    let state = AppState::new(
+        app_manager.clone(),
+        deis_runtime::config::default_max_request_body_bytes(),
+    );
     app_manager
         .load_app(
             AppKey::production("ws_bridge_app"),

@@ -1,436 +1,229 @@
-# Storage Services 实现文档
+# Storage Services
 
-## 概述
+What `context.services.*` actually does on the runtime side: which op talks to
+which backend, what crosses the Rust/JS boundary as bytes versus text, and
+what happens when a service was never wired up for this deployment.
 
-Runtime 实现了三种存储服务，符合 Cloudflare Workers / Deno Deploy 规范：
+| Service | Backend | Where |
+|---|---|---|
+| **Cache** | In-process (moka), one cache per isolate | `src/runtime/cache_ops.rs` |
+| **KV** | deis-store's `KvStore`, over gRPC | `src/runtime/kv_client.rs`, `src/runtime/ops.rs` |
+| **Database** | deis-store's `Database`, one SQLite file per tenant, over gRPC | `src/runtime/db_client.rs`, `src/runtime/db_ops.rs` |
+| **Blob** | deis-store's `BlobStore`, content-addressed, streamed, over gRPC | `src/runtime/blob_client.rs`, `src/runtime/blob_ops.rs` |
+| **Queue** | deis-queue's `Queue`, lease-based, over gRPC | `src/runtime/queue_client.rs`, `src/runtime/queue_ops.rs` |
 
-| 服务 | 实现方式 | 状态 | 说明 |
-|------|---------|------|------|
-| **Cache** | 本地 (moka) | ✅ 完成 | 高性能本地缓存 |
-| **KV Store** | 远程 (gRPC) | ✅ 客户端完成 | 键值存储，服务端待实现 |
-| **Database** | 远程 (gRPC) | ✅ 客户端完成 | SQL 数据库，服务端待实现 |
+All four remote services are one process's worth of work
+([`deis-store`](../../deis-store) for the first three, [`deis-queue`](../../deis-queue)
+for the fourth) reached from this node's own gRPC clients. There is no
+"deis-control server" on this path — the control plane's only involvement is
+handing the node the two addresses (`store_endpoint`, `queue_endpoint`) and,
+when a shared secret is configured, minting the per-tenant capability token
+that authorises this node's calls (see `runtime/bindings.rs` and
+`crates/deis-store/src/auth.rs`).
 
 ---
 
-## 1. Cache API (本地缓存)
+## No fallback: an unwired service is a hard error, not a stand-in
 
-### 技术实现
+None of the four ever falls back to an in-memory store. A deployment's
+manifest declares which services it uses; `runtime/bindings.rs` builds a
+client for each declared service that the control plane gave an address for,
+and puts it in the isolate's `OpState`. An op whose client is missing —
+because the manifest never declared the service, or the control plane sent no
+address for it — returns `service_unavailable(name)` immediately:
 
-- **底层库**: [moka](https://github.com/moka-rs/moka) 0.12
-- **容量**: 10,000 条目
-- **TTL**: 全局 10 分钟空闲过期
-- **线程安全**: `Arc<Cache<String, String>>`
-- **性能**: 零锁读取，近乎内存访问速度
+```
+"{service} service is not available to this app: its manifest does not
+ declare \"{service}\", or the control plane sent no address for it"
+```
 
-### JavaScript API
+(`ops.rs::service_unavailable`, used identically by the KV, database, blob and
+queue ops.) That is the whole of it: there has never been an in-memory
+`HashMap` or similar standing in for a missing client. An application that
+sees this error has a configuration problem — an undeclared service or a
+control plane that was not told the storage addresses — not a degraded mode
+to work around.
+
+---
+
+## Bytes across the boundary, not text
+
+A value stored through `context.services.kv`, `context.services.blob` or
+`context.services.cache` is whatever the application wrote — an image, a
+compressed record, a protobuf — and only the application knows whether that
+happens to be text. So the op boundary carries bytes, not a `String`:
+
+```rust
+// KV: reading crosses as a Uint8Array, not text. js/runtime.js decodes it as
+// "text", "json" or leaves it as an ArrayBuffer, whichever kv.get(key,
+// { type }) asked for.
+async fn op_kv_get(...) -> Result<Option<ToJsBuffer>, JsErrorBox>
+
+// Writing takes whatever ArrayBufferView the application handed to put().
+async fn op_kv_set(..., #[buffer] value: JsBuffer, ...) -> Result<(), JsErrorBox>
+```
+
+Blob (`op_blob_get` / `op_blob_put`) and the Cache API (`op_cache_get` /
+`op_cache_set`) follow the identical shape: `#[buffer] JsBuffer` in,
+`ToJsBuffer` out. This is deliberate and asymmetric — see
+`blob_ops.rs` for why `#[serde] Vec<u8>` is the wrong type on both sides
+(`serde_v8` does not accept it as a typed array either direction) and
+`cache_ops.rs`'s module comment for what carrying a Cache API body as a
+string used to do: decode it as UTF-8 on write, which replaces every
+ill-formed byte sequence with U+FFFD, so anything outside the ASCII range —
+an image cached through `caches.default`, which every isolate has whether the
+application asked for it or not — came back corrupted with nothing reporting
+an error.
+
+The one thing that stays text is metadata *about* the bytes: KV's optional
+`metadata` string (`op_kv_get_with_metadata`), a database `sql` string and its
+JSON-encoded `params`, and the Cache API's status/headers, which travel as one
+JSON string alongside the body buffer.
+
+The request and response bodies a handler sees follow the same rule, one
+level up: `JsRequest.body` / `JsResponse.body` cross the boundary as
+`Option<Vec<u8>>` (`ops.rs::PendingRequestBody` / `PendingResponseBody`), not
+as a string — an upload or an upstream response that is not valid UTF-8
+survives the trip intact.
+
+---
+
+## KV
+
+`context.services.kv` → `KvClient` → deis-store's `KvStore` service
+(`crates/deis-store/proto/storage.proto`): `Get`, `Set`, `Delete`, `List`.
 
 ```javascript
-export default {
-  async fetch(request, env) {
-    // 设置缓存
-    await env.cache.set("user:123", "John Doe", 0);
-
-    // 获取缓存
-    const user = await env.cache.get("user:123");
-    // => "John Doe"
-
-    // 检查存在
-    const exists = await env.cache.has("user:123");
-    // => true
-
-    // 删除缓存
-    await env.cache.delete("user:123");
-
-    // 清空所有缓存
-    await env.cache.clear();
-
-    // 获取统计信息
-    const stats = await env.cache.stats();
-    // => { entry_count: 42, weighted_size: 1024 }
-
-    return new Response("OK");
-  }
-};
+export default function handler(context) {
+  await context.services.kv.put("counter", "42");
+  const value = await context.services.kv.get("counter"); // "42"
+  const withMeta = await context.services.kv.getWithMetadata("counter");
+  // => { value, metadata, expiration } | null
+  const keys = await context.services.kv.list("user:");    // string[]
+  await context.services.kv.delete("counter");
+}
 ```
 
-### Rust Ops 实现
+`put(key, value, { expirationTtl, metadata })` accepts a string or any
+`ArrayBufferView`; `get(key, { type })` decodes the returned bytes as `"text"`
+(default), `"json"` or hands back an `ArrayBuffer`. `metadata` is an opaque
+string deis-store stores and returns untouched, read back through
+`getWithMetadata`.
 
-位置: `src/runtime/cache_ops.rs`
+## Database
 
-```rust
-// 6 个异步 ops
-#[op2(async)] async fn op_cache_get(state, key) -> Option<String>
-#[op2(async)] async fn op_cache_set(state, key, value, ttl)
-#[op2(async)] async fn op_cache_delete(state, key)
-#[op2(async)] async fn op_cache_has(state, key) -> bool
-#[op2(async)] async fn op_cache_clear(state)
-#[op2(async)] async fn op_cache_stats(state) -> JsonValue
-```
-
-### 性能特点
-
-- **读取延迟**: < 1μs (微秒级)
-- **写入延迟**: < 10μs
-- **并发**: 支持高并发读写
-- **内存**: 约 100 bytes/entry (键值对)
-
----
-
-## 2. KV Store API (远程键值存储)
-
-### 架构设计
-
-```
-JavaScript 应用 (env.kv.get())
-    ↓
-deno_core async ops (op_kv_get)
-    ↓
-KvClient (gRPC 客户端)
-    ↓
-网络 gRPC 调用
-    ↓
-deis-control server (TODO: 服务端待实现)
-```
-
-### JavaScript API
+`context.services.database` → `DbClient` → deis-store's `Database` service:
+`Execute`, `Query`, `Batch`, `Prepare` / `ExecutePrepared` / `QueryPrepared`,
+and the session-scoped `BeginTransaction` / `ExecuteInTransaction` /
+`QueryInTransaction` / `CommitTransaction` / `RollbackTransaction` that back
+`database.transaction(...)`.
 
 ```javascript
-export default {
-  async fetch(request, env) {
-    // 设置值
-    await env.kv.set("counter", "42");
+const result = await context.services.database.query(
+  "SELECT * FROM users WHERE id = ?", [123],
+);
+// => { rows: [...], columns: [...] }
 
-    // 获取值
-    const value = await env.kv.get("counter");
-    // => "42"
+const exec = await context.services.database.execute(
+  "INSERT INTO users (name) VALUES (?)", ["Alice"],
+);
+// => { rowsAffected: 1, lastInsertId: 456 }
 
-    // 删除键
-    await env.kv.delete("counter");
-
-    // 列出前缀匹配的键
-    const keys = await env.kv.list("user:");
-    // => ["user:123", "user:456"]
-
-    return new Response(value);
-  }
-};
+await context.services.database.transaction(async (tx) => {
+  const [row] = await tx.query("SELECT balance FROM accounts WHERE id = ?", [id]);
+  await tx.execute("UPDATE accounts SET balance = ? WHERE id = ?", [row.balance - 10, id]);
+});
 ```
 
-### gRPC Protocol
+One SQLite file per tenant on deis-store's side; `sql` and `params` cross as
+text and JSON respectively, because a query and its parameter list are
+exactly the string and the JSON values the application wrote, not an opaque
+payload. `transaction(...)` pins one connection for the tenant for the life
+of the callback (server-side deadline, default 5 s, `{ timeoutMs }` may only
+shorten it); the outer `context.services.database` handle is a different
+connection and does not see the transaction's uncommitted writes. See
+`js/runtime.js`'s `NativeTransaction` and `docs/architecture.zh.md` section 6.
 
-位置: `proto/storage.proto`
+## Blob
 
-```protobuf
-service KvStore {
-  rpc Get(GetRequest) returns (GetResponse);
-  rpc Set(SetRequest) returns (SetResponse);
-  rpc Delete(DeleteRequest) returns (DeleteResponse);
-  rpc List(ListRequest) returns (ListResponse);
-  rpc Has(HasRequest) returns (HasResponse);
-}
-```
-
-### Rust 客户端实现
-
-位置: `src/runtime/kv_client.rs`
-
-```rust
-pub struct KvClient {
-    client: Arc<Mutex<KvStoreClient<Channel>>>,
-}
-
-impl KvClient {
-    // 连接到远程 KV Store
-    pub async fn connect(endpoint: String) -> Result<Self>
-
-    // 5 个异步方法
-    pub async fn get(&self, key: String) -> Result<Option<String>>
-    pub async fn set(&self, key: String, value: String) -> Result<()>
-    pub async fn delete(&self, key: String) -> Result<()>
-    pub async fn list(&self, prefix: String, limit: Option<i32>)
-        -> Result<(Vec<String>, Option<String>)>
-    pub async fn has(&self, key: String) -> Result<bool>
-}
-```
-
-### Fallback 机制
-
-KV ops 实现了双层策略：
-
-```rust
-async fn op_kv_get(state, key) -> Option<String> {
-    // 1. 优先尝试 gRPC 客户端
-    if let Some(client) = state.try_borrow::<KvClient>() {
-        match client.get(key).await {
-            Ok(value) => return value,
-            Err(e) => tracing::error!("KV Get failed via gRPC: {}", e),
-        }
-    }
-
-    // 2. Fallback 到内存 HashMap
-    let kv = state.borrow::<KVStore>();
-    kv.borrow().get(&key).cloned()
-}
-```
-
-**优势**:
-- 开发环境：无需 deis-control server，使用内存存储
-- 生产环境：配置 KvClient，自动切换到 gRPC
-- 容错：gRPC 失败时回退到内存
-
-### 配置 gRPC 连接
-
-```rust
-// 在 isolate.rs 中配置 KvClient
-use deis-runtime::runtime::KvClient;
-
-let kv_client = KvClient::connect("http://deis-control:50051").await?;
-
-// 注入到 OpState
-let op_state = runtime.op_state();
-let mut state = op_state.borrow_mut();
-state.put(kv_client);
-```
-
----
-
-## 3. Database API (SQL 数据库)
-
-### 状态
-
-✅ **客户端完成，服务端待实现**
-
-### 技术实现
-
-- **gRPC 客户端**: `DbClient` (Arc<Mutex<DatabaseClient>>)
-- **Ops**: 6 个异步 ops (execute, query, batch, prepare 等)
-- **JavaScript API**: `env.db.*`
-- **错误处理**: JSON 返回错误信息
-
-### Protocol 定义
-
-位置: `proto/storage.proto`
-
-```protobuf
-service Database {
-  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
-  rpc Query(QueryRequest) returns (QueryResponse);
-  rpc Batch(BatchRequest) returns (BatchResponse);
-  rpc Prepare(PrepareRequest) returns (PrepareResponse);
-  rpc ExecutePrepared(ExecutePreparedRequest) returns (ExecuteResponse);
-  rpc QueryPrepared(QueryPreparedRequest) returns (QueryResponse);
-}
-```
-
-### JavaScript API
+`context.services.blob` → `BlobClient` → deis-store's `BlobStore` service,
+content-addressed on disk, `Put`/`Get` streamed in chunks so an object never
+has to sit in memory whole on either side.
 
 ```javascript
-export default {
-  async fetch(request, env) {
-    // 查询
-    const result = await env.db.query(
-      "SELECT * FROM users WHERE id = ?",
-      [123]
-    );
-    // => { rows: [...], columns: [...] }
-
-    // 执行
-    const execResult = await env.db.execute(
-      "INSERT INTO users (name) VALUES (?)",
-      ["Alice"]
-    );
-    // => { rows_affected: 1, last_insert_id: 456 }
-
-    // 批量操作
-    const batchResults = await env.db.batch([
-      { sql: "INSERT INTO users (name) VALUES (?)", params: ["Bob"] },
-      { sql: "UPDATE users SET age = ? WHERE name = ?", params: [25, "Alice"] },
-    ]);
-    // => [{ rows_affected: 1, last_insert_id: 457 }, { rows_affected: 1 }]
-
-    // 预处理语句
-    const stmtId = await env.db.prepare("SELECT * FROM users WHERE id = ?");
-    const preparedResult = await env.db.queryPrepared(stmtId, [123]);
-    // => { rows: [...], columns: [...] }
-
-    return new Response(JSON.stringify(result.rows));
-  }
-};
+await context.services.blob.put("avatar", arrayBuffer);
+const object = await context.services.blob.get("avatar"); // null if absent
+const bytes = await object.arrayBuffer();
+await context.services.blob.delete("avatar");
 ```
 
-### Rust 客户端实现
+`put` takes a string, an `ArrayBuffer` or any `ArrayBufferView`; `get`
+answers an object with `arrayBuffer()`, `text()` and `json()`, or `null` for
+a key that was never written or has been deleted.
 
-位置: `src/runtime/db_client.rs`
+## Cache
 
-```rust
-pub struct DbClient {
-    client: Arc<Mutex<DatabaseClient<Channel>>>,
-}
+`context.services.cache`, and `globalThis.caches.default` names the identical
+instance (the Cloudflare-style global some code expects to find). Keys accept
+a string, a `Request` or a `URL`. `Cache-Control: max-age` / `s-maxage`
+(`s-maxage` wins when both are present) decides how long an entry stays
+fresh; a response with no such header gets the node's default; `no-store` or
+`private` is refused with a `TypeError` rather than cached. `delete()`
+reports whether there was anything to delete.
 
-impl DbClient {
-    // 连接到远程 Database
-    pub async fn connect(endpoint: String) -> Result<Self>
+Scope is one isolate: a later request to the same `(application,
+environment)` on the same node sees a hit, a different node or a new isolate
+(a fresh deployment) does not. It is an optimisation, not a place to keep
+state.
 
-    // 6 个异步方法
-    pub async fn execute(&self, sql: String, params: Option<String>)
-        -> Result<(i64, Option<i64>)>
-    pub async fn query(&self, sql: String, params: Option<String>)
-        -> Result<(String, Vec<String>)>
-    pub async fn batch(&self, statements: Vec<(String, Option<String>)>)
-        -> Result<Vec<(i64, Option<i64>)>>
-    pub async fn prepare(&self, sql: String) -> Result<String>
-    pub async fn execute_prepared(&self, statement_id: String, params: Option<String>)
-        -> Result<(i64, Option<i64>)>
-    pub async fn query_prepared(&self, statement_id: String, params: Option<String>)
-        -> Result<(String, Vec<String>)>
-}
-```
+## Queue
 
-### Rust Ops 实现
+`context.services.queue` → `QueueClient` → deis-queue's `Queue` service:
+`send()`, and `to(name)` for a queue other than the default. Consumption is
+the node's own poller (`trigger/`), not something an application calls
+directly — it leases a batch, hands it to the application's `queue` export,
+and the export's `message.ack()` / `message.retry()` decide what happens
+next. A message body crosses as bytes end to end, same as KV and blob: a
+queue carries whatever the application put on it, and the dead-letter view is
+typed as bytes for the same reason.
 
-位置: `src/runtime/db_ops.rs`
-
-```rust
-// 6 个异步 ops
-#[op2(async)] async fn op_db_execute(state, sql, params) -> JsonValue
-#[op2(async)] async fn op_db_query(state, sql, params) -> JsonValue
-#[op2(async)] async fn op_db_batch(state, statements_json) -> JsonValue
-#[op2(async)] async fn op_db_prepare(state, sql) -> String
-#[op2(async)] async fn op_db_execute_prepared(state, stmt_id, params) -> JsonValue
-#[op2(async)] async fn op_db_query_prepared(state, stmt_id, params) -> JsonValue
-```
-
-**错误处理**: 所有 ops 在出错时返回包含 `error` 字段的 JSON
+`send()` encodes a string as UTF-8, a plain object as JSON then UTF-8, and an
+`ArrayBuffer`/`ArrayBufferView` as its own bytes unchanged. On the receiving
+side `message.body` is the text as it was sent — but only when the body
+decodes as UTF-8; a body that does not (a buffer sent as its own bytes need
+not be text at all) leaves `message.body` as `null` rather than a decoding
+error or a lossily-decoded string. `message.bytes()` reads the bytes
+regardless of whether they are text; `message.json()` throws, naming the
+message, when `body` is `null` rather than parsing text that was never
+there.
 
 ---
 
-## 测试
+## Tests
 
-### 运行所有测试
+- `cache_ops_test.rs` — Cache API round trips, including
+  `a_cached_body_that_is_not_text_survives_the_round_trip`.
+- `kv_client.rs`'s own tests — KV round trips against a real deis-store,
+  including `a_value_that_is_not_valid_utf8_survives_the_round_trip` and the
+  capability-token checks.
+- `db_client.rs`'s own tests and `db_ops_test.rs` — `execute` / `query` /
+  `batch` / prepared statements / `transaction`, against a real deis-store.
+- `blob_client_test.rs` — blob round trips against a real deis-store,
+  including `multi_chunk_object_round_trips_byte_for_byte`.
+- `queue_consumer_test.rs` — the poller: a batch handled, failed, retried or
+  handed back after its lease lapsed, against a fake queue client; the wire
+  round trip itself is `crates/deis-queue`'s own `grpc_e2e.rs`.
 
-```bash
-cargo test --lib
-```
-
-### 测试覆盖
-
-- **Cache**: 7 个单元测试
-- **KV Ops**: 3 个单元测试
-- **KV Client**: 2 个集成测试 (#[ignore], 需要 deis-control server)
-- **DB Ops**: 4 个单元测试
-- **DB Client**: 2 个集成测试 (#[ignore], 需要 deis-control server)
-- **集成测试**: isolate_test, manager_test
-
-**总计**: 37 个测试通过 ✅ (4 个忽略等待集成环境)
-
-### 运行集成测试
-
-**前提**: 需要运行 deis-control server 提供 gRPC 服务
-
-```bash
-# 1. 启动 deis-control server (端口 50051)
-cd ../deis-control
-cargo run
-
-# 2. 运行 KV 客户端集成测试
-cd ../deis-runtime
-cargo test --lib kv_client::tests::test_kv_client_operations --ignored
-
-# 3. 运行 Database 客户端集成测试
-cargo test --lib db_client::tests::test_db_client_operations --ignored
-```
-
----
-
-## 性能基准
-
-### Cache (本地)
-
-| 操作 | 延迟 | 吞吐量 |
-|------|------|--------|
-| Get | < 1μs | > 1M ops/s |
-| Set | < 10μs | > 100K ops/s |
-| Delete | < 5μs | > 200K ops/s |
-
-### KV (gRPC)
-
-性能取决于：
-- 网络延迟 (LAN: ~0.5ms, WAN: ~50ms)
-- deis-control server 性能
-- 并发连接数
-
-**预期**:
-- LAN: ~1-2ms
-- 本地回环: ~0.1-0.5ms
-
----
-
-## 故障排查
-
-### 问题: KV ops 总是使用内存存储
-
-**原因**: KvClient 未注入到 OpState
-
-**解决**:
-```rust
-// 检查 isolate.rs 中是否有以下代码
-let kv_client = KvClient::connect("http://deis-control:50051").await?;
-state.put(kv_client);
-```
-
-### 问题: gRPC 连接失败
-
-**检查**:
-1. deis-control server 是否运行: `curl http://deis-control:50051`
-2. 端口是否正确
-3. 防火墙设置
-
-**日志**:
-```bash
-RUST_LOG=deis_runtime=debug cargo run
-```
-
-查找日志: `KV Get failed via gRPC: ...`
-
----
-
-## 未来计划
-
-### Phase 2: deis-control 服务端
-- [ ] KV Store service 实现 (使用 RocksDB)
-- [ ] Database service 实现 (使用 SQLite/PostgreSQL)
-- [ ] 认证和权限控制
-- [ ] 监控和日志
-
----
-
-## 相关文件
-
-**Protocol Buffers**:
-- `proto/storage.proto` - gRPC 协议定义 (KV + Database services)
-- `build.rs` - Protocol Buffers 编译配置
-
-**Cache (本地)**:
-- `src/runtime/cache_ops.rs` - Cache ops 实现
-- `src/runtime/cache_ops_test.rs` - Cache 单元测试
-
-**KV Store (gRPC)**:
-- `src/runtime/kv_client.rs` - KV gRPC 客户端
-- `src/runtime/ops.rs` - KV ops 实现 (带 fallback)
-- `src/runtime/ops_test.rs` - KV ops 测试
-
-**Database (gRPC)**:
-- `src/runtime/db_client.rs` - Database gRPC 客户端
-- `src/runtime/db_ops.rs` - Database ops 实现
-- `src/runtime/db_ops_test.rs` - Database ops 测试
-
-**集成**:
-- `src/runtime/mod.rs` - 导出所有客户端和 extension
-- `src/runtime/isolate.rs` - Runtime 集成
-- `runtime_js/runtime.js` - JavaScript API (kv, cache, db)
-
----
+The KV, database and blob tests are not `#[ignore]`d waiting on a separate
+server process: each starts its own instance of deis-store in-process for the
+duration of the test and talks to it over a real socket. The queue poller's
+own tests run against a fake queue client instead, because what they are
+proving is the poller's retry and lease-handling logic, not the wire; the
+wire round trip is deis-queue's own `grpc_e2e.rs`, likewise a real service
+started in-process. `scripts/demo.sh verify` additionally exercises KV and
+the queue end to end through a deployed application, against the real
+processes the demo starts.
 
 ## License
 
-Apache 2.0
+Apache-2.0

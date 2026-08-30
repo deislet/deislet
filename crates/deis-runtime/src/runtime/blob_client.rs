@@ -16,7 +16,7 @@
 
 use super::bindings::StorageIdentity;
 use crate::STREAM_CHUNK_BYTES;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use futures_util::{stream, Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
@@ -64,37 +64,6 @@ pub struct BlobClient {
 }
 
 impl BlobClient {
-    /// Connect to deis-store's blob service on behalf of one application.
-    ///
-    /// Reads are capped at [`DEFAULT_MAX_OBJECT_BYTES`]; use
-    /// [`BlobClient::with_max_object_bytes`] to choose another ceiling.
-    ///
-    /// # Parameters
-    /// - endpoint: gRPC address of deis-store, e.g. `http://127.0.0.1:8090`
-    /// - tenant: the `<app>.<environment>` every call of this client is
-    ///   charged to; see [`StorageIdentity`]
-    ///
-    /// Carries no capability token, so it can only speak to a deis-store that
-    /// has no `auth_secret`; application bindings use [`Self::connect_lazy`].
-    pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
-        let endpoint = endpoint.into();
-        let identity = StorageIdentity::new(tenant, None)?;
-
-        tracing::info!(%endpoint, app_id = identity.tenant(), "connecting to blob store");
-        let client = GrpcBlobClient::connect(endpoint.clone())
-            .await
-            .with_context(|| format!("connecting to blob store at {endpoint}"))?
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
-        tracing::info!(%endpoint, app_id = identity.tenant(), "blob store client connected");
-
-        Ok(Self {
-            client,
-            identity,
-            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
-        })
-    }
-
     /// Build a client that dials deis-store on its first call; see
     /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
     /// rather than connecting eagerly.
@@ -759,3 +728,7 @@ mod tests {
         assert_eq!(body, b"abcd");
     }
 }
+
+#[cfg(test)]
+#[path = "blob_client_test.rs"]
+mod blob_client_test;

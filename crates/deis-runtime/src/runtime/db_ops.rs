@@ -133,15 +133,79 @@ async fn op_db_query(
     }
 }
 
+/// The statements of a batch, as the pair `DbClient::batch` sends: the SQL and
+/// its parameters already encoded the way the wire carries them.
+///
+/// Split out of [`op_db_batch`] because it is where a caller's mistake is
+/// caught, and because it is the one part of a batch that can be checked
+/// without a store to send it to. `Err` is the `{ error }` the op answers
+/// with; every message names the offending statement by its index in the
+/// array, since a batch is usually built in a loop and "one of your
+/// statements is wrong" is not enough to find which.
+fn decode_batch_statements(
+    statements_json: &str,
+) -> Result<Vec<(String, Option<String>)>, JsonValue> {
+    let refuse = |message: String| Err(serde_json::json!({ "error": message }));
+
+    let statements_value: JsonValue = match serde_json::from_str(statements_json) {
+        Ok(v) => v,
+        Err(e) => return refuse(format!("the batch is not valid JSON: {e}")),
+    };
+
+    let Some(statements_array) = statements_value.as_array() else {
+        return refuse("a batch is an array of { sql, params } statements".to_string());
+    };
+
+    let mut statements = Vec::with_capacity(statements_array.len());
+    for (index, stmt) in statements_array.iter().enumerate() {
+        let Some(sql) = stmt.get("sql").and_then(JsonValue::as_str) else {
+            return refuse(format!(
+                "statement {index} has no 'sql' string; a batch statement is {{ sql, params }}"
+            ));
+        };
+        // Both forms, because both exist: `js/runtime.js` sends the array,
+        // and a caller holding what `op_db_execute` takes sends the encoded
+        // string. Reading only the string is what this used to do, and an
+        // array then fell through to `None` -- the statement went to the
+        // store with nothing bound, so it either failed complaining about the
+        // number of parameters or wrote a row of NULLs.
+        let params = match stmt.get("params") {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::String(encoded)) => Some(encoded.clone()),
+            Some(array @ JsonValue::Array(_)) => Some(array.to_string()),
+            Some(other) => {
+                return refuse(format!(
+                    "statement {index}: params must be an array or a JSON-encoded array, got \
+                     {other}"
+                ));
+            }
+        };
+        statements.push((sql.to_string(), params));
+    }
+
+    Ok(statements)
+}
+
 /// Database Batch operation
 ///
-/// Executes multiple SQL statements in a batch
+/// Sends several statements as one request, which deis-store runs inside one
+/// transaction: either every statement was applied or none was. It is the
+/// primitive behind `ctx.services.database.batch`, and the cheap half of the
+/// pair it forms with `transaction` -- a batch is one round trip and cannot
+/// look at a result before sending the next statement; a transaction can, and
+/// pays for it by holding one of the tenant's connections open.
 ///
 /// # Parameters
-/// - statements: JSON-encoded array of statements, each element contains sql and optional params
+/// - statements: JSON-encoded array of `{ sql, params }`, where `params` is
+///   the parameter array. A JSON-encoded array string is taken too -- that is
+///   the form `op_db_execute` takes, and the form a caller that assembled the
+///   batch by hand is likely to already hold.
 ///
 /// # Returns
-/// - JSON array: [{ rows_affected: number, last_insert_id?: number }, ...]
+/// - JSON array: [{ rows_affected: number, last_insert_id?: number }, ...],
+///   one entry per statement in the order they were sent
+/// - or `{ error }` when the batch was rolled back, naming the statement that
+///   failed
 #[op2(async)]
 #[serde]
 async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: String) -> JsonValue {
@@ -158,38 +222,10 @@ async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: Str
         }
     };
 
-    // Parse statement list
-    let statements_value: JsonValue = match serde_json::from_str(&statements_json) {
-        Ok(v) => v,
-        Err(e) => {
-            return serde_json::json!({
-                "error": format!("Invalid JSON: {}", e)
-            });
-        }
+    let statements = match decode_batch_statements(&statements_json) {
+        Ok(statements) => statements,
+        Err(refusal) => return refusal,
     };
-
-    let statements_array = match statements_value.as_array() {
-        Some(a) => a,
-        None => {
-            return serde_json::json!({
-                "error": "Statements must be an array"
-            });
-        }
-    };
-
-    let mut statements = Vec::new();
-    for stmt in statements_array {
-        let sql = match stmt["sql"].as_str() {
-            Some(s) => s.to_string(),
-            None => {
-                return serde_json::json!({
-                    "error": "Statement must have 'sql' field"
-                });
-            }
-        };
-        let params = stmt["params"].as_str().map(|s| s.to_string());
-        statements.push((sql, params));
-    }
 
     // Execute batch
     match client.batch(statements).await {

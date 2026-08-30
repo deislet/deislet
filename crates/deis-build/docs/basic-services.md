@@ -19,17 +19,40 @@ These services **do not need to be enabled in configuration**, and the deis-buil
 
 ### Usage
 
+`kv.put` stores bytes: a string is UTF-8 encoded, and an `ArrayBuffer` or
+`ArrayBufferView` (e.g. `Uint8Array`) is stored as given. Non-text content
+such as an image or a compressed frame does not need to be turned into a
+string first.
+
 ```typescript
 export default async function handler(context: Context) {
   // Use directly, no configuration needed
   const kv = context.services.kv;
 
   await kv.put('user:123', JSON.stringify({ name: 'Alice' }));
-  const data = await kv.get('user:123');
+  const data = await kv.get('user:123'); // read back as text by default
 
   return new Response(data);
 }
 ```
+
+`kv.get`'s second argument, `type`, chooses how the stored bytes are read
+back: `"text"` (the default, UTF-8 decoded), `"json"` (decoded then
+`JSON.parse`d), or `"arrayBuffer"` (the raw bytes, no decoding — the right
+choice for non-text content). These three names match other platforms; only
+`"stream"` is not available — a read on this platform always returns the
+whole value at once, there is no streaming read behind it, and asking for
+`"stream"` throws an error saying so rather than silently falling back to
+text.
+
+```typescript
+const image = await kv.get('avatar:123', { type: 'arrayBuffer' });
+const parsed = await kv.get('user:123', { type: 'json' }); // same as JSON.parse(await kv.get(...))
+```
+
+`kv.put` also accepts `expirationTtl` (seconds until the entry expires) and
+`metadata` (stored alongside the value and read back separately with
+`kv.getWithMetadata()`; it does not count against the value's own size).
 
 ### Platform Implementations
 
@@ -105,6 +128,41 @@ All platforms support the standard Cache API.
 ```
 
 At compile time, it will check whether the target platform supports SQL Database. If not supported, it will fail with alternative suggestions.
+
+Once enabled, `context.services.database` offers more than statement-by-statement
+`execute`/`query`: two ways to combine several statements into one call.
+
+```typescript
+// batch: every statement is decided up front, one round trip, all-or-nothing;
+// there is no point to read a result and branch on it, and a row-returning
+// SELECT is refused.
+await database.batch([
+  { sql: "UPDATE items SET stock = stock - 1 WHERE id = ? AND stock > 0", params: [id] },
+  { sql: "INSERT INTO orders (item, buyer) VALUES (?, ?)", params: [id, buyer] },
+]);
+
+// transaction: the callback can read, decide, and write, all through one
+// connection pinned to it until the callback returns; that connection is a
+// scarce resource, so the transaction carries a deadline.
+const total = await database.transaction(async (tx) => {
+  const [row] = await tx.query("SELECT balance FROM accounts WHERE id = ?", [id]);
+  await tx.execute("UPDATE accounts SET balance = ? WHERE id = ?", [row.balance - 10, id]);
+  return row.balance - 10;
+});
+```
+
+Not sure which to reach for: if every statement is decided before anything
+runs, use `batch`; use `transaction` only when a later statement depends on
+what an earlier one read.
+
+`context.services.queue` changed the same way: `send()` now carries bytes
+rather than only text — a string is UTF-8 encoded, an object is
+`JSON.stringify`-ed first, and an `ArrayBuffer`/`ArrayBufferView` is sent as
+given. On the consumer side, `message.body` is the text exactly as it was
+sent, but when the body is not valid UTF-8, `message.body` is `null` (not an
+empty string, not mangled text) — such a message can only be read with
+`message.bytes()`; calling `message.json()` on it throws, naming the reason,
+rather than trying to parse text that was never there.
 
 ---
 

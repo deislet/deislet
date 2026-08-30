@@ -453,23 +453,46 @@ sequenceDiagram
 不做成 deis-queue 主动推给节点——那需要队列知道哪个节点跑哪个应用，会破坏「哑服务」
 这条边界。
 
-### 授权：现阶段靠网络收敛，不是靠校验
+### 授权：调用方要证明自己有资格声称这个租户
 
-**这里写清楚，免得被上面那段租户校验误导**：deis-store 校验 `x-deis-tenant` 的
-**形状**，但不校验**身份**，也没有授权表。能连上端口的任何东西都能自称任何租户——
-包括同一个应用的另一个环境——从而读写删它的数据。租户拆分挡不住这一层，它挡的是应用
-自己写错租户。收敛手段仍是网络层：默认只监听回环地址，绑定非回环地址时启动会打 warn
-说明后果。
+**这里写清楚，免得被上面那段租户校验误导**：`split_tenant` 只检查
+`x-deis-tenant` 的**形状**（两段合法部分，不含 `.` `/` `\`）。这一节说的是**身份**
+——凭什么相信提出这个租户的调用方真的有权代表它。
 
-这对「自己/团队内部用」是相称的：只有同机的 deis-runtime 需要连它。要把它暴露到本机
-之外，**必须先有**这几样，缺一不可：
+做法是能力令牌：调用方在 `x-deis-storage-token` 头里带一个
+`base64(HMAC-SHA256(auth_secret, tenant))`（`deis_wire::conventions::storage_token`
+/ `storage_token_matches`）。deis-store 与 deis-queue 各自配一份 `auth_secret`，
+控制面配同一份 `storage_auth_secret`——三处必须是同一个字符串，改一处就要三处一起
+改，改完之前旧令牌全部失效。控制面在给节点下发一次部署时，用这份密钥给部署所属的
+租户现算一个令牌，塞进 `env` 表里保留键 `DEIS_STORAGE_TOKEN`（`bindings.rs` 在应用
+看到自己的环境变量之前把它取走，应用摸不到自己的令牌，更摸不到别的租户的）；节点侧
+每一次 KV / SQL / Blob / Queue 调用都把它带上（`crates/deis-store/src/auth.rs`、
+`deis-queue` 的对应实现）。
 
-1. 每个调用方的身份（mTLS 客户端证书，或控制面签发的令牌）
-2. 身份与所声明租户的核对
-3. 拒绝要有可追查的日志
-4. 健康端点同等对待——否则它成了免鉴权的存活探针
+验证的顺序刻意是「先看调用方声称的租户，再用这个租户算出期望的令牌，最后才比较」，
+而不是反过来拿令牌去查它对应哪个租户——这样一份从某个应用那里泄漏出去的令牌，换到
+别的租户身上立刻算不出正确答案，包括同一个应用的另一个环境。令牌不过期、也不是
+会话；轮换 `auth_secret` 是唯一的失效手段，一轮换全部令牌同时作废。
 
-授权表列为未来工作。
+**未配置 `auth_secret` 时到底发生什么，两种情况刻意不同**：
+
+- **回环地址 + 未配置**：照旧工作，也就是曾经唯一的机制——相信调用方声称的租户，
+  唯一的收敛手段是网络层，端口够不到就调不了。不是静默的：启动时打一条 `warn`，
+  把「现在保护数据的只有这一层」原样写出来。这是单机自用的默认状态，受支持。
+- **非回环地址 + 未配置**：**拒绝启动**，不是打 warn 放行。未配置不能悄悄等于
+  「不设防也照样监听公网」——一旦真的绑定到别处，曾经顶替鉴权的那层收敛就不存在了。
+  这一条和控制面的节点通道是同一个形状：预共享密钥列表一旦为空，那条通道直接关闭，
+  而不是打开。
+
+配了 `auth_secret` 却没带令牌、令牌对不上租户、或者干脆没带 `x-deis-tenant`，三种
+情况都在拿到任何数据**之前**被拒——tonic 拦截器挡在每个 handler 前面
+（`crates/deis-store/src/server.rs` 的 `guarded`），新增第四个服务也不可能漏掉这一层。
+拒绝一律以 `warn` 记日志，带上声称的租户，可追查。健康检查端点刻意例外：它不回答
+任何租户的数据，只说这个进程能不能应答，要求它也带令牌，控制面就做不出一个不知道
+任何租户令牌的存活探针了。
+
+这套机制是 deis-store 与 deis-queue 共用的同一份代码路径（各自的 `auth.rs`），
+不是各写一份。
 
 ### 其他取舍
 
@@ -628,13 +651,57 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 
 原先全部写死在代码里。现在是两层：**平台默认**（deis-runtime 配置的
 `[default_execution_limits]`，`timeout_ms` 与 `rate_limit_ops_per_sec`）→
-**应用覆盖**（`AppConfig` 里的同名字段）。V8 堆上限也可配。
+**应用覆盖**（`AppConfig` 里的同名字段）。V8 堆上限也可配，但方向和前两者相反：
+应用只能把堆往小里改，往大改会被拒——保护的是节点自己那份内存，覆盖只准让它
+更省，不准让它更贵。
 
-还缺的三项：
+模块顶层求值现在有一条应用怎么覆盖都碰不到的硬天花板：**5 秒**，写死在
+`crates/deis-runtime/src/runtime/isolate.rs` 的 `MODULE_EVALUATION_BUDGET_MS`
+里，根本没有进 `AppConfig`，也就没有字段能覆盖它。以前这里是空的——一个应用
+模块顶层写一个 `while (true)`，会把装着它的那条运行时线程从节点里拿走到进程
+退出为止：`RuntimePool` 是在这条线程自己的消息循环上等模块装载完成的，装载不
+完成，这条线程就一直不服务下一个应用，等于永久损失一条线程。现在超过 5 秒直接
+判这次部署失败：损失变成有界的——一条线程五秒，不是一条线程直到重启。
 
-- **硬上限**。应用覆盖目前能突破平台默认，没有一个「怎么覆盖都不能超过」的天花板。
-- **CPU 时间**。30 秒是墙钟，而且只约束「正在跑 JS」的那部分：一个卡在慢存储 await
-  上的处理函数能无限占住它那条运行时线程，超时管不到它。
+### 运行时线程的裁断机制：一个 OS 线程，不是一个定时器
+
+请求、`waitUntil` 尾巴、队列批次、cron 触发、WebSocket 消息——连同上面的模块
+求值，一共六条会跑应用代码的路径——现在都是同一套机制裁断的：每个 isolate
+起在自己的 OS 线程上（见 §1 与 `runtime/pool.rs`），这条线程旁边现在还配一条
+专门的**看守线程**（`Watchdog`，同一个文件），isolate 建好的时候一起起来，
+活得和 isolate 一样长。一次执行开始时把「什么时候到期」告诉看守线程（arm）；
+到期前正常结束就取消（disarm）；到期了看守线程还没等到取消，就从**它自己
+那条线程**上调用 V8 的 `terminate_execution()`，把这次执行打断。
+
+这条线程不是可有可无的实现细节，是这套机制唯一能成立的原因。之前这里跟大多数
+超时一样，是 `tokio::spawn` 一个定时器，到点调用同一个 `terminate_execution()`
+——这个写法在测试里全部通过，因为测试里的处理函数都会 `await` 点什么。它在
+生产上失效的方式是最坏的一种：每个 isolate 跑在自己单独的 `current_thread`
+tokio 运行时上，这条线程上 spawn 的定时器，只有在这条线程把控制权交还给
+tokio 调度器的时候才有机会被轮到——而 JS 只有在 `await` 的时候才会交出控制权。
+`export default function handler() { while (true) {} }` 从不 `await`，那个
+定时器就永远轮不到、永远不会去调用终止，配置的超时形同虚设：实测量到跑了
+75 秒还没停，一颗核心被钉死在那。`waitUntil` 尾巴、队列批次、cron 触发、
+WebSocket 消息，这四条路径原来是同一个写法，问题也一样。看守线程解决的正是
+这一点：它在**另一条**线程上等到期，到期就直接调用终止，不需要也不依赖
+被裁断的那条线程主动交出控制权——V8 的 `terminate_execution()` 本来就允许
+从任意线程调用，这是它能被单独一条线程拿来当裁断手段的前提。
+
+还缺的两项（原先「怎么覆盖都不能超过的天花板」这一条，现在只对模块求值成立；
+下面这两个仍然是纯粹的应用覆盖，应用抬得比平台默认高多少都不拒）：
+
+- **请求 / 队列 / cron 的超时没有硬上限**。应用通过 `ResourceLimits.timeout_ms`
+  覆盖平台默认，方向和堆上限相反：不管往哪边改都放行，没有「改到这里就拒绝」
+  的天花板。
+- **一次没有自己超时的原生调用真卡死时，看守线程也救不回那条运行时线程**。
+  看守线程能立刻打断的，是 V8 正在跑的字节码；一个处理函数卡在
+  `await ctx.services.kv.get(...)` 上，如果背后那次到 deis-store 的 gRPC 调用
+  自己没配超时、永远不应答，此刻根本没有字节码在跑，看守线程到期调用
+  `terminate_execution()` 也没有字节码可打断——这条运行时线程会一直陪着这个
+  永远不会完成的 `await` 等下去。这和上面的问题是两类：上面是「JS 忙着不肯
+  交出线程」，这里是「JS 已经交出了线程，但线程在等一个永远不回来的答案」。
+  真正的解法在调用的另一端——给 deis-store / deis-queue 的每次调用配一个自己
+  的超时——而不是指望调用方这边的裁断机制。
 - **出网控制**。已经做了，而且是和 `fetch` 同一批做的——顺序上本来就不能分开：
   `fetch` 一装上，处理函数就能打到任意地址，包括本机上的 deis-store。现在的模型是
   **默认拒绝、按例外放行**：公网通，环回 / 私有 / 链路本地（含云元数据
@@ -654,7 +721,7 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 | **二** | 版本、环境与部署模型：建表、ApplyDeployment 指针下发、节点自举拉取与自取包 | **完成** |
 | **三** | 静态资产：包内带资产、节点资产优先命中 | **完成**（deis-proxy 的路径级路由与资产缓存、自动子域仍缺，见 §4） |
 | **四** | 可观测：deis-telemetry；节点侧日志与指标投递；真实状态上报 | **完成**（`deis logs` / `deis tail` 已有；控制面面板的日志视图仍缺） |
-| **五** | cron 修正、secrets、限额两层化 | **完成**；出网控制已随 `fetch` 落地（见 §9/§12），CPU 硬上限仍缺（见 §9） |
+| **五** | cron 修正、secrets、限额两层化 | **完成**；出网控制已随 `fetch` 落地（见 §9/§12），模块求值已有不可覆盖的硬上限，请求/队列/cron 超时仍是纯应用覆盖、没有天花板（见 §9） |
 | **六** | `deis` CLI 闭环：deploy / rollback / versions / tail / dev 接真运行时 | **完成**（`deis dev` 起的是真的 deis-runtime，走的是控制面同一个 `ApplyDeployment`） |
 
 ---
@@ -672,7 +739,11 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 - （已定）出网控制用**黑名单打底 + 白名单开口**：默认拒绝所有非公网地址，运维用
   `[fetch] allow` 按 `host` / `host:port` 逐条开。纯白名单会把「打公网 API」这件最
   常见的事变成每个应用都要报备，纯黑名单挡不住运维自己的内网服务需求。
-- deis-store 的备份周期与保留策略。
+- （已定）deis-store 的备份周期与保留策略：`snapshot_interval_secs` 默认 86400
+  秒（一天一次），`snapshot_retention` 默认 7（保留最近 7 份，超出的按快照写入时间
+  删除）。两者都可配，`snapshot_interval_secs = 0` 在保留 `snapshot_dir` 配置的同时
+  暂停调度，`snapshot_retention = 0` 表示一份都不删——一个误填的值最安全的读法是
+  「不删」而不是「删光」。
 
 **已知缺口（不阻塞现有功能，但都会被踩到）**
 
@@ -683,15 +754,32 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
   RPC 本身已改为 `Unimplemented` 并指向 `ApplyDeployment`，但消息里那个字段还在，
   删它要同时改 `crates/deis-runtime/proto/management.proto` 与
   `crates/deis-runtime/src/management/`。
-- **请求与响应体是 `String`**：`JsRequest.body` / `JsResponse.body` 都是文本，二进制
-  主体过不了 Isolate 边界。
-- ~~**Web 标准的全局大半没装上，`fetch` 也在其中**~~ **已补齐**（2026-08-29）。
+- ~~**请求与响应体是 `String`**~~ **已补齐**：`JsRequest.body` / `JsResponse.body`
+  过 Rust/JS 边界时是 `Option<Vec<u8>>`（`ops.rs::PendingRequestBody` /
+  `PendingResponseBody`，op 边界上是 `#[buffer]` / `ToJsBuffer`），二进制主体原样
+  穿过 Isolate 边界。`context.services.kv`、`context.services.blob`、Cache API 与
+  `context.services.queue` 同一轮也都改成了按字节走，理由与做法都写在
+  `blob_ops.rs` 的模块注释里：`#[serde] Vec<u8>` 在两个方向上都是错的类型，
+  serde_v8 不认定型数组。
+- ~~**Web 标准的全局大半没装上，`fetch` 也在其中**~~ **已补齐**。
   SPECIFICATION_BASIC.md 8.1 节要求的全局现在一个不缺，`fetch` 与 `crypto` 都在真
-  Isolate 里跑通过（§12）。仍然没有装上全局名的是 `Blob` / `File` / `FormData` /
-  `URLPattern` / 客户端 `WebSocket` / `structuredClone` / `performance` / `navigator` /
-  `Event`——它们在 Isolate 内部是活的（deno_fetch、deno_web 自己要用），只是没挂到
-  `globalThis` 上，因为 8.1 节没要求，而每多一个全局就多一份要长期兑现的承诺。
-- **执行超时管不住卡在 await 上的处理函数**（§9）。
+  Isolate 里跑通过（§12），随后两轮又把 `Blob` / `File` / `FormData` /
+  `URLPattern` / `structuredClone` / `Event` / `CustomEvent` / `performance` /
+  `navigator` 和客户端 `WebSocket`（走的是和 `fetch` 同一道出网策略）挂上了全局名。
+  仍然没有装的只剩 `Deno` / `__bootstrap`（永久不给，见下方出网一节）、
+  `addEventListener`（这个平台跑的是模块语法，不是 service worker 写法）和
+  `BroadcastChannel`（真没实现：Isolate 之间没有消息总线）。
+- ~~**执行超时管不住卡在 await 上的处理函数**~~ **一半解决**（§9）。请求 /
+  `waitUntil` / 队列 / cron / WebSocket / 模块求值六条路径现在都由一条独立的
+  OS 看守线程按 wall clock 裁断，不再依赖处理函数自己让出线程，所以一个不
+  `await` 任何东西、纯占 CPU 的 `while (true)` 已经管得住。没解决的是另一半：
+  看守线程能打断的是 V8 正在跑的字节码，一个卡在
+  `await ctx.services.kv.get(...)` 上、背后那次到 deis-store 的 gRPC 调用
+  自己没配超时的处理函数，此刻根本没有字节码在跑，裁断打不到它身上——这条运行时线程
+  会一直陪着这个不会完成的 await 等下去。`fetch` 不在此列：出站调用另有一套
+  按剩余执行预算武装的 `AbortSignal`（见 §12「出网这一格」），到期直接把 op
+  卷回来；KV / SQL / 队列这几个调用 deis-store、deis-queue 的路径还没有这一层，
+  真正的解法在调用的那一端——给这几个 gRPC 调用配上各自的超时。
 - **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent`
   已经有了）。队列消费目前由节点自己按 `(应用, 环境)` 轮询，不经过这个消息，所以还没
   被踩到；一旦有别的调用方用它投递批次，就会指不准环境。
@@ -699,12 +787,15 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 
 **涉及对外承诺**
 
-- **WebSocket 经 deis-proxy 的那一跳从未验证**。节点这一端现在有证据：
+- ~~**WebSocket 经 deis-proxy 的那一跳从未验证**~~ **已补齐**。节点这一端：
   `websocket_direct_test.rs` 在进程内验 Isolate 侧那一半，`websocket_bridging_test.rs`
   自己 bind 一个端口起 router，用真 WebSocket 客户端带 `x-deis-app-id` 连上去，断言
-  101 与两轮 echo 往返（此前它是 POST 到写死的 localhost:8000，没服务就打印
-  "Server not running, skipping test" 然后 return 当通过，而那个端点 dispatcher 早已
-  不提供）。仍然没测的是 deis-proxy → deis-runtime 这一跳，以及二进制帧那条路。
+  101 与两轮 echo 往返，文本帧与二进制帧都走过（此前它是 POST 到写死的
+  localhost:8000，没服务就打印 "Server not running, skipping test" 然后 return 当
+  通过，而那个端点 dispatcher 早已不提供）。经 deis-proxy 的那一跳现在也有专门测试：
+  `websocket_through_proxy_test.rs` 起一个真的 `deis-proxy` 二进制，走真实的
+  HTTP Upgrade 握手连过去，`scripts/demo.sh verify` 的「websockets」一组同样从这一跳
+  发起，而不是直接打节点端口。
 - **deis-control 面板认证是 API Key 且默认关闭**（`api_auth_enabled` 默认 false），
   没有用户与角色概念。节点通道另有独立鉴权，不受它影响（§8）。
 
@@ -717,8 +808,9 @@ SSR。
 
 ## 12. 能力矩阵对账
 
-`edge-canon/PLATFORM_MATRIX.md` 是公开仓库里的那张表。下面是 2026-08-29 逐项核对的
-结果——**核对的是代码本身，不是变更记录**；其中「有哪些全局」这一项另外起了一套
+`edge-canon/PLATFORM_MATRIX.md` 是公开仓库里的那张表。下面是自 2026-08-29 起逐项
+核对、并随每一轮改动更新到 2026-08-30 的结果——**核对的是代码本身，不是变更
+记录**；其中「有哪些全局」这一项另外起了一套
 控制面 + 节点，用探针应用实测过（见下）。编译器侧的同一份判断写在
 `crates/deis-build-core/src/platform_capabilities.rs`，`test_deislet_capabilities`
 会在实现变化而没人改表时失败。
@@ -728,11 +820,11 @@ SSR。
 | 特性 | 实况 | 依据 |
 |---|---|---|
 | HTTP Handler | 成立 | `dispatcher` → `RuntimePool` → Isolate |
-| Request / Response | **部分成立** | JS 侧现在是 deno_fetch 自己的 `Request` / `Response`，手写的最小实现已删除：`Response.json()` / `Response.redirect()` / `Response.error()`、`ok`、`arrayBuffer()` / `blob()` / `formData()`、`clone()`、`Headers.getSetCookie()`、`body` 是真 `ReadableStream`，都实测可用。仍然**部分**的原因只剩一条：`JsRequest.body` / `JsResponse.body` 过 Rust↔JS 边界时是 `Option<String>`，二进制主体会被有损转换 |
+| Request / Response | 成立 | JS 侧是 deno_fetch 自己的 `Request` / `Response`，手写的最小实现已删除：`Response.json()` / `Response.redirect()` / `Response.error()`、`ok`、`arrayBuffer()` / `blob()` / `formData()`、`clone()`、`Headers.getSetCookie()`、`body` 是真 `ReadableStream`，都实测可用。此前唯一的保留——`JsRequest.body` / `JsResponse.body` 过 Rust↔JS 边界是 `Option<String>`，二进制主体会被有损转换——已改成 `Option<Vec<u8>>`（op 边界 `#[buffer]` / `ToJsBuffer`），二进制原样穿过 |
 | 环境变量 | 成立 | 控制面下发的 `env` 表注入 `context.env`，平台保留键先被取走 |
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
-| KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务 |
-| Cache API | 成立 | 标准入口是 `context.services.cache`，`globalThis.caches.default` 指向同一个实例；后端是 moka 进程内缓存，`Cache-Control` 的 `max-age` / `s-maxage` 决定过期。语义上是单 Isolate 缓存：换节点、换版本都读不到 |
+| KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本 |
+| Cache API | 成立 | 标准入口是 `context.services.cache`，`globalThis.caches.default` 指向同一个实例；后端是 moka 进程内缓存，`Cache-Control` 的 `max-age` / `s-maxage` 决定过期。语义上是单 Isolate 缓存：换节点、换版本都读不到。**此前这一格是有保留的**：body 过边界是字符串，写入前先当 UTF-8 解码，`0x80..=0xff` 的字节一律变成 `ef bf bd`——`caches.default` 是每个 Isolate 自带的，一张放进去的图片会在读出来时静默损坏，没有任何报错。现已改成按字节走（`op_cache_set` 收 `#[buffer] JsBuffer`，`op_cache_get` 答 `ToJsBuffer`），status/headers 仍是文本，因为那部分确实是文本 |
 | 生命周期 `waitUntil` | 成立 | `runtime.js` 的 `__deis_runtime_wait_until_all` |
 | 结构化日志 | 成立 | 环形缓冲 + `LogShipper` → deis-telemetry，`Query` 能查回来 |
 | Web 标准 | 成立（8.1 节的部分） | 见下方「Web 标准这一格的实情」 |
@@ -766,17 +858,34 @@ SSR。
 
 | 有 | 没有 |
 |---|---|
-| `fetch`、`crypto`、`Request`、`Response`、`Headers`、`URL`、`URLSearchParams`、`ReadableStream` / `WritableStream` / `TransformStream`、`setTimeout` / `clearTimeout`、`setInterval` / `clearInterval`、`AbortController` / `AbortSignal`、`DOMException`、`TextEncoder` / `TextDecoder`、`atob` / `btoa`、`EventTarget`、`queueMicrotask`、`console`、`caches`、`WebSocketPair` / `WebSocketServer` | `Deno`、`__bootstrap`、`Blob`、`File`、`FormData`、`URLPattern`、客户端 `WebSocket`、`BroadcastChannel`、`structuredClone`、`Event`、`performance`、`navigator`、`addEventListener` |
+| `fetch`、`crypto`、`Request`、`Response`、`Headers`、`URL`、`URLSearchParams`、`ReadableStream` / `WritableStream` / `TransformStream`、`setTimeout` / `clearTimeout`、`setInterval` / `clearInterval`、`AbortController` / `AbortSignal`、`DOMException`、`TextEncoder` / `TextDecoder`、`atob` / `btoa`、`EventTarget`、`Event` / `CustomEvent`、`queueMicrotask`、`console`、`caches`、`WebSocketPair` / `WebSocketServer`、客户端 `WebSocket`、`Blob` / `File` / `FormData`、`URLPattern`、`structuredClone`、`performance`、`navigator` | `Deno`、`__bootstrap`、`BroadcastChannel`、`addEventListener` |
 
-右边那一列里的大半**并不是没实现**：`Blob`、`FormData`、`Event` 这些在 Isolate 内部
-是活的，deno_fetch 和 deno_web 自己就要用——`response.blob()`、`response.formData()`
-都能正常返回对象，只是那个对象的构造器没有被挂上全局名。这条线是有意划的：
-**8.1 节要的，加上让 8.1 节能用起来的那几个，到此为止**。每多挂一个全局，就多一份
-以后不能随便收回的承诺。
+这张表经过了两轮扩充，右边原来更长的那一列**大半并不是没实现**：`Blob`、
+`FormData`、`Event` 这些在 Isolate 内部本来就是活的，deno_fetch 和 deno_web 自己
+就要用——`response.blob()`、`response.formData()` 早就能正常返回对象，缺的只是
+把构造器挂上全局名这一步。第二轮补上了 `Blob` / `File` / `FormData`（没有它们，
+多部件上传收得到、读不出、转不走）、`URLPattern`（路由库要做的第一件事）、
+`structuredClone`、`Event` / `CustomEvent`（`EventTarget` 早挂着，没有事件可以往
+里发）、`performance`（截到整毫秒、`timeOrigin` 钉死在 0，防的是跨 Isolate 时间
+侧信道——这个节点上好几个租户的 Isolate 共用一条 OS 线程）、`navigator`（运行时
+自己的冻结对象，只有一个 `userAgent`）；第三轮补上了客户端 `WebSocket`
+（`runtime/ws_client_ops.rs`，走的是和 `fetch` 同一道 `fetch_policy.rs` 判定，不是
+deno_websocket 自己的连接器）。这条线仍然是有意划的：**8.1 节要的，加上让 8.1
+节能用起来的那几个，加上不给就等于这个能力不存在的那几个，到此为止**——不是
+「deno_web 装了什么就给什么」，`BroadcastChannel` 就是被划在外面的那个，理由见
+下文。
 
-`AbortController` / `AbortSignal` / `DOMException` 就是「让 8.1 节能用起来」的那几个：
+`AbortController` / `AbortSignal` / `DOMException` 是「让 8.1 节能用起来」的那几个：
 没有前两个，一发慢的出网请求没法取消，会一直烧到 Isolate 的执行预算见底；没有
 `DOMException`，`crypto.subtle`、流和被取消的 `fetch` 抛出来的错误没法按类型 catch。
+
+剩下没挂的四个，各有各的理由：`Deno` / `__bootstrap` 是裸 op 表，见下方出网一节；
+`addEventListener` 是 service worker 写法，这个平台跑的是模块语法
+（`export default function handler`），挂一个收下 `"fetch"` 监听器又永远不触发的
+全局比不挂更坏；`BroadcastChannel` 真的没实现——一个 Isolate 是一个
+`(应用, 环境)`，两个 Isolate 不共享内存，deno_web 的实现装在扩展里、挂上去也能跑，
+但那是每个 Isolate 单独一份，挂上去的结果是「每次 `postMessage` 都成功、任何地方
+都收不到」，比缺席更坏；替代用 `context.services.queue`。
 
 `TextEncoder` / `TextDecoder` / `atob` / `btoa` 仍是 `runtime.js` 里手写的，**只做
 UTF-8**，没有换成 deno_web 那一套。这是有意收窄，理由写在 `runtime.js` 和
@@ -798,8 +907,12 @@ UTF-8**，没有换成 deno_web 那一套。这是有意收窄，理由写在 `r
 ### 出网这一格
 
 `fetch` 装上的同一批还做了出网策略，因为这两件事分不开：能打出去的处理函数，第一
-个能打到的就是本机的 deis-store，而 deis-store 至今无条件相信别人给它的
-`x-deis-tenant` 头。也就是说，一个没有策略的 `fetch` 等于把每个应用的数据都摊开。
+个能打到的就是本机的 deis-store，而单机默认安装下 deis-store 相信别人给它的
+`x-deis-tenant` 头（§6 的授权一节说了配了 `auth_secret` 之后不再是这样，但那是运维
+要主动打开的，不是默认状态）。也就是说，一个没有策略的 `fetch` 等于把每个应用的
+数据都摊开——即便配了令牌，应用代码本身也拿不到自己那个租户的令牌
+（`bindings.rs` 在它看到 `context.env` 之前就把令牌取走了），但一个不受限的
+`fetch` 仍然是一条应用本不该有的、直连节点内部服务的路。
 
 **默认拒绝、按例外放行。** 公网通；环回、私有段、链路本地（含云元数据
 `169.254.169.254`，读它就是节点的云凭据泄露）、唯一本地、组播、广播、未指定与保留
@@ -872,11 +985,11 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 |---|---|---|
 | SQL 数据库 | 成立 | deis-store 的 `Database` 服务，每租户一个 SQLite 文件；节点按 manifest 建 `DbClient` |
 | 对象存储 | 成立 | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；Isolate 侧 `context.services.blob` 收字符串 / `ArrayBuffer` / `ArrayBufferView`，有顶着真 deis-store 的端到端测试 |
-| 消息队列 | 成立 | deis-queue 的 `Send`/`Pull`/`Ack`/`Nack` + 节点的 `queue_consumer` 轮询任务 |
+| 消息队列 | 成立 | deis-queue 的 `Send`/`Pull`/`Ack`/`Nack` + 节点的 `queue_consumer` 轮询任务；消息体按字节走（`queue.proto` 的 `body` 是 `bytes`），`send()` 接受字符串、普通对象或 `ArrayBuffer`/`ArrayBufferView`；消费端 `message.body` 是发送时的原文，body 不是合法 UTF-8 时为 `null`，只能靠 `message.bytes()` 读 |
 | 定时任务 | 成立 | 控制面按 `(app, environment)` 调度 → 节点 `Trigger.OnScheduled` → 跑 `scheduled` 导出 |
 | 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match` |
 | WebAssembly | 成立 | V8 自带 |
-| WebSocket | **未验证** | 节点侧代码齐全，进程内测过 Isolate 那一半；HTTP 升级与经过 deis-proxy 的链路没有有效测试（见 §11） |
+| WebSocket | 成立 | 服务端（`WebSocketPair` 桥接）与客户端（走 `fetch_policy.rs` 出网策略的 `WebSocket` 全局）都有；HTTP 升级、经过 deis-proxy 的一跳、文本帧与二进制帧都有真测试覆盖（`websocket_bridging_test.rs`、`websocket_through_proxy_test.rs`，见 §11） |
 | BroadcastChannel | **不成立** | `deno_web` 带着 `01_broadcast_channel.js` 被 import 进来了，但没有把 `BroadcastChannel` 装到 `globalThis` 上——8.1 节没要求它，`bootstrap.js` 补全局时就没带上。探针实测：`typeof BroadcastChannel === "undefined"`。真要开还有一层要想清楚：进程内广播是跨应用的，得先按 (应用, 环境) 隔离 |
 | Node.js 运行时 | 不成立（形态上没有） | `build_runtime_extensions()` 里没有 `deno_node`，只从中借了一个 TLS op。`require`、`Buffer`、`node:` 模块都不可用 |
 | 服务端渲染 | 不成立（形态上没有） | 处理函数当然可以自己拼 HTML，但没有框架挂钩，也没有 npm 生态 |
@@ -922,3 +1035,23 @@ Workers AI 在项目配置里根本没有可声明的地方，所以编译器检
 - **Request/Response 由「部分」转为成立**，保留一条注：主体过边界仍是文本。
 - **维持 ❌**：BroadcastChannel、客户端 WebSocket、`URLPattern`、`structuredClone`
   ——它们没有变，只是理由从「没人挂」变成了「有意不挂」。
+
+第三轮（2026-08-30，二进制边界 + 客户端 WebSocket + 存储鉴权）：
+
+- **Request/Response 的那条保留撤掉**：主体过边界从 `Option<String>` 改成
+  `Option<Vec<u8>>`，二进制不再被有损转换。同一轮里 KV、Blob、Cache API、
+  deis-queue 的消息体也都改成了按字节走，理由与做法统一写在 `blob_ops.rs` 的模块
+  注释里。
+- **客户端 WebSocket 由「有意不挂」转正**：挂上了全局名，走的是和 `fetch` 同一道
+  `runtime/fetch_policy.rs` 判定，不是 deno_websocket 自己的连接器。同一轮里
+  `Blob` / `File` / `FormData`、`URLPattern`、`structuredClone`、`Event` /
+  `CustomEvent`、`performance`、`navigator` 也已在此前两轮陆续转正（见上「Web 标准
+  这一格的实情」）。
+- **WebSocket 由「维持 ⚠️」转正**：经 deis-proxy 的一跳与二进制帧都有了真测试
+  （`websocket_through_proxy_test.rs`、`websocket_bridging_test.rs`），不再是「未
+  验证」。
+- **deis-store / deis-queue 有了调用方鉴权**：这张矩阵本身没有一格是「鉴权」，但
+  §6「授权」一节此前写的「无条件相信调用方声称的租户」已经不是全貌——配置
+  `auth_secret` 后每次调用都要带能力令牌，见该节。
+- **维持 ❌**：BroadcastChannel、`addEventListener`、`Deno` / `__bootstrap`——理由
+  不变。

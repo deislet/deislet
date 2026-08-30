@@ -281,9 +281,10 @@ pid_running() {
 
 # Save what `verify`, `status` and `stop` need in a later shell.
 #
-# Owner-only: this file holds the node pre-shared key the components
-# authenticate to each other with, and the value of the demo secret, which
-# `verify` needs in order to go looking for it.
+# Owner-only: this file holds the node pre-shared key and the storage
+# capability secret the components authenticate to each other with, and the
+# value of the demo secret, which `verify` needs in order to go looking for
+# it.
 write_state() {
   touch "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -310,6 +311,7 @@ DEIS_STORE_CONFIG=$DEIS_STORE_CONFIG
 DEIS_QUEUE_CONFIG=$DEIS_QUEUE_CONFIG
 DEIS_TELEMETRY_CONFIG=$DEIS_TELEMETRY_CONFIG
 SECRET=$SECRET
+STORAGE_AUTH_SECRET=$STORAGE_AUTH_SECRET
 SECRET_KEY_FILE=$SECRET_KEY_FILE
 APP_ID=$APP_ID
 ENV_NAME=$ENV_NAME
@@ -371,14 +373,23 @@ metrics_listen = "127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}"
 data_dir = "${DEMO_DIR}/deis-telemetry-data"
 EOF
 
+  # auth_secret turns on the capability-token check
+  # (crates/deis-store/src/auth.rs): every call must then present
+  # x-deis-storage-token for the tenant it names, or it is refused before any
+  # data is touched. Configured here, on deis-queue below and as
+  # storage_auth_secret on deis-control, so the demo proves the feature
+  # rather than leaving it dark the way an all-loopback install with no
+  # secret configured would.
   cat > "$DEIS_STORE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_STORE_PORT}"
 data_dir = "${DEMO_DIR}/deis-store-data"
+auth_secret = "${STORAGE_AUTH_SECRET}"
 EOF
 
   cat > "$DEIS_QUEUE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_QUEUE_PORT}"
 data_dir = "${DEMO_DIR}/deis-queue-data"
+auth_secret = "${STORAGE_AUTH_SECRET}"
 EOF
 
   echo "🚀 Starting Telemetry (gRPC: ${DEIS_TELEMETRY_PORT}, metrics: ${DEIS_TELEMETRY_METRICS_PORT})"
@@ -782,6 +793,16 @@ start_demo() {
 
   SECRET=${SECRET:-$(generate_secret)}
 
+  # The shared secret deis-store's, deis-queue's and deis-control's
+  # per-tenant capability tokens are all derived from - see
+  # crates/deis-store/src/auth.rs. A separate value from SECRET on purpose:
+  # SECRET authenticates a *node* to the control plane, this one authenticates
+  # a *storage call* to whichever tenant it claims, and the two channels have
+  # nothing to do with each other. Configured on all three of deis-store,
+  # deis-queue and deis-control below - see check_storage_capability_token for
+  # what it looks like when only some of the three carry it.
+  STORAGE_AUTH_SECRET=${STORAGE_AUTH_SECRET:-$(generate_secret)}
+
   # The master key that encrypts environment secrets. 32 bytes as 64 hex
   # characters, which is what `openssl rand -hex 32` produces. It never enters
   # the database and is never logged; without it every secret endpoint answers
@@ -822,7 +843,11 @@ start_demo() {
     # secret endpoints work at all: without it they answer 503 rather than
     # storing anything in the clear. store_endpoint / queue_endpoint are the
     # addresses handed down to nodes with every deployment - a node never
-    # learns where storage lives from its own file.
+    # learns where storage lives from its own file. storage_auth_secret must
+    # be the identical string as auth_secret on both deis-store and
+    # deis-queue above - it is what this control plane mints each tenant's
+    # capability token from; set it here and not on the two services, or on
+    # the services and not here, and every storage call is refused.
     cat > "$DEIS_CONTROL_CONFIG" <<EOF
 bind_addr = "0.0.0.0"
 port = ${DEIS_CONTROL_PORT}
@@ -835,6 +860,7 @@ public_base_url = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 secret_key_file = "${SECRET_KEY_FILE}"
 store_endpoint = "http://127.0.0.1:${DEIS_STORE_PORT}"
 queue_endpoint = "http://127.0.0.1:${DEIS_QUEUE_PORT}"
+storage_auth_secret = "${STORAGE_AUTH_SECRET}"
 
 [[deis_runtime_nodes]]
 id = "${NODE_ID}"
@@ -1137,6 +1163,20 @@ header_value() {
 
 http_status() {
   head -n 1 "$1" | tr -d '\r' | awk '{print $2}'
+}
+
+# base64(HMAC-SHA256(STORAGE_AUTH_SECRET, tenant)) - the identical
+# construction deis_wire::conventions::storage_token uses on every side of
+# the storage wire (crates/deis-wire/src/conventions.rs), so a call made with
+# this is indistinguishable to deis-store or deis-queue from one deis-runtime
+# itself made. Needed here only to let check_kv_roundtrip's direct call to
+# deis-store present a token now that auth_secret is configured; the
+# capability-token check itself proves the *absence* of a token is refused,
+# which needs no token to be computed at all.
+storage_token() {
+  local tenant=$1
+  printf '%s' "$tenant" | openssl dgst -sha256 -hmac "$STORAGE_AUTH_SECRET" -binary \
+    | openssl base64 -A
 }
 
 check_static_asset() {
@@ -1494,15 +1534,27 @@ check_kv_roundtrip() {
       "PUT then GET returned ${value} from the node, but grpcurl is not installed so deis-store could not be asked directly whether it holds the row"
     return
   fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    fail_check "$title" \
+      "PUT then GET returned ${value} from the node, but openssl is not installed so this check could not mint the capability token deis-store now requires to be asked directly"
+    return
+  fi
 
+  # deis-store's KvStore.Get answers `value` as bytes (GetResponse.value is
+  # `bytes`, not `string` - a KV value is whatever the application wrote), so
+  # grpcurl's JSON rendering of it is base64, same as any protobuf bytes
+  # field. Decode before comparing, or every value that happens not to equal
+  # its own base64 form would fail this check regardless of whether
+  # deis-store actually holds the right bytes.
   local tenant="${APP_ID}.${ENV_NAME}"
   local direct direct_value
   direct=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" \
+    -H "x-deis-storage-token: $(storage_token "$tenant")" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1)
-  direct_value=$(echo "$direct" | jq -r '.value // empty' 2>/dev/null || true)
+  direct_value=$(echo "$direct" | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
 
   if [ "$direct_value" = "$value" ]; then
     pass_check "$title" \
@@ -1510,6 +1562,39 @@ check_kv_roundtrip() {
   else
     fail_check "$title" \
       "the node answered ${value}, but deis-store's own KvStore.Get for tenant ${tenant}, key ${key} returned: $(echo "$direct" | tr '\n' ' ' | head -c 200)"
+  fi
+}
+
+# The other half of the capability-token feature: not that a call carrying
+# the right token succeeds (check_kv_roundtrip's direct call already proves
+# that, now that this demo configures auth_secret), but that a call carrying
+# none is refused before it touches any data. Without this check, `start`
+# could configure auth_secret on none of the three places it belongs and
+# every check above would still pass - loopback alone would still be
+# standing in for the whole of it, silently, which is exactly the gap
+# crates/deis-store/src/auth.rs exists to close.
+check_storage_capability_token() {
+  local title="a storage call presenting no capability token is refused"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is not installed, so this check could not be run"
+    return
+  fi
+
+  local tenant="${APP_ID}.${ENV_NAME}"
+  local out rc
+  out=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -d "{\"key\":\"whatever-this-key-is-does-not-matter\"}" \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1) && rc=0 || rc=$?
+
+  if [ "$rc" -ne 0 ] && echo "$out" | grep -q 'Code: Unauthenticated'; then
+    pass_check "$title" \
+      "KvStore.Get for tenant ${tenant} with no x-deis-storage-token header was refused before deis-store looked at any data: $(echo "$out" | tr '\n' ' ' | sed 's/  */ /g')"
+  else
+    fail_check "$title" \
+      "expected the call to be refused as Code: Unauthenticated with no token; deis-store answered: $(echo "$out" | tr '\n' ' ' | head -c 300)"
   fi
 }
 
@@ -2331,6 +2416,7 @@ verify_demo() {
   check_secret_delivery
   echo "-- storage --"
   check_kv_roundtrip
+  check_storage_capability_token
   echo "-- queue --"
   check_queue_roundtrip
   echo "-- cron --"

@@ -9,9 +9,7 @@
 //! stored.
 
 use super::bindings::StorageIdentity;
-use anyhow::{Context, Result};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use anyhow::Result;
 use tonic::transport::Channel;
 
 // Import generated proto code
@@ -39,50 +37,54 @@ pub struct KvRead {
     pub expiration: Option<i64>,
 }
 
-/// KV Store client wrapper
+/// One key as a *listing* reports it.
 ///
-/// Wrapped in Arc<Mutex> to support sharing and internal mutability across async operations
+/// The stored value is deliberately absent. A page holds up to ten thousand
+/// keys and deis-store caps one gRPC message at 16 MB, so a listing that
+/// carried values would fail on exactly the tenants that most need to
+/// enumerate. An application that wants a value asks for it by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvListEntry {
+    /// The key itself.
+    pub name: String,
+    /// Whatever the last write attached, returned untouched; `None` when the
+    /// write attached nothing.
+    pub metadata: Option<String>,
+    /// Absolute unix second this entry lapses at; `None` never does.
+    pub expiration: Option<i64>,
+}
+
+/// One page of a prefix scan, and where to pick the scan up again.
+///
+/// `cursor` is `Some` exactly when deis-store filled the page to the limit,
+/// which is *not* the same as "there is more". A prefix holding four keys
+/// listed two at a time answers with a cursor after the second page, and
+/// following it yields an empty page with no cursor. That is the store's
+/// contract (`Kv::list` in deis-store), and it is why a caller must page
+/// until the cursor is gone rather than until a page comes back short.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvListPage {
+    /// The keys of this page, in key order.
+    pub keys: Vec<KvListEntry>,
+    /// What to pass as the next call's `cursor`, or `None` when the scan is
+    /// finished.
+    pub cursor: Option<String>,
+}
+
+/// KV client for one tenant.
+///
+/// Cloning is cheap and every call clones: the inner tonic client wraps an
+/// HTTP/2 `Channel`, which is a reference-counted handle that multiplexes
+/// concurrent calls over one connection. Holding one shared client behind a
+/// lock instead would serialise the tenant's KV traffic, so a single slow
+/// call would stall every other one the application had in flight.
 #[derive(Clone)]
 pub struct KvClient {
-    client: Arc<Mutex<KvStoreClient<Channel>>>,
+    client: KvStoreClient<Channel>,
     identity: StorageIdentity,
 }
 
 impl KvClient {
-    /// Connect to remote KV Store service
-    ///
-    /// # Parameters
-    /// - endpoint: deis-store gRPC address (e.g., "http://127.0.0.1:8090",
-    ///   deis-store's default listen address)
-    /// - tenant: the `<app>.<environment>` every call of this client is
-    ///   charged to; see [`StorageIdentity`]
-    ///
-    /// Carries no capability token, so it can only speak to a deis-store that
-    /// has no `auth_secret`. Application bindings go through
-    /// [`Self::connect_lazy`], which is handed the token the control plane
-    /// minted for the tenant.
-    ///
-    /// # Returns
-    /// - Ok(KvClient): Connection successful
-    /// - Err: Connection failed
-    pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
-        let endpoint = endpoint.into();
-        let identity = StorageIdentity::new(tenant, None)?;
-        tracing::info!(%endpoint, app_id = identity.tenant(), "connecting to KV store");
-
-        let client = KvStoreClient::connect(endpoint.clone())
-            .await
-            .with_context(|| format!("connecting to KV store at {endpoint}"))?
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
-
-        tracing::info!(%endpoint, app_id = identity.tenant(), "KV store client connected");
-        Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            identity,
-        })
-    }
-
     /// Build a client that dials deis-store on its first call.
     ///
     /// This is what an application binding uses: constructing it cannot fail
@@ -102,7 +104,7 @@ impl KvClient {
             "KV client prepared; it will dial on the first call"
         );
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client,
             identity: identity.clone(),
         })
     }
@@ -142,7 +144,7 @@ impl KvClient {
 
         tracing::debug!("KV Get: {}", key);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.get(request).await?;
         let get_response = response.into_inner();
 
@@ -189,7 +191,7 @@ impl KvClient {
 
         tracing::debug!("KV Set: {} ({} bytes, ttl={:?})", key, bytes, ttl_seconds);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.set(request).await?;
         let set_response = response.into_inner();
 
@@ -209,7 +211,7 @@ impl KvClient {
 
         tracing::debug!("KV Delete: {}", key);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.delete(request).await?;
         let delete_response = response.into_inner();
 
@@ -220,37 +222,80 @@ impl KvClient {
         Ok(())
     }
 
-    /// List keys with matching prefix
+    /// One page of the keys under `prefix`, in key order.
     ///
-    /// # Parameters
-    /// - prefix: Prefix
-    /// - limit: Optional quantity limit
+    /// `limit` is a *request*: deis-store substitutes its default (1000) for
+    /// an absent or non-positive one and caps anything above its ceiling
+    /// (10000), so a caller that asks for a million gets ten thousand and a
+    /// cursor rather than an error. `cursor` resumes a previous page and is
+    /// `None` for the first one.
     ///
-    /// # Returns
-    /// - (keys, next_cursor): Key list and next page cursor
+    /// Every listing asks for metadata, because `ctx.services.kv.list`
+    /// promises it and the columns are on rows the scan already visits -- what
+    /// the flag buys is response *size*, and a page of names alone is not a
+    /// shape anything in this runtime wants.
     pub async fn list(
         &self,
         prefix: String,
         limit: Option<i32>,
-    ) -> Result<(Vec<String>, Option<String>)> {
+        cursor: Option<String>,
+    ) -> Result<KvListPage> {
         let request = self.identity.stamp(ListRequest {
             prefix: prefix.clone(),
             limit,
-            cursor: None,
-            // Names only. Asking for metadata moves the page into
-            // `entries` and leaves `keys` empty, which is a different
-            // answer than this method promises; nothing in the runtime
-            // exposes a per-key listing yet.
-            include_metadata: None,
+            cursor: cursor.clone(),
+            include_metadata: Some(true),
         });
 
-        tracing::debug!("KV List: prefix={}, limit={:?}", prefix, limit);
+        tracing::debug!(
+            prefix = %prefix,
+            limit = ?limit,
+            resuming = cursor.is_some(),
+            "KV List"
+        );
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.list(request).await?;
         let list_response = response.into_inner();
 
-        Ok((list_response.keys, list_response.next_cursor))
+        // `entries` is where a store that honoured `include_metadata` puts
+        // the page; `keys` is where one that did not put it. The second can
+        // only happen against a deis-store older than the flag, which is a
+        // version skew an operator has to fix -- the listing still answers,
+        // without the metadata it was asked for, rather than looking empty.
+        let keys = if list_response.entries.is_empty() && !list_response.keys.is_empty() {
+            tracing::warn!(
+                prefix = %prefix,
+                keys = list_response.keys.len(),
+                "deis-store answered a listing without the metadata it was asked for; it predates \
+                 ListRequest.include_metadata, so every listed key reports null metadata and null \
+                 expiration until the store is upgraded"
+            );
+            list_response
+                .keys
+                .into_iter()
+                .map(|name| KvListEntry {
+                    name,
+                    metadata: None,
+                    expiration: None,
+                })
+                .collect()
+        } else {
+            list_response
+                .entries
+                .into_iter()
+                .map(|entry| KvListEntry {
+                    name: entry.key,
+                    metadata: entry.metadata,
+                    expiration: entry.expires_at,
+                })
+                .collect()
+        };
+
+        Ok(KvListPage {
+            keys,
+            cursor: list_response.next_cursor,
+        })
     }
 
     /// Check if key exists
@@ -266,7 +311,7 @@ impl KvClient {
 
         tracing::debug!("KV Has: {}", key);
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client.has(request).await?;
         let has_response = response.into_inner();
 
@@ -331,18 +376,17 @@ mod tests {
             }
         }
 
+        /// A client for one tenant, wired the way an application binding is:
+        /// lazily dialled, carrying whatever proof the node was handed.
         /// `tenant` is the `<app>.<environment>` pair the store keys on.
-        async fn client(&self, tenant: &str) -> KvClient {
-            KvClient::connect(self.endpoint.clone(), tenant)
-                .await
-                .expect("connect kv client")
-        }
-
-        /// A client wired the way an application binding is: lazily dialled,
-        /// carrying whatever proof the node was handed for this tenant.
         fn binding(&self, tenant: &str, token: Option<&str>) -> KvClient {
             let identity = StorageIdentity::new(tenant, token).expect("a legal tenant");
             KvClient::connect_lazy(&self.endpoint, &identity).expect("client is built")
+        }
+
+        /// The common case: a store with no `auth_secret`, so no token.
+        fn client(&self, tenant: &str) -> KvClient {
+            self.binding(tenant, None)
         }
     }
 
@@ -357,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn a_value_written_with_a_lifetime_is_readable_until_it_lapses() {
         let store = Store::start().await;
-        let client = store.client("demo.production").await;
+        let client = store.client("demo.production");
 
         client
             .set_with_options("session".to_string(), b"abc".to_vec(), Some(3600), None)
@@ -378,7 +422,7 @@ mod tests {
         // that could never be read again. Over a real socket, because the two
         // halves are owned by different crates.
         let store = Store::start().await;
-        let client = store.client("demo.production").await;
+        let client = store.client("demo.production");
 
         // A PNG signature followed by a lone continuation byte and 0xFF:
         // valid as bytes, invalid as UTF-8 at the first character.
@@ -407,7 +451,7 @@ mod tests {
         // round trip, over a real socket, because the two halves are owned by
         // different crates.
         let store = Store::start().await;
-        let client = store.client("demo.production").await;
+        let client = store.client("demo.production");
 
         client
             .set_with_options(
@@ -437,7 +481,7 @@ mod tests {
         // An app branches on these differently: one means "nothing stored
         // here", the other means "stored, and the writer attached nothing".
         let store = Store::start().await;
-        let client = store.client("demo.production").await;
+        let client = store.client("demo.production");
 
         client
             .set("plain".to_string(), b"value".to_vec())
@@ -467,7 +511,7 @@ mod tests {
         // of it is left; the store answers with the absolute moment instead of
         // making every reader subtract.
         let store = Store::start().await;
-        let client = store.client("demo.production").await;
+        let client = store.client("demo.production");
 
         let before = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -496,7 +540,7 @@ mod tests {
         // already lapsed; honouring it would delete the write immediately and
         // look like the store losing data.
         let store = Store::start().await;
-        let client = store.client("demo.production").await;
+        let client = store.client("demo.production");
 
         let error = client
             .set_with_options("k".to_string(), b"v".to_vec(), Some(0), None)
@@ -514,7 +558,7 @@ mod tests {
     #[tokio::test]
     async fn a_plain_write_never_lapses_and_carries_no_metadata() {
         let store = Store::start().await;
-        let client = store.client("demo.production").await;
+        let client = store.client("demo.production");
 
         client
             .set("greeting".to_string(), b"hello".to_vec())
@@ -529,12 +573,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_listing_carries_each_key_s_metadata_and_pages_on_the_store_s_cursor() {
+        // The seam deis-store owns: this client asks for `include_metadata`,
+        // and the store answers that request in `entries` while leaving
+        // `keys` empty. A client that read the wrong one of the two would
+        // report every listing as empty, and no unit test on either half
+        // alone would notice.
+        let store = Store::start().await;
+        let client = store.client("demo.production");
+
+        client
+            .set_with_options(
+                "session:a".to_string(),
+                b"one".to_vec(),
+                Some(3600),
+                Some(r#"{"user":7}"#.to_string()),
+            )
+            .await
+            .expect("write with a lifetime and metadata");
+        for key in ["session:b", "session:c"] {
+            client
+                .set(key.to_string(), b"x".to_vec())
+                .await
+                .expect("plain write");
+        }
+        client
+            .set("other".to_string(), b"x".to_vec())
+            .await
+            .expect("plain write");
+
+        let first = client
+            .list("session:".to_string(), Some(2), None)
+            .await
+            .expect("the first page");
+        assert_eq!(
+            first
+                .keys
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session:a", "session:b"],
+            "a page is in key order and stops at the limit"
+        );
+        assert_eq!(first.keys[0].metadata.as_deref(), Some(r#"{"user":7}"#));
+        assert!(
+            first.keys[0].expiration.is_some(),
+            "a key written with a lifetime has to report when it lapses"
+        );
+        assert_eq!(first.keys[1].metadata, None);
+        assert_eq!(first.keys[1].expiration, None);
+
+        let cursor = first
+            .cursor
+            .expect("a page filled to the limit hands back where to resume");
+        let second = client
+            .list("session:".to_string(), Some(2), Some(cursor))
+            .await
+            .expect("the second page");
+        assert_eq!(
+            second
+                .keys
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session:c"],
+            "the cursor resumes after the last key of the previous page, and the prefix still \
+             holds: `other` is not in it"
+        );
+        assert_eq!(
+            second.cursor, None,
+            "a page that came back short is the end of the scan"
+        );
+    }
+
+    #[tokio::test]
     async fn one_app_cannot_see_another_app_s_keys() {
         // The tenant travels in the header, not in the message; a client that
         // stopped stamping it would read another application's data.
         let store = Store::start().await;
-        let first = store.client("app-one.production").await;
-        let second = store.client("app-two.production").await;
+        let first = store.client("app-one.production");
+        let second = store.client("app-two.production");
 
         first
             .set("shared-name".to_string(), b"one".to_vec())
@@ -557,8 +675,8 @@ mod tests {
         // an unrecoverable failure, and nothing in the app's own code says
         // which environment it is running in.
         let store = Store::start().await;
-        let production = store.client("demo.production").await;
-        let preview = store.client("demo.preview-7").await;
+        let production = store.client("demo.production");
+        let preview = store.client("demo.preview-7");
 
         production
             .set("customer".to_string(), b"real".to_vec())
@@ -606,7 +724,7 @@ mod tests {
         // computing different values.
         let store = Store::start_with(Some(AUTH_SECRET)).await;
         let tenant = "demo.production";
-        let token = deis_wire::conventions::storage_token(AUTH_SECRET, tenant);
+        let token = deis_wire::storage_token(AUTH_SECRET, tenant);
 
         let unproven = store.binding(tenant, None);
         let error = unproven
@@ -648,8 +766,7 @@ mod tests {
         // presenting production's token while naming the preview proves
         // nothing.
         let store = Store::start_with(Some(AUTH_SECRET)).await;
-        let production_token =
-            deis_wire::conventions::storage_token(AUTH_SECRET, "demo.production");
+        let production_token = deis_wire::storage_token(AUTH_SECRET, "demo.production");
 
         let error = store
             .binding("demo.preview-7", Some(&production_token))
@@ -666,7 +783,7 @@ mod tests {
         // check them is a legal intermediate state during a rollout, and it
         // must keep working.
         let store = Store::start().await;
-        let token = deis_wire::conventions::storage_token(AUTH_SECRET, "demo.production");
+        let token = deis_wire::storage_token(AUTH_SECRET, "demo.production");
 
         let client = store.binding("demo.production", Some(&token));
         client

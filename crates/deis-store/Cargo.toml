@@ -12,7 +12,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-rusqlite = { workspace = true }
+# `hooks` gives `Connection::authorizer` and `limits` gives `Connection::set_limit`.
+# Both are what keeps a tenant's SQL inside its own file; see `crate::database`.
+rusqlite = { workspace = true, features = ["hooks", "limits"] }
 deis-wire = { workspace = true }
 tonic = "0.12"
 tonic-health = "0.12"

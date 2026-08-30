@@ -234,6 +234,11 @@ fn main() -> Result<()> {
         apps = config.routes().len(),
         "configuration loaded"
     );
+    info!(
+        max_request_body_bytes = system.max_request_body_bytes(),
+        "request bodies larger than this are answered 413 here and never carried to a node; \
+         deis-runtime's own max_request_body_bytes should be set to the same value"
+    );
 
     let (balancer, balancer_service) = Balancer::build(Arc::clone(&config));
 

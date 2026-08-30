@@ -17,7 +17,7 @@
 
 use super::ops::{service_call_failed, AppId};
 use super::queue_client::QueueClient;
-use deno_core::{extension, op2, OpState};
+use deno_core::{extension, op2, JsBuffer, OpState};
 use deno_error::JsErrorBox;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -37,6 +37,11 @@ fn queue_unavailable(queue_name: &str) -> JsErrorBox {
 
 /// Enqueue one message, answering with the id deis-queue assigned it.
 ///
+/// The body arrives as a buffer rather than a string: a queue carries
+/// whatever the application put on it, and the `Queue` class in
+/// `js/runtime.js` is what turns a string or an object into those bytes. See
+/// `blob_ops.rs` for why `#[buffer]` and not `#[serde] Vec<u8>`.
+///
 /// The id comes from the server. Nothing here invents one: an id the queue
 /// never issued would let an app believe a message exists that it could never
 /// find again. The JS binding does not hand it to the application -- `send()`
@@ -47,7 +52,7 @@ fn queue_unavailable(queue_name: &str) -> JsErrorBox {
 async fn op_queue_send(
     state: Rc<RefCell<OpState>>,
     #[string] queue_name: String,
-    #[string] message: String,
+    #[buffer] message: JsBuffer,
 ) -> Result<String, JsErrorBox> {
     let (client_opt, app_id) = {
         let state_borrow = state.borrow();
@@ -77,7 +82,7 @@ async fn op_queue_send(
     };
 
     client
-        .send(queue_name, message)
+        .send(queue_name, message.to_vec())
         .await
         .map_err(|e| service_call_failed("queue.send", e))
 }

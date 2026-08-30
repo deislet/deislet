@@ -29,7 +29,7 @@ node.
 
 `scripts/demo.sh` brings up six processes, deploys an application with
 `deis deploy` — the same command a person would run, not a `curl` against the
-REST API — and then runs nineteen checks in eleven groups, printing the
+REST API — and then runs twenty-five checks in thirteen groups, printing the
 evidence for each:
 
 | Check | Evidence |
@@ -39,10 +39,16 @@ evidence for each:
 | static asset served from the bundle | without entering an isolate |
 | `If-None-Match` answers 304 | the ETag is the asset's own sha256 |
 | a route placeholder reaches `context.params` | `/hello/:name` |
+| a WebSocket handshake through deis-proxy switches protocols | the RFC 6455 answer to a published test key, so the 101 came from the node and was relayed, not invented by the proxy |
+| a text frame and a binary frame survive that round trip | bytes that are not valid UTF-8 echoed back byte for byte |
+| a handler's `fetch` reaches an allowed destination | the node's `[fetch] allow` names exactly one address, and the handler gets its body back |
+| a handler's `fetch` to deis-store is refused | the platform never makes the call — refused, not merely answered with an error |
+| `crypto.randomUUID` and `crypto.subtle.digest` return real values | a version-4 UUID that differs across calls; a SHA-256 digest checked against the known hash of a fixed string |
 | `deis secret list` never prints a value | names and times only, in both human and `--json` output |
 | the environment's secret reached the isolate | delivered decrypted, in memory |
 | the decrypted secret is written nowhere | the data directories and logs are grepped for it |
 | `context.services.kv` round-trips | through deis-store, in this tenant's rows |
+| a storage call presenting no capability token is refused | deis-store answers Unauthenticated before touching any data |
 | a queue message is produced and consumed | deis-queue, pulled under a lease |
 | a cron expression fires on one node | and runs the app's `scheduled` export |
 | two environments of one app serve at once | each on its own version |
@@ -71,11 +77,13 @@ protocol.
 | [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four targets — Cloudflare Workers, Deno Deploy, Tencent EdgeOne, and this platform. Translation only: it never deploys. |
 | [`deis-wire`](crates/deis-wire) | The gRPC toolkit and, in `deis_wire::conventions`, the names both sides of every wire agree on: the header names, the tenant id, the message ceiling, the reserved environment keys. |
 
-Two library crates carry contracts rather than behaviour:
+A few more crates carry contracts rather than behaviour:
 [`deis-bundle`](crates/deis-bundle) is the bundle format — manifest, asset
 index, archive layout — shared by the compiler, the control plane and the
-node; `deis-build-adapter-*` are one code generator per compile target, each
-named after the `--vendor` value it answers for —
+node; [`deis-build-core`](crates/deis-build-core) holds the types, config and
+bundling logic every compile target's code generator shares; and
+`deis-build-adapter-*` are one code generator per compile target, each named
+after the `--vendor` value it answers for —
 `deis-build-adapter-{cloudflare,deno,tencent,deislet}`.
 
 ## How the pieces are addressed
@@ -116,7 +124,7 @@ environment map) and the node fetches the bytes itself.
 
 ```bash
 scripts/demo.sh start     # build everything, start six processes, deploy the example app with `deis deploy`
-scripts/demo.sh verify    # run the nineteen checks and print the evidence for each
+scripts/demo.sh verify    # run the twenty-five checks and print the evidence for each
 scripts/demo.sh stop      # stop everything and wait until each process has really exited
 ```
 
@@ -126,11 +134,12 @@ Then talk to the deployed application:
 curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
 ```
 
-`start` needs `cargo`, `curl` and `jq`; two checks in `verify` — the log query
-and the one that asks deis-store directly whether the KV row is there — need
-`grpcurl`, and each reports a failure rather than skipping when it is missing.
-The whole run takes a minute or two, because the cron check waits for a real
-occurrence.
+`start` needs `cargo`, `curl` and `jq`; three checks in `verify` — the log
+query and the two that call deis-store directly (whether the KV row is there,
+and that a call with no capability token is refused) — need `grpcurl`, and the
+first of those two also needs `openssl` to mint the token it presents. Each
+reports a failure rather than skipping when a dependency is missing. The whole
+run takes a minute or two, because the cron check waits for a real occurrence.
 
 On a fresh clone, build the web console first. Its output is gitignored and
 `deis-control` embeds it at compile time, so `cargo build` fails without it and
@@ -172,35 +181,39 @@ order it is likely to matter:
   still resolves an application by host or by header only. Path-prefix routing
   and automatic preview subdomains (`<env>.<app>.<zone>`) both wait on that
   link.
-- **Request and response bodies are strings.** Binary payloads are not carried
-  through the isolate boundary yet, and the `Request` / `Response` an isolate
-  sees are the runtime's own minimal classes, not `deno_fetch`'s.
-- **Most Web API globals are missing, `fetch` among them.** The extensions are
-  registered — `deno_web`, `deno_fetch`, `deno_crypto`, `deno_websocket` are
-  all in `build_runtime_extensions()` — but their JS modules only export;
-  nothing binds them to `globalThis`, because the file that does that in Deno
-  itself (`99_main.js`) is not part of this runtime.
+- **A handful of Web API globals beyond what Edge Canon requires stay
+  unbound.** SPECIFICATION_BASIC.md section 8.1 is met in full: `fetch`,
+  `crypto`, the streams, `AbortController`/`AbortSignal` and the rest of the
+  required surface are on `globalThis`, backed by the real
+  `deno_web`/`deno_fetch`/`deno_crypto` extensions rather than stand-ins, so
+  `Response.json()` and a streaming body behave as they do in a browser.
+  Beyond section 8.1, `Blob`, `File`, `FormData`, `URLPattern`,
+  `structuredClone`, `Event`, `CustomEvent`, the client `WebSocket` (policed
+  by the same outbound egress policy as `fetch`), `performance` (deliberately
+  coarsened to whole milliseconds, against cross-isolate timing side
+  channels) and `navigator` (one frozen property, `userAgent`) are bound too,
+  because section 8.1's own surface is not usable without them — a multipart
+  upload could be received but not read without `Blob`/`File`/`FormData`, for
+  instance.
+  `the_isolate_global_surface_is_the_one_the_documents_describe` in
+  `isolate_test.rs` walks the full list both ways inside a real isolate, so a
+  global gained or lost fails that test until this section,
+  `crates/deis-runtime/README.md` and edge-canon's `PLATFORM_MATRIX.md` move
+  with it.
 
-  Measured with a probe that asks `typeof globalThis[name]` inside a real
-  isolate. **Present:** `Headers`, `Request`, `Response`, `URL`,
-  `URLSearchParams`, `EventTarget`, `setTimeout`, `clearTimeout`,
-  `queueMicrotask`, `console`, `caches`, `WebSocketPair`, `WebSocketServer`.
-  **Absent:** `fetch`, `crypto`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`,
-  `AbortController`, `AbortSignal`, `ReadableStream`, `WritableStream`,
-  `TransformStream`, `Blob`, `File`, `FormData`, `URLPattern`, `WebSocket`,
-  `BroadcastChannel`, `structuredClone`, `Event`, `setInterval`,
-  `clearInterval`, `performance`, `DOMException`, `MessageChannel`,
-  `MessagePort`, `CompressionStream`, `DecompressionStream`, `EventSource`,
-  `FileReader`, `navigator`, `reportError`.
-
-  Of the `Present` names, `console` and `queueMicrotask` come from deno_core's
-  own `01_core.js`; every other one is defined by the runtime's own
-  `src/runtime/js/runtime.js`, not by Deno. They are minimal stand-ins, so
-  `Response.json()` and `Response.prototype.arrayBuffer()` are not there
-  either. Nothing in the test suite touches
-  any of the absent ones, so nothing goes red; the missing piece is a
-  conformance test that walks Edge Canon's global list and fails per name.
-  See §12 of the architecture document.
+  What still stays off `globalThis` is a much shorter list, each for its own
+  reason: `Deno` and `__bootstrap`, which would otherwise hand a handler the
+  raw op table and a way around the outbound fetch policy
+  (`crates/deis-runtime/src/runtime/fetch_policy.rs`); `addEventListener`,
+  because this platform runs Edge Canon's module syntax
+  (`export default function handler`) rather than the service-worker style an
+  `addEventListener("fetch", ...)` implies; and `BroadcastChannel`, which is
+  genuinely not implemented — an isolate is one `(application, environment)`
+  on one node, two of them share no memory, and nothing on this node carries
+  a message between them. `MessageChannel`, `MessagePort`, `CompressionStream`,
+  `DecompressionStream`, `EventSource`, `FileReader` and `reportError` remain
+  unbound as well, simply not yet taken up. See §12 of the architecture
+  document.
 - **No Node.js built-ins and no npm resolution**, and therefore no framework
   SSR. This is a decision, not a gap: see the capability matrix.
 - **Only the node ships logs.** deis-proxy, deis-store, deis-queue and
@@ -214,7 +227,7 @@ order it is likely to matter:
   not.
 - **The isolate's timeout is wall-clock only.** A handler blocked on a slow
   dependency holds its runtime thread for the full 30 seconds; there is no CPU
-  time limit and no egress policy.
+  time limit.
 
 See §11 and §12 of the architecture document for the full list and the
 per-capability accounting against [Edge Canon's platform

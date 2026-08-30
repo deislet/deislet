@@ -16,8 +16,6 @@
 
 use super::bindings::StorageIdentity;
 use anyhow::{Context, Result};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 pub mod proto {
@@ -36,7 +34,11 @@ pub struct LeasedMessage {
     /// idempotent handler can deduplicate on. It is *not* on its own enough to
     /// answer for the message; see [`Self::handle`].
     pub id: String,
-    pub body: String,
+    /// The bytes that were sent, handed back untouched. Bytes and not a
+    /// string because a queue body is whatever the application put on it --
+    /// a compressed record, a serialised frame -- and only the consumer knows
+    /// how to read it. See [`Self::js_body`] for the form a handler sees.
+    pub body: Vec<u8>,
     /// Deliveries so far, including this one; starts at 1.
     pub attempts: i32,
     /// Unix second at which the lease lapses and the message becomes visible
@@ -65,6 +67,46 @@ impl LeasedMessage {
             lease_token: self.lease_token.clone(),
         }
     }
+
+    /// The body in the form the JS payload carries it.
+    ///
+    /// A queue batch reaches an isolate as JSON written into the source text
+    /// of the invocation script, and JSON has no way to spell a byte that is
+    /// not text. So a body that is valid UTF-8 travels as itself -- which is
+    /// every body an application has ever sent, and what `message.body` in
+    /// `js/runtime.js` hands the handler -- and anything else travels base64
+    /// encoded, to be turned back into bytes there. The two cases are
+    /// distinguished by which variant this is, never by inspecting the
+    /// string: a text body that happened to look like base64 would otherwise
+    /// be decoded into something the sender never wrote.
+    pub fn js_body(&self) -> JsBody {
+        match std::str::from_utf8(&self.body) {
+            Ok(text) => JsBody::Text {
+                text: text.to_string(),
+            },
+            Err(_) => JsBody::Bytes {
+                base64: base64_standard(&self.body),
+            },
+        }
+    }
+}
+
+/// One message body as the JS payload carries it; see
+/// [`LeasedMessage::js_body`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+pub enum JsBody {
+    /// The body is valid UTF-8 and travels as the text itself.
+    Text { text: String },
+    /// The body is not text and travels base64 encoded.
+    Bytes { base64: String },
+}
+
+/// Standard base64 with padding, the alphabet `js/runtime.js`'s `atob`
+/// decodes.
+fn base64_standard(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 impl From<QueueMessage> for LeasedMessage {
@@ -122,34 +164,20 @@ pub struct NackOutcome {
     pub stale_leases: i32,
 }
 
+/// Queue client for one tenant.
+///
+/// Cloning is cheap and every call clones: the inner tonic client wraps an
+/// HTTP/2 `Channel`, which is a reference-counted handle that multiplexes
+/// concurrent calls over one connection. One shared client behind a lock
+/// would serialise this tenant's queue traffic, so a consumer's slow `Pull`
+/// would hold up a request handler's `send` on the same node.
 #[derive(Clone)]
 pub struct QueueClient {
-    client: Arc<Mutex<GrpcQueueClient<Channel>>>,
+    client: GrpcQueueClient<Channel>,
     identity: StorageIdentity,
 }
 
 impl QueueClient {
-    /// Connect eagerly, failing if deis-queue is not reachable right now.
-    ///
-    /// Used by tests and by callers that want the failure at construction.
-    /// Application bindings use [`Self::connect_lazy`] instead, so that a
-    /// queue outage cannot stop an app from loading and so that the call
-    /// carries this tenant's capability token.
-    pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
-        let endpoint = endpoint.into();
-        let identity = StorageIdentity::new(tenant, None)?;
-        let client = GrpcQueueClient::connect(endpoint.clone())
-            .await
-            .with_context(|| format!("connecting to the queue at {endpoint}"))?
-            .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
-        tracing::info!(%endpoint, app_id = identity.tenant(), "queue client connected");
-        Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            identity,
-        })
-    }
-
     /// Build a client that dials on first use.
     ///
     /// Fails only on an address that is not a URL -- a configuration mistake
@@ -165,7 +193,7 @@ impl QueueClient {
             "queue client prepared; it will dial on the first call"
         );
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client,
             identity: identity.clone(),
         })
     }
@@ -177,13 +205,16 @@ impl QueueClient {
     }
 
     /// Enqueue one message, returning the id deis-queue assigned it.
-    pub async fn send(&self, queue_name: String, message: String) -> Result<String> {
+    ///
+    /// The body is bytes: the queue stores and returns exactly what it is
+    /// given, and an application that sends text encodes it first.
+    pub async fn send(&self, queue_name: String, message: Vec<u8>) -> Result<String> {
         let request = self.identity.stamp(SendRequest {
             queue_name: queue_name.clone(),
             message_body: message,
         });
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client
             .send(request)
             .await
@@ -226,7 +257,7 @@ impl QueueClient {
             lease_seconds: lease_seconds.min(i32::MAX as u32) as i32,
         });
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client
             .pull(request)
             .await
@@ -259,7 +290,7 @@ impl QueueClient {
             messages: handles.into_iter().map(Into::into).collect(),
         });
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client
             .ack(request)
             .await
@@ -295,7 +326,7 @@ impl QueueClient {
             delay_seconds: delay_seconds.min(i32::MAX as u32) as i32,
         });
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let response = client
             .nack(request)
             .await
@@ -307,5 +338,78 @@ impl QueueClient {
             dead_lettered: inner.dead_lettered,
             stale_leases: inner.stale_leases,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leased(body: Vec<u8>) -> LeasedMessage {
+        LeasedMessage {
+            id: "m1".to_string(),
+            body,
+            attempts: 1,
+            lease_expires_at: 0,
+            created_at: 0,
+            lease_token: "lease".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_text_body_travels_as_itself_and_anything_else_as_base64() {
+        assert_eq!(
+            leased(b"{\"job\":1}".to_vec()).js_body(),
+            JsBody::Text {
+                text: "{\"job\":1}".to_string()
+            }
+        );
+        // Two bytes no UTF-8 decoder accepts. RFC 4648 base64 of ff fe.
+        assert_eq!(
+            leased(vec![0xff, 0xfe]).js_body(),
+            JsBody::Bytes {
+                base64: "//4=".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_text_body_that_looks_like_base64_still_travels_as_text() {
+        // The two forms are told apart by which variant this is, never by
+        // inspecting the string: `js/runtime.js` decodes only the base64
+        // variant, so this application's own text is handed over unchanged
+        // rather than turned into bytes it never wrote.
+        assert_eq!(
+            leased(b"aGVsbG8=".to_vec()).js_body(),
+            JsBody::Text {
+                text: "aGVsbG8=".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn the_two_forms_serialise_to_the_shapes_the_js_side_reads() {
+        // `js/runtime.js` looks for `text` first and falls back to `base64`;
+        // a rename on either side would leave every body arriving as bytes.
+        assert_eq!(
+            serde_json::to_string(&leased(b"hi".to_vec()).js_body()).unwrap(),
+            r#"{"text":"hi"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&leased(vec![0xff, 0xfe]).js_body()).unwrap(),
+            r#"{"base64":"//4="}"#
+        );
+    }
+
+    #[test]
+    fn an_empty_body_is_text_rather_than_bytes() {
+        // A zero-length body decodes as the empty string, so a handler reads
+        // `""` rather than being pushed onto the bytes path for nothing.
+        assert_eq!(
+            leased(Vec::new()).js_body(),
+            JsBody::Text {
+                text: String::new()
+            }
+        );
     }
 }

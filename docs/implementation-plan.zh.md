@@ -423,10 +423,33 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 - **控制面的 `routes` 表没人消费**：表、REST（`GET /api/routes`）都有，deis-proxy 仍只按域名或 `x-deis-app-id` 选应用，`path_prefix` 不影响任何请求的去向。预览子域（`<env>.<app>.<zone>`）也卡在这条链路上。
 - **只有 deis-runtime 在往 deis-telemetry 投递**：deis-proxy / deis-store / deis-queue / deis-control 都还只写自己的 stdout。
 - **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent` 已经有了）。队列消费目前由节点自己按 `(应用, 环境)` 轮询，不走这个消息，所以还没被踩到。
-- **Web 标准的全局大半没装上，`fetch` 也在其中**：扩展注册了，但它们的 JS 模块只 `export`，没有谁把它们挂到 `globalThis` 上（Deno 自己是在 `99_main.js` 里挂的，那个文件不在这里）。探针实测（2026-08-29，在真 Isolate 里逐个 `typeof globalThis[name]`）：**有** `Headers` / `Request` / `Response` / `URL` / `URLSearchParams` / `EventTarget` / `setTimeout` / `clearTimeout` / `queueMicrotask` / `console` / `caches` / `WebSocketPair` / `WebSocketServer`；**没有** `fetch` / `crypto` / `TextEncoder` / `TextDecoder` / `atob` / `btoa` / `AbortController` / `AbortSignal` / `ReadableStream` / `WritableStream` / `TransformStream` / `Blob` / `File` / `FormData` / `URLPattern` / `WebSocket` / `BroadcastChannel` / `structuredClone` / `Event` / `setInterval` / `clearInterval` / `performance` / `DOMException` / `MessageChannel` / `MessagePort` / `CompressionStream` / `DecompressionStream` / `EventSource` / `FileReader` / `navigator` / `reportError`。「有」的那一列里，`console` 与 `queueMicrotask` 来自 deno_core 自己的 `01_core.js`，其余全部是 `src/runtime/js/runtime.js` 自带的最小实现，不是 Deno 的——所以 `Response.json()` 这个静态方法和实例上的 `arrayBuffer()` 也都没有。edge-canon 把 `fetch` 列为基础特性，这是最直接的一处不达标。缺的是一个真正跑 JS 的一致性测试——列一份全局清单，在 Isolate 里逐个 `typeof`，缺哪个红哪个。
+- ~~**Web 标准的全局大半没装上，`fetch` 也在其中**~~ **已关闭**：这一条记的是
+  2026-08-29 之前、`fetch` 本身都还没挂上全局名那个阶段的探针结果，早已被后续几轮
+  超过。现状见 `docs/architecture.zh.md` §12「Web 标准这一格的实情」——
+  SPECIFICATION_BASIC.md 8.1 节要求的全局一个不缺，随后又补上了
+  `Blob` / `File` / `FormData` / `URLPattern` / `structuredClone` / `Event` /
+  `CustomEvent` / `performance` / `navigator` 和客户端 `WebSocket`；仍未挂的只剩
+  `Deno` / `__bootstrap`（永久不给）、`addEventListener`、`BroadcastChannel`
+  （真没实现）。这条已不再是「开着的」，留在这里只为免得又有人把这份旧探针结果
+  当成现状。
 - **`TriggerResponse` 没有「处理函数已被调用」这一位**，只能靠 `deis_runtime::trigger::HANDLER_FAILED_PREFIX` 这个错误前缀表达，控制面据此不再换节点重试。
-- **请求与响应体是 `String`**：`JsRequest.body` / `JsResponse.body` 都是文本，二进制主体过不了 Isolate 边界。
-- **执行超时管不住卡在 await 上的处理函数**：30 秒墙钟只约束「正在跑 JS」的那部分，一个卡在慢存储上的 handler 能无限占住它那条运行时线程。
+- ~~**请求与响应体是 `String`**~~ **已关闭**：`JsRequest.body` / `JsResponse.body`
+  过 Rust/JS 边界现在是 `Option<Vec<u8>>`（`ops.rs::PendingRequestBody` /
+  `PendingResponseBody`，op 边界 `#[buffer]` / `ToJsBuffer`），二进制主体原样穿过
+  Isolate 边界；同一轮里 KV、Blob、Cache API、deis-queue 的消息体也都改成了按字节
+  走。
+- ~~**执行超时管不住卡在 await 上的处理函数**~~ **一半关闭**：请求 / `waitUntil` /
+  队列 / cron / WebSocket / 模块求值六条路径现在都由一条独立的 OS 看守线程
+  （`isolate.rs` 的 `Watchdog`）按 wall clock 裁断，不再靠处理函数自己让出线程，
+  一个不 `await` 任何东西、纯占 CPU 的 `while (true)` 已经管得住——此前是
+  `tokio::spawn` 一个定时器，同一条线程上的 JS 不 `await` 就永远轮不到它，实测量到
+  跑了 75 秒还没停。没关的是另一半：看守线程打断的是 V8 正在跑的字节码，一个卡在
+  `await ctx.services.kv.get(...)` 上、背后那次 gRPC 调用自己没配超时的 handler，
+  此刻根本没有字节码在跑，裁断打不到它身上，这条运行时线程还是会一直等下去——真正
+  的解法是给 deis-store / deis-queue 的每次调用配自己的超时。模块顶层求值另外多了
+  一条应用怎么覆盖都碰不到的硬上限（5 秒，`MODULE_EVALUATION_BUDGET_MS`，不进
+  `AppConfig`）；请求 / 队列 / cron 的超时仍是纯应用覆盖，没有这样的天花板。详见
+  `docs/architecture.zh.md` §9。
 - **`StartInspectRequest` 已加 `environment`**，但调试通道本身还只覆盖到单个环境的用法。
 
 ### 波次 C

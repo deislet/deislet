@@ -122,6 +122,11 @@ pub struct ApplicationManager {
     // An app's own `ResourceLimits` may override either value; see
     // `effective_limits`.
     default_limits: ExecutionLimits,
+    /// V8 heap ceiling (MB) every isolate on this node runs with unless its
+    /// app asked for less. Not part of `default_limits` because
+    /// `ExecutionLimits` bounds one invocation and is re-armed per request,
+    /// while a heap belongs to the isolate and outlives every request in it.
+    default_memory_limit_mb: usize,
     /// Where every isolate on this node may send an outbound `fetch()`. One
     /// policy for the node, because it is the node's network that is being
     /// protected, not any one application's. The default refuses everything
@@ -147,6 +152,7 @@ impl ApplicationManager {
             runtime_pool: Arc::new(RuntimePool::new(num_threads)),
             inspect_sessions: DashMap::new(),
             default_limits: ExecutionLimits::default(),
+            default_memory_limit_mb: crate::config::default_memory_limit_mb(),
             fetch_policy: FetchPolicy::default(),
         }
     }
@@ -158,6 +164,7 @@ impl ApplicationManager {
             runtime_pool: Arc::new(RuntimePool::new_with_repo(num_threads, Some(app_repo))),
             inspect_sessions: DashMap::new(),
             default_limits: ExecutionLimits::default(),
+            default_memory_limit_mb: crate::config::default_memory_limit_mb(),
             fetch_policy: FetchPolicy::default(),
         }
     }
@@ -167,6 +174,15 @@ impl ApplicationManager {
     /// called once at startup with the values loaded from `RuntimeConfig`.
     pub fn with_limits(mut self, default_limits: ExecutionLimits) -> Self {
         self.default_limits = default_limits;
+        self
+    }
+
+    /// Override the platform-wide V8 heap ceiling every isolate on this node
+    /// runs with. Intended to be called once at startup with
+    /// `RuntimeConfig::default_memory_limit_mb`, which validation has already
+    /// held to a floor.
+    pub fn with_memory_limit_mb(mut self, default_memory_limit_mb: usize) -> Self {
+        self.default_memory_limit_mb = default_memory_limit_mb;
         self
     }
 
@@ -224,6 +240,50 @@ impl ApplicationManager {
         }
     }
 
+    /// Resolve the V8 heap ceiling for one app: the node's default, narrowed
+    /// by the app's own `ResourceLimits.memory_mb` when it asked for less.
+    ///
+    /// Always a value, never `None`. An isolate built with no ceiling runs on
+    /// whatever V8 defaults to, which on a 64-bit host is large enough that an
+    /// app allocating in a loop takes the node process down and every other
+    /// tenant's isolate with it. The node default is therefore the floor, and
+    /// the only direction an app may move it is down.
+    fn effective_memory_limit_mb(&self, key: &AppKey, limits: Option<&ResourceLimits>) -> usize {
+        // 0 is "unset", not "no memory at all"; see `ResourceLimits::memory_mb`.
+        let requested = limits.map(|l| l.memory_mb).filter(|mb| *mb > 0);
+        match requested {
+            None => self.default_memory_limit_mb,
+            Some(mb) if mb <= self.default_memory_limit_mb => {
+                tracing::info!(
+                    target: "app",
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
+                    "App {} narrows the default heap ceiling: {}MB (platform default {}MB)",
+                    key,
+                    mb,
+                    self.default_memory_limit_mb
+                );
+                mb
+            }
+            Some(mb) => {
+                tracing::warn!(
+                    target: "app",
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
+                    requested_mb = mb,
+                    applied_mb = self.default_memory_limit_mb,
+                    "App {} asks for a {}MB heap, above this node's {}MB ceiling; it is held to \
+                     the node's value. Raise default_memory_limit_mb if this node is meant to \
+                     carry apps that large",
+                    key,
+                    mb,
+                    self.default_memory_limit_mb
+                );
+                self.default_memory_limit_mb
+            }
+        }
+    }
+
     /// Load application
     pub async fn load_app(
         &self,
@@ -256,7 +316,7 @@ impl ApplicationManager {
             entry_point,
             env: config.env.clone(),
             permissions: config.permissions.clone(),
-            memory_limit_mb: config.limits.as_ref().map(|l| l.memory_mb),
+            memory_limit_mb: Some(self.effective_memory_limit_mb(&key, config.limits.as_ref())),
             resource_table_max: config.limits.as_ref().and_then(|l| l.resource_table_max),
             route_patterns: config.routes.clone(),
             limits: self.effective_limits(&key, config.limits.as_ref()),
@@ -426,7 +486,9 @@ impl ApplicationManager {
             entry_point: Some(record.entry_point.clone()),
             env: record.config.env.clone(),
             permissions: record.config.permissions.clone(),
-            memory_limit_mb: record.config.limits.as_ref().map(|l| l.memory_mb),
+            memory_limit_mb: Some(
+                self.effective_memory_limit_mb(key, record.config.limits.as_ref()),
+            ),
             resource_table_max: record
                 .config
                 .limits
@@ -766,3 +828,177 @@ impl Default for ApplicationManager {
 #[cfg(test)]
 #[path = "manager_test.rs"]
 mod manager_test;
+
+/// The node-level heap ceiling, exercised against a real isolate.
+///
+/// Not in `manager_test.rs` with the rest: this is the one property of the
+/// manager that only shows up in V8, so it costs a real runtime thread and a
+/// real allocation loop, and it is worth having the reason for that in one
+/// place rather than mixed into the fast tests.
+#[cfg(test)]
+mod memory_ceiling {
+    use super::*;
+    use crate::app::types::{AppConfig, ResourceLimits};
+    use std::collections::HashMap;
+
+    /// Allocates until something stops it. `new Array(n).fill(0)` is used
+    /// rather than a bare `new Array(n)`, which V8 is free to leave as a
+    /// hole-backed array that costs nothing: the `fill` forces a real backing
+    /// store, so the heap genuinely grows on every iteration.
+    const RUNAWAY: &str = r#"
+        export default function handler() {
+            const held = [];
+            for (;;) {
+                held.push(new Array(100000).fill(0));
+            }
+        }
+    "#;
+
+    const HEALTHY: &str = r#"
+        export default function handler() {
+            return new Response("still serving");
+        }
+    "#;
+
+    fn limits(memory_mb: usize) -> AppConfig {
+        AppConfig {
+            limits: Some(ResourceLimits {
+                memory_mb,
+                cpu_milli: 0,
+                resource_table_max: None,
+                timeout_ms: None,
+                rate_limit_ops_per_sec: None,
+            }),
+            ..AppConfig::default()
+        }
+    }
+
+    async fn call(manager: &ApplicationManager, key: &AppKey) -> Result<(u16, Option<Vec<u8>>)> {
+        manager
+            .execute_app(
+                key,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .map(|(status, _, body)| (status, body))
+    }
+
+    /// The bug this ceiling exists for: nothing ever set `memory_limit_mb`, so
+    /// every isolate ran on whatever V8 defaults to and an application
+    /// allocating in a loop grew until the node process was killed -- taking
+    /// every other application in that process with it.
+    ///
+    /// Both applications share one runtime thread here on purpose. The second
+    /// call is what proves the runaway was contained: if the heap ceiling were
+    /// enforced by killing the process, or if the terminated isolate left the
+    /// thread wedged, there would be nothing left to answer it.
+    #[tokio::test]
+    async fn an_app_allocating_without_bound_is_stopped_and_the_node_keeps_serving() {
+        let manager = ApplicationManager::with_threads(Some(2)).with_memory_limit_mb(64);
+        let runaway = AppKey::production("runaway_allocator");
+        let neighbour = AppKey::production("quiet_neighbour");
+
+        manager
+            .load_app(
+                runaway.clone(),
+                RUNAWAY.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("an app with no limits of its own still loads");
+        manager
+            .load_app(
+                neighbour.clone(),
+                HEALTHY.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the neighbour loads");
+
+        // The isolate logs the heap it was stopped at; with a test writer it
+        // is visible under `--nocapture`, which is how a failure here is
+        // diagnosed.
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+        let started = std::time::Instant::now();
+        let refused = call(&manager, &runaway).await;
+        let elapsed = started.elapsed();
+        assert!(
+            refused.is_err(),
+            "an app allocating without bound must be stopped, not answered; it returned {refused:?}"
+        );
+
+        // What stopped it has to be the heap and not the clock. The execution
+        // timeout is the other thing that terminates an isolate, and it is a
+        // whole platform budget away; the ceiling bites in a fraction of it.
+        let budget = std::time::Duration::from_millis(manager.default_limits.timeout_ms);
+        assert!(
+            elapsed * 4 < budget,
+            "the runaway was stopped after {elapsed:?}, close enough to the {budget:?} execution \
+             timeout that the timeout, not the heap ceiling, may be what stopped it"
+        );
+
+        let (status, body) = call(&manager, &neighbour)
+            .await
+            .expect("the node still serves its other applications");
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8(body.unwrap_or_default()).as_deref(),
+            Ok("still serving")
+        );
+
+        let _ = manager.unload_app(&runaway).await;
+        let _ = manager.unload_app(&neighbour).await;
+    }
+
+    #[test]
+    fn an_app_that_asks_for_nothing_is_held_to_the_node_ceiling() {
+        let manager = ApplicationManager::with_threads(Some(1)).with_memory_limit_mb(128);
+        let key = AppKey::production("no_limits_of_its_own");
+        assert_eq!(manager.effective_memory_limit_mb(&key, None), 128);
+        // A deployment that carries a `ResourceLimits` but leaves the memory
+        // key at its default is the same case: it asked for nothing.
+        let unset = limits(0);
+        assert_eq!(
+            manager.effective_memory_limit_mb(&key, unset.limits.as_ref()),
+            128
+        );
+    }
+
+    #[test]
+    fn an_app_may_narrow_the_ceiling_but_not_widen_it() {
+        let manager = ApplicationManager::with_threads(Some(1)).with_memory_limit_mb(128);
+        let key = AppKey::production("bounded_by_the_node");
+
+        let narrower = limits(32);
+        assert_eq!(
+            manager.effective_memory_limit_mb(&key, narrower.limits.as_ref()),
+            32
+        );
+
+        let wider = limits(4096);
+        assert_eq!(
+            manager.effective_memory_limit_mb(&key, wider.limits.as_ref()),
+            128,
+            "an app must not be able to raise the node's ceiling"
+        );
+    }
+
+    /// The call site the bug lived at: `IsolateSpec.memory_limit_mb` was fed
+    /// `config.limits.as_ref().map(|l| l.memory_mb)` and nothing ever produced
+    /// a `limits`, so it was `None` on every isolate on every node.
+    #[test]
+    fn every_isolate_is_built_with_a_ceiling_even_with_no_deployment_limits() {
+        let manager = ApplicationManager::with_threads(Some(1)).with_memory_limit_mb(96);
+        let key = AppKey::production("spec_carries_a_ceiling");
+        assert_eq!(
+            manager.effective_memory_limit_mb(&key, AppConfig::default().limits.as_ref()),
+            96
+        );
+    }
+}
