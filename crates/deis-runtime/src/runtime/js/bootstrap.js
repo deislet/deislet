@@ -49,8 +49,8 @@ import * as domException from "ext:deno_web/01_dom_exception.js";
 import "ext:deno_web/01_mimesniff.js";
 import "ext:deno_web/01_broadcast_channel.js";
 import "ext:deno_web/01_console.js";
-import "ext:deno_web/01_urlpattern.js";
-import "ext:deno_web/02_event.js";
+import * as urlPattern from "ext:deno_web/01_urlpattern.js";
+import * as event from "ext:deno_web/02_event.js";
 import "ext:deno_web/02_structured_clone.js";
 import * as timers from "ext:deno_web/02_timers.js";
 import * as abortSignal from "ext:deno_web/03_abort_signal.js";
@@ -58,15 +58,15 @@ import "ext:deno_web/04_global_interfaces.js";
 import "ext:deno_web/05_base64.js";
 import * as streams from "ext:deno_web/06_streams.js";
 import "ext:deno_web/08_text_encoding.js";
-import "ext:deno_web/09_file.js";
+import * as file from "ext:deno_web/09_file.js";
 import "ext:deno_web/10_filereader.js";
 import "ext:deno_web/12_location.js";
-import "ext:deno_web/13_message_port.js";
+import * as messagePort from "ext:deno_web/13_message_port.js";
 import "ext:deno_web/14_compression.js";
 import "ext:deno_web/15_performance.js";
 import "ext:deno_web/16_image_data.js";
 import * as headers from "ext:deno_fetch/20_headers.js";
-import "ext:deno_fetch/21_formdata.js";
+import * as formData from "ext:deno_fetch/21_formdata.js";
 import "ext:deno_fetch/22_body.js";
 import "ext:deno_fetch/22_http_client.js";
 import * as request from "ext:deno_fetch/23_request.js";
@@ -75,6 +75,7 @@ import * as fetchModule from "ext:deno_fetch/26_fetch.js";
 import "ext:deno_fetch/27_eventsource.js";
 import "ext:deno_websocket/01_websocket.js";
 import "ext:deno_websocket/02_websocketstream.js";
+import * as wsClient from "ext:deis_runtime_ws_client_ops/src/runtime/js/ws_client.js";
 import * as crypto from "ext:deno_crypto/00_crypto.js";
 import "ext:deno_net/01_net.js";
 import "ext:deno_net/02_tls.js";
@@ -84,8 +85,11 @@ import "ext:deno_telemetry/util.ts";
 const {
   ArrayPrototypeIncludes,
   ArrayPrototypePush,
+  DateNow,
   FunctionPrototypeCall,
+  MathFloor,
   ObjectDefineProperties,
+  ObjectFreeze,
   ObjectGetOwnPropertyDescriptor,
   SafeSet,
   SafeSetIterator,
@@ -561,6 +565,84 @@ function sweepIntervals() {
 }
 
 // ---------------------------------------------------------------------------
+// The clock, and what this platform calls itself
+// ---------------------------------------------------------------------------
+//
+// # performance
+//
+// `performance` below is this runtime's own object. deno_web builds a real one
+// in `15_performance.js` -- still imported above, because other deno_web
+// modules measure themselves with it -- and that one is deliberately not what
+// an application gets, for one reason: its `now()` reads `op_now`, a
+// nanosecond clock returned as a seconds/nanoseconds pair, and a
+// sub-millisecond clock an application can read is the first ingredient of a
+// timing side channel. With one, a handler can tell a cache hit from a cache
+// miss and, over enough samples, read what the hardware is doing for somebody
+// else. On this node "somebody else" is another tenant: the pool runs many
+// applications' isolates on one machine and several isolates on one OS thread
+// (`runtime/pool.rs`). Browsers coarsened this clock after Spectre and the
+// edge platform this one is modelled on ships it clamped to whole
+// milliseconds; so does this.
+//
+// deno_web's object is not usable here for a second, duller reason as well:
+// its `timeOrigin` is filled in by `setTimeOrigin()`, which Deno calls from
+// the `99_main.js` this runtime does not run, so it would answer `undefined`.
+//
+// `timeOrigin` is fixed at 0, which is also what that platform reports, and it
+// buys two things. `timeOrigin + now()` is then an ordinary Unix timestamp, so
+// the two halves agree with each other; and the origin says nothing about when
+// this isolate was created, which would otherwise let a handler tell a cold
+// start from a reused isolate and date the node it is sharing.
+//
+// Two things this deliberately does not do, so that nobody reads more into it
+// than is there:
+//
+//   * the clock is coarse, not frozen. That platform additionally holds time
+//     still between I/O operations, so a stretch of pure computation cannot be
+//     measured at all. Here `now()` advances with the wall clock, one
+//     millisecond at a time. A millisecond is a wide enough step to spoil the
+//     measurements above; it is not the absence of a timer.
+//   * `mark()`, `measure()` and the `PerformanceObserver` family are absent.
+//     They exist to feed a profiler, their entry list lives as long as the
+//     isolate -- which outlives the request that filled it -- and nothing on
+//     this node collects it.
+//
+// What is left is a millisecond stopwatch: enough to say how long an upstream
+// took, not enough to microbenchmark, which is the trade being made.
+
+function performanceNow() {
+  return MathFloor(DateNow());
+}
+
+const performance = ObjectFreeze({
+  timeOrigin: 0,
+  now: performanceNow,
+});
+
+// # navigator
+//
+// One property, and the object is frozen.
+//
+// The name is worth having because libraries branch on it: a package that
+// supports several runtimes reads `navigator.userAgent` to pick its edge
+// implementation, and one that finds no `navigator` at all falls through to
+// the browser branch and reaches for `document`. So the object exists and
+// answers with the name of this platform.
+//
+// Nothing else is on it. `hardwareConcurrency` describes the node's cores,
+// which is the operator's business and not the tenant's; `language`,
+// `onLine`, `storage` and `sendBeacon` either mean nothing on a server or are
+// promises this platform cannot keep, and a member that answers a plausible
+// lie is worse than one that is missing. It is frozen so that a handler cannot
+// bolt one on either -- an isolate is reused across requests, so a property
+// written onto a platform global during one request would still be there,
+// looking like platform surface, during the next.
+
+const navigator = ObjectFreeze({
+  userAgent: "Deislet",
+});
+
+// ---------------------------------------------------------------------------
 // The global surface
 // ---------------------------------------------------------------------------
 //
@@ -569,11 +651,13 @@ function sweepIntervals() {
 // `globalThis.fetch` to install its own instrumentation is doing something
 // ordinary and should not get a silent no-op.
 //
-// What is deliberately *not* here is as much a decision as what is: `Deno`,
-// `WebSocket`, `BroadcastChannel`, `URLPattern`, `Blob`, `FormData`,
-// `structuredClone`, `performance` and `navigator` are all loaded above,
-// because deno_fetch and deno_web need them internally, and are all left
-// unbound. See `isolate_test.rs` for the list and `README.md` for the reasons.
+// What is deliberately *not* here is as much a decision as what is, and each
+// name left out has its own reason rather than a shared one: `Deno` and
+// `__bootstrap` are the raw op table, `addEventListener` would accept a
+// "fetch" listener this platform never fires, and `BroadcastChannel` has no
+// bus to carry it. The reasons are written out one per name in
+// `isolate_test.rs::EXTRA_GLOBALS_ABSENT`, which is also what asserts they
+// stay absent.
 
 ObjectDefineProperties(globalThis, {
   // Section 8.1: the outbound HTTP client, policed. See the header.
@@ -612,6 +696,74 @@ ObjectDefineProperties(globalThis, {
   AbortController: core.propNonEnumerable(abortSignal.AbortController),
   AbortSignal: core.propNonEnumerable(abortSignal.AbortSignal),
   DOMException: core.propNonEnumerable(domException.DOMException),
+
+  // Multipart bodies. `request.formData()` already works -- deno_fetch parses
+  // one -- but without these three names an application can receive an upload
+  // and not read it: a file entry is a `File`, `entry instanceof File` is the
+  // check every upload handler makes, and there is no way to build a
+  // multipart body to send one on. `Blob` is the type the other two are
+  // defined in terms of, and the one `response.blob()` has been returning
+  // unnameably all along.
+  Blob: core.propNonEnumerable(file.Blob),
+  File: core.propNonEnumerable(file.File),
+  FormData: core.propNonEnumerable(formData.FormData),
+
+  // Routing. A request handler's first job is to decide which path it was
+  // given, and `URLPattern` is what the routers written for edge runtimes
+  // reach for to do it -- so its absence is felt on line one of a ported
+  // application, not in some corner of it. Backed by deno_web's
+  // implementation, so `:named` groups and `*` mean what they mean elsewhere.
+  URLPattern: core.propNonEnumerable(urlPattern.URLPattern),
+
+  // Deep copy. The alternative an application falls back on is
+  // `JSON.parse(JSON.stringify(x))`, which silently drops `undefined`,
+  // functions and `Map`/`Set`, turns a `Date` into a string and throws on a
+  // cycle.
+  //
+  // One caveat, measured rather than assumed: this is the variant from
+  // `13_message_port.js`, which takes a `{ transfer: [...] }` list, and that
+  // list does nothing here. deno_core only moves a buffer when the runtime
+  // was built with a shared ArrayBuffer store (`ops_builtin_v8.rs`), and this
+  // one is not, so a buffer named for transfer is copied like everything else
+  // and is *not* left detached. The clone is correct either way; what an
+  // application does not get is the move. Pinned by
+  // `structuredclone_deep_copies_what_a_json_round_trip_loses`, so enabling
+  // that store later is a test failure rather than a silent change.
+  structuredClone: core.propWritable(messagePort.structuredClone),
+
+  // Events. `EventTarget` is bound (in `js/runtime.js`) and an EventTarget
+  // with no Event to fire is furniture: `dispatchEvent` has to be handed
+  // something, and every handler written elsewhere hands it one of these.
+  // `CustomEvent` comes with it because carrying a payload is the only reason
+  // an application dispatches an event of its own.
+  //
+  // These are deno_web's classes while the `EventTarget` they are dispatched
+  // through is the small one in `js/runtime.js`, which calls listeners with
+  // the event object exactly as given. That combination works -- it reads
+  // `event.type` and nothing else -- but it does not fill in `event.target`.
+  // deno_web's own `EventTarget` is not bound in its place because the
+  // WebSocket bridge in `js/runtime.js` dispatches plain `{ type, data }`
+  // objects, which deno_web's `dispatchEvent` rejects outright.
+  Event: core.propNonEnumerable(event.Event),
+  CustomEvent: core.propNonEnumerable(event.CustomEvent),
+
+  // The outbound socket, policed. Not deno_websocket's class: that one dials
+  // with a connector of its own that never reaches
+  // `runtime/fetch_policy.rs`, which would give an application a second way
+  // out of the isolate past the single decision point the outbound policy is
+  // built around. This one is backed by `runtime/ws_client_ops.rs`, which
+  // puts every destination through that policy and then connects to the
+  // address the policy judged - so a name that resolves to loopback, to a
+  // private range or to one of this platform's own services is refused here
+  // exactly as it is for `fetch`. The inbound half (`WebSocketPair`,
+  // `WebSocketServer`) is bound in `js/runtime.js`.
+  WebSocket: core.propNonEnumerable(wsClient.WebSocket),
+
+  // Not deno_web's `performance`, and one property of `navigator`. Both are
+  // built above; the section there says why the clock is coarse and why
+  // `navigator` answers with a name and nothing else.
+  performance: core.propReadOnly(performance),
+  navigator: core.propReadOnly(navigator),
 
   // Internal, not part of the platform's promise to applications: see the
   // timers section above and the execution-budget section further up. Both

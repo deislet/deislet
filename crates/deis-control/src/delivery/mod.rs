@@ -90,30 +90,61 @@ pub fn bundle_url(base: &str, app_id: &str, version_id: &str) -> String {
     format!("{base}/api/apps/{app_id}/versions/{version_id}/bundle")
 }
 
-/// Where the platform's storage services live, as a node has to dial them.
+/// What the platform tells a node about storage: where the services live,
+/// and what proves a call to them may act as the tenant it names.
 ///
-/// The control plane owns these addresses; a node never reads them from its
-/// own file (docs/architecture.zh.md section 6). They travel in the same `env`
-/// map as an application's variables, under the two reserved keys spelled once
-/// in [`deis_wire::conventions`], and deis-runtime lifts them back out before
-/// the application sees the map.
+/// The control plane owns all three; a node never reads them from its own file
+/// (docs/architecture.zh.md section 6). The addresses and the per-tenant token
+/// travel in the same `env` map as an application's variables, under reserved
+/// keys spelled once in [`deis_wire::conventions`], and deis-runtime lifts
+/// them back out before the application sees the map.
 ///
-/// Unset means "this platform has no such service": the deployment still goes
-/// out, the application still loads, and only its `ctx.services` calls fail -
-/// which is better than refusing to deploy an application that declared a
-/// service it never actually calls.
-#[derive(Debug, Clone, Default)]
-pub struct StorageEndpoints {
+/// An unset address means "this platform has no such service": the deployment
+/// still goes out, the application still loads, and only its `ctx.services`
+/// calls fail - which is better than refusing to deploy an application that
+/// declared a service it never actually calls.
+#[derive(Clone, Default)]
+pub struct StorageWiring {
     /// deis-store: KV, per-app SQL and blobs.
     pub store: Option<String>,
     /// deis-queue.
     pub queue: Option<String>,
+    /// Shared secret every capability token is derived from, identical to the
+    /// `auth_secret` of both storage services. Unset means this platform
+    /// mints no tokens at all, which is the single-box default and only safe
+    /// while the services are on loopback without a secret of their own.
+    ///
+    /// Never sent to a node and never logged: what a node gets is
+    /// [`Self::token_for`], which authorises exactly one tenant.
+    auth_secret: Option<String>,
 }
 
-impl StorageEndpoints {
-    /// Read them off the control plane's configuration, dropping blank
-    /// entries so an empty string in the file does not become an address
-    /// nothing can dial.
+impl std::fmt::Debug for StorageWiring {
+    /// The addresses are plain configuration and print; the secret is the one
+    /// value in this struct that can mint a token for *any* tenant, so it is
+    /// reduced to whether it exists. A derived `Debug` would put it in
+    /// whatever log line printed a payload.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageWiring")
+            .field("store", &self.store)
+            .field("queue", &self.queue)
+            .field("auth_secret", &redacted(&self.auth_secret))
+            .finish()
+    }
+}
+
+/// How an optional credential is allowed to appear in a log line.
+fn redacted(value: &Option<String>) -> &'static str {
+    match value {
+        Some(_) => "<set>",
+        None => "<unset>",
+    }
+}
+
+impl StorageWiring {
+    /// Read it off the control plane's configuration, dropping blank entries
+    /// so an empty string in the file does not become an address nothing can
+    /// dial, nor an HMAC key that happens to compute.
     pub fn from_config(config: &crate::config::ControlConfig) -> Self {
         let clean = |value: &Option<String>| {
             value
@@ -124,18 +155,40 @@ impl StorageEndpoints {
         Self {
             store: clean(&config.store_endpoint),
             queue: clean(&config.queue_endpoint),
+            auth_secret: clean(&config.storage_auth_secret),
         }
     }
 
-    /// Add the addresses to a deployment's environment map.
+    /// The capability token for one tenant, or `None` on a platform with no
+    /// secret configured.
+    ///
+    /// The tenant is the whole `<app>.<environment>` pair, the same string
+    /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: the storage
+    /// services recompute the expected token from the tenant the call itself
+    /// claims, so a token minted for anything else - the app id alone, say -
+    /// would be refused on every call.
+    pub fn token_for(&self, app_id: &str, environment: &str) -> Option<String> {
+        self.auth_secret.as_ref().map(|secret| {
+            deis_wire::conventions::storage_token(
+                secret,
+                &deis_wire::conventions::tenant_id(app_id, environment),
+            )
+        })
+    }
+
+    /// Add the addresses and this tenant's token to a deployment's
+    /// environment map.
     ///
     /// Every reserved key is *removed* first and only then written back,
-    /// which is the part that matters when an address is not configured: an
+    /// which is the part that matters when a value is not configured: an
     /// application that declares `DEIS_STORE_ENDPOINT` in its own manifest
     /// would otherwise keep that value - the platform having nothing to
     /// overwrite it with - and the node would build its KV, SQL and blob
-    /// clients against a host the application chose.
-    fn write_into(&self, app_id: &str, env: &mut BTreeMap<String, String>) {
+    /// clients against a host the application chose. The same holds for
+    /// `DEIS_STORAGE_TOKEN`, where the consequence is worse: an application
+    /// that could put its own value there would be handing itself a
+    /// credential the node then presents on its behalf.
+    fn write_into(&self, app_id: &str, environment: &str, env: &mut BTreeMap<String, String>) {
         let mut put = |key: &str, value: &Option<String>| {
             // The declared value is dropped without being logged: it is
             // the application's own text, and one of these keys can also
@@ -154,12 +207,21 @@ impl StorageEndpoints {
         };
         put(deis_wire::conventions::STORE_ENDPOINT_ENV, &self.store);
         put(deis_wire::conventions::QUEUE_ENDPOINT_ENV, &self.queue);
+        put(
+            deis_wire::conventions::STORAGE_TOKEN_ENV,
+            &self.token_for(app_id, environment),
+        );
     }
 
-    /// True when nothing is configured, which is worth saying once at
+    /// True when no address is configured, which is worth saying once at
     /// startup rather than discovering per deployment.
-    pub fn is_empty(&self) -> bool {
+    pub fn has_no_endpoints(&self) -> bool {
         self.store.is_none() && self.queue.is_none()
+    }
+
+    /// True when this control plane mints capability tokens at all.
+    pub fn mints_tokens(&self) -> bool {
+        self.auth_secret.is_some()
     }
 }
 
@@ -204,10 +266,11 @@ pub struct DeploymentPayload {
     /// Which of the `env` keys came from a secret. Names only - they are
     /// safe to log, the values are not.
     secret_names: Vec<String>,
-    /// Storage addresses the node needs. Kept apart from `env` so the
-    /// report and the log lines stay about the application, and merged in
-    /// only when the wire message is built.
-    endpoints: StorageEndpoints,
+    /// The storage addresses and the secret this tenant's capability token
+    /// is derived from. Kept apart from `env` so the report and the log
+    /// lines stay about the application, and merged in only when the wire
+    /// message is built.
+    storage: StorageWiring,
 }
 
 impl std::fmt::Debug for DeploymentPayload {
@@ -224,8 +287,12 @@ impl std::fmt::Debug for DeploymentPayload {
             .field("variables", &self.variable_names())
             .field("secrets", &self.secret_names)
             .field("values", &"<redacted>")
-            .field("store_endpoint", &self.endpoints.store)
-            .field("queue_endpoint", &self.endpoints.queue)
+            .field("store_endpoint", &self.storage.store)
+            .field("queue_endpoint", &self.storage.queue)
+            .field(
+                "storage_token",
+                &redacted(&self.storage.token_for(&self.app_id, &self.environment)),
+            )
             .finish()
     }
 }
@@ -254,15 +321,18 @@ impl DeploymentPayload {
     }
 
     /// The complete environment a node should see: the application's own
-    /// variables and secrets plus the platform's storage addresses.
+    /// variables and secrets, the platform's storage addresses, and the
+    /// capability token that lets the node act as this tenant.
     ///
     /// Carries secret values in the clear. Hand it to the node and nowhere
     /// else - never to a log line and never to a read API.
     pub fn env_for_wire(&self) -> BTreeMap<String, String> {
         let mut env: BTreeMap<String, String> = self.env.clone();
         // Written last, so an application variable spelled like a reserved
-        // key cannot point the app's storage client somewhere else.
-        self.endpoints.write_into(&self.app_id, &mut env);
+        // key cannot point the app's storage client somewhere else, nor hand
+        // itself a token the node would then present on its behalf.
+        self.storage
+            .write_into(&self.app_id, &self.environment, &mut env);
         env
     }
 
@@ -355,7 +425,7 @@ pub struct DeploymentDeliverer {
     secrets: Arc<SecretsBackend>,
     nodes: Arc<RuntimeNodeManager>,
     address: Arc<PublicAddress>,
-    endpoints: StorageEndpoints,
+    storage: StorageWiring,
 }
 
 impl DeploymentDeliverer {
@@ -364,14 +434,14 @@ impl DeploymentDeliverer {
         secrets: Arc<SecretsBackend>,
         nodes: Arc<RuntimeNodeManager>,
         address: Arc<PublicAddress>,
-        endpoints: StorageEndpoints,
+        storage: StorageWiring,
     ) -> Self {
         Self {
             store,
             secrets,
             nodes,
             address,
-            endpoints,
+            storage,
         }
     }
 
@@ -475,7 +545,7 @@ impl DeploymentDeliverer {
             bundle_sha: version.bundle_sha.clone(),
             env: env_map,
             secret_names,
-            endpoints: self.endpoints.clone(),
+            storage: self.storage.clone(),
         })
     }
 
@@ -817,17 +887,33 @@ mod tests {
     async fn deliverer(secrets_ready: bool) -> (DeploymentDeliverer, Arc<CatalogStore>) {
         deliverer_with(
             secrets_ready,
-            StorageEndpoints {
+            StorageWiring {
                 store: Some("http://127.0.0.1:8090".to_string()),
                 queue: Some("http://127.0.0.1:8091".to_string()),
+                auth_secret: None,
             },
         )
         .await
     }
 
+    /// The shared secret these tests mint tokens with. Any string works -
+    /// it is an HMAC key - so it is spelled out rather than generated, and
+    /// the expected token is computed from it the same way deis-store will.
+    const AUTH_SECRET: &str = "the-secret-both-halves-hold";
+
+    /// A control plane wired the way an authenticated install is: addresses
+    /// plus the secret the storage services carry as their `auth_secret`.
+    fn authenticated_wiring() -> StorageWiring {
+        StorageWiring {
+            store: Some("http://127.0.0.1:8090".to_string()),
+            queue: Some("http://127.0.0.1:8091".to_string()),
+            auth_secret: Some(AUTH_SECRET.to_string()),
+        }
+    }
+
     async fn deliverer_with(
         secrets_ready: bool,
-        endpoints: StorageEndpoints,
+        storage: StorageWiring,
     ) -> (DeploymentDeliverer, Arc<CatalogStore>) {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
         let store = Arc::new(CatalogStore::new(database));
@@ -849,7 +935,7 @@ mod tests {
                 scheme: "http",
                 fallback: "http://127.0.0.1:8080".to_string(),
             }),
-            endpoints,
+            storage,
         );
         (deliverer, store)
     }
@@ -945,10 +1031,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deployment_carries_the_capability_token_of_its_own_tenant() {
+        // The node presents this on every storage call. It has to be the
+        // token for `<app>.<environment>` - the same string the tenant
+        // header carries - because deis-store recomputes the expected value
+        // from the tenant the call claims and refuses anything else.
+        let (deliverer, store) = deliverer_with(true, authenticated_wiring()).await;
+        let production = environment(&store).await;
+        let preview = store.create_environment("demo", "preview-7").await.unwrap();
+
+        let for_production = deliverer
+            .payload(&production, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap()
+            .to_request();
+        let for_preview = deliverer
+            .payload(&preview, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap()
+            .to_request();
+
+        let token = |request: &proto::ApplyDeploymentRequest| {
+            request
+                .env
+                .get(deis_wire::conventions::STORAGE_TOKEN_ENV)
+                .cloned()
+                .expect("a deployment on a configured platform carries a token")
+        };
+        assert_eq!(
+            token(&for_production),
+            deis_wire::conventions::storage_token(
+                AUTH_SECRET,
+                &deis_wire::conventions::tenant_id("demo", "production")
+            )
+        );
+        assert_eq!(
+            token(&for_preview),
+            deis_wire::conventions::storage_token(
+                AUTH_SECRET,
+                &deis_wire::conventions::tenant_id("demo", "preview-7")
+            )
+        );
+        assert_ne!(
+            token(&for_production),
+            token(&for_preview),
+            "one token for both environments would let a preview read and overwrite production's data"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_with_no_shared_secret_ships_no_token() {
+        // The single-box default. The storage services accept an unproven
+        // call only while they have no auth_secret of their own, which they
+        // only allow on loopback.
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let request = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap()
+            .to_request();
+
+        assert!(
+            !request
+                .env
+                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
+            "a platform with no secret must ship no token rather than an empty one"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_cannot_hand_itself_a_storage_token() {
+        // A bundle that could declare this key would be choosing the
+        // credential the node presents on its behalf - and on a platform
+        // that mints no tokens of its own there would be nothing to
+        // overwrite it with, so the key has to be removed either way.
+        let manifest = format!(
+            r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"forged","KEEP":"mine"}}}}"#,
+            deis_wire::conventions::STORAGE_TOKEN_ENV
+        );
+
+        let (deliverer, store) = deliverer_with(true, authenticated_wiring()).await;
+        let env = environment(&store).await;
+        let request = deliverer
+            .payload(&env, &version(&manifest), "http://control.test")
+            .await
+            .unwrap()
+            .to_request();
+        assert_eq!(
+            request
+                .env
+                .get(deis_wire::conventions::STORAGE_TOKEN_ENV)
+                .map(String::as_str),
+            Some(
+                deis_wire::conventions::storage_token(
+                    AUTH_SECRET,
+                    &deis_wire::conventions::tenant_id("demo", "production")
+                )
+                .as_str()
+            ),
+            "the platform's token must win over anything the bundle declared"
+        );
+        assert_eq!(request.env.get("KEEP").map(String::as_str), Some("mine"));
+
+        let (deliverer, store) = deliverer_with(true, StorageWiring::default()).await;
+        let env = environment(&store).await;
+        let request = deliverer
+            .payload(&env, &version(&manifest), "http://control.test")
+            .await
+            .unwrap()
+            .to_request();
+        assert!(
+            !request
+                .env
+                .contains_key(deis_wire::conventions::STORAGE_TOKEN_ENV),
+            "with nothing to overwrite it with, the declared value must be dropped"
+        );
+        assert_eq!(request.env.get("KEEP").map(String::as_str), Some("mine"));
+    }
+
+    #[test]
+    fn the_shared_secret_never_reaches_a_log_line() {
+        // The one value here that can mint a token for any tenant. A
+        // derived Debug would put it in whatever line printed a payload.
+        let rendered = format!("{:?}", authenticated_wiring());
+        assert!(
+            !rendered.contains(AUTH_SECRET),
+            "the shared secret is printable: {rendered}"
+        );
+        assert!(rendered.contains("<set>"), "{rendered}");
+        assert!(
+            format!("{:?}", StorageWiring::default()).contains("<unset>"),
+            "an unconfigured secret should say so"
+        );
+    }
+
+    #[tokio::test]
     async fn a_control_plane_without_storage_configured_sends_no_addresses() {
         // A valid setup: the deployment still goes out, and only the app's
         // ctx.services calls fail.
-        let (deliverer, store) = deliverer_with(true, StorageEndpoints::default()).await;
+        let (deliverer, store) = deliverer_with(true, StorageWiring::default()).await;
         let env = environment(&store).await;
 
         let request = deliverer
@@ -975,7 +1198,7 @@ mod tests {
     /// clients dial.
     #[tokio::test]
     async fn an_application_cannot_name_a_storage_address_the_platform_never_configured() {
-        let (deliverer, store) = deliverer_with(true, StorageEndpoints::default()).await;
+        let (deliverer, store) = deliverer_with(true, StorageWiring::default()).await;
         let env = environment(&store).await;
         let manifest = format!(
             r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"http://attacker.invalid","{}":"http://attacker.invalid","KEEP":"mine"}}}}"#,
@@ -1019,7 +1242,7 @@ mod tests {
                 15,
             )),
             Arc::clone(&ready.address),
-            StorageEndpoints::default(),
+            StorageWiring::default(),
         );
 
         let report = deliverer
@@ -1111,7 +1334,7 @@ mod tests {
             )),
             Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
             Arc::clone(&ready.address),
-            StorageEndpoints::default(),
+            StorageWiring::default(),
         );
         let err = broken
             .payload(&env, &version(MANIFEST), "http://control.test")
@@ -1172,7 +1395,7 @@ mod tests {
                 15,
             )),
             Arc::clone(&ready.address),
-            StorageEndpoints::default(),
+            StorageWiring::default(),
         );
 
         let payload = deliverer

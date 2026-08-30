@@ -70,6 +70,7 @@ mod tests {
         // halves disagree the symptom is a service that is silently absent,
         // so they are the same code and this test holds them together.
         let original = ServiceWiring {
+            storage_token: Some("a-minted-token".to_string()),
             declaration: ServiceDeclaration::from_names(["kv", "database", "blob", "queue"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://store:8090".to_string()),
@@ -167,6 +168,7 @@ mod tests {
         // An app that never asked for a database must not hold a connection
         // to one.
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
@@ -185,6 +187,7 @@ mod tests {
     #[tokio::test]
     async fn every_declared_service_gets_a_client_stamped_with_the_tenant() {
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv", "database", "blob", "queue"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
@@ -222,6 +225,7 @@ mod tests {
         // to guess is production -- which is exactly the namespace a preview
         // must never touch.
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
@@ -245,6 +249,7 @@ mod tests {
         // The app keeps running; every call answers "service not available"
         // rather than the node refusing to load the app.
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints::default(),
             consumers: Vec::new(),
@@ -258,6 +263,7 @@ mod tests {
         // Unlike a store that is merely down, this can never start working,
         // so it is reported at load time instead of on every call.
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("not a url".to_string()),
@@ -278,6 +284,7 @@ mod tests {
         // a storage outage may not stop an app from loading, and the binding
         // has to recover by itself once the store is back.
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:1".to_string()),
@@ -295,6 +302,7 @@ mod tests {
     #[test]
     fn a_tenant_that_cannot_be_a_header_is_refused() {
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
@@ -308,6 +316,7 @@ mod tests {
     #[test]
     fn consumers_are_not_started_without_a_queue_address() {
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["queue"]),
             endpoints: ServiceEndpoints::default(),
             consumers: vec![QueueConsumerSpec {
@@ -321,6 +330,7 @@ mod tests {
     #[test]
     fn consumers_are_not_started_without_the_queue_service_declared() {
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::new(),
             endpoints: ServiceEndpoints {
                 store: None,
@@ -337,6 +347,7 @@ mod tests {
     #[test]
     fn consumers_are_started_when_both_halves_are_present() {
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["queue"]),
             endpoints: ServiceEndpoints {
                 store: None,
@@ -492,6 +503,240 @@ mod tests {
         assert_eq!(dropped, vec!["DEIS_SERVICES"]);
         // A variable that merely starts with DEIS_ is the application's own.
         assert_eq!(map, env(&[("DEIS_LOG_LEVEL", "debug")]));
+    }
+
+    #[test]
+    fn the_capability_token_never_reaches_the_application_s_own_variables() {
+        // An application that could read this value would be able to call
+        // deis-store and deis-queue directly as its own tenant, with none of
+        // the checks this node makes on its behalf.
+        let mut map = env(&[
+            ("DEIS_SERVICES", "kv"),
+            ("DEIS_STORE_ENDPOINT", "http://127.0.0.1:8090"),
+            (deis_wire::conventions::STORAGE_TOKEN_ENV, "a-minted-token"),
+            ("LOG_LEVEL", "info"),
+        ]);
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+
+        assert_eq!(map, env(&[("LOG_LEVEL", "info")]));
+        assert_eq!(wiring.storage_token.as_deref(), Some("a-minted-token"));
+    }
+
+    #[test]
+    fn a_bundle_cannot_hand_itself_a_capability_token() {
+        // A bundle recovered from this node's own disk never passed through
+        // deis-control, so its manifest may name anything. Keeping the value
+        // would make the node present a credential the application chose on
+        // every storage call it made for it. The order here is the loader's
+        // (`deployment::mod`): strip what the manifest declared, merge what
+        // the delivery carried, then wire.
+        let mut map = env(&[
+            (deis_wire::conventions::STORAGE_TOKEN_ENV, "forged"),
+            ("LOG_LEVEL", "info"),
+        ]);
+        let dropped = strip_reserved_env(&mut map);
+        assert!(dropped.contains(&deis_wire::conventions::STORAGE_TOKEN_ENV));
+
+        wire_deployment_env(
+            &manifest(
+                r#"{
+                    "schema": 1,
+                    "app": "demo",
+                    "entry": "worker/index.js",
+                    "services": { "kv": true }
+                }"#,
+            ),
+            &mut map,
+        );
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+        assert_eq!(
+            wiring.storage_token, None,
+            "the bundle's own value must not become the proof this node presents"
+        );
+        assert_eq!(map, env(&[("LOG_LEVEL", "info")]));
+    }
+
+    #[test]
+    fn a_delivered_token_survives_being_rewired_against_the_manifest() {
+        // `wire_deployment_env` clears every reserved key before writing the
+        // manifest's own answer back. Dropping the token there would leave an
+        // app that loads and whose every storage call is then refused.
+        let mut map = env(&[
+            ("DEIS_STORE_ENDPOINT", "http://127.0.0.1:8090"),
+            (deis_wire::conventions::STORAGE_TOKEN_ENV, "a-minted-token"),
+        ]);
+
+        wire_deployment_env(
+            &manifest(
+                r#"{
+                    "schema": 1,
+                    "app": "demo",
+                    "entry": "worker/index.js",
+                    "services": { "kv": true }
+                }"#,
+            ),
+            &mut map,
+        );
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+        assert_eq!(wiring.storage_token.as_deref(), Some("a-minted-token"));
+        assert!(wiring.declaration.declares(ServiceKind::Kv));
+    }
+
+    #[test]
+    fn a_blank_token_counts_as_absent() {
+        // An empty header would be presented as a token and refused, where
+        // sending nothing at least works against a service that checks none.
+        let mut map = env(&[(deis_wire::conventions::STORAGE_TOKEN_ENV, "   ")]);
+        assert_eq!(ServiceWiring::take_from_env(&mut map).storage_token, None);
+    }
+
+    #[test]
+    fn a_storage_call_carries_the_tenant_and_the_proof_together() {
+        // Both headers or neither: a call with the tenant alone is refused by
+        // a service that has an auth_secret, and a token without the tenant
+        // names no namespace at all.
+        let identity = StorageIdentity::new("demo.production", Some("a-minted-token"))
+            .expect("a legal tenant and a sendable token");
+        let request = identity.stamp(());
+
+        let header = |name: &str| {
+            request
+                .metadata()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            header(deis_wire::conventions::TENANT_HEADER).as_deref(),
+            Some("demo.production")
+        );
+        assert_eq!(
+            header(deis_wire::conventions::STORAGE_TOKEN_HEADER).as_deref(),
+            Some("a-minted-token")
+        );
+        assert!(identity.is_proven());
+    }
+
+    #[test]
+    fn a_node_with_no_token_still_names_its_tenant() {
+        // The single-box default. Stamping an empty token instead would turn
+        // a working install into one where every call is refused.
+        let identity = StorageIdentity::new("demo.production", None).expect("a legal tenant");
+        let request = identity.stamp(());
+        assert!(request
+            .metadata()
+            .get(deis_wire::conventions::TENANT_HEADER)
+            .is_some());
+        assert!(request
+            .metadata()
+            .get(deis_wire::conventions::STORAGE_TOKEN_HEADER)
+            .is_none());
+        assert!(!identity.is_proven());
+    }
+
+    #[test]
+    fn a_token_that_could_not_be_sent_is_refused_when_the_client_is_built() {
+        // A value that is not sendable metadata can only be a control plane
+        // that handed this node something that was never a token, and every
+        // storage call would fail with a message about the tenant instead.
+        let error = StorageIdentity::new("demo.production", Some("line\nbreak"))
+            .expect_err("a token with a control character cannot be sent");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be sent as gRPC metadata"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_token_reaches_the_store_through_the_clients_this_module_builds() {
+        // The node's half of the chain, end to end and over a real socket:
+        // the token arrives in the deployment's env map, is lifted out of it,
+        // and comes back out of a client this module built as the proof
+        // deis-store demands. Asserting the field alone would not catch a
+        // client that holds the token and never sends it.
+        const SECRET: &str = "the-secret-both-halves-hold";
+        let tenant = "demo.production";
+        let store = crate::runtime::test_store::TestStore::start_with_secret(SECRET).await;
+
+        let mut map = env(&[("DEIS_SERVICES", "kv")]);
+        map.insert("DEIS_STORE_ENDPOINT".to_string(), store.endpoint.clone());
+        map.insert(
+            deis_wire::conventions::STORAGE_TOKEN_ENV.to_string(),
+            deis_wire::conventions::storage_token(SECRET, tenant),
+        );
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+        let services = connect_or_panic(tenant, &wiring);
+        let kv = services
+            .kv
+            .expect("kv was declared and an address was sent");
+
+        kv.set("k".to_string(), b"v".to_vec())
+            .await
+            .expect("a client built from a delivery that carried a token is authorised");
+        assert_eq!(
+            kv.get("k".to_string()).await.expect("read back"),
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_without_a_token_is_refused_by_a_store_that_requires_one() {
+        // The same wiring minus the token. The client is still built - an app
+        // must load whatever the storage services think of it - and the
+        // refusal arrives on the call, naming the credential rather than the
+        // tenant.
+        const SECRET: &str = "the-secret-both-halves-hold";
+        let store = crate::runtime::test_store::TestStore::start_with_secret(SECRET).await;
+
+        let mut map = env(&[("DEIS_SERVICES", "kv")]);
+        map.insert("DEIS_STORE_ENDPOINT".to_string(), store.endpoint.clone());
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+        assert_eq!(wiring.storage_token, None);
+        let services = connect_or_panic("demo.production", &wiring);
+        let kv = services
+            .kv
+            .expect("kv was declared and an address was sent");
+
+        let error = kv
+            .set("k".to_string(), b"v".to_vec())
+            .await
+            .expect_err("a store with an auth_secret must not serve an unproven call");
+        assert_eq!(
+            error
+                .downcast_ref::<tonic::Status>()
+                .map(tonic::Status::code),
+            Some(tonic::Code::Unauthenticated),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_capability_token_never_reaches_a_log_line() {
+        let wiring = ServiceWiring {
+            storage_token: Some("a-minted-token".to_string()),
+            ..ServiceWiring::default()
+        };
+        let rendered = format!("{wiring:?}");
+        assert!(
+            !rendered.contains("a-minted-token"),
+            "the token is printable: {rendered}"
+        );
+        assert!(rendered.contains("<present>"), "{rendered}");
+
+        let identity = StorageIdentity::new("demo.production", Some("a-minted-token"))
+            .expect("a legal tenant");
+        let rendered = format!("{identity:?}");
+        assert!(
+            !rendered.contains("a-minted-token"),
+            "the token is printable: {rendered}"
+        );
     }
 
     #[test]

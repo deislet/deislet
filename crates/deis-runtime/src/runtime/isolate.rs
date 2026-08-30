@@ -5,7 +5,9 @@ use super::cache_ops::{create_cache_store, CacheStore};
 use super::fetch_policy::FetchPolicy;
 use super::loader::DbModuleLoader;
 use super::metrics::{recorder, MetricsRegistry, RequestOutcome};
-use super::ops::{AppId, EnvStore, ExecutionDeadline, ResponseStore};
+use super::ops::{
+    AppId, EnvStore, ExecutionDeadline, PendingRequestBody, PendingResponseBody, ResponseStore,
+};
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
 use super::rate_limit::RateLimiter;
@@ -31,14 +33,24 @@ use std::time::{Duration, Instant};
 use sys_traits::impls::RealSys;
 use tokio::sync::oneshot;
 
-type FetchResult = (u16, HashMap<String, String>, Option<String>);
+/// Status, headers and body of one answered request.
+///
+/// The body is bytes, not text: a handler may answer with an image, a
+/// compressed frame, or anything else `fetch()` brought back from upstream,
+/// and a `String` here corrupted every one of them.
+type FetchResult = (u16, HashMap<String, String>, Option<Vec<u8>>);
 
+/// The request as `js/runtime.js` sees it -- everything except the body.
+///
+/// This is serialised into the source text of the invocation script, so it
+/// has to be text that survives being written into a program. The body does
+/// not qualify: it is arbitrary bytes, and it travels beside this through
+/// [`PendingRequestBody`] instead.
 #[derive(Serialize)]
 struct JsRequest {
     url: String,
     method: String,
     headers: HashMap<String, String>,
-    body: Option<String>,
     /// Route placeholder values (e.g. `:id` in "/users/:id"), resolved against
     /// the app's configured route patterns. Empty when no pattern matches, or
     /// when the app has no route patterns configured yet.
@@ -96,12 +108,12 @@ struct JsScheduledResult {
     error: Option<String>,
 }
 
+/// What the handler answered, minus the body: see [`PendingResponseBody`].
 #[derive(Deserialize)]
 struct JsResponse {
     status: u16,
     #[serde(default)]
     headers: HashMap<String, String>,
-    body: Option<String>,
 }
 
 /// Everything one isolate needs beyond its identity and its source.
@@ -162,6 +174,10 @@ pub struct AppRuntime {
     /// Maximum wall-clock time (ms) a single `execute_fetch` may run before
     /// this isolate is terminated and the request fails.
     timeout_ms: u64,
+    /// Maximum wall-clock time (ms) the `waitUntil` tail of one invocation may
+    /// run once the response has been sent. Its own limit, not what is left of
+    /// `timeout_ms`: see [`crate::config::ExecutionLimits::wait_until_timeout_ms`].
+    wait_until_timeout_ms: u64,
     /// Configured JS-op dispatch rate limit (ops/sec) for this isolate.
     /// Kept alongside the live `RateLimiter` (captured in the op-metrics
     /// closure) purely so tests can assert the configured value reached
@@ -212,6 +228,7 @@ impl AppRuntime {
         } = spec;
         let ExecutionLimits {
             timeout_ms,
+            wait_until_timeout_ms,
             rate_limit_ops_per_sec,
         } = limits;
 
@@ -456,6 +473,12 @@ impl AppRuntime {
             let response_store: ResponseStore = Rc::new(RefCell::new(None));
             state.put(response_store);
 
+            // Both empty until an invocation stages a body. Present from the
+            // start so the two ops that use them are defined on every path
+            // into this isolate, not only the request path.
+            state.put(PendingRequestBody::default());
+            state.put(PendingResponseBody::default());
+
             // Ops that emit logs need to say which tenant they are acting for;
             // see `AppId`.
             state.put(AppId(app_id.clone()));
@@ -512,6 +535,7 @@ impl AppRuntime {
             snapshot_loaded,
             route_patterns,
             timeout_ms,
+            wait_until_timeout_ms,
             rate_limit_ops_per_sec,
             metrics,
             execution_deadline,
@@ -530,15 +554,30 @@ impl AppRuntime {
     /// statement can be a `fetch`, and that runs synchronously inside
     /// `execute_script`, before the cut-off task below has been spawned.
     fn arm_execution_budget(&self) -> Instant {
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
+        self.arm_budget(self.timeout_ms)
+    }
+
+    /// Start the clock again, for the `waitUntil` tail this time, once the
+    /// response has gone out.
+    ///
+    /// A budget of its own, and a fresh one: the tail is meant to outlive the
+    /// response, so what is left of the request's budget is the wrong measure
+    /// -- usually nothing at all. See
+    /// [`crate::config::ExecutionLimits::wait_until_timeout_ms`] for why the
+    /// tail is nonetheless not allowed to run forever.
+    fn arm_wait_until_budget(&self) -> Instant {
+        self.arm_budget(self.wait_until_timeout_ms)
+    }
+
+    fn arm_budget(&self, budget_ms: u64) -> Instant {
+        let deadline = Instant::now() + Duration::from_millis(budget_ms);
         self.execution_deadline.set(Some(deadline));
         deadline
     }
 
-    /// Stop the clock. Anything that runs after this point -- the `waitUntil`
-    /// tail, which the cut-off task no longer covers either -- makes outbound
-    /// calls with no deadline on them, which is what it did before this
-    /// existed.
+    /// Stop the clock. Anything that runs after this point makes outbound
+    /// calls with no deadline on them, so it is only ever left off between
+    /// invocations -- nothing of the application's runs there.
     fn disarm_execution_budget(&self) {
         self.execution_deadline.set(None);
     }
@@ -575,6 +614,76 @@ impl AppRuntime {
     /// it; this is the cleanup, and it says nothing of its own.
     fn clear_termination(&mut self) {
         self.runtime.v8_isolate().cancel_terminate_execution();
+    }
+
+    /// Run the `waitUntil` tail of one invocation, under a budget of its own.
+    ///
+    /// The tail is application code like any other and it holds the runtime
+    /// thread every other application on that thread is waiting for, but by the
+    /// time it runs the answer has already gone out: nothing downstream is
+    /// still waiting on it, so nothing would ever report it. Before it had a
+    /// budget, work handed to `waitUntil` that never finished held that thread
+    /// for good -- behind a request that answered 200 and looked entirely
+    /// healthy.
+    ///
+    /// Enforced the way the request budget is: the deadline is published so an
+    /// outbound `fetch` started in the tail bounds itself by it, and a cut-off
+    /// task terminates the isolate when it expires. Both are given back on
+    /// every path out, including the one where the script never starts -- a
+    /// deadline left armed, or a termination flag left set, is spent on the
+    /// *next* invocation of this isolate rather than on this one. See
+    /// `clear_termination` for what that costs.
+    async fn run_wait_until_tail(&mut self, script_name: &'static str) -> Result<()> {
+        let deadline = self.arm_wait_until_budget();
+
+        let budget_ms = self.wait_until_timeout_ms;
+        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let app_id_for_cut_off = self.app_id.clone();
+        let metrics_for_cut_off = self.metrics.clone();
+        // Armed before the tail starts rather than after it has been handed to
+        // the event loop: `execute_script` runs the tail's first synchronous
+        // stretch itself, so a cut-off task spawned only once it returned would
+        // not cover the part of the tail that runs inside it.
+        let cut_off = tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            metrics_for_cut_off.record_timeout_cutoff(&app_id_for_cut_off);
+            tracing::warn!(
+                target: "app",
+                app_id = %app_id_for_cut_off,
+                "The waitUntil tail of app {} was still running {}ms after its invocation was \
+                 answered, and has been cut off. The invocation itself succeeded, so this line is \
+                 the only sign of it: background work this application started is being killed",
+                app_id_for_cut_off,
+                budget_ms
+            );
+            isolate_handle.terminate_execution();
+        });
+
+        let outcome = self
+            .settle_script(script_name, "__deis_runtime_wait_until_all()".to_string())
+            .await;
+
+        cut_off.abort();
+        self.disarm_execution_budget();
+        self.clear_termination();
+        outcome
+    }
+
+    /// Start a script and drive the event loop until the promise it evaluated
+    /// to settles.
+    ///
+    /// The two halves are one call so that a caller holding a budget gives it
+    /// back on both paths: a script that never starts -- which is what a
+    /// cut-off during its first synchronous stretch looks like -- leaves the
+    /// same deadline armed and the same termination flag set as one that ran
+    /// to the end.
+    async fn settle_script(&mut self, name: &'static str, source: String) -> Result<()> {
+        let promise = self.runtime.execute_script(name, source)?;
+        let resolve_future = self.runtime.resolve(promise);
+        self.runtime
+            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
+            .await?;
+        Ok(())
     }
 
     pub async fn init_module(&mut self) -> Result<()> {
@@ -684,7 +793,7 @@ impl AppRuntime {
         url: String,
         method: String,
         headers: HashMap<String, String>,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
         response_tx: oneshot::Sender<Result<FetchResult>>,
     ) -> Result<()> {
         let started = Instant::now();
@@ -730,11 +839,29 @@ impl AppRuntime {
             url,
             method,
             headers,
-            body,
             params,
         };
 
         let request_json = serde_json::to_string(&request)?;
+
+        // The body is handed over out of band, and any body left behind by the
+        // previous invocation is cleared in the same breath: an isolate is
+        // reused across requests, so a stale one would be answered as this
+        // request's, and a handler that returns no body would be given the
+        // last one's.
+        {
+            let op_state = self.runtime.op_state();
+            let mut state = op_state.borrow_mut();
+            let bytes = body.as_ref().map(|b| b.len()).unwrap_or(0);
+            state.put(PendingRequestBody(body));
+            state.put(PendingResponseBody(None));
+            tracing::trace!(
+                target: "app",
+                app_id = %self.app_id,
+                bytes,
+                "Request body staged for the isolate"
+            );
+        }
 
         let code = format!(
             r#"
@@ -845,14 +972,35 @@ impl AppRuntime {
         self.metrics
             .record_request(&self.app_id, started.elapsed(), outcome);
 
-        let _ = response_tx.send(Ok((response.status, response.headers, response.body)));
+        // Absent means the handler answered without a body -- a 204, a 304,
+        // the answer to a HEAD, a WebSocket upgrade -- which is not the same
+        // as an empty one, so nothing is invented here.
+        let response_body = {
+            let op_state = self.runtime.op_state();
+            let mut state = op_state.borrow_mut();
+            state
+                .try_borrow_mut::<PendingResponseBody>()
+                .and_then(|pending| pending.0.take())
+        };
 
-        let wait_code = "__deis_runtime_wait_until_all()";
-        let wait_promise = self.runtime.execute_script("<wait_until>", wait_code)?;
-        let wait_resolve = self.runtime.resolve(wait_promise);
-        self.runtime
-            .with_event_loop_promise(wait_resolve, PollEventLoopOptions::default())
-            .await?;
+        let _ = response_tx.send(Ok((response.status, response.headers, response_body)));
+
+        // The response is gone; what the handler handed to `waitUntil` runs
+        // from here, under the tail's own budget. A failure past this point
+        // cannot be reported to the client and must not be counted against the
+        // request, which succeeded -- it is said here instead.
+        if let Err(e) = self.run_wait_until_tail("<wait_until>").await {
+            tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                error = %e,
+                "The waitUntil work of app {} did not finish: {}. The response had already been \
+                 sent, so the request is unaffected and the client saw nothing of this",
+                self.app_id,
+                e
+            );
+            return Ok(());
+        }
 
         let resource_count = {
             let op_state = self.runtime.op_state();
@@ -1016,14 +1164,10 @@ impl AppRuntime {
         // Anything the handler awaited through waitUntil still has to finish
         // before the batch counts as settled; a message acknowledged while
         // its follow-up work is still pending would be lost if the node went
-        // away right after.
-        let wait_promise = self
-            .runtime
-            .execute_script("<queue_wait_until>", "__deis_runtime_wait_until_all()")?;
-        let wait_resolve = self.runtime.resolve(wait_promise);
-        self.runtime
-            .with_event_loop_promise(wait_resolve, PollEventLoopOptions::default())
-            .await?;
+        // away right after. A tail that runs past its own budget is cut off,
+        // and the batch goes back to deis-queue for the same reason: its
+        // follow-up work did not finish either.
+        self.run_wait_until_tail("<queue_wait_until>").await?;
 
         Ok(BatchOutcome {
             failed: result.failed,
@@ -1122,14 +1266,10 @@ impl AppRuntime {
         let outcome: JsScheduledResult = serde_json::from_str(&json_str)?;
 
         // Follow-up work the handler started must finish before the tick is
-        // called done, or it would be cut off when the isolate goes idle.
-        let wait_promise = self
-            .runtime
-            .execute_script("<scheduled_wait_until>", "__deis_runtime_wait_until_all()")?;
-        let wait_resolve = self.runtime.resolve(wait_promise);
-        self.runtime
-            .with_event_loop_promise(wait_resolve, PollEventLoopOptions::default())
-            .await?;
+        // called done, or it would be cut off when the isolate goes idle. It
+        // gets the tail's budget to do that in, and a tick whose tail is cut
+        // off is reported as a failed tick.
+        self.run_wait_until_tail("<scheduled_wait_until>").await?;
 
         if outcome.ok {
             return Ok(());
@@ -1164,7 +1304,19 @@ impl AppRuntime {
         Ok(())
     }
 
+    /// Hand one message from a connected client to the application's socket.
+    ///
+    /// Bounded by the same wall-clock budget a request is, and for the same
+    /// reason: this is the application's own `onmessage` running on the runtime
+    /// thread every other application on that thread shares. A socket is open
+    /// for as long as the client keeps it open and carries as many messages as
+    /// the client sends, so an unbounded one is a request path that anybody can
+    /// reach without ever making a request.
     pub async fn dispatch_ws_message(&mut self, ws_id: String, message: String) -> Result<()> {
+        // A flag left over from a previous cut-off would fail this message
+        // before a line of the application's code ran.
+        self.clear_termination();
+
         let code = format!(
             r#"
             (async () => {{
@@ -1181,13 +1333,47 @@ impl AppRuntime {
             serde_json::to_string(&message)?
         );
 
-        let promise = self.runtime.execute_script("<ws_message>", code)?;
-        let resolve_future = self.runtime.resolve(promise);
-        self.runtime
-            .with_event_loop_promise(resolve_future, PollEventLoopOptions::default())
-            .await?;
+        // Armed before the script runs; see `arm_execution_budget`.
+        let deadline = self.arm_execution_budget();
 
-        Ok(())
+        let timeout_ms = self.timeout_ms;
+        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let app_id_for_timeout = self.app_id.clone();
+        let ws_id_for_timeout = ws_id.clone();
+        let metrics_for_timeout = self.metrics.clone();
+        // Spawned before the dispatch, unlike the request path's: a message
+        // handler is called synchronously by the script below, so all of it
+        // runs inside `execute_script` and a cut-off armed afterwards would
+        // never cover any of it.
+        let timeout_task = tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            metrics_for_timeout.record_timeout_cutoff(&app_id_for_timeout);
+            tracing::warn!(
+                target: "app",
+                app_id = %app_id_for_timeout,
+                ws_id = %ws_id_for_timeout,
+                "App {} took longer than {}ms on one message from WebSocket {}. Terminating the \
+                 isolate; that message is dropped and the gateway closes the connection, while \
+                 the application keeps serving everything else on this thread",
+                app_id_for_timeout,
+                timeout_ms,
+                ws_id_for_timeout
+            );
+            isolate_handle.terminate_execution();
+        });
+
+        let outcome = self.settle_script("<ws_message>", code).await;
+
+        timeout_task.abort();
+        // A budget armed and never given back is spent by whatever runs next in
+        // this isolate -- the next message, or a request -- which would be told
+        // its time was already gone. Same trap as `execute_fetch`.
+        self.disarm_execution_budget();
+        // And without this a cut-off message would be the last thing this
+        // isolate ever did: every later message and every later request would
+        // fail on the flag this one left behind.
+        self.clear_termination();
+        outcome
     }
 
     pub async fn close_ws_connection(
@@ -1270,6 +1456,16 @@ impl AppRuntime {
     #[cfg(test)]
     pub fn timeout_ms(&self) -> u64 {
         self.timeout_ms
+    }
+
+    /// Exposes the effective `waitUntil` budget for this isolate, so a test
+    /// can assert the configured value arrived here. It is set from a
+    /// different config key than `timeout_ms`, and an isolate handed the
+    /// request's value in this slot behaves correctly on every path except a
+    /// tail -- which is the path nothing downstream is waiting on.
+    #[cfg(test)]
+    pub fn wait_until_timeout_ms(&self) -> u64 {
+        self.wait_until_timeout_ms
     }
 
     /// Exposes the effective JS-op rate limit for this isolate, for the same

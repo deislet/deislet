@@ -2,11 +2,13 @@
 //!
 //! Talks to deis-store, which partitions data by tenant -- one application in
 //! one environment. The tenant travels in the `x-deis-tenant` metadata header
-//! (see [`Tenant`]), not in the proto messages, so one client speaks for
-//! exactly one environment of one application and a preview cannot read or
-//! overwrite what production stored.
+//! and the capability token that proves this node may act as it travels in
+//! `x-deis-storage-token` (both stamped by [`StorageIdentity`]), not in the
+//! proto messages, so one client speaks for exactly one environment of one
+//! application and a preview cannot read or overwrite what production
+//! stored.
 
-use super::tenant::Tenant;
+use super::bindings::StorageIdentity;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -28,7 +30,11 @@ use proto::{kv_store_client::KvStoreClient, *};
 /// expiry on every read, so an entry returned here was live as of that read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvRead {
-    pub value: String,
+    /// The bytes the last write stored, handed back untouched. Bytes and not
+    /// a string because a KV value is whatever the application wrote -- an
+    /// image, a compressed frame, a serialised record -- and only the caller
+    /// knows how to read it.
+    pub value: Vec<u8>,
     pub metadata: Option<String>,
     pub expiration: Option<i64>,
 }
@@ -39,7 +45,7 @@ pub struct KvRead {
 #[derive(Clone)]
 pub struct KvClient {
     client: Arc<Mutex<KvStoreClient<Channel>>>,
-    tenant: Tenant,
+    identity: StorageIdentity,
 }
 
 impl KvClient {
@@ -49,15 +55,20 @@ impl KvClient {
     /// - endpoint: deis-store gRPC address (e.g., "http://127.0.0.1:8090",
     ///   deis-store's default listen address)
     /// - tenant: the `<app>.<environment>` every call of this client is
-    ///   charged to; see [`Tenant`]
+    ///   charged to; see [`StorageIdentity`]
+    ///
+    /// Carries no capability token, so it can only speak to a deis-store that
+    /// has no `auth_secret`. Application bindings go through
+    /// [`Self::connect_lazy`], which is handed the token the control plane
+    /// minted for the tenant.
     ///
     /// # Returns
     /// - Ok(KvClient): Connection successful
     /// - Err: Connection failed
     pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let tenant = Tenant::new(tenant)?;
-        tracing::info!(%endpoint, app_id = tenant.as_str(), "connecting to KV store");
+        let identity = StorageIdentity::new(tenant, None)?;
+        tracing::info!(%endpoint, app_id = identity.tenant(), "connecting to KV store");
 
         let client = KvStoreClient::connect(endpoint.clone())
             .await
@@ -65,10 +76,10 @@ impl KvClient {
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
-        tracing::info!(%endpoint, app_id = tenant.as_str(), "KV store client connected");
+        tracing::info!(%endpoint, app_id = identity.tenant(), "KV store client connected");
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
-            tenant,
+            identity,
         })
     }
 
@@ -78,29 +89,28 @@ impl KvClient {
     /// because the store is down, so a store outage never stops an app from
     /// loading or takes the node with it. The first call after an outage
     /// dials again, so the binding recovers on its own once the store is
-    /// back. Only an address that is not a URL, or a tenant that is not an
-    /// application and an environment, is refused here -- neither would ever start working.
-    pub fn connect_lazy(endpoint: &str, tenant: impl Into<String>) -> Result<Self> {
-        let tenant = Tenant::new(tenant)?;
+    /// back. Only an address that is not a URL is refused here -- and it would
+    /// never start working.
+    pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
         let channel = super::bindings::unary_channel(endpoint)?;
         let client = KvStoreClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::debug!(
             endpoint,
-            app_id = tenant.as_str(),
+            app_id = identity.tenant(),
             "KV client prepared; it will dial on the first call"
         );
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
-            tenant,
+            identity: identity.clone(),
         })
     }
 
     /// The tenant -- application and environment -- every call of this client
     /// is charged to.
     pub fn tenant(&self) -> &str {
-        self.tenant.as_str()
+        self.identity.tenant()
     }
 
     /// Get value
@@ -111,7 +121,7 @@ impl KvClient {
     /// # Returns
     /// - Some(value): Value found
     /// - None: Key does not exist
-    pub async fn get(&self, key: String) -> Result<Option<String>> {
+    pub async fn get(&self, key: String) -> Result<Option<Vec<u8>>> {
         Ok(self.get_with_metadata(key).await?.map(|read| read.value))
     }
 
@@ -128,7 +138,7 @@ impl KvClient {
     /// that stored no metadata and an app whose key is gone are not the same
     /// situation, and `value` is what separates them.
     pub async fn get_with_metadata(&self, key: String) -> Result<Option<KvRead>> {
-        let request = self.tenant.stamp(GetRequest { key: key.clone() });
+        let request = self.identity.stamp(GetRequest { key: key.clone() });
 
         tracing::debug!("KV Get: {}", key);
 
@@ -148,7 +158,7 @@ impl KvClient {
     /// # Parameters
     /// - key: Key
     /// - value: Value
-    pub async fn set(&self, key: String, value: String) -> Result<()> {
+    pub async fn set(&self, key: String, value: Vec<u8>) -> Result<()> {
         self.set_with_options(key, value, None, None).await
     }
 
@@ -163,18 +173,21 @@ impl KvClient {
     pub async fn set_with_options(
         &self,
         key: String,
-        value: String,
+        value: Vec<u8>,
         ttl_seconds: Option<i64>,
         metadata: Option<String>,
     ) -> Result<()> {
-        let request = self.tenant.stamp(SetRequest {
+        // The size, not the value: a value may be megabytes of binary, and a
+        // log line is not the place for it.
+        let bytes = value.len();
+        let request = self.identity.stamp(SetRequest {
             key: key.clone(),
-            value: value.clone(),
+            value,
             ttl_seconds,
             metadata,
         });
 
-        tracing::debug!("KV Set: {} = {} (ttl={:?})", key, value, ttl_seconds);
+        tracing::debug!("KV Set: {} ({} bytes, ttl={:?})", key, bytes, ttl_seconds);
 
         let mut client = self.client.lock().await;
         let response = client.set(request).await?;
@@ -192,7 +205,7 @@ impl KvClient {
     /// # Parameters
     /// - key: Key
     pub async fn delete(&self, key: String) -> Result<()> {
-        let request = self.tenant.stamp(DeleteRequest { key: key.clone() });
+        let request = self.identity.stamp(DeleteRequest { key: key.clone() });
 
         tracing::debug!("KV Delete: {}", key);
 
@@ -220,7 +233,7 @@ impl KvClient {
         prefix: String,
         limit: Option<i32>,
     ) -> Result<(Vec<String>, Option<String>)> {
-        let request = self.tenant.stamp(ListRequest {
+        let request = self.identity.stamp(ListRequest {
             prefix: prefix.clone(),
             limit,
             cursor: None,
@@ -249,7 +262,7 @@ impl KvClient {
     /// - true: Exists
     /// - false: Does not exist
     pub async fn has(&self, key: String) -> Result<bool> {
-        let request = self.tenant.stamp(HasRequest { key: key.clone() });
+        let request = self.identity.stamp(HasRequest { key: key.clone() });
 
         tracing::debug!("KV Has: {}", key);
 
@@ -280,12 +293,23 @@ mod tests {
         shutdown: Option<oneshot::Sender<()>>,
     }
 
+    /// The shared secret an authenticated install holds in three places:
+    /// deis-control, deis-store and deis-queue.
+    const AUTH_SECRET: &str = "the-secret-both-halves-hold";
+
     impl Store {
+        /// The single-box default: no `auth_secret`, so the store serves a
+        /// call that carries only the tenant it claims.
         async fn start() -> Self {
+            Self::start_with(None).await
+        }
+
+        async fn start_with(auth_secret: Option<&str>) -> Self {
             let data = TempDir::new().expect("temp dir");
             let config = Config {
                 listen: "127.0.0.1:0".to_string(),
                 data_dir: data.path().to_path_buf(),
+                auth_secret: auth_secret.map(str::to_string),
                 ..Config::default()
             };
             // Bind before spawning, so the port is known and no test has to
@@ -313,6 +337,13 @@ mod tests {
                 .await
                 .expect("connect kv client")
         }
+
+        /// A client wired the way an application binding is: lazily dialled,
+        /// carrying whatever proof the node was handed for this tenant.
+        fn binding(&self, tenant: &str, token: Option<&str>) -> KvClient {
+            let identity = StorageIdentity::new(tenant, token).expect("a legal tenant");
+            KvClient::connect_lazy(&self.endpoint, &identity).expect("client is built")
+        }
     }
 
     impl Drop for Store {
@@ -329,13 +360,42 @@ mod tests {
         let client = store.client("demo.production").await;
 
         client
-            .set_with_options("session".to_string(), "abc".to_string(), Some(3600), None)
+            .set_with_options("session".to_string(), b"abc".to_vec(), Some(3600), None)
             .await
             .expect("write with a lifetime");
 
         assert_eq!(
             client.get("session".to_string()).await.expect("read back"),
-            Some("abc".to_string())
+            Some(b"abc".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_that_is_not_valid_utf8_survives_the_round_trip() {
+        // A KV value is whatever the application wrote. While the wire typed
+        // it as a string, the store held these bytes intact and `Get` refused
+        // to hand them back, so a write that reported success produced a key
+        // that could never be read again. Over a real socket, because the two
+        // halves are owned by different crates.
+        let store = Store::start().await;
+        let client = store.client("demo.production").await;
+
+        // A PNG signature followed by a lone continuation byte and 0xFF:
+        // valid as bytes, invalid as UTF-8 at the first character.
+        let png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x80, 0xFF];
+        assert!(
+            String::from_utf8(png.clone()).is_err(),
+            "the fixture has to be bytes a string could not hold"
+        );
+
+        client
+            .set("avatar".to_string(), png.clone())
+            .await
+            .expect("write raw bytes");
+
+        assert_eq!(
+            client.get("avatar".to_string()).await.expect("read back"),
+            Some(png)
         );
     }
 
@@ -352,7 +412,7 @@ mod tests {
         client
             .set_with_options(
                 "avatar".to_string(),
-                "png-bytes".to_string(),
+                b"png-bytes".to_vec(),
                 None,
                 Some(r#"{"contentType":"image/png"}"#.to_string()),
             )
@@ -364,7 +424,7 @@ mod tests {
             .await
             .expect("read back")
             .expect("the key exists");
-        assert_eq!(read.value, "png-bytes");
+        assert_eq!(read.value, b"png-bytes");
         assert_eq!(
             read.metadata.as_deref(),
             Some(r#"{"contentType":"image/png"}"#)
@@ -380,7 +440,7 @@ mod tests {
         let client = store.client("demo.production").await;
 
         client
-            .set("plain".to_string(), "value".to_string())
+            .set("plain".to_string(), b"value".to_vec())
             .await
             .expect("plain write");
 
@@ -389,7 +449,7 @@ mod tests {
             .await
             .expect("read back")
             .expect("the key exists");
-        assert_eq!(read.value, "value");
+        assert_eq!(read.value, b"value");
         assert_eq!(read.metadata, None);
 
         assert_eq!(
@@ -414,7 +474,7 @@ mod tests {
             .expect("clock is after the epoch")
             .as_secs() as i64;
         client
-            .set_with_options("session".to_string(), "abc".to_string(), Some(3600), None)
+            .set_with_options("session".to_string(), b"abc".to_vec(), Some(3600), None)
             .await
             .expect("write with a lifetime");
 
@@ -439,7 +499,7 @@ mod tests {
         let client = store.client("demo.production").await;
 
         let error = client
-            .set_with_options("k".to_string(), "v".to_string(), Some(0), None)
+            .set_with_options("k".to_string(), b"v".to_vec(), Some(0), None)
             .await
             .expect_err("a zero lifetime is refused");
         assert!(error.to_string().contains("ttl"), "{error}");
@@ -457,13 +517,13 @@ mod tests {
         let client = store.client("demo.production").await;
 
         client
-            .set("greeting".to_string(), "hello".to_string())
+            .set("greeting".to_string(), b"hello".to_vec())
             .await
             .expect("plain write");
 
         assert_eq!(
             client.get("greeting".to_string()).await.expect("read back"),
-            Some("hello".to_string())
+            Some(b"hello".to_vec())
         );
         assert!(client.has("greeting".to_string()).await.expect("has"));
     }
@@ -477,7 +537,7 @@ mod tests {
         let second = store.client("app-two.production").await;
 
         first
-            .set("shared-name".to_string(), "one".to_string())
+            .set("shared-name".to_string(), b"one".to_vec())
             .await
             .expect("write as app-one");
 
@@ -501,11 +561,11 @@ mod tests {
         let preview = store.client("demo.preview-7").await;
 
         production
-            .set("customer".to_string(), "real".to_string())
+            .set("customer".to_string(), b"real".to_vec())
             .await
             .expect("write as production");
         preview
-            .set("customer".to_string(), "fixture".to_string())
+            .set("customer".to_string(), b"fixture".to_vec())
             .await
             .expect("write as the preview");
 
@@ -514,7 +574,7 @@ mod tests {
                 .get("customer".to_string())
                 .await
                 .expect("read as production"),
-            Some("real".to_string()),
+            Some(b"real".to_vec()),
             "a preview deployment overwrote production's data"
         );
         assert_eq!(
@@ -522,7 +582,100 @@ mod tests {
                 .get("customer".to_string())
                 .await
                 .expect("read as the preview"),
-            Some("fixture".to_string())
+            Some(b"fixture".to_vec())
+        );
+    }
+
+    /// The gRPC code a refusal must arrive as, so a caller can tell "you are
+    /// not who you say" from "that tenant does not exist for me".
+    fn refusal(error: &anyhow::Error) -> tonic::Code {
+        error
+            .downcast_ref::<tonic::Status>()
+            .unwrap_or_else(|| {
+                panic!("the store answered with something that is not a gRPC status: {error:#}")
+            })
+            .code()
+    }
+
+    #[tokio::test]
+    async fn a_store_that_requires_a_token_refuses_a_client_without_one_and_serves_one_with_it() {
+        // The whole delivery path in one test, over a real socket: the store
+        // holds the shared secret, the control plane would mint this token
+        // from it, and the client stamps it beside the tenant it claims.
+        // Asserting on the header alone would not catch the two halves
+        // computing different values.
+        let store = Store::start_with(Some(AUTH_SECRET)).await;
+        let tenant = "demo.production";
+        let token = deis_wire::conventions::storage_token(AUTH_SECRET, tenant);
+
+        let unproven = store.binding(tenant, None);
+        let error = unproven
+            .set("k".to_string(), b"v".to_vec())
+            .await
+            .expect_err("a store with an auth_secret must not serve an unproven call");
+        assert_eq!(
+            refusal(&error),
+            tonic::Code::Unauthenticated,
+            "a missing token is a credential problem, not a bad tenant: {error:#}"
+        );
+
+        let proven = store.binding(tenant, Some(&token));
+        proven
+            .set("k".to_string(), b"v".to_vec())
+            .await
+            .expect("a call carrying this tenant's token is served");
+        assert_eq!(
+            proven.get("k".to_string()).await.expect("read back"),
+            Some(b"v".to_vec())
+        );
+
+        assert_eq!(
+            refusal(
+                &unproven
+                    .get("k".to_string())
+                    .await
+                    .expect_err("still unproven")
+            ),
+            tonic::Code::Unauthenticated,
+            "an unproven client must not read what a proven one wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_minted_for_another_tenant_is_refused() {
+        // What makes a leaked token harmless elsewhere: the store recomputes
+        // the expected value from the tenant the call itself claims, so
+        // presenting production's token while naming the preview proves
+        // nothing.
+        let store = Store::start_with(Some(AUTH_SECRET)).await;
+        let production_token =
+            deis_wire::conventions::storage_token(AUTH_SECRET, "demo.production");
+
+        let error = store
+            .binding("demo.preview-7", Some(&production_token))
+            .set("k".to_string(), b"v".to_vec())
+            .await
+            .expect_err("one environment's token must not authorise another's namespace");
+        assert_eq!(refusal(&error), tonic::Code::Unauthenticated, "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_secret_serves_a_client_that_carries_a_token_anyway() {
+        // Why the node stamps the token unconditionally instead of behind a
+        // flag: a control plane that mints tokens and a store that does not
+        // check them is a legal intermediate state during a rollout, and it
+        // must keep working.
+        let store = Store::start().await;
+        let token = deis_wire::conventions::storage_token(AUTH_SECRET, "demo.production");
+
+        let client = store.binding("demo.production", Some(&token));
+        client
+            .set("k".to_string(), b"v".to_vec())
+            .await
+            .expect("a store with no auth_secret ignores the token it was handed");
+        assert_eq!(
+            client.get("k".to_string()).await.expect("read back"),
+            Some(b"v".to_vec())
         );
     }
 
@@ -531,8 +684,9 @@ mod tests {
         // Nothing listens on port 1. Building the client must succeed -- an
         // app may not be blocked from loading by a store outage -- and the
         // call must fail with something an operator can act on.
-        let client = KvClient::connect_lazy("http://127.0.0.1:1", "demo.production")
-            .expect("client is built");
+        let identity = StorageIdentity::new("demo.production", None).expect("a legal tenant");
+        let client =
+            KvClient::connect_lazy("http://127.0.0.1:1", &identity).expect("client is built");
         let error = client
             .get("anything".to_string())
             .await
@@ -550,16 +704,15 @@ mod tests {
         // again. Without this an app whose store restarted would keep failing
         // until the app itself was reloaded.
         let store = Store::start().await;
-        let client =
-            KvClient::connect_lazy(&store.endpoint, "demo.production").expect("client is built");
+        let client = store.binding("demo.production", None);
 
         client
-            .set("k".to_string(), "v".to_string())
+            .set("k".to_string(), b"v".to_vec())
             .await
             .expect("write over a lazily dialled channel");
         assert_eq!(
             client.get("k".to_string()).await.expect("read back"),
-            Some("v".to_string())
+            Some(b"v".to_vec())
         );
     }
 }

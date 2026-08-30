@@ -11,13 +11,29 @@
 //! runs on is checked out of a fixed-size pool for exactly that closure. A
 //! semaphore bounds how many blocking threads the pool can occupy, which also
 //! bounds how many SQLite handles the process opens.
+//!
+//! # One exception: a connection can be pinned
+//!
+//! An interactive transaction cannot live inside one closure - the caller
+//! decides what to run next from what it read, and that decision happens in
+//! another process. [`SqlitePool::checkout`] therefore hands out a
+//! [`PooledConnection`] that stays out of the pool until it is dropped, and
+//! whoever holds it runs each statement on it inside its own `spawn_blocking`.
+//! The permit is held for the whole time, so a pinned connection is one fewer
+//! connection the rest of the tenant's traffic can use; [`crate::database`]
+//! bounds how many may be pinned at once and puts a deadline on each.
+//!
+//! Every release goes through the same guard, which refuses to hand a
+//! connection back while a transaction is still open on it: an unfinished
+//! `BEGIN` returned to the pool would carry its write lock into whichever
+//! unrelated request picked the connection up next.
 
 use crate::error::{StoreError, StoreResult};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// How long a connection waits for a competing writer before giving up.
 /// WAL keeps readers out of the way, so contention here means two writers,
@@ -87,52 +103,45 @@ impl SqlitePool {
     /// The closure owns the connection for its whole body, so it can open a
     /// transaction; the connection goes back to the pool afterwards whether
     /// the closure succeeded or not (a rolled-back transaction leaves the
-    /// handle perfectly usable).
+    /// handle perfectly usable, and one left open is rolled back by the
+    /// guard before anybody else sees it).
     pub async fn with_conn<F, T>(&self, f: F) -> StoreResult<T>
     where
         F: FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static,
         T: Send + 'static,
     {
         let inner = self.inner.clone();
-        let permit = inner
+        let permit = self.permit().await?;
+        tokio::task::spawn_blocking(move || {
+            let mut conn = PooledConnection::take(inner, permit)?;
+            // The guard is dropped here, on the blocking thread, because
+            // releasing a connection may have to talk to SQLite.
+            f(&mut conn)
+        })
+        .await?
+    }
+
+    /// Take a connection out of the pool and keep it until the guard drops.
+    ///
+    /// For work that spans several requests - today, exactly one thing: an
+    /// interactive transaction, which has to run `BEGIN`, then whatever the
+    /// caller decides, then `COMMIT`, all on the same connection. The pool
+    /// permit is held for the whole time, so the caller is responsible for
+    /// bounding how long that is and how many it does at once.
+    pub async fn checkout(&self) -> StoreResult<PooledConnection> {
+        let inner = self.inner.clone();
+        let permit = self.permit().await?;
+        tokio::task::spawn_blocking(move || PooledConnection::take(inner, permit)).await?
+    }
+
+    /// Wait for the pool to admit one more connection.
+    async fn permit(&self) -> StoreResult<OwnedSemaphorePermit> {
+        self.inner
             .permits
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| StoreError::BlockingTask("sqlite pool was closed".to_string()))?;
-
-        tokio::task::spawn_blocking(move || {
-            let mut conn = match inner.idle.lock() {
-                Ok(mut idle) => idle.pop(),
-                Err(poisoned) => {
-                    // A previous holder panicked while the lock was held. The
-                    // list itself is still readable, so recover it rather
-                    // than failing every later request on this pool.
-                    tracing::warn!(
-                        pool = %inner.label,
-                        "sqlite idle list mutex was poisoned by an earlier panic, recovering it; \
-                         no data is affected"
-                    );
-                    poisoned.into_inner().pop()
-                }
-            };
-            if conn.is_none() {
-                conn = Some(open(&inner.path, &inner.label)?);
-            }
-            let mut conn = conn.expect("connection was just opened");
-
-            let result = f(&mut conn);
-
-            match inner.idle.lock() {
-                Ok(mut idle) => idle.push(conn),
-                Err(poisoned) => poisoned.into_inner().push(conn),
-            }
-            // The permit lives until here so the connection is back in the
-            // pool before another caller is admitted.
-            drop(permit);
-            result
-        })
-        .await?
+            .map_err(|_| StoreError::BlockingTask("sqlite pool was closed".to_string()))
     }
 
     /// Run `f` once at startup, typically to create tables. Separate from
@@ -151,6 +160,115 @@ impl SqlitePool {
                 "schema setup failed; this store cannot serve any request"
             );
         })
+    }
+}
+
+/// A connection checked out of a pool, returned to it when this is dropped.
+///
+/// Deref gives the `rusqlite::Connection` itself, so a holder runs statements
+/// on it exactly as `with_conn`'s closure does.
+///
+/// Drop is where the pool's one invariant is enforced: a connection only goes
+/// back if no transaction is open on it. Dropping this guard can therefore
+/// talk to SQLite, which is why every release in this crate happens on a
+/// blocking thread.
+pub struct PooledConnection {
+    inner: Arc<Inner>,
+    /// `None` only during drop, so the connection can be moved out of a
+    /// `&mut self`.
+    conn: Option<Connection>,
+    /// Held until the connection is back in the pool, so the pool never
+    /// admits more callers than it has connections for.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PooledConnection {
+    /// Pop an idle connection or open a new one. Blocking: it may open a
+    /// file, so it is only ever called from inside `spawn_blocking`.
+    fn take(inner: Arc<Inner>, permit: OwnedSemaphorePermit) -> StoreResult<Self> {
+        let idle = match inner.idle.lock() {
+            Ok(mut idle) => idle.pop(),
+            Err(poisoned) => {
+                // A previous holder panicked while the lock was held. The
+                // list itself is still readable, so recover it rather than
+                // failing every later request on this pool.
+                tracing::warn!(
+                    pool = %inner.label,
+                    "sqlite idle list mutex was poisoned by an earlier panic, recovering it; \
+                     no data is affected"
+                );
+                poisoned.into_inner().pop()
+            }
+        };
+        let conn = match idle {
+            Some(conn) => conn,
+            None => open(&inner.path, &inner.label)?,
+        };
+        Ok(Self {
+            inner,
+            conn: Some(conn),
+            permit: Some(permit),
+        })
+    }
+}
+
+impl std::ops::Deref for PooledConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn
+            .as_ref()
+            .expect("connection is only taken on drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.conn
+            .as_mut()
+            .expect("connection is only taken on drop")
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else { return };
+
+        // An open transaction rides on the connection, not on the request
+        // that opened it: handing this back mid-`BEGIN` would give the next
+        // unrelated statement someone else's write lock and someone else's
+        // uncommitted rows. Roll it back, or throw the connection away.
+        if !conn.is_autocommit() {
+            match conn.execute_batch("ROLLBACK") {
+                Ok(()) => tracing::warn!(
+                    pool = %self.inner.label,
+                    "a connection was released with a transaction still open on it; it has been \
+                     rolled back before the connection goes back into the pool, so whatever that \
+                     transaction had written is gone"
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        pool = %self.inner.label,
+                        error = %e,
+                        "a connection was released inside a transaction that will not roll back; \
+                         it is being closed instead of pooled so its write lock cannot outlive \
+                         the request, and the pool will open a replacement on demand"
+                    );
+                    // Closing the connection is what actually releases the
+                    // lock, and dropping `conn` here is that close.
+                    drop(self.permit.take());
+                    return;
+                }
+            }
+        }
+
+        match self.inner.idle.lock() {
+            Ok(mut idle) => idle.push(conn),
+            Err(poisoned) => poisoned.into_inner().push(conn),
+        }
+        // Released last, so the connection is back in the pool before
+        // another caller is admitted.
+        drop(self.permit.take());
     }
 }
 
@@ -288,5 +406,68 @@ mod tests {
     #[test]
     fn pool_size_is_never_zero() {
         assert_eq!(PoolSize::new(0).0, 1);
+    }
+
+    /// A checked-out connection is gone from the pool until the guard drops,
+    /// and comes back when it does.
+    #[tokio::test]
+    async fn a_checkout_pins_one_connection_and_gives_it_back() {
+        let dir = TempDir::new().unwrap();
+        let pool = pool(&dir);
+        {
+            let pinned = pool.checkout().await.unwrap();
+            pinned.execute_batch("CREATE TABLE t(a INTEGER)").unwrap();
+            assert!(
+                pool.inner.idle.lock().unwrap().is_empty(),
+                "a pinned connection must not also be sitting in the idle list"
+            );
+            // The pool still serves everyone else while it is pinned.
+            pool.with_conn(|c| {
+                c.execute("INSERT INTO t(a) VALUES(1)", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(pool.inner.idle.lock().unwrap().len(), 2);
+    }
+
+    /// The case that would poison the pool: a holder that left `BEGIN`
+    /// hanging. The connection must not go back carrying the write lock, or
+    /// the next unrelated statement inherits it.
+    #[tokio::test]
+    async fn a_connection_released_mid_transaction_is_rolled_back_first() {
+        let dir = TempDir::new().unwrap();
+        let pool = pool(&dir);
+        pool.migrate(|c| {
+            c.execute_batch("CREATE TABLE t(a INTEGER)")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Abandon a write transaction: no commit, no rollback, guard dropped.
+        pool.with_conn(|c| {
+            c.execute_batch("BEGIN IMMEDIATE")?;
+            c.execute("INSERT INTO t(a) VALUES(1)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // The row is gone and the file takes writes again, on the same
+        // connection the abandoned transaction had been using.
+        let n: i64 = pool
+            .with_conn(|c| Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "the abandoned transaction must have been rolled back");
+        pool.with_conn(|c| {
+            assert!(c.is_autocommit(), "a pooled connection must arrive clean");
+            c.execute("INSERT INTO t(a) VALUES(2)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

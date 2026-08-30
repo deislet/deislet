@@ -28,8 +28,13 @@ message GetRequest {
 
 // Get response
 message GetResponse {
-  // If found, value is present; otherwise it is absent
-  optional string value = 1;
+  // If found, value is present; otherwise it is absent.
+  //
+  // Bytes, not a string: a KV value is whatever the application wrote -- a
+  // PNG, a protobuf, a gzip frame -- and typing it as a string made every
+  // value that is not valid UTF-8 unreadable through this API even though
+  // the column behind it is a BLOB and held the bytes intact.
+  optional bytes value = 1;
   // Whatever the last Set stored in `SetRequest.metadata`, returned
   // untouched. Absent when the key has none, and absent when the key does
   // not exist at all - `value` is what says which of the two happened.
@@ -44,7 +49,8 @@ message GetResponse {
 // Set request
 message SetRequest {
   string key = 1;
-  string value = 2;
+  // Bytes, not a string; see GetResponse.value.
+  bytes value = 2;
   // Lifetime in seconds from the moment the store accepts the write. Absent
   // means the entry never lapses. Must be positive: a zero or negative
   // lifetime is a caller bug, not a request to store something already
@@ -137,6 +143,29 @@ service Database {
 
   // Query with a prepared statement
   rpc QueryPrepared(QueryPreparedRequest) returns (QueryResponse);
+
+  // Open an interactive transaction and get a handle to it.
+  //
+  // Unlike Batch, the caller decides what to do next from what it read: the
+  // transaction stays open across calls on one pinned connection, so a
+  // handler can read a row, branch on it, and write. The price is that the
+  // connection is unavailable to anything else until the transaction ends,
+  // which is why the server puts a deadline on it and bounds how many may
+  // be open at once.
+  rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);
+
+  // Run a row-less statement inside an open transaction.
+  rpc ExecuteInTransaction(ExecuteInTransactionRequest) returns (ExecuteResponse);
+
+  // Run a query inside an open transaction, seeing its own uncommitted
+  // writes.
+  rpc QueryInTransaction(QueryInTransactionRequest) returns (QueryResponse);
+
+  // Apply everything the transaction did and release the connection.
+  rpc CommitTransaction(CommitTransactionRequest) returns (CommitTransactionResponse);
+
+  // Discard everything the transaction did and release the connection.
+  rpc RollbackTransaction(RollbackTransactionRequest) returns (RollbackTransactionResponse);
 }
 
 // Execute request
@@ -212,4 +241,72 @@ message QueryPreparedRequest {
   string statement_id = 1;
   // JSON-encoded parameter array
   optional string params = 2;
+}
+
+// BeginTransaction request
+message BeginTransactionRequest {
+  // How long the caller wants the transaction to stay open, in
+  // milliseconds. Absent asks for the server's ceiling; anything above the
+  // ceiling is clamped down to it, and the value actually granted comes back
+  // in `expires_in_ms`. Zero or negative is refused, because a transaction
+  // that is dead on arrival is a caller bug rather than a request for one.
+  optional int64 timeout_ms = 1;
+}
+
+// BeginTransaction response
+message BeginTransactionResponse {
+  bool success = 1;
+  // Handle to pass to every later call. Belongs to the tenant that opened
+  // it, which is checked on each use.
+  string transaction_id = 2;
+  // Milliseconds from the moment this response was produced until the server
+  // rolls the transaction back on its own. It is a hard deadline, not a hint:
+  // a handler that awaits something slow in the middle of a transaction will
+  // find the handle dead, because the alternative is one handler holding its
+  // tenant's only writer indefinitely.
+  int64 expires_in_ms = 3;
+  // Why no transaction was opened - most often that this tenant, or this
+  // server, already has as many open as it allows.
+  optional string error = 4;
+}
+
+// ExecuteInTransaction request
+message ExecuteInTransactionRequest {
+  string transaction_id = 1;
+  string sql = 2;
+  // JSON-encoded parameter array
+  optional string params = 3;
+}
+
+// QueryInTransaction request
+message QueryInTransactionRequest {
+  string transaction_id = 1;
+  string sql = 2;
+  // JSON-encoded parameter array
+  optional string params = 3;
+}
+
+// CommitTransaction request
+message CommitTransactionRequest {
+  string transaction_id = 1;
+}
+
+// CommitTransaction response
+message CommitTransactionResponse {
+  bool success = 1;
+  // Set when the commit did not happen. The transaction is over either way:
+  // the connection is released and the handle is spent, so a failed commit
+  // means the work was rolled back rather than left open to retry.
+  optional string error = 2;
+}
+
+// RollbackTransaction request
+message RollbackTransactionRequest {
+  string transaction_id = 1;
+}
+
+// RollbackTransaction response
+message RollbackTransactionResponse {
+  bool success = 1;
+  optional string error = 2;
 }

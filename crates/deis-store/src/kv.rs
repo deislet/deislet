@@ -433,32 +433,20 @@ impl KvStore for KvService {
         tracing::trace!(tenant = %tenant, key = %key, "kv get");
 
         let found = self.get(&tenant, &key).await?;
+        // The value goes back exactly as it was stored. It used to be decoded
+        // as UTF-8 first, which meant a value the store held intact -- an
+        // image, a compressed frame, anything binary -- was answered with
+        // DataLoss and could never be read back through this API.
         let response = match found {
             None => GetResponse {
                 value: None,
                 metadata: None,
                 expires_at: None,
             },
-            Some(entry) => match String::from_utf8(entry.value) {
-                Ok(text) => GetResponse {
-                    value: Some(text),
-                    metadata: entry.metadata,
-                    expires_at: entry.expires_at,
-                },
-                Err(e) => {
-                    // storage.proto types the value as a string, so bytes
-                    // that are not UTF-8 cannot be handed back at all.
-                    tracing::error!(
-                        tenant = %tenant,
-                        key = %key,
-                        error = %e,
-                        "stored kv value is not valid UTF-8; the caller cannot read this key \
-                         through the KV API until it is rewritten"
-                    );
-                    return Err(
-                        StoreError::Corrupt(format!("value of {key} is not valid UTF-8")).into(),
-                    );
-                }
+            Some(entry) => GetResponse {
+                value: Some(entry.value),
+                metadata: entry.metadata,
+                expires_at: entry.expires_at,
             },
         };
         Ok(Response::new(response))
@@ -477,14 +465,8 @@ impl KvStore for KvService {
             "kv set"
         );
 
-        self.set(
-            &tenant,
-            &req.key,
-            req.value.into_bytes(),
-            req.metadata,
-            expires_at,
-        )
-        .await?;
+        self.set(&tenant, &req.key, req.value, req.metadata, expires_at)
+            .await?;
         Ok(Response::new(SetResponse { success: true }))
     }
 
@@ -600,6 +582,54 @@ mod tests {
         assert!(!svc.delete(&a, "greeting").await.unwrap());
     }
 
+    /// A KV value is whatever the application wrote, and most of what an
+    /// application stores in bytes is not text: an image, a compressed frame,
+    /// a serialised record. While storage.proto typed the value as a string,
+    /// the column held these bytes intact but `Get` refused to hand them back
+    /// -- it decoded them as UTF-8 first and answered DataLoss -- so a write
+    /// that succeeded produced a key that could never be read again.
+    #[tokio::test]
+    async fn a_value_that_is_not_text_survives_the_round_trip() {
+        let (_dir, svc) = service().await;
+        // A PNG signature followed by a lone 0x80 continuation byte: valid as
+        // bytes, invalid as UTF-8 at the first character.
+        let png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x80, 0xFF];
+
+        KvStore::set(
+            &svc,
+            as_tenant(
+                "app-one.production",
+                SetRequest {
+                    key: "avatar".to_string(),
+                    value: png.clone(),
+                    ttl_seconds: None,
+                    metadata: Some(r#"{"contentType":"image/png"}"#.to_string()),
+                },
+            ),
+        )
+        .await
+        .expect("the write is accepted");
+
+        let got = KvStore::get(
+            &svc,
+            as_tenant(
+                "app-one.production",
+                GetRequest {
+                    key: "avatar".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("the read succeeds rather than reporting corruption")
+        .into_inner();
+
+        assert_eq!(got.value.as_deref(), Some(&png[..]));
+        assert_eq!(
+            got.metadata.as_deref(),
+            Some(r#"{"contentType":"image/png"}"#)
+        );
+    }
+
     /// The gap this closes: metadata used to be write-only. `Set` took it,
     /// the column held it, and no RPC gave it back, so an application could
     /// write a note about a value it could never read again.
@@ -613,7 +643,7 @@ mod tests {
             "app-one.production",
             SetRequest {
                 key: "session".to_string(),
-                value: "token".to_string(),
+                value: b"token".to_vec(),
                 ttl_seconds: Some(3600),
                 metadata: Some(r#"{"user":"7"}"#.to_string()),
             },
@@ -632,7 +662,7 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        assert_eq!(got.value.as_deref(), Some("token"));
+        assert_eq!(got.value.as_deref(), Some(&b"token"[..]));
         assert_eq!(got.metadata.as_deref(), Some(r#"{"user":"7"}"#));
         let expires_at = got.expires_at.expect("a lifetime was asked for");
         assert!(
@@ -645,7 +675,7 @@ mod tests {
         svc.set(&a, "plain", b"v".to_vec(), None, None)
             .await
             .unwrap();
-        for (key, value) in [("plain", Some("v")), ("absent", None)] {
+        for (key, value) in [("plain", Some(&b"v"[..])), ("absent", None)] {
             let got = KvStore::get(
                 &svc,
                 as_tenant(
@@ -746,7 +776,7 @@ mod tests {
             "app-one.production",
             SetRequest {
                 key: "session".to_string(),
-                value: "token".to_string(),
+                value: b"token".to_vec(),
                 ttl_seconds: Some(3600),
                 metadata: Some(r#"{"kind":"session"}"#.to_string()),
             },
@@ -776,7 +806,7 @@ mod tests {
             "app-one.production",
             SetRequest {
                 key: "forever".to_string(),
-                value: "v".to_string(),
+                value: b"v".to_vec(),
                 ttl_seconds: None,
                 metadata: None,
             },
@@ -797,7 +827,7 @@ mod tests {
                 "app-one.production",
                 SetRequest {
                     key: "doomed".to_string(),
-                    value: "v".to_string(),
+                    value: b"v".to_vec(),
                     ttl_seconds: Some(ttl),
                     metadata: None,
                 },

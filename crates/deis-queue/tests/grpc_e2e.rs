@@ -25,7 +25,7 @@ use deis_queue::proto::queue::{
 };
 use deis_queue::tenant::TENANT_HEADER;
 use deis_queue::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
+use deis_wire::conventions::{APP_ID_HEADER, STORAGE_TOKEN_HEADER, storage_token, tenant_id};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -51,13 +51,27 @@ struct Harness {
 }
 
 impl Harness {
+    /// The default single-box install: loopback, no `auth_secret`, so calls
+    /// need no token. Most tests below are about queue behaviour rather than
+    /// about who may call it.
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// A server that requires a capability token, as any deployment that is
+    /// reachable off-host must.
+    async fn start_authenticated(secret: &str) -> Self {
+        Self::start_with(Some(secret.to_string())).await
+    }
+
+    async fn start_with(auth_secret: Option<String>) -> Self {
         let data = TempDir::new().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
             max_attempts: MAX_ATTEMPTS,
             max_body_bytes: MAX_BODY_BYTES,
+            auth_secret,
             ..Config::default()
         };
         // Bind first, so the port is known before anything is spawned and no
@@ -105,6 +119,26 @@ fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     request
         .metadata_mut()
         .insert(TENANT_HEADER, tenant.parse().unwrap());
+    request
+}
+
+/// Stamp the tenant *and* the capability token minted for `token_tenant`
+/// under `secret`, the way deis-runtime has to once a secret is configured.
+///
+/// The two tenants are separate arguments on purpose: presenting a token
+/// minted for one tenant on a call that claims another is exactly the attack
+/// the derivation is meant to defeat, and it has to be expressible here.
+fn as_tenant_with_token<T>(
+    tenant: &str,
+    secret: &str,
+    token_tenant: &str,
+    message: T,
+) -> Request<T> {
+    let mut request = as_tenant(tenant, message);
+    request.metadata_mut().insert(
+        STORAGE_TOKEN_HEADER,
+        storage_token(secret, token_tenant).parse().unwrap(),
+    );
     request
 }
 
@@ -825,5 +859,129 @@ async fn concurrent_consumers_never_receive_the_same_message() {
     assert_eq!(
         total, 40,
         "every message should have been leased exactly once"
+    );
+}
+
+// ---- the capability token, over a real server -------------------------
+//
+// The checks below go through the same interceptor a deployed process runs.
+// A token check that lives only in a unit test is a token check nothing
+// applies, so the server is the thing being asked here.
+
+#[tokio::test]
+async fn a_signed_call_is_served_when_a_secret_is_configured() {
+    let secret = "an-operator-secret";
+    let harness = Harness::start_authenticated(secret).await;
+    let tenant = tenant_id("app-one", "production");
+    let mut client = harness.client().await;
+
+    let sent = client
+        .send(as_tenant_with_token(
+            &tenant,
+            secret,
+            &tenant,
+            SendRequest {
+                queue_name: "jobs".to_string(),
+                message_body: "work".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(sent.success);
+
+    let pulled = client
+        .pull(as_tenant_with_token(
+            &tenant,
+            secret,
+            &tenant,
+            PullRequest {
+                queue_name: "jobs".to_string(),
+                max_messages: 10,
+                lease_seconds: 30,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pulled.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn a_call_with_no_token_is_refused_once_a_secret_is_configured() {
+    let harness = Harness::start_authenticated("an-operator-secret").await;
+    let status = harness
+        .client()
+        .await
+        .pull(as_tenant(
+            &tenant_id("app-one", "production"),
+            PullRequest {
+                queue_name: "jobs".to_string(),
+                max_messages: 10,
+                lease_seconds: 30,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn a_token_minted_for_another_tenant_drains_nothing() {
+    // Draining is destructive: a message another tenant's consumer takes is
+    // one its owner never receives. This is the check that stops a token that
+    // leaked out of one application from being used to do that.
+    let secret = "an-operator-secret";
+    let harness = Harness::start_authenticated(secret).await;
+    let mine = tenant_id("app-one", "production");
+
+    for claimed in [
+        tenant_id("app-two", "production"),
+        tenant_id("app-one", "preview"),
+    ] {
+        let status = harness
+            .client()
+            .await
+            .pull(as_tenant_with_token(
+                &claimed,
+                secret,
+                &mine,
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 10,
+                    lease_seconds: 30,
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            status.code(),
+            Code::Unauthenticated,
+            "a token for {mine} must not drain {claimed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
+    // The fail-closed half. An operator who widens `listen` and changes
+    // nothing else gets a process that stops with an explanation, rather than
+    // one whose queues anyone on the network can drain.
+    let data = TempDir::new().unwrap();
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        data_dir: data.path().to_path_buf(),
+        ..Config::default()
+    };
+    let public = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    public.set_nonblocking(true).unwrap();
+    let public = tokio::net::TcpListener::from_std(public).unwrap();
+
+    let error = server::serve(config, public, async {})
+        .await
+        .expect_err("a public bind with no auth_secret must not serve");
+    assert!(
+        format!("{error:#}").contains("auth_secret"),
+        "the refusal must name the missing setting: {error:#}"
     );
 }

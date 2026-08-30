@@ -27,7 +27,7 @@ use crate::{
     config::ControlConfig,
     config_manager::ConfigManager,
     database::Database,
-    delivery::{DeploymentDeliverer, PublicAddress, StorageEndpoints},
+    delivery::{DeploymentDeliverer, PublicAddress, StorageWiring},
     metrics::MetricsCollector,
     runtime_client::RuntimeNodeManager,
     session::SessionManager,
@@ -271,16 +271,29 @@ fn build_catalog_state(
         );
     }
 
-    let endpoints = StorageEndpoints::from_config(config);
-    if endpoints.is_empty() {
+    let storage = StorageWiring::from_config(config);
+    if storage.has_no_endpoints() {
         warn!(
             "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so every ctx.services.kv / database / blob / queue call an application makes answers \"service not available\" and declared queue consumers never start"
         );
     } else {
         info!(
-            store_endpoint = ?endpoints.store,
-            queue_endpoint = ?endpoints.queue,
+            store_endpoint = ?storage.store,
+            queue_endpoint = ?storage.queue,
             "Storage addresses will be handed to nodes with every deployment"
+        );
+    }
+
+    // Which of the two modes this platform runs in is not something an
+    // operator can see from a deployment: both send the same message, and
+    // the difference only shows up as every storage call being refused.
+    if storage.mints_tokens() {
+        info!(
+            "storage_auth_secret is configured: every deployment carries a capability token minted for its own tenant, and deis-store and deis-queue must hold the identical auth_secret or every storage call an application makes is refused with Unauthenticated"
+        );
+    } else {
+        warn!(
+            "storage_auth_secret is not configured: deployments carry no storage capability token, so anything that can reach deis-store or deis-queue may name any tenant and be served. That is only safe while both services are bound to loopback and have no auth_secret of their own; set the identical secret in all three places before either is reachable from another host"
         );
     }
 
@@ -303,7 +316,7 @@ fn build_catalog_state(
         bundles: Arc::new(bundles),
         secrets: Arc::clone(&secrets),
         deliverer: Arc::new(DeploymentDeliverer::new(
-            store, secrets, nodes, address, endpoints,
+            store, secrets, nodes, address, storage,
         )),
         node_auth,
     }

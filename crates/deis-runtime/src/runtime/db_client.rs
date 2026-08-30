@@ -2,13 +2,23 @@
 //!
 //! Talks to deis-store, which gives each tenant -- one application in one
 //! environment -- its own SQLite file: the tenant travels in the
-//! `x-deis-tenant` metadata header (see [`Tenant`]), not in the proto
-//! messages, so one client speaks for exactly one environment of one
+//! `x-deis-tenant` metadata header, with the capability token that proves
+//! this node may act as it alongside (both stamped by [`StorageIdentity`]),
+//! not in the proto messages, so one client speaks for exactly one environment of one
 //! application and a preview's writes never reach production's database.
 //! Prepared-statement handles are owned by the tenant that created them and
 //! the store refuses them across tenants.
+//!
+//! Interactive transactions ([`DbClient::begin_transaction`] and the calls
+//! that take its handle) are the one part of this surface that holds server
+//! state between calls: the store pins one of the tenant's connections to the
+//! transaction and holds that file's write lock until it commits or rolls
+//! back. That is what lets a caller read a row, decide from it, and write --
+//! and it is also why the store gives every transaction a deadline and rolls
+//! it back itself when it passes. A handle is owned by the tenant that opened
+//! it, checked on every use, and spent once the transaction ends.
 
-use super::tenant::Tenant;
+use super::bindings::StorageIdentity;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -21,13 +31,30 @@ pub mod proto {
 
 use proto::{database_client::DatabaseClient, *};
 
+/// The error a transaction call reports when deis-store answered `success =
+/// false`.
+///
+/// The store's own words are passed through unchanged. Every other call in
+/// this file puts its own name in front of the message; these do not, because
+/// what the store says about a transaction is written for whoever is holding
+/// the handle and is already a whole answer -- "was rolled back because it
+/// exceeded its 5000 ms deadline; nothing it wrote was applied" tells an
+/// application both what happened and what became of its writes. `runtime.js`
+/// names the call once on its way to the handler; adding a second frame here
+/// would only push that sentence further from the start of the line.
+fn transaction_refusal(error: Option<String>) -> anyhow::Error {
+    anyhow::anyhow!(error.unwrap_or_else(|| {
+        "the store refused a transaction call without saying why".to_string()
+    }))
+}
+
 /// Database client wrapper
 ///
 /// Wrapped in Arc<Mutex> to support sharing and internal mutability across async operations
 #[derive(Clone)]
 pub struct DbClient {
     client: Arc<Mutex<DatabaseClient<Channel>>>,
-    tenant: Tenant,
+    identity: StorageIdentity,
 }
 
 impl DbClient {
@@ -37,15 +64,18 @@ impl DbClient {
     /// - endpoint: deis-store gRPC address (e.g., "http://127.0.0.1:8090",
     ///   deis-store's default listen address)
     /// - tenant: the `<app>.<environment>` every call of this client is
-    ///   charged to; see [`Tenant`]
+    ///   charged to; see [`StorageIdentity`]
+    ///
+    /// Carries no capability token, so it can only speak to a deis-store that
+    /// has no `auth_secret`; application bindings use [`Self::connect_lazy`].
     ///
     /// # Returns
     /// - Ok(DbClient): Connection successful
     /// - Err: Connection failed
     pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let tenant = Tenant::new(tenant)?;
-        tracing::info!(%endpoint, app_id = tenant.as_str(), "connecting to database");
+        let identity = StorageIdentity::new(tenant, None)?;
+        tracing::info!(%endpoint, app_id = identity.tenant(), "connecting to database");
 
         let client = DatabaseClient::connect(endpoint.clone())
             .await
@@ -53,37 +83,36 @@ impl DbClient {
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
-        tracing::info!(%endpoint, app_id = tenant.as_str(), "database client connected");
+        tracing::info!(%endpoint, app_id = identity.tenant(), "database client connected");
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
-            tenant,
+            identity,
         })
     }
 
     /// Build a client that dials deis-store on its first call; see
     /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
     /// rather than connecting eagerly.
-    pub fn connect_lazy(endpoint: &str, tenant: impl Into<String>) -> Result<Self> {
-        let tenant = Tenant::new(tenant)?;
+    pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
         let channel = super::bindings::unary_channel(endpoint)?;
         let client = DatabaseClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::debug!(
             endpoint,
-            app_id = tenant.as_str(),
+            app_id = identity.tenant(),
             "database client prepared; it will dial on the first call"
         );
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
-            tenant,
+            identity: identity.clone(),
         })
     }
 
     /// The tenant -- application and environment -- every call of this client
     /// is charged to.
     pub fn tenant(&self) -> &str {
-        self.tenant.as_str()
+        self.identity.tenant()
     }
 
     /// Executes SQL statements (INSERT, UPDATE, DELETE, etc.)
@@ -95,7 +124,7 @@ impl DbClient {
     /// # Returns
     /// - (rows_affected, last_insert_id): Number of rows affected and last insert ID
     pub async fn execute(&self, sql: String, params: Option<String>) -> Result<(i64, Option<i64>)> {
-        let request = self.tenant.stamp(ExecuteRequest {
+        let request = self.identity.stamp(ExecuteRequest {
             sql: sql.clone(),
             params,
         });
@@ -129,7 +158,7 @@ impl DbClient {
         sql: String,
         params: Option<String>,
     ) -> Result<(String, Vec<String>)> {
-        let request = self.tenant.stamp(QueryRequest {
+        let request = self.identity.stamp(QueryRequest {
             sql: sql.clone(),
             params,
         });
@@ -166,7 +195,7 @@ impl DbClient {
             .map(|(sql, params)| ExecuteRequest { sql, params })
             .collect();
 
-        let request = self.tenant.stamp(BatchRequest {
+        let request = self.identity.stamp(BatchRequest {
             statements: execute_requests,
         });
 
@@ -203,7 +232,7 @@ impl DbClient {
     /// # Returns
     /// - statement_id: Prepared statement ID
     pub async fn prepare(&self, sql: String) -> Result<String> {
-        let request = self.tenant.stamp(PrepareRequest { sql: sql.clone() });
+        let request = self.identity.stamp(PrepareRequest { sql: sql.clone() });
 
         tracing::debug!("DB Prepare: {}", sql);
 
@@ -234,7 +263,7 @@ impl DbClient {
         statement_id: String,
         params: Option<String>,
     ) -> Result<(i64, Option<i64>)> {
-        let request = self.tenant.stamp(ExecutePreparedRequest {
+        let request = self.identity.stamp(ExecutePreparedRequest {
             statement_id,
             params,
         });
@@ -268,7 +297,7 @@ impl DbClient {
         statement_id: String,
         params: Option<String>,
     ) -> Result<(String, Vec<String>)> {
-        let request = self.tenant.stamp(QueryPreparedRequest {
+        let request = self.identity.stamp(QueryPreparedRequest {
             statement_id,
             params,
         });
@@ -287,6 +316,151 @@ impl DbClient {
         }
 
         Ok((query_response.rows, query_response.columns))
+    }
+
+    /// Opens an interactive transaction and returns the handle every later
+    /// call in it is made against.
+    ///
+    /// Unlike [`Self::batch`], which is decided before the first statement
+    /// runs, this one stays open across round trips, so a caller can read a
+    /// row, branch on what it read, and write. deis-store pays for that by
+    /// pinning one of this tenant's few connections to the transaction and
+    /// holding the file's write lock, which is why it puts a deadline on it.
+    ///
+    /// # Parameters
+    /// - timeout_ms: how long the caller wants it open. `None` asks for the
+    ///   store's ceiling; more than the ceiling is clamped down to it.
+    ///
+    /// # Returns
+    /// - (transaction_id, expires_in_ms): the handle, and the deadline that
+    ///   was actually granted counted from the moment the store answered.
+    pub async fn begin_transaction(&self, timeout_ms: Option<i64>) -> Result<(String, i64)> {
+        let request = self.identity.stamp(BeginTransactionRequest { timeout_ms });
+
+        tracing::debug!(timeout_ms, "DB BeginTransaction");
+
+        let mut client = self.client.lock().await;
+        let response = client.begin_transaction(request).await?;
+        let begun = response.into_inner();
+
+        if !begun.success {
+            return Err(transaction_refusal(begun.error));
+        }
+
+        Ok((begun.transaction_id, begun.expires_in_ms))
+    }
+
+    /// Runs a row-less statement inside an open transaction.
+    ///
+    /// # Parameters
+    /// - transaction_id: handle from [`Self::begin_transaction`]
+    /// - sql: SQL statement; the transaction-control words (BEGIN, COMMIT,
+    ///   ROLLBACK, SAVEPOINT and friends) are refused by the store, because
+    ///   the transaction is ended through [`Self::commit_transaction`] and
+    ///   [`Self::rollback_transaction`] and nowhere else
+    /// - params: Optional parameters (JSON encoded array)
+    ///
+    /// # Returns
+    /// - (rows_affected, last_insert_id): Number of rows affected and last insert ID
+    pub async fn execute_in_transaction(
+        &self,
+        transaction_id: String,
+        sql: String,
+        params: Option<String>,
+    ) -> Result<(i64, Option<i64>)> {
+        let request = self.identity.stamp(ExecuteInTransactionRequest {
+            transaction_id,
+            sql: sql.clone(),
+            params,
+        });
+
+        tracing::debug!("DB ExecuteInTransaction: {}", sql);
+
+        let mut client = self.client.lock().await;
+        let response = client.execute_in_transaction(request).await?;
+        let exec_response = response.into_inner();
+
+        if !exec_response.success {
+            return Err(transaction_refusal(exec_response.error));
+        }
+
+        Ok((exec_response.rows_affected, exec_response.last_insert_id))
+    }
+
+    /// Queries inside an open transaction, which is the only way to read the
+    /// transaction's own uncommitted writes.
+    ///
+    /// # Parameters
+    /// - transaction_id: handle from [`Self::begin_transaction`]
+    /// - sql: SQL query statement
+    /// - params: Optional parameters (JSON encoded array)
+    ///
+    /// # Returns
+    /// - (rows, columns): Result rows (JSON-encoded) and column names
+    pub async fn query_in_transaction(
+        &self,
+        transaction_id: String,
+        sql: String,
+        params: Option<String>,
+    ) -> Result<(String, Vec<String>)> {
+        let request = self.identity.stamp(QueryInTransactionRequest {
+            transaction_id,
+            sql: sql.clone(),
+            params,
+        });
+
+        tracing::debug!("DB QueryInTransaction: {}", sql);
+
+        let mut client = self.client.lock().await;
+        let response = client.query_in_transaction(request).await?;
+        let query_response = response.into_inner();
+
+        if !query_response.success {
+            return Err(transaction_refusal(query_response.error));
+        }
+
+        Ok((query_response.rows, query_response.columns))
+    }
+
+    /// Applies everything the transaction did and releases its connection.
+    ///
+    /// The handle is spent either way: a commit that fails means the work was
+    /// rolled back, not that the transaction is still there to retry.
+    pub async fn commit_transaction(&self, transaction_id: String) -> Result<()> {
+        let request = self
+            .identity
+            .stamp(CommitTransactionRequest { transaction_id });
+
+        tracing::debug!("DB CommitTransaction");
+
+        let mut client = self.client.lock().await;
+        let response = client.commit_transaction(request).await?;
+        let committed = response.into_inner();
+
+        if !committed.success {
+            return Err(transaction_refusal(committed.error));
+        }
+
+        Ok(())
+    }
+
+    /// Discards everything the transaction did and releases its connection.
+    pub async fn rollback_transaction(&self, transaction_id: String) -> Result<()> {
+        let request = self
+            .identity
+            .stamp(RollbackTransactionRequest { transaction_id });
+
+        tracing::debug!("DB RollbackTransaction");
+
+        let mut client = self.client.lock().await;
+        let response = client.rollback_transaction(request).await?;
+        let rolled_back = response.into_inner();
+
+        if !rolled_back.success {
+            return Err(transaction_refusal(rolled_back.error));
+        }
+
+        Ok(())
     }
 }
 
@@ -419,5 +593,173 @@ mod tests {
             !rows.contains("first"),
             "the successful half of a failed batch must have been rolled back: {rows}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_interactive_transaction_commits_what_it_wrote_and_only_it_can_read_it_first() {
+        // The whole reason this exists rather than `batch`: the caller reads
+        // inside the transaction, decides from what it read, and writes. So
+        // the test reads its own uncommitted row through the handle, and
+        // checks that a read on any other connection cannot see it until the
+        // commit.
+        let store = TestStore::start().await;
+        let client = DbClient::connect(&store.endpoint, "db_tx_commit_test.production")
+            .await
+            .expect("the store is listening");
+
+        client
+            .execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)".to_string(),
+                None,
+            )
+            .await
+            .expect("create table");
+
+        let (id, expires_in_ms) = client
+            .begin_transaction(None)
+            .await
+            .expect("a transaction is available");
+        assert!(
+            expires_in_ms > 0,
+            "the store has to say how long the handle lives, got {expires_in_ms}"
+        );
+
+        client
+            .execute_in_transaction(
+                id.clone(),
+                "INSERT INTO t (v) VALUES (?)".to_string(),
+                Some("[\"inside\"]".to_string()),
+            )
+            .await
+            .expect("insert inside the transaction");
+
+        let (rows, _) = client
+            .query_in_transaction(id.clone(), "SELECT v FROM t".to_string(), None)
+            .await
+            .expect("read inside the transaction");
+        assert!(
+            rows.contains("inside"),
+            "a transaction reads its own uncommitted writes: {rows}"
+        );
+
+        // WAL keeps this read off the transaction's write lock, so it answers
+        // now rather than waiting for the commit -- with the old contents.
+        let (outside, _) = client
+            .query("SELECT v FROM t".to_string(), None)
+            .await
+            .expect("read outside the transaction");
+        assert!(
+            !outside.contains("inside"),
+            "an uncommitted write must not be visible outside its transaction: {outside}"
+        );
+
+        client.commit_transaction(id).await.expect("commit");
+
+        let (after, _) = client
+            .query("SELECT v FROM t".to_string(), None)
+            .await
+            .expect("read after the commit");
+        assert!(
+            after.contains("inside"),
+            "the commit must have applied: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_transaction_leaves_nothing_and_its_handle_is_spent() {
+        let store = TestStore::start().await;
+        let client = DbClient::connect(&store.endpoint, "db_tx_rollback_test.production")
+            .await
+            .expect("the store is listening");
+
+        client
+            .execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)".to_string(),
+                None,
+            )
+            .await
+            .expect("create table");
+
+        let (id, _) = client.begin_transaction(None).await.expect("begin");
+        client
+            .execute_in_transaction(
+                id.clone(),
+                "INSERT INTO t (v) VALUES (?)".to_string(),
+                Some("[\"doomed\"]".to_string()),
+            )
+            .await
+            .expect("insert");
+        client
+            .rollback_transaction(id.clone())
+            .await
+            .expect("rollback");
+
+        let (rows, _) = client
+            .query("SELECT v FROM t".to_string(), None)
+            .await
+            .expect("query");
+        assert!(
+            !rows.contains("doomed"),
+            "a rolled-back write must be gone: {rows}"
+        );
+
+        // A spent handle is refused rather than quietly running the statement
+        // on some other connection, which would commit on its own.
+        let after = client
+            .execute_in_transaction(
+                id,
+                "INSERT INTO t (v) VALUES (?)".to_string(),
+                Some("[\"after\"]".to_string()),
+            )
+            .await;
+        let message = after.expect_err("a spent handle is not usable").to_string();
+        assert!(
+            message.contains("rolled back"),
+            "the refusal has to say what became of the handle: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_reports_its_failures_in_the_stores_own_words() {
+        // These arrive as `success = false` with a message rather than as a
+        // gRPC status, so the client has to look at the flag. Passing the
+        // message through unchanged is what lets `runtime.js` hand an
+        // application a sentence it can act on.
+        let store = TestStore::start().await;
+        let client = DbClient::connect(&store.endpoint, "db_tx_errors_test.production")
+            .await
+            .expect("the store is listening");
+
+        let refused = client
+            .begin_transaction(Some(0))
+            .await
+            .expect_err("a transaction that is already over cannot be opened");
+        assert!(refused.to_string().contains("positive"), "{refused}");
+
+        let (id, _) = client.begin_transaction(Some(5_000)).await.expect("begin");
+
+        // The transaction ends through Commit/Rollback and nowhere else; SQL
+        // that tries to end it from the inside would leave the store's idea
+        // of the connection and the connection itself disagreeing.
+        let control = client
+            .execute_in_transaction(id.clone(), "COMMIT".to_string(), None)
+            .await
+            .expect_err("transaction-control SQL is refused");
+        assert!(
+            control.to_string().to_lowercase().contains("commit"),
+            "{control}"
+        );
+
+        let bad_sql = client
+            .execute_in_transaction(
+                id.clone(),
+                "INSERT INTO nonexistent (v) VALUES (1)".to_string(),
+                None,
+            )
+            .await
+            .expect_err("a statement against a table that is not there fails");
+        assert!(bad_sql.to_string().contains("nonexistent"), "{bad_sql}");
+
+        client.rollback_transaction(id).await.expect("rollback");
     }
 }

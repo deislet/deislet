@@ -252,30 +252,11 @@ export function Commands() {
                   )}
                 </div>
 
-                {command.command_data && Object.keys(command.command_data).length > 0 && (
-                  <div className="mt-4">
-                    <p className="text-sm text-muted-foreground mb-2">Command Data</p>
-                    <pre className="rounded-md bg-muted p-3 text-xs overflow-auto max-h-32">
-                      {JSON.stringify(command.command_data, null, 2)}
-                    </pre>
-                  </div>
-                )}
-
-                {command.response_data && Object.keys(command.response_data).length > 0 && (
-                  <div className="mt-4">
-                    <p className="text-sm text-muted-foreground mb-2">Response Data</p>
-                    <pre className="rounded-md bg-muted p-3 text-xs overflow-auto max-h-32">
-                      {JSON.stringify(command.response_data, null, 2)}
-                    </pre>
-                  </div>
-                )}
-
-                {command.error_message && (
-                  <div className="mt-4">
-                    <p className="text-sm text-destructive mb-2">Error Message</p>
-                    <p className="text-sm bg-destructive/10 rounded-md p-2">{command.error_message}</p>
-                  </div>
-                )}
+                {/* `GET /api/commands` and `.../node/:id` do not carry the
+                    command's payload, its result or an error message - see
+                    the `Command` type in `@/lib/api`. There is nothing to
+                    show here until the control plane's list endpoints answer
+                    with more than id/type/status/timestamps. */}
               </CardContent>
             </Card>
           ))}

@@ -203,10 +203,12 @@ pub(crate) mod tests {
                 secrets,
                 Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
                 address,
-                crate::delivery::StorageEndpoints {
-                    store: Some("http://127.0.0.1:8090".to_string()),
-                    queue: None,
-                },
+                // Built the way the server builds it, so the harness cannot
+                // drift from the real assembly of a delivery.
+                crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
+                    store_endpoint: Some("http://127.0.0.1:8090".to_string()),
+                    ..Default::default()
+                }),
             )),
             node_auth: NodeAuthConfig::new(node_keys),
         };

@@ -85,10 +85,11 @@ pub struct RuntimeConfig {
     #[serde(default = "default_shutdown_grace_period_secs")]
     pub shutdown_grace_period_secs: u64,
 
-    /// Platform-wide defaults for per-app execution limits. Individual apps may
-    /// override either value via their `ResourceLimits` config (see
-    /// `crate::app::types::ResourceLimits`); these are only the fallback values
-    /// used when an app does not specify its own.
+    /// Platform-wide defaults for per-app execution limits. An app may override
+    /// `timeout_ms` and `rate_limit_ops_per_sec` via its `ResourceLimits`
+    /// config (see `crate::app::types::ResourceLimits`), in which case these
+    /// are only the fallback; `wait_until_timeout_ms` has no per-app override,
+    /// so every app on this node is held to the value set here.
     #[serde(default)]
     pub default_execution_limits: ExecutionLimits,
 
@@ -387,14 +388,29 @@ impl FetchConfig {
 /// Default execution limits applied to each app's isolate.
 ///
 /// These bound what one invocation of one app may do; they are not limits on
-/// the node process itself. An app's `ResourceLimits` may override either
-/// value, in which case these are only the fallback.
+/// the node process itself. An app's `ResourceLimits` may override the request
+/// timeout and the rate limit, in which case these are only the fallback; the
+/// tail budget is the platform's alone.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionLimits {
     /// Maximum wall-clock time (ms) a single fetch invocation may run before
     /// the isolate is terminated and the request fails.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+
+    /// Maximum wall-clock time (ms) the `waitUntil` tail of one invocation may
+    /// run after the response has already been sent.
+    ///
+    /// A limit of its own rather than what is left of `timeout_ms`: the tail is
+    /// meant to outlive the response -- that is the whole point of
+    /// `waitUntil` -- so by the time it starts the request's budget is spent,
+    /// and measuring it against that would refuse every tail. It still needs a
+    /// ceiling, because the tail runs on the runtime thread that every other
+    /// application on that thread is waiting for: a tail that never finishes
+    /// holds the node behind a request that answered 200 and looks perfectly
+    /// healthy.
+    #[serde(default = "default_wait_until_timeout_ms")]
+    pub wait_until_timeout_ms: u64,
 
     /// Maximum rate (ops/sec) of JS-op dispatch before the isolate is
     /// terminated and the in-flight request fails.
@@ -406,6 +422,14 @@ fn default_timeout_ms() -> u64 {
     30_000
 }
 
+/// The tail gets the same allowance as the request by default: it is the same
+/// application code doing the same kind of work, only after the answer went
+/// out. An operator who wants background work held to less (or given more)
+/// than a request sets this on its own.
+fn default_wait_until_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_rate_limit_ops_per_sec() -> f64 {
     1000.0
 }
@@ -414,6 +438,7 @@ impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             timeout_ms: default_timeout_ms(),
+            wait_until_timeout_ms: default_wait_until_timeout_ms(),
             rate_limit_ops_per_sec: default_rate_limit_ops_per_sec(),
         }
     }
@@ -569,6 +594,15 @@ impl RuntimeConfig {
             self.default_execution_limits.timeout_ms = parse_env(
                 &value,
                 "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS",
+                "a whole number of milliseconds",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_WAIT_UNTIL_TIMEOUT_MS")
+        {
+            self.default_execution_limits.wait_until_timeout_ms = parse_env(
+                &value,
+                "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_WAIT_UNTIL_TIMEOUT_MS",
                 "a whole number of milliseconds",
             )?;
         }
@@ -755,6 +789,16 @@ impl RuntimeConfig {
                 "default_execution_limits.timeout_ms is {}, which is below the {}ms floor; every \
                  request on this node would be terminated before its handler could finish",
                 limits.timeout_ms,
+                MIN_TIMEOUT_MS
+            ));
+        }
+
+        if limits.wait_until_timeout_ms < MIN_TIMEOUT_MS {
+            return Err(anyhow!(
+                "default_execution_limits.wait_until_timeout_ms is {}, which is below the {}ms \
+                 floor; the waitUntil tail of every invocation on this node would be terminated \
+                 before the work it was handed could finish",
+                limits.wait_until_timeout_ms,
                 MIN_TIMEOUT_MS
             ));
         }
@@ -1015,7 +1059,47 @@ mod tests {
     fn test_execution_limits_defaults() {
         let limits = ExecutionLimits::default();
         assert_eq!(limits.timeout_ms, 30_000);
+        assert_eq!(limits.wait_until_timeout_ms, 30_000);
         assert_eq!(limits.rate_limit_ops_per_sec, 1000.0);
+    }
+
+    #[test]
+    fn the_tail_budget_is_configured_on_its_own() {
+        // The tail is allowed to outlive the response, so an operator has to be
+        // able to give background work a different allowance from a request
+        // without changing what a request gets.
+        let toml_str = r#"
+            [default_execution_limits]
+            timeout_ms = 5000
+            wait_until_timeout_ms = 120000
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.default_execution_limits.timeout_ms, 5_000);
+        assert_eq!(
+            config.default_execution_limits.wait_until_timeout_ms,
+            120_000
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_config_that_names_no_tail_budget_gets_the_default() {
+        // Every configuration written before this setting existed omits it, and
+        // an unbounded tail is what this closes; the default has to apply.
+        let config: RuntimeConfig =
+            toml::from_str("[default_execution_limits]\ntimeout_ms = 5000\n").unwrap();
+        assert_eq!(
+            config.default_execution_limits.wait_until_timeout_ms,
+            30_000
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_tail_budget_below_floor() {
+        let mut config = RuntimeConfig::default();
+        config.default_execution_limits.wait_until_timeout_ms = MIN_TIMEOUT_MS - 1;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("wait_until_timeout_ms"), "{err}");
     }
 
     #[test]
@@ -1246,6 +1330,10 @@ mod tests {
 
         env::set_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS", "12345");
         env::set_var(
+            "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_WAIT_UNTIL_TIMEOUT_MS",
+            "54321",
+        );
+        env::set_var(
             "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_RATE_LIMIT_OPS_PER_SEC",
             "42.5",
         );
@@ -1254,9 +1342,11 @@ mod tests {
         config.apply_env_overrides().unwrap();
 
         env::remove_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS");
+        env::remove_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_WAIT_UNTIL_TIMEOUT_MS");
         env::remove_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_RATE_LIMIT_OPS_PER_SEC");
 
         assert_eq!(config.default_execution_limits.timeout_ms, 12345);
+        assert_eq!(config.default_execution_limits.wait_until_timeout_ms, 54321);
         assert_eq!(config.default_execution_limits.rate_limit_ops_per_sec, 42.5);
     }
 

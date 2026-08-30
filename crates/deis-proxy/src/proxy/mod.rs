@@ -17,6 +17,11 @@
 //!    to production when the route names none), replacing whatever the
 //!    client sent for either header, so deis-runtime only ever sees values
 //!    that passed the checks above.
+//! 4. A request the upstream upgrades (a WebSocket handshake) becomes a
+//!    tunnel: everything after the 101 is relayed in both directions until
+//!    one end closes. The upstream read timeout is a bound on how long a
+//!    reply may take and is not applied to that tunnel, so a connection is
+//!    not closed for being quiet.
 
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
@@ -330,8 +335,38 @@ impl ProxyHttp for DeisProxy {
         };
         let mut peer = HttpPeer::new(addr, tls_upstream, sni);
         peer.options.connection_timeout = Some(system.upstream_connect_timeout());
-        peer.options.read_timeout = Some(system.upstream_read_timeout());
+        // Bounds an in-flight write to the upstream, which only exists while
+        // there are bytes to push, so it means the same thing on a tunnel as
+        // on a request and stays set either way.
         peer.options.write_timeout = Some(system.upstream_read_timeout());
+        // `upstream_read_timeout` answers "how long may an upstream take to
+        // reply". Once a request has been upgraded there is no reply still
+        // owed: the 101 has arrived and what follows is a tunnel that both
+        // ends drive whenever they have something to say. Pingora sets the
+        // peer's read timeout on the upstream connection once and applies it
+        // to every read, the duplexed ones included, so leaving it set turns
+        // it into "how long a WebSocket may stay quiet" - and a chat, a
+        // notification stream or anything else waiting on a person is quiet
+        // for far longer than that. It used to close every WebSocket after
+        // `upstream_read_timeout` (30s by default) with nothing wrong,
+        // mid-conversation and with no close frame.
+        //
+        // It is cleared rather than raised because any finite value is the
+        // same bug at a different number. The cost is that an upstream which
+        // accepts an upgrade and then never answers holds that connection
+        // until the client goes away; the connection still ends the moment
+        // either end closes, and unreachable backends are taken out of
+        // rotation by the health check rather than by this timeout.
+        if session.is_upgrade_req() {
+            debug!(
+                host = %ctx.host,
+                app_id = ?ctx.app_id,
+                upstream = %addr,
+                "upgrade request: the upstream read timeout does not apply to the tunnel"
+            );
+        } else {
+            peer.options.read_timeout = Some(system.upstream_read_timeout());
+        }
         Ok(Box::new(peer))
     }
 

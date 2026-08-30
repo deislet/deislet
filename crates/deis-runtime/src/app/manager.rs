@@ -217,6 +217,9 @@ impl ApplicationManager {
 
         ExecutionLimits {
             timeout_ms,
+            // No per-app override: `ResourceLimits` has no key for the tail
+            // budget, so every app on this node is held to the platform value.
+            wait_until_timeout_ms: self.default_limits.wait_until_timeout_ms,
             rate_limit_ops_per_sec,
         }
     }
@@ -558,18 +561,22 @@ impl ApplicationManager {
         }
     }
 
-    /// Execute application
+    /// Execute application.
+    ///
+    /// The request body goes in as bytes and the response body comes back as
+    /// bytes: what an application receives and answers with is not always
+    /// text, and text is what this used to be.
     pub async fn execute_app(
         &self,
         key: &AppKey,
         url: String,
         method: String,
         headers: std::collections::HashMap<String, String>,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     ) -> Result<(
         u16,
         std::collections::HashMap<String, String>,
-        Option<String>,
+        Option<Vec<u8>>,
     )> {
         self.require_running(key)?;
 

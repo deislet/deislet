@@ -89,6 +89,28 @@ pub struct ControlConfig {
     /// consumers never start, so messages pile up in deis-queue unread.
     #[serde(default)]
     pub queue_endpoint: Option<String>,
+    /// Shared secret the storage capability tokens are derived from. It must
+    /// be the identical string that deis-store and deis-queue carry as their
+    /// own `auth_secret`.
+    ///
+    /// Unlike [`Self::store_endpoint`] this is a credential, so it is never
+    /// logged and never travels to a node as itself: the control plane mints
+    /// one token per tenant with
+    /// [`deis_wire::conventions::storage_token`] and ships only that. A token
+    /// authorises exactly the one tenant it was derived for, so a value that
+    /// leaks out of one application is useless against another's data.
+    ///
+    /// Unset - the single-box default - means no token is minted and none is
+    /// shipped. That is only safe while both storage services are bound to
+    /// loopback and have no `auth_secret` of their own; they refuse to start
+    /// on any other address without one. Setting it here while the services
+    /// have no secret is harmless, and setting it on the services while it is
+    /// unset here refuses every storage call every application makes.
+    ///
+    /// A blank or whitespace-only value counts as unset, so an empty string
+    /// in the file cannot become an HMAC key that happens to compute.
+    #[serde(default)]
+    pub storage_auth_secret: Option<String>,
     /// Seconds between cron scheduler ticks (default: 60, clamped to 1..=60).
     ///
     /// A tick does two things: it rebuilds the task list from the catalog,
@@ -172,6 +194,7 @@ impl Default for ControlConfig {
             secret_key_file: None,
             store_endpoint: None,
             queue_endpoint: None,
+            storage_auth_secret: None,
             cron_tick_seconds: default_cron_tick_seconds(),
             node_registration_ttl_secs: default_node_registration_ttl(),
         }

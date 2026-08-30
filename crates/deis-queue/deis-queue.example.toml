@@ -3,12 +3,33 @@
 
 # Address the gRPC server binds to.
 #
-# Loopback on purpose. The service trusts the `x-deis-tenant` header it is
-# handed and has no way to tell one caller from another, so the only thing
-# keeping an unrelated client away from a tenant's messages is that it cannot
-# reach the port. Binding anything else publishes every tenant's queue to that
-# network; the service warns at startup when you do.
+# Loopback on purpose, because the line below is commented out. With no
+# auth_secret, the service trusts the `x-deis-tenant` header it is handed and
+# has no way to tell one caller from another, so the only thing keeping an
+# unrelated client away from a tenant's messages is that it cannot reach the
+# port. Binding anywhere else in that state is refused at startup rather than
+# warned about: draining a queue is destructive, and a message somebody else's
+# consumer takes is one its owner never receives.
 listen = "127.0.0.1:8091"
+
+# Shared secret the per-tenant capability tokens are derived from. Commented
+# out by default, which is the single-box install: deis-queue and deis-runtime
+# on one host, nothing else able to reach the port. The service says so at
+# startup, at warn.
+#
+# Set it, and every call must carry `x-deis-storage-token` holding
+# base64(HMAC-SHA256(auth_secret, tenant)) for the tenant it names. A token
+# only ever opens the one tenant it was minted for, so a token that leaked out
+# of one application is useless for another - and useless for another
+# environment of the same application.
+#
+# This is the same value deis-store uses and the same one the control plane
+# mints tokens from: one secret, one token per tenant, both services. Changing
+# it invalidates every token at once, so change it in all three places, or
+# every call from every node is refused.
+#
+# Required as soon as `listen` is not a loopback address.
+# auth_secret = "put a long random string here"
 
 # Directory holding queue.sqlite.
 #

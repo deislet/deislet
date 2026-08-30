@@ -5,7 +5,7 @@ use crate::app::AppKey;
 use crate::assets::{if_none_match_matches, AssetHit};
 use crate::{APP_ID_HEADER, ENVIRONMENT_HEADER};
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
@@ -34,7 +34,10 @@ pub async fn handle_request(
     uri: Uri,
     headers: HeaderMap,
     ws: Option<WebSocketUpgrade>,
-    body: String,
+    // Bytes, not `String`: an upload is whatever the client sent. Extracting
+    // it as text made axum reject every request whose body is not valid UTF-8
+    // -- a file upload, a protobuf, an image -- before the application saw it.
+    body: Bytes,
 ) -> impl IntoResponse {
     // Get app_id from header
     let app_id = match headers.get(APP_ID_HEADER).and_then(|v| v.to_str().ok()) {
@@ -153,7 +156,14 @@ pub async fn handle_request(
         header_map.insert("upgrade".to_string(), "websocket".to_string());
     }
 
-    let body_opt = if body.is_empty() { None } else { Some(body) };
+    // Empty stays absent: a request with no body and a request with a
+    // zero-length one are the same thing to a handler, and `new Request(url,
+    // { body })` refuses an empty body on a GET.
+    let body_opt = if body.is_empty() {
+        None
+    } else {
+        Some(body.to_vec())
+    };
 
     // Execute application
     match state

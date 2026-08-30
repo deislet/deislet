@@ -7,10 +7,12 @@
 //! opaque key. Consumers come to it and lease work; it never pushes to
 //! anyone.
 //!
-//! It also does not authenticate its callers: the tenant header is taken at
-//! face value, which is why it listens on loopback by default. See the crate
-//! docs in `lib.rs` for the trust model and for what would have to exist
-//! before it can be bound anywhere else.
+//! Who a caller is allowed to be, it does check: a call carries a capability
+//! token for the tenant it names, derived from the `auth_secret` this service
+//! shares with deis-store and deis-control. With no secret configured it
+//! listens on loopback and believes the header, which is the default
+//! single-box install; binding anywhere else in that state is refused at
+//! startup. See the crate docs in `lib.rs` and [`deis_queue::auth`].
 
 use anyhow::Result;
 use clap::Parser;

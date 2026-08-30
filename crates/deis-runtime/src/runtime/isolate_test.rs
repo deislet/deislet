@@ -10,6 +10,21 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
+    /// A response body as text.
+    ///
+    /// The body crosses as bytes now, because a response is not always text.
+    /// Most handlers in this file answer with a string, and this is the one
+    /// place that says so; a body that is not UTF-8 here is a bug in the test,
+    /// not in the runtime.
+    fn text(body: Option<Vec<u8>>) -> Option<String> {
+        body.map(|bytes| String::from_utf8(bytes).expect("this test's handler answers with text"))
+    }
+
+    /// A request body written as a string, for the tests whose payload is one.
+    fn sent(body: &str) -> Option<Vec<u8>> {
+        Some(body.as_bytes().to_vec())
+    }
+
     #[test]
     fn test_transform_esm_typescript() {
         let ts_code = r#"export default function handler(_request: Request): Response {
@@ -408,6 +423,178 @@ export default function handler(context: any): Response {
     }
 
     #[tokio::test]
+    async fn a_request_body_of_raw_bytes_reaches_the_handler_unchanged() {
+        // The request used to be serialised into the *source text* of the
+        // invocation script, so a body that was not valid UTF-8 could not
+        // survive the trip at all: an upload -- an image, a protobuf, a zip --
+        // reached the handler mangled. The bytes travel on their own channel
+        // now; this is the test that would notice if they went back into JSON.
+        let code = r#"
+            export default async function handler(context) {
+                const bytes = new Uint8Array(await context.request.arrayBuffer());
+                // Echoed back as bytes, so the return leg is under test too.
+                return new Response(bytes);
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "raw_body_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        // Every byte value once, so a lossy step anywhere shows up: 0x00 ends
+        // a C string, 0x80..=0xFF are not valid UTF-8 on their own, and the
+        // quote and backslash are what a JSON round trip would escape.
+        let payload: Vec<u8> = (0u8..=255).collect();
+        assert!(
+            String::from_utf8(payload.clone()).is_err(),
+            "the fixture has to be bytes a string could not hold"
+        );
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/upload".to_string(),
+                "POST".to_string(),
+                HashMap::new(),
+                Some(payload.clone()),
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(
+            body.as_deref(),
+            Some(&payload[..]),
+            "the body did not survive the trip through the isolate byte for byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_that_carries_no_body_is_not_given_an_empty_one() {
+        // A 204 and a 204 with a zero-length body are different answers, and
+        // an isolate is reused: the body of the previous request must not be
+        // handed to the next one either.
+        let code = r#"
+            export default async function handler(context) {
+                if (context.request.url.endsWith("/empty")) {
+                    return new Response(null, { status: 204 });
+                }
+                return new Response("first");
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "no_body_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/first".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(text(body).as_deref(), Some("first"));
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/empty".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 204);
+        assert_eq!(
+            body, None,
+            "a body-less answer must stay body-less, and must not inherit the last one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_body_is_handed_to_the_isolate_once_and_not_again() {
+        // The bytes are *taken* out of the isolate's state rather than copied
+        // from it. Leaving them there would let the next request -- an isolate
+        // serves many -- read a body belonging to one already answered, which
+        // is one application's payload delivered to another caller.
+        let code = r#"
+            export default async function handler(context) {
+                return new Response(JSON.stringify({
+                    body: await context.request.text()
+                }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "once_body_app".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "POST".to_string(),
+                HashMap::new(),
+                sent("only once"),
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        let seen: serde_json::Value = serde_json::from_str(&text(body).unwrap()).unwrap();
+        assert_eq!(seen["body"], "only once");
+
+        // The next request carries nothing: the previous body must be gone,
+        // not still waiting in the isolate.
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        let seen: serde_json::Value = serde_json::from_str(&text(body).unwrap()).unwrap();
+        assert_eq!(
+            seen["body"], "",
+            "the next request read the previous request's body"
+        );
+    }
+
+    #[tokio::test]
     async fn a_handler_can_read_the_request_body() {
         // Without Request.text() every handler that reads a POST body failed
         // with "text is not a function", which named the runtime's polyfill
@@ -434,12 +621,13 @@ export default function handler(context: any): Response {
                 "http://localhost/".to_string(),
                 "POST".to_string(),
                 HashMap::new(),
-                Some("hello body".to_string()),
+                sent("hello body"),
                 tx,
             )
             .await
             .unwrap();
         let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
 
         assert_eq!(status, 200);
         let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
@@ -471,12 +659,13 @@ export default function handler(context: any): Response {
                 "http://localhost/".to_string(),
                 "POST".to_string(),
                 HashMap::new(),
-                Some(r#"{"key":"value"}"#.to_string()),
+                sent(r#"{"key":"value"}"#),
                 tx,
             )
             .await
             .unwrap();
         let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
 
         assert_eq!(status, 200);
         let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
@@ -512,12 +701,13 @@ export default function handler(context: any): Response {
                 "http://localhost/".to_string(),
                 "POST".to_string(),
                 HashMap::new(),
-                Some("once".to_string()),
+                sent("once"),
                 tx,
             )
             .await
             .unwrap();
         let (_, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
         assert!(body.unwrap().starts_with("refused:"));
     }
 
@@ -563,6 +753,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
 
         assert_eq!(status, 200);
         assert_eq!(body, Some("named jobs, empty name rejected".to_string()));
@@ -608,6 +799,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
 
         assert_eq!(status, 200);
         let body = body.unwrap_or_default();
@@ -669,6 +861,7 @@ export default function handler(context: any): Response {
             .await
             .expect("the isolate must still be usable after a cut-off");
         let (status, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
 
         assert_eq!(status, 200);
         assert_eq!(body, Some("served /after".to_string()));
@@ -825,6 +1018,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
 
         assert_eq!(status, 200);
         let body = body.unwrap_or_default();
@@ -839,6 +1033,7 @@ export default function handler(context: any): Response {
         // Nothing listens on port 1: the client exists, the call fails, and
         // the isolate survives to serve the next request.
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:1".to_string()),
@@ -881,6 +1076,7 @@ export default function handler(context: any): Response {
                 .await
                 .unwrap();
             let (status, _, body) = rx.await.unwrap().unwrap();
+            let body = text(body);
             let body = body.unwrap_or_default();
             assert_eq!(status, 200);
             assert!(body.starts_with("call failed:"), "{body}");
@@ -924,6 +1120,7 @@ export default function handler(context: any): Response {
             .await
             .expect("the request runs");
         let (status, _, body) = rx.await.expect("a response").expect("a response");
+        let body = text(body);
         let body = body.unwrap_or_default();
         assert_eq!(status, 200, "{body}");
         body
@@ -970,6 +1167,185 @@ export default function handler(context: any): Response {
     }
 
     #[tokio::test]
+    async fn a_kv_value_that_is_not_valid_utf8_round_trips_through_an_app() {
+        // KV values were typed as `string` all the way down, so a value that
+        // is not text could not be stored at all: the write encoded it as
+        // UTF-8 and the read decoded it again, and every byte outside ASCII
+        // came back as something else. An app that caches a rendered image or
+        // a compressed payload in KV is the ordinary case for this.
+        let store = TestStore::start().await;
+        let code = r#"
+            export default async function handler(ctx) {
+                // Every byte value once, including 0x00 and the 0x80..0xFF
+                // range that is not valid UTF-8 on its own.
+                const written = new Uint8Array(256);
+                for (let i = 0; i < 256; i++) written[i] = i;
+
+                await ctx.services.kv.put("blob", written);
+                const read = new Uint8Array(
+                    await ctx.services.kv.get("blob", { type: "arrayBuffer" })
+                );
+
+                let identical = read.length === written.length;
+                for (let i = 0; identical && i < written.length; i++) {
+                    if (read[i] !== written[i]) identical = false;
+                }
+                return new Response(JSON.stringify({
+                    identical,
+                    length: read.length,
+                    first: read[0],
+                    last: read[255],
+                }));
+            }
+        "#;
+
+        let body = body_of_one_request("kv_bytes_app.production", code, &store.kv_wiring()).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(parsed["length"], 256, "{body}");
+        assert_eq!(parsed["first"], 0, "{body}");
+        assert_eq!(parsed["last"], 255, "{body}");
+        assert_eq!(
+            parsed["identical"], true,
+            "the bytes did not survive the round trip through KV: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_reads_answer_in_the_shape_the_caller_asked_for() {
+        // The types applications are already written against: text by
+        // default, and json / arrayBuffer on request. A read that ignored the
+        // option would hand a handler a string where it expected an object.
+        let store = TestStore::start().await;
+        let code = r#"
+            export default async function handler(ctx) {
+                await ctx.services.kv.put("doc", JSON.stringify({ n: 7 }));
+
+                const plain = await ctx.services.kv.get("doc");
+                const asText = await ctx.services.kv.get("doc", { type: "text" });
+                const asJson = await ctx.services.kv.get("doc", { type: "json" });
+                const asBuffer = await ctx.services.kv.get("doc", { type: "arrayBuffer" });
+
+                return new Response(JSON.stringify({
+                    plainIsString: typeof plain === "string",
+                    plain,
+                    textMatches: asText === plain,
+                    jsonIsObject: typeof asJson === "object" && asJson !== null,
+                    n: asJson.n,
+                    bufferIsArrayBuffer: asBuffer instanceof ArrayBuffer,
+                    bufferLength: asBuffer.byteLength,
+                    missing: await ctx.services.kv.get("absent", { type: "json" }),
+                }));
+            }
+        "#;
+
+        let body = body_of_one_request("kv_types_app.production", code, &store.kv_wiring()).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(parsed["plainIsString"], true, "{body}");
+        assert_eq!(parsed["plain"], r#"{"n":7}"#, "{body}");
+        assert_eq!(parsed["textMatches"], true, "{body}");
+        assert_eq!(parsed["jsonIsObject"], true, "{body}");
+        assert_eq!(parsed["n"], 7, "{body}");
+        assert_eq!(parsed["bufferIsArrayBuffer"], true, "{body}");
+        assert_eq!(parsed["bufferLength"], 7, "{body}");
+        assert!(
+            parsed["missing"].is_null(),
+            "a key that is not there is null whatever type was asked for: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kv_read_type_this_platform_does_not_implement_is_refused() {
+        // "stream" is a name in the same set as the three that work, and
+        // there is no streaming read behind it here: op_kv_get answers with
+        // the whole value. Ignoring the option and handing back text would
+        // give the handler something that is not a ReadableStream and fail on
+        // the first method it called, far from the call that was wrong.
+        let store = TestStore::start().await;
+        let code = r#"
+            export default async function handler(ctx) {
+                await ctx.services.kv.put("k", "v");
+                const attempts = {};
+                for (const type of ["stream", "nonsense"]) {
+                    try {
+                        await ctx.services.kv.get("k", { type });
+                        attempts[type] = "accepted";
+                    } catch (e) {
+                        attempts[type] = String(e.message || e);
+                    }
+                }
+                return new Response(JSON.stringify(attempts));
+            }
+        "#;
+
+        let body =
+            body_of_one_request("kv_bad_type_app.production", code, &store.kv_wiring()).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let refusal = parsed["stream"].as_str().expect("a message");
+        assert!(
+            refusal.contains("stream") && refusal.contains("not available"),
+            "the refusal has to name the type and say it is not implemented: {body}"
+        );
+        assert!(
+            parsed["nonsense"]
+                .as_str()
+                .expect("a message")
+                .contains("unknown type"),
+            "a type that is not in the set at all is refused too: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_put_takes_a_string_a_buffer_or_a_view() {
+        // The three shapes an application has to hand: a string, the
+        // ArrayBuffer a `fetch` response or a file read produces, and the
+        // typed-array view everything else works in. Anything else is a
+        // mistake worth naming rather than storing "[object Object]".
+        let store = TestStore::start().await;
+        let code = r#"
+            export default async function handler(ctx) {
+                const bytes = new Uint8Array([104, 105]); // "hi"
+
+                await ctx.services.kv.put("as-string", "hi");
+                await ctx.services.kv.put("as-buffer", bytes.buffer);
+                await ctx.services.kv.put("as-view", bytes);
+                // A view over part of a larger buffer must store its own
+                // window, not the whole allocation behind it.
+                const wide = new Uint8Array([0, 104, 105, 0]);
+                await ctx.services.kv.put("as-slice", wide.subarray(1, 3));
+
+                let refused = "accepted";
+                try {
+                    await ctx.services.kv.put("as-object", { not: "bytes" });
+                } catch (e) {
+                    refused = String(e.message || e);
+                }
+
+                return new Response(JSON.stringify({
+                    string: await ctx.services.kv.get("as-string"),
+                    buffer: await ctx.services.kv.get("as-buffer"),
+                    view: await ctx.services.kv.get("as-view"),
+                    slice: await ctx.services.kv.get("as-slice"),
+                    refused,
+                }));
+            }
+        "#;
+
+        let body =
+            body_of_one_request("kv_put_shapes_app.production", code, &store.kv_wiring()).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        for shape in ["string", "buffer", "view", "slice"] {
+            assert_eq!(parsed[shape], "hi", "{shape} did not round trip: {body}");
+        }
+        assert!(
+            parsed["refused"]
+                .as_str()
+                .expect("a message")
+                .contains("ArrayBuffer"),
+            "a value that is none of the three shapes has to say what is accepted: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_lifetime_comes_back_as_the_moment_the_entry_lapses() {
         // The app asked for a lifetime and cannot otherwise tell how much of
         // it is left.
@@ -1012,6 +1388,7 @@ export default function handler(context: any): Response {
         let store = TestStore::start().await;
 
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some(store.endpoint.clone()),
@@ -1054,6 +1431,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _, body) = rx2.await.unwrap().unwrap();
+        let body = text(body);
         drop(store);
 
         assert_eq!(status, 200, "body: {body:?}");
@@ -1102,6 +1480,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (_, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
         let body = body.unwrap_or_default();
         assert!(
             body.contains("expirationTtl"),
@@ -1149,6 +1528,7 @@ export default function handler(context: any): Response {
 
         let result_data = rx.await.unwrap().unwrap();
         let (status, _headers, body) = result_data;
+        let body = text(body);
         assert_eq!(status, 200);
         assert_eq!(body, Some("Hello from test".to_string()));
     }
@@ -1187,6 +1567,7 @@ export default function handler(context: any): Response {
 
         let result_data = rx.await.unwrap().unwrap();
         let (status, _headers, body) = result_data;
+        let body = text(body);
         assert_eq!(status, 500);
         assert!(body.unwrap().contains("Test error"));
     }
@@ -1234,6 +1615,7 @@ export default function handler(context: any): Response {
 
         let result_data = rx.await.unwrap().unwrap();
         let (status, _headers, body) = result_data;
+        let body = text(body);
         assert_eq!(status, 200);
         assert_eq!(body, Some("/test".to_string()));
     }
@@ -1278,6 +1660,7 @@ export default function handler(context: any): Response {
 
         let result_data = rx.await.unwrap().unwrap();
         let (status, _headers, body) = result_data;
+        let body = text(body);
         assert_eq!(status, 200);
         assert_eq!(body, Some(r#"{"id":"123"}"#.to_string()));
     }
@@ -1319,6 +1702,7 @@ export default function handler(context: any): Response {
 
         let result_data = rx.await.unwrap().unwrap();
         let (_status, _headers, body) = result_data;
+        let body = text(body);
         assert_eq!(body, Some("{}".to_string()));
     }
 
@@ -1337,6 +1721,7 @@ export default function handler(context: any): Response {
             IsolateSpec {
                 limits: ExecutionLimits {
                     timeout_ms: 5_000,
+                    wait_until_timeout_ms: 7_500,
                     rate_limit_ops_per_sec: 42.5,
                 },
                 ..Default::default()
@@ -1345,11 +1730,15 @@ export default function handler(context: any): Response {
         )
         .unwrap();
 
-        // Both values differ from the platform defaults (30_000ms /
-        // 1000.0 ops/sec) used elsewhere in this file, so this only passes
+        // Every value differs from the platform defaults (30_000ms / 30_000ms
+        // / 1000.0 ops/sec) used elsewhere in this file, so this only passes
         // if the values actually threaded through `AppRuntime::new` rather
-        // than falling back to a hard-coded default.
+        // than falling back to a hard-coded default. The tail budget is the
+        // one that is easy to get wrong: it is configured separately from the
+        // request budget, so an isolate built with the request's value in that
+        // slot would still look correct until a tail ran.
         assert_eq!(runtime.timeout_ms(), 5_000);
+        assert_eq!(runtime.wait_until_timeout_ms(), 7_500);
         assert_eq!(runtime.rate_limit_ops_per_sec(), 42.5);
     }
 
@@ -1371,6 +1760,7 @@ export default function handler(context: any): Response {
         .unwrap();
 
         assert_eq!(runtime.timeout_ms(), 30_000);
+        assert_eq!(runtime.wait_until_timeout_ms(), 30_000);
         assert_eq!(runtime.rate_limit_ops_per_sec(), 1000.0);
     }
 
@@ -1553,6 +1943,16 @@ export default function handler(context: any): Response {
         "caches",
         "WebSocketPair",
         "WebSocketServer",
+        // The outbound socket, and policed: not deno_websocket's client, which
+        // dials with a connector of its own that never reaches
+        // `runtime/fetch_policy.rs`. This one is `runtime/ws_client_ops.rs`,
+        // which puts every destination through the same decision point an
+        // outbound `fetch` goes through and then connects to the address that
+        // was judged, so a name resolving to loopback, to a private range or
+        // to one of this platform's own services is refused here too. Its
+        // sockets are bounded by the invocation's execution budget and closed
+        // when the invocation ends.
+        "WebSocket",
         // Not in section 8.1, but section 8.1's own surface is not usable
         // without them: `AbortController`/`AbortSignal` are the only way to
         // cancel an outbound `fetch`, so without them a slow upstream burns
@@ -1562,16 +1962,53 @@ export default function handler(context: any): Response {
         "AbortController",
         "AbortSignal",
         "DOMException",
+        // `request.formData()` hands back a `FormData` whose file entries are
+        // `File`s, so a multipart upload is unreadable without these three
+        // names: `entry instanceof File` is the check every upload handler
+        // makes, and it was a ReferenceError. There was also no way to build
+        // a multipart body to send one on. `Blob` is the type the other two
+        // are defined in terms of, and what `response.blob()` had been
+        // returning all along without an application being able to name it.
+        "Blob",
+        "File",
+        "FormData",
+        // What a router matches a path against, and routing is the first
+        // thing a request handler does - so this one is missed on line one of
+        // a ported application rather than in some corner of it.
+        "URLPattern",
+        // Deep copy. The fallback without it is
+        // `JSON.parse(JSON.stringify(x))`, which drops `undefined`, functions,
+        // `Map` and `Set`, turns a `Date` into a string and throws on a cycle.
+        "structuredClone",
+        // `EventTarget` above is furniture without an event to dispatch
+        // through it, and `CustomEvent` comes with it because carrying a
+        // payload is the only reason an application fires one of its own.
+        "Event",
+        "CustomEvent",
+        // Deliberately coarse: `now()` is clamped to whole milliseconds and
+        // `timeOrigin` is a fixed 0, because a sub-millisecond clock is the
+        // standard building block of a cross-isolate timing side channel and
+        // this node runs several tenants' isolates on one OS thread. Browsers
+        // and the edge platform this one is modelled on coarsen it the same
+        // way. See the section in `js/bootstrap.js`.
+        "performance",
+        // This runtime's own frozen object, carrying `userAgent` and nothing
+        // else, so a library choosing between a browser, Node and an edge
+        // runtime can tell where it is. Every other member of the browser's
+        // `navigator` would either describe the node - the operator's
+        // business, not the tenant's - or be a promise this platform cannot
+        // keep.
+        "navigator",
     ];
 
     /// Beyond the canon's list: things a handler ported from another platform
     /// is likely to reach for and will not find here.
     ///
-    /// Several of these are loaded and working inside the isolate - deno_fetch
-    /// needs `Blob` and `FormData`, deno_web needs `Event` - and are simply
-    /// not bound to a global name. That is the deliberate line: section 8.1
-    /// plus what section 8.1 needs, and nothing further, so the surface this
-    /// platform promises stays one an operator can reason about.
+    /// Short, and every entry carries its own reason. Three of them are
+    /// permanent decisions and one is a genuine gap. Nothing is on this list
+    /// merely
+    /// because it was loaded and never bound - that was the state this list
+    /// used to describe, and it is no longer a reason to withhold a name.
     const EXTRA_GLOBALS_ABSENT: &[&str] = &[
         "Deno",
         // `deno_core` publishes its op table on both `globalThis.Deno.core`
@@ -1582,17 +2019,31 @@ export default function handler(context: any): Response {
         // and every other op, which is a total bypass of the outbound fetch
         // policy. See `an_application_cannot_reach_the_raw_op_table`.
         "__bootstrap",
-        "Blob",
-        "File",
-        "FormData",
-        "URLPattern",
-        "WebSocket",
-        "BroadcastChannel",
-        "structuredClone",
-        "Event",
-        "performance",
-        "navigator",
+        // The service-worker authoring style - `addEventListener("fetch", e =>
+        // e.respondWith(...))` - is not what this platform runs. Edge Canon is
+        // module syntax: `export default function handler(context)`, and
+        // `js/runtime.js` calls that export and nothing else. A global that
+        // accepted a "fetch" listener and then never fired it would be worse
+        // than no global at all: the application would boot, register its
+        // handler, answer nothing, and the failure would look like a platform
+        // fault rather than a porting mistake. A ReferenceError on the
+        // registration line says where the problem actually is. `EventTarget`,
+        // `Event` and `CustomEvent` are all present, so an application that
+        // wants an event bus of its own still has one - what is refused is the
+        // *global* one, which implies a dispatcher this runtime does not have.
         "addEventListener",
+        // Genuinely not implemented, and not a binding away. It means a
+        // message bus between isolates and there is none: an isolate is one
+        // (application, environment) on one node, two of them share no memory,
+        // and nothing on this node carries a message from one to another.
+        // deno_web's implementation is loaded and would bind, which is exactly
+        // the trap - `runtime/runtime_init.rs` builds a fresh
+        // `InMemoryBroadcastChannel` per isolate, so a bound
+        // `BroadcastChannel` would post messages that no receiver anywhere can
+        // ever observe. A name that accepts every send and delivers none is a
+        // silent data-loss bug in an application that trusted it. Use a queue
+        // (`context.services.queue`), which is durable and crosses nodes.
+        "BroadcastChannel",
     ];
 
     #[tokio::test]
@@ -1617,7 +2068,7 @@ export default function handler(context: any): Response {
         );
 
         let mut runtime = AppRuntime::new(
-            "globals_app".to_string(),
+            "globals_app.production".to_string(),
             code,
             None,
             IsolateSpec::default(),
@@ -1638,6 +2089,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (_status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
         let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
 
         for name in CANON_GLOBALS_PRESENT.iter().chain(EXTRA_GLOBALS_PRESENT) {
@@ -1712,6 +2164,437 @@ export default function handler(context: any): Response {
         );
     }
 
+    // --- the globals bound beyond section 8.1 ------------------------------
+    //
+    // `the_isolate_global_surface_is_the_one_the_documents_describe` asserts
+    // that a name is defined. That is the cheap half. A name that is bound and
+    // broken is the failure this repo keeps hitting, and it reads exactly like
+    // a working platform until an application calls the thing, so each of the
+    // globals below is also driven the way an application drives it.
+
+    /// A multipart upload has to arrive as something a handler can read.
+    ///
+    /// `request.formData()` already parsed one before these were bound - the
+    /// parser is deno_fetch's and it was never the problem. What an
+    /// application could not do was *read the result*: a file entry is a
+    /// `File`, `entry instanceof File` was a ReferenceError, and there was no
+    /// constructor to build a multipart body to send one on. So this drives
+    /// both directions in one handler: the multipart body below is parsed,
+    /// and then the same upload is rebuilt out of `FormData`/`File`/`Blob` and
+    /// parsed back through a second `Request`.
+    #[tokio::test]
+    async fn a_multipart_upload_round_trips_through_request_formdata() {
+        let boundary = "----deislet-test-boundary";
+        let payload = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"title\"\r\n\
+             \r\n\
+             a picture of a cat\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"upload\"; filename=\"cat.txt\"\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             meow\r\n\
+             --{boundary}--\r\n"
+        );
+
+        let code = r#"
+            export default async function handler(context) {
+                const form = await context.request.formData();
+                const title = form.get("title");
+                const upload = form.get("upload");
+
+                // The outbound direction: build the same upload out of the
+                // constructors and parse it back, because a handler that can
+                // read an upload but not forward one is only half ported.
+                const rebuilt = new FormData();
+                rebuilt.append("title", title);
+                rebuilt.append(
+                    "upload",
+                    new File([await upload.text()], upload.name, { type: upload.type }),
+                );
+                const reparsed = await new Request("http://localhost/echo", {
+                    method: "POST",
+                    body: rebuilt,
+                }).formData();
+
+                const blob = new Blob(["meow"], { type: "text/plain" });
+
+                return new Response(JSON.stringify({
+                    isFormData: form instanceof FormData,
+                    title,
+                    uploadIsFile: upload instanceof File,
+                    uploadIsBlob: upload instanceof Blob,
+                    name: upload.name,
+                    type: upload.type,
+                    text: await upload.text(),
+                    rebuiltTitle: reparsed.get("title"),
+                    rebuiltName: reparsed.get("upload").name,
+                    rebuiltText: await reparsed.get("upload").text(),
+                    blobSize: blob.size,
+                    blobText: await blob.text(),
+                }));
+            }
+        "#;
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "content-type".to_string(),
+            format!("multipart/form-data; boundary={boundary}"),
+        );
+
+        let mut runtime = AppRuntime::new(
+            "formdata_app.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/upload".to_string(),
+                "POST".to_string(),
+                headers,
+                Some(payload.into_bytes()),
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body).unwrap_or_default();
+        assert_eq!(status, 200, "the handler failed: {body}");
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(seen["isFormData"], true);
+        assert_eq!(seen["title"], "a picture of a cat");
+        assert_eq!(
+            seen["uploadIsFile"], true,
+            "a file entry has to be a `File` an application can name; this is the check every \
+             upload handler makes"
+        );
+        assert_eq!(seen["uploadIsBlob"], true, "`File` extends `Blob`");
+        assert_eq!(seen["name"], "cat.txt");
+        assert_eq!(seen["type"], "text/plain");
+        assert_eq!(seen["text"], "meow");
+        assert_eq!(seen["rebuiltTitle"], "a picture of a cat");
+        assert_eq!(
+            seen["rebuiltName"], "cat.txt",
+            "a `FormData` built by the handler has to survive being sent as a request body and \
+             parsed again, or an upload can be received but not forwarded"
+        );
+        assert_eq!(seen["rebuiltText"], "meow");
+        assert_eq!(seen["blobSize"], 4);
+        assert_eq!(seen["blobText"], "meow");
+    }
+
+    /// Routing, which is the first thing a request handler does.
+    ///
+    /// `URLPattern` is bound because a router reaches for it; a binding that
+    /// existed but did not match would move the failure from the import to
+    /// the route table, which is worse. So this matches, extracts a named
+    /// group, refuses a path it should refuse, and takes a wildcard.
+    #[tokio::test]
+    async fn a_router_matches_a_path_with_urlpattern() {
+        let code = r#"
+            export default function handler() {
+                const books = new URLPattern({ pathname: "/books/:id" });
+                const hit = books.exec("http://localhost/books/9780134685991");
+                const assets = new URLPattern({ pathname: "/assets/*" });
+                return new Response(JSON.stringify({
+                    matches: books.test("http://localhost/books/42"),
+                    id: hit.pathname.groups.id,
+                    miss: books.exec("http://localhost/authors/1"),
+                    wildcard: assets.test("http://localhost/assets/img/logo.png"),
+                    wildcardMiss: assets.test("http://localhost/books/42"),
+                }));
+            }
+        "#;
+        let body = body_of(
+            "urlpattern_app.production",
+            code,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .await;
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(seen["matches"], true);
+        assert_eq!(
+            seen["id"], "9780134685991",
+            "a `:named` group has to come back"
+        );
+        assert!(
+            seen["miss"].is_null(),
+            "a pattern that matched a path it should not have is worse than no pattern at all"
+        );
+        assert_eq!(seen["wildcard"], true);
+        assert_eq!(seen["wildcardMiss"], false);
+    }
+
+    /// The deep copy, against the thing it replaces.
+    ///
+    /// Without `structuredClone` an application copies with
+    /// `JSON.parse(JSON.stringify(x))`, which drops `undefined` keys and
+    /// functions, flattens `Map` and `Set` to `{}`, turns a `Date` into a
+    /// string and throws outright on a cycle. Each of those is asserted here
+    /// against a value that carries all of them at once, plus the point of a
+    /// deep copy: writing through the copy must not reach the original.
+    #[tokio::test]
+    async fn structuredclone_deep_copies_what_a_json_round_trip_loses() {
+        let code = r#"
+            export default function handler() {
+                const original = {
+                    when: new Date("2026-08-30T00:00:00.000Z"),
+                    tags: new Set(["a", "b"]),
+                    index: new Map([["k", { deep: [1, 2, 3] }]]),
+                    bytes: new Uint8Array([1, 2, 3]),
+                    missing: undefined,
+                    nested: { list: [{ n: 1 }] },
+                };
+                original.self = original;
+
+                let jsonThrows = false;
+                try {
+                    JSON.stringify(original);
+                } catch (_) {
+                    jsonThrows = true;
+                }
+
+                const copy = structuredClone(original);
+                copy.nested.list[0].n = 99;
+                copy.index.get("k").deep.push(4);
+
+                // The transfer list. It is accepted and it does nothing
+                // here - see the assertions below.
+                const buffer = new Uint8Array([9, 9, 9]).buffer;
+                const moved = structuredClone(buffer, { transfer: [buffer] });
+
+                return new Response(JSON.stringify({
+                    movedLength: moved.byteLength,
+                    sourceDetached: buffer.byteLength === 0,
+                    jsonThrows,
+                    separate: copy !== original,
+                    originalUntouched: original.nested.list[0].n,
+                    copyWritten: copy.nested.list[0].n,
+                    originalMapDepth: original.index.get("k").deep.length,
+                    copyMapDepth: copy.index.get("k").deep.length,
+                    dateSurvives:
+                        copy.when instanceof Date &&
+                        copy.when.getTime() === original.when.getTime(),
+                    setSurvives: copy.tags instanceof Set && copy.tags.has("b"),
+                    mapSurvives: copy.index instanceof Map,
+                    bytesSurvive: copy.bytes instanceof Uint8Array && copy.bytes[2] === 3,
+                    undefinedKeyKept: "missing" in copy,
+                    cycleSurvives: copy.self === copy,
+                }));
+            }
+        "#;
+        let body = body_of(
+            "structured_clone_app.production",
+            code,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .await;
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            seen["jsonThrows"], true,
+            "the value under test has to be one the JSON fallback cannot copy, or this test is \
+             not testing anything"
+        );
+        assert_eq!(seen["separate"], true);
+        assert_eq!(
+            seen["originalUntouched"], 1,
+            "a write through the copy reached the original, which makes this a shallow copy"
+        );
+        assert_eq!(seen["copyWritten"], 99);
+        assert_eq!(seen["originalMapDepth"], 3);
+        assert_eq!(seen["copyMapDepth"], 4);
+        assert_eq!(seen["dateSurvives"], true);
+        assert_eq!(seen["setSurvives"], true);
+        assert_eq!(seen["mapSurvives"], true);
+        assert_eq!(seen["bytesSurvive"], true);
+        assert_eq!(seen["undefinedKeyKept"], true);
+        assert_eq!(seen["cycleSurvives"], true);
+        assert_eq!(seen["movedLength"], 3);
+        // Documented, not aspirational. The bound `structuredClone` takes a
+        // `{ transfer: [...] }` list because it is the one from
+        // `13_message_port.js`, but deno_core only moves a buffer when the
+        // runtime carries a shared ArrayBuffer store, and this one does not:
+        // the buffer is copied and the source stays usable. The clone is
+        // still correct; the move is what is missing. Asserting the current
+        // answer means turning that store on becomes a visible test failure
+        // instead of a silent change of contract - and it keeps
+        // `js/bootstrap.js` honest about it in the meantime.
+        assert_eq!(
+            seen["sourceDetached"], false,
+            "a transferred buffer is now detached; structuredClone's transfer list has started \
+             moving buffers, so js/bootstrap.js, crates/deis-runtime/README.md and edge-canon's \
+             PLATFORM_MATRIX.md all say something that is no longer true"
+        );
+    }
+
+    /// The clock is coarse on purpose, and that is a property worth a test.
+    ///
+    /// deno_web's `performance.now()` reads a nanosecond clock, and a
+    /// sub-millisecond clock an application can read is the standard building
+    /// block of a cross-isolate timing side channel - this node runs several
+    /// tenants' isolates on one OS thread. `js/bootstrap.js` binds its own
+    /// object instead, clamped to whole milliseconds with `timeOrigin` fixed
+    /// at 0. A later change that swapped deno_web's object back in would keep
+    /// the surface test green and quietly hand that clock back, so the
+    /// clamping itself is asserted: two thousand reads, none of them
+    /// fractional.
+    #[tokio::test]
+    async fn the_clock_an_application_reads_is_clamped_to_whole_milliseconds() {
+        let code = r#"
+            export default function handler() {
+                const samples = [];
+                for (let i = 0; i < 2000; i++) samples.push(performance.now());
+                const before = Date.now();
+                const reading = performance.now();
+                const after = Date.now();
+                return new Response(JSON.stringify({
+                    timeOrigin: performance.timeOrigin,
+                    fractional: samples.filter((n) => !Number.isInteger(n)).length,
+                    neverGoesBackwards: samples[samples.length - 1] >= samples[0],
+                    // timeOrigin is 0, so timeOrigin + now() has to read as a
+                    // plain Unix timestamp or the two halves disagree.
+                    agreesWithTheWallClock: reading >= before && reading <= after,
+                    frozen: Object.isFrozen(performance),
+                    mark: typeof performance.mark,
+                    measure: typeof performance.measure,
+                }));
+            }
+        "#;
+        let body = body_of(
+            "performance_app.production",
+            code,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .await;
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(seen["timeOrigin"], 0);
+        assert_eq!(
+            seen["fractional"], 0,
+            "performance.now() returned a sub-millisecond reading; that is the timer a \
+             cross-isolate timing side channel is built on"
+        );
+        assert_eq!(seen["neverGoesBackwards"], true);
+        assert_eq!(seen["agreesWithTheWallClock"], true);
+        assert_eq!(seen["frozen"], true);
+        assert_eq!(
+            seen["mark"], "undefined",
+            "the profiler entry list is deliberately absent; nothing on this node collects it"
+        );
+        assert_eq!(seen["measure"], "undefined");
+    }
+
+    /// `navigator` says what this platform is and nothing else.
+    ///
+    /// The name exists so a library that branches on the runtime it is in can
+    /// find one - without it such a library takes its browser branch and
+    /// reaches for `document`. Everything else a browser hangs off `navigator`
+    /// would either describe the node, which is the operator's business rather
+    /// than the tenant's, or answer a plausible lie. It is frozen because an
+    /// isolate is reused: a property written onto a platform global by one
+    /// request would still be there, looking like platform surface, during the
+    /// next.
+    #[tokio::test]
+    async fn navigator_names_this_platform_and_carries_nothing_else() {
+        let code = r#"
+            export default function handler() {
+                let refused = false;
+                try {
+                    navigator.hardwareConcurrency = 64;
+                } catch (_) {
+                    refused = true;
+                }
+                return new Response(JSON.stringify({
+                    userAgent: navigator.userAgent,
+                    keys: Object.keys(navigator),
+                    frozen: Object.isFrozen(navigator),
+                    refused,
+                    afterwards: typeof navigator.hardwareConcurrency,
+                }));
+            }
+        "#;
+        let body = body_of(
+            "navigator_app.production",
+            code,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .await;
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(seen["userAgent"], "Deislet");
+        assert_eq!(
+            seen["keys"],
+            serde_json::json!(["userAgent"]),
+            "navigator grew a member; every one of them is a promise to applications"
+        );
+        assert_eq!(seen["frozen"], true);
+        assert_eq!(
+            seen["refused"], true,
+            "handler code is a module, so it is strict"
+        );
+        assert_eq!(seen["afterwards"], "undefined");
+    }
+
+    /// `EventTarget` was bound with nothing to fire through it.
+    ///
+    /// `dispatchEvent` has to be handed an object, and every handler written
+    /// for another runtime hands it an `Event` or a `CustomEvent` - so until
+    /// those two were bound the event bus this platform advertised could only
+    /// be driven with a hand-rolled `{ type }` literal. This dispatches both
+    /// through the `EventTarget` an application actually gets (the small one
+    /// in `js/runtime.js`) and reads the payload back off the listener.
+    #[tokio::test]
+    async fn an_event_dispatched_through_eventtarget_carries_its_payload() {
+        let code = r#"
+            export default function handler() {
+                const bus = new EventTarget();
+                const seen = [];
+                bus.addEventListener("ping", (e) => {
+                    seen.push({ type: e.type, detail: e.detail ?? null });
+                });
+                bus.dispatchEvent(new Event("ping"));
+                bus.dispatchEvent(new CustomEvent("ping", { detail: { n: 7 } }));
+                bus.dispatchEvent(new CustomEvent("pong", { detail: { n: 8 } }));
+                return new Response(JSON.stringify({
+                    delivered: seen.length,
+                    plainDetail: seen[0].detail,
+                    customDetail: seen[1].detail,
+                    type: seen[1].type,
+                    customIsAnEvent: new CustomEvent("x") instanceof Event,
+                }));
+            }
+        "#;
+        let body = body_of(
+            "event_app.production",
+            code,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .await;
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            seen["delivered"], 2,
+            "a listener registered for one type must not be given another type's event"
+        );
+        assert!(
+            seen["plainDetail"].is_null(),
+            "a plain Event carries no detail"
+        );
+        assert_eq!(seen["customDetail"], serde_json::json!({ "n": 7 }));
+        assert_eq!(seen["type"], "ping");
+        assert_eq!(seen["customIsAnEvent"], true);
+    }
+
     // --- outbound fetch ----------------------------------------------------
     //
     // The policy itself is unit-tested in `runtime/fetch_policy_test.rs`.
@@ -1738,6 +2621,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
         let body = body.unwrap_or_default();
         assert_eq!(status, 200, "the handler failed: {body}");
         body
@@ -1830,6 +2714,7 @@ export default function handler(context: any): Response {
         // deployment is wired to. Widening the policy must not be able to
         // widen it into deis-store by accident.
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
@@ -1996,6 +2881,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
 
         assert_eq!(status, 200);
         assert_eq!(body.as_deref(), Some("proxied body"));
@@ -2227,6 +3113,7 @@ export default function handler(context: any): Response {
                 .await
                 .unwrap();
             let (status, _headers, body) = rx.await.unwrap().unwrap();
+            let body = text(body);
             let body = body.unwrap_or_default();
             assert_eq!(status, 200, "{body}");
             seen.push(serde_json::from_str::<serde_json::Value>(&body).unwrap());
@@ -2326,6 +3213,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
         assert_eq!(status, 200);
         let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
 
@@ -2378,12 +3266,13 @@ export default function handler(context: any): Response {
                 "http://localhost/".to_string(),
                 "POST".to_string(),
                 HashMap::new(),
-                Some("héllo".to_string()),
+                sent("héllo"),
                 tx,
             )
             .await
             .unwrap();
         let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
         assert_eq!(status, 200);
         let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
         assert_eq!(seen["byteLength"], 6);
@@ -2402,6 +3291,7 @@ export default function handler(context: any): Response {
         let store = TestStore::start().await;
 
         let wiring = ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(["blob"]),
             endpoints: ServiceEndpoints {
                 store: Some(store.endpoint.clone()),
@@ -2460,6 +3350,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
         drop(store);
 
         assert_eq!(status, 200, "body: {body:?}");
@@ -3144,6 +4035,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
         assert_eq!(status, 200);
         assert_eq!(body.as_deref(), Some("started"));
 
@@ -3159,7 +4051,7 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (_status2, _, body2) = rx2.await.unwrap().unwrap();
-        let outcome = body2.unwrap_or_default();
+        let outcome = text(body2).unwrap_or_default();
         assert_eq!(
             outcome, "rejected:TimeoutError",
             "a detached fetch was not aborted when its invocation ended (outcome: {outcome}); \
@@ -3207,6 +4099,7 @@ export default function handler(context: any): Response {
                 .await
                 .unwrap_or_else(|e| panic!("request {attempt} did not complete: {e}"));
             let (status, _, body) = rx.await.unwrap().unwrap();
+            let body = text(body);
             assert_eq!(status, 200, "request {attempt}: {body:?}");
             let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
             assert_eq!(seen["ok"], true, "request {attempt}: {seen}");
@@ -3216,11 +4109,12 @@ export default function handler(context: any): Response {
 
     #[tokio::test]
     async fn a_fetch_started_in_wait_until_still_runs_after_the_response_is_sent() {
-        // The budget is disarmed when the handler's own execution ends, which
-        // is before the `waitUntil` tail runs -- the cut-off task is cancelled
-        // at the same point, so that tail has never been bounded by the
-        // timeout either. Leaving the deadline armed instead would have made
-        // every `waitUntil` fetch fail with an expired budget.
+        // The request's budget is disarmed when the handler's own execution
+        // ends, which is before the `waitUntil` tail runs. Carrying what was
+        // left of it into the tail would make every `waitUntil` fetch fail with
+        // an expired budget -- the tail is meant to outlive the response. The
+        // tail is armed with a budget of its own instead, which this call fits
+        // inside comfortably; see the tail tests at the end of this file.
         use axum::routing::get;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -3268,5 +4162,285 @@ export default function handler(context: any): Response {
             1,
             "the waitUntil call never reached the upstream"
         );
+    }
+
+    // --- the waitUntil tail, and messages, have budgets of their own --------
+
+    #[tokio::test]
+    async fn a_wait_until_tail_that_never_finishes_is_cut_off_and_the_isolate_serves_again() {
+        // The defect this closes: the clock was stopped as soon as the response
+        // was sent, and `__deis_runtime_wait_until_all()` was then run with
+        // nothing bounding it. Whatever the handler had handed to `waitUntil`
+        // ran unbounded on the runtime thread that every other application on
+        // that thread is waiting for, so one endless tail took the thread out
+        // of service for good -- behind a request that had answered 200 and
+        // looked entirely healthy.
+        //
+        // The tail here is the shape that actually happens: a background poll
+        // whose exit condition never arrives. It yields between rounds, which
+        // is what lets the cut-off task -- a `tokio::spawn`ed timer, the same
+        // mechanism the request budget uses -- get a turn. A purely
+        // synchronous loop still holds its thread; that is a property of the
+        // mechanism itself and is described on `AppRuntime::timeout_ms`.
+        let code = r#"
+            export default function handler(ctx) {
+                if (globalThis.__tail_started) {
+                    return new Response("still serving");
+                }
+                globalThis.__tail_started = true;
+                ctx.waitUntil((async () => {
+                    for (;;) {
+                        await new Promise((resolve) => setTimeout(resolve, 5));
+                    }
+                })());
+                return new Response("answered");
+            }
+        "#;
+
+        let spec = IsolateSpec {
+            limits: ExecutionLimits {
+                wait_until_timeout_ms: 500,
+                ..ExecutionLimits::default()
+            },
+            ..IsolateSpec::default()
+        };
+        let mut runtime = AppRuntime::new(
+            "wait-until-hang.production".to_string(),
+            code.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        let started = std::time::Instant::now();
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            runtime.execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            ),
+        )
+        .await
+        .expect("the invocation never returned: the tail was not cut off");
+        let elapsed = started.elapsed();
+        ran.expect("a cut-off tail must not be reported as a failed request");
+
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200, "{:?}", text(body.clone()));
+        assert_eq!(
+            text(body).as_deref(),
+            Some("answered"),
+            "the response goes out before the tail runs at all"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(500),
+            "the tail was cut off after {elapsed:?}, before the 500ms it was given"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the tail ran for {elapsed:?} against a 500ms budget"
+        );
+
+        // And the isolate is still usable. A cut-off leaves V8 marked for
+        // termination, so a tail cut off without clearing that flag would take
+        // the application off this thread just as surely as the hang did.
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the isolate must serve again after a tail was cut off");
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
+        assert_eq!(status, 200, "{body:?}");
+        assert_eq!(body.as_deref(), Some("still serving"));
+    }
+
+    #[tokio::test]
+    async fn a_tail_that_finishes_is_left_alone_even_past_the_request_budget() {
+        // The other half: the tail has to be allowed to outlive the response,
+        // which is the entire point of `waitUntil`. Measuring it against what
+        // was left of the request's budget would cut off every tail that took
+        // longer than the handler had to spare -- here, a request budget of
+        // 200ms and a tail that takes rather longer than that on purpose.
+        let code = r#"
+            export default function handler(ctx) {
+                if (globalThis.__tail_result) {
+                    return new Response(globalThis.__tail_result);
+                }
+                ctx.waitUntil((async () => {
+                    await new Promise((resolve) => setTimeout(resolve, 400));
+                    globalThis.__tail_result = "the tail finished";
+                })());
+                return new Response("answered");
+            }
+        "#;
+
+        let spec = IsolateSpec {
+            limits: ExecutionLimits {
+                timeout_ms: 200,
+                wait_until_timeout_ms: 10_000,
+                ..ExecutionLimits::default()
+            },
+            ..IsolateSpec::default()
+        };
+        let mut runtime = AppRuntime::new(
+            "wait-until-slow.production".to_string(),
+            code.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200, "{:?}", text(body.clone()));
+        assert_eq!(text(body).as_deref(), Some("answered"));
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the second request runs");
+        let (_, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(
+            text(body).as_deref(),
+            Some("the tail finished"),
+            "the tail was cut off although it was inside its own budget"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_websocket_message_that_never_finishes_is_cut_off() {
+        // A message dispatched into an isolate runs the application's own
+        // `onmessage` on the runtime thread, exactly as a request runs its
+        // handler -- and it used to run with no budget at all. A socket stays
+        // open as long as the client keeps it open and carries as many messages
+        // as the client cares to send, so that was a way into unbounded
+        // execution that needed no request at all.
+        //
+        // `_handleMessage` calls the handler synchronously, so the message
+        // *is* the loop below: there is nothing for an async handler to hold
+        // the dispatch with. That makes this the one budget test that has to
+        // run on a multi-threaded runtime -- the cut-off is delivered by a
+        // `tokio::spawn`ed timer, and a synchronous loop never gives a
+        // single-threaded runtime the turn it would need to fire. On the node
+        // each runtime thread has a `current_thread` runtime, so a loop of this
+        // shape still holds its thread there; what this test pins down is that
+        // the budget is armed, that the cut-off ends the message rather than
+        // the isolate, and that the deadline outbound calls read is given back
+        // afterwards.
+        let code = r#"
+            export default function handler() {
+                const pair = new WebSocketPair();
+                const socket = pair[1];
+                socket.accept();
+                socket.onmessage = () => {
+                    for (;;) {}
+                };
+                return new Response(socket.ws_id);
+            }
+        "#;
+
+        let spec = IsolateSpec {
+            limits: ExecutionLimits {
+                timeout_ms: 500,
+                ..ExecutionLimits::default()
+            },
+            ..IsolateSpec::default()
+        };
+        let mut runtime = AppRuntime::new(
+            "ws-message-hang.production".to_string(),
+            code.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the upgrade handler runs");
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        let ws_id = text(body).expect("the handler answers with the socket id");
+        assert_eq!(status, 200, "{ws_id}");
+
+        let started = std::time::Instant::now();
+        let dispatched = runtime
+            .dispatch_ws_message(ws_id.clone(), "hello".to_string())
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            dispatched.is_err(),
+            "a message the application never finished handling must be reported as failed, \
+             not acknowledged"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(500),
+            "the message was cut off after {elapsed:?}, before the 500ms budget it was given"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the message ran for {elapsed:?} against a 500ms budget"
+        );
+
+        // The application survives the message that was cut off. The socket
+        // does not: `dispatcher/handlers.rs` ends the bridge for this
+        // connection when a dispatch fails, which is the honest outcome for a
+        // client whose message was never handled. What must not happen is the
+        // isolate staying terminated, which would take the application off this
+        // thread for every later request as well.
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the isolate must serve again after a message was cut off");
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200, "{:?}", text(body));
     }
 }

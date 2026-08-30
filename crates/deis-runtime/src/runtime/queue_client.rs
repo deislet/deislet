@@ -2,7 +2,9 @@
 //!
 //! Talks to deis-queue, which partitions messages by tenant -- one
 //! application in one environment: the tenant travels in the `x-deis-tenant`
-//! metadata header (see [`Tenant`]), not in the proto messages, so one client
+//! metadata header, and the capability token that proves this node may act as
+//! it in `x-deis-storage-token` (both stamped by [`StorageIdentity`]), not in
+//! the proto messages, so one client
 //! speaks for exactly one environment of one application and a preview never
 //! consumes production's messages. A call without the header is refused with
 //! `PermissionDenied` rather than served from some default namespace, which is
@@ -12,7 +14,7 @@
 //! acknowledged, so a consumer that crashes mid-batch sees the same messages
 //! again once the lease lapses. Application queue handlers must be idempotent.
 
-use super::tenant::Tenant;
+use super::bindings::StorageIdentity;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -123,7 +125,7 @@ pub struct NackOutcome {
 #[derive(Clone)]
 pub struct QueueClient {
     client: Arc<Mutex<GrpcQueueClient<Channel>>>,
-    tenant: Tenant,
+    identity: StorageIdentity,
 }
 
 impl QueueClient {
@@ -131,52 +133,52 @@ impl QueueClient {
     ///
     /// Used by tests and by callers that want the failure at construction.
     /// Application bindings use [`Self::connect_lazy`] instead, so that a
-    /// queue outage cannot stop an app from loading.
+    /// queue outage cannot stop an app from loading and so that the call
+    /// carries this tenant's capability token.
     pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let tenant = Tenant::new(tenant)?;
+        let identity = StorageIdentity::new(tenant, None)?;
         let client = GrpcQueueClient::connect(endpoint.clone())
             .await
             .with_context(|| format!("connecting to the queue at {endpoint}"))?
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
-        tracing::info!(%endpoint, app_id = tenant.as_str(), "queue client connected");
+        tracing::info!(%endpoint, app_id = identity.tenant(), "queue client connected");
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
-            tenant,
+            identity,
         })
     }
 
     /// Build a client that dials on first use.
     ///
-    /// Fails only on an address that is not a URL or a value that is not a
-    /// tenant -- both configuration mistakes that no retry would fix.
-    pub fn connect_lazy(endpoint: &str, tenant: impl Into<String>) -> Result<Self> {
-        let tenant = Tenant::new(tenant)?;
+    /// Fails only on an address that is not a URL -- a configuration mistake
+    /// that no retry would fix.
+    pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
         let channel = super::bindings::unary_channel(endpoint)?;
         let client = GrpcQueueClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::debug!(
             endpoint,
-            app_id = tenant.as_str(),
+            app_id = identity.tenant(),
             "queue client prepared; it will dial on the first call"
         );
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
-            tenant,
+            identity: identity.clone(),
         })
     }
 
     /// The tenant -- application and environment -- every call of this client
     /// is charged to.
     pub fn tenant(&self) -> &str {
-        self.tenant.as_str()
+        self.identity.tenant()
     }
 
     /// Enqueue one message, returning the id deis-queue assigned it.
     pub async fn send(&self, queue_name: String, message: String) -> Result<String> {
-        let request = self.tenant.stamp(SendRequest {
+        let request = self.identity.stamp(SendRequest {
             queue_name: queue_name.clone(),
             message_body: message,
         });
@@ -218,7 +220,7 @@ impl QueueClient {
         max_messages: u32,
         lease_seconds: u32,
     ) -> Result<Vec<LeasedMessage>> {
-        let request = self.tenant.stamp(PullRequest {
+        let request = self.identity.stamp(PullRequest {
             queue_name: queue_name.to_string(),
             max_messages: max_messages.min(i32::MAX as u32) as i32,
             lease_seconds: lease_seconds.min(i32::MAX as u32) as i32,
@@ -252,7 +254,7 @@ impl QueueClient {
                 stale_leases: 0,
             });
         }
-        let request = self.tenant.stamp(AckRequest {
+        let request = self.identity.stamp(AckRequest {
             queue_name: queue_name.to_string(),
             messages: handles.into_iter().map(Into::into).collect(),
         });
@@ -287,7 +289,7 @@ impl QueueClient {
                 stale_leases: 0,
             });
         }
-        let request = self.tenant.stamp(NackRequest {
+        let request = self.identity.stamp(NackRequest {
             queue_name: queue_name.to_string(),
             messages: handles.into_iter().map(Into::into).collect(),
             delay_seconds: delay_seconds.min(i32::MAX as u32) as i32,

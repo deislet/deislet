@@ -172,6 +172,115 @@ pub const ASSIGNMENTS_COMPLETE_HEADER: &str = "x-deis-assignments-complete";
 /// describe, and so left out. Non-zero always accompanies a `complete: false`.
 pub const ASSIGNMENTS_WITHHELD_HEADER: &str = "x-deis-assignments-withheld";
 
+// ---- proving a storage caller may be the tenant it claims --------------
+//
+// The tenant header above says *which* namespace a call wants. On its own it
+// is a claim and nothing more: a caller that can reach deis-store or
+// deis-queue can name any tenant and be served. These three names are the
+// proof that goes with the claim, and they live here for the usual reason -
+// deis-control mints the token, deis-runtime carries it, and the two storage
+// services check it, so a disagreement about the header name or the digest
+// would show up as every storage call being refused.
+
+/// Header carrying the capability token that proves a caller may act as the
+/// tenant it names in [`TENANT_HEADER`].
+///
+/// Its own header rather than a field in an existing one: the tenant header
+/// is a routing key that deis-runtime fills in from the request it is
+/// serving, while this is a credential the node was handed. Keeping them
+/// apart means a log line, a trace or a proxy rule that prints the tenant
+/// does not thereby print the credential.
+pub const STORAGE_TOKEN_HEADER: &str = "x-deis-storage-token";
+
+/// Deployment-env key carrying the storage capability token for the tenant a
+/// deployment belongs to.
+///
+/// Travels the same way as [`STORE_ENDPOINT_ENV`]: the control plane puts it
+/// in the `env` map of an `ApplyDeployment`, and deis-runtime lifts it back
+/// out before the application sees its own variables - an application that
+/// could read this value could mint calls as its own tenant directly against
+/// the storage port, bypassing every check the node makes on its behalf.
+pub const STORAGE_TOKEN_ENV: &str = "DEIS_STORAGE_TOKEN";
+
+/// The capability token for one tenant, derived from the shared secret.
+///
+/// `base64(HMAC-SHA256(secret, tenant))`, standard alphabet with padding.
+/// HMAC rather than a plain hash so the secret cannot be recovered by
+/// extending a digest, and per tenant rather than one bearer token for the
+/// fleet so that a token which leaked out of one application is useless for
+/// another: it only ever matches the one tenant it was derived for.
+///
+/// The token is not a session and does not expire. Rotating the secret
+/// invalidates every token at once, which is the intended lever: change it on
+/// the control plane and on both storage services, and every node picks up
+/// new tokens with its next deployment.
+///
+/// `secret` is used as the HMAC key, so any length works, including the empty
+/// string - which is why an unconfigured secret is a *refusal* on the
+/// verifying side rather than an empty key that happens to compute.
+pub fn storage_token(secret: &str, tenant: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256>>::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(tenant.as_bytes());
+    base64_standard(&mac.finalize().into_bytes())
+}
+
+/// Whether a presented token is the expected one, in time that does not
+/// depend on how many leading bytes matched.
+///
+/// The verifying side computes the expected token with [`storage_token`] for
+/// the tenant *the request itself claims*, then compares here. Doing it in
+/// that order is what makes a leaked token useless elsewhere: there is no
+/// lookup from token to tenant, so a token only ever authorises the tenant it
+/// was derived for.
+///
+/// The timing difference is small over a LAN and costs nothing to remove;
+/// this is the whole authorisation of the storage channel.
+pub fn storage_token_matches(expected: &str, presented: &str) -> bool {
+    let (expected, presented) = (expected.as_bytes(), presented.as_bytes());
+    if expected.len() != presented.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(presented)
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// Standard base64 with padding (RFC 4648 section 4).
+///
+/// Written out here rather than pulled in as a dependency because it encodes
+/// exactly one thing - a 32 byte digest - and because every component in the
+/// platform has to produce the identical string for the same bytes. The
+/// alphabet is chosen so the result is valid in a gRPC metadata value, which
+/// admits only printable ASCII.
+fn base64_standard(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let group = ((chunk[0] as u32) << 16)
+            | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
+            | (*chunk.get(2).unwrap_or(&0) as u32);
+        out.push(ALPHABET[(group >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(group >> 12) as usize & 63] as char);
+        // The tail is padded rather than truncated: a decoder that is handed
+        // an unpadded string is entitled to reject it, and these values are
+        // compared as strings, so one side dropping the padding would refuse
+        // every call.
+        out.push(match chunk.len() {
+            1 => '=',
+            _ => ALPHABET[(group >> 6) as usize & 63] as char,
+        });
+        out.push(match chunk.len() {
+            3 => ALPHABET[group as usize & 63] as char,
+            _ => '=',
+        });
+    }
+    out
+}
+
 /// A single chunk plus its framing must never approach the ceiling, otherwise
 /// streaming would start failing on the transport instead of being bounded by
 /// our own logic. Checked at compile time so it cannot drift.
@@ -186,7 +295,7 @@ mod tests {
         // They travel in the same map as an application's own variables, so
         // anything that is not a plain uppercase identifier would be a name a
         // handler could not read back.
-        for key in [STORE_ENDPOINT_ENV, QUEUE_ENDPOINT_ENV] {
+        for key in [STORE_ENDPOINT_ENV, QUEUE_ENDPOINT_ENV, STORAGE_TOKEN_ENV] {
             assert!(
                 key.starts_with("DEIS_")
                     && key
@@ -201,9 +310,97 @@ mod tests {
     fn headers_are_lowercase() {
         // gRPC metadata keys must be lowercase; a capitalised key is rejected
         // by tonic at send time rather than ignored.
-        for h in [APP_ID_HEADER, ENVIRONMENT_HEADER, TENANT_HEADER] {
+        for h in [
+            APP_ID_HEADER,
+            ENVIRONMENT_HEADER,
+            TENANT_HEADER,
+            STORAGE_TOKEN_HEADER,
+        ] {
             assert_eq!(h, h.to_ascii_lowercase(), "{h} must be lowercase");
         }
+    }
+
+    #[test]
+    fn base64_agrees_with_rfc_4648() {
+        // The token is compared as a string across three binaries, so the
+        // encoder is pinned to the published vectors rather than to itself.
+        for (input, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_standard(input.as_bytes()), want, "for {input:?}");
+        }
+    }
+
+    #[test]
+    fn a_storage_token_is_the_published_hmac_of_the_tenant() {
+        // RFC 4231 test case 2, so the digest is checked against something
+        // outside this crate: a change of algorithm here would otherwise be
+        // invisible until the control plane and the store disagreed.
+        let expected = base64_standard(
+            &hex::decode("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+                .unwrap(),
+        );
+        assert_eq!(
+            storage_token("Jefe", "what do ya want for nothing?"),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_token_only_ever_matches_the_tenant_it_was_minted_for() {
+        // The whole point of deriving per tenant: a token that leaked out of
+        // one application authorises nothing in another, and neither does a
+        // token minted under a different secret.
+        let secret = "shared-secret";
+        let mine = storage_token(secret, &tenant_id("shop", "production"));
+        for other in [
+            tenant_id("shop", "preview-7"),
+            tenant_id("other-app", "production"),
+        ] {
+            assert!(
+                !storage_token_matches(&storage_token(secret, &other), &mine),
+                "a token for shop.production must not be accepted for {other}"
+            );
+        }
+        assert!(!storage_token_matches(
+            &storage_token("another-secret", &tenant_id("shop", "production")),
+            &mine
+        ));
+        assert!(storage_token_matches(
+            &storage_token(secret, &tenant_id("shop", "production")),
+            &mine
+        ));
+    }
+
+    #[test]
+    fn a_token_is_printable_ascii_so_it_survives_grpc_metadata() {
+        // tonic refuses a metadata value that is not visible ASCII at send
+        // time, which would turn a correct token into a call that never
+        // leaves the node.
+        let token = storage_token("s", &tenant_id("app", "production"));
+        assert!(
+            token.bytes().all(|b| b.is_ascii_graphic() || b == b' '),
+            "{token} cannot be sent as metadata"
+        );
+        // 32 digest bytes, so four characters per three bytes plus padding.
+        assert_eq!(token.len(), 44);
+    }
+
+    #[test]
+    fn comparing_tokens_is_length_safe() {
+        // A truncated or extended presentation must be refused rather than
+        // indexing past the end of either side.
+        let token = storage_token("s", "app.production");
+        assert!(!storage_token_matches(&token, ""));
+        assert!(!storage_token_matches(&token, &token[..10]));
+        assert!(!storage_token_matches(&token, &format!("{token}x")));
+        assert!(storage_token_matches("", ""));
     }
 
     #[test]

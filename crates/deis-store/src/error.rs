@@ -15,6 +15,11 @@ use tonic::{Code, Status};
 pub enum StoreError {
     /// The caller did not identify a usable tenant.
     Tenant(String),
+    /// The caller did not prove it may act as the tenant it named. Distinct
+    /// from [`StoreError::Tenant`], which is a tenant id the service cannot
+    /// use at all: this one is well formed and simply not the caller's to
+    /// name. See [`crate::auth`].
+    Unauthenticated(String),
     /// The caller sent a request the store cannot act on at all.
     InvalidArgument(String),
     /// The addressed object does not exist.
@@ -23,6 +28,16 @@ pub enum StoreError {
     Corrupt(String),
     /// The request exceeds a configured ceiling.
     TooLarge(String),
+    /// A per-server or per-tenant ceiling on how many of something may be
+    /// open at once is already reached. Nothing the caller sent is wrong and
+    /// the same request may well succeed later, which is what separates this
+    /// from [`StoreError::InvalidArgument`].
+    Exhausted(String),
+    /// A handle the caller still holds was closed by the server because it
+    /// outlived its deadline. Deliberately not [`StoreError::NotFound`]: the
+    /// caller is owed the difference between "that never existed" and "your
+    /// work was rolled back and here is why".
+    Expired(String),
     /// SQLite refused or failed.
     Sqlite(rusqlite::Error),
     /// The filesystem refused or failed - or an inbound stream broke, which
@@ -45,10 +60,13 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Tenant(m) => write!(f, "tenant: {m}"),
+            Self::Unauthenticated(m) => write!(f, "unauthenticated: {m}"),
             Self::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Self::NotFound(m) => write!(f, "not found: {m}"),
             Self::Corrupt(m) => write!(f, "corrupt: {m}"),
             Self::TooLarge(m) => write!(f, "too large: {m}"),
+            Self::Exhausted(m) => write!(f, "at capacity: {m}"),
+            Self::Expired(m) => write!(f, "expired: {m}"),
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::BlockingTask(m) => write!(f, "blocking task: {m}"),
@@ -90,16 +108,26 @@ impl From<StoreError> for Status {
     fn from(e: StoreError) -> Self {
         let code = match &e {
             StoreError::Tenant(_) => Code::PermissionDenied,
+            // Unauthenticated rather than PermissionDenied: the caller
+            // presented no usable credential, so what it should do is obtain
+            // one, not ask for wider access with the one it has.
+            StoreError::Unauthenticated(_) => Code::Unauthenticated,
             StoreError::InvalidArgument(_) => Code::InvalidArgument,
             StoreError::NotFound(_) => Code::NotFound,
             // The row exists but the bytes it points at do not: the caller
             // will never get this object back without operator repair.
             StoreError::Corrupt(_) => Code::DataLoss,
-            StoreError::TooLarge(_) => Code::ResourceExhausted,
+            // Same code as TooLarge and for the same reason - the server
+            // will not spend the resource - but a different cause: this one
+            // is a count that other callers are holding, not a size the
+            // caller chose, so the answer to it is to wait rather than to
+            // send something smaller.
+            StoreError::TooLarge(_) | StoreError::Exhausted(_) => Code::ResourceExhausted,
             // The caller ran out of time, not the store: telling it apart
             // from an internal fault is what lets a client retry instead of
-            // paging whoever owns the store.
-            StoreError::Stalled(_) => Code::DeadlineExceeded,
+            // paging whoever owns the store. `Expired` is the same story from
+            // the server's side of a handle it closed on a deadline.
+            StoreError::Stalled(_) | StoreError::Expired(_) => Code::DeadlineExceeded,
             // Nothing the caller sent is wrong and no retry helps: the
             // service is standing on data it cannot use, and an operator has
             // to move it aside first.
@@ -124,13 +152,19 @@ mod tests {
         let cases: Vec<(StoreError, Code)> = vec![
             (StoreError::Tenant("x".into()), Code::PermissionDenied),
             (
+                StoreError::Unauthenticated("x".into()),
+                Code::Unauthenticated,
+            ),
+            (
                 StoreError::InvalidArgument("x".into()),
                 Code::InvalidArgument,
             ),
             (StoreError::NotFound("x".into()), Code::NotFound),
             (StoreError::Corrupt("x".into()), Code::DataLoss),
             (StoreError::TooLarge("x".into()), Code::ResourceExhausted),
+            (StoreError::Exhausted("x".into()), Code::ResourceExhausted),
             (StoreError::Stalled("x".into()), Code::DeadlineExceeded),
+            (StoreError::Expired("x".into()), Code::DeadlineExceeded),
             (
                 StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
                 Code::Internal,

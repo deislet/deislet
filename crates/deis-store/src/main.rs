@@ -5,14 +5,19 @@
 //! deployment is. Those concepts live in deis-control and deis-runtime, which
 //! is also where the tenant id is built - here it is one opaque key.
 //!
-//! It also does not authenticate its callers: the tenant header is taken at
-//! face value, which is why it listens on loopback by default. See the crate
-//! docs for what would have to exist before it can be bound anywhere else.
+//! Who a caller is allowed to be, it does check: a call carries a capability
+//! token for the tenant it names, derived from the `auth_secret` this service
+//! and deis-control share. With no secret configured it listens on loopback
+//! and believes the header, which is the default single-box install; binding
+//! anywhere else in that state is refused at startup. See
+//! [`deis_store::auth`].
 //!
 //! Beside serving, the binary is also how a data directory is backed up and
 //! put back: `snapshot` and `restore`. Those are subcommands rather than RPCs
 //! because they write local files an operator names, and because they have to
-//! work when the service is not running - see [`deis_store::snapshot`].
+//! work when the service is not running - see [`deis_store::snapshot`]. The
+//! running service takes the same snapshots on a schedule once `snapshot_dir`
+//! is configured; see [`deis_store::backup`].
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

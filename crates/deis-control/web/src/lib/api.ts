@@ -43,8 +43,12 @@ export const api = {
 
   /**
    * The one place an HTTP request is issued.
+   *
+   * `unknown`, not `any`, when a caller does not name `T`: an unread response
+   * needs no shape, and one that is read has to be narrowed first, which is
+   * what catches a caller assuming a field that is not actually there.
    */
-  request: async <T = any>(
+  request: async <T = unknown>(
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> => {
@@ -126,28 +130,51 @@ export const api = {
   getFleet: () => api.request<{ nodes: FleetNode[] }>("/api/runtime"),
 
   // ==================== Configs API ====================
+  //
+  // Every handler here answers `{ success, ... }`, not the bare payload -
+  // `crates/deis-control/src/api/configs.rs`. A configuration value itself is
+  // whatever JSON an operator pushed, stored as `serde_json::Value` with no
+  // schema (`crates/deis-control/src/config_manager/mod.rs`), so it comes
+  // through as `ConfigValue` (`unknown`) here; narrow it with
+  // `asPlainObject` before reading a field out of it.
 
   /**
-   * List every configuration.
+   * List every configuration, for every node.
    */
-  getConfigs: () => api.request<{ [nodeId: string]: { [key: string]: any } }>("/api/configs"),
+  getConfigs: () =>
+    api.request<{
+      success: boolean;
+      data: { [nodeId: string]: NodeConfigMap };
+      count: number;
+    }>("/api/configs"),
 
   /**
    * Configuration counts.
    */
-  getConfigStats: () => api.request<ConfigStats>("/api/configs/stats"),
+  getConfigStats: () =>
+    api.request<{ success: boolean; node_count: number; total_configs: number }>(
+      "/api/configs/stats"
+    ),
 
   /**
    * Fetch one node's configuration.
    */
   getNodeConfig: (nodeId: string) =>
-    api.request<{ [key: string]: any }>(`/api/configs/${nodeId}`),
+    api.request<{ success: boolean; node_id: string; data: NodeConfigMap; count: number }>(
+      `/api/configs/${nodeId}`
+    ),
 
   /**
    * Update one node's configuration.
    */
-  updateNodeConfig: (nodeId: string, configs: { [key: string]: any }) =>
-    api.request(`/api/configs/${nodeId}`, {
+  updateNodeConfig: (nodeId: string, configs: NodeConfigMap) =>
+    api.request<{
+      success: boolean;
+      node_id: string;
+      version_timestamp: string;
+      updated_keys: string[];
+      message: string;
+    }>(`/api/configs/${nodeId}`, {
       method: "POST",
       body: JSON.stringify({ configs }),
     }),
@@ -156,43 +183,79 @@ export const api = {
    * Delete a node's whole configuration.
    */
   deleteNodeConfig: (nodeId: string) =>
-    api.request(`/api/configs/${nodeId}`, { method: "DELETE" }),
+    api.request<{ success: boolean; node_id: string; message: string }>(
+      `/api/configs/${nodeId}`,
+      { method: "DELETE" }
+    ),
 
   /**
    * Delete a single configuration key.
    */
   deleteConfigKey: (nodeId: string, key: string) =>
-    api.request(`/api/configs/${nodeId}/${key}`, { method: "DELETE" }),
+    api.request<{ success: boolean; node_id: string; config_key: string; message: string }>(
+      `/api/configs/${nodeId}/${key}`,
+      { method: "DELETE" }
+    ),
 
   /**
    * Configuration change history.
    */
   getConfigHistory: (nodeId: string, limit = 100) =>
-    api.request<ConfigHistory[]>(`/api/configs/${nodeId}/history?limit=${limit}`),
+    api.request<{ success: boolean; node_id: string; history: ConfigHistory[]; count: number }>(
+      `/api/configs/${nodeId}/history?limit=${limit}`
+    ),
 
   /**
    * Change history for one configuration key.
    */
   getConfigKeyHistory: (nodeId: string, key: string, limit = 50) =>
-    api.request<ConfigHistory[]>(`/api/configs/${nodeId}/${key}/history?limit=${limit}`),
+    api.request<{
+      success: boolean;
+      node_id: string;
+      config_key: string;
+      history: ConfigHistory[];
+      count: number;
+    }>(`/api/configs/${nodeId}/${key}/history?limit=${limit}`),
 
   /**
    * Roll a configuration back to an earlier version.
    */
   rollbackConfig: (nodeId: string, key: string, versionTimestamp: string) =>
-    api.request(`/api/configs/${nodeId}/${key}/rollback`, {
+    api.request<{
+      success: boolean;
+      node_id: string;
+      config_key: string;
+      rolled_back_to: string;
+      new_version: string;
+      value: ConfigValue;
+      message: string;
+    }>(`/api/configs/${nodeId}/${key}/rollback`, {
       method: "POST",
       body: JSON.stringify({ version_timestamp: versionTimestamp }),
     }),
 
   /**
    * Push a configuration to a node.
+   *
+   * One key hits `push_config` (`{ ..., config_key, message }`); the whole
+   * node hits `push_all_configs` (`{ ..., pushed_count, message }`) - two
+   * different handlers, so two different shapes back.
    */
   pushConfig: (nodeId: string, key?: string) => {
-    const endpoint = key
-      ? `/api/configs/push/${nodeId}/${key}`
-      : `/api/configs/push/${nodeId}`;
-    return api.request(endpoint, { method: "POST" });
+    if (key) {
+      return api.request<{
+        success: boolean;
+        node_id: string;
+        config_key: string;
+        message: string;
+      }>(`/api/configs/push/${nodeId}/${key}`, { method: "POST" });
+    }
+    return api.request<{
+      success: boolean;
+      node_id: string;
+      pushed_count: number;
+      message: string;
+    }>(`/api/configs/push/${nodeId}`, { method: "POST" });
   },
 
   // ==================== Commands API ====================
@@ -200,34 +263,49 @@ export const api = {
   /**
    * List every command.
    */
-  getCommands: () => api.request<Command[]>("/api/commands"),
+  getCommands: () =>
+    api.request<{ success: boolean; count: number; commands: Command[] }>("/api/commands"),
 
   /**
    * List the commands issued to one node.
    */
   getNodeCommands: (nodeId: string) =>
-    api.request<Command[]>(`/api/commands/node/${nodeId}`),
+    api.request<{ success: boolean; node_id: string; count: number; commands: Command[] }>(
+      `/api/commands/node/${nodeId}`
+    ),
 
   /**
-   * Fetch a command's status.
+   * Fetch a command's status - just the status string, not the command
+   * itself (`crates/deis-control/src/command/mod.rs::get_status`).
    */
   getCommandStatus: (commandId: string) =>
-    api.request<Command>(`/api/commands/status/${commandId}`),
+    api.request<{ success: boolean; command_id: string; status: string }>(
+      `/api/commands/status/${commandId}`
+    ),
 
   /**
    * Issue a command.
    */
   executeCommand: (nodeId: string, command: ExecuteCommandRequest) =>
-    api.request<{ success: boolean; command_id: string; message: string }>(
-      `/api/commands/execute/${nodeId}`,
-      { method: "POST", body: JSON.stringify(command) }
-    ),
+    api.request<{
+      success: boolean;
+      command_id: string;
+      node_id: string;
+      command_type: string;
+      message: string;
+    }>(`/api/commands/execute/${nodeId}`, {
+      method: "POST",
+      body: JSON.stringify(command),
+    }),
 
   /**
    * Cancel a command.
    */
   cancelCommand: (commandId: string) =>
-    api.request(`/api/commands/cancel/${commandId}`, { method: "POST" }),
+    api.request<{ success: boolean; command_id: string; message: string }>(
+      `/api/commands/cancel/${commandId}`,
+      { method: "POST" }
+    ),
 
   // ==================== Events API ====================
 
@@ -242,23 +320,51 @@ export const api = {
     if (params?.offset) query.set("offset", params.offset.toString());
 
     const queryString = query.toString();
-    return api.request<Event[]>(`/api/events${queryString ? `?${queryString}` : ""}`);
+    return api.request<{ success: boolean; total: number; limit: number; offset: number; events: Event[] }>(
+      `/api/events${queryString ? `?${queryString}` : ""}`
+    );
   },
 
   /**
    * Event counts.
    */
-  getEventStats: () => api.request<EventStats>("/api/events/stats"),
+  getEventStats: () =>
+    api.request<{ success: boolean; stats: EventStats }>("/api/events/stats"),
 
   // ==================== Metrics API ====================
 
   /**
    * Metrics summary.
    */
-  getMetricsSummary: () => api.request<MetricsSummary>("/api/metrics/summary"),
+  getMetricsSummary: () =>
+    api.request<{ success: boolean; metrics: MetricsSummary }>("/api/metrics/summary"),
 };
 
 // ==================== Types ====================
+
+/**
+ * A value with no fixed shape on the wire - `serde_json::Value` on the
+ * control plane. `unknown`, not `any`: a caller has to narrow it (see
+ * `asPlainObject` below) before it can read a field out of one.
+ */
+export type ConfigValue = unknown;
+
+/** One node's configuration: config key -> whatever value is stored for it. */
+export type NodeConfigMap = { [key: string]: ConfigValue };
+
+/**
+ * Narrow a `ConfigValue` (or any other `serde_json::Value`-shaped field, such
+ * as a command's payload or an event's metadata) down to the "plain JSON
+ * object" case the dashboard actually renders. Everything else a JSON value
+ * can be - a string, a number, an array, `null` - answers `undefined`, so a
+ * caller cannot accidentally run `Object.keys` over something that is not a
+ * record.
+ */
+export function asPlainObject(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
 
 /**
  * One node holding a control channel open to the control plane, as
@@ -312,24 +418,28 @@ export interface ConfigStats {
 export interface ConfigHistory {
   id: number;
   config_key: string;
-  config_value: any;
+  config_value: ConfigValue;
   version_timestamp: string;
   operation: "create" | "update" | "delete";
   created_at: string;
 }
 
+/**
+ * One command, as `/api/commands` and `/api/commands/node/:id` list it -
+ * `crates/deis-control/src/command/mod.rs::list_commands` /
+ * `list_node_commands`. Neither builds its JSON from the stored command
+ * record; both list exactly these fields, so a payload, a result, a timeout
+ * or an error message is not part of this type - nothing in this API returns
+ * them today.
+ */
 export interface Command {
   id: string;
   node_id: string;
   command_type: string;
-  command_data: any;
   status: "Pending" | "Sent" | "Acknowledged" | "Completed" | "Failed" | "Timeout";
   created_at: string;
   sent_at?: string;
   completed_at?: string;
-  timeout_at?: string;
-  response_data?: any;
-  error_message?: string;
 }
 
 /**
@@ -359,7 +469,7 @@ export interface Event {
   node_id?: string;
   severity: "Info" | "Warning" | "Error";
   message: string;
-  metadata?: any;
+  metadata?: ConfigValue;
   timestamp: string;
 }
 

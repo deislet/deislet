@@ -20,11 +20,24 @@ pub(crate) struct TestStore {
 }
 
 impl TestStore {
+    /// The single-box default: no `auth_secret`, so a call that carries only
+    /// the tenant it claims is served.
     pub(crate) async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// A store that checks the capability token, the way one is configured as
+    /// soon as it is reachable from anywhere but this machine.
+    pub(crate) async fn start_with_secret(secret: &str) -> Self {
+        Self::start_with(Some(secret)).await
+    }
+
+    async fn start_with(auth_secret: Option<&str>) -> Self {
         let data = tempfile::TempDir::new().expect("temp dir");
         let config = deis_store::config::Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: data.path().to_path_buf(),
+            auth_secret: auth_secret.map(str::to_string),
             ..deis_store::config::Config::default()
         };
         let listener = deis_store::server::bind(&config).await.expect("bind");
@@ -67,6 +80,7 @@ impl TestStore {
     /// process and nothing here speaks to it.
     pub(crate) fn wiring_for<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> ServiceWiring {
         ServiceWiring {
+            storage_token: None,
             declaration: ServiceDeclaration::from_names(names),
             endpoints: ServiceEndpoints {
                 store: Some(self.endpoint.clone()),

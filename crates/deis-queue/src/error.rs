@@ -14,6 +14,11 @@ use tonic::{Code, Status};
 pub enum QueueError {
     /// The caller did not identify a usable tenant.
     Tenant(String),
+    /// The caller did not prove it may act as the tenant it named. Distinct
+    /// from [`QueueError::Tenant`], which is a tenant id the service cannot
+    /// use at all: this one is well formed and simply not the caller's to
+    /// name. See [`crate::auth`].
+    Unauthenticated(String),
     /// The caller sent a request the queue cannot act on at all.
     InvalidArgument(String),
     /// The request exceeds a configured ceiling.
@@ -36,6 +41,7 @@ impl fmt::Display for QueueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Tenant(m) => write!(f, "tenant: {m}"),
+            Self::Unauthenticated(m) => write!(f, "unauthenticated: {m}"),
             Self::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Self::TooLarge(m) => write!(f, "too large: {m}"),
             Self::Corrupt(m) => write!(f, "corrupt: {m}"),
@@ -79,6 +85,10 @@ impl From<QueueError> for Status {
     fn from(e: QueueError) -> Self {
         let code = match &e {
             QueueError::Tenant(_) => Code::PermissionDenied,
+            // Unauthenticated rather than PermissionDenied: the caller
+            // presented no usable credential, so what it should do is obtain
+            // one, not ask for wider access with the one it has.
+            QueueError::Unauthenticated(_) => Code::Unauthenticated,
             QueueError::InvalidArgument(_) => Code::InvalidArgument,
             QueueError::TooLarge(_) => Code::ResourceExhausted,
             // The row is there but cannot be handed back: no retry by the
@@ -107,6 +117,10 @@ mod tests {
     fn status_codes_match_error_kind() {
         let cases: Vec<(QueueError, Code)> = vec![
             (QueueError::Tenant("x".into()), Code::PermissionDenied),
+            (
+                QueueError::Unauthenticated("x".into()),
+                Code::Unauthenticated,
+            ),
             (
                 QueueError::InvalidArgument("x".into()),
                 Code::InvalidArgument,

@@ -141,6 +141,6 @@ mod tests {
             .unwrap();
         let (status, _headers, body) = rx.await.unwrap().unwrap();
         assert_eq!(status, 200, "{body:?}");
-        assert_eq!(body.as_deref(), Some("ok"));
+        assert_eq!(body.as_deref(), Some(&b"ok"[..]));
     }
 }

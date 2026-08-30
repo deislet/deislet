@@ -15,6 +15,9 @@ use super::queue_ops::init_queue_extension;
 use super::tls_ops::init_tls_ops_extension;
 use super::ws_server_ops::init_ws_server_extension;
 
+#[path = "ws_client_ops.rs"]
+mod ws_client_ops;
+
 pub fn build_runtime_extensions() -> Vec<Extension> {
     vec![
         init_bootstrap_extension(),
@@ -33,6 +36,7 @@ pub fn build_runtime_extensions() -> Vec<Extension> {
         init_db_extension(),
         init_blob_extension(),
         init_ws_server_extension(),
+        ws_client_ops::init_ws_client_extension(),
         init_queue_extension(),
     ]
 }

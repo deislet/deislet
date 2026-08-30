@@ -19,10 +19,12 @@
 //! Snapshotting is a subcommand of the `deis-store` binary rather than a
 //! service method, for three reasons that all point the same way:
 //!
-//! 1. The service has no caller authentication at all (see the crate docs).
-//!    An RPC that writes a full copy of every tenant's data to a path the
-//!    caller names would hand anything that can reach the port both a way to
-//!    read every tenant's data and a way to fill the disk.
+//! 1. A caller proves it may act as *one* tenant (see [`crate::auth`]), and
+//!    on a loopback install with no secret it proves nothing at all. A
+//!    snapshot is every tenant at once, written to a path the caller names,
+//!    so as an RPC it would hand any one tenant a copy of all the others -
+//!    and a way to fill the disk. There is no credential in this design that
+//!    would authorise it.
 //! 2. A snapshot is written to local storage the operator chooses. That is a
 //!    host concern, and a host concern does not belong on a network API.
 //! 3. The moments a snapshot matters most - before an upgrade, after a crash,

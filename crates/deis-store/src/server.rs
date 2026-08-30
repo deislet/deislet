@@ -1,10 +1,22 @@
-//! Process wiring: open the three stores, register them on one gRPC server,
-//! and keep the KV sweeper running alongside.
+//! Process wiring: open the three stores, register them on one gRPC server
+//! behind one authentication check, and keep the background tasks - the KV
+//! sweeper and the scheduled snapshots - running alongside.
+//!
+//! # There is one door, not three
+//!
+//! The capability token is checked by an interceptor applied in [`guarded`],
+//! which is the only way a service is handed to the server below. A handler
+//! therefore cannot forget the check, and a fourth service registered later
+//! cannot become a fourth unguarded entrance without deleting the call. The
+//! health service is registered without it on purpose - it names no tenant
+//! and reads no data.
 
 use crate::MAX_GRPC_MESSAGE_BYTES;
+use crate::auth::StorageAuth;
+use crate::backup;
 use crate::blob::BlobService;
 use crate::config::Config;
-use crate::database::DatabaseService;
+use crate::database::{DatabaseService, TransactionLimits};
 use crate::kv::KvService;
 use crate::proto::blob::blob_store_server::BlobStoreServer;
 use crate::proto::storage::{database_server::DatabaseServer, kv_store_server::KvStoreServer};
@@ -14,7 +26,18 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
+
+/// Put a service behind the capability check.
+///
+/// Every service that can reach tenant data goes through here, so the check
+/// is spelled once and applies to all of them - including any added later,
+/// which is the point of the helper existing rather than three copies of the
+/// same wrapping.
+fn guarded<S>(service: S, auth: &StorageAuth) -> InterceptedService<S, StorageAuth> {
+    InterceptedService::new(service, auth.clone())
+}
 
 /// The three stores, opened and ready to serve.
 #[derive(Clone)]
@@ -138,8 +161,12 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
+    // Before the stores are even opened: an address this service must not
+    // serve on is a refusal to start, not a request that fails later.
+    let auth = StorageAuth::for_listener(&config, addr)?;
     let stores = Stores::open(&config).await?;
     let sweeper = spawn_kv_sweeper(stores.kv.clone(), config.kv_sweep_interval_secs);
+    let snapshots = spawn_snapshots(&config);
 
     // Health reporting is always on so the control plane has a uniform
     // liveness probe across every Deislet service. The stores are open by
@@ -156,31 +183,38 @@ pub async fn serve(
         .set_serving::<BlobStoreServer<BlobService>>()
         .await;
 
-    info_ready(&config, addr);
+    info_ready(&config, addr, &auth, stores.database.transaction_limits());
 
     let result = Server::builder()
         .add_service(health_service)
-        .add_service(
+        .add_service(guarded(
             KvStoreServer::new(stores.kv)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-        )
-        .add_service(
+            &auth,
+        ))
+        .add_service(guarded(
             DatabaseServer::new(stores.database)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-        )
-        .add_service(
+            &auth,
+        ))
+        .add_service(guarded(
             BlobStoreServer::new(stores.blob)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-        )
+            &auth,
+        ))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await;
 
-    // Nothing else keeps the sweeper alive, and leaving it running would hold
-    // a connection to a database the process is done with.
+    // Nothing else keeps these alive, and leaving them running would hold a
+    // connection to a database the process is done with - or start copying a
+    // data directory nobody is serving from any more.
     sweeper.abort();
+    if let Some(snapshots) = snapshots {
+        snapshots.abort();
+    }
 
     match result {
         Ok(()) => {
@@ -198,7 +232,34 @@ pub async fn serve(
     }
 }
 
-fn info_ready(config: &Config, addr: std::net::SocketAddr) {
+/// Start the scheduled snapshots, or say why nothing is backing this up.
+///
+/// Returns `None` when no schedule is configured, which is the default. The
+/// warning is at startup rather than on a timer because it describes a
+/// standing state, and one line an operator can find beats a line an hour
+/// that everyone learns to skip.
+fn spawn_snapshots(config: &Config) -> Option<JoinHandle<()>> {
+    match config.snapshot_schedule() {
+        Some(schedule) => Some(backup::spawn(schedule)),
+        None => {
+            tracing::warn!(
+                data_dir = %config.data_dir.display(),
+                "no scheduled snapshots are configured, so this service never copies its own \
+                 data; the data directory is the only copy of every tenant's KV, SQL and blob \
+                 data, and it cannot be backed up by copying it while the service runs. Set \
+                 snapshot_dir, or run `deis-store snapshot --out DIR` from outside"
+            );
+            None
+        }
+    }
+}
+
+fn info_ready(
+    config: &Config,
+    addr: std::net::SocketAddr,
+    auth: &StorageAuth,
+    transactions: TransactionLimits,
+) {
     tracing::info!(
         %addr,
         data_dir = %config.data_dir.display(),
@@ -207,18 +268,20 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
         upload_idle_timeout_secs = config.upload_idle_timeout_secs,
         download_idle_timeout_secs = config.download_idle_timeout_secs,
         kv_sweep_interval_secs = config.kv_sweep_interval_secs,
+        // An interactive transaction pins one of a tenant's connections until
+        // it ends, so these three are what an operator needs in front of them
+        // when a `BeginTransaction` is refused or a handler reports that its
+        // transaction was rolled back under it. They are the effective values,
+        // after the per-tenant ceiling is clamped to the pool size.
+        transaction_deadline_ms = transactions.deadline.as_millis(),
+        max_open_transactions_per_tenant = transactions.max_open_per_tenant,
+        max_open_transactions = transactions.max_open_total,
+        // Whether callers are authenticated belongs on the line an operator
+        // greps for first; the detail of what that means is logged by
+        // `StorageAuth::for_listener` just above it.
+        authenticated = auth.is_enforcing(),
         "deis-store serving KvStore, Database and BlobStore"
     );
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
-            %addr,
-            "listening off the local host with no caller authentication; the tenant header is \
-             taken at face value, so anything that can route to this port can read, overwrite and \
-             delete any tenant's KV, SQL and blob data by naming its tenant id - including one \
-             environment of an application reaching another. Bind a loopback address unless \
-             caller identity has been added first"
-        );
-    }
 }
 
 #[cfg(test)]

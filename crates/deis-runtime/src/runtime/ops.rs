@@ -2,7 +2,7 @@
 // Provides interfaces for JavaScript to call Rust
 
 use super::kv_client::KvClient;
-use deno_core::{extension, op2, OpState};
+use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -29,13 +29,20 @@ pub(super) fn service_call_failed(call: &str, error: impl std::fmt::Display) -> 
     JsErrorBox::generic(format!("{call} failed: {error}"))
 }
 
-/// KV Get operation
+/// KV Get operation.
+///
+/// Answers a `Uint8Array`, or null when the key is not there. The bytes cross
+/// as a buffer rather than as a string: a KV value is whatever the
+/// application wrote, and only the caller knows whether it is text. Deciding
+/// that here would mean every value that is not UTF-8 -- an image, a
+/// compressed frame -- could not be read back at all. `js/runtime.js` turns
+/// the bytes into whatever `kv.get(key, { type })` asked for.
 #[op2(async)]
-#[string]
+#[serde]
 async fn op_kv_get(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
-) -> Result<Option<String>, JsErrorBox> {
+) -> Result<Option<ToJsBuffer>, JsErrorBox> {
     let client_opt = {
         let state_borrow = state.borrow();
         state_borrow.try_borrow::<KvClient>().cloned()
@@ -48,6 +55,7 @@ async fn op_kv_get(
     client
         .get(key)
         .await
+        .map(|found| found.map(ToJsBuffer::from))
         .map_err(|e| service_call_failed("kv.get", e))
 }
 
@@ -76,22 +84,28 @@ pub struct KvSetOptions {
 /// A missing key is `null` on the JavaScript side, not a record with a null
 /// value: "no such key" and "a key whose metadata is null" are different
 /// answers and an app branches on them differently.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KvReadResult {
-    pub value: String,
+    /// The stored bytes, as a `Uint8Array`; see [`op_kv_get`] for why the
+    /// value is not decoded here.
+    pub value: ToJsBuffer,
     /// Exactly the string the last write stored, or null if it stored none.
     pub metadata: Option<String>,
     /// Absolute unix second this entry lapses at; null means it never does.
     pub expiration: Option<i64>,
 }
 
-/// KV Set operation
+/// KV Set operation.
+///
+/// Takes a `Uint8Array` (or any `ArrayBufferView`) straight from V8, for the
+/// same reason [`op_kv_get`] answers with one: what an application stores is
+/// bytes, and `js/runtime.js` is where a string is encoded into them.
 #[op2(async)]
 async fn op_kv_set(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
-    #[string] value: String,
+    #[buffer] value: JsBuffer,
     #[serde] options: KvSetOptions,
 ) -> Result<(), JsErrorBox> {
     if let Some(ttl) = options.ttl_seconds {
@@ -114,7 +128,7 @@ async fn op_kv_set(
     };
 
     client
-        .set_with_options(key, value, options.ttl_seconds, options.metadata)
+        .set_with_options(key, value.to_vec(), options.ttl_seconds, options.metadata)
         .await
         .map_err(|e| service_call_failed("kv.put", e))
 }
@@ -145,7 +159,7 @@ async fn op_kv_get_with_metadata(
         .await
         .map(|read| {
             read.map(|read| KvReadResult {
-                value: read.value,
+                value: read.value.into(),
                 metadata: read.metadata,
                 expiration: read.expiration,
             })
@@ -227,21 +241,83 @@ fn op_log(state: &mut OpState, #[string] level: String, #[string] message: Strin
     }
 }
 
-// Response store (used for temporary storage of application responses)
+/// Where a handler's response *metadata* -- status and headers -- waits for
+/// `AppRuntime` to pick it up, as the JSON `js/runtime.js` produced.
+///
+/// The body is not in here. See [`PendingResponseBody`].
 pub type ResponseStore = Rc<RefCell<Option<String>>>;
 
-/// Internal op: set response
+/// Internal op: set the status and headers of the response.
+///
+/// The body travels on its own channel ([`op_deis_set_response_body`]), so
+/// this JSON stays small and, more importantly, stays *text*: a response body
+/// is arbitrary bytes and JSON has no way to carry those without either
+/// corrupting them or paying to base64 every response.
 #[op2(fast)]
 fn op_set_response(state: &mut OpState, #[string] response_json: String) {
     let store = state.borrow::<ResponseStore>().clone();
     *store.borrow_mut() = Some(response_json);
 }
 
+/// The body of the request being served, waiting for the isolate to take it.
+///
+/// `AppRuntime::execute_fetch` puts the bytes here immediately before the
+/// invocation script runs and `js/runtime.js` takes them out through
+/// [`op_deis_take_request_body`] while building the `Request`. It exists
+/// because the request used to be serialised into the *source text* of that
+/// script: a body that was not valid UTF-8 could not survive that trip at all,
+/// and one that was still paid to be JSON-escaped into a program V8 then had
+/// to parse.
+///
+/// A newtype rather than a bare `Option<Vec<u8>>` because `OpState` keys on
+/// the type: sharing one with [`PendingResponseBody`] would make the two
+/// overwrite each other.
+#[derive(Debug, Default)]
+pub struct PendingRequestBody(pub Option<Vec<u8>>);
+
+/// The body the handler produced, waiting for `AppRuntime` to read it back.
+///
+/// Absent means the response carried no body -- a 204, a 304, the answer to a
+/// HEAD, a WebSocket upgrade -- which is not the same as a body of zero
+/// length, so nothing is written here unless the handler actually produced
+/// one.
+#[derive(Debug, Default)]
+pub struct PendingResponseBody(pub Option<Vec<u8>>);
+
+/// Internal op: hand the request body to JavaScript, once.
+///
+/// Answers a `Uint8Array`, or null when the request carried no body. The
+/// bytes are *taken*: a second call answers null. An isolate is reused across
+/// requests, so leaving them in place would let a later invocation -- or a
+/// second `createContext` inside this one -- resurrect a body that belongs to
+/// a request that has already been answered.
+#[op2]
+#[serde]
+fn op_deis_take_request_body(state: &mut OpState) -> Option<ToJsBuffer> {
+    state
+        .try_borrow_mut::<PendingRequestBody>()
+        .and_then(|pending| pending.0.take())
+        .map(ToJsBuffer::from)
+}
+
+/// Internal op: set the body of the response.
+///
+/// Takes a `Uint8Array` (or any `ArrayBufferView`) straight from V8, which is
+/// what `await response.arrayBuffer()` produces. Called only when the handler
+/// returned a body; see [`PendingResponseBody`].
+#[op2]
+fn op_deis_set_response_body(state: &mut OpState, #[buffer] body: JsBuffer) {
+    state.put(PendingResponseBody(Some(body.to_vec())));
+}
+
 /// When the invocation currently running in this isolate runs out of time.
 ///
 /// `None` means no invocation is in flight -- the snapshot build, module
-/// evaluation, the `waitUntil` tail that runs after a request has already been
-/// answered -- and nothing is bounded by a deadline then.
+/// evaluation, the gaps between invocations -- and nothing is bounded by a
+/// deadline then. The `waitUntil` tail that runs on after a request has been
+/// answered is an invocation of its own for this purpose: it is re-armed with
+/// its own budget (`ExecutionLimits::wait_until_timeout_ms`), because the work
+/// it carries is allowed to outlive the response but not to run forever.
 ///
 /// It lives in `OpState` rather than being passed to each op because the
 /// consumer is `js/bootstrap.js`: an outbound `fetch` asks how much of the
@@ -280,6 +356,8 @@ extension!(
         op_kv_list,
         op_log,
         op_set_response,
+        op_deis_take_request_body,
+        op_deis_set_response_body,
         op_get_env
     ],
 );

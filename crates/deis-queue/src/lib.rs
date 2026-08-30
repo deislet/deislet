@@ -69,33 +69,39 @@
 //! queue that looks healthy while every pull answers "nothing ready". See
 //! [`legacy`].
 //!
-//! # Trust model: the tenant header is believed, and that is why we listen on
-//! loopback
+//! # Trust model: a tenant is claimed in a header and proved with a token
 //!
-//! Every request names its tenant in the `x-deis-tenant` header and the
-//! service acts on it as given. There is no authorization step, because there
-//! is nothing to authorize against: the queue holds no credentials and no
-//! table of who may be whom. A client that can open a connection to this port
-//! can read and delete any tenant's messages simply by putting that tenant's
-//! id in the header - including another environment of its own application,
-//! which the tenant split otherwise keeps apart. There is no privilege
-//! escalation to find here; it is the design as it stands, and it is the same
-//! trade deis-store makes.
+//! Every request names its tenant in the `x-deis-tenant` header. On its own
+//! that is a claim: the header says which queues the caller wants, not that
+//! the caller is entitled to them. What goes with the claim is a capability
+//! token in `x-deis-storage-token`,
+//! `base64(HMAC-SHA256(auth_secret, tenant))`, minted by deis-control from a
+//! secret this service is configured with - the same secret and the same
+//! token deis-store checks. The expected token is derived from the tenant
+//! *the request itself claims*, so a token that leaked out of one application
+//! reaches nothing in another. See [`auth`].
 //!
-//! What contains it, for this round, is reachability: the default listen
-//! address is `127.0.0.1`, so the only callers are processes on the same
-//! host - which is where deis-runtime, the sole intended caller, runs. The
-//! service warns at startup when it is bound anywhere else, because that
-//! turns a local trust assumption into an open one. Exposing this service
-//! beyond the local host is not a configuration change, it is a feature that
-//! does not exist yet: it needs an identity per caller, a check that the
-//! identity is entitled to the tenant the call claims, and refusals logged
-//! with enough context to investigate.
+//! Two things follow, and they are deliberately different:
+//!
+//! * With no `auth_secret` and a **loopback** `listen`, the service runs as
+//!   it always has: the tenant header is believed, and what keeps one
+//!   tenant's messages away from an unrelated client is only that the client
+//!   cannot reach the port. This is the default single-box install, it is
+//!   supported, and the service says exactly this at startup at `warn`.
+//! * With no `auth_secret` and any **other** address, the service refuses to
+//!   start. A queue reachable from another host with nothing checking the
+//!   tenant header can be drained by anyone who can route to it, and a
+//!   drained message is one its owner never receives.
+//!
+//! The health service is answered without a token: it names no tenant and
+//! touches no message, and a liveness probe that needed a tenant credential
+//! is a probe the control plane could not make.
 
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
 pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod legacy;

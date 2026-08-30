@@ -586,15 +586,85 @@ globalThis.caches = {
   default: defaultCache
 };
 
-class NativeKV {
-  async get(key) {
-    return await DenoCore.ops.op_kv_get(key);
+// What a KV value is stored as, and what a read is asked to hand back.
+//
+// deis-store holds a value as bytes, because that is what an application
+// writes: a string, a rendered image, a compressed frame. The `type` option
+// says how to read those bytes back, and it is the same set of names
+// applications are already written against elsewhere: "text" (the default),
+// "json" and "arrayBuffer".
+//
+// "stream" is deliberately absent. It is a name in that same set, and this
+// platform has no streaming read behind it -- op_kv_get answers with the
+// whole value. Accepting it and quietly handing back text would give an
+// application something that is not a ReadableStream and fail on the first
+// method it called; refusing it says so on the spot.
+const KV_VALUE_TYPES = new Set(["text", "json", "arrayBuffer"]);
+
+function kvValueType(options) {
+  const requested =
+    typeof options === "string" ? options : options && options.type;
+  if (requested === undefined || requested === null) return "text";
+  if (KV_VALUE_TYPES.has(requested)) return requested;
+  if (requested === "stream") {
+    throw new TypeError(
+      'kv: type "stream" is not available on this platform: a KV read returns ' +
+        "the whole value, there is no streaming read behind it. Use " +
+        '"arrayBuffer" and wrap the bytes yourself if you need a stream.'
+    );
   }
-  // getWithMetadata(key) -> { value, metadata, expiration } | null
+  throw new TypeError(
+    "kv: unknown type " +
+      JSON.stringify(requested) +
+      '; expected "text", "json" or "arrayBuffer"'
+  );
+}
+
+// Turn the bytes op_kv_get answered with into what the caller asked for.
+function kvDecode(bytes, type) {
+  if (type === "arrayBuffer") {
+    // A fresh copy, so a caller cannot reach past the value into whatever
+    // else shares the buffer V8 handed over.
+    return bytes.slice().buffer;
+  }
+  const text = new TextDecoder().decode(bytes);
+  return type === "json" ? JSON.parse(text) : text;
+}
+
+// Encode what put() was handed into the bytes deis-store stores.
+function kvEncode(value) {
+  if (typeof value === "string") return new TextEncoder().encode(value);
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  throw new TypeError(
+    "kv.put: value must be a string, an ArrayBuffer or an ArrayBufferView, got " +
+      (value === null ? "null" : typeof value)
+  );
+}
+
+class NativeKV {
+  // get(key) -> the value as text, or null when the key is not there.
+  // get(key, { type }) -> the value as "text", "json" or "arrayBuffer".
+  //
+  // The type is validated before the read, so an unsupported one is refused
+  // whether or not the key exists: a call that is wrong is wrong the same way
+  // every time.
+  async get(key, options) {
+    const type = kvValueType(options);
+    const bytes = await DenoCore.ops.op_kv_get(key);
+    if (bytes === null || bytes === undefined) return null;
+    return kvDecode(bytes, type);
+  }
+  // getWithMetadata(key, options) -> { value, metadata, expiration } | null
   //
   // null means the key does not exist or has already lapsed. A key that was
   // written without metadata comes back as a record whose metadata is null:
   // "no such key" and "no metadata on this key" are different answers.
+  //
+  // `value` is read the same way get() reads it, and takes the same `type`
+  // option, so the two never disagree about what a stored value is.
   //
   // metadata is JSON-decoded, which is the exact inverse of what put() stores,
   // so an object goes in and the same object comes out. A value that does not
@@ -605,7 +675,8 @@ class NativeKV {
   //
   // expiration is the absolute unix second the entry lapses at, or null when
   // it never does.
-  async getWithMetadata(key) {
+  async getWithMetadata(key, options) {
+    const type = kvValueType(options);
     const read = await DenoCore.ops.op_kv_get_with_metadata(key);
     if (!read) return null;
     let metadata = null;
@@ -617,12 +688,16 @@ class NativeKV {
       }
     }
     return {
-      value: read.value,
+      value: kvDecode(read.value, type),
       metadata: metadata,
       expiration: read.expiration === undefined ? null : read.expiration
     };
   }
   // put(key, value, { expirationTtl, metadata })
+  //
+  // value is a string, an ArrayBuffer or an ArrayBufferView. A string is
+  // encoded as UTF-8; bytes are stored exactly as given, which is what makes
+  // this usable for anything that is not text.
   //
   // expirationTtl is a lifetime in whole seconds, counted from the moment
   // deis-store accepts the write; leave it out and the entry never lapses.
@@ -649,53 +724,222 @@ class NativeKV {
       metadata = JSON.stringify(opts.metadata);
     }
 
-    await DenoCore.ops.op_kv_set(key, value, { ttlSeconds: ttl, metadata: metadata });
+    await DenoCore.ops.op_kv_set(key, kvEncode(value), {
+      ttlSeconds: ttl,
+      metadata: metadata
+    });
   }
   async delete(key) {
     await DenoCore.ops.op_kv_delete(key);
   }
 }
 
-class NativeDB {
-  // The database ops report failure as an `error` field rather than by
-  // throwing, so a caller that did not look for it would see `undefined`
-  // rows and no reason why. Turn it into an exception, which is what the
-  // other services do and what a handler's try/catch expects.
-  #check(result, call) {
-    if (result && result.error) {
-      throw new Error("database." + call + " failed: " + result.error);
-    }
-    return result;
+// The database ops report failure as an `error` field rather than by
+// throwing, so a caller that did not look for it would see `undefined`
+// rows and no reason why. Turn it into an exception, which is what the
+// other services do and what a handler's try/catch expects.
+//
+// Whatever deis-store said is kept whole behind the call's name. A
+// transaction that died on its deadline explains itself in a full sentence,
+// including what became of the writes, and rewording that here would cost the
+// handler the only account it gets of what happened.
+function checkDbResult(result, call) {
+  if (result && result.error) {
+    throw new Error("database." + call + " failed: " + result.error);
   }
+  return result;
+}
+
+// The deadline a caller asked its transaction to have, in milliseconds.
+// Validated here so a nonsense value is refused before deis-store pins a
+// connection for it.
+function transactionTimeout(options) {
+  const asked = options === undefined || options === null ? null : options.timeoutMs;
+  if (asked === undefined || asked === null) return null;
+  const ms = Number(asked);
+  if (!Number.isFinite(ms) || Math.floor(ms) !== ms || ms <= 0) {
+    throw new TypeError(
+      "database.transaction: timeoutMs must be a whole number of milliseconds greater " +
+        "than 0, got " + String(asked)
+    );
+  }
+  return ms;
+}
+
+// The handle a transaction callback is given. `execute` and `query` are the
+// same two calls the database itself has, and take and return the same
+// things, so moving a statement into a transaction is a matter of writing
+// `tx.` in front of it.
+//
+// The difference is where they run. Every statement here goes to the one
+// connection deis-store pinned to this transaction, so a `query` sees the
+// transaction's own uncommitted writes -- the read-then-decide-then-write
+// that is the whole reason to open one.
+//
+// It stops working the moment the callback settles. That is deliberate: a
+// statement run on a spent handle could only be sent outside any transaction,
+// where it would commit on its own and look like it had succeeded.
+class NativeTransaction {
+  // Shared with the `transaction()` call that opened it, which is what marks
+  // it ended. Deliberately not a method on this object: `tx` is the
+  // application's handle, not the switch that closes it.
+  #state;
+
+  constructor(state, expiresInMs) {
+    this.#state = state;
+    // How long deis-store granted this transaction, counted from when it
+    // answered. A handler with slow work to do can look before it starts.
+    this.expiresInMs = expiresInMs;
+  }
+
+  // The handle, or an account of why there no longer is one.
+  #handle() {
+    if (this.#state.ended !== null) {
+      throw new Error(
+        "database.transaction: this transaction was already " + this.#state.ended +
+          ", so this statement cannot be part of it. Every statement has to run inside " +
+          "the callback, before it returns; a tx kept past that point is spent."
+      );
+    }
+    return this.#state.id;
+  }
+
   async execute(sql, params = []) {
-    return this.#check(
+    return checkDbResult(
+      await DenoCore.ops.op_db_execute_in_transaction(
+        this.#handle(),
+        sql,
+        JSON.stringify(params)
+      ),
+      "transaction.execute"
+    );
+  }
+
+  async query(sql, params = []) {
+    const res = checkDbResult(
+      await DenoCore.ops.op_db_query_in_transaction(
+        this.#handle(),
+        sql,
+        JSON.stringify(params)
+      ),
+      "transaction.query"
+    );
+    return res.rows;
+  }
+}
+
+class NativeDB {
+  async execute(sql, params = []) {
+    return checkDbResult(
       await DenoCore.ops.op_db_execute(sql, JSON.stringify(params)),
       "execute"
     );
   }
   async query(sql, params = []) {
-    const res = this.#check(
+    const res = checkDbResult(
       await DenoCore.ops.op_db_query(sql, JSON.stringify(params)),
       "query"
     );
     return res.rows;
   }
-  // Edge Canon's Database interface names a transaction, and this platform
-  // has no session-scoped one: deis-store serves each call on whichever
-  // pooled connection is free, so there is no place to hold an open BEGIN
-  // across the awaits inside a callback.
+  // Runs `callback` inside one interactive transaction and resolves to
+  // whatever the callback returned.
   //
-  // It used to accept the callback, never call it, and resolve. An
-  // application whose two writes were "in a transaction" therefore performed
-  // neither of them and was told nothing - the worst of the three possible
-  // answers. This one is the least bad: the work does not happen, and the
-  // caller finds out on the spot.
-  async transaction(_callback) {
-    throw new Error(
-      "database.transaction is not available on this platform: deis-store has no " +
-        "session-scoped transaction. Run the statements with database.execute(), or " +
-        "write them so each one is safe on its own."
+  //   const total = await ctx.services.database.transaction(async (tx) => {
+  //     const [row] = await tx.query("SELECT balance FROM accounts WHERE id = ?", [id]);
+  //     await tx.execute("UPDATE accounts SET balance = ? WHERE id = ?", [row.balance - 10, id]);
+  //     return row.balance - 10;
+  //   });
+  //
+  // What it guarantees. deis-store opens the transaction IMMEDIATE on a
+  // connection pinned to it, so for as long as the callback runs this
+  // transaction holds the tenant's write lock and every statement made
+  // through `tx` lands on that one connection. Reads through `tx` see this
+  // transaction's own uncommitted writes and nobody else's half-finished
+  // ones. The callback returning commits all of it; the callback throwing
+  // rolls all of it back and rethrows the error the callback raised, never
+  // one about the transaction, so a handler always sees the failure its own
+  // code produced. Either way `tx` is spent when the callback settles and
+  // using it after that throws rather than writing outside the transaction.
+  //
+  // What it does not do. `ctx.services.database` is not redirected while the
+  // callback runs. A statement run on the outer handle inside the callback
+  // goes to a different connection, is not part of this transaction, and
+  // commits on its own -- a rollback will not take it back. That is the
+  // mistake to look for first when a transaction that failed still left rows
+  // behind. Reads on the outer handle answer with the database as it was
+  // before this transaction opened; writes on it will sit and wait for the
+  // write lock this transaction is holding, and fail. Use `tx` for
+  // everything that belongs to the transaction.
+  //
+  // Deadline. An open transaction is holding one of the tenant's few
+  // connections, so deis-store gives it a hard deadline -- five seconds
+  // unless `options.timeoutMs` asks for less -- and rolls it back itself when
+  // that passes. The next call on `tx`, or the commit, then throws saying the
+  // transaction was rolled back for exceeding its deadline and that nothing
+  // it wrote was applied. Do not await anything slow between statements.
+  async transaction(callback, options) {
+    if (typeof callback !== "function") {
+      throw new TypeError(
+        "database.transaction: the statements go in a callback, as " +
+          "database.transaction(async (tx) => { ... })"
+      );
+    }
+
+    const opened = checkDbResult(
+      await DenoCore.ops.op_db_begin_transaction({
+        timeoutMs: transactionTimeout(options)
+      }),
+      "transaction"
     );
+
+    const state = { id: opened.transaction_id, ended: null };
+    const tx = new NativeTransaction(state, opened.expires_in_ms);
+
+    let value;
+    try {
+      value = await callback(tx);
+    } catch (error) {
+      state.ended = "rolled back";
+      try {
+        checkDbResult(
+          await DenoCore.ops.op_db_rollback_transaction(state.id),
+          "transaction.rollback"
+        );
+      } catch (rollbackError) {
+        // The callback's error is the one the handler can act on. This one
+        // usually only says the transaction was already over -- which is
+        // exactly the case when its deadline is what made the callback throw
+        // -- and putting it in front of the original would hide the bug the
+        // application is actually looking for.
+        console.warn(
+          "database.transaction: the rollback after the callback threw did not succeed: " +
+            rollbackError.message +
+            ". The transaction ends either way; the error the callback raised is the one " +
+            "being reported."
+        );
+      }
+      throw error;
+    }
+
+    // Marked ended before the commit is even sent: the handle is spent from
+    // here whether the commit lands or not, and a statement slipped in while
+    // this await is outstanding would not be part of the transaction.
+    state.ended = "committed";
+    try {
+      checkDbResult(
+        await DenoCore.ops.op_db_commit_transaction(state.id),
+        "transaction.commit"
+      );
+    } catch (error) {
+      // A commit that did not happen means deis-store discarded the work, not
+      // that the transaction is still open to retry. Say that, so a `tx` the
+      // callback let escape cannot go on claiming writes the database never
+      // took.
+      state.ended = "rolled back";
+      throw error;
+    }
+    return value;
   }
 }
 
@@ -806,12 +1050,20 @@ function createServiceContext() {
 // The request context: the service half above plus the request itself and
 // whatever the route matcher captured. Built on createServiceContext so a
 // service added to one path cannot go missing from the other.
+//
+// The body is not in `requestData`. That object arrives as JSON written into
+// the source text of the invocation script, and a body is arbitrary bytes: an
+// upload that was not valid UTF-8 could not survive that trip at all. It is
+// staged in the isolate's state instead and taken here, once, as a
+// Uint8Array. Null means the request carried no body, which is what a GET
+// looks like and what `new Request` wants to be told.
 function createContext(requestData) {
+  const body = DenoCore.ops.op_deis_take_request_body();
   return Object.assign(createServiceContext(), {
     request: new Request(requestData.url, {
       method: requestData.method,
       headers: requestData.headers,
-      body: requestData.body
+      body: body ?? null
     }),
     params: requestData.params || {},
   });
@@ -988,9 +1240,9 @@ globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
 
 // Response headers that belong to the connection a body arrived on rather
 // than to the body itself. See where this is used, in __deis_runtime_invoke.
-// `content-encoding` is in the list because the body is handed on as decoded
-// text: telling the client it is gzip would leave it trying to inflate a
-// string.
+// `content-encoding` is in the list because `fetch` already decoded the body
+// before the handler saw it: telling the client it is still gzip would leave
+// it trying to inflate bytes that are no longer compressed.
 const REFRAMED_HEADERS = new Set([
   "connection",
   "content-encoding",
@@ -1004,6 +1256,26 @@ const REFRAMED_HEADERS = new Set([
   "upgrade",
 ]);
 
+// Hand the answer back to `AppRuntime::execute_fetch` in two pieces: the
+// status and headers as the JSON this returns, and the body -- bytes -- as a
+// buffer through its own op.
+//
+// The body used to be a field of this object, JSON.stringify'd and parsed on
+// the Rust side as a String. That corrupted everything that is not text: the
+// shortest reverse proxy anyone writes, `return fetch(upstream)`, mangled
+// every image it passed through.
+//
+// A body-less answer -- a 204, a 304, a HEAD, a WebSocket upgrade -- calls the
+// op not at all, so the isolate reports "no body" rather than an empty one.
+function respond(status, headers, body) {
+  if (body !== null && body !== undefined) {
+    DenoCore.ops.op_deis_set_response_body(
+      typeof body === "string" ? new TextEncoder().encode(body) : body
+    );
+  }
+  return { status: status, headers: headers };
+}
+
 globalThis.__deis_runtime_invoke = async function(requestPayload) {
   try {
     let handler;
@@ -1012,7 +1284,7 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     }
     
     if (!handler) {
-      return { status: 500, headers: {}, body: "No default export handler found (Edge Canon requires 'export default function(context)')" };
+      return respond(500, {}, "No default export handler found (Edge Canon requires 'export default function(context)')");
     }
 
     const ctx = createContext(requestPayload);
@@ -1021,16 +1293,16 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     resp = await handler(ctx);
     
     if (!(resp instanceof Response)) {
-       return { status: 500, headers: {}, body: "Handler did not return a Response object" };
+       return respond(500, {}, "Handler did not return a Response object");
     }
 
     // Prepare response
     //
     // Headers that describe how a body was framed on some *other* connection
-    // are dropped. What leaves this isolate is the text below, and the node
-    // frames it again on its own connection to the client, so a Content-Length
-    // or Transfer-Encoding taken from somewhere else is a claim about a body
-    // that no longer exists. This is not hypothetical since `fetch` exists:
+    // are dropped. What leaves this isolate is the buffer read below, and the
+    // node frames it again on its own connection to the client, so a
+    // Content-Length or Transfer-Encoding taken from somewhere else is a claim
+    // about a body that no longer exists. This is not hypothetical since `fetch` exists:
     // `return fetch(upstream)` -- the shortest reverse proxy anyone writes --
     // hands back a Response still carrying the upstream's framing, and a
     // Content-Length that disagrees with the bytes actually sent is a
@@ -1049,25 +1321,22 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
         headers["X-Runtime-WebSocket-ID"] = webSocketId;
     }
 
-    // Read body
+    // Read body.
+    //
+    // arrayBuffer(), not text(): the handler's bytes go out as they are. A
+    // response with no body at all stays without one -- an upgrade, and the
+    // 204/304/HEAD answers where a zero-length body is a different thing from
+    // no body.
     let body = null;
     if (!webSocketId && resp.body) {
-        body = await resp.text();
+        body = new Uint8Array(await resp.arrayBuffer());
     }
 
-    return {
-      status: resp.status,
-      headers: headers,
-      body: body
-    };
+    return respond(resp.status, headers, body);
   } catch (e) {
     const errorText = e && e.stack ? e.stack : String(e);
     console.error("Runtime invoke error:", errorText);
-    return {
-      status: 500,
-      headers: {},
-      body: `Runtime Error: ${errorText}`
-    };
+    return respond(500, {}, `Runtime Error: ${errorText}`);
   }
 };
 

@@ -3,10 +3,12 @@
 //! The service is deliberately "dumb". It knows exactly one thing about the
 //! world outside itself: a tenant id, carried in the `x-deis-tenant` gRPC
 //! metadata header. It has no idea what a version, an environment or a
-//! deployment is, it never calls anything back, and it holds no opinion about
-//! who is allowed to be which tenant. Those decisions live in deis-control and
-//! deis-runtime; keeping them out of here is what lets storage be restarted,
-//! backed up and reasoned about on its own.
+//! deployment is, and it never calls anything back. It holds no opinion about
+//! which application owns which tenant either - only about whether the caller
+//! in front of it can prove it holds the capability for the tenant it names.
+//! Those decisions live in deis-control and deis-runtime; keeping them out of
+//! here is what lets storage be restarted, backed up and reasoned about on
+//! its own.
 //!
 //! # What a tenant is here, and what it is not
 //!
@@ -59,38 +61,50 @@
 //! alternative is a store that looks healthy while every read answers "not
 //! found". See [`legacy`].
 //!
-//! # Trust model: the tenant header is believed, and that is why we listen on
-//! loopback
+//! # Trust model: a tenant is claimed in a header and proved with a token
 //!
-//! Every request names its tenant in the `x-deis-tenant` header and the
-//! service acts on it as given. There is no authorization step, because
-//! there is nothing to authorize against: the store holds no credentials, no
-//! per-tenant keys and no table of who may be whom. So a client that can open
-//! a connection to this port can read, overwrite and delete any tenant's data
-//! simply by putting that tenant's id in the header - including another
-//! environment of its own application, which the tenant split otherwise keeps
-//! apart. There is no privilege escalation to find here; it is the design as
-//! it stands.
+//! Every request names its tenant in `x-deis-tenant`. On its own that is a
+//! claim: the header says which namespace the caller wants, and nothing in
+//! it says the caller is entitled to it. What goes with the claim is a
+//! capability token in `x-deis-storage-token`,
+//! `base64(HMAC-SHA256(auth_secret, tenant))`, minted by deis-control from a
+//! secret this service is configured with and handed to a node together with
+//! that tenant's deployment. The check derives the expected token from the
+//! tenant *the request itself claims*, so a token that leaked out of one
+//! application opens nothing for another. See [`auth`].
 //!
-//! What contains it, for this round, is reachability. The default listen
-//! address is `127.0.0.1`, so the only callers are processes on the same
-//! host - which is where deis-runtime, the sole intended caller, runs. The
-//! service warns at startup when it is bound anywhere else, because that
-//! turns a local trust assumption into an open one.
+//! Two things follow, and they are deliberately different:
 //!
-//! Exposing this service beyond the local host is therefore not a
-//! configuration change, it is a feature that does not exist yet. It needs,
-//! at a minimum: an identity per caller (mutual TLS certificate or a signed
-//! token issued by deis-control), a check that the identity is entitled to
-//! the tenant the call claims, refusals logged with enough context to
-//! investigate, and the same treatment for the health endpoint. Until that
-//! exists, an operator who widens `listen` is publishing every tenant's data
-//! to whoever can route to the port.
+//! * With no `auth_secret` and a **loopback** `listen`, the service runs as
+//!   it always has: the tenant header is believed, and what keeps one
+//!   tenant's data away from an unrelated client is only that the client
+//!   cannot reach the port. This is the default single-box install, it is
+//!   supported, and the service says exactly this at startup at `warn`.
+//! * With no `auth_secret` and any **other** address, the service refuses to
+//!   start. Reachable from another host with nothing checking the tenant
+//!   header means every tenant's data is published to that network, and an
+//!   unconfigured secret must never be able to mean that by accident.
+//!
+//! The health service is answered without a token: it names no tenant and
+//! reads no data, and a liveness probe that needed a tenant credential is a
+//! probe the control plane could not make.
+//!
+//! # Backups run themselves
+//!
+//! [`snapshot`] is how this directory is copied and put back, and
+//! [`backup`] is what runs it: set `snapshot_dir` and the service takes a
+//! snapshot on an interval, prunes past a retention count, and logs a failed
+//! snapshot at `error` because a failed snapshot means this interval has no
+//! backup at all. Leaving `snapshot_dir` unset is also supported - and also
+//! said out loud at startup, at `warn`, because then nothing is copying the
+//! only copy of every tenant's data.
 
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
 pub use deis_wire::conventions::{MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES};
 
+pub mod auth;
+pub mod backup;
 pub mod blob;
 pub mod config;
 pub mod database;

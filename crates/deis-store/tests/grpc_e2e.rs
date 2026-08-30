@@ -22,7 +22,7 @@ use deis_store::proto::storage::{
 };
 use deis_store::tenant::TENANT_HEADER;
 use deis_store::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
+use deis_wire::conventions::{APP_ID_HEADER, STORAGE_TOKEN_HEADER, storage_token, tenant_id};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::Request;
@@ -36,7 +36,20 @@ struct Harness {
 }
 
 impl Harness {
+    /// The default single-box install: loopback, no `auth_secret`, so calls
+    /// need no token. Most tests below are about storage rather than about
+    /// who may call it.
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// A server that requires a capability token, as any deployment that is
+    /// reachable off-host must.
+    async fn start_authenticated(secret: &str) -> Self {
+        Self::start_with(Some(secret.to_string())).await
+    }
+
+    async fn start_with(auth_secret: Option<String>) -> Self {
         let data = TempDir::new().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
@@ -44,6 +57,7 @@ impl Harness {
             // Small enough that the size limit is reachable in a test, large
             // enough for the multi-chunk object below.
             max_object_bytes: 8 * 1024 * 1024,
+            auth_secret,
             ..Config::default()
         };
         // Bind first, so the port is known before anything is spawned and no
@@ -109,6 +123,27 @@ fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     request
 }
 
+/// Stamp the tenant *and* the capability token minted for `token_tenant`
+/// under `secret`, the way deis-runtime will have to once a secret is
+/// configured.
+///
+/// The two tenants are separate arguments on purpose: presenting a token
+/// minted for one tenant on a call that claims another is exactly the attack
+/// the derivation is meant to defeat, and it has to be expressible here.
+fn as_tenant_with_token<T>(
+    tenant: &str,
+    secret: &str,
+    token_tenant: &str,
+    message: T,
+) -> Request<T> {
+    let mut request = as_tenant(tenant, message);
+    request.metadata_mut().insert(
+        STORAGE_TOKEN_HEADER,
+        storage_token(secret, token_tenant).parse().unwrap(),
+    );
+    request
+}
+
 #[tokio::test]
 async fn kv_round_trip_over_grpc() {
     let harness = Harness::start().await;
@@ -118,7 +153,7 @@ async fn kv_round_trip_over_grpc() {
         "app-one.production",
         SetRequest {
             key: "greeting".to_string(),
-            value: "hello".to_string(),
+            value: b"hello".to_vec(),
             ttl_seconds: None,
             metadata: None,
         },
@@ -136,7 +171,7 @@ async fn kv_round_trip_over_grpc() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(got.value.as_deref(), Some("hello"));
+    assert_eq!(got.value.as_deref(), Some(&b"hello"[..]));
 
     assert!(
         kv.has(as_tenant(
@@ -197,7 +232,7 @@ async fn kv_honours_a_lifetime_over_grpc() {
         "app-one.production",
         SetRequest {
             key: "session".to_string(),
-            value: "token".to_string(),
+            value: b"token".to_vec(),
             ttl_seconds: Some(3600),
             metadata: Some("owner=tests".to_string()),
         },
@@ -216,7 +251,7 @@ async fn kv_honours_a_lifetime_over_grpc() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(got.value.as_deref(), Some("token"));
+    assert_eq!(got.value.as_deref(), Some(&b"token"[..]));
 
     // A lifetime that cannot be honoured is refused outright, rather than
     // stored as something no reader will ever see again.
@@ -225,7 +260,7 @@ async fn kv_honours_a_lifetime_over_grpc() {
             "app-one.production",
             SetRequest {
                 key: "doomed".to_string(),
-                value: "v".to_string(),
+                value: b"v".to_vec(),
                 ttl_seconds: Some(0),
                 metadata: None,
             },
@@ -255,7 +290,7 @@ async fn kv_list_pages_by_prefix() {
             "app-one.production",
             SetRequest {
                 key: key.to_string(),
-                value: "v".to_string(),
+                value: b"v".to_vec(),
                 ttl_seconds: None,
                 metadata: None,
             },
@@ -310,7 +345,7 @@ async fn kv_metadata_can_be_read_back_by_get_and_by_list() {
         "app-one.production",
         SetRequest {
             key: "session:1".to_string(),
-            value: "token".to_string(),
+            value: b"token".to_vec(),
             ttl_seconds: Some(3600),
             metadata: Some(r#"{"user":"7"}"#.to_string()),
         },
@@ -328,7 +363,7 @@ async fn kv_metadata_can_be_read_back_by_get_and_by_list() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(got.value.as_deref(), Some("token"));
+    assert_eq!(got.value.as_deref(), Some(&b"token"[..]));
     assert_eq!(got.metadata.as_deref(), Some(r#"{"user":"7"}"#));
     let expires_at = got.expires_at.expect("a lifetime was asked for");
 
@@ -419,7 +454,7 @@ async fn a_value_larger_than_the_tonic_default_still_goes_through() {
     let harness = Harness::start().await;
     let mut kv = harness.kv().await;
     // 5 MiB: over the 4 MB tonic default, under the 16 MB Deislet ceiling.
-    let big = "a".repeat(5 * 1024 * 1024);
+    let big = vec![b'a'; 5 * 1024 * 1024];
 
     kv.set(as_tenant(
         "app-one.production",
@@ -882,7 +917,7 @@ async fn two_environments_of_one_application_share_nothing() {
             tenant,
             SetRequest {
                 key: "banner".to_string(),
-                value: value.to_string(),
+                value: value.as_bytes().to_vec(),
                 ttl_seconds: None,
                 metadata: None,
             },
@@ -901,7 +936,11 @@ async fn two_environments_of_one_application_share_nothing() {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(got.value.as_deref(), Some(expected), "{tenant} kv");
+        assert_eq!(
+            got.value.as_deref(),
+            Some(expected.as_bytes()),
+            "{tenant} kv"
+        );
     }
 
     // SQL: a table created by one environment does not exist in the other.
@@ -992,4 +1031,222 @@ async fn the_application_header_alone_does_not_identify_a_tenant() {
         .insert(APP_ID_HEADER, "app-one".parse().unwrap());
     let status = kv.get(request).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+// ---- the capability token, over a real server -------------------------
+//
+// The checks below go through the same interceptor a deployed process runs,
+// which is the point: a token check that lives only in a unit test is a token
+// check nothing applies. Every service that touches tenant data is exercised,
+// because each one is registered separately and each one could have been
+// registered without the guard.
+
+#[tokio::test]
+async fn a_signed_call_is_served_when_a_secret_is_configured() {
+    let secret = "an-operator-secret";
+    let harness = Harness::start_authenticated(secret).await;
+    let tenant = tenant_id("app-one", "production");
+    let mut kv = harness.kv().await;
+
+    kv.set(as_tenant_with_token(
+        &tenant,
+        secret,
+        &tenant,
+        SetRequest {
+            key: "greeting".to_string(),
+            value: b"hello".to_vec(),
+            ttl_seconds: None,
+            metadata: None,
+        },
+    ))
+    .await
+    .unwrap();
+
+    let got = kv
+        .get(as_tenant_with_token(
+            &tenant,
+            secret,
+            &tenant,
+            GetRequest {
+                key: "greeting".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.value, Some(b"hello".to_vec()));
+}
+
+#[tokio::test]
+async fn every_service_refuses_a_call_that_carries_no_token() {
+    // One case per service: they are registered one by one, so this is three
+    // separate pieces of evidence that the guard was applied.
+    let secret = "an-operator-secret";
+    let harness = Harness::start_authenticated(secret).await;
+    let tenant = tenant_id("app-one", "production");
+
+    let status = harness
+        .kv()
+        .await
+        .get(as_tenant(
+            &tenant,
+            GetRequest {
+                key: "greeting".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated, "KvStore");
+
+    let status = harness
+        .database()
+        .await
+        .query(as_tenant(
+            &tenant,
+            QueryRequest {
+                sql: "SELECT 1".to_string(),
+                params: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated, "Database");
+
+    let status = harness
+        .blob()
+        .await
+        .delete(as_tenant(
+            &tenant,
+            deis_store::proto::blob::DeleteRequest {
+                key: "an-object".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated, "BlobStore");
+
+    // And a streaming method, which opens its response before the handler
+    // has produced anything: the guard has to refuse it at the call rather
+    // than partway down a body the caller is already reading.
+    let status = harness
+        .blob()
+        .await
+        .get(as_tenant(
+            &tenant,
+            deis_store::proto::blob::GetRequest {
+                key: "an-object".to_string(),
+            },
+        ))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "BlobStore.Get streams, and must be refused before the first chunk"
+    );
+}
+
+#[tokio::test]
+async fn a_token_minted_for_another_tenant_opens_nothing() {
+    // The reason the token is derived from the tenant rather than issued as
+    // one fleet-wide bearer credential: a token that leaked out of one
+    // application must be useless against another, and against another
+    // environment of its own.
+    let secret = "an-operator-secret";
+    let harness = Harness::start_authenticated(secret).await;
+    let mine = tenant_id("app-one", "production");
+
+    for claimed in [
+        tenant_id("app-two", "production"),
+        tenant_id("app-one", "preview"),
+    ] {
+        let status = harness
+            .kv()
+            .await
+            .get(as_tenant_with_token(
+                &claimed,
+                secret,
+                &mine,
+                GetRequest {
+                    key: "greeting".to_string(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unauthenticated,
+            "a token for {mine} must not open {claimed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_token_from_a_different_secret_is_refused() {
+    // What a half-finished rotation looks like from the store's side.
+    let harness = Harness::start_authenticated("the-new-secret").await;
+    let tenant = tenant_id("app-one", "production");
+    let status = harness
+        .kv()
+        .await
+        .get(as_tenant_with_token(
+            &tenant,
+            "the-old-secret",
+            &tenant,
+            GetRequest {
+                key: "greeting".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn health_answers_without_a_token() {
+    // The control plane probes liveness without knowing any tenant, and the
+    // answer names none: a probe that needed a tenant credential is a probe
+    // that cannot be made.
+    let harness = Harness::start_authenticated("an-operator-secret").await;
+    let mut health = tonic_health::pb::health_client::HealthClient::new(harness.channel().await);
+    let status = health
+        .check(tonic_health::pb::HealthCheckRequest {
+            service: "deis.storage.KvStore".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        status.status,
+        tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+    );
+}
+
+#[tokio::test]
+async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
+    // The fail-closed half. An operator who widens `listen` and changes
+    // nothing else gets a process that stops with an explanation, rather than
+    // one that serves every tenant's data to that network.
+    let data = TempDir::new().unwrap();
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        data_dir: data.path().to_path_buf(),
+        ..Config::default()
+    };
+    let listener = server::bind(&config).await.unwrap();
+    // The listener is loopback, so the refusal is provoked with the address
+    // the process would actually be serving on.
+    let public = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    public.set_nonblocking(true).unwrap();
+    let public = tokio::net::TcpListener::from_std(public).unwrap();
+    drop(listener);
+
+    let error = server::serve(config, public, async {})
+        .await
+        .expect_err("a public bind with no auth_secret must not serve");
+    assert!(
+        format!("{error:#}").contains("auth_secret"),
+        "the refusal must name the missing setting: {error:#}"
+    );
 }

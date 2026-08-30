@@ -19,7 +19,9 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 /// Ensure V8 platform is initialized only once
 static V8_INIT: Once = Once::new();
 
-type FetchResult = (u16, HashMap<String, String>, Option<String>);
+/// Status, headers and body of one answered request; the same triple
+/// `super::isolate` produces. Bytes, not text -- see its definition there.
+type FetchResult = (u16, HashMap<String, String>, Option<Vec<u8>>);
 
 /// Initialize V8 platform (can only be called once per process)
 fn init_v8_platform() {
@@ -57,7 +59,7 @@ pub enum RuntimeMessage {
         url: String,
         method: String,
         headers: HashMap<String, String>,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
         response: oneshot::Sender<Result<FetchResult>>,
     },
     /// Hand a batch of queue messages to an app's queue handler
@@ -999,22 +1001,25 @@ impl RuntimePool {
             return;
         };
 
-        // Charged to the same tenant as the app's own queue client, so a
-        // preview leases only its own messages.
-        let client: Arc<dyn QueuePort> = match consumer_queue_client(tenant, endpoint) {
-            Ok(client) => Arc::new(client),
-            Err(e) => {
-                tracing::error!(
-                    app_id = tenant,
-                    endpoint,
-                    error = %e,
-                    "Cannot build a queue client for {}; none of its queues will be \
-                     consumed and their messages will pile up in deis-queue",
-                    tenant
-                );
-                return;
-            }
-        };
+        // Charged to the same tenant as the app's own queue client, and
+        // carrying the same capability token, so a preview leases only its own
+        // messages and a deis-queue that checks the token answers the poller
+        // instead of refusing it.
+        let client: Arc<dyn QueuePort> =
+            match consumer_queue_client(tenant, endpoint, wiring.storage_token.as_deref()) {
+                Ok(client) => Arc::new(client),
+                Err(e) => {
+                    tracing::error!(
+                        app_id = tenant,
+                        endpoint,
+                        error = %e,
+                        "Cannot build a queue client for {}; none of its queues will be \
+                         consumed and their messages will pile up in deis-queue",
+                        tenant
+                    );
+                    return;
+                }
+            };
 
         let mut handles = Vec::with_capacity(specs.len());
         for spec in specs {
@@ -1117,8 +1122,8 @@ impl RuntimePool {
         url: String,
         method: String,
         headers: HashMap<String, String>,
-        body: Option<String>,
-    ) -> Result<(u16, HashMap<String, String>, Option<String>)> {
+        body: Option<Vec<u8>>,
+    ) -> Result<FetchResult> {
         let (tx, rx) = oneshot::channel();
         self.dispatch(
             app_id,
@@ -1422,7 +1427,7 @@ mod tests {
         assert!(result.is_ok());
         let (status, _, body) = result.unwrap();
         assert_eq!(status, 200);
-        assert_eq!(body, Some("Hello from pool!".to_string()));
+        assert_eq!(body.as_deref(), Some(&b"Hello from pool!"[..]));
 
         // Cleanup
         let _ = pool.unload_app("test_load_exec_app").await;
@@ -1488,7 +1493,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{name} stopped serving: {e}"));
             assert_eq!(status, 200, "{name}");
-            assert_eq!(body.as_deref(), Some("ok"), "{name}");
+            assert_eq!(body.as_deref(), Some(&b"ok"[..]), "{name}");
         }
 
         assert!(
@@ -1592,7 +1597,7 @@ mod tests {
         let _ = pool.unload_app("env_wiring_app.production").await;
 
         assert_eq!(status, 200);
-        let body = body.unwrap_or_default();
+        let body = String::from_utf8(body.unwrap_or_default()).expect("the handler answers JSON");
         assert!(body.contains("LOG_LEVEL"), "{body}");
         assert!(
             !body.contains("DEIS_STORE_ENDPOINT") && !body.contains("DEIS_SERVICES"),
@@ -1681,7 +1686,7 @@ mod tests {
             .await
             .expect("the app is still serving while its replacement is built");
         assert_eq!(status, 200);
-        assert_eq!(body.as_deref(), Some("v1"));
+        assert_eq!(body.as_deref(), Some(&b"v1"[..]));
 
         let stats = pool.get_stats().await;
         assert_eq!(
@@ -1704,7 +1709,7 @@ mod tests {
             .expect("the app serves after the swap");
         assert_eq!(
             body.as_deref(),
-            Some("v2"),
+            Some(&b"v2"[..]),
             "the swap did not make the new version the one that serves"
         );
 
@@ -1747,7 +1752,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("the working version stopped serving after {error}: {e}"));
         assert_eq!(status, 200);
-        assert_eq!(body.as_deref(), Some("good"));
+        assert_eq!(body.as_deref(), Some(&b"good"[..]));
 
         // The thread the failed build reserved is back in circulation.
         assert_eq!(pool.get_stats().await.get("staging_apps"), Some(&0));

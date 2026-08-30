@@ -1,5 +1,10 @@
-//! Process wiring: open the queue, register it on one gRPC server, and keep
-//! the dead letter sweep running alongside.
+//! Process wiring: open the queue, register it on one gRPC server behind one
+//! authentication check, and keep the dead letter sweep running alongside.
+//!
+//! The capability token is checked by an interceptor applied in [`guarded`],
+//! which is the only way a service is handed to the server below, so a
+//! handler cannot forget it. The health service is registered without it on
+//! purpose - it names no tenant and touches no message.
 //!
 //! # Nothing here can be held open by a quiet client
 //!
@@ -24,6 +29,7 @@
 //! to someone else.
 
 use crate::MAX_GRPC_MESSAGE_BYTES;
+use crate::auth::QueueAuth;
 use crate::config::Config;
 use crate::proto::queue::queue_server::QueueServer;
 use crate::queue::QueueService;
@@ -34,7 +40,18 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
+
+/// Put a service behind the capability check.
+///
+/// Everything that can reach a tenant's messages goes through here, so the
+/// check is spelled once - including for any service added later, which is
+/// the point of the helper existing rather than the wrapping being written
+/// inline at the one call site there is today.
+fn guarded<S>(service: S, auth: &QueueAuth) -> InterceptedService<S, QueueAuth> {
+    InterceptedService::new(service, auth.clone())
+}
 
 /// How often the server pings an idle connection.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -157,6 +174,9 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
+    // Before the queue is even opened: an address this service must not serve
+    // on is a refusal to start, not a request that fails later.
+    let auth = QueueAuth::for_listener(&config, addr)?;
     let queue = open(&config).await?;
     let sweeper = spawn_dead_letter_sweeper(queue.clone(), config.dead_letter_sweep_interval_secs);
 
@@ -169,7 +189,7 @@ pub async fn serve(
         .set_serving::<QueueServer<QueueService>>()
         .await;
 
-    info_ready(&config, addr);
+    info_ready(&config, addr, &auth);
 
     let mut builder = Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
@@ -180,11 +200,12 @@ pub async fn serve(
 
     let result = builder
         .add_service(health_service)
-        .add_service(
+        .add_service(guarded(
             QueueServer::new(queue)
                 .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-        )
+            &auth,
+        ))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await;
 
@@ -211,7 +232,7 @@ pub async fn serve(
     }
 }
 
-fn info_ready(config: &Config, addr: std::net::SocketAddr) {
+fn info_ready(config: &Config, addr: std::net::SocketAddr, auth: &QueueAuth) {
     tracing::info!(
         %addr,
         data_dir = %config.data_dir.display(),
@@ -220,22 +241,16 @@ fn info_ready(config: &Config, addr: std::net::SocketAddr) {
         max_attempts = config.max_attempts,
         default_lease_secs = config.default_lease_secs,
         request_timeout_secs = config.request_timeout_secs,
+        // Whether callers are authenticated belongs on the line an operator
+        // greps for first; the detail of what that means is logged by
+        // `QueueAuth::for_listener` just above it.
+        authenticated = auth.is_enforcing(),
         "deis-queue serving Queue"
     );
     if config.request_timeout().is_none() {
         tracing::warn!(
             "no request timeout is configured; a request that wedges on the database will hold a \
              connection pool permit until the process is restarted"
-        );
-    }
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
-            %addr,
-            "listening off the local host with no caller authentication; the tenant header is \
-             taken at face value, so anything that can route to this port can enqueue, drain and \
-             delete any tenant's messages by naming its tenant id - including one environment of \
-             an application reaching another. Bind a loopback address unless caller identity has \
-             been added first"
         );
     }
 }

@@ -505,7 +505,7 @@ async fn secrets_reach_the_isolate_and_never_the_disk() {
         .await
         .unwrap();
     assert_eq!(status, 200);
-    let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
     assert_eq!(seen["env"]["API_KEY"], secret, "the secret never arrived");
     assert_eq!(
         seen["env"]["LOG_LEVEL"], "info",
@@ -559,7 +559,7 @@ async fn a_declared_service_gets_a_client_built_from_the_address_the_order_carri
         )
         .await
         .unwrap();
-    let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
     let outcome = seen["outcome"].as_str().unwrap();
     assert!(
         outcome.contains("failed"),
@@ -610,7 +610,7 @@ async fn an_app_that_declares_no_service_is_told_so_rather_than_given_one() {
         )
         .await
         .unwrap();
-    let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
     assert!(
         seen["outcome"]
             .as_str()
@@ -960,7 +960,7 @@ async fn secret_seen(apps: &ApplicationManager, key: &AppKey) -> String {
         )
         .await
         .expect("the app is loaded");
-    let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
     seen["env"]["API_KEY"]
         .as_str()
         .unwrap_or_default()

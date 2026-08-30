@@ -4,15 +4,34 @@
 # gRPC endpoint: KvStore, Database and BlobStore, plus the standard
 # grpc.health.v1 service.
 #
-# Loopback on purpose. deis-store has no caller authentication: it takes the
-# tenant from the `x-deis-tenant` header and serves that tenant's data, so
-# anything that can reach this port can read, overwrite and delete any
-# tenant's data by naming its id. What keeps that contained is that only
-# processes on this host can connect, and deis-runtime is one of them. Binding
-# elsewhere publishes every tenant's data to that network; the service logs a
-# warning when you do, and the warning is not the thing to silence - caller
-# identity (mutual TLS, or a token issued by deis-control) has to exist first.
+# Loopback on purpose, because the line below is commented out. With no
+# auth_secret, deis-store takes the tenant from the `x-deis-tenant` header and
+# serves that tenant's data without checking anything, so what keeps one
+# tenant's data away from an unrelated client is only that the client cannot
+# reach this port. Binding anywhere else in that state is refused at startup
+# rather than warned about: it would publish every tenant's data to that
+# network. Set auth_secret first.
 listen = "127.0.0.1:8090"
+
+# Shared secret the per-tenant capability tokens are derived from. Commented
+# out by default, which is the single-box install: deis-store and deis-runtime
+# on one host, nothing else able to reach the port. The service says so at
+# startup, at warn - that line is the whole of the trust model, and it is
+# worth reading once.
+#
+# Set it, and every call must carry `x-deis-storage-token` holding
+# base64(HMAC-SHA256(auth_secret, tenant)) for the tenant it names. A token
+# only ever opens the one tenant it was minted for, so a token that leaked out
+# of one application is useless for another - and useless for another
+# environment of the same application.
+#
+# The identical value goes in deis-queue's auth_secret and in the control
+# plane's configuration, which is what mints the tokens and hands them to
+# nodes. Changing it invalidates every token at once: change it in all three
+# places, or every storage call from every node is refused.
+#
+# Required as soon as `listen` is not a loopback address.
+# auth_secret = "put a long random string here"
 
 # Directory holding kv.sqlite, blob.sqlite, db/<tenant>.sqlite and the blob
 # content tree. Back this up: it is the only copy of every tenant's data.
@@ -59,3 +78,41 @@ upload_idle_timeout_secs = 60
 # DeadlineExceeded status rather than a clean end, so a partial body is never
 # mistaken for the whole object.
 download_idle_timeout_secs = 60
+
+# --- backups -----------------------------------------------------------
+
+# Where the service writes its own snapshots, one subdirectory per snapshot.
+#
+# Commented out by default, and then nothing ever takes one: the data
+# directory above is the only copy of every tenant's data, and it cannot be
+# backed up by copying it while the service runs, because SQLite is in WAL
+# mode and a plain copy can restore as a database missing its last commits or
+# as a corrupt one. The service warns at startup while this is unset.
+#
+# Uncomment it and the service snapshots itself on the interval below, using
+# exactly the same code as `deis-store snapshot --out DIR`. Leave it commented
+# out if a backup agent, cron or a filesystem snapshot is doing the job
+# instead - but check that one of them actually is.
+#
+# Put it on a different disk from data_dir, and copy it off this host. A
+# snapshot that shares a disk with the thing it is a copy of survives an
+# accidental `rm`, and nothing else.
+# snapshot_dir = "/var/backups/deis-store"
+
+# Seconds between scheduled snapshots. Only consulted when snapshot_dir is
+# set. A snapshot that takes longer than this delays the next one rather than
+# running two at once, so a value shorter than a snapshot takes does not pile
+# copies up - it just means the service is always snapshotting.
+#
+# Set to 0 to suspend the schedule while keeping snapshot_dir configured.
+snapshot_interval_secs = 86400
+
+# How many snapshots to keep. After each successful snapshot, everything older
+# than the newest this many is deleted; only directories written by the
+# schedule and holding a finished manifest are ever considered, so an
+# operator's own copies in the same directory are left alone.
+#
+# 0 means keep every snapshot and delete none. That is the safe reading of a
+# value typed by accident: a full disk can be recovered from, and a retention
+# rule that ate the backups cannot.
+snapshot_retention = 7

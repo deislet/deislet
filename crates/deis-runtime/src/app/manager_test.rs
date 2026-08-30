@@ -136,7 +136,7 @@ mod tests {
                 )
                 .await
                 .expect("the app is loaded");
-            body.unwrap_or_default()
+            String::from_utf8(body.unwrap_or_default()).expect("the handler answers text")
         }
         assert_eq!(answer(&manager, &production).await, "from production");
         assert_eq!(answer(&manager, &preview).await, "from preview");
@@ -184,7 +184,9 @@ mod tests {
 
         let (status, _headers, body) = result.unwrap();
         assert_eq!(status, 200);
-        assert!(body.unwrap().contains("/test/path"));
+        assert!(String::from_utf8(body.unwrap())
+            .unwrap()
+            .contains("/test/path"));
 
         // Cleanup
         let _ = manager.unload_app(&key("test4")).await;
@@ -314,7 +316,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(body, Some("42".to_string()));
+        assert_eq!(body.as_deref(), Some(&b"42"[..]));
 
         // Cleanup
         let _ = manager.unload_app(&key("kvtest")).await;
@@ -353,7 +355,7 @@ mod tests {
         assert!(result.is_ok());
         let (status, _headers, body) = result.unwrap();
         assert_eq!(status, 200);
-        assert_eq!(body, Some(r#"{"id":"42"}"#.to_string()));
+        assert_eq!(body.as_deref(), Some(&br#"{"id":"42"}"#[..]));
 
         // Cleanup
         let _ = manager.unload_app(&key("params_app")).await;

@@ -1,19 +1,24 @@
 //! Operator-facing configuration.
 //!
-//! # Why `listen` defaults to loopback
+//! # `listen` and `auth_secret` are one decision, not two
 //!
-//! deis-queue has no authorization of its own. It reads the tenant from the
-//! `x-deis-tenant` header and serves that tenant's messages; it does not
-//! check that the caller is entitled to that tenant, because there is nothing
-//! to check against - no credential, no key, no per-tenant table. Whoever can
-//! open a TCP connection to this port can drain or delete any tenant's queue
-//! by naming it.
+//! Whether a caller is authenticated at all is decided by `auth_secret`, and
+//! what happens when it is absent depends on `listen`:
 //!
-//! The containment for this round is therefore the network, not a permission
-//! check: the default address is `127.0.0.1`, so only processes on the same
-//! host can reach the service, and deis-runtime is expected to be one of
-//! them. The startup log warns when the configured address is not loopback,
-//! and the warning is not to be silenced by widening the address.
+//! * `auth_secret` set: every call must carry a capability token for the
+//!   tenant it names, wherever the service is bound. See [`crate::auth`].
+//! * No `auth_secret`, loopback `listen`: the service runs exactly as it did
+//!   before tokens existed - the tenant header is believed, and what keeps
+//!   one tenant's messages away from an unrelated client is that the client
+//!   cannot reach the port. This is the default single-box install and it is
+//!   supported; the service says so at startup, at `warn`.
+//! * No `auth_secret`, any other `listen`: the service refuses to start.
+//!   Reachable from another host with nothing checking the tenant header is
+//!   every tenant's queue published to that network, and an unconfigured
+//!   secret must not be able to mean that by accident.
+//!
+//! The value is the same one deis-store is configured with: one secret, one
+//! token per tenant, both services.
 
 use crate::queue::QueueLimits;
 use serde::Deserialize;
@@ -26,13 +31,27 @@ use std::time::Duration;
 pub struct Config {
     /// Address the gRPC server binds to.
     ///
-    /// Loopback by default on purpose: the service trusts the tenant header
-    /// it is handed and has no way to tell one caller from another, so the
-    /// only thing keeping one tenant's messages away from an unrelated
-    /// client is that the client cannot reach the port. See the module docs
-    /// before changing this.
+    /// Loopback by default, because the default install configures no
+    /// `auth_secret` and then the only thing keeping one tenant's messages
+    /// away from an unrelated client is that the client cannot reach the
+    /// port. Binding anywhere else without an `auth_secret` is refused at
+    /// startup rather than warned about; see the module docs.
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Shared secret the per-tenant capability tokens are derived from, or
+    /// `None` to run with no caller authentication at all.
+    ///
+    /// The same value must be configured on deis-store and on deis-control,
+    /// which mints `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant
+    /// and hands it to the node running that tenant. Anything that reaches
+    /// this service without a token matching the tenant it names is refused.
+    /// Rotating the value invalidates every token at once, so change it here,
+    /// on deis-store and on deis-control together.
+    ///
+    /// `None` is only permitted on a loopback bind - [`crate::auth`] has the
+    /// reasoning and the refusal.
+    #[serde(default)]
+    pub auth_secret: Option<String>,
     /// Directory holding the SQLite database.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -146,6 +165,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
+            auth_secret: None,
             data_dir: default_data_dir(),
             connections: default_connections(),
             max_body_bytes: default_max_body_bytes(),
@@ -211,6 +231,7 @@ mod tests {
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
         assert_eq!(parsed.listen, defaults.listen);
+        assert_eq!(parsed.auth_secret, defaults.auth_secret);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.connections, defaults.connections);
         assert_eq!(parsed.max_body_bytes, defaults.max_body_bytes);
@@ -238,8 +259,10 @@ mod tests {
 
     #[test]
     fn the_default_address_is_loopback() {
-        // The service trusts the tenant header, so reachability is the only
-        // thing keeping an unrelated client away from a tenant's messages.
+        // With no auth_secret - which is the default - the tenant header is
+        // believed, so reachability is the only thing keeping an unrelated
+        // client away from a tenant's messages. Anything else is refused at
+        // startup rather than served, so this default is load-bearing.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
     }
@@ -285,6 +308,15 @@ mod tests {
         // Untouched fields keep their defaults.
         assert_eq!(parsed.connections, default_connections());
         assert_eq!(parsed.max_lease_secs, default_max_lease_secs());
+    }
+
+    #[test]
+    fn the_secret_is_read_from_a_file() {
+        let parsed: Config = toml::from_str("auth_secret = \"a-shared-secret\"").unwrap();
+        assert_eq!(parsed.auth_secret.as_deref(), Some("a-shared-secret"));
+        // Unset by default, which is what makes the loopback install work
+        // with no configuration at all.
+        assert_eq!(Config::default().auth_secret, None);
     }
 
     #[test]

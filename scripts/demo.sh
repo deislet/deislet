@@ -542,7 +542,76 @@ prepare_app_source() {
     sed -i "s/data-label=\"v1\"/data-label=\"${label}\"/" "$dest/public/index.html"
   fi
 
+  add_websocket_route "$dest"
+
   echo "$dest"
+}
+
+# The route the WebSocket check talks to, derived from the handler's path in
+# the function tree the way every other route is.
+WS_ROUTE="/api/ws"
+
+# Give the staged copy a WebSocket handler if the example app does not carry
+# one.
+#
+# The check below needs an application that upgrades, and the example app has
+# no such handler today. Writing it into the staged copy keeps the check
+# self-contained instead of leaving the one hop nobody has ever exercised
+# unexercised; the moment `functions/api/ws.ts` appears in the example app's
+# own sources this stops writing anything and the app's version is what gets
+# deployed, so there is nothing here to remove by hand.
+#
+# The handler answers a binary frame with its length and its bytes in hex
+# rather than with the bytes. An application can be handed a binary frame -
+# the node base64s it across the boundary and the isolate sees an ArrayBuffer
+# - but it has no way to send one: `op_ws_server_send` takes a string and only
+# ever emits a text message. Describing the bytes is therefore the only way a
+# handler can prove which ones reached it.
+add_websocket_route() {
+  local dest=$1
+  local handler="${dest}/functions${WS_ROUTE}.ts"
+
+  if [ -f "$handler" ]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$handler")"
+  cat > "$handler" <<'TS'
+// A WebSocket echo endpoint, in the shape Edge Canon describes: make a
+// WebSocketPair, accept the server half, and answer 101 with the client half
+// attached to the Response.
+export default async function handler(context: any): Promise<Response> {
+  if (context.request.headers.get("upgrade") !== "websocket") {
+    return new Response("this path answers a WebSocket handshake\n", {
+      status: 426,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
+
+  server.addEventListener("message", (event: any) => {
+    const data = event.data;
+    // Prefixed so an answer cannot be mistaken for the frame that caused it,
+    // and so the two frame kinds are told apart by the reply itself.
+    if (typeof data === "string") {
+      server.send("text:" + data);
+      return;
+    }
+    const bytes = new Uint8Array(data);
+    let hex = "";
+    for (let i = 0; i < bytes.length; i++) {
+      hex += bytes[i].toString(16).padStart(2, "0");
+    }
+    server.send("binary:" + bytes.length + ":" + hex);
+  });
+
+  return new Response(null, { status: 101, webSocket: client });
+}
+TS
 }
 
 # `deis deploy` from a prepared source tree, with the report kept for `verify`.
@@ -1122,6 +1191,224 @@ check_route_parameter() {
   else
     fail_check "a route placeholder reaches context.params" \
       "GET /hello/world -> $(http_status "$headers") ${body}"
+  fi
+}
+
+# ----------------------------------------------------------------------
+# The WebSocket hop
+# ----------------------------------------------------------------------
+#
+# One handshake and one frame of each kind, performed by hand against
+# deis-proxy.
+#
+# Through deis-proxy rather than straight at the node on purpose. An upgrade
+# is the one exchange a reverse proxy is most likely to ruin -- it can answer
+# the 101 itself, rewrite Sec-WebSocket-Accept, buffer the frames, or hold the
+# connection only as long as it holds an ordinary response -- and this hop had
+# never been exercised with a real handshake at all.
+#
+# By hand because of the evidence. A client library invents a fresh
+# Sec-WebSocket-Key on every run and checks the answer privately, which is
+# precisely the value worth printing here. RFC 6455 section 1.3 publishes one
+# key and the answer to it, so sending that key makes the correct
+# Sec-WebSocket-Accept a constant that can be shown and compared. The nonce is
+# only a handshake nonce; nothing about the connection depends on it being
+# unpredictable.
+#
+# python3 is used the same way `start_origin` uses it -- from the standard
+# library, nothing installed -- and its absence fails the check with the
+# reason rather than skipping it.
+WS_KEY="dGhlIHNhbXBsZSBub25jZQ=="
+WS_ACCEPT="s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+# Bytes no path that mistook the frame for text could carry through intact:
+# 0x00 ends a C string, 0xff and 0xfe never occur in UTF-8 at all, and 0x80 is
+# a continuation byte with no lead byte in front of it.
+WS_BINARY_HEX="00fffe807f41"
+WS_TEXT="demo-websocket-frame"
+
+websocket_exchange() {
+  local port=$1
+  python3 - "$port" "$APP_ID" "$WS_ROUTE" "$WS_KEY" "$WS_ACCEPT" "$WS_TEXT" "$WS_BINARY_HEX" <<'PY'
+import json
+import os
+import socket
+import struct
+import sys
+
+port, app, path, key, accept_expected, text, binary_hex = sys.argv[1:8]
+payload = bytes.fromhex(binary_hex)
+report = {"ok": False}
+
+
+def read_until_headers_end(sock):
+    # One byte at a time: a buffered read would pull whatever follows the
+    # header terminator out of the socket and into a buffer this function
+    # throws away, eating the first frames of a server that starts talking
+    # straight after the 101.
+    raw = b""
+    while not raw.endswith(b"\r\n\r\n"):
+        chunk = sock.recv(1)
+        if not chunk:
+            raise EOFError("closed after %d bytes of handshake response" % len(raw))
+        raw += chunk
+        if len(raw) > 8192:
+            raise ValueError("handshake response never ended")
+    return raw.decode("latin-1")
+
+
+def recv_exact(sock, count):
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            raise EOFError("closed after %d of %d frame bytes" % (len(buf), count))
+        buf += chunk
+    return buf
+
+
+def send_frame(sock, opcode, body):
+    mask = os.urandom(4)
+    masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(body))
+    header = bytes([0x80 | opcode])
+    size = len(body)
+    if size < 126:
+        header += bytes([0x80 | size])
+    elif size < 65536:
+        header += bytes([0x80 | 126]) + struct.pack("!H", size)
+    else:
+        header += bytes([0x80 | 127]) + struct.pack("!Q", size)
+    sock.sendall(header + mask + masked)
+
+
+def read_frame(sock):
+    # Ping and pong are not the answer and are not a failure either; keep
+    # reading rather than deciding the check on frame order.
+    while True:
+        first, second = recv_exact(sock, 2)
+        opcode = first & 0x0F
+        size = second & 0x7F
+        if size == 126:
+            size = struct.unpack("!H", recv_exact(sock, 2))[0]
+        elif size == 127:
+            size = struct.unpack("!Q", recv_exact(sock, 8))[0]
+        if second & 0x80:
+            mask = recv_exact(sock, 4)
+            body = bytes(b ^ mask[i % 4] for i, b in enumerate(recv_exact(sock, size)))
+        else:
+            body = recv_exact(sock, size)
+        if opcode in (0x9, 0xA):
+            continue
+        if opcode == 0x8:
+            raise EOFError("the peer closed the connection instead of answering")
+        return opcode, body
+
+
+try:
+    sock = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
+    sock.settimeout(10)
+    request = (
+        "GET %s HTTP/1.1\r\n"
+        "Host: 127.0.0.1:%s\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "x-deis-app-id: %s\r\n"
+        "\r\n" % (path, port, key, app)
+    )
+    sock.sendall(request.encode("ascii"))
+
+    head = read_until_headers_end(sock)
+    lines = head.split("\r\n")
+    report["status_line"] = lines[0]
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+    report["accept"] = headers.get("sec-websocket-accept", "")
+    report["upgrade"] = headers.get("upgrade", "")
+    report["connection"] = headers.get("connection", "")
+    report["switched"] = (
+        report["status_line"].endswith("101 Switching Protocols")
+        and report["upgrade"].lower() == "websocket"
+        and report["connection"].lower() == "upgrade"
+        and report["accept"] == accept_expected
+    )
+
+    if report["switched"]:
+        send_frame(sock, 0x1, text.encode("utf-8"))
+        report["text_echo"] = read_frame(sock)[1].decode("utf-8", "replace")
+        send_frame(sock, 0x2, payload)
+        report["binary_echo"] = read_frame(sock)[1].decode("utf-8", "replace")
+        report["text_expected"] = "text:" + text
+        report["binary_expected"] = "binary:%d:%s" % (len(payload), binary_hex)
+        report["echoed"] = (
+            report["text_echo"] == report["text_expected"]
+            and report["binary_echo"] == report["binary_expected"]
+        )
+        # A close frame, so the node sees a closing handshake rather than a
+        # connection that vanished and logs an error about it.
+        send_frame(sock, 0x8, struct.pack("!H", 1000))
+    report["ok"] = report["switched"] and report.get("echoed", False)
+    sock.close()
+except Exception as failure:
+    report["error"] = "%s: %s" % (type(failure).__name__, failure)
+
+print(json.dumps(report))
+PY
+}
+
+# One field out of the exchange report, empty when it is not there.
+ws_field() {
+  jq -r "$2 // empty" < "$1" 2>/dev/null || true
+}
+
+check_websocket_through_proxy() {
+  local switched="a WebSocket handshake through deis-proxy switches protocols"
+  local echoed="a text frame and a binary frame survive the round trip through deis-proxy"
+  local report="${LOG_DIR}/verify-websocket.json"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$switched" "python3 is not installed, so no handshake was made"
+    fail_check "$echoed" "python3 is not installed, so no frame was sent"
+    return
+  fi
+
+  websocket_exchange "$DEIS_PROXY_PORT" \
+    > "$report" 2> "${LOG_DIR}/verify-websocket.log" || true
+
+  local error
+  error=$(ws_field "$report" '.error')
+  if [ -n "$error" ]; then
+    fail_check "$switched" "127.0.0.1:${DEIS_PROXY_PORT}${WS_ROUTE} -> ${error}"
+    fail_check "$echoed" "there was no connection to send a frame over"
+    return
+  fi
+
+  if [ "$(ws_field "$report" '.switched')" = "true" ]; then
+    pass_check "$switched" \
+      "$(ws_field "$report" '.status_line'), Upgrade: $(ws_field "$report" '.upgrade'), Connection: $(ws_field "$report" '.connection'), Sec-WebSocket-Accept: $(ws_field "$report" '.accept') -- the RFC 6455 answer to the key that was sent, so the 101 came from the node and was relayed, not invented by the proxy"
+  else
+    local hint=""
+    # The handler is written into the staged sources at `start`, so a demo
+    # started before this check existed serves a 404 here and the reason is
+    # worth saying rather than leaving to be guessed.
+    case "$(ws_field "$report" '.status_line')" in
+      *404*) hint="; ${WS_ROUTE} is not in the deployed bundle, so this demo was started before the check existed - run \`demo.sh stop\` and \`demo.sh start\` again" ;;
+    esac
+    fail_check "$switched" \
+      "got \"$(ws_field "$report" '.status_line')\" with Sec-WebSocket-Accept \"$(ws_field "$report" '.accept')\", expected \"HTTP/1.1 101 Switching Protocols\" and \"${WS_ACCEPT}\"${hint}"
+    fail_check "$echoed" "the handshake did not complete, so no frame was sent"
+    return
+  fi
+
+  if [ "$(ws_field "$report" '.echoed')" = "true" ]; then
+    pass_check "$echoed" \
+      "text \"${WS_TEXT}\" -> \"$(ws_field "$report" '.text_echo')\"; binary ${WS_BINARY_HEX} ($(( ${#WS_BINARY_HEX} / 2 )) bytes that are not valid UTF-8: 0xff and 0xfe never occur in it and 0x80 has no lead byte in front of it) -> \"$(ws_field "$report" '.binary_echo')\""
+  else
+    fail_check "$echoed" \
+      "text -> \"$(ws_field "$report" '.text_echo')\", expected \"$(ws_field "$report" '.text_expected')\"; binary -> \"$(ws_field "$report" '.binary_echo')\", expected \"$(ws_field "$report" '.binary_expected')\""
   fi
 }
 
@@ -2025,6 +2312,11 @@ verify_demo() {
   check_static_asset
   echo "-- routing --"
   check_route_parameter
+  echo "-- websockets --"
+  # Through deis-proxy, which is the only check here that goes through it.
+  # Everything else addresses the node directly, so a proxy that mangled an
+  # upgrade would have left every other check green.
+  check_websocket_through_proxy
   echo "-- the web platform --"
   # Here rather than at the end: these are about what a handler finds on
   # `globalThis`, which is the same subject as the check above, and they run

@@ -6,13 +6,15 @@
 //! whole object fits in a single gRPC message, so this client always frames
 //! uploads and always reassembles downloads.
 //!
-//! The tenant travels out of band in the `x-deis-tenant` metadata header: one
+//! The tenant travels out of band in the `x-deis-tenant` metadata header, and
+//! the capability token proving this node may act as it in
+//! `x-deis-storage-token` (see [`StorageIdentity`]): one
 //! application in one environment (see [`Tenant`]). deis-store refuses any
 //! request that arrives without it, so a client is bound to exactly one
 //! environment of one application for its whole life, and a preview cannot
 //! read or overwrite an object production stored.
 
-use super::tenant::Tenant;
+use super::bindings::StorageIdentity;
 use crate::STREAM_CHUNK_BYTES;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{stream, Stream, StreamExt};
@@ -57,7 +59,7 @@ pub const DEFAULT_MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub struct BlobClient {
     client: GrpcBlobClient<Channel>,
-    tenant: Tenant,
+    identity: StorageIdentity,
     max_object_bytes: usize,
 }
 
@@ -70,22 +72,25 @@ impl BlobClient {
     /// # Parameters
     /// - endpoint: gRPC address of deis-store, e.g. `http://127.0.0.1:8090`
     /// - tenant: the `<app>.<environment>` every call of this client is
-    ///   charged to; see [`Tenant`]
+    ///   charged to; see [`StorageIdentity`]
+    ///
+    /// Carries no capability token, so it can only speak to a deis-store that
+    /// has no `auth_secret`; application bindings use [`Self::connect_lazy`].
     pub async fn connect(endpoint: impl Into<String>, tenant: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
-        let tenant = Tenant::new(tenant)?;
+        let identity = StorageIdentity::new(tenant, None)?;
 
-        tracing::info!(%endpoint, app_id = tenant.as_str(), "connecting to blob store");
+        tracing::info!(%endpoint, app_id = identity.tenant(), "connecting to blob store");
         let client = GrpcBlobClient::connect(endpoint.clone())
             .await
             .with_context(|| format!("connecting to blob store at {endpoint}"))?
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
-        tracing::info!(%endpoint, app_id = tenant.as_str(), "blob store client connected");
+        tracing::info!(%endpoint, app_id = identity.tenant(), "blob store client connected");
 
         Ok(Self {
             client,
-            tenant,
+            identity,
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
         })
     }
@@ -98,20 +103,19 @@ impl BlobClient {
     /// a blob transfer is a stream whose honest duration depends on the size
     /// of the object, so a fixed deadline would cut off large-but-healthy
     /// downloads. [`DEFAULT_MAX_OBJECT_BYTES`] bounds the cost instead.
-    pub fn connect_lazy(endpoint: &str, tenant: impl Into<String>) -> Result<Self> {
-        let tenant = Tenant::new(tenant)?;
+    pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
         let channel = super::bindings::streaming_channel(endpoint)?;
         let client = GrpcBlobClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
         tracing::debug!(
             endpoint,
-            app_id = tenant.as_str(),
+            app_id = identity.tenant(),
             "blob client prepared; it will dial on the first call"
         );
         Ok(Self {
             client,
-            tenant,
+            identity: identity.clone(),
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
         })
     }
@@ -128,7 +132,7 @@ impl BlobClient {
     /// The tenant -- application and environment -- every call of this client
     /// is charged to.
     pub fn tenant(&self) -> &str {
-        self.tenant.as_str()
+        self.identity.tenant()
     }
 
     /// Fetch an object whole. `Ok(None)` means no such key.
@@ -137,7 +141,7 @@ impl BlobClient {
         let mut client = self.client.clone();
 
         let inbound = match client
-            .get(self.tenant.stamp(GetRequest { key: key.clone() }))
+            .get(self.identity.stamp(GetRequest { key: key.clone() }))
             .await
         {
             Ok(response) => response.into_inner(),
@@ -192,7 +196,7 @@ impl BlobClient {
 
         let mut client = self.client.clone();
         let response = client
-            .put(self.tenant.stamp(put_messages(&key, content_type, data)))
+            .put(self.identity.stamp(put_messages(&key, content_type, data)))
             .await
             .map_err(|status| {
                 tracing::warn!(
@@ -236,7 +240,7 @@ impl BlobClient {
         tracing::debug!(app_id = self.tenant(), %key, "blob delete");
         let mut client = self.client.clone();
         let response = client
-            .delete(self.tenant.stamp(DeleteRequest { key: key.clone() }))
+            .delete(self.identity.stamp(DeleteRequest { key: key.clone() }))
             .await?
             .into_inner();
 

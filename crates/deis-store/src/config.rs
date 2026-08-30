@@ -1,27 +1,31 @@
 //! Operator-facing configuration.
 //!
-//! # Why `listen` defaults to loopback
+//! # `listen` and `auth_secret` are one decision, not two
 //!
-//! deis-store has no authorization of its own. It reads the tenant from the
-//! `x-deis-tenant` header and serves that tenant's data; it does not check
-//! that the caller is entitled to that tenant, because there is nothing to
-//! check against - no credential, no key, no per-tenant table. Whoever can
-//! open a TCP connection to this port can read and delete any tenant's data
-//! by naming it.
+//! Whether a caller is authenticated at all is decided by `auth_secret`, and
+//! what happens when it is absent depends on `listen`:
 //!
-//! The containment for this round is therefore the network, not a
-//! permission check: the default address is `127.0.0.1`, so only processes
-//! on the same host can reach the service, and deis-runtime is expected to
-//! be one of them. That is a deliberate, documented choice rather than an
-//! oversight - see the crate docs for the trust model in full.
+//! * `auth_secret` set: every call must carry a capability token for the
+//!   tenant it names, wherever the service is bound. See [`crate::auth`].
+//! * No `auth_secret`, loopback `listen`: the service runs exactly as it did
+//!   before tokens existed - the tenant header is believed, and what keeps
+//!   one tenant's data away from an unrelated client is that the client
+//!   cannot reach the port. This is the default single-box install and it is
+//!   supported; the service says so at startup, at `warn`.
+//! * No `auth_secret`, any other `listen`: the service refuses to start.
+//!   Reachable from another host with nothing checking the tenant header is
+//!   every tenant's data published to that network, and an unconfigured
+//!   secret must not be able to mean that by accident.
 //!
-//! Binding anything other than a loopback address publishes an unauthenticated
-//! store to that network. Before doing it, the service needs a real caller
-//! identity: mutual TLS or a signed token per node, checked against the
-//! tenant the call claims, plus an audit trail of refusals. The startup log
-//! warns when the configured address is not loopback, and the warning is
-//! not to be silenced by widening the address.
+//! # `snapshot_dir` is the difference between having backups and not
+//!
+//! The data directory is the only copy of every tenant's data and cannot be
+//! backed up by copying it (WAL; see [`crate::snapshot`]). Setting
+//! `snapshot_dir` starts the scheduled snapshots in [`crate::backup`]; leaving
+//! it unset means nothing ever takes one, which the service also says at
+//! startup, at `warn`.
 
+use crate::backup::SnapshotSchedule;
 use crate::blob::BlobLimits;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -33,13 +37,27 @@ use std::time::Duration;
 pub struct Config {
     /// Address the gRPC server binds to.
     ///
-    /// Loopback by default on purpose: the service trusts the tenant header
-    /// it is handed and has no way to tell one caller from another, so the
-    /// only thing keeping one tenant's data away from an unrelated client is
-    /// that the client cannot reach the port. See the module docs before
-    /// changing this.
+    /// Loopback by default, because the default install configures no
+    /// `auth_secret` and then the only thing keeping one tenant's data away
+    /// from an unrelated client is that the client cannot reach the port.
+    /// Binding anywhere else without an `auth_secret` is refused at startup
+    /// rather than warned about; see the module docs.
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Shared secret the per-tenant capability tokens are derived from, or
+    /// `None` to run with no caller authentication at all.
+    ///
+    /// The same value must be configured on deis-control, which mints
+    /// `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant and hands
+    /// it to the node running that tenant. Anything that reaches this service
+    /// without a token matching the tenant it names is refused. Rotating the
+    /// value invalidates every token at once, so change it here, on
+    /// deis-queue and on deis-control together.
+    ///
+    /// `None` is only permitted on a loopback bind - [`crate::auth`] has the
+    /// reasoning and the refusal.
+    #[serde(default)]
+    pub auth_secret: Option<String>,
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -74,6 +92,27 @@ pub struct Config {
     /// other direction.
     #[serde(default = "default_download_idle_timeout_secs")]
     pub download_idle_timeout_secs: u64,
+    /// Directory scheduled snapshots are written into, one subdirectory per
+    /// snapshot. Unset means no snapshot is ever taken by the service, which
+    /// is the default and which the service warns about at startup: the data
+    /// directory is then the only copy of every tenant's data.
+    #[serde(default)]
+    pub snapshot_dir: Option<PathBuf>,
+    /// Seconds between scheduled snapshots. Only consulted when
+    /// `snapshot_dir` is set; zero turns the schedule off while leaving the
+    /// directory configured, which is how a snapshot run is suspended without
+    /// losing the setting.
+    #[serde(default = "default_snapshot_interval_secs")]
+    pub snapshot_interval_secs: u64,
+    /// How many snapshots to keep. Once a new one is written, everything
+    /// older than the newest `snapshot_retention` is deleted.
+    ///
+    /// Zero means keep every snapshot and delete none. That is deliberately
+    /// the *safe* reading of a value an operator may have typed by accident:
+    /// a full disk is recoverable, and a retention rule that destroyed the
+    /// backups is not.
+    #[serde(default = "default_snapshot_retention")]
+    pub snapshot_retention: usize,
 }
 
 fn default_listen() -> String {
@@ -113,6 +152,19 @@ fn default_download_idle_timeout_secs() -> u64 {
     60
 }
 
+/// Daily. Small enough that a lost day is the worst case, large enough that
+/// the copy is not competing with the service for disk all the time. Only
+/// used once `snapshot_dir` names somewhere to write.
+fn default_snapshot_interval_secs() -> u64 {
+    86_400
+}
+
+/// A week of daily snapshots: long enough that damage noticed on a Monday can
+/// still be restored from before the weekend.
+fn default_snapshot_retention() -> usize {
+    7
+}
+
 /// A configured number of seconds, or `None` for the zero that means "no
 /// bound at all".
 fn optional_seconds(secs: u64) -> Option<Duration> {
@@ -133,6 +185,10 @@ impl Default for Config {
             max_object_bytes: default_max_object_bytes(),
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
+            auth_secret: None,
+            snapshot_dir: None,
+            snapshot_interval_secs: default_snapshot_interval_secs(),
+            snapshot_retention: default_snapshot_retention(),
         }
     }
 }
@@ -148,6 +204,25 @@ impl Config {
             upload_idle_timeout: optional_seconds(self.upload_idle_timeout_secs),
             download_idle_timeout: optional_seconds(self.download_idle_timeout_secs),
         }
+    }
+
+    /// What the scheduled snapshot task should do, or `None` when the
+    /// operator has configured no destination or turned the interval off.
+    ///
+    /// Returning `None` rather than a disabled schedule keeps the "is anyone
+    /// backing this up" question answerable in one place, which is also where
+    /// the startup warning is decided.
+    pub fn snapshot_schedule(&self) -> Option<SnapshotSchedule> {
+        let directory = self.snapshot_dir.clone()?;
+        if self.snapshot_interval_secs == 0 {
+            return None;
+        }
+        Some(SnapshotSchedule {
+            data_dir: self.data_dir.clone(),
+            directory,
+            interval: Duration::from_secs(self.snapshot_interval_secs),
+            retention: self.snapshot_retention,
+        })
     }
 
     /// Load from `path`. A missing file is not an error: the service is
@@ -168,10 +243,22 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn assert_matches_defaults(parsed: &Config) {
+        let defaults = Config::default();
+        assert_eq!(parsed.auth_secret, defaults.auth_secret);
+        assert_eq!(parsed.snapshot_dir, defaults.snapshot_dir);
+        assert_eq!(
+            parsed.snapshot_interval_secs,
+            defaults.snapshot_interval_secs
+        );
+        assert_eq!(parsed.snapshot_retention, defaults.snapshot_retention);
+    }
+
     #[test]
     fn an_empty_file_yields_the_defaults() {
         let parsed: Config = toml::from_str("").unwrap();
         let defaults = Config::default();
+        assert_matches_defaults(&parsed);
         assert_eq!(parsed.listen, defaults.listen);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.shared_connections, defaults.shared_connections);
@@ -193,8 +280,10 @@ mod tests {
 
     #[test]
     fn the_default_address_is_loopback() {
-        // The service trusts the tenant header, so reachability is the only
-        // thing keeping an unrelated client away from a tenant's data.
+        // With no auth_secret - which is the default - the tenant header is
+        // believed, so reachability is the only thing keeping an unrelated
+        // client away from a tenant's data. Anything else is refused at
+        // startup rather than served, so this default is load-bearing.
         let addr: std::net::SocketAddr = default_listen().parse().unwrap();
         assert!(addr.ip().is_loopback(), "{addr} is reachable off-host");
     }
@@ -256,6 +345,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{} is not readable: {e}", path.display()));
         let parsed: Config = toml::from_str(&text).expect("the example must parse");
         let defaults = Config::default();
+        assert_matches_defaults(&parsed);
         assert_eq!(parsed.listen, defaults.listen);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.shared_connections, defaults.shared_connections);
@@ -273,6 +363,55 @@ mod tests {
             parsed.download_idle_timeout_secs,
             defaults.download_idle_timeout_secs
         );
+    }
+
+    #[test]
+    fn nothing_is_backed_up_unless_a_destination_is_named() {
+        // The default. Whoever runs this has to be told, which is why
+        // `deis_store::server` warns rather than leaving it to be noticed.
+        assert!(Config::default().snapshot_schedule().is_none());
+    }
+
+    #[test]
+    fn naming_a_destination_is_enough_to_get_scheduled_snapshots() {
+        let cfg = Config {
+            snapshot_dir: Some(PathBuf::from("/var/backups/deis-store")),
+            ..Config::default()
+        };
+        let schedule = cfg
+            .snapshot_schedule()
+            .expect("a destination is a schedule");
+        assert_eq!(schedule.directory, PathBuf::from("/var/backups/deis-store"));
+        assert_eq!(schedule.interval, Duration::from_secs(86_400));
+        assert_eq!(schedule.retention, 7);
+        assert_eq!(schedule.data_dir, cfg.data_dir);
+    }
+
+    #[test]
+    fn a_zero_interval_suspends_the_schedule_without_losing_the_destination() {
+        let cfg = Config {
+            snapshot_dir: Some(PathBuf::from("/var/backups/deis-store")),
+            snapshot_interval_secs: 0,
+            ..Config::default()
+        };
+        assert!(cfg.snapshot_schedule().is_none());
+    }
+
+    #[test]
+    fn the_secret_and_the_snapshot_keys_are_read_from_a_file() {
+        let parsed: Config = toml::from_str(
+            r#"
+            auth_secret = "a-shared-secret"
+            snapshot_dir = "/var/backups/deis-store"
+            snapshot_interval_secs = 3600
+            snapshot_retention = 24
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.auth_secret.as_deref(), Some("a-shared-secret"));
+        let schedule = parsed.snapshot_schedule().unwrap();
+        assert_eq!(schedule.interval, Duration::from_secs(3600));
+        assert_eq!(schedule.retention, 24);
     }
 
     #[test]
