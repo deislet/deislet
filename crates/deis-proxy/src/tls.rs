@@ -93,9 +93,30 @@ fn certificate_names(cert: &X509) -> Vec<String> {
         .unwrap_or_default();
     if names.is_empty()
         && let Some(entry) = cert.subject_name().entries_by_nid(Nid::COMMONNAME).next()
-        && let Ok(cn) = entry.data().as_utf8()
     {
-        names.push(cn.to_string().to_ascii_lowercase());
+        // Read the raw bytes and judge them here rather than through
+        // `Asn1StringRef::as_utf8`, which stops at the first interior NUL and
+        // hands back the prefix. A common name is what this certificate is
+        // matched against for SNI, and a NUL inside one is the oldest trick
+        // there is for making a name read as two different things: a CN of
+        // `a.example.com\0b.example.com` would be registered here as
+        // `a.example.com` and could then be chosen for a host it does not
+        // actually attest to. No legitimate hostname contains a NUL, so this
+        // refuses rather than truncates.
+        let raw = entry.data().as_slice();
+        match std::str::from_utf8(raw) {
+            Ok(cn) if !cn.contains('\0') => names.push(cn.to_ascii_lowercase()),
+            Ok(_) => tracing::warn!(
+                "a certificate's common name contains a NUL byte and has been ignored; the \
+                 certificate will not be selected for any host by that name. Give it a \
+                 subjectAltName instead - a common name has not been the right place for a \
+                 hostname for a long time"
+            ),
+            Err(_) => tracing::warn!(
+                "a certificate's common name is not UTF-8 and has been ignored; the certificate \
+                 will not be selected for any host by that name. Give it a subjectAltName instead"
+            ),
+        }
     }
     names
 }
@@ -143,5 +164,100 @@ impl TlsAccept for SniCertificates {
             }
         }
         debug!(server_name = ?server_name, names = ?cert.names, "certificate selected");
+    }
+}
+
+#[cfg(test)]
+mod certificate_name_tests {
+    use super::*;
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::x509::extension::SubjectAlternativeName;
+    use openssl::x509::{X509Builder, X509NameBuilder};
+
+    /// Build a self-signed certificate whose common name is exactly `cn`,
+    /// including bytes a hostname may not legally contain.
+    ///
+    /// The typed form is used because it takes the value with its length
+    /// rather than as a C string, so an interior NUL survives into the
+    /// certificate. That is the whole point of the test below: a certificate
+    /// an ordinary tool would not produce, and a check that only holds for
+    /// certificates built by well-behaved tools is not a check.
+    fn cert_with_common_name(cn: &str) -> X509 {
+        cert_with(cn, &[])
+    }
+
+    /// As above, plus subjectAltName DNS entries.
+    fn cert_with(cn: &str, sans: &[&str]) -> X509 {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid_with_type(
+            Nid::COMMONNAME,
+            cn,
+            openssl::asn1::Asn1Type::UTF8STRING,
+        )
+        .unwrap();
+        let name = name.build();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        if !sans.is_empty() {
+            let mut san = SubjectAlternativeName::new();
+            for name in sans {
+                san.dns(name);
+            }
+            let context = builder.x509v3_context(None, None);
+            let extension = san.build(&context).unwrap();
+            builder.append_extension(extension).unwrap();
+        }
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        builder.build()
+    }
+
+    #[test]
+    fn an_ordinary_common_name_is_matched_case_insensitively() {
+        let cert = cert_with_common_name("API.Example.COM");
+        assert_eq!(certificate_names(&cert), vec!["api.example.com"]);
+    }
+
+    #[test]
+    fn a_common_name_holding_a_nul_names_nothing() {
+        // The reason this function reads raw bytes instead of going through
+        // `Asn1StringRef::as_utf8`: that call stops at the NUL and answers
+        // "a.example.com", so this certificate would have been registered as
+        // valid for a host it does not attest to, and would then be served for
+        // it. No hostname contains a NUL, so the whole name is refused.
+        let cert = cert_with_common_name("a.example.com\0b.example.com");
+        assert!(
+            certificate_names(&cert).is_empty(),
+            "a certificate whose common name hides a second name behind a NUL must match no host"
+        );
+    }
+
+    #[test]
+    fn a_subject_alt_name_wins_and_the_common_name_is_not_consulted() {
+        // Beyond correctness, this is what bounds the refusal above: a
+        // certificate that carries SANs never reaches the common-name branch,
+        // so a certificate that names its hosts the modern way cannot lose
+        // them to a common name this function decided it did not like.
+        let cert = cert_with(
+            "a.example.com\0b.example.com",
+            &["One.Example.com", "two.example.com"],
+        );
+        assert_eq!(
+            certificate_names(&cert),
+            vec!["one.example.com", "two.example.com"]
+        );
     }
 }
