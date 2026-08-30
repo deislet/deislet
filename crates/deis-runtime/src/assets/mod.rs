@@ -7,16 +7,29 @@
 //! for as long as the version is the one running.
 //!
 //! [`deis_bundle::AssetIndex`] answers "which asset does this path mean". This
-//! module adds the two things serving needs on top of it: the bytes, and the
-//! `ETag` those bytes hash to.
+//! module adds the three things serving needs on top of it: the bytes, the
+//! `ETag` those bytes hash to, and the rules the site brought with it -
+//! `_redirects`, `_headers` and the not-found behaviour, compiled once here
+//! and applied in [`AssetBundle::resolve_request`].
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
+use axum::response::Response;
 use bytes::Bytes;
-use deis_bundle::{AssetIndex, Manifest, ASSETS_PREFIX};
+use deis_bundle::{
+    decoded_segments, percent_decode, AssetIndex, HeaderField, Manifest, RedirectAction,
+    ASSETS_PREFIX,
+};
 use sha2::{Digest, Sha256};
+
+mod response;
+mod site;
+
+pub use response::{asset_response, outcome_response};
+pub use site::{Lookup, SiteRules};
 
 /// Why a version's assets could not be turned into something servable.
 ///
@@ -46,6 +59,12 @@ pub enum AssetError {
         total: u64,
         limit: u64,
     },
+    /// A `_redirects` or `_headers` rule in the manifest is not one this node
+    /// will apply.
+    UnusableRules { reason: String },
+    /// The manifest asks for a not-found behaviour whose page the bundle does
+    /// not carry.
+    FallbackMissing { page: &'static str },
 }
 
 impl std::fmt::Display for AssetError {
@@ -78,11 +97,76 @@ impl std::fmt::Display for AssetError {
                  {path:?} ({total} bytes read); they are held in memory for the life of the \
                  version, so loading it would put the node's own memory at risk"
             ),
+            Self::UnusableRules { reason } => write!(
+                f,
+                "this version's static site rules are not usable: {reason}. The build checks the \
+                 same rules, so a bundle that reaches a node with a bad one was not produced by \
+                 `deis build`"
+            ),
+            Self::FallbackMissing { page } => write!(
+                f,
+                "the manifest asks for unmatched paths to be answered with {page:?} and the \
+                 bundle does not carry that file; every such request would fall through to the \
+                 application, which is not what the manifest says"
+            ),
         }
     }
 }
 
 impl std::error::Error for AssetError {}
+
+/// What the asset layer decided to do with a request.
+///
+/// A separate type from [`AssetHit`] because two of the three answers a static
+/// site can give are not a file: a redirect has no body, and a rewrite or a
+/// custom 404 is a file served under a status that is not 200.
+#[derive(Debug, Clone)]
+pub enum AssetOutcome {
+    /// Send these bytes.
+    Serve(AssetAnswer),
+    /// Send the client somewhere else. `location` is already escaped.
+    Redirect {
+        status: u16,
+        location: String,
+        headers: Vec<HeaderField>,
+    },
+}
+
+/// One asset, with the status and the extra headers the site's rules chose.
+#[derive(Debug, Clone)]
+pub struct AssetAnswer {
+    pub hit: AssetHit,
+    /// 200 for a file or a rewrite, 404 for a custom not-found page.
+    pub status: u16,
+    /// What `_headers` puts on this response, already resolved. Applied last,
+    /// so an author can override the content type and the cache policy.
+    pub headers: Vec<HeaderField>,
+}
+
+/// The answer to one `env.ASSETS.fetch()` call.
+///
+/// Flat and owned on purpose: it crosses the Rust/JS boundary, where the shape
+/// has to be something an op can hand over without borrowing from the bundle.
+#[derive(Debug, Clone)]
+pub struct AssetFetch {
+    pub status: u16,
+    /// Lower-case names, in the order they should be set. `_headers` blocks
+    /// have already been applied, so a name appears once.
+    pub headers: Vec<(String, String)>,
+    /// Empty for a redirect, and for a HEAD the caller decides to make.
+    pub body: Bytes,
+}
+
+/// Put the site's headers over the defaults, later winning, as a response
+/// builder would.
+fn merge(into: &mut Vec<(String, String)>, extra: &[HeaderField]) {
+    for field in extra {
+        match into.iter_mut().find(|(name, _)| *name == field.name) {
+            Some(existing) => existing.1 = field.value.clone(),
+            None => into.push((field.name.clone(), field.value.clone())),
+        }
+    }
+}
 
 /// One asset, resolved and ready to be written to a response.
 #[derive(Debug, Clone)]
@@ -113,6 +197,11 @@ pub struct AssetBundle {
     cache_control: Arc<str>,
     duplicate_paths: usize,
     undeclared_files: usize,
+    /// `_redirects`, `_headers` and the not-found behaviour, compiled.
+    site: SiteRules,
+    /// The application this bundle belongs to, so a log line about a rule says
+    /// whose rule it was.
+    app: String,
 }
 
 impl std::fmt::Debug for AssetBundle {
@@ -134,6 +223,8 @@ impl AssetBundle {
             cache_control,
             duplicate_paths: 0,
             undeclared_files: 0,
+            site: SiteRules::default(),
+            app: String::new(),
         }
     }
 
@@ -238,6 +329,21 @@ impl AssetBundle {
             .filter(|name| !bodies.contains_key(*name))
             .count();
 
+        // Compiled once, here, for the same reason the index is built once:
+        // this is the path of every request that does not name a file, which
+        // on a static site is every 404 and every client-side route.
+        let site = SiteRules::compile(manifest, &index)?;
+        if !site.is_empty() {
+            tracing::info!(
+                app_id = %manifest.app,
+                redirect_rules = site.redirect_count(),
+                header_blocks = site.header_block_count(),
+                not_found = ?site.not_found(),
+                "Compiled this version's static site rules; they are applied to every request \
+                 that does not name a file in the bundle"
+            );
+        }
+
         Ok(Self {
             index,
             bodies,
@@ -245,20 +351,214 @@ impl AssetBundle {
             cache_control,
             duplicate_paths,
             undeclared_files,
+            site,
+            app: manifest.app.clone(),
         })
     }
 
-    /// Resolve a request path, or `None` to let the request reach the isolate.
+    /// Resolve a request path to the file that answers it, with none of the
+    /// site's rules applied.
+    ///
+    /// The plain lookup, for callers that want to know whether a path names a
+    /// file and nothing more. Serving goes through
+    /// [`AssetBundle::resolve_request`], which also applies `_redirects`,
+    /// `_headers` and the not-found behaviour.
     pub fn resolve(&self, request_path: &str) -> Option<AssetHit> {
         let matched = self.index.lookup(request_path)?;
         let body = self.bodies.get(&matched.archive_path)?;
-        Some(AssetHit {
+        Some(self.hit(&matched, body))
+    }
+
+    fn hit(&self, matched: &deis_bundle::AssetMatch<'_>, body: &AssetBody) -> AssetHit {
+        AssetHit {
             path: matched.asset_path.to_string(),
             bytes: body.bytes.clone(),
             etag: body.etag.clone(),
             content_type: matched.content_type.to_string(),
             cache_control: self.cache_control.clone(),
-        })
+        }
+    }
+
+    /// Decide what to answer, applying everything the site declared.
+    ///
+    /// `None` means the request belongs to the isolate. That is the answer for
+    /// a path that names no file, matches no `_redirects` rule and either has
+    /// a function route of its own or no not-found behaviour to fall back on.
+    ///
+    /// The order is the module's: index, `_redirects`, function routes, then
+    /// the not-found behaviour. See [`site`] for why `_redirects` sits above
+    /// the route table and the fallback below it.
+    pub fn resolve_request(&self, request_path: &str, scope: Lookup) -> Option<AssetOutcome> {
+        let raw = request_path.split('#').next().unwrap_or("");
+        let (raw_path, query) = match raw.split_once('?') {
+            Some((path, query)) => (path, query),
+            None => (raw, ""),
+        };
+        let path = percent_decode(raw_path);
+
+        // A normalised path never contains `..`; one that does is malformed,
+        // and running it through rules that build a target out of it would
+        // turn a bad request into a redirect somebody has to reason about.
+        if path.split('/').any(|segment| segment == "..") {
+            return None;
+        }
+
+        if let Some(matched) = self.index.lookup_decoded(&path) {
+            let body = self.bodies.get(&matched.archive_path)?;
+            // Splitting the path is the only allocation this branch would
+            // make, and it is the branch every request for a real file takes,
+            // so a site with no `_headers` never pays for it.
+            let headers = if self.site.has_headers() {
+                self.site.headers_for(&decoded_segments(&path))
+            } else {
+                Vec::new()
+            };
+            return Some(AssetOutcome::Serve(AssetAnswer {
+                hit: self.hit(&matched, body),
+                status: 200,
+                headers,
+            }));
+        }
+
+        if self.site.is_empty() {
+            return None;
+        }
+
+        let segments = decoded_segments(&path);
+
+        if let Some(action) = self.site.redirect_for(&segments, query) {
+            match action {
+                RedirectAction::Redirect { status, location } => {
+                    return Some(AssetOutcome::Redirect {
+                        status,
+                        location,
+                        headers: self.site.headers_for(&segments),
+                    })
+                }
+                RedirectAction::Rewrite { status, target } => {
+                    match self.answer_with(&target, status, &segments) {
+                        Some(outcome) => return Some(outcome),
+                        None => self.site.report_rewrite_miss(&path, &target, &self.app),
+                    }
+                }
+            }
+        }
+
+        let (page, status) = self.site.fallback_for(&segments, scope)?;
+        self.answer_with(&format!("/{page}"), status, &segments)
+    }
+
+    /// Serve a named asset under this request's path, if the bundle has it.
+    ///
+    /// The headers are the ones that match the path the *visitor* asked for,
+    /// not the file that ends up answering: a `_headers` block is written
+    /// against the URLs of the site, and an SPA fallback would otherwise give
+    /// every client-side route the headers of `/index.html`.
+    fn answer_with(
+        &self,
+        asset_path: &str,
+        status: u16,
+        segments: &[String],
+    ) -> Option<AssetOutcome> {
+        let matched = self.index.lookup_decoded(asset_path)?;
+        let body = self.bodies.get(&matched.archive_path)?;
+        Some(AssetOutcome::Serve(AssetAnswer {
+            hit: self.hit(&matched, body),
+            status,
+            headers: self.site.headers_for(segments),
+        }))
+    }
+
+    /// Answer a request from the HTTP entry, or `None` to start an isolate.
+    ///
+    /// Everything the entry needs is here rather than there because the same
+    /// decision now has a second caller in `env.ASSETS.fetch()`, and the two
+    /// have to answer a path identically.
+    pub fn serve(
+        &self,
+        request_path: &str,
+        request_headers: &HeaderMap,
+        head_only: bool,
+    ) -> Option<Response> {
+        let outcome = self.resolve_request(request_path, Lookup::BeforeFunctions)?;
+        match &outcome {
+            AssetOutcome::Serve(answer) => tracing::debug!(
+                app_id = %self.app,
+                path = %answer.hit.path,
+                status = answer.status,
+                bytes = answer.hit.bytes.len(),
+                "Served a static asset without entering an isolate"
+            ),
+            AssetOutcome::Redirect {
+                status, location, ..
+            } => tracing::debug!(
+                app_id = %self.app,
+                request_path,
+                status,
+                location,
+                "Answered a _redirects rule without entering an isolate"
+            ),
+        }
+        Some(outcome_response(outcome, request_headers, head_only))
+    }
+
+    /// The answer `env.ASSETS.fetch()` gets, in the shape an op hands to JS.
+    ///
+    /// Same pipeline as [`AssetBundle::serve`], with one difference: the
+    /// function has already had its turn, so the not-found behaviour applies
+    /// even to a path a function route claims. Without that, a handler that
+    /// decided to hand an unmatched path to the asset layer would get nothing
+    /// back from the layer it asked.
+    ///
+    /// Always an answer, never `None`: a function that asked for a file that
+    /// is not there gets a 404 to return, the same as any other caller of
+    /// `fetch`. Returning nothing would leave the handler to invent a
+    /// response, and every handler would invent a different one.
+    pub fn fetch_asset(&self, request_path: &str) -> AssetFetch {
+        match self.resolve_request(request_path, Lookup::FromFunction) {
+            Some(AssetOutcome::Serve(answer)) => {
+                let mut headers = vec![
+                    ("content-type".to_string(), answer.hit.content_type.clone()),
+                    ("etag".to_string(), answer.hit.etag.clone()),
+                    (
+                        "cache-control".to_string(),
+                        answer.hit.cache_control.to_string(),
+                    ),
+                ];
+                merge(&mut headers, &answer.headers);
+                AssetFetch {
+                    status: answer.status,
+                    headers,
+                    body: answer.hit.bytes,
+                }
+            }
+            Some(AssetOutcome::Redirect {
+                status,
+                location,
+                headers: extra,
+            }) => {
+                let mut headers = vec![("location".to_string(), location)];
+                merge(&mut headers, &extra);
+                AssetFetch {
+                    status,
+                    headers,
+                    body: Bytes::new(),
+                }
+            }
+            None => AssetFetch {
+                status: 404,
+                headers: vec![(
+                    "content-type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )],
+                body: Bytes::from_static(b"Not Found"),
+            },
+        }
+    }
+
+    /// The rules this version brought with it.
+    pub fn site(&self) -> &SiteRules {
+        &self.site
     }
 
     pub fn len(&self) -> usize {
@@ -315,3 +615,7 @@ pub fn if_none_match_matches(header: &str, etag: &str) -> bool {
 #[cfg(test)]
 #[path = "assets_test.rs"]
 mod assets_test;
+
+#[cfg(test)]
+#[path = "site_test.rs"]
+mod site_test;

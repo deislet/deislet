@@ -34,6 +34,107 @@ impl Output {
     }
 }
 
+/// Refuse to run a destructive call until the operator running it types
+/// `tenant` back, or passed `skip_confirmation` for a script.
+///
+/// Typing the tenant rather than answering `y` is deliberate: `y` is muscle
+/// memory after the tenth time, identical whichever tenant is on screen, so
+/// it protects against nothing. Re-reading `demo.production` and typing it
+/// back is the one thing a person cannot do on autopilot, which is what
+/// "hard to run by accident" has to mean for a command whose entire job is
+/// an action that cannot be undone.
+///
+/// A non-interactive stdin (a script, a CI job, an SSH command with no
+/// pseudo-terminal) is refused outright rather than prompted: reading a
+/// confirmation line from a pipe that is actually the next command in a
+/// script would make the prompt worse than useless, since a script producing
+/// exactly the wrong next line would make the call happen. `skip_confirmation`
+/// is `-y`/`--yes`, which is what a script should pass instead once it has
+/// decided on its own that the call is correct.
+pub fn confirm_destructive(
+    tenant: &str,
+    action: &str,
+    skip_confirmation: bool,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    if skip_confirmation {
+        return Ok(());
+    }
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!(
+            "{action} on {tenant} is destructive and this is not a terminal to confirm it on. \
+             Pass -y/--yes once you are sure - that is what a script or a CI job should do."
+        );
+    }
+
+    eprintln!();
+    eprintln!("{}", format!("About to {action} on {tenant}.").red().bold());
+    eprintln!("{}", "This cannot be undone.".red());
+    eprint!("Type {tenant} to continue: ");
+    std::io::stderr().flush().ok();
+
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| anyhow::anyhow!("reading the confirmation: {e}"))?;
+
+    if answer.trim() != tenant {
+        anyhow::bail!("confirmation did not match {tenant}; nothing was done");
+    }
+    Ok(())
+}
+
+/// How a KV value or a blob object should be shown when a person did not ask
+/// for it to be written to a file.
+///
+/// A value from `deis kv`/`deis blob` is whatever bytes an application
+/// wrote, with no reason to expect UTF-8. Printing them straight into a
+/// terminal either works by luck or corrupts the scrollback with control
+/// characters and stray escape sequences, so this is decided once, here,
+/// rather than by each command finding out the hard way.
+pub enum BytesForDisplay<'a> {
+    /// Valid UTF-8: safe, and almost always what the operator wanted to see.
+    Text(&'a str),
+    /// Not valid UTF-8. `preview_hex` is the first bytes, so the operator
+    /// still sees *something* concrete without the whole value hitting the
+    /// terminal.
+    Binary { len: usize, preview_hex: String },
+}
+
+/// How many leading bytes of a binary value to show as a hex preview.
+/// Enough to recognise a magic number (PNG, gzip, a protobuf tag byte)
+/// without printing enough to be mistaken for the whole value.
+const BINARY_PREVIEW_BYTES: usize = 16;
+
+/// Base64 for a value that has to travel through JSON: `--json` output for a
+/// KV value or a blob object carries this rather than the raw bytes, which
+/// JSON cannot represent, and rather than an array of byte numbers, which
+/// would cost roughly three times the space for the same content.
+pub fn base64_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+pub fn bytes_for_display(data: &[u8]) -> BytesForDisplay<'_> {
+    match std::str::from_utf8(data) {
+        Ok(text) => BytesForDisplay::Text(text),
+        Err(_) => {
+            let preview_len = data.len().min(BINARY_PREVIEW_BYTES);
+            let preview_hex = data[..preview_len]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            BytesForDisplay::Binary {
+                len: data.len(),
+                preview_hex,
+            }
+        }
+    }
+}
+
 /// A Unix timestamp in seconds, as a local wall-clock time.
 pub fn timestamp(seconds: i64) -> String {
     match Local.timestamp_opt(seconds, 0).single() {
@@ -167,6 +268,72 @@ fn pad(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipping_confirmation_never_touches_stdin() {
+        // `cargo test` gives every test a non-terminal stdin, which is
+        // exactly the situation `-y`/`--yes` exists to get past without a
+        // prompt this call would otherwise refuse to make.
+        confirm_destructive("demo.production", "delete kv key \"x\"", true)
+            .expect("skip_confirmation must short-circuit before stdin is examined");
+    }
+
+    #[test]
+    fn a_non_terminal_stdin_is_refused_rather_than_read_from() {
+        // The test harness's stdin is never a terminal, so this is the path
+        // every un-skipped call takes here - and it is the path that matters
+        // most: a script whose stdin is a pipe must be refused, not have a
+        // line of its own output silently consumed as a confirmation.
+        let error = confirm_destructive("demo.production", "delete kv key \"x\"", false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("-y/--yes"), "{error}");
+        assert!(error.contains("demo.production"), "{error}");
+    }
+
+    #[test]
+    fn base64_matches_the_published_vectors() {
+        // Same RFC 4648 vectors deis_wire::conventions checks its own
+        // encoder against, so a KV value round-trips identically to a
+        // storage capability token wherever both cross this CLI.
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(&[0xffu8, 0x00, 0x01]), "/wAB");
+    }
+
+    #[test]
+    fn valid_utf8_is_shown_as_text() {
+        assert!(matches!(
+            bytes_for_display(b"hello"),
+            BytesForDisplay::Text("hello")
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_is_described_not_dumped() {
+        // 0xff can never start a valid UTF-8 sequence, so this is binary by
+        // construction, not by chance.
+        let data = [0xffu8, 0x00, 0x01, 0x02];
+        match bytes_for_display(&data) {
+            BytesForDisplay::Binary { len, preview_hex } => {
+                assert_eq!(len, 4);
+                assert_eq!(preview_hex, "ff 00 01 02");
+            }
+            BytesForDisplay::Text(_) => panic!("0xff is never valid UTF-8"),
+        }
+    }
+
+    #[test]
+    fn the_binary_preview_is_capped_even_for_a_large_value() {
+        let data = vec![0xffu8; 1024];
+        match bytes_for_display(&data) {
+            BytesForDisplay::Binary { len, preview_hex } => {
+                assert_eq!(len, 1024);
+                assert_eq!(preview_hex.split(' ').count(), BINARY_PREVIEW_BYTES);
+            }
+            BytesForDisplay::Text(_) => panic!("0xff repeated is never valid UTF-8"),
+        }
+    }
 
     #[test]
     fn durations_and_instants_both_parse() {

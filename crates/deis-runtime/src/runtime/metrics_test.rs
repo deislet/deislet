@@ -34,7 +34,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_time_accumulates_and_keeps_the_peak() {
+    fn execution_time_accumulates() {
         let registry = MetricsRegistry::new();
         registry.record_request("demo", Duration::from_millis(10), RequestOutcome::Ok);
         registry.record_request("demo", Duration::from_millis(40), RequestOutcome::Ok);
@@ -42,10 +42,102 @@ mod tests {
 
         assert_eq!(registry.value(EXECUTION_MS_COUNT, "demo"), 3.0);
         assert!((registry.value(EXECUTION_MS_SUM, "demo") - 70.0).abs() < 3.0);
-        assert!(
-            (registry.value(EXECUTION_MS_MAX, "demo") - 40.0).abs() < 3.0,
-            "the peak must not be overwritten by a later, shorter run"
+    }
+
+    /// The count in one latency bucket, read the way a scraper reads it.
+    fn bucket(samples: &[proto::MetricSample], le: &str) -> f64 {
+        samples
+            .iter()
+            .find(|s| {
+                s.name == EXECUTION_MS_BUCKET && s.labels.iter().any(|(k, v)| k == "le" && v == le)
+            })
+            .unwrap_or_else(|| panic!("no bucket le={le}: {samples:?}"))
+            .value
+    }
+
+    #[test]
+    fn latency_lands_in_buckets_a_percentile_can_be_read_from() {
+        // What the high-water gauge could not do: three fast requests and one
+        // slow one must leave a distribution, not a single number pinned at
+        // the slow one for the rest of the process's life.
+        let registry = MetricsRegistry::new();
+        registry.record_request("demo", Duration::from_millis(3), RequestOutcome::Ok);
+        registry.record_request("demo", Duration::from_millis(4), RequestOutcome::Ok);
+        registry.record_request("demo", Duration::from_millis(7), RequestOutcome::Ok);
+        registry.record_request("demo", Duration::from_millis(400), RequestOutcome::Ok);
+
+        let samples = registry.snapshot(1);
+        assert_eq!(bucket(&samples, "1"), 0.0);
+        assert_eq!(bucket(&samples, "5"), 2.0, "3ms and 4ms fall at or under 5");
+        assert_eq!(bucket(&samples, "10"), 3.0);
+        assert_eq!(bucket(&samples, "250"), 3.0);
+        assert_eq!(bucket(&samples, "500"), 4.0);
+        assert_eq!(bucket(&samples, "+Inf"), 4.0);
+        assert_eq!(registry.value(EXECUTION_MS_COUNT, "demo"), 4.0);
+    }
+
+    #[test]
+    fn one_slow_request_does_not_pin_the_numbers_for_ever() {
+        // The defect this replaced: a 30-second timeout used to hold the
+        // latency reading at 30 seconds until the process restarted. In a
+        // histogram it is one observation in the top bucket and the fast
+        // requests after it are still visible as fast.
+        let registry = MetricsRegistry::new();
+        registry.record_request("demo", Duration::from_secs(30), RequestOutcome::Error);
+        for _ in 0..99 {
+            registry.record_request("demo", Duration::from_millis(2), RequestOutcome::Ok);
+        }
+
+        let samples = registry.snapshot(1);
+        assert_eq!(bucket(&samples, "2"), 99.0);
+        assert_eq!(bucket(&samples, "+Inf"), 100.0);
+        assert_eq!(
+            bucket(&samples, "10000"),
+            99.0,
+            "the slow one is above 10s and must not be counted below it"
         );
+    }
+
+    #[test]
+    fn every_bucket_exists_from_the_first_observation() {
+        // A bucket that appears partway through makes rate() over it read as
+        // a burst that never happened, so they are all created at once.
+        let registry = MetricsRegistry::new();
+        registry.record_request("demo", Duration::from_millis(1), RequestOutcome::Ok);
+
+        let samples = registry.snapshot(1);
+        let buckets = samples
+            .iter()
+            .filter(|s| s.name == EXECUTION_MS_BUCKET)
+            .count();
+        assert_eq!(
+            buckets,
+            EXECUTION_MS_BUCKETS.len() + 1,
+            "every finite bound plus +Inf: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn buckets_never_decrease_as_the_bound_rises() {
+        // Cumulative counts are what histogram_quantile assumes; a bucket
+        // that read lower than the one below it would make every quantile
+        // nonsense.
+        let registry = MetricsRegistry::new();
+        for ms in [1, 3, 9, 30, 90, 300, 900, 3000] {
+            registry.record_request("demo", Duration::from_millis(ms), RequestOutcome::Ok);
+        }
+
+        let samples = registry.snapshot(1);
+        let mut previous = 0.0;
+        for (_, label) in EXECUTION_MS_BUCKETS {
+            let value = bucket(&samples, label);
+            assert!(
+                value >= previous,
+                "bucket le={label} is {value}, below the bucket under it ({previous})"
+            );
+            previous = value;
+        }
+        assert!(bucket(&samples, "+Inf") >= previous);
     }
 
     #[test]
@@ -191,6 +283,7 @@ mod tests {
                 endpoint: Some("not a url".to_string()),
                 enabled: true,
                 interval_secs: 1,
+                ..MetricShipperConfig::default()
             },
             "node-a".to_string(),
         );
@@ -221,6 +314,283 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("preview")
         );
+    }
+
+    // ---- invocation traces -------------------------------------------
+
+    fn traced(registry: &MetricsRegistry) -> Vec<InvocationTrace> {
+        registry.traces().drain(usize::MAX)
+    }
+
+    #[test]
+    fn a_request_leaves_a_trace_that_says_what_it_was_and_how_it_ended() {
+        // The question section 4.6 says the platform cannot answer: which
+        // request failed, and what it was aimed at.
+        let registry = MetricsRegistry::new();
+        registry.record_request_with(
+            "demo.production",
+            Duration::from_millis(9),
+            RequestOutcome::Error,
+            RequestFacts {
+                trace_id: "abc".into(),
+                method: "POST".into(),
+                url: "https://demo.test/checkout".into(),
+                status: 500,
+                error: "TypeError: cannot read properties of undefined".into(),
+                platform_fault: false,
+            },
+        );
+
+        let traces = traced(&registry);
+        assert_eq!(traces.len(), 1);
+        let trace = &traces[0];
+        assert_eq!(trace.kind, InvocationKind::HttpRequest);
+        assert_eq!(trace.outcome, InvocationOutcome::ApplicationError);
+        assert_eq!(trace.target, "https://demo.test/checkout");
+        assert_eq!(trace.method, "POST");
+        assert_eq!(trace.status, 500);
+        assert_eq!(trace.trace_id, "abc");
+        assert!(trace.error.starts_with("TypeError"));
+        assert!(trace.duration >= Duration::from_millis(9));
+    }
+
+    #[test]
+    fn a_cut_off_invocation_does_not_get_blamed_on_the_application() {
+        // The single most useful thing an operator can be told, and the one
+        // thing only this node knows: a killed isolate answers 500 exactly
+        // like a handler that threw.
+        for (cut_off, expected) in [
+            (
+                &MetricsRegistry::record_timeout_cutoff as &dyn Fn(&MetricsRegistry, &str),
+                InvocationOutcome::ExecutionTimeout,
+            ),
+            (
+                &MetricsRegistry::record_rate_limit_cutoff,
+                InvocationOutcome::RateLimited,
+            ),
+            (
+                &MetricsRegistry::record_cpu_cutoff,
+                InvocationOutcome::CpuLimit,
+            ),
+            (
+                &MetricsRegistry::record_memory_cutoff,
+                InvocationOutcome::MemoryLimit,
+            ),
+        ] {
+            let registry = MetricsRegistry::new();
+            // The cut-off fires on the watchdog thread first; the request
+            // path finds out when its script returns an error.
+            cut_off(&registry, "demo");
+            registry.record_request("demo", Duration::from_secs(30), RequestOutcome::Error);
+
+            let traces = traced(&registry);
+            assert_eq!(traces[0].outcome, expected, "got {:?}", traces[0]);
+        }
+    }
+
+    #[test]
+    fn a_cut_off_is_charged_to_the_invocation_it_stopped_and_no_later_one() {
+        // A cut-off can also fire during a `waitUntil` tail, after its own
+        // request was recorded. Pinning that stale cause on whichever request
+        // fails next names the wrong invocation, which is worse than naming
+        // none.
+        let registry = MetricsRegistry::new();
+        registry.record_timeout_cutoff("demo");
+        // A one-microsecond invocation cannot be the one a cut-off recorded
+        // before it stopped.
+        registry.record_request("demo", Duration::from_micros(1), RequestOutcome::Error);
+
+        let traces = traced(&registry);
+        assert_eq!(traces[0].outcome, InvocationOutcome::ApplicationError);
+    }
+
+    #[test]
+    fn a_platform_fault_is_not_reported_as_the_application_failing() {
+        let registry = MetricsRegistry::new();
+        registry.record_request_with(
+            "demo",
+            Duration::from_millis(1),
+            RequestOutcome::Error,
+            RequestFacts {
+                error: "Module evaluation failed".into(),
+                platform_fault: true,
+                ..RequestFacts::default()
+            },
+        );
+        assert_eq!(
+            traced(&registry)[0].outcome,
+            InvocationOutcome::InternalError
+        );
+    }
+
+    #[test]
+    fn every_kind_of_invocation_can_be_traced() {
+        // A queue batch, a cron tick and a WebSocket message are invocations
+        // too; a surface that only covered requests would leave the other
+        // three kinds as invisible as they were before.
+        let registry = MetricsRegistry::new();
+        for (kind, target) in [
+            (InvocationKind::QueueBatch, "orders"),
+            (InvocationKind::CronTick, "*/5 * * * *"),
+            (InvocationKind::WebsocketMessage, "/socket"),
+        ] {
+            let mut trace = InvocationTrace::new("demo.production", kind);
+            trace.outcome = InvocationOutcome::Ok;
+            trace.target = target.to_string();
+            trace.duration = Duration::from_millis(3);
+            registry.record_invocation(trace);
+        }
+
+        let traces = traced(&registry);
+        assert_eq!(traces.len(), 3);
+        assert_eq!(traces[0].kind, InvocationKind::QueueBatch);
+        assert_eq!(traces[1].target, "*/5 * * * *");
+        assert_eq!(traces[2].kind, InvocationKind::WebsocketMessage);
+    }
+
+    #[test]
+    fn a_trace_splits_the_tenant_and_carries_the_node() {
+        // Same rule as a metric sample: `demo.production` and `demo.preview`
+        // are one application, and two nodes serving it must stay apart.
+        let registry = MetricsRegistry::new();
+        registry.record_request("demo.preview", Duration::from_millis(1), RequestOutcome::Ok);
+
+        let record = traced(&registry)[0].to_proto("node-a");
+        assert_eq!(record.app_id, "demo");
+        assert_eq!(record.environment, "preview");
+        assert_eq!(record.node, "node-a");
+        assert_eq!(record.kind, InvocationKind::HttpRequest as i32);
+        assert_eq!(record.outcome, InvocationOutcome::Ok as i32);
+    }
+
+    #[test]
+    fn sampling_keeps_every_failure_whatever_the_rate() {
+        // An operator asking "what is failing" is asking about exactly these
+        // records; a sampled node that threw them away would answer with
+        // silence.
+        let registry = MetricsRegistry::new();
+        registry.traces().configure(1_000, 0.0);
+        for _ in 0..50 {
+            registry.record_request("demo", Duration::from_millis(1), RequestOutcome::Ok);
+        }
+        for _ in 0..5 {
+            registry.record_timeout_cutoff("demo");
+            registry.record_request("demo", Duration::from_secs(30), RequestOutcome::Error);
+        }
+
+        let traces = traced(&registry);
+        assert_eq!(
+            traces.iter().filter(|t| t.is_failure()).count(),
+            5,
+            "every failure survives the lowest rate on offer: {traces:?}"
+        );
+        // Counting off keeps the first of every N, so one successful
+        // invocation is recorded too: a node that recorded literally nothing
+        // would look indistinguishable from a node nobody is calling.
+        assert_eq!(traces.len(), 6);
+        assert_eq!(registry.value(TRACES_SAMPLED_OUT_TOTAL, "demo"), 49.0);
+        assert_eq!(registry.value(TRACES_RECORDED_TOTAL, "demo"), 6.0);
+    }
+
+    #[test]
+    fn a_sample_rate_records_one_successful_invocation_in_n() {
+        let registry = MetricsRegistry::new();
+        registry.traces().configure(1_000, 0.1);
+        for _ in 0..100 {
+            registry.record_request("demo", Duration::from_millis(1), RequestOutcome::Ok);
+        }
+
+        let traces = traced(&registry);
+        assert_eq!(traces.len(), 10, "one in ten, counted off, not drawn");
+        assert_eq!(registry.value(TRACES_SAMPLED_OUT_TOTAL, "demo"), 90.0);
+    }
+
+    #[test]
+    fn a_rate_of_one_records_everything() {
+        let registry = MetricsRegistry::new();
+        registry.traces().configure(1_000, 1.0);
+        for _ in 0..20 {
+            registry.record_request("demo", Duration::from_millis(1), RequestOutcome::Ok);
+        }
+        assert_eq!(traced(&registry).len(), 20);
+    }
+
+    #[test]
+    fn an_overrun_buffer_drops_records_and_says_how_many() {
+        // The requirement the review is explicit about: losing records is
+        // allowed, losing them silently is not.
+        let registry = MetricsRegistry::new();
+        registry.traces().configure(4, 1.0);
+        for _ in 0..10 {
+            registry.record_request("demo", Duration::from_millis(1), RequestOutcome::Ok);
+        }
+
+        assert_eq!(registry.traces().pending(), 4);
+        assert_eq!(registry.value(TRACES_RECORDED_TOTAL, "demo"), 10.0);
+        assert_eq!(registry.value(TRACES_DROPPED_TOTAL, "demo"), 6.0);
+        let gaps = registry.traces().take_gaps();
+        assert_eq!(gaps.dropped, 6);
+        assert_eq!(gaps.sampled_out, 0);
+        assert!(
+            registry.traces().take_gaps().is_empty(),
+            "the counts are deltas: what one push reported the next must not repeat"
+        );
+    }
+
+    #[test]
+    fn a_failed_push_puts_the_batch_and_the_gap_counts_back() {
+        // An invocation happened whether or not deis-telemetry was
+        // reachable; losing the record of it to a transient outage is the
+        // failure this whole surface exists to prevent.
+        let registry = MetricsRegistry::new();
+        registry.traces().configure(10, 1.0);
+        for _ in 0..3 {
+            registry.record_request("demo", Duration::from_millis(1), RequestOutcome::Ok);
+        }
+        let gaps = registry.traces().take_gaps();
+        let batch = registry.traces().drain(10);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(registry.traces().pending(), 0);
+
+        registry.traces().restore_gaps(gaps);
+        assert_eq!(registry.traces().requeue(batch), 3);
+        assert_eq!(registry.traces().pending(), 3);
+    }
+
+    #[test]
+    fn a_requeue_that_no_longer_fits_is_counted_as_dropped() {
+        let registry = MetricsRegistry::new();
+        registry.traces().configure(2, 1.0);
+        let batch = vec![
+            InvocationTrace::new("demo", InvocationKind::HttpRequest),
+            InvocationTrace::new("demo", InvocationKind::HttpRequest),
+            InvocationTrace::new("demo", InvocationKind::HttpRequest),
+        ];
+        assert_eq!(registry.traces().requeue(batch), 2);
+        assert_eq!(registry.traces().take_gaps().dropped, 1);
+    }
+
+    #[test]
+    fn a_sample_rate_out_of_range_is_refused_rather_than_obeyed() {
+        // A typo must not silently turn tracing off, and must not divide by
+        // zero either.
+        assert_eq!(keep_one_in(1.0), 1);
+        assert_eq!(keep_one_in(2.0), 1);
+        assert_eq!(keep_one_in(0.5), 2);
+        assert_eq!(keep_one_in(0.01), 100);
+        assert_eq!(keep_one_in(0.0), 1_000_000);
+        assert_eq!(keep_one_in(-1.0), 1_000_000);
+        assert_eq!(keep_one_in(f64::NAN), 1);
+    }
+
+    #[test]
+    fn the_trace_recorder_is_reachable_from_the_process_registry() {
+        // The cut-off paths reach the recorder the same way they reach the
+        // counters; a second global would be a second thing to keep in step.
+        assert!(std::sync::Arc::ptr_eq(
+            recorder().traces(),
+            recorder().traces()
+        ));
     }
 
     #[test]

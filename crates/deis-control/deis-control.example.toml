@@ -12,12 +12,15 @@ heartbeat_timeout = 90
 
 # Node pre-shared keys.
 #
-# One credential, used on every channel a runtime node talks to:
-#   - the gRPC registration handshake,
+# One credential, used on every channel the platform's own processes talk on:
+#   - the gRPC registration handshake, which both a runtime node and
+#     deis-proxy open,
 #   - PUT/DELETE /api/nodes/{node_id}/registration, by which a node puts
-#     itself on the fleet list, and
-#   - the two HTTP endpoints it reads from,
-#     GET /api/nodes/{node_id}/assignments and the bundle download.
+#     itself on the fleet list,
+#   - the two HTTP endpoints a runtime node reads from,
+#     GET /api/nodes/{node_id}/assignments and the bundle download, and
+#   - GET /api/routing-table, which deis-proxy polls for the whole routing
+#     table (see the section on routing below).
 #
 # The assignment list answers with every environment's DECRYPTED secrets,
 # because a node that restarts has to come back with the environment it
@@ -116,6 +119,30 @@ bundle_dir = "data/bundles"
 # secret_key_file = "/etc/deis/secret.key"
 
 # ========================================
+# Routing: how a request finds an application
+# ========================================
+
+# Routes live in the catalog, one per app + environment, created with
+#   POST /api/apps/{app_id}/environments/{env}/routes
+# or through the dashboard. Each binds a host and a path prefix, so
+# example.com/api/* and example.com/* can serve different applications and
+# different environments of the same one.
+#
+# deis-proxy reads the whole table from GET /api/routing-table, with a
+# node_preshared_keys value, and swaps it in as one piece. There is nothing
+# to configure here: the polling interval belongs to the edge, in
+# deis-proxy's own [routing] section, together with preview_zone - the
+# domain under which every environment gets an automatic address. Those two
+# live there because they have to agree with the DNS record and the wildcard
+# certificate that machine holds, and because one control plane can feed
+# several edges serving different zones.
+#
+# What that means operationally: a route created here reaches the edge
+# within one of its poll intervals, with no restart. While this control
+# plane is down, every edge keeps serving on the last table it fetched -
+# routing simply stops changing.
+
+# ========================================
 # Storage services and cron
 # ========================================
 
@@ -208,6 +235,7 @@ bundle_dir = "data/bundles"
 #     DELETE /api/nodes/{node_id}/registration
 #     GET    /api/nodes/{node_id}/assignments
 #     GET    /api/apps/{app_id}/versions/{version_id}/bundle
+#     GET    /api/routing-table
 
 # ========================================
 # Security recommendations

@@ -7,9 +7,11 @@
 //!   produces what that vendor's own tooling deploys; this CLI never pushes
 //!   to them.
 //! * `deploy` / `versions` / `rollback` / `status` / `secret` / `logs` /
-//!   `tail` talk to a Deislet platform - a `deis-control` and, for logs, a
-//!   `deis-telemetry`. Where those live and which credential to present is
-//!   [`settings`].
+//!   `tail` / `kv` / `db` / `blob` talk to a Deislet platform - a
+//!   `deis-control` and, for logs, a `deis-telemetry`, and for `kv`/`db`/
+//!   `blob`, also a `deis-store` reached *through* `deis-control` (see
+//!   [`commands::Session::storage`]). Where those live and which credential
+//!   to present is [`settings`].
 //!
 //! Flag names are the same everywhere they mean the same thing. In
 //! particular the environment is always `-e, --environment` and never
@@ -305,11 +307,236 @@ enum Commands {
         action: SecretAction,
     },
 
+    /// Read and write an environment's key-value store.
+    Kv {
+        #[command(subcommand)]
+        action: KvAction,
+    },
+
+    /// Run SQL against an environment's database.
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
+
+    /// Read and write an environment's blob objects.
+    Blob {
+        #[command(subcommand)]
+        action: BlobAction,
+    },
+
     /// Show or change where the platform is and which credential to use.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
+}
+
+#[derive(Subcommand)]
+enum KvAction {
+    /// Read one value.
+    Get {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Key to read.
+        key: String,
+
+        /// Write the value's bytes here instead of showing them. Without
+        /// this, a value that is not valid UTF-8 is described (size and a
+        /// hex preview) rather than printed, so it never corrupts the
+        /// terminal.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+    },
+
+    /// Write one value.
+    Put {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Key to write.
+        key: String,
+
+        /// The value, as text. Omit it and pass --file for anything that is
+        /// not text, or pipe the value in on stdin.
+        #[arg(conflicts_with = "file")]
+        value: Option<String>,
+
+        /// The value, as raw bytes read from a file. What binary content
+        /// goes in through.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+
+        /// Lifetime in seconds from now. Omitted means the value never
+        /// expires.
+        #[arg(long, value_name = "SECONDS")]
+        ttl: Option<i64>,
+
+        /// An opaque string stored and returned alongside the value.
+        /// Never parsed by the store.
+        #[arg(long)]
+        metadata: Option<String>,
+    },
+
+    /// Delete one key.
+    ///
+    /// Destructive and confirmed: without -y/--yes this asks the tenant to
+    /// be typed back before anything is deleted.
+    Delete {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Key to delete.
+        key: String,
+
+        /// Skip the confirmation prompt. For scripts.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// List keys under a prefix.
+    List {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Only keys starting with this. Empty lists every key.
+        #[arg(long, default_value = "")]
+        prefix: String,
+
+        /// Show at most this many.
+        #[arg(long, default_value = "100")]
+        limit: i32,
+
+        /// Resume a listing from a previous page's `next_cursor`.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbAction {
+    /// Run a SELECT and show what came back.
+    Query {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// The SQL to run. Quote it as one shell argument.
+        sql: String,
+
+        /// One per `?` placeholder, in order. Repeatable. Each is parsed as
+        /// JSON when it parses (42, true, null, "already-quoted") and taken
+        /// as a plain string otherwise (alice).
+        #[arg(long = "param", value_name = "VALUE")]
+        params: Vec<String>,
+    },
+
+    /// Run anything that is not a SELECT: INSERT, UPDATE, DELETE, DDL.
+    ///
+    /// Destructive and confirmed: without -y/--yes this asks the tenant to
+    /// be typed back before the statement runs. This is the command a
+    /// mistaken WHERE clause turns into an incident, so read what is on
+    /// screen before typing it back.
+    Execute {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// The SQL to run. Quote it as one shell argument.
+        sql: String,
+
+        /// One per `?` placeholder, in order. Same parsing as `deis db
+        /// query`.
+        #[arg(long = "param", value_name = "VALUE")]
+        params: Vec<String>,
+
+        /// Skip the confirmation prompt. For scripts and migration runners.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BlobAction {
+    /// Read one object.
+    Get {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Key to read.
+        key: String,
+
+        /// Write the object's bytes here instead of showing them.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+
+        /// Largest object this command will hold in memory. Raise it for an
+        /// object bigger than the default.
+        #[arg(long, value_name = "BYTES", default_value_t = commands::blob::default_max_bytes())]
+        max_size: usize,
+    },
+
+    /// Write one object.
+    Put {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Key to write.
+        key: String,
+
+        /// The object's bytes. Omit it to pipe the object in on stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+
+        /// Media type recorded alongside the object, e.g. image/png.
+        #[arg(long, value_name = "TYPE")]
+        content_type: Option<String>,
+    },
+
+    /// Delete one object.
+    ///
+    /// Destructive and confirmed: without -y/--yes this asks the tenant to
+    /// be typed back before anything is deleted.
+    Delete {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Key to delete.
+        key: String,
+
+        /// Skip the confirmation prompt. For scripts.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    // No `List`: `BlobStore` in deis-store's proto has no List RPC. See the
+    // module comment on `crate::commands::blob` for why this is not offered
+    // rather than offered and broken.
 }
 
 #[derive(Subcommand)]
@@ -579,6 +806,182 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
 
+        Commands::Kv { action } => match action {
+            KvAction::Get {
+                target,
+                format,
+                key,
+                file,
+            } => {
+                commands::kv::get(
+                    commands::kv::GetArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        key,
+                        file,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+            KvAction::Put {
+                target,
+                format,
+                key,
+                value,
+                file,
+                ttl,
+                metadata,
+            } => {
+                commands::kv::put(
+                    commands::kv::PutArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        key,
+                        value,
+                        file,
+                        ttl_seconds: ttl,
+                        metadata,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+            KvAction::Delete {
+                target,
+                format,
+                key,
+                yes,
+            } => {
+                commands::kv::delete(
+                    commands::kv::DeleteArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        key,
+                        yes,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+            KvAction::List {
+                target,
+                format,
+                prefix,
+                limit,
+                cursor,
+            } => {
+                commands::kv::list(
+                    commands::kv::ListArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        prefix,
+                        limit,
+                        cursor,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+        },
+
+        Commands::Db { action } => match action {
+            DbAction::Query {
+                target,
+                format,
+                sql,
+                params,
+            } => {
+                commands::db::query(
+                    commands::db::QueryArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        sql,
+                        params,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+            DbAction::Execute {
+                target,
+                format,
+                sql,
+                params,
+                yes,
+            } => {
+                commands::db::execute(
+                    commands::db::ExecuteArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        sql,
+                        params,
+                        yes,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+        },
+
+        Commands::Blob { action } => match action {
+            BlobAction::Get {
+                target,
+                format,
+                key,
+                file,
+                max_size,
+            } => {
+                commands::blob::get(
+                    commands::blob::GetArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        key,
+                        file,
+                        max_bytes: max_size,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+            BlobAction::Put {
+                target,
+                format,
+                key,
+                file,
+                content_type,
+            } => {
+                commands::blob::put(
+                    commands::blob::PutArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        key,
+                        file,
+                        content_type,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+            BlobAction::Delete {
+                target,
+                format,
+                key,
+                yes,
+            } => {
+                commands::blob::delete(
+                    commands::blob::DeleteArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        key,
+                        yes,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+        },
+
         Commands::Config { action } => match action {
             ConfigAction::Set { key, value, format } => {
                 commands::config::set(&key, &value, format.into())
@@ -611,6 +1014,16 @@ mod tests {
             vec!["deis", "tail", "-e", "preview"],
             vec!["deis", "logs", "--environment", "preview"],
             vec!["deis", "secret", "list", "-e", "preview"],
+            vec!["deis", "kv", "get", "-e", "preview", "mykey"],
+            vec![
+                "deis",
+                "db",
+                "query",
+                "--environment",
+                "preview",
+                "select 1",
+            ],
+            vec!["deis", "blob", "get", "-e", "preview", "mykey"],
         ] {
             Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
@@ -618,6 +1031,7 @@ mod tests {
         for argv in [
             vec!["deis", "deploy", "--env", "preview"],
             vec!["deis", "tail", "--env", "preview"],
+            vec!["deis", "kv", "get", "--env", "preview", "mykey"],
         ] {
             assert!(
                 Cli::try_parse_from(&argv).is_err(),
@@ -654,6 +1068,10 @@ mod tests {
             vec!["deis", "tail", "--json"],
             vec!["deis", "secret", "list", "--json"],
             vec!["deis", "config", "list", "--json"],
+            vec!["deis", "kv", "get", "mykey", "--json"],
+            vec!["deis", "kv", "list", "--json"],
+            vec!["deis", "db", "query", "select 1", "--json"],
+            vec!["deis", "blob", "get", "mykey", "--json"],
         ] {
             Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
@@ -669,5 +1087,55 @@ mod tests {
                 "{argv:?}: this command has no JSON form, so the flag must not be accepted"
             );
         }
+    }
+
+    /// `-y`/`--yes` exists exactly on the calls that delete or run arbitrary
+    /// SQL, and nowhere else: a skip-confirmation flag on a command with
+    /// nothing to confirm is a flag someone will pass out of habit and then
+    /// rely on for a command where it used to matter.
+    #[test]
+    fn yes_is_offered_exactly_where_a_confirmation_exists() {
+        for argv in [
+            vec!["deis", "kv", "delete", "mykey", "-y"],
+            vec!["deis", "db", "execute", "delete from t", "--yes"],
+            vec!["deis", "blob", "delete", "mykey", "-y"],
+        ] {
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+
+        for argv in [
+            vec!["deis", "kv", "get", "mykey", "-y"],
+            vec!["deis", "kv", "put", "mykey", "value", "-y"],
+            vec!["deis", "kv", "list", "-y"],
+            vec!["deis", "db", "query", "select 1", "-y"],
+            vec!["deis", "blob", "get", "mykey", "-y"],
+            vec!["deis", "blob", "put", "mykey", "-y"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?}: this command deletes and changes nothing, so -y must not be accepted"
+            );
+        }
+    }
+
+    /// `BlobStore` has no `List` RPC (see `crates/deis-store/proto/blob.proto`),
+    /// so offering `deis blob list` would be a command that can never work.
+    #[test]
+    fn blob_has_no_list_subcommand() {
+        assert!(
+            Cli::try_parse_from(["deis", "blob", "list"]).is_err(),
+            "deis blob list must not parse: there is no BlobStore.List RPC to call"
+        );
+    }
+
+    /// A KV value comes from exactly one place per call - the CLI must not
+    /// let a positional value and `--file` both be given, since only one of
+    /// them could ever win and silently picking one would hide the mistake.
+    #[test]
+    fn kv_put_refuses_a_value_and_a_file_together() {
+        assert!(
+            Cli::try_parse_from(["deis", "kv", "put", "mykey", "text", "--file", "v.bin"]).is_err(),
+            "a value argument and --file must be mutually exclusive"
+        );
     }
 }

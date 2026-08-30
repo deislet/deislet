@@ -22,14 +22,24 @@ use std::io::{Cursor, Read};
 use serde::{Deserialize, Serialize};
 
 pub mod assets;
+pub mod headers;
 pub mod path;
+pub mod redirects;
 pub mod routing;
+pub mod site;
 
 pub use assets::{AssetIndex, AssetMatch, guess_content_type};
-pub use path::percent_decode;
+pub use headers::{HeaderField, HeaderRule, HeaderTable, parse_headers};
+pub use path::{percent_decode, percent_encode_uri};
+pub use redirects::{
+    ParsedRedirects, RedirectAction, RedirectRule, RedirectTable, parse_redirects,
+};
 pub use routing::{
-    CATCH_ALL_PARAM, CATCH_ALL_SEGMENT, PLACEHOLDER_PREFIX, Specificity, segments,
-    sort_by_specificity,
+    CATCH_ALL_PARAM, CATCH_ALL_SEGMENT, Captures, CompiledPattern, PLACEHOLDER_PREFIX, Specificity,
+    decoded_segments, match_pattern, segments, sort_by_specificity,
+};
+pub use site::{
+    HEADERS_FILE, NOT_FOUND_PAGE, NotFound, REDIRECTS_FILE, RuleError, SPA_SHELL, SiteConfig,
 };
 
 /// Manifest schema this version of the platform understands.
@@ -116,6 +126,11 @@ pub struct Manifest {
     pub queues: Vec<QueueConsumer>,
     #[serde(default)]
     pub assets: Vec<Asset>,
+    /// What the static half of the app does beyond serving files by name:
+    /// `_redirects`, `_headers`, and the choice between an SPA fallback and a
+    /// custom 404 page. Absent in a bundle that ships none of them.
+    #[serde(default, skip_serializing_if = "SiteConfig::is_empty")]
+    pub site: SiteConfig,
 }
 
 /// A route pattern the runtime matches against to fill `context.params`.
@@ -177,6 +192,14 @@ impl Manifest {
         if self.entry.trim().is_empty() {
             return Err(BundleError::InvalidManifest("\"entry\" is empty".into()));
         }
+        // Compiled here rather than where they are first used, so a bundle
+        // carrying a rule nothing could apply is refused wherever a manifest
+        // is read - by the control plane at upload and by a node at load -
+        // rather than on the one request that would have matched it.
+        self.site
+            .validate()
+            .map_err(|e| BundleError::InvalidManifest(e.to_string()))?;
+
         for asset in &self.assets {
             if asset.path.starts_with('/') {
                 return Err(BundleError::InvalidManifest(format!(

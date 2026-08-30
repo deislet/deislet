@@ -138,6 +138,15 @@ pub const NODE_REGISTRATION_ROUTE: &str = "/api/nodes/:id/registration";
 /// [`NODE_REGISTRATION_ROUTE`].
 pub const NODE_ASSIGNMENTS_ROUTE: &str = "/api/nodes/:id/assignments";
 
+/// Path the control plane serves its routing table on, and deis-proxy polls.
+///
+/// It carries no path parameter, so server and client spell the same string.
+/// Here for the same reason as [`NODE_ASSIGNMENTS_ROUTE`]: the two crates do
+/// not depend on each other, and a disagreement would show up as an edge that
+/// keeps an empty routing table and sends every request to whatever the local
+/// application list happens to match.
+pub const ROUTING_TABLE_ROUTE: &str = "/api/routing-table";
+
 /// Path a node registers itself at, and refreshes that registration at.
 ///
 /// `PUT` is the method: a registration states what a node is rather than

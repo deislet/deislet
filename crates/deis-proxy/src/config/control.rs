@@ -36,6 +36,13 @@ impl ControlSystemConfig {
         config.log = None;
         config.cache = None;
         config.control = None;
+        // Where the routing table comes from, and how often, is part of the
+        // control connection by the same reasoning as `control` itself: a
+        // remote push must not be able to point this instance at another
+        // control plane or stop it asking. `preview_zone` goes with them
+        // because it has to agree with the DNS record and the wildcard
+        // certificate this machine holds.
+        config.routing = None;
 
         config.validate()?;
         Ok(Self(config))

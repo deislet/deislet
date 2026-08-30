@@ -41,10 +41,77 @@ fn render_self(out: &mut String, stats: &ServiceStats) {
     }
 }
 
+/// A metric family as it will be written out: either a set of independent
+/// gauge series, or one histogram assembled from the three suffixed series
+/// Prometheus expects a histogram to be made of.
+#[derive(Default)]
+struct Family {
+    /// Label signature -> (value, sample time).
+    gauges: BTreeMap<String, (f64, i64)>,
+    /// Label signature without `le` -> the histogram series under it.
+    histograms: BTreeMap<String, HistogramSeries>,
+}
+
+/// One histogram series: every bucket, the sum and the observation count that
+/// share one label set.
+#[derive(Default)]
+struct HistogramSeries {
+    /// The label set, kept unrendered so `le` can be appended to it per line.
+    pairs: Vec<(String, String)>,
+    /// (upper bound, cumulative count, sample time).
+    buckets: Vec<(f64, f64, i64)>,
+    sum: Option<(f64, i64)>,
+    count: Option<(f64, i64)>,
+}
+
+/// The three suffixes that make a series part of a histogram rather than a
+/// gauge of its own.
+const HISTOGRAM_SUFFIXES: [&str; 3] = ["_bucket", "_sum", "_count"];
+
+/// Keep the newer of two samples of one series.
+fn keep_newest(slot: &mut Option<(f64, i64)>, value: f64, timestamp_us: i64) {
+    match slot {
+        Some((_, seen)) if *seen >= timestamp_us => {}
+        _ => *slot = Some((value, timestamp_us)),
+    }
+}
+
+/// Read the `le` label off a bucket sample.
+///
+/// `+Inf` is recognised as itself rather than left to `parse`, because that
+/// is the token the exposition format uses and the one a producer sends.
+fn bucket_bound(sample: &MetricRecord) -> Option<f64> {
+    let raw = sample.labels.get("le")?;
+    if raw == "+Inf" || raw.eq_ignore_ascii_case("inf") {
+        return Some(f64::INFINITY);
+    }
+    raw.parse::<f64>().ok().filter(|v| !v.is_nan())
+}
+
 fn render_samples(out: &mut String, samples: &[MetricRecord]) {
-    // Group by exported name so `# HELP` and `# TYPE` appear exactly once per
-    // name, then by label signature so one series appears exactly once.
-    let mut grouped: BTreeMap<String, BTreeMap<String, (f64, i64)>> = BTreeMap::new();
+    // A histogram arrives as three ordinary series - `_bucket`, `_sum` and
+    // `_count` - and is only a histogram if they are exported together under
+    // one `# TYPE ... histogram` header. The `_bucket` series is what proves
+    // the family is one, so it is looked for first: without this pass a
+    // producer pushing buckets would get a heap of unrelated gauges and
+    // `histogram_quantile` would have nothing to work with, which is the
+    // whole point of pushing buckets.
+    let mut histogram_families: BTreeSet<String> = BTreeSet::new();
+    for sample in samples {
+        let Some(name) = sanitize_name(&sample.name) else {
+            continue;
+        };
+        if let Some(base) = name.strip_suffix("_bucket")
+            && !base.is_empty()
+            && bucket_bound(sample).is_some()
+        {
+            histogram_families.insert(base.to_string());
+        }
+    }
+
+    // Group by exported family so `# HELP` and `# TYPE` appear exactly once
+    // per family, then by label signature so one series appears exactly once.
+    let mut grouped: BTreeMap<String, Family> = BTreeMap::new();
     for sample in samples {
         let Some(name) = sanitize_name(&sample.name) else {
             warn!(
@@ -54,26 +121,80 @@ fn render_samples(out: &mut String, samples: &[MetricRecord]) {
             );
             continue;
         };
-        let labels = label_signature(sample);
-        grouped
-            .entry(name)
-            .or_default()
-            .entry(labels)
-            .and_modify(|slot| {
-                if sample.timestamp_us > slot.1 {
-                    *slot = (sample.value, sample.timestamp_us);
+
+        let part = HISTOGRAM_SUFFIXES.iter().find_map(|suffix| {
+            let base = name.strip_suffix(suffix)?;
+            histogram_families
+                .contains(base)
+                .then(|| (base.to_string(), *suffix))
+        });
+
+        let Some((base, suffix)) = part else {
+            let labels = render_pairs(&label_pairs(sample, ""));
+            let gauges = &mut grouped.entry(name).or_default().gauges;
+            match gauges.get(&labels) {
+                Some((_, seen)) if *seen >= sample.timestamp_us => {}
+                _ => {
+                    gauges.insert(labels, (sample.value, sample.timestamp_us));
                 }
-            })
-            .or_insert((sample.value, sample.timestamp_us));
+            }
+            continue;
+        };
+
+        // `le` is not part of a series' identity: every bucket of one series
+        // carries the same other labels and differs only in its bound, so it
+        // is left out of the key here and put back, last, on the line.
+        let pairs = label_pairs(sample, "le");
+        let labels = render_pairs(&pairs);
+        let series = grouped
+            .entry(base)
+            .or_default()
+            .histograms
+            .entry(labels)
+            .or_default();
+        series.pairs = pairs;
+        match suffix {
+            "_bucket" => {
+                let Some(bound) = bucket_bound(sample) else {
+                    warn!(
+                        metric = %sample.name,
+                        "a bucket sample carries no usable `le` label, so it names no upper \
+                         bound; it is left out of /metrics and the histogram it belongs to \
+                         will under-report at that bound"
+                    );
+                    continue;
+                };
+                match series
+                    .buckets
+                    .iter_mut()
+                    .find(|(existing, _, _)| *existing == bound)
+                {
+                    Some(slot) if slot.2 < sample.timestamp_us => {
+                        *slot = (bound, sample.value, sample.timestamp_us)
+                    }
+                    Some(_) => {}
+                    None => series
+                        .buckets
+                        .push((bound, sample.value, sample.timestamp_us)),
+                }
+            }
+            "_sum" => keep_newest(&mut series.sum, sample.value, sample.timestamp_us),
+            _ => keep_newest(&mut series.count, sample.value, sample.timestamp_us),
+        }
     }
 
-    for (name, series) in grouped {
+    for (name, family) in grouped {
+        if !family.histograms.is_empty() {
+            render_histogram(out, &name, family.histograms);
+            continue;
+        }
         let _ = writeln!(out, "# HELP {name} Latest sample pushed to deis-telemetry");
-        // Every pushed series is exported as a gauge: this service is handed
-        // values, it does not know whether the producer resets them, so it
-        // cannot honestly claim a counter's monotonicity.
+        // Every other pushed series is exported as a gauge: this service is
+        // handed values, it does not know whether the producer resets them,
+        // so it cannot honestly claim a counter's monotonicity. A histogram
+        // is the exception only because its three parts say so themselves.
         let _ = writeln!(out, "# TYPE {name} gauge");
-        for (labels, (value, _)) in series {
+        for (labels, (value, _)) in family.gauges {
             // No timestamp is emitted: the scrape time is used instead, which
             // keeps samples inside Prometheus's staleness window. The export
             // window already keeps series that stopped reporting out.
@@ -82,7 +203,65 @@ fn render_samples(out: &mut String, samples: &[MetricRecord]) {
     }
 }
 
-/// Build the `{k="v",...}` part, with `app_id` first when present.
+/// Write one histogram family.
+///
+/// The bucket lines ascend by upper bound and `+Inf` comes last, because that
+/// is the order `histogram_quantile` reads them in.
+fn render_histogram(out: &mut String, name: &str, series: BTreeMap<String, HistogramSeries>) {
+    let _ = writeln!(
+        out,
+        "# HELP {name} Latest histogram pushed to deis-telemetry"
+    );
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    for (labels, mut series) in series {
+        // A family with no `+Inf` bucket is one a scraper cannot compute a
+        // quantile from. The observation count is exactly what that bucket
+        // holds, so it stands in when the producer left it out; when there is
+        // no count either, nothing honest can be written and the gap is said
+        // out loud instead of being invented.
+        let has_infinity = series
+            .buckets
+            .iter()
+            .any(|(bound, _, _)| bound.is_infinite());
+        if !has_infinity {
+            match series.count {
+                Some((count, timestamp_us)) => {
+                    series.buckets.push((f64::INFINITY, count, timestamp_us))
+                }
+                None => warn!(
+                    metric = %name,
+                    labels = %labels,
+                    "a histogram series arrived with no +Inf bucket and no count, so it has \
+                     no total; histogram_quantile will refuse the family until the producer \
+                     sends a complete histogram"
+                ),
+            }
+        }
+        series
+            .buckets
+            .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (bound, value, _) in &series.buckets {
+            let mut pairs = series.pairs.clone();
+            pairs.push(("le".to_string(), format_value(*bound)));
+            let _ = writeln!(
+                out,
+                "{name}_bucket{} {}",
+                render_pairs(&pairs),
+                format_value(*value)
+            );
+        }
+        if let Some((sum, _)) = series.sum {
+            let _ = writeln!(out, "{name}_sum{labels} {}", format_value(sum));
+        }
+        if let Some((count, _)) = series.count {
+            let _ = writeln!(out, "{name}_count{labels} {}", format_value(count));
+        }
+    }
+}
+
+/// Build the label pairs of one sample, `app_id` first when present, leaving
+/// out `skip` (a label the caller renders itself, such as a bucket's `le`).
 ///
 /// One label name may appear at most once on a line. Prometheus does not skip
 /// a line that repeats one, it fails the entire scrape, so a single bad pair
@@ -92,14 +271,17 @@ fn render_samples(out: &mut String, samples: &[MetricRecord]) {
 /// `http.status` and `http-status` are two different names to a producer and
 /// the same name here. The first one wins, which also settles `app_id`: the
 /// dedicated field is placed first, so a label of that name loses to it.
-fn label_signature(sample: &MetricRecord) -> String {
-    let mut pairs: Vec<(String, &str)> = Vec::new();
+fn label_pairs(sample: &MetricRecord, skip: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
     let mut taken: BTreeSet<String> = BTreeSet::new();
     if !sample.app_id.is_empty() {
         taken.insert("app_id".to_string());
-        pairs.push(("app_id".to_string(), sample.app_id.as_str()));
+        pairs.push(("app_id".to_string(), sample.app_id.clone()));
     }
     for (key, value) in &sample.labels {
+        if !skip.is_empty() && key == skip {
+            continue;
+        }
         let Some(sanitized) = sanitize_name(key) else {
             warn!(
                 label = %key,
@@ -121,8 +303,13 @@ fn label_signature(sample: &MetricRecord) -> String {
             );
             continue;
         }
-        pairs.push((sanitized, value.as_str()));
+        pairs.push((sanitized, value.clone()));
     }
+    pairs
+}
+
+/// Render label pairs as the `{k="v",...}` part of an exported line.
+fn render_pairs(pairs: &[(String, String)]) -> String {
     if pairs.is_empty() {
         return String::new();
     }
@@ -336,6 +523,141 @@ mod tests {
             text.contains("deis_telemetry_retention_metric_samples_dropped_total 5"),
             "retention deletes data permanently and must be observable:\n{text}"
         );
+    }
+
+    #[test]
+    fn buckets_sum_and_count_are_exported_as_one_histogram() {
+        // The three series a producer pushes have to come back out as one
+        // family with a histogram TYPE line, or histogram_quantile has
+        // nothing to compute a p99 from - which is the whole reason the
+        // runtime pushes buckets instead of a high-water gauge.
+        let text = render(
+            &[
+                sample("latency_ms_bucket", "shop", &[("le", "10")], 3.0, 10),
+                sample("latency_ms_bucket", "shop", &[("le", "100")], 7.0, 10),
+                sample("latency_ms_bucket", "shop", &[("le", "+Inf")], 9.0, 10),
+                sample("latency_ms_sum", "shop", &[], 420.0, 10),
+                sample("latency_ms_count", "shop", &[], 9.0, 10),
+            ],
+            &ServiceStats::new(),
+        );
+        assert!(
+            text.contains("# TYPE latency_ms histogram"),
+            "unexpected export:\n{text}"
+        );
+        assert_eq!(text.matches("# TYPE latency_ms").count(), 1);
+        assert!(text.contains("latency_ms_bucket{app_id=\"shop\",le=\"10\"} 3"));
+        assert!(text.contains("latency_ms_bucket{app_id=\"shop\",le=\"+Inf\"} 9"));
+        assert!(text.contains("latency_ms_sum{app_id=\"shop\"} 420"));
+        assert!(text.contains("latency_ms_count{app_id=\"shop\"} 9"));
+        assert!(
+            !text.contains("# TYPE latency_ms_bucket"),
+            "the parts must not also be exported as families of their own:\n{text}"
+        );
+    }
+
+    #[test]
+    fn bucket_lines_ascend_by_bound_with_infinity_last() {
+        // Pushed in the wrong order on purpose: a scraper reads the bounds in
+        // the order they appear, and out-of-order buckets interpolate
+        // nonsense.
+        let text = render(
+            &[
+                sample("latency_ms_bucket", "shop", &[("le", "+Inf")], 9.0, 10),
+                sample("latency_ms_bucket", "shop", &[("le", "100")], 7.0, 10),
+                sample("latency_ms_bucket", "shop", &[("le", "2")], 1.0, 10),
+                sample("latency_ms_bucket", "shop", &[("le", "10")], 3.0, 10),
+            ],
+            &ServiceStats::new(),
+        );
+        let bounds: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("latency_ms_bucket"))
+            .map(|line| {
+                let start = line.find("le=\"").expect("a bucket line carries le") + 4;
+                let rest = &line[start..];
+                &rest[..rest.find('"').expect("le is quoted")]
+            })
+            .collect();
+        assert_eq!(bounds, vec!["2", "10", "100", "+Inf"], "got:\n{text}");
+    }
+
+    #[test]
+    fn two_label_sets_of_one_histogram_stay_separate_series() {
+        let text = render(
+            &[
+                sample("latency_ms_bucket", "shop", &[("le", "10")], 1.0, 10),
+                sample("latency_ms_bucket", "blog", &[("le", "10")], 5.0, 10),
+                sample("latency_ms_count", "shop", &[], 1.0, 10),
+                sample("latency_ms_count", "blog", &[], 5.0, 10),
+            ],
+            &ServiceStats::new(),
+        );
+        assert_eq!(text.matches("# TYPE latency_ms histogram").count(), 1);
+        assert!(text.contains("latency_ms_bucket{app_id=\"blog\",le=\"10\"} 5"));
+        assert!(text.contains("latency_ms_bucket{app_id=\"shop\",le=\"10\"} 1"));
+    }
+
+    #[test]
+    fn a_histogram_missing_its_infinity_bucket_gets_one_from_the_count() {
+        // A family with no +Inf bucket is one Prometheus refuses to compute a
+        // quantile from, and the observation count is exactly what that
+        // bucket holds.
+        let text = render(
+            &[
+                sample("latency_ms_bucket", "shop", &[("le", "10")], 3.0, 10),
+                sample("latency_ms_count", "shop", &[], 8.0, 10),
+            ],
+            &ServiceStats::new(),
+        );
+        assert!(
+            text.contains("latency_ms_bucket{app_id=\"shop\",le=\"+Inf\"} 8"),
+            "unexpected export:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_sum_without_buckets_is_still_a_plain_gauge() {
+        // The existing counters end in `_sum` and `_count` and nothing else;
+        // making them part of a histogram nobody pushed would break every
+        // dashboard reading them.
+        let text = render(
+            &[
+                sample(
+                    "deis_runtime_isolate_execution_ms_sum",
+                    "shop",
+                    &[],
+                    5.0,
+                    10,
+                ),
+                sample(
+                    "deis_runtime_isolate_execution_ms_count",
+                    "shop",
+                    &[],
+                    2.0,
+                    10,
+                ),
+            ],
+            &ServiceStats::new(),
+        );
+        assert!(text.contains("# TYPE deis_runtime_isolate_execution_ms_sum gauge"));
+        assert!(text.contains("# TYPE deis_runtime_isolate_execution_ms_count gauge"));
+        assert!(!text.contains("histogram"));
+    }
+
+    #[test]
+    fn a_bucket_without_a_usable_bound_is_left_out_rather_than_exported_wrong() {
+        let text = render(
+            &[
+                sample("latency_ms_bucket", "shop", &[("le", "wat")], 3.0, 10),
+                sample("latency_ms_bucket", "shop", &[("le", "10")], 4.0, 10),
+                sample("latency_ms_count", "shop", &[], 4.0, 10),
+            ],
+            &ServiceStats::new(),
+        );
+        assert!(text.contains("# TYPE latency_ms histogram"));
+        assert!(!text.contains("le=\"wat\""), "got:\n{text}");
+        assert!(text.contains("latency_ms_bucket{app_id=\"shop\",le=\"10\"} 4"));
     }
 
     #[test]

@@ -2,12 +2,17 @@
 //!
 //! Request flow:
 //!
-//! 1. Resolve the application: a non-empty `x-deis-app-id` header names the
-//!    app and must match a configured id (an unknown id is a 404, never a
-//!    fallback to the `Host`); otherwise the `Host` name is matched against
-//!    the route table. Unknown hosts get a 404 once any application is
-//!    configured; with none configured every request is forwarded unchanged
-//!    so a bare instance still works as a plain reverse proxy.
+//! 1. Resolve the application. A non-empty `x-deis-app-id` header names the
+//!    app and must match one this instance knows (an unknown id is a 404,
+//!    never a fallback to the `Host`). Otherwise `Host` plus the request
+//!    path are matched against the control plane's catalog
+//!    ([`crate::catalog`]) first and the locally configured application
+//!    list second - the catalog is the table an operator can change without
+//!    touching this machine, and it is the only one that knows path
+//!    prefixes and per-environment addresses. Unknown hosts get a 404 once
+//!    either table has anything in it; with both empty every request is
+//!    forwarded unchanged so a bare instance still works as a plain reverse
+//!    proxy.
 //! 2. Disabled applications get a 403. Plain HTTP requests for an application
 //!    whose certificate is actually loaded are redirected to HTTPS when the
 //!    policy says so.
@@ -52,6 +57,7 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType};
 use tracing::{debug, warn};
 
+use crate::catalog::table::{CatalogRoutes, MatchSource};
 use crate::config::routes::{RouteTable, normalize_host};
 use crate::config::system::{CompressionAlgo, DEFAULT_MAX_REQUEST_BODY_BYTES};
 use crate::config::{AppConfig, ConfigManager};
@@ -192,32 +198,137 @@ fn https_authority(host: &str, port: u16) -> String {
     }
 }
 
-/// Outcome of matching a request against the route table.
-#[derive(Debug)]
-enum Resolution {
-    /// No application is configured at all: plain reverse proxy mode.
-    Passthrough,
-    /// Applications exist but none matches: 404.
-    NotFound,
-    App(Arc<AppConfig>),
+/// Which table answered "which application is this".
+///
+/// Carried into the log lines because it is the first thing an operator
+/// wants when a request went somewhere unexpected: a catalog route can be
+/// changed through the API, a local one cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedFrom {
+    /// The `x-deis-app-id` header named it outright.
+    Header,
+    /// A route in the control plane's catalog.
+    Catalog,
+    /// The automatic address of an environment.
+    CatalogPreview,
+    /// The application list configured on this machine.
+    Local,
 }
 
-/// The routing rule. A non-empty `x-deis-app-id` is authoritative: it must
-/// name a configured app, and an unknown value is rejected rather than
-/// silently replaced by whatever the `Host` maps to, because the id is what
-/// deis-runtime routes on and the two must not disagree. An empty header counts as
-/// absent.
-fn resolve_app(routes: &RouteTable, requested_id: Option<&str>, host: &str) -> Resolution {
-    if routes.is_empty() {
-        return Resolution::Passthrough;
+impl ResolvedFrom {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResolvedFrom::Header => "header",
+            ResolvedFrom::Catalog => "catalog-route",
+            ResolvedFrom::CatalogPreview => "catalog-preview",
+            ResolvedFrom::Local => "local-config",
+        }
     }
-    let app = match requested_id.filter(|id| !id.is_empty()) {
-        Some(id) => routes.app_by_id(id),
-        None => routes.app_by_host(host),
+}
+
+/// One resolved request: which application and environment it belongs to,
+/// and the local policy for that application when this machine has one.
+#[derive(Debug)]
+struct Resolved {
+    app_id: String,
+    environment: String,
+    /// Certificates, cache policy and the enabled flag. Absent for an
+    /// application only the catalog knows, which is the ordinary case on an
+    /// edge that is driven entirely from the control plane.
+    config: Option<Arc<AppConfig>>,
+    from: ResolvedFrom,
+}
+
+/// Outcome of matching a request.
+#[derive(Debug)]
+enum Resolution {
+    /// Nothing is configured and nothing has been fetched: plain reverse
+    /// proxy mode.
+    Passthrough,
+    /// Something is configured but none of it matches: 404.
+    NotFound,
+    Found(Resolved),
+}
+
+/// The routing rule.
+///
+/// A non-empty `x-deis-app-id` is authoritative: it must name an app this
+/// instance knows, and an unknown value is rejected rather than silently
+/// replaced by whatever the `Host` maps to, because the id is what
+/// deis-runtime routes on and the two must not disagree. An empty header
+/// counts as absent. The header names an *application* and not an
+/// environment, so an app that only the catalog knows resolves to its
+/// default environment.
+///
+/// Without the header, the catalog is consulted before the local list. The
+/// catalog is what an operator edits through the API or the dashboard, and
+/// it is strictly more specific: it matches on host *and* path prefix where
+/// the local list matches on host alone. An application the catalog resolves
+/// still picks up its local configuration when this machine has one, so a
+/// certificate or a cache policy written here keeps applying.
+fn resolve_app(
+    routes: &RouteTable,
+    catalog: &CatalogRoutes,
+    requested_id: Option<&str>,
+    host: &str,
+    path: &str,
+) -> Resolution {
+    // Nothing here claims any host: forward the request untouched. Checked
+    // last of all, after every lookup has failed, so an app the catalog
+    // knows by id is still reachable by header on an instance whose routing
+    // table happens to hold no rule.
+    let nothing_claims_a_host = || {
+        if routes.is_empty() && catalog.is_empty() {
+            Resolution::Passthrough
+        } else {
+            Resolution::NotFound
+        }
     };
-    match app {
-        Some(app) => Resolution::App(Arc::clone(app)),
-        None => Resolution::NotFound,
+
+    if let Some(id) = requested_id.filter(|id| !id.is_empty()) {
+        if let Some(app) = routes.app_by_id(id) {
+            return Resolution::Found(Resolved {
+                app_id: app.id.clone(),
+                environment: app.environment.clone(),
+                config: Some(Arc::clone(app)),
+                from: ResolvedFrom::Header,
+            });
+        }
+        return match catalog.target_by_app_id(id) {
+            Some(target) => Resolution::Found(Resolved {
+                app_id: target.app_id,
+                environment: target.environment,
+                config: None,
+                from: ResolvedFrom::Header,
+            }),
+            None => nothing_claims_a_host(),
+        };
+    }
+
+    if let Some(found) = catalog.match_request(host, path) {
+        // The same app id may also be configured locally; that entry is
+        // this machine's policy for it, not a second opinion on where the
+        // request should go.
+        let config = routes.app_by_id(&found.target.app_id).map(Arc::clone);
+        return Resolution::Found(Resolved {
+            app_id: found.target.app_id,
+            environment: found.target.environment,
+            config,
+            from: match found.source {
+                MatchSource::Route => ResolvedFrom::Catalog,
+                MatchSource::Preview => ResolvedFrom::CatalogPreview,
+            },
+        });
+    }
+
+    match routes.app_by_host(host) {
+        Some(app) => Resolution::Found(Resolved {
+            app_id: app.id.clone(),
+            environment: app.environment.clone(),
+            config: Some(Arc::clone(app)),
+            from: ResolvedFrom::Local,
+        }),
+        None => nothing_claims_a_host(),
     }
 }
 
@@ -316,18 +427,39 @@ impl ProxyHttp for DeisProxy {
         }
 
         let routes = self.config.routes();
+        let catalog = self.config.catalog_routes();
         let requested_id = session
             .get_header(APP_ID_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        // Resolved in its own statement so the borrow of the request header
+        // ends here: the arms below need the session mutably, and the path is
+        // read again rather than copied, which keeps an allocation off every
+        // request.
+        let resolution = resolve_app(
+            &routes,
+            &catalog,
+            requested_id.as_deref(),
+            &ctx.host,
+            session.req_header().uri.path(),
+        );
 
-        let app = match resolve_app(&routes, requested_id.as_deref(), &ctx.host) {
+        let resolved = match resolution {
             Resolution::Passthrough => {
-                debug!(host = %ctx.host, "no applications configured; forwarding unchanged");
+                debug!(
+                    host = %ctx.host,
+                    "no applications configured and no routing table fetched; forwarding unchanged"
+                );
                 return Ok(false);
             }
             Resolution::NotFound => {
-                debug!(host = %ctx.host, app_id = ?requested_id, "no application for request");
+                debug!(
+                    host = %ctx.host,
+                    path = %session.req_header().uri.path(),
+                    app_id = ?requested_id,
+                    catalog_version = %catalog.version(),
+                    "no application for request"
+                );
                 session
                     .respond_error_with_body(
                         404,
@@ -336,31 +468,57 @@ impl ProxyHttp for DeisProxy {
                     .await?;
                 return Ok(true);
             }
-            Resolution::App(app) => app,
+            Resolution::Found(resolved) => resolved,
         };
 
-        if !app.enabled {
-            debug!(host = %ctx.host, app_id = %app.id, environment = %app.environment, "application disabled");
+        // A local entry that is switched off is this machine's kill switch
+        // for that application; it applies however the request was routed.
+        if let Some(config) = &resolved.config
+            && !config.enabled
+        {
+            debug!(
+                host = %ctx.host,
+                app_id = %resolved.app_id,
+                environment = %resolved.environment,
+                "application disabled"
+            );
             session
                 .respond_error_with_body(403, Bytes::from_static(b"application disabled\n"))
                 .await?;
             return Ok(true);
         }
-        ctx.app_id = Some(app.id.clone());
-        ctx.environment = Some(app.environment.clone());
+        debug!(
+            host = %ctx.host,
+            path = %session.req_header().uri.path(),
+            app_id = %resolved.app_id,
+            environment = %resolved.environment,
+            resolved_from = resolved.from.as_str(),
+            "request routed"
+        );
+        ctx.app_id = Some(resolved.app_id.clone());
+        ctx.environment = Some(resolved.environment.clone());
 
         let system = self.config.get_system_config();
         let tls_ports = system.tls_ports();
+        // Whether a handshake for this request would actually succeed. An
+        // application configured here answers on the certificates it names;
+        // one only the catalog knows has none of its own, so the question is
+        // whether any certificate would be served for this host - which is
+        // how a wildcard certificate covers a whole preview zone.
+        let https_ready = match &resolved.config {
+            Some(config) => routes.https_available(config),
+            None => routes.https_available_for_host(&ctx.host),
+        };
         if !ctx.tls
             && system.https().auto_redirect_to_https
-            && routes.https_available(&app)
+            && https_ready
             && let Some(port) = tls_ports.first()
         {
             if ctx.host.is_empty() {
                 // Only reachable through the explicit app id header; the
                 // redirect is a convenience, so forward rather than build a
                 // Location without a host.
-                debug!(app_id = %app.id, "request carries no host; cannot build an HTTPS redirect, forwarding");
+                debug!(app_id = %resolved.app_id, "request carries no host; cannot build an HTTPS redirect, forwarding");
                 return Ok(false);
             }
             let path = session
@@ -371,7 +529,7 @@ impl ProxyHttp for DeisProxy {
                 .unwrap_or("/");
             let authority = https_authority(&ctx.host, *port);
             let location = format!("https://{authority}{path}");
-            debug!(host = %ctx.host, app_id = %app.id, %location, "redirecting to HTTPS");
+            debug!(host = %ctx.host, app_id = %resolved.app_id, %location, "redirecting to HTTPS");
 
             let mut resp = ResponseHeader::build(301, Some(2))?;
             resp.insert_header("Location", location.as_str())?;
@@ -571,24 +729,45 @@ mod tests {
         RouteTable::build(&apps, None)
     }
 
-    fn resolved_id(resolution: Resolution) -> Option<String> {
+    /// The catalog table the routing tests match against. `zone` turns the
+    /// automatic per-environment addresses on.
+    fn catalog(json: &str, zone: Option<&str>) -> CatalogRoutes {
+        let document: crate::catalog::wire::RoutingTableDocument =
+            serde_json::from_str(json).unwrap();
+        document.validate().unwrap();
+        let zone = zone.and_then(crate::catalog::PreviewZone::new);
+        CatalogRoutes::build(&document, zone.as_ref())
+    }
+
+    fn no_catalog() -> CatalogRoutes {
+        CatalogRoutes::default()
+    }
+
+    fn resolved(resolution: Resolution) -> Option<Resolved> {
         match resolution {
-            Resolution::App(app) => Some(app.id.clone()),
+            Resolution::Found(found) => Some(found),
             _ => None,
         }
     }
 
+    fn resolved_id(resolution: Resolution) -> Option<String> {
+        resolved(resolution).map(|found| found.app_id)
+    }
+
     fn resolved_environment(resolution: Resolution) -> Option<String> {
-        match resolution {
-            Resolution::App(app) => Some(app.environment.clone()),
-            _ => None,
-        }
+        resolved(resolution).map(|found| found.environment)
     }
 
     #[test]
     fn header_wins_when_it_names_a_known_app() {
         let routes = table(&[("shop", "shop.example.com"), ("blog", "blog.example.com")]);
-        let resolution = resolve_app(&routes, Some("blog"), "shop.example.com");
+        let resolution = resolve_app(
+            &routes,
+            &no_catalog(),
+            Some("blog"),
+            "shop.example.com",
+            "/",
+        );
         assert_eq!(resolved_id(resolution).as_deref(), Some("blog"));
     }
 
@@ -596,11 +775,23 @@ mod tests {
     fn unknown_header_is_rejected_even_for_a_known_host() {
         let routes = table(&[("shop", "shop.example.com")]);
         assert!(matches!(
-            resolve_app(&routes, Some("Shop"), "shop.example.com"),
+            resolve_app(
+                &routes,
+                &no_catalog(),
+                Some("Shop"),
+                "shop.example.com",
+                "/"
+            ),
             Resolution::NotFound
         ));
         assert!(matches!(
-            resolve_app(&routes, Some("other"), "shop.example.com"),
+            resolve_app(
+                &routes,
+                &no_catalog(),
+                Some("other"),
+                "shop.example.com",
+                "/"
+            ),
             Resolution::NotFound
         ));
     }
@@ -608,23 +799,209 @@ mod tests {
     #[test]
     fn empty_header_falls_back_to_the_host() {
         let routes = table(&[("shop", "shop.example.com")]);
-        let resolution = resolve_app(&routes, Some(""), "shop.example.com");
+        let resolution = resolve_app(&routes, &no_catalog(), Some(""), "shop.example.com", "/");
         assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
-        let resolution = resolve_app(&routes, None, "shop.example.com");
+        let resolution = resolve_app(&routes, &no_catalog(), None, "shop.example.com", "/");
         assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
         assert!(matches!(
-            resolve_app(&routes, None, "other.example.com"),
+            resolve_app(&routes, &no_catalog(), None, "other.example.com", "/"),
             Resolution::NotFound
         ));
     }
 
     #[test]
-    fn no_apps_means_passthrough() {
+    fn no_apps_and_no_routing_table_means_passthrough() {
         let routes = table(&[]);
         assert!(matches!(
-            resolve_app(&routes, Some("anything"), "any.example.com"),
+            resolve_app(
+                &routes,
+                &no_catalog(),
+                Some("anything"),
+                "any.example.com",
+                "/"
+            ),
             Resolution::Passthrough
         ));
+    }
+
+    #[test]
+    fn a_fetched_routing_table_alone_ends_passthrough() {
+        // With no local application list, a catalog route is the only thing
+        // routing this instance - and an unmatched host must then be a 404
+        // rather than a blind forward to the upstream pool.
+        let catalog = catalog(
+            r#"{"version":"v1","routes":[{"app_id":"shop","environment":"production","host":"shop.example.com","path_prefix":"/"}],"environments":[]}"#,
+            None,
+        );
+        let routes = table(&[]);
+        assert_eq!(
+            resolved_id(resolve_app(
+                &routes,
+                &catalog,
+                None,
+                "shop.example.com",
+                "/"
+            ))
+            .as_deref(),
+            Some("shop")
+        );
+        assert!(matches!(
+            resolve_app(&routes, &catalog, None, "other.example.com", "/"),
+            Resolution::NotFound
+        ));
+    }
+
+    #[test]
+    fn a_catalog_path_prefix_route_reaches_the_data_plane() {
+        // The gap this closes: a route created through the control plane
+        // used to be read by nobody at all.
+        let catalog = catalog(
+            r#"{"version":"v1","routes":[
+                {"app_id":"api","environment":"pr-42","host":"example.com","path_prefix":"/api","priority":0},
+                {"app_id":"site","environment":"production","host":"example.com","path_prefix":"/","priority":0}
+            ],"environments":[]}"#,
+            None,
+        );
+        let routes = table(&[]);
+        let found = resolved(resolve_app(
+            &routes,
+            &catalog,
+            None,
+            "example.com",
+            "/api/users",
+        ))
+        .unwrap();
+        assert_eq!(found.app_id, "api");
+        assert_eq!(found.environment, "pr-42");
+        assert_eq!(found.from, ResolvedFrom::Catalog);
+        assert_eq!(
+            resolved_id(resolve_app(&routes, &catalog, None, "example.com", "/")).as_deref(),
+            Some("site")
+        );
+    }
+
+    #[test]
+    fn a_catalog_route_beats_a_local_host_entry_and_keeps_its_local_policy() {
+        // Both tables know shop.example.com. The catalog decides where the
+        // request goes - it is the one an operator can change through the
+        // API - and the local entry still supplies this machine's policy
+        // for that application.
+        let routes = table(&[("shop", "shop.example.com")]);
+        let catalog = catalog(
+            r#"{"version":"v1","routes":[{"app_id":"shop","environment":"pr-9","host":"shop.example.com","path_prefix":"/"}],"environments":[]}"#,
+            None,
+        );
+        let found = resolved(resolve_app(
+            &routes,
+            &catalog,
+            None,
+            "shop.example.com",
+            "/",
+        ))
+        .unwrap();
+        assert_eq!(found.app_id, "shop");
+        assert_eq!(found.environment, "pr-9");
+        assert_eq!(found.from, ResolvedFrom::Catalog);
+        assert!(
+            found.config.is_some(),
+            "the local entry is this machine's policy for the app, not a second opinion on routing"
+        );
+    }
+
+    #[test]
+    fn a_host_the_catalog_does_not_claim_still_falls_to_the_local_list() {
+        let routes = table(&[("shop", "shop.example.com")]);
+        let catalog = catalog(
+            r#"{"version":"v1","routes":[{"app_id":"other","environment":"production","host":"other.example.com","path_prefix":"/"}],"environments":[]}"#,
+            None,
+        );
+        let found = resolved(resolve_app(
+            &routes,
+            &catalog,
+            None,
+            "shop.example.com",
+            "/",
+        ))
+        .unwrap();
+        assert_eq!(found.app_id, "shop");
+        assert_eq!(found.from, ResolvedFrom::Local);
+    }
+
+    #[test]
+    fn a_preview_address_routes_to_its_environment() {
+        let catalog = catalog(
+            r#"{"version":"v1","routes":[],"environments":[{"app_id":"shop","environment":"pr-42"}]}"#,
+            Some("preview.example.com"),
+        );
+        let routes = table(&[]);
+        let found = resolved(resolve_app(
+            &routes,
+            &catalog,
+            None,
+            "pr-42--shop.preview.example.com",
+            "/anything",
+        ))
+        .unwrap();
+        assert_eq!(found.app_id, "shop");
+        assert_eq!(found.environment, "pr-42");
+        assert_eq!(found.from, ResolvedFrom::CatalogPreview);
+    }
+
+    #[test]
+    fn the_header_can_name_an_app_only_the_catalog_knows() {
+        let catalog = catalog(
+            r#"{"version":"v1","routes":[{"app_id":"shop","environment":"production","host":"shop.example.com","path_prefix":"/"}],
+                "environments":[{"app_id":"shop","environment":"production"},{"app_id":"shop","environment":"pr-42"}]}"#,
+            None,
+        );
+        let routes = table(&[]);
+        let found = resolved(resolve_app(
+            &routes,
+            &catalog,
+            Some("shop"),
+            "anything.test",
+            "/",
+        ))
+        .unwrap();
+        assert_eq!(found.app_id, "shop");
+        assert_eq!(
+            found.environment,
+            deis_wire::conventions::DEFAULT_ENVIRONMENT,
+            "the header names an application, so the only honest environment is the default one"
+        );
+        assert!(matches!(
+            resolve_app(&routes, &catalog, Some("nothing"), "anything.test", "/"),
+            Resolution::NotFound
+        ));
+    }
+
+    #[test]
+    fn a_catalog_with_apps_but_no_route_still_forwards_unmatched_traffic() {
+        // The shape a platform has before anyone creates a route, and the
+        // shape the bundled demo runs in: applications and environments
+        // exist, nothing claims a hostname. A bare instance must still be a
+        // plain reverse proxy, and an app named outright by header must
+        // still resolve.
+        let catalog = catalog(
+            r#"{"version":"v1","routes":[],"environments":[{"app_id":"demo","environment":"production"}]}"#,
+            None,
+        );
+        let routes = table(&[]);
+        assert!(matches!(
+            resolve_app(&routes, &catalog, None, "127.0.0.1", "/"),
+            Resolution::Passthrough
+        ));
+        assert_eq!(
+            resolved_id(resolve_app(
+                &routes,
+                &catalog,
+                Some("demo"),
+                "127.0.0.1",
+                "/"
+            ))
+            .as_deref(),
+            Some("demo")
+        );
     }
 
     #[test]
@@ -633,7 +1010,7 @@ mod tests {
         // pushed without one must still resolve to a concrete value rather
         // than leave it unset.
         let routes = table(&[("shop", "shop.example.com")]);
-        let resolution = resolve_app(&routes, None, "shop.example.com");
+        let resolution = resolve_app(&routes, &no_catalog(), None, "shop.example.com", "/");
         assert_eq!(
             resolved_environment(resolution).as_deref(),
             Some(deis_wire::conventions::DEFAULT_ENVIRONMENT)

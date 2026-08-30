@@ -23,6 +23,16 @@ pub struct Config {
     /// How many days of metric samples to keep.
     #[serde(default = "default_metric_retention_days")]
     pub metric_retention_days: u32,
+    /// How many days of traces to keep. Traces live in one table per UTC day
+    /// like logs, and the sweeper drops whole tables older than this.
+    ///
+    /// Shorter than `log_retention_days` on purpose: there is one trace per
+    /// invocation whether or not the application logged anything, so the
+    /// table grows with traffic rather than with how chatty the code is. An
+    /// operator who wants a longer history should raise this deliberately,
+    /// having looked at the disk it costs.
+    #[serde(default = "default_trace_retention_days")]
+    pub trace_retention_days: u32,
     /// Seconds between retention sweeps. A sweep also runs once at startup.
     #[serde(default = "default_retention_sweep_interval_secs")]
     pub retention_sweep_interval_secs: u64,
@@ -31,6 +41,11 @@ pub struct Config {
     /// are never blocked and storage is unaffected).
     #[serde(default = "default_tail_capacity")]
     pub tail_capacity: usize,
+    /// How many records the live trace fan-out buffer holds. Separate from
+    /// `tail_capacity`, and larger by default, because traces arrive at one
+    /// record per invocation.
+    #[serde(default = "default_trace_tail_capacity")]
+    pub trace_tail_capacity: usize,
     /// Page size used when a query does not ask for one.
     #[serde(default = "default_query_default_limit")]
     pub query_default_limit: u32,
@@ -64,12 +79,20 @@ fn default_metric_retention_days() -> u32 {
     30
 }
 
+fn default_trace_retention_days() -> u32 {
+    3
+}
+
 fn default_retention_sweep_interval_secs() -> u64 {
     3600
 }
 
 fn default_tail_capacity() -> usize {
     1024
+}
+
+fn default_trace_tail_capacity() -> usize {
+    4096
 }
 
 fn default_query_default_limit() -> u32 {
@@ -92,8 +115,10 @@ impl Default for Config {
             data_dir: default_data_dir(),
             log_retention_days: default_log_retention_days(),
             metric_retention_days: default_metric_retention_days(),
+            trace_retention_days: default_trace_retention_days(),
             retention_sweep_interval_secs: default_retention_sweep_interval_secs(),
             tail_capacity: default_tail_capacity(),
+            trace_tail_capacity: default_trace_tail_capacity(),
             query_default_limit: default_query_default_limit(),
             query_max_limit: default_query_max_limit(),
             metrics_export_window_secs: default_metrics_export_window_secs(),
@@ -127,11 +152,17 @@ impl Config {
         if self.metric_retention_days == 0 {
             anyhow::bail!("metric_retention_days must be at least 1");
         }
+        if self.trace_retention_days == 0 {
+            anyhow::bail!("trace_retention_days must be at least 1");
+        }
         if self.retention_sweep_interval_secs == 0 {
             anyhow::bail!("retention_sweep_interval_secs must be at least 1");
         }
         if self.tail_capacity == 0 {
             anyhow::bail!("tail_capacity must be at least 1");
+        }
+        if self.trace_tail_capacity == 0 {
+            anyhow::bail!("trace_tail_capacity must be at least 1");
         }
         if self.query_default_limit == 0 || self.query_max_limit == 0 {
             anyhow::bail!("query_default_limit and query_max_limit must be at least 1");
@@ -157,6 +188,8 @@ mod tests {
         assert_eq!(config.listen, "127.0.0.1:8092");
         assert_eq!(config.metrics_listen, "127.0.0.1:8093");
         assert_eq!(config.log_retention_days, 7);
+        assert_eq!(config.trace_retention_days, 3);
+        assert_eq!(config.trace_tail_capacity, 4096);
         config.validate().expect("defaults must be valid");
     }
 
@@ -188,6 +221,17 @@ mod tests {
             err.to_string().contains("retention_days"),
             "error should name the unknown key, got: {err}"
         );
+    }
+
+    #[test]
+    fn zero_trace_retention_is_rejected() {
+        // Zero would make the first sweep drop today's traces, which is the
+        // opposite of what anybody means by "keep no history".
+        let config = Config {
+            trace_retention_days: 0,
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! REST surface of the catalog: apps, versions, environments,
-//! deployments, routes, secrets, and the two endpoints nodes use to work
-//! out what they should be running (`assignments` and the bundle
-//! download).
+//! deployments, routes, secrets, and the endpoints the data plane uses to
+//! work out what it should be running (`assignments` and the bundle
+//! download for a runtime node, `routing_table` for deis-proxy).
 //!
 //! It is built as two routers, because the two halves answer to different
 //! credentials:
@@ -9,7 +9,8 @@
 //! * [`router`] is the human surface - dashboard and CLI. It is merged into
 //!   the part of the API guarded by the API key, which `api_auth_enabled`
 //!   turns on and off.
-//! * [`node_router`] is what a runtime node calls. It carries its own
+//! * [`node_router`] is what the platform's own processes call - a runtime
+//!   node, and deis-proxy for the routing table. It carries its own
 //!   authentication ([`crate::api::middleware::node_auth`]) and ignores
 //!   `api_auth_enabled` entirely: the assignment list hands out every
 //!   environment's decrypted secrets, so that channel cannot be left open by
@@ -20,6 +21,7 @@ pub mod assignments;
 pub mod deployments;
 pub mod environments;
 pub mod routes;
+pub mod routing_table;
 pub mod secrets;
 pub mod versions;
 
@@ -119,13 +121,20 @@ pub fn router(state: CatalogState) -> Router {
         .with_state(state)
 }
 
-/// Build the node half: the assignment list and the bundle download.
+/// Build the node half: the assignment list, the bundle download and the
+/// routing table.
 ///
 /// The authentication layer is applied here rather than by the caller, so
-/// there is no way to mount these two routes without it. Both exist for
-/// runtime nodes; a dashboard API key is not accepted, because the list one
-/// of them returns contains secret values that the dashboard is deliberately
-/// unable to read back (docs/architecture.zh.md section 8).
+/// there is no way to mount these routes without it. A dashboard API key is
+/// not accepted on any of them, for two different reasons:
+///
+/// * the assignment list returns secret values that the dashboard is
+///   deliberately unable to read back (docs/architecture.zh.md section 8);
+/// * the routing table is what deis-proxy runs on, and `api_auth_enabled`
+///   defaults to off - mounting it on the human router would publish a map
+///   of every application and hostname on the platform to anyone who can
+///   reach the port. deis-proxy already holds a `node_preshared_keys` value
+///   for its gRPC control channel, so this costs it no second credential.
 pub fn node_router(state: CatalogState) -> Router {
     let auth = state.node_auth.clone();
     Router::new()
@@ -139,6 +148,10 @@ pub fn node_router(state: CatalogState) -> Router {
         .route(
             "/api/apps/:app_id/versions/:version_id/bundle",
             get(versions::download_bundle),
+        )
+        .route(
+            routing_table::ROUTING_TABLE_ROUTE,
+            get(routing_table::routing_table),
         )
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(auth, node_auth))

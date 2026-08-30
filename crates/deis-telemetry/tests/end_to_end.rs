@@ -8,9 +8,11 @@ use std::net::SocketAddr;
 use deis_telemetry::config::Config;
 use deis_telemetry::proto::log_service_client::LogServiceClient;
 use deis_telemetry::proto::metric_service_client::MetricServiceClient;
+use deis_telemetry::proto::trace_service_client::TraceServiceClient;
 use deis_telemetry::proto::{
-    LogEntry, MetricSample, PushLogsRequest, PushMetricsRequest, QueryMetricsRequest, QueryRequest,
-    TailRequest,
+    LogEntry, MetricSample, PushLogsRequest, PushMetricsRequest, PushTracesRequest,
+    QueryMetricsRequest, QueryRequest, QueryTracesRequest, TailRequest, TailTracesRequest,
+    TraceRecord,
 };
 use deis_telemetry::server::{self, RunningServer};
 use deis_telemetry::{MAX_GRPC_MESSAGE_BYTES, now_us};
@@ -52,6 +54,43 @@ async fn connect_metrics(server: &RunningServer) -> MetricServiceClient<Channel>
     MetricServiceClient::new(channel(server).await)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+}
+
+async fn connect_traces(server: &RunningServer) -> TraceServiceClient<Channel> {
+    TraceServiceClient::new(channel(server).await)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+}
+
+/// `InvocationKind::HttpRequest`.
+const KIND_HTTP: i32 = 1;
+/// `InvocationOutcome::Ok`.
+const OUTCOME_OK: i32 = 1;
+/// `InvocationOutcome::ApplicationError`.
+const OUTCOME_APPLICATION_ERROR: i32 = 2;
+/// `InvocationOutcome::ExecutionTimeout`.
+const OUTCOME_EXECUTION_TIMEOUT: i32 = 3;
+
+fn invocation(app_id: &str, outcome: i32, target: &str, started_us: i64) -> TraceRecord {
+    TraceRecord {
+        trace_id: format!("trace-{started_us}"),
+        started_us,
+        duration_us: 12_345,
+        app_id: app_id.to_string(),
+        environment: "production".to_string(),
+        node: "node-a".to_string(),
+        kind: KIND_HTTP,
+        outcome,
+        target: target.to_string(),
+        method: "GET".to_string(),
+        status: if outcome == OUTCOME_OK { 200 } else { 500 },
+        error: if outcome == OUTCOME_OK {
+            String::new()
+        } else {
+            "boom".to_string()
+        },
+        attributes: HashMap::new(),
+    }
 }
 
 fn entry(app_id: &str, level: i32, message: &str, timestamp_us: i64) -> LogEntry {
@@ -100,6 +139,7 @@ async fn push_query_and_tail_against_a_running_service() {
     let mut health = HealthClient::new(channel(&server).await);
     for service in [
         "deis.telemetry.LogService",
+        "deis.telemetry.TraceService",
         "deis.telemetry.MetricService",
         // The empty name asks about the server as a whole.
         "",
@@ -427,5 +467,236 @@ async fn stored_logs_survive_a_restart() {
         .into_inner();
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].message, "written before the restart");
+    server.shutdown().await.expect("shutdown must succeed");
+}
+
+/// The question section 4.6 of the gap review says the platform cannot
+/// answer: which invocations failed, and which of those the platform itself
+/// stopped. Driven through the real service, over gRPC, end to end.
+#[tokio::test]
+async fn failed_invocations_are_queryable_without_reading_a_log_line() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()))
+        .await
+        .expect("the service must start");
+    let mut traces = connect_traces(&server).await;
+
+    // Opened before anything is pushed, so nothing can slip past it.
+    let mut live = traces
+        .tail_traces(TailTracesRequest {
+            app_id: "shop".to_string(),
+            outcomes: vec![OUTCOME_APPLICATION_ERROR, OUTCOME_EXECUTION_TIMEOUT],
+            ..Default::default()
+        })
+        .await
+        .expect("tail_traces must open")
+        .into_inner();
+
+    let base = now_us() - 10_000;
+    let pushed = traces
+        .push_traces(PushTracesRequest {
+            records: vec![
+                invocation("shop", OUTCOME_OK, "https://shop.test/", base + 1),
+                invocation(
+                    "shop",
+                    OUTCOME_APPLICATION_ERROR,
+                    "https://shop.test/checkout",
+                    base + 2,
+                ),
+                invocation(
+                    "shop",
+                    OUTCOME_EXECUTION_TIMEOUT,
+                    "https://shop.test/report",
+                    base + 3,
+                ),
+                invocation(
+                    "blog",
+                    OUTCOME_APPLICATION_ERROR,
+                    "https://blog.test/",
+                    base + 4,
+                ),
+            ],
+            // The producer says what it threw away, so a gap in the history
+            // is a number rather than nothing.
+            sampled_out: 7,
+            dropped: 2,
+            metadata: HashMap::new(),
+        })
+        .await
+        .expect("push_traces must succeed")
+        .into_inner();
+    assert_eq!(pushed.accepted_count, 4);
+    assert_eq!(pushed.rejected_count, 0);
+
+    // The follower sees this application's failures and nothing else.
+    let first = live
+        .message()
+        .await
+        .expect("tail_traces must stream")
+        .expect("a first record must arrive");
+    assert_eq!(first.target, "https://shop.test/checkout");
+    let second = live
+        .message()
+        .await
+        .expect("tail_traces must stream")
+        .expect("a second record must arrive");
+    assert_eq!(second.outcome, OUTCOME_EXECUTION_TIMEOUT);
+
+    // "Which of this application's invocations failed in this window", newest
+    // first, with the platform's own verdict on each.
+    let failures = traces
+        .query_traces(QueryTracesRequest {
+            app_id: "shop".to_string(),
+            start_us: base,
+            outcomes: vec![OUTCOME_APPLICATION_ERROR, OUTCOME_EXECUTION_TIMEOUT],
+            ..Default::default()
+        })
+        .await
+        .expect("query_traces must answer")
+        .into_inner();
+    let targets: Vec<&str> = failures
+        .records
+        .iter()
+        .map(|record| record.target.as_str())
+        .collect();
+    assert_eq!(
+        targets,
+        vec!["https://shop.test/report", "https://shop.test/checkout"]
+    );
+    assert_eq!(failures.records[0].outcome, OUTCOME_EXECUTION_TIMEOUT);
+    assert_eq!(failures.records[0].status, 500);
+    assert_eq!(failures.records[0].node, "node-a");
+    assert_eq!(failures.records[0].environment, "production");
+
+    // One invocation, by the id its log lines carry.
+    let one = traces
+        .query_traces(QueryTracesRequest {
+            trace_id: format!("trace-{}", base + 2),
+            ..Default::default()
+        })
+        .await
+        .expect("query_traces must answer")
+        .into_inner();
+    assert_eq!(one.records.len(), 1);
+    assert_eq!(one.records[0].target, "https://shop.test/checkout");
+
+    // What the producer threw away is on the scrape, not lost in silence.
+    let scrape = http_get(server.metrics_addr, "/metrics").await;
+    assert!(
+        scrape.contains("deis_telemetry_traces_accepted_total 4"),
+        "unexpected scrape:\n{scrape}"
+    );
+    assert!(
+        scrape.contains("deis_telemetry_traces_sampled_out_total 7"),
+        "sampling gaps must be visible:\n{scrape}"
+    );
+    assert!(
+        scrape.contains("deis_telemetry_traces_dropped_by_producer_total 2"),
+        "records a producer lost must be visible:\n{scrape}"
+    );
+
+    // The stream is deliberately left open: shutdown must not wait for it.
+    server.shutdown().await.expect("shutdown must succeed");
+}
+
+#[tokio::test]
+async fn a_pushed_histogram_is_scraped_as_a_histogram() {
+    // The runtime pushes latency as bucket, sum and count series. If the
+    // scrape endpoint hands them back as unrelated gauges, `histogram_quantile`
+    // has nothing to work with and there is still no p99.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()))
+        .await
+        .expect("the service must start");
+    let mut client = connect_metrics(&server).await;
+
+    let now = now_us();
+    let mut samples = Vec::new();
+    for (bound, count) in [("1", 0.0), ("10", 4.0), ("100", 9.0), ("+Inf", 10.0)] {
+        samples.push(MetricSample {
+            name: "deis_runtime_isolate_execution_ms_bucket".to_string(),
+            app_id: "shop".to_string(),
+            labels: HashMap::from([("le".to_string(), bound.to_string())]),
+            value: count,
+            timestamp_us: now,
+        });
+    }
+    samples.push(MetricSample {
+        name: "deis_runtime_isolate_execution_ms_sum".to_string(),
+        app_id: "shop".to_string(),
+        labels: HashMap::new(),
+        value: 275.0,
+        timestamp_us: now,
+    });
+    samples.push(MetricSample {
+        name: "deis_runtime_isolate_execution_ms_count".to_string(),
+        app_id: "shop".to_string(),
+        labels: HashMap::new(),
+        value: 10.0,
+        timestamp_us: now,
+    });
+    client
+        .push_metrics(PushMetricsRequest {
+            samples,
+            metadata: HashMap::new(),
+        })
+        .await
+        .expect("push must succeed");
+
+    let scrape = http_get(server.metrics_addr, "/metrics").await;
+    assert!(
+        scrape.contains("# TYPE deis_runtime_isolate_execution_ms histogram"),
+        "unexpected scrape:\n{scrape}"
+    );
+    assert!(
+        scrape.contains("deis_runtime_isolate_execution_ms_bucket{app_id=\"shop\",le=\"+Inf\"} 10"),
+        "unexpected scrape:\n{scrape}"
+    );
+    assert!(
+        scrape.contains("deis_runtime_isolate_execution_ms_sum{app_id=\"shop\"} 275"),
+        "unexpected scrape:\n{scrape}"
+    );
+    assert!(
+        scrape.contains("deis_runtime_isolate_execution_ms_count{app_id=\"shop\"} 10"),
+        "unexpected scrape:\n{scrape}"
+    );
+
+    server.shutdown().await.expect("shutdown must succeed");
+}
+
+#[tokio::test]
+async fn stored_traces_survive_a_restart() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = test_config(dir.path());
+
+    let server = server::start(&config)
+        .await
+        .expect("the service must start");
+    let mut traces = connect_traces(&server).await;
+    traces
+        .push_traces(PushTracesRequest {
+            records: vec![invocation(
+                "shop",
+                OUTCOME_EXECUTION_TIMEOUT,
+                "https://shop.test/report",
+                now_us() - 1_000,
+            )],
+            ..Default::default()
+        })
+        .await
+        .expect("push_traces must succeed");
+    server.shutdown().await.expect("shutdown must succeed");
+
+    let server = server::start(&config)
+        .await
+        .expect("the service must start again on the same data dir");
+    let mut traces = connect_traces(&server).await;
+    let page = traces
+        .query_traces(QueryTracesRequest::default())
+        .await
+        .expect("query_traces must answer")
+        .into_inner();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].outcome, OUTCOME_EXECUTION_TIMEOUT);
     server.shutdown().await.expect("shutdown must succeed");
 }

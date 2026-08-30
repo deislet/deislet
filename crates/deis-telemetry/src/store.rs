@@ -57,6 +57,59 @@ pub struct MetricRecord {
     pub timestamp_us: i64,
 }
 
+/// One stored trace record: a single invocation of one application.
+///
+/// The storage-side shape, converted to and from the proto type at the
+/// service boundary so storage does not depend on generated code. `kind` and
+/// `outcome` are the proto enum ordinals, kept as integers so a value this
+/// build does not know about survives a round trip instead of being flattened
+/// to "unspecified".
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceRecord {
+    /// The same id the invocation's log lines carry, which is what makes
+    /// "show me this invocation's log" a `LogFilter { trace_id }` query.
+    pub trace_id: String,
+    pub started_us: i64,
+    pub duration_us: i64,
+    pub app_id: String,
+    pub environment: String,
+    pub node: String,
+    /// `InvocationKind` ordinal.
+    pub kind: i32,
+    /// `InvocationOutcome` ordinal.
+    pub outcome: i32,
+    /// What the invocation was aimed at: a URL, a queue, a cron expression.
+    pub target: String,
+    pub method: String,
+    pub status: i32,
+    pub error: String,
+    /// Extra dimensions, kept ordered so the stored JSON is canonical.
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// Filters for [`TelemetryStore::query_traces`]. `None` and an empty list
+/// mean "no restriction"; the restrictions that are set combine with AND.
+#[derive(Debug, Clone, Default)]
+pub struct TraceFilter {
+    pub app_id: Option<String>,
+    pub environment: Option<String>,
+    /// Inclusive lower bound on `started_us`.
+    pub start_us: Option<i64>,
+    /// Exclusive upper bound on `started_us`.
+    pub end_us: Option<i64>,
+    /// `InvocationKind` ordinals; empty matches every kind.
+    pub kinds: Vec<i32>,
+    /// `InvocationOutcome` ordinals; empty matches every outcome. This is
+    /// how "the invocations that failed" is asked for.
+    pub outcomes: Vec<i32>,
+    pub trace_id: Option<String>,
+    /// Only invocations that ran at least this long.
+    pub min_duration_us: Option<i64>,
+    /// Case-insensitive substring of `target`. SQLite's `lower()` only folds
+    /// ASCII, so a non-ASCII target matches case-sensitively.
+    pub target_contains: Option<String>,
+}
+
 /// Filters for [`TelemetryStore::query_logs`]. `None` means "no restriction"; the
 /// restrictions that are set combine with AND.
 #[derive(Debug, Clone, Default)]
@@ -182,6 +235,56 @@ pub struct MetricPage {
     pub has_more: bool,
 }
 
+/// Position of the last row of a trace page. Keyset based, like the other
+/// two, and ordered by start time: an invocation is filed under the day it
+/// started, so a long one never lands in a partition its start is not in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceCursor {
+    /// Days since the Unix epoch, identifying the partition.
+    pub day: i64,
+    pub started_us: i64,
+    pub row_id: i64,
+}
+
+impl TraceCursor {
+    /// Encode for the wire; opaque to callers.
+    pub fn encode(&self) -> String {
+        format!("{}:{}:{}", self.day, self.started_us, self.row_id)
+    }
+
+    /// Decode a token produced by [`TraceCursor::encode`].
+    pub fn decode(raw: &str) -> Result<Self> {
+        let mut parts = raw.split(':');
+        let mut next = |field: &str| -> Result<i64> {
+            parts
+                .next()
+                .with_context(|| format!("cursor is missing its {field} component"))?
+                .parse::<i64>()
+                .with_context(|| format!("cursor {field} component is not an integer"))
+        };
+        let day = next("day")?;
+        let started_us = next("start time")?;
+        let row_id = next("row id")?;
+        if parts.next().is_some() {
+            anyhow::bail!("cursor has trailing components");
+        }
+        Ok(Self {
+            day,
+            started_us,
+            row_id,
+        })
+    }
+}
+
+/// One page of trace records, newest first.
+#[derive(Debug, Clone, Default)]
+pub struct TracePage {
+    pub records: Vec<TraceRecord>,
+    /// Position to resume from; `None` when the page is the last one.
+    pub next_cursor: Option<TraceCursor>,
+    pub has_more: bool,
+}
+
 /// A log partition removed by a retention sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DroppedPartition {
@@ -195,18 +298,26 @@ pub struct DroppedPartition {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepOutcome {
     pub dropped_partitions: Vec<DroppedPartition>,
+    pub dropped_trace_partitions: Vec<DroppedPartition>,
     pub deleted_metric_samples: usize,
 }
 
 impl SweepOutcome {
     /// True when the sweep removed nothing, so the caller can stay quiet.
     pub fn is_empty(&self) -> bool {
-        self.dropped_partitions.is_empty() && self.deleted_metric_samples == 0
+        self.dropped_partitions.is_empty()
+            && self.dropped_trace_partitions.is_empty()
+            && self.deleted_metric_samples == 0
     }
 
     /// Total rows removed from log partitions.
     pub fn dropped_log_rows(&self) -> i64 {
         self.dropped_partitions.iter().map(|p| p.rows).sum()
+    }
+
+    /// Total rows removed from trace partitions.
+    pub fn dropped_trace_rows(&self) -> i64 {
+        self.dropped_trace_partitions.iter().map(|p| p.rows).sum()
     }
 }
 
@@ -371,7 +482,7 @@ impl TelemetryStore {
         let tx = conn.transaction().context("cannot begin log insert")?;
         let mut written = 0usize;
         for (day, day_records) in by_day {
-            let table = partition_table(day)?;
+            let table = partition_table(LOG_PARTITIONS, day)?;
             create_partition(&tx, &table)?;
             let sql = format!(
                 "INSERT INTO {table}
@@ -414,7 +525,7 @@ impl TelemetryStore {
     ) -> Result<LogPage> {
         let limit = limit.max(1);
         let mut collected = self.with_reader(|conn| {
-            let mut partitions = list_partitions(conn)?;
+            let mut partitions = list_partitions(conn, LOG_PARTITIONS)?;
             partitions.sort_unstable_by(|a, b| b.cmp(a));
 
             let mut collected: Vec<(LogCursor, LogRecord)> = Vec::new();
@@ -423,7 +534,7 @@ impl TelemetryStore {
                 if collected.len() >= want {
                     break;
                 }
-                if !partition_intersects(day, filter) {
+                if !day_intersects(day, filter.start_us, filter.end_us) {
                     continue;
                 }
                 // The cursor points into one partition. Newer partitions were
@@ -434,7 +545,7 @@ impl TelemetryStore {
                     Some(c) if day == c.day => Some(c),
                     _ => None,
                 };
-                let table = partition_table(day)?;
+                let table = partition_table(LOG_PARTITIONS, day)?;
                 let rows = query_partition(
                     conn,
                     &table,
@@ -456,6 +567,123 @@ impl TelemetryStore {
             None
         };
         Ok(LogPage {
+            records: collected.into_iter().map(|(_, record)| record).collect(),
+            next_cursor,
+            has_more,
+        })
+    }
+
+    /// Append trace records, creating day partitions as needed.
+    ///
+    /// Returns the number of rows written. The whole call is one transaction,
+    /// so a batch either lands entirely or not at all.
+    pub fn insert_traces(&self, records: &[TraceRecord]) -> Result<usize> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        // Filed under the day the invocation started, not the day it ended:
+        // that is the timestamp every query orders and bounds by, so a record
+        // must live in the partition that timestamp points at.
+        let mut by_day: BTreeMap<i64, Vec<&TraceRecord>> = BTreeMap::new();
+        for record in records {
+            by_day
+                .entry(day_of(record.started_us))
+                .or_default()
+                .push(record);
+        }
+
+        let mut conn = self.writer();
+        let tx = conn.transaction().context("cannot begin trace insert")?;
+        let mut written = 0usize;
+        for (day, day_records) in by_day {
+            let table = partition_table(TRACE_PARTITIONS, day)?;
+            create_trace_partition(&tx, &table)?;
+            let sql = format!(
+                "INSERT INTO {table}
+                     (trace_id, started_us, duration_us, app_id, environment, node,
+                      kind, outcome, target, method, status, error, attributes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+            );
+            let mut stmt = tx
+                .prepare_cached(&sql)
+                .with_context(|| format!("cannot prepare insert into {table}"))?;
+            for record in day_records {
+                let attributes = serde_json::to_string(&record.attributes)
+                    .context("cannot serialize trace attributes")?;
+                stmt.execute(rusqlite::params![
+                    record.trace_id,
+                    record.started_us,
+                    record.duration_us,
+                    record.app_id,
+                    record.environment,
+                    record.node,
+                    record.kind,
+                    record.outcome,
+                    record.target,
+                    record.method,
+                    record.status,
+                    record.error,
+                    attributes,
+                ])
+                .with_context(|| format!("cannot insert trace into {table}"))?;
+                written += 1;
+            }
+        }
+        tx.commit().context("cannot commit trace insert")?;
+        Ok(written)
+    }
+
+    /// Read one page of traces, newest invocation first.
+    ///
+    /// `limit` is the page size; the store fetches one extra row to decide
+    /// whether an older page exists, and never returns that extra row.
+    pub fn query_traces(
+        &self,
+        filter: &TraceFilter,
+        limit: usize,
+        cursor: Option<TraceCursor>,
+    ) -> Result<TracePage> {
+        let limit = limit.max(1);
+        let mut collected = self.with_reader(|conn| {
+            let mut partitions = list_partitions(conn, TRACE_PARTITIONS)?;
+            partitions.sort_unstable_by(|a, b| b.cmp(a));
+
+            let mut collected: Vec<(TraceCursor, TraceRecord)> = Vec::new();
+            let want = limit + 1;
+            for day in partitions {
+                if collected.len() >= want {
+                    break;
+                }
+                if !day_intersects(day, filter.start_us, filter.end_us) {
+                    continue;
+                }
+                let partition_cursor = match cursor {
+                    Some(c) if day > c.day => continue,
+                    Some(c) if day == c.day => Some(c),
+                    _ => None,
+                };
+                let table = partition_table(TRACE_PARTITIONS, day)?;
+                let rows = query_trace_partition(
+                    conn,
+                    &table,
+                    day,
+                    filter,
+                    partition_cursor,
+                    want - collected.len(),
+                )?;
+                collected.extend(rows);
+            }
+            Ok(collected)
+        })?;
+
+        let has_more = collected.len() > limit;
+        collected.truncate(limit);
+        let next_cursor = if has_more {
+            collected.last().map(|(cursor, _)| *cursor)
+        } else {
+            None
+        };
+        Ok(TracePage {
             records: collected.into_iter().map(|(_, record)| record).collect(),
             next_cursor,
             has_more,
@@ -608,30 +836,42 @@ impl TelemetryStore {
         now_us: i64,
         log_retention_days: u32,
         metric_retention_days: u32,
+        trace_retention_days: u32,
     ) -> Result<SweepOutcome> {
         let today = day_of(now_us);
-        let oldest_log_day = today - i64::from(log_retention_days) + 1;
         let metric_cutoff_us = (today - i64::from(metric_retention_days) + 1) * DAY_US;
 
         // Dropping a table and deleting rows are writes, so this takes the
         // write connection; queries keep running on the read pool meanwhile.
         let conn = self.writer();
         let mut outcome = SweepOutcome::default();
-        for day in list_partitions(&conn)? {
-            if day >= oldest_log_day {
-                continue;
+        for (prefix, retention_days, dropped) in [
+            (
+                LOG_PARTITIONS,
+                log_retention_days,
+                &mut outcome.dropped_partitions,
+            ),
+            (
+                TRACE_PARTITIONS,
+                trace_retention_days,
+                &mut outcome.dropped_trace_partitions,
+            ),
+        ] {
+            let oldest_day = today - i64::from(retention_days) + 1;
+            for day in list_partitions(&conn, prefix)? {
+                if day >= oldest_day {
+                    continue;
+                }
+                let table = partition_table(prefix, day)?;
+                let rows: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .with_context(|| format!("cannot count rows of {table}"))?;
+                conn.execute(&format!("DROP TABLE {table}"), [])
+                    .with_context(|| format!("cannot drop expired partition {table}"))?;
+                dropped.push(DroppedPartition { table, day, rows });
             }
-            let table = partition_table(day)?;
-            let rows: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .with_context(|| format!("cannot count rows of {table}"))?;
-            conn.execute(&format!("DROP TABLE {table}"), [])
-                .with_context(|| format!("cannot drop expired partition {table}"))?;
-            outcome
-                .dropped_partitions
-                .push(DroppedPartition { table, day, rows });
         }
         let deleted = conn
             .execute(
@@ -646,7 +886,12 @@ impl TelemetryStore {
     /// Number of log partitions currently on disk. Used by the self-metrics
     /// export and by tests.
     pub fn partition_count(&self) -> Result<usize> {
-        self.with_reader(|conn| Ok(list_partitions(conn)?.len()))
+        self.with_reader(|conn| Ok(list_partitions(conn, LOG_PARTITIONS)?.len()))
+    }
+
+    /// Number of trace partitions currently on disk.
+    pub fn trace_partition_count(&self) -> Result<usize> {
+        self.with_reader(|conn| Ok(list_partitions(conn, TRACE_PARTITIONS)?.len()))
     }
 
     /// Number of stored metric samples.
@@ -816,21 +1061,28 @@ pub fn day_of(timestamp_us: i64) -> i64 {
     timestamp_us.div_euclid(DAY_US)
 }
 
-/// Table name of the partition holding `day`.
-fn partition_table(day: i64) -> Result<String> {
+/// Table-name prefix of the log partitions.
+const LOG_PARTITIONS: &str = "logs_";
+
+/// Table-name prefix of the trace partitions. Traces are partitioned by day
+/// for the same reason logs are, and expire on their own shorter schedule.
+const TRACE_PARTITIONS: &str = "traces_";
+
+/// Table name of the partition of `prefix` holding `day`.
+fn partition_table(prefix: &str, day: i64) -> Result<String> {
     let seconds = day
         .checked_mul(86_400)
         .with_context(|| format!("day {day} is out of range"))?;
     let date = chrono::DateTime::from_timestamp(seconds, 0)
         .with_context(|| format!("day {day} is not a representable date"))?
         .date_naive();
-    Ok(format!("logs_{}", date.format("%Y%m%d")))
+    Ok(format!("{prefix}{}", date.format("%Y%m%d")))
 }
 
 /// Inverse of [`partition_table`], for reading the partition list back out of
 /// `sqlite_master`.
-fn day_from_partition(table: &str) -> Option<i64> {
-    let suffix = table.strip_prefix("logs_")?;
+fn day_from_partition(prefix: &str, table: &str) -> Option<i64> {
+    let suffix = table.strip_prefix(prefix)?;
     let date = chrono::NaiveDate::parse_from_str(suffix, "%Y%m%d").ok()?;
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
     Some(date.signed_duration_since(epoch).num_days())
@@ -862,21 +1114,64 @@ fn create_partition(conn: &Connection, table: &str) -> Result<()> {
     .with_context(|| format!("cannot create log partition {table}"))
 }
 
-fn list_partitions(conn: &Connection) -> Result<Vec<i64>> {
+fn create_trace_partition(conn: &Connection, table: &str) -> Result<()> {
+    // The indexes mirror the four questions traces exist to answer: "this
+    // application over this window", "everything over this window", "what
+    // failed" - the one the review was written about, which without an
+    // outcome index would scan a whole day of invocations - and "this one
+    // invocation", which is also how a trace is joined to its log lines.
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {table} (
+             id          INTEGER PRIMARY KEY,
+             trace_id    TEXT NOT NULL,
+             started_us  INTEGER NOT NULL,
+             duration_us INTEGER NOT NULL,
+             app_id      TEXT NOT NULL,
+             environment TEXT NOT NULL,
+             node        TEXT NOT NULL,
+             kind        INTEGER NOT NULL,
+             outcome     INTEGER NOT NULL,
+             target      TEXT NOT NULL,
+             method      TEXT NOT NULL,
+             status      INTEGER NOT NULL,
+             error       TEXT NOT NULL,
+             attributes  TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS ix_{table}_app_time
+             ON {table} (app_id, started_us DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS ix_{table}_time
+             ON {table} (started_us DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS ix_{table}_outcome_time
+             ON {table} (outcome, started_us DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS ix_{table}_trace
+             ON {table} (trace_id, started_us DESC);"
+    ))
+    .with_context(|| format!("cannot create trace partition {table}"))
+}
+
+fn list_partitions(conn: &Connection, prefix: &str) -> Result<Vec<i64>> {
+    // `_` is a single-character wildcard in LIKE, so the prefix is escaped:
+    // an unescaped `traces_%` would also match a hypothetical `tracesX...`,
+    // and an unescaped `logs_%` would match anything starting with `logs`.
+    let pattern = format!("{}%", prefix.replace('_', "\\_"));
     let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'logs_%'")
-        .context("cannot list log partitions")?;
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name LIKE ?1 ESCAPE '\\'",
+        )
+        .context("cannot list day partitions")?;
     let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .context("cannot read log partition list")?;
+        .query_map([pattern], |row| row.get::<_, String>(0))
+        .context("cannot read the day partition list")?;
     let mut days = Vec::new();
     for row in rows {
-        let name = row.context("cannot read log partition name")?;
-        match day_from_partition(&name) {
+        let name = row.context("cannot read a day partition name")?;
+        match day_from_partition(prefix, &name) {
             Some(day) => days.push(day),
             None => warn!(
                 table = %name,
-                "table looks like a log partition but its name is not a date, \
+                prefix,
+                "table looks like a day partition but its name is not a date, \
                  it is ignored by queries and by retention"
             ),
         }
@@ -884,16 +1179,16 @@ fn list_partitions(conn: &Connection) -> Result<Vec<i64>> {
     Ok(days)
 }
 
-/// Whether a partition can hold any row inside the filter's time window.
-fn partition_intersects(day: i64, filter: &LogFilter) -> bool {
+/// Whether a day partition can hold any row inside `[start_us, end_us)`.
+fn day_intersects(day: i64, start_us: Option<i64>, end_us: Option<i64>) -> bool {
     let start = day * DAY_US;
     let end = start + DAY_US;
-    if let Some(filter_start) = filter.start_us
+    if let Some(filter_start) = start_us
         && end <= filter_start
     {
         return false;
     }
-    if let Some(filter_end) = filter.end_us
+    if let Some(filter_end) = end_us
         && start >= filter_end
     {
         return false;
@@ -1056,6 +1351,140 @@ fn query_partition(
             ))
         })
         .with_context(|| format!("cannot query log partition {table}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.with_context(|| format!("cannot read row of {table}"))?);
+    }
+    Ok(out)
+}
+
+/// Build the statement for one trace partition. Separate from execution for
+/// the same reason the log one is: a test can hand the exact SQL to
+/// `EXPLAIN QUERY PLAN` and prove the indexes are used.
+fn build_trace_partition_query(
+    table: &str,
+    filter: &TraceFilter,
+    cursor: Option<TraceCursor>,
+    limit: usize,
+) -> (String, Vec<SqlValue>) {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut args: Vec<SqlValue> = Vec::new();
+    if let Some(app_id) = &filter.app_id {
+        clauses.push(format!("app_id = ?{}", args.len() + 1));
+        args.push(SqlValue::Text(app_id.clone()));
+    }
+    if let Some(environment) = &filter.environment {
+        clauses.push(format!("environment = ?{}", args.len() + 1));
+        args.push(SqlValue::Text(environment.clone()));
+    }
+    if let Some(start) = filter.start_us {
+        clauses.push(format!("started_us >= ?{}", args.len() + 1));
+        args.push(SqlValue::Integer(start));
+    }
+    if let Some(end) = filter.end_us {
+        clauses.push(format!("started_us < ?{}", args.len() + 1));
+        args.push(SqlValue::Integer(end));
+    }
+    for (column, wanted) in [("kind", &filter.kinds), ("outcome", &filter.outcomes)] {
+        if wanted.is_empty() {
+            continue;
+        }
+        let slots: Vec<String> = wanted
+            .iter()
+            .map(|value| {
+                args.push(SqlValue::Integer(i64::from(*value)));
+                format!("?{}", args.len())
+            })
+            .collect();
+        clauses.push(format!("{column} IN ({})", slots.join(", ")));
+    }
+    if let Some(trace_id) = &filter.trace_id {
+        clauses.push(format!("trace_id = ?{}", args.len() + 1));
+        args.push(SqlValue::Text(trace_id.clone()));
+    }
+    if let Some(floor) = filter.min_duration_us {
+        clauses.push(format!("duration_us >= ?{}", args.len() + 1));
+        args.push(SqlValue::Integer(floor));
+    }
+    if let Some(needle) = &filter.target_contains {
+        clauses.push(format!(
+            "instr(lower(target), lower(?{})) > 0",
+            args.len() + 1
+        ));
+        args.push(SqlValue::Text(needle.clone()));
+    }
+    if let Some(cursor) = cursor {
+        let ts_slot = args.len() + 1;
+        let id_slot = args.len() + 2;
+        clauses.push(format!(
+            "(started_us < ?{ts_slot} OR (started_us = ?{ts_slot} AND id < ?{id_slot}))"
+        ));
+        args.push(SqlValue::Integer(cursor.started_us));
+        args.push(SqlValue::Integer(cursor.row_id));
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let limit_slot = args.len() + 1;
+    args.push(SqlValue::Integer(limit as i64));
+    let sql = format!(
+        "SELECT id, trace_id, started_us, duration_us, app_id, environment, node,
+                kind, outcome, target, method, status, error, attributes
+         FROM {table}{where_sql}
+         ORDER BY started_us DESC, id DESC
+         LIMIT ?{limit_slot}"
+    );
+    (sql, args)
+}
+
+fn query_trace_partition(
+    conn: &Connection,
+    table: &str,
+    day: i64,
+    filter: &TraceFilter,
+    cursor: Option<TraceCursor>,
+    limit: usize,
+) -> Result<Vec<(TraceCursor, TraceRecord)>> {
+    let (sql, args) = build_trace_partition_query(table, filter, cursor, limit);
+    let mut stmt = prepare_stmt(conn, &sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(args.iter()), |row| {
+            let id: i64 = row.get(0)?;
+            let started_us: i64 = row.get(2)?;
+            let attributes_json: String = row.get(13)?;
+            Ok((
+                TraceCursor {
+                    day,
+                    started_us,
+                    row_id: id,
+                },
+                TraceRecord {
+                    trace_id: row.get(1)?,
+                    started_us,
+                    duration_us: row.get(3)?,
+                    app_id: row.get(4)?,
+                    environment: row.get(5)?,
+                    node: row.get(6)?,
+                    kind: row.get(7)?,
+                    outcome: row.get(8)?,
+                    target: row.get(9)?,
+                    method: row.get(10)?,
+                    status: row.get(11)?,
+                    error: row.get(12)?,
+                    attributes: serde_json::from_str(&attributes_json).unwrap_or_else(|e| {
+                        warn!(
+                            trace_row = id,
+                            error = %e,
+                            "trace attributes are not valid JSON, the record is returned without them"
+                        );
+                        BTreeMap::new()
+                    }),
+                },
+            ))
+        })
+        .with_context(|| format!("cannot query trace partition {table}"))?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row.with_context(|| format!("cannot read row of {table}"))?);
@@ -1237,7 +1666,8 @@ mod tests {
                 record(BASE_US, "shop", 3, "today"),
             ])
             .expect("insert must succeed");
-        let expiring = partition_table(day_of(BASE_US - DAY_US)).expect("partition name");
+        let expiring =
+            partition_table(LOG_PARTITIONS, day_of(BASE_US - DAY_US)).expect("partition name");
 
         let (listed_tx, listed_rx) = mpsc::channel();
         let (swept_tx, swept_rx) = mpsc::channel::<()>();
@@ -1246,7 +1676,7 @@ mod tests {
             let table = expiring.clone();
             std::thread::spawn(move || {
                 store.with_reader(|conn| {
-                    let _ = listed_tx.send(list_partitions(conn)?.len());
+                    let _ = listed_tx.send(list_partitions(conn, LOG_PARTITIONS)?.len());
                     // Wait for the sweep to commit, then read the partition
                     // this query already committed to reading.
                     let _ = swept_rx.recv();
@@ -1261,7 +1691,7 @@ mod tests {
         assert_eq!(listed_rx.recv().expect("the reader must list"), 2);
 
         let outcome = store
-            .sweep_retention(BASE_US, 1, 30)
+            .sweep_retention(BASE_US, 1, 30, 30)
             .expect("sweep must succeed");
         assert_eq!(outcome.dropped_partitions.len(), 1);
         let _ = swept_tx.send(());
@@ -1275,10 +1705,16 @@ mod tests {
 
     #[test]
     fn partition_names_are_dates() {
-        assert_eq!(partition_table(day_of(BASE_US)).unwrap(), "logs_20260829");
-        assert_eq!(day_from_partition("logs_20260829"), Some(day_of(BASE_US)));
-        assert_eq!(day_from_partition("metrics"), None);
-        assert_eq!(day_from_partition("logs_not_a_date"), None);
+        assert_eq!(
+            partition_table(LOG_PARTITIONS, day_of(BASE_US)).unwrap(),
+            "logs_20260829"
+        );
+        assert_eq!(
+            day_from_partition(LOG_PARTITIONS, "logs_20260829"),
+            Some(day_of(BASE_US))
+        );
+        assert_eq!(day_from_partition(LOG_PARTITIONS, "metrics"), None);
+        assert_eq!(day_from_partition(LOG_PARTITIONS, "logs_not_a_date"), None);
     }
 
     #[test]
@@ -1472,9 +1908,21 @@ mod tests {
             end_us: Some(BASE_US + DAY_US),
             ..Default::default()
         };
-        assert!(partition_intersects(day_of(BASE_US), &filter));
-        assert!(!partition_intersects(day_of(BASE_US) - 1, &filter));
-        assert!(!partition_intersects(day_of(BASE_US) + 1, &filter));
+        assert!(day_intersects(
+            day_of(BASE_US),
+            filter.start_us,
+            filter.end_us
+        ));
+        assert!(!day_intersects(
+            day_of(BASE_US) - 1,
+            filter.start_us,
+            filter.end_us
+        ));
+        assert!(!day_intersects(
+            day_of(BASE_US) + 1,
+            filter.start_us,
+            filter.end_us
+        ));
     }
 
     #[test]
@@ -1504,7 +1952,7 @@ mod tests {
         assert_eq!(store.partition_count().unwrap(), 3);
 
         // Three days of retention keeps today and the two days before it.
-        let outcome = store.sweep_retention(BASE_US, 3, 30).unwrap();
+        let outcome = store.sweep_retention(BASE_US, 3, 30, 30).unwrap();
         assert_eq!(outcome.dropped_partitions.len(), 1);
         assert_eq!(outcome.dropped_partitions[0].rows, 1);
         assert_eq!(outcome.dropped_log_rows(), 1);
@@ -1514,7 +1962,291 @@ mod tests {
         assert_eq!(messages(&page), vec!["fresh", "still wanted"]);
 
         // A second sweep with nothing expired reports nothing.
-        assert!(store.sweep_retention(BASE_US, 3, 30).unwrap().is_empty());
+        assert!(
+            store
+                .sweep_retention(BASE_US, 3, 30, 30)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Kind ordinals, mirroring `InvocationKind` in the proto.
+    const KIND_HTTP: i32 = 1;
+    const KIND_QUEUE: i32 = 2;
+    /// Outcome ordinals, mirroring `InvocationOutcome` in the proto.
+    const OUTCOME_OK: i32 = 1;
+    const OUTCOME_APP_ERROR: i32 = 2;
+    const OUTCOME_TIMEOUT: i32 = 3;
+
+    fn trace(started_us: i64, app: &str, outcome: i32, target: &str) -> TraceRecord {
+        TraceRecord {
+            trace_id: format!("t-{started_us}"),
+            started_us,
+            duration_us: 1_000,
+            app_id: app.to_string(),
+            environment: "production".to_string(),
+            node: "node-a".to_string(),
+            kind: KIND_HTTP,
+            outcome,
+            target: target.to_string(),
+            method: "GET".to_string(),
+            status: if outcome == OUTCOME_OK { 200 } else { 500 },
+            error: String::new(),
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    fn targets(page: &TracePage) -> Vec<&str> {
+        page.records.iter().map(|r| r.target.as_str()).collect()
+    }
+
+    #[test]
+    fn traces_come_back_newest_first_with_their_attributes() {
+        let store = TelemetryStore::open_in_memory().unwrap();
+        let mut first = trace(BASE_US + 1, "shop", OUTCOME_OK, "/a");
+        first
+            .attributes
+            .insert("retry".to_string(), "0".to_string());
+        store
+            .insert_traces(&[first, trace(BASE_US + 2, "shop", OUTCOME_OK, "/b")])
+            .unwrap();
+
+        let page = store
+            .query_traces(&TraceFilter::default(), 10, None)
+            .unwrap();
+        assert_eq!(targets(&page), vec!["/b", "/a"]);
+        assert_eq!(
+            page.records[1].attributes.get("retry").map(String::as_str),
+            Some("0")
+        );
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn the_question_the_trace_surface_exists_for_is_one_query() {
+        // "Show me the requests that failed in the last hour" -- a window and
+        // an outcome selection, answered without reading a single log line.
+        let store = TelemetryStore::open_in_memory().unwrap();
+        store
+            .insert_traces(&[
+                trace(BASE_US + 1, "shop", OUTCOME_OK, "/healthy"),
+                trace(BASE_US + 2, "shop", OUTCOME_APP_ERROR, "/threw"),
+                trace(BASE_US + 3, "shop", OUTCOME_TIMEOUT, "/hung"),
+                trace(BASE_US + 4, "blog", OUTCOME_APP_ERROR, "/other-app"),
+            ])
+            .unwrap();
+
+        let filter = TraceFilter {
+            app_id: Some("shop".to_string()),
+            start_us: Some(BASE_US),
+            outcomes: vec![OUTCOME_APP_ERROR, OUTCOME_TIMEOUT],
+            ..TraceFilter::default()
+        };
+        let page = store.query_traces(&filter, 10, None).unwrap();
+        assert_eq!(targets(&page), vec!["/hung", "/threw"]);
+    }
+
+    #[test]
+    fn a_cut_off_is_distinguishable_from_an_application_error() {
+        // The single most useful thing an operator can be told, and the whole
+        // reason the outcome is stored rather than inferred from the status.
+        let store = TelemetryStore::open_in_memory().unwrap();
+        store
+            .insert_traces(&[
+                trace(BASE_US + 1, "shop", OUTCOME_APP_ERROR, "/threw"),
+                trace(BASE_US + 2, "shop", OUTCOME_TIMEOUT, "/hung"),
+            ])
+            .unwrap();
+
+        let filter = TraceFilter {
+            outcomes: vec![OUTCOME_TIMEOUT],
+            ..TraceFilter::default()
+        };
+        let page = store.query_traces(&filter, 10, None).unwrap();
+        assert_eq!(targets(&page), vec!["/hung"]);
+    }
+
+    #[test]
+    fn a_trace_can_be_found_by_the_id_its_log_lines_carry() {
+        let store = TelemetryStore::open_in_memory().unwrap();
+        store
+            .insert_traces(&[
+                trace(BASE_US + 1, "shop", OUTCOME_OK, "/a"),
+                trace(BASE_US + 2, "shop", OUTCOME_OK, "/b"),
+            ])
+            .unwrap();
+
+        let filter = TraceFilter {
+            trace_id: Some(format!("t-{}", BASE_US + 2)),
+            ..TraceFilter::default()
+        };
+        let page = store.query_traces(&filter, 10, None).unwrap();
+        assert_eq!(targets(&page), vec!["/b"]);
+    }
+
+    #[test]
+    fn traces_filter_on_kind_environment_duration_and_target() {
+        let store = TelemetryStore::open_in_memory().unwrap();
+        let mut slow = trace(BASE_US + 1, "shop", OUTCOME_OK, "/checkout");
+        slow.duration_us = 5_000_000;
+        let mut batch = trace(BASE_US + 2, "shop", OUTCOME_OK, "orders");
+        batch.kind = KIND_QUEUE;
+        let mut preview = trace(BASE_US + 3, "shop", OUTCOME_OK, "/checkout");
+        preview.environment = "preview".to_string();
+        store.insert_traces(&[slow, batch, preview]).unwrap();
+
+        let by_kind = store
+            .query_traces(
+                &TraceFilter {
+                    kinds: vec![KIND_QUEUE],
+                    ..TraceFilter::default()
+                },
+                10,
+                None,
+            )
+            .unwrap();
+        assert_eq!(targets(&by_kind), vec!["orders"]);
+
+        let by_environment = store
+            .query_traces(
+                &TraceFilter {
+                    environment: Some("preview".to_string()),
+                    ..TraceFilter::default()
+                },
+                10,
+                None,
+            )
+            .unwrap();
+        assert_eq!(by_environment.records.len(), 1);
+
+        let by_duration = store
+            .query_traces(
+                &TraceFilter {
+                    min_duration_us: Some(2_000_000),
+                    ..TraceFilter::default()
+                },
+                10,
+                None,
+            )
+            .unwrap();
+        assert_eq!(by_duration.records.len(), 1);
+        assert_eq!(by_duration.records[0].duration_us, 5_000_000);
+
+        let by_target = store
+            .query_traces(
+                &TraceFilter {
+                    target_contains: Some("CHECK".to_string()),
+                    ..TraceFilter::default()
+                },
+                10,
+                None,
+            )
+            .unwrap();
+        assert_eq!(by_target.records.len(), 2);
+    }
+
+    #[test]
+    fn trace_pages_cross_day_partitions() {
+        let store = TelemetryStore::open_in_memory().unwrap();
+        store
+            .insert_traces(&[
+                trace(BASE_US - DAY_US, "shop", OUTCOME_OK, "/yesterday"),
+                trace(BASE_US + 1, "shop", OUTCOME_OK, "/today"),
+            ])
+            .unwrap();
+        assert_eq!(store.trace_partition_count().unwrap(), 2);
+
+        let first = store
+            .query_traces(&TraceFilter::default(), 1, None)
+            .unwrap();
+        assert_eq!(targets(&first), vec!["/today"]);
+        assert!(first.has_more);
+
+        let second = store
+            .query_traces(&TraceFilter::default(), 1, first.next_cursor)
+            .unwrap();
+        assert_eq!(targets(&second), vec!["/yesterday"]);
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn traces_expire_on_their_own_shorter_schedule() {
+        // Traces are higher volume than logs, so they are kept for fewer days
+        // and the two sweeps must not be able to take each other's data.
+        let store = TelemetryStore::open_in_memory().unwrap();
+        store
+            .insert_logs(&[record(BASE_US - 4 * DAY_US, "shop", 3, "old log")])
+            .unwrap();
+        store
+            .insert_traces(&[
+                trace(BASE_US - 4 * DAY_US, "shop", OUTCOME_OK, "/old"),
+                trace(BASE_US + 1, "shop", OUTCOME_OK, "/fresh"),
+            ])
+            .unwrap();
+
+        let outcome = store.sweep_retention(BASE_US, 7, 30, 2).unwrap();
+        assert_eq!(outcome.dropped_trace_partitions.len(), 1);
+        assert_eq!(outcome.dropped_trace_rows(), 1);
+        assert!(
+            outcome.dropped_partitions.is_empty(),
+            "the log partition is inside its own seven-day window and must survive"
+        );
+        assert_eq!(store.partition_count().unwrap(), 1);
+
+        let page = store
+            .query_traces(&TraceFilter::default(), 10, None)
+            .unwrap();
+        assert_eq!(targets(&page), vec!["/fresh"]);
+    }
+
+    #[test]
+    fn the_failed_invocation_query_uses_an_index() {
+        // Without the outcome index this scans a whole day of invocations,
+        // and a day of invocations is the volume traces exist to survive.
+        let store = TelemetryStore::open_in_memory().unwrap();
+        store
+            .insert_traces(&[trace(BASE_US + 1, "shop", OUTCOME_APP_ERROR, "/threw")])
+            .unwrap();
+        let table = partition_table(TRACE_PARTITIONS, day_of(BASE_US)).unwrap();
+        let (sql, args) = build_trace_partition_query(
+            &table,
+            &TraceFilter {
+                outcomes: vec![OUTCOME_APP_ERROR],
+                start_us: Some(BASE_US),
+                end_us: Some(BASE_US + DAY_US),
+                ..TraceFilter::default()
+            },
+            None,
+            10,
+        );
+        let plan = explain(&store, &sql, &args);
+        assert!(
+            plan.contains(&format!("USING INDEX ix_{table}_outcome_time")),
+            "the failed-invocation query must not scan the day: {plan}"
+        );
+    }
+
+    #[test]
+    fn the_trace_id_join_between_a_trace_and_its_log_lines_uses_an_index() {
+        let store = TelemetryStore::open_in_memory().unwrap();
+        store
+            .insert_traces(&[trace(BASE_US + 1, "shop", OUTCOME_OK, "/a")])
+            .unwrap();
+        let table = partition_table(TRACE_PARTITIONS, day_of(BASE_US)).unwrap();
+        let (sql, args) = build_trace_partition_query(
+            &table,
+            &TraceFilter {
+                trace_id: Some("t".to_string()),
+                ..TraceFilter::default()
+            },
+            None,
+            10,
+        );
+        let plan = explain(&store, &sql, &args);
+        assert!(
+            plan.contains(&format!("USING INDEX ix_{table}_trace")),
+            "looking one invocation up by id must not scan the day: {plan}"
+        );
     }
 
     #[test]
@@ -1526,7 +2258,7 @@ mod tests {
                 metric("requests", "shop", &[], 2.0, BASE_US),
             ])
             .unwrap();
-        let outcome = store.sweep_retention(BASE_US, 30, 2).unwrap();
+        let outcome = store.sweep_retention(BASE_US, 30, 2, 30).unwrap();
         assert_eq!(outcome.deleted_metric_samples, 1);
         assert_eq!(store.metric_sample_count().unwrap(), 1);
     }
@@ -1637,7 +2369,7 @@ mod tests {
         store
             .insert_logs(&[record(BASE_US + 1, "shop", 3, "indexed")])
             .unwrap();
-        let table = partition_table(day_of(BASE_US)).unwrap();
+        let table = partition_table(LOG_PARTITIONS, day_of(BASE_US)).unwrap();
         let filter = LogFilter {
             app_id: Some("shop".into()),
             start_us: Some(BASE_US),
@@ -1662,7 +2394,7 @@ mod tests {
         store
             .insert_logs(&[record(BASE_US + 1, "shop", 3, "indexed")])
             .unwrap();
-        let table = partition_table(day_of(BASE_US)).unwrap();
+        let table = partition_table(LOG_PARTITIONS, day_of(BASE_US)).unwrap();
         let (sql, args) = build_partition_query(&table, &LogFilter::default(), None, 10);
         let plan = explain(&store, &sql, &args);
         assert!(
@@ -1681,7 +2413,7 @@ mod tests {
         store
             .insert_logs(&[record(BASE_US + 1, "shop", 3, "indexed")])
             .unwrap();
-        let table = partition_table(day_of(BASE_US)).unwrap();
+        let table = partition_table(LOG_PARTITIONS, day_of(BASE_US)).unwrap();
         let filter = LogFilter {
             trace_id: Some("trace-1".into()),
             ..Default::default()

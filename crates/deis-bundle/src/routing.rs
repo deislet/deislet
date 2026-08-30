@@ -170,6 +170,170 @@ pub fn sort_by_specificity<T>(routes: &mut [T], pattern_of: impl Fn(&T) -> &str)
     });
 }
 
+/// The values a pattern took out of the path it matched.
+///
+/// Only the patterns a *static site* writes need these - a redirect target
+/// substitutes them, and a function route's own params are filled by the entry
+/// module, which knows the file name a catch-all was written with and can
+/// publish it under both spellings. Matching itself is one rule, here, for the
+/// same reason the ordering is: the manifest's route table, the `_redirects`
+/// table and the `_headers` blocks all use this pattern language, and three
+/// implementations of it would be three chances to disagree about what
+/// `/blog/*` covers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Captures {
+    /// `:name` values, in the order the pattern names them.
+    pub named: Vec<(String, String)>,
+    /// What the trailing `*` swallowed, `Some("")` when there was nothing
+    /// left for it. `None` when the pattern has no catch-all at all.
+    pub splat: Option<String>,
+}
+
+impl Captures {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.named
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// One segment of a compiled pattern. A catch-all is not a segment: it can
+/// only be the last one, so it is a flag on the pattern instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatternSegment {
+    Literal(String),
+    Param(String),
+}
+
+/// A pattern compiled once, ready to be matched against many paths.
+///
+/// Compiling is where a malformed pattern is rejected and where the literal
+/// segments are percent-decoded, so matching a path is a comparison of
+/// already-decoded strings and allocates nothing beyond the captures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledPattern {
+    segments: Vec<PatternSegment>,
+    catch_all: bool,
+}
+
+impl CompiledPattern {
+    /// Compile a pattern, or say what is wrong with it.
+    ///
+    /// A `*` anywhere but the last segment is refused rather than treated as a
+    /// literal asterisk: an author who wrote `/a/*/b` meant something this
+    /// language cannot express, and matching a path that literally contains an
+    /// asterisk is not it.
+    pub fn compile(pattern: &str) -> Result<Self, String> {
+        let parts = segments(pattern);
+        let mut compiled = Vec::with_capacity(parts.len());
+        let mut catch_all = false;
+
+        for (index, part) in parts.iter().enumerate() {
+            if *part == CATCH_ALL_SEGMENT {
+                if index + 1 != parts.len() {
+                    return Err(format!(
+                        "{CATCH_ALL_SEGMENT:?} stands for the whole rest of the path, so it can \
+                         only be the last segment of {pattern:?}"
+                    ));
+                }
+                catch_all = true;
+                continue;
+            }
+            if part.contains(CATCH_ALL_SEGMENT) {
+                return Err(format!(
+                    "segment {part:?} of {pattern:?} mixes {CATCH_ALL_SEGMENT:?} with other \
+                     characters; a catch-all is a whole segment of its own"
+                ));
+            }
+            if let Some(name) = part.strip_prefix(PLACEHOLDER_PREFIX) {
+                if name.is_empty() {
+                    return Err(format!(
+                        "a placeholder in {pattern:?} has no name; write {PLACEHOLDER_PREFIX}name"
+                    ));
+                }
+                compiled.push(PatternSegment::Param(name.to_string()));
+                continue;
+            }
+            compiled.push(PatternSegment::Literal(crate::percent_decode(part)));
+        }
+
+        Ok(Self {
+            segments: compiled,
+            catch_all,
+        })
+    }
+
+    /// Whether this pattern ends in a catch-all.
+    pub fn has_catch_all(&self) -> bool {
+        self.catch_all
+    }
+
+    /// Match against a path that has already been split and decoded by
+    /// [`decoded_segments`].
+    ///
+    /// Callers matching one path against a whole table split it once and pass
+    /// the same slice to every pattern, which is what keeps a two thousand
+    /// rule redirect table one decode rather than two thousand.
+    pub fn match_segments(&self, path: &[String]) -> Option<Captures> {
+        if self.catch_all {
+            if path.len() < self.segments.len() {
+                return None;
+            }
+        } else if path.len() != self.segments.len() {
+            return None;
+        }
+
+        let mut named = Vec::new();
+        for (pattern, actual) in self.segments.iter().zip(path.iter()) {
+            match pattern {
+                PatternSegment::Literal(literal) => {
+                    if literal != actual {
+                        return None;
+                    }
+                }
+                PatternSegment::Param(name) => named.push((name.clone(), actual.clone())),
+            }
+        }
+
+        let splat = self
+            .catch_all
+            .then(|| path[self.segments.len()..].join("/"));
+
+        Some(Captures { named, splat })
+    }
+
+    /// Match against a request path, splitting and decoding it first.
+    pub fn captures(&self, path: &str) -> Option<Captures> {
+        self.match_segments(&decoded_segments(path))
+    }
+
+    /// Whether this pattern answers a path, when the captures do not matter.
+    pub fn matches(&self, path: &str) -> bool {
+        self.captures(path).is_some()
+    }
+}
+
+/// Split a request path into the decoded segments a [`CompiledPattern`] is
+/// matched against.
+///
+/// Decoding happens here rather than inside the match so that one path costs
+/// one decode however many patterns it is tried against, and so that a literal
+/// segment written `/caf%C3%A9` in a pattern and sent as `/caf%C3%A9` by a
+/// browser compare equal - both sides are the text, never the escapes.
+pub fn decoded_segments(path: &str) -> Vec<String> {
+    segments(path)
+        .into_iter()
+        .map(crate::percent_decode)
+        .collect()
+}
+
+/// Compile and match in one call. For a pattern matched once; anything on a
+/// request path compiles at load time instead.
+pub fn match_pattern(pattern: &str, path: &str) -> Option<Captures> {
+    CompiledPattern::compile(pattern).ok()?.captures(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +429,79 @@ mod tests {
             best(&table, &["/:user/settings", "/:org/settings"]),
             table[0]
         );
+    }
+    #[test]
+    fn a_literal_pattern_matches_only_itself() {
+        assert!(match_pattern("/about", "/about").is_some());
+        assert!(match_pattern("/about", "/about/team").is_none());
+        assert!(match_pattern("/about", "/abou").is_none());
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_change_a_match() {
+        assert!(match_pattern("/docs", "/docs/").is_some());
+        assert!(match_pattern("/docs/", "/docs").is_some());
+    }
+
+    #[test]
+    fn a_placeholder_takes_exactly_one_segment() {
+        let captures = match_pattern("/news/:year/:slug", "/news/2026/launch").unwrap();
+        assert_eq!(captures.get("year"), Some("2026"));
+        assert_eq!(captures.get("slug"), Some("launch"));
+        assert!(match_pattern("/news/:year", "/news/2026/launch").is_none());
+    }
+
+    #[test]
+    fn a_catch_all_takes_the_rest_including_none_of_it() {
+        assert_eq!(
+            match_pattern("/blog/*", "/blog/2026/hello").unwrap().splat,
+            Some("2026/hello".to_string())
+        );
+        assert_eq!(
+            match_pattern("/blog/*", "/blog").unwrap().splat,
+            Some(String::new())
+        );
+        assert_eq!(
+            match_pattern("/*", "/anything/at/all").unwrap().splat,
+            Some("anything/at/all".to_string())
+        );
+    }
+
+    #[test]
+    fn both_sides_are_compared_as_text_not_as_escapes() {
+        // A browser can only send the escaped form; the pattern is written
+        // either way, and the two have to agree.
+        assert!(match_pattern("/caf\u{e9}/menu", "/caf%C3%A9/menu").is_some());
+        assert!(match_pattern("/caf%C3%A9/menu", "/caf\u{e9}/menu").is_some());
+        assert_eq!(
+            match_pattern("/files/:name", "/files/my%20report.pdf")
+                .unwrap()
+                .get("name"),
+            Some("my report.pdf")
+        );
+    }
+
+    #[test]
+    fn a_catch_all_that_is_not_last_is_refused_rather_than_guessed_at() {
+        let err = CompiledPattern::compile("/a/*/b").unwrap_err();
+        assert!(err.contains("last segment"), "{err}");
+    }
+
+    #[test]
+    fn a_placeholder_with_no_name_is_refused() {
+        let err = CompiledPattern::compile("/news/:").unwrap_err();
+        assert!(err.contains("no name"), "{err}");
+    }
+
+    #[test]
+    fn the_matcher_and_the_ordering_agree_about_what_a_pattern_covers() {
+        // The two halves of this module answer different questions about the
+        // same table, and a pattern the ordering treats as a catch-all has to
+        // be one the matcher treats as a catch-all too.
+        for pattern in ["/", "/a", "/a/:b", "/a/*", "/*"] {
+            let compiled = CompiledPattern::compile(pattern).unwrap();
+            let ranked = Specificity::of(pattern, 0);
+            assert_eq!(compiled.has_catch_all(), ranked.catch_all == 1, "{pattern}");
+        }
     }
 }

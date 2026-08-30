@@ -173,6 +173,23 @@ impl ApplicationManager {
     /// limit) used for apps that do not configure their own. Intended to be
     /// called once at startup with the values loaded from `RuntimeConfig`.
     pub fn with_limits(mut self, default_limits: ExecutionLimits) -> Self {
+        // Said here because this is the one call that carries the operator's
+        // values, and because the CPU ceiling is the newest of them: an
+        // operator reading a node's startup output has to be able to see the
+        // number that is in force without deploying anything to find out.
+        tracing::info!(
+            timeout_ms = default_limits.timeout_ms,
+            wait_until_timeout_ms = default_limits.wait_until_timeout_ms,
+            cpu_time_limit_ms = default_limits.cpu_time_limit_ms,
+            rate_limit_ops_per_sec = default_limits.rate_limit_ops_per_sec,
+            "Node execution ceilings: {}ms of wall clock and {}ms of CPU time per invocation, \
+             {}ms for a waitUntil tail, {} ops/sec of op dispatch. An application may narrow the \
+             CPU ceiling but not widen it",
+            default_limits.timeout_ms,
+            default_limits.cpu_time_limit_ms,
+            default_limits.wait_until_timeout_ms,
+            default_limits.rate_limit_ops_per_sec
+        );
         self.default_limits = default_limits;
         self
     }
@@ -231,13 +248,102 @@ impl ApplicationManager {
             );
         }
 
+        let cpu_time_limit_ms = self.effective_cpu_time_limit_ms(key, limits);
+
+        // A thread cannot burn more CPU time than wall-clock time, so a CPU
+        // ceiling at or above the duration ceiling can never be the one that
+        // fires. That is not dangerous -- the node is protected by the
+        // stricter of the two -- but an operator who set a CPU ceiling and
+        // never sees it in the logs deserves to be told why, rather than
+        // concluding it works and nothing ever trips it.
+        if cpu_time_limit_ms >= timeout_ms {
+            tracing::warn!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                cpu_time_limit_ms,
+                timeout_ms,
+                "App {} has a {}ms CPU ceiling and a {}ms duration ceiling; one thread cannot \
+                 spend more CPU time than wall-clock time, so the CPU ceiling can never fire for \
+                 it and the duration limit is the only one in effect. Lower \
+                 default_execution_limits.cpu_time_limit_ms below the timeout for it to mean \
+                 anything",
+                key,
+                cpu_time_limit_ms,
+                timeout_ms
+            );
+        }
+
         ExecutionLimits {
             timeout_ms,
             // No per-app override: `ResourceLimits` has no key for the tail
             // budget, so every app on this node is held to the platform value.
             wait_until_timeout_ms: self.default_limits.wait_until_timeout_ms,
             rate_limit_ops_per_sec,
+            cpu_time_limit_ms,
         }
+    }
+
+    /// Resolve the CPU-time ceiling for one app: the node's default, narrowed
+    /// by the app's own `ResourceLimits.cpu_time_limit_ms` when it asked for
+    /// less.
+    ///
+    /// Narrowing only, exactly like the heap ceiling and unlike `timeout_ms`.
+    /// A duration ceiling bounds how long a client waits, which is the
+    /// application's business; CPU time is a core taken from every other
+    /// tenant on this node, which is the node's. So an app may hold itself to
+    /// less and may not help itself to more.
+    fn effective_cpu_time_limit_ms(&self, key: &AppKey, limits: Option<&ResourceLimits>) -> u64 {
+        let node_default = self.default_limits.cpu_time_limit_ms;
+        let Some(requested) = limits.and_then(|l| l.cpu_time_limit_ms) else {
+            return node_default;
+        };
+
+        if requested == 0 {
+            // Same sentinel the wire uses: an absent field and a zero are one
+            // and the same to every producer of an `ApplyDeployment`, and a
+            // ceiling of zero would cut off every invocation before it ran an
+            // instruction.
+            tracing::warn!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                applied_ms = node_default,
+                "App {} asks for a 0ms CPU ceiling, which would terminate every invocation before \
+                 it ran; it is held to this node's {}ms default instead",
+                key,
+                node_default
+            );
+            return node_default;
+        }
+
+        if requested <= node_default {
+            tracing::info!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                "App {} narrows the default CPU ceiling: {}ms (platform default {}ms)",
+                key,
+                requested,
+                node_default
+            );
+            return requested;
+        }
+
+        tracing::warn!(
+            target: "app",
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            requested_ms = requested,
+            applied_ms = node_default,
+            "App {} asks for a {}ms CPU ceiling, above this node's {}ms ceiling; it is held to \
+             the node's value. Raise default_execution_limits.cpu_time_limit_ms if this node is \
+             meant to carry applications that compute that long",
+            key,
+            requested,
+            node_default
+        );
+        node_default
     }
 
     /// Resolve the V8 heap ceiling for one app: the node's default, narrowed
@@ -868,6 +974,7 @@ mod memory_ceiling {
                 resource_table_max: None,
                 timeout_ms: None,
                 rate_limit_ops_per_sec: None,
+                cpu_time_limit_ms: None,
             }),
             ..AppConfig::default()
         }
@@ -999,6 +1106,99 @@ mod memory_ceiling {
         assert_eq!(
             manager.effective_memory_limit_mb(&key, AppConfig::default().limits.as_ref()),
             96
+        );
+    }
+}
+
+/// The CPU ceiling, resolved the same way the heap ceiling is: the node's
+/// value, which an application may hold itself below and may not raise.
+#[cfg(test)]
+mod cpu_ceiling {
+    use super::*;
+    use crate::app::types::{AppConfig, ResourceLimits};
+    use crate::config::ExecutionLimits;
+
+    fn key(app_id: &str) -> AppKey {
+        AppKey::production(app_id)
+    }
+
+    fn asking_for(cpu_time_limit_ms: Option<u64>) -> AppConfig {
+        AppConfig {
+            limits: Some(ResourceLimits {
+                memory_mb: 0,
+                cpu_milli: 0,
+                resource_table_max: None,
+                timeout_ms: None,
+                rate_limit_ops_per_sec: None,
+                cpu_time_limit_ms,
+            }),
+            ..AppConfig::default()
+        }
+    }
+
+    fn node_with_cpu_ceiling(cpu_time_limit_ms: u64) -> ApplicationManager {
+        ApplicationManager::with_threads(Some(1)).with_limits(ExecutionLimits {
+            cpu_time_limit_ms,
+            ..ExecutionLimits::default()
+        })
+    }
+
+    /// The reachability check the heap ceiling failed for months: a default
+    /// that only a test can produce is not a default. Every path that builds
+    /// an isolate goes through `effective_limits`, and a deployment that
+    /// carries no `ResourceLimits` at all -- which is every deployment the
+    /// control plane sends today -- has to come out of it holding the node's
+    /// number.
+    #[test]
+    fn every_isolate_is_built_with_a_cpu_ceiling_even_with_no_deployment_limits() {
+        let manager = node_with_cpu_ceiling(1_500);
+        let effective = manager.effective_limits(
+            &key("no_limits_at_all"),
+            AppConfig::default().limits.as_ref(),
+        );
+        assert_eq!(effective.cpu_time_limit_ms, 1_500);
+
+        // And the same through the struct an isolate is actually built from,
+        // so a ceiling resolved correctly and then dropped on the floor
+        // between here and `AppRuntime::new` would still fail.
+        let spec_limits = manager.effective_limits(&key("no_limits_at_all"), None);
+        assert_eq!(spec_limits.cpu_time_limit_ms, 1_500);
+    }
+
+    #[test]
+    fn an_app_may_narrow_the_cpu_ceiling_but_not_widen_it() {
+        let manager = node_with_cpu_ceiling(1_000);
+
+        let narrower = asking_for(Some(250));
+        assert_eq!(
+            manager
+                .effective_limits(&key("modest"), narrower.limits.as_ref())
+                .cpu_time_limit_ms,
+            250
+        );
+
+        let wider = asking_for(Some(60_000));
+        assert_eq!(
+            manager
+                .effective_limits(&key("greedy"), wider.limits.as_ref())
+                .cpu_time_limit_ms,
+            1_000,
+            "CPU time is the node's resource; an application must not be able to help itself to \
+             more of it than the operator allowed"
+        );
+    }
+
+    /// `0` is what an absent field looks like on the wire, and a ceiling of
+    /// zero would terminate every invocation before it ran an instruction.
+    #[test]
+    fn a_zero_cpu_ceiling_is_read_as_unset_and_not_as_no_cpu_at_all() {
+        let manager = node_with_cpu_ceiling(2_000);
+        let unset = asking_for(Some(0));
+        assert_eq!(
+            manager
+                .effective_limits(&key("zero_means_unset"), unset.limits.as_ref())
+                .cpu_time_limit_ms,
+            2_000
         );
     }
 }

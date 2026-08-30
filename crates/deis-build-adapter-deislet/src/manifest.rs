@@ -15,6 +15,7 @@ use deis_bundle::{Asset, Manifest, QueueConsumer, Route, SUPPORTED_SCHEMA};
 
 use crate::assets::StagedAsset;
 use crate::routing::RouteEntry;
+use crate::site::{build_site_config, is_site_file};
 
 /// Where the bundled entry module sits inside the archive.
 ///
@@ -46,6 +47,12 @@ pub fn build_manifest(
         bail!("the project's \"name\" is the application id the bundle is filed under; it cannot be empty");
     }
 
+    // Read and checked before anything else uses `assets`, because the two
+    // files it reads are then dropped from the list: they describe the site,
+    // they are not part of it, and a bundle that served `/_redirects` would
+    // publish an author's routing table.
+    let site = build_site_config(config, assets)?;
+
     let manifest = Manifest {
         schema: SUPPORTED_SCHEMA,
         app: app.to_string(),
@@ -76,6 +83,7 @@ pub fn build_manifest(
             .collect(),
         assets: assets
             .iter()
+            .filter(|asset| !is_site_file(&asset.path))
             .map(|asset| Asset {
                 path: asset.path.clone(),
                 sha256: Some(asset.sha256.clone()),
@@ -83,6 +91,7 @@ pub fn build_manifest(
                 size: Some(asset.size()),
             })
             .collect(),
+        site,
     };
 
     // Fail here rather than at upload: the checks are the control plane's, and
@@ -280,6 +289,148 @@ mod tests {
             Some("text/css; charset=utf-8")
         );
         assert_eq!(entry.size, Some(6));
+    }
+
+    fn staged(path: &str, body: &str) -> StagedAsset {
+        StagedAsset {
+            path: path.to_string(),
+            bytes: body.as_bytes().to_vec(),
+            sha256: "0".repeat(64),
+            content_type: "text/plain; charset=utf-8",
+        }
+    }
+
+    #[test]
+    fn the_two_files_a_site_configures_itself_with_are_read_not_served() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({})),
+            &[],
+            &[
+                staged("_redirects", "/old  /new  301\n"),
+                staged("_headers", "/*\n  X-Frame-Options: DENY\n"),
+                staged("index.html", "<h1>hi</h1>"),
+            ],
+        )
+        .unwrap();
+
+        let paths: Vec<&str> = manifest.assets.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["index.html"],
+            "a visitor asking for /_redirects must not get the routing table"
+        );
+        assert_eq!(manifest.site.redirects.len(), 1);
+        assert_eq!(manifest.site.headers.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_redirect_line_fails_the_build_with_its_line_number() {
+        let err = build_manifest(
+            &config(serde_json::json!({})),
+            &[],
+            &[staged("_redirects", "/a  /b  301\n/c  /d  999\n")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("999"), "{err}");
+    }
+
+    #[test]
+    fn a_rewrite_target_that_is_not_in_the_bundle_fails_the_build() {
+        // The rule would match every request and then serve nothing, which is
+        // a site that 404s everywhere - discovered by a visitor, not the
+        // author, unless the build says so.
+        let err = build_manifest(
+            &config(serde_json::json!({})),
+            &[],
+            &[
+                staged("_redirects", "/app/*  /app/index.html  200\n"),
+                staged("index.html", "<h1>hi</h1>"),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("/app/index.html"), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn shipping_a_404_page_is_enough_to_get_it_served() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({})),
+            &[],
+            &[staged("404.html", "gone"), staged("index.html", "hi")],
+        )
+        .unwrap();
+        assert_eq!(manifest.site.not_found, deis_bundle::NotFound::Page);
+    }
+
+    #[test]
+    fn a_site_with_no_404_page_leaves_the_answer_to_the_app() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({})),
+            &[],
+            &[staged("index.html", "hi")],
+        )
+        .unwrap();
+        assert_eq!(manifest.site.not_found, deis_bundle::NotFound::None);
+    }
+
+    #[test]
+    fn an_author_can_ask_for_the_spa_fallback_instead() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({
+                "assets": { "dir": "./public", "notFound": "single-page-app" }
+            })),
+            &[],
+            &[staged("404.html", "gone"), staged("index.html", "hi")],
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.site.not_found,
+            deis_bundle::NotFound::SinglePageApp,
+            "a declared choice wins over the one inferred from the files"
+        );
+    }
+
+    #[test]
+    fn an_author_can_turn_the_inferred_404_page_off() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({
+                "assets": { "dir": "./public", "notFound": "none" }
+            })),
+            &[],
+            &[staged("404.html", "gone")],
+        )
+        .unwrap();
+        assert_eq!(manifest.site.not_found, deis_bundle::NotFound::None);
+    }
+
+    #[test]
+    fn asking_for_a_fallback_whose_page_is_missing_fails_the_build() {
+        let err = build_manifest(
+            &config(serde_json::json!({
+                "assets": { "dir": "./public", "notFound": "single-page-app" }
+            })),
+            &[],
+            &[staged("about.html", "hi")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("index.html"), "{err}");
+    }
+
+    #[test]
+    fn a_header_the_platform_owns_fails_the_build() {
+        let err = build_manifest(
+            &config(serde_json::json!({})),
+            &[],
+            &[staged("_headers", "/*\n  Content-Length: 0\n")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("may not set"), "{err}");
     }
 
     #[test]

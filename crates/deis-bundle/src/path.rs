@@ -60,6 +60,69 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
+/// Re-escape text that is going into a `Location` header.
+///
+/// A redirect target is built by substituting decoded captures into a decoded
+/// template, so it holds the *text* - a space is a space, an accented letter is
+/// an accented letter. A header value cannot carry either: `HeaderValue`
+/// refuses a space in a URL and a bare CR or LF in a header value is a
+/// response-splitting attempt, so a target that came out of a bundle has to be
+/// escaped again before it is sent.
+///
+/// `%` is deliberately left alone. An author who wrote an already-escaped
+/// target means it, and doubling their escapes would send the client to a
+/// path with a literal `%25` in it. The cost is that a file whose name really
+/// contains a percent sign cannot be redirected to; that is rarer than an
+/// author writing `%20`, and it is visible in the `Location` rather than
+/// silent.
+pub fn percent_encode_uri(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if is_uri_safe(byte) {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Bytes that may stand for themselves in a URI reference.
+///
+/// Unreserved plus the reserved characters that keep their structural meaning
+/// in a target we are passing through - the delimiters between path, query and
+/// fragment, and the sub-delimiters a query string is built out of. Everything
+/// else, control characters and every non-ASCII byte included, is escaped.
+fn is_uri_safe(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b':'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'['
+                | b']'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b'%'
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +164,33 @@ mod tests {
     #[test]
     fn invalid_utf8_does_not_fail_the_call() {
         assert_eq!(percent_decode("/%FF"), "/\u{fffd}");
+    }
+    #[test]
+    fn a_location_gets_its_escapes_back() {
+        assert_eq!(percent_encode_uri("/my file.txt"), "/my%20file.txt");
+        assert_eq!(percent_encode_uri("/caf\u{e9}"), "/caf%C3%A9");
+    }
+
+    #[test]
+    fn a_newline_can_never_reach_a_header_value() {
+        // A redirect target is author-controlled text; a bare CRLF in a
+        // Location is how a response gets split.
+        assert_eq!(
+            percent_encode_uri("/a\r\nX-Injected: 1"),
+            "/a%0D%0AX-Injected:%201"
+        );
+    }
+
+    #[test]
+    fn an_already_escaped_target_is_left_as_the_author_wrote_it() {
+        assert_eq!(percent_encode_uri("/my%20file.txt"), "/my%20file.txt");
+    }
+
+    #[test]
+    fn the_structure_of_a_url_survives() {
+        assert_eq!(
+            percent_encode_uri("https://example.com/a/b?x=1&y=2#top"),
+            "https://example.com/a/b?x=1&y=2#top"
+        );
     }
 }

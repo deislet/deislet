@@ -59,12 +59,47 @@ max_request_body_bytes = 33554432
 default_memory_limit_mb = 256
 
 # Default execution limits applied to each app's isolate. An individual app may
-# override either value through its own ResourceLimits; these are the fallback
-# used when it does not.
+# override timeout_ms, rate_limit_ops_per_sec and cpu_time_limit_ms through its
+# own ResourceLimits; these are the fallback used when it does not. The CPU
+# ceiling narrows only -- see below -- and wait_until_timeout_ms has no per-app
+# override at all.
 [default_execution_limits]
 # Maximum wall-clock time (ms) a single fetch invocation may run before the
 # isolate is terminated and the request fails. Must be at least 100.
 timeout_ms = 30000
+
+# Maximum CPU time (ms) one invocation may spend on the thread running it,
+# before the isolate is terminated. Must be at least 100.
+#
+# A separate ceiling from timeout_ms, and the one that measures what this node
+# actually pays. A handler waiting 25 seconds on a slow upstream and a handler
+# spinning for 25 seconds are the same thing to a wall clock and differ by
+# orders of magnitude to the machine: the first costs a parked thread, the
+# second holds a core that every other application on this node is queued
+# behind.
+#
+# An application's own ResourceLimits.cpu_time_limit_ms may ask for less and
+# gets what it asked for. One asking for more is refused and held to this
+# value: CPU time is the node's resource, so no tenant widens it.
+#
+# Set at or above timeout_ms it can never fire, because one thread cannot spend
+# more CPU time than wall-clock time; the node says so per application at
+# startup rather than leaving it to be noticed.
+#
+# Enforced by sampling the running thread's CPU clock in /proc. On a platform
+# without one -- macOS, Windows, a container with /proc hidden -- the node logs
+# an error at startup saying this ceiling is not in force, and the wall-clock
+# timeout is the only one left.
+cpu_time_limit_ms = 5000
+
+# Maximum wall-clock time (ms) the waitUntil tail of one invocation may run
+# after the response has already been sent. Must be at least 100.
+#
+# Its own budget rather than what is left of timeout_ms: the tail is meant to
+# outlive the response, so measuring it against the request's budget would
+# refuse every tail. No per-app override; every application on this node is
+# held to the value set here.
+wait_until_timeout_ms = 30000
 
 # Maximum rate (ops/sec) of JS-op dispatch before the isolate is terminated and
 # the in-flight request fails. Must be a finite value greater than 0.

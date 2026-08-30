@@ -12,9 +12,10 @@ use pingora::server::Server;
 use pingora::server::configuration::{Opt, ServerConf};
 use pingora::services::background::background_service;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use deis_proxy::catalog::{CatalogClient, CatalogPoller, ControlEndpoint};
 use deis_proxy::cli::CliConfig;
 use deis_proxy::config::system::LogLevel;
 use deis_proxy::config::{ConfigManager, SystemConfig};
@@ -344,8 +345,62 @@ fn main() -> Result<()> {
                 .with_config_manager(Arc::clone(&config));
             client.set_process_channel(commands.clone());
             server.add_service(background_service("control", ControlService::new(client)));
+
+            // The catalog's routing table. One background service, owned by
+            // the server, so an upgrade replaces it rather than stacking
+            // another poll loop on top; see deis_proxy::catalog.
+            let routing = system.routing();
+            match ControlEndpoint::parse(&control.addr) {
+                Ok(endpoint) => {
+                    match routing.preview_zone() {
+                        Some(zone) => info!(
+                            zone = zone.as_str(),
+                            "automatic per-environment addresses are on: an environment answers \
+                             at <env>--<app> under this zone, and the default environment also \
+                             at <app> under it. Point a wildcard DNS record at this instance and \
+                             give it a certificate for the zone, or those names resolve to \
+                             nothing and the handshake fails"
+                        ),
+                        None => info!(
+                            "automatic per-environment addresses are off; set \
+                             routing.preview_zone to give every environment one"
+                        ),
+                    }
+                    info!(
+                        poll_interval_secs = routing.control_poll_interval_secs(),
+                        max_table_bytes = routing.max_table_bytes(),
+                        "a route created in the control plane takes effect within one poll \
+                         interval, and a poll that fails leaves the last table in force"
+                    );
+                    let poller = CatalogPoller::new(
+                        CatalogClient::new(
+                            endpoint,
+                            control.secret.clone(),
+                            control.request_timeout_duration(),
+                            routing.max_table_bytes(),
+                        ),
+                        Arc::clone(&config),
+                        Duration::from_secs(routing.control_poll_interval_secs()),
+                    );
+                    server.add_service(background_service("routing table", poller));
+                }
+                // Unreachable through the configuration file, which validates
+                // the address, but a control plane this process cannot dial
+                // must not become a silent loss of routing.
+                Err(e) => error!(
+                    addr = %control.addr,
+                    error = %e,
+                    "not polling for the routing table: the control plane address cannot be \
+                     dialled over HTTP. Every route created through the control plane is \
+                     unreachable, and this instance routes only by the applications configured \
+                     on this machine"
+                ),
+            }
         }
-        None => info!("no control configured; running standalone"),
+        None => info!(
+            "no control configured; running standalone, so the catalog's routing table is never \
+             fetched and only locally configured applications are routed"
+        ),
     }
 
     server.run_forever()

@@ -18,9 +18,10 @@
 //! labels chunks with paths relative to its working directory, so the caller
 //! has to give it the project root; see `BuildBundler::with_cwd`.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use deis_bundle::{Manifest, ASSETS_PREFIX, MANIFEST_ENTRY};
 use zip::write::FileOptions;
 use zip::{CompressionMethod, DateTime, ZipWriter};
@@ -37,6 +38,14 @@ pub const BUNDLE_FILE_NAME: &str = "bundle.zip";
 
 /// Pack a manifest, a bundled entry module and the static files into one
 /// archive, returning its bytes.
+///
+/// The archive carries exactly what the manifest declares, no more and no
+/// less. Staged files the manifest left out - `_redirects` and `_headers`,
+/// which the build reads and does not serve - are not written, because a node
+/// counts anything under `assets/` that no manifest entry names as an
+/// unreachable file and would report the site's own configuration as bundle
+/// weight. A manifest entry with no staged bytes is the other direction and is
+/// an error: the bundle would promise a file it does not contain.
 pub fn write_bundle(
     manifest: &Manifest,
     worker_js: &str,
@@ -48,11 +57,23 @@ pub fn write_bundle(
         // someone opens it out of the archive.
         + "\n";
 
-    let mut entries: Vec<(String, &[u8])> = Vec::with_capacity(assets.len() + 2);
+    let staged: HashMap<&str, &StagedAsset> = assets
+        .iter()
+        .map(|asset| (asset.path.as_str(), asset))
+        .collect();
+
+    let mut entries: Vec<(String, &[u8])> = Vec::with_capacity(manifest.assets.len() + 2);
     entries.push((MANIFEST_ENTRY.to_string(), manifest_json.as_bytes()));
     entries.push((WORKER_ENTRY.to_string(), worker_js.as_bytes()));
-    for asset in assets {
-        entries.push((format!("{ASSETS_PREFIX}{}", asset.path), &asset.bytes));
+    for asset in &manifest.assets {
+        let Some(file) = staged.get(asset.path.as_str()) else {
+            bail!(
+                "the manifest declares asset {:?} but the build has no bytes for it; the bundle \
+                 would promise a file it does not carry",
+                asset.path
+            );
+        };
+        entries.push((format!("{ASSETS_PREFIX}{}", asset.path), &file.bytes));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -92,7 +113,7 @@ pub fn bundle_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deis_bundle::read_manifest;
+    use deis_bundle::{read_manifest, Asset};
 
     fn manifest() -> Manifest {
         Manifest {
@@ -107,7 +128,28 @@ mod tests {
             cron: Vec::new(),
             queues: Vec::new(),
             assets: Vec::new(),
+            site: Default::default(),
         }
+    }
+
+    /// Write a bundle whose manifest declares exactly the files staged for it,
+    /// which is the pairing `build_manifest` produces.
+    fn bundle(worker_js: &str, assets: &[StagedAsset]) -> Result<Vec<u8>> {
+        let mut manifest = manifest();
+        manifest.assets = assets
+            .iter()
+            .map(|asset| Asset {
+                path: asset.path.clone(),
+                sha256: Some(asset.sha256.clone()),
+                content_type: Some(asset.content_type.to_string()),
+                size: Some(asset.size()),
+            })
+            .collect();
+        // Sorted, the way `collect_assets` hands them to `build_manifest`:
+        // the manifest is part of the archive, so its own ordering is part of
+        // the bundle's identity.
+        manifest.assets.sort_by(|a, b| a.path.cmp(&b.path));
+        write_bundle(&manifest, worker_js, assets)
     }
 
     fn asset(path: &str, body: &[u8]) -> StagedAsset {
@@ -128,12 +170,7 @@ mod tests {
 
     #[test]
     fn the_archive_has_the_layout_the_format_defines() {
-        let bytes = write_bundle(
-            &manifest(),
-            "export default () => {}",
-            &[asset("a.txt", b"a")],
-        )
-        .unwrap();
+        let bytes = bundle("export default () => {}", &[asset("a.txt", b"a")]).unwrap();
         assert_eq!(
             names(&bytes),
             vec!["assets/a.txt", "manifest.json", "worker/index.js"]
@@ -144,7 +181,7 @@ mod tests {
     fn the_manifest_reads_back_with_the_shared_reader() {
         // The whole point of the format: what deis-build writes, deis-control
         // and deis-runtime read with `deis_bundle::read_manifest`.
-        let bytes = write_bundle(&manifest(), "export default () => {}", &[]).unwrap();
+        let bytes = bundle("export default () => {}", &[]).unwrap();
         let parsed = read_manifest(&bytes).unwrap();
         assert_eq!(parsed.manifest.app, "demo");
         assert_eq!(parsed.manifest.entry, WORKER_ENTRY);
@@ -152,31 +189,21 @@ mod tests {
 
     #[test]
     fn the_same_input_produces_the_same_bytes() {
-        let first = write_bundle(&manifest(), "code", &[asset("a.txt", b"a")]).unwrap();
-        let second = write_bundle(&manifest(), "code", &[asset("a.txt", b"a")]).unwrap();
+        let first = bundle("code", &[asset("a.txt", b"a")]).unwrap();
+        let second = bundle("code", &[asset("a.txt", b"a")]).unwrap();
         assert_eq!(bundle_sha256(&first), bundle_sha256(&second));
     }
 
     #[test]
     fn the_order_the_assets_arrive_in_does_not_change_the_bytes() {
-        let forward = write_bundle(
-            &manifest(),
-            "code",
-            &[asset("a.txt", b"a"), asset("b.txt", b"b")],
-        )
-        .unwrap();
-        let backward = write_bundle(
-            &manifest(),
-            "code",
-            &[asset("b.txt", b"b"), asset("a.txt", b"a")],
-        )
-        .unwrap();
+        let forward = bundle("code", &[asset("a.txt", b"a"), asset("b.txt", b"b")]).unwrap();
+        let backward = bundle("code", &[asset("b.txt", b"b"), asset("a.txt", b"a")]).unwrap();
         assert_eq!(bundle_sha256(&forward), bundle_sha256(&backward));
     }
 
     #[test]
     fn no_entry_carries_a_timestamp_from_the_build_host() {
-        let bytes = write_bundle(&manifest(), "code", &[asset("a.txt", b"a")]).unwrap();
+        let bytes = bundle("code", &[asset("a.txt", b"a")]).unwrap();
         let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
         for i in 0..archive.len() {
             let entry = archive.by_index(i).unwrap();
@@ -193,8 +220,38 @@ mod tests {
     fn a_different_input_is_a_different_bundle() {
         // The digest has to actually track the contents, or pinning the
         // timestamp would have made every build look identical.
-        let first = write_bundle(&manifest(), "code", &[]).unwrap();
-        let second = write_bundle(&manifest(), "other code", &[]).unwrap();
+        let first = bundle("code", &[]).unwrap();
+        let second = bundle("other code", &[]).unwrap();
         assert_ne!(bundle_sha256(&first), bundle_sha256(&second));
+    }
+
+    #[test]
+    fn a_staged_file_the_manifest_does_not_declare_is_not_written() {
+        // `_redirects` and `_headers` are staged like any other file and then
+        // left out of the manifest. Writing them anyway would publish the
+        // site's routing table at /_redirects and would show up on a node as
+        // an unreachable file.
+        let bytes = write_bundle(
+            &manifest(),
+            "code",
+            &[asset("_redirects", b"/a /b 301"), asset("a.txt", b"a")],
+        )
+        .unwrap();
+        assert_eq!(names(&bytes), vec!["manifest.json", "worker/index.js"]);
+    }
+
+    #[test]
+    fn a_declared_file_with_no_bytes_fails_the_build() {
+        let mut manifest = manifest();
+        manifest.assets = vec![Asset {
+            path: "missing.txt".to_string(),
+            sha256: None,
+            content_type: None,
+            size: None,
+        }];
+        let err = write_bundle(&manifest, "code", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing.txt"), "{err}");
     }
 }

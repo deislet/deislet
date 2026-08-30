@@ -24,6 +24,31 @@ service LogService {
     rpc Tail(TailRequest) returns (stream LogEntry);
 }
 
+// Per-invocation traces: ingest, query and live follow.
+//
+// A log line says something happened. A trace record says one *invocation*
+// happened: which application, which kind of invocation, what it was aimed
+// at, how long it took, and how the platform decided it ended. That last part
+// is the reason this service exists next to LogService - an application that
+// fails silently writes no log line at all, and the difference between "the
+// application threw" and "we cut it off" is knowable only to the runtime.
+//
+// Traces carry the same `trace_id` the application's log lines carry, so
+// LogService.Query with that trace_id returns the lines one invocation wrote.
+//
+// Just as dumb as the other two: records are stored and handed back, never
+// judged, thresholded or alerted on.
+service TraceService {
+    // Push trace records (batched)
+    rpc PushTraces(PushTracesRequest) returns (PushTracesResponse);
+
+    // Query stored traces, newest first, paginated
+    rpc QueryTraces(QueryTracesRequest) returns (QueryTracesResponse);
+
+    // Follow traces as they arrive
+    rpc TailTraces(TailTracesRequest) returns (stream TraceRecord);
+}
+
 // Metric ingest and query.
 //
 // Split from LogService because the two carry different data with different
@@ -157,6 +182,205 @@ message TailRequest {
 
     // Minimum severity; LOG_LEVEL_UNSPECIFIED means no floor
     LogLevel min_level = 2;
+}
+
+// What kind of invocation a trace record describes. Every entry point the
+// runtime has is one of these; an invocation the runtime cannot classify
+// arrives as UNSPECIFIED rather than being forced into the wrong bucket.
+enum InvocationKind {
+    INVOCATION_KIND_UNSPECIFIED = 0;
+    INVOCATION_KIND_HTTP_REQUEST = 1;
+    INVOCATION_KIND_QUEUE_BATCH = 2;
+    INVOCATION_KIND_CRON_TICK = 3;
+    INVOCATION_KIND_WEBSOCKET_MESSAGE = 4;
+}
+
+// How the platform decided the invocation ended.
+//
+// The split between "the application failed" and "we stopped it" is the
+// point of this enum: an operator reading a 500 cannot tell a handler that
+// threw from a handler the node killed, and only the runtime knows which it
+// was. Each cut-off is its own value because each has a different fix -- a
+// slow handler, a handler hammering the op layer, a handler eating the heap.
+enum InvocationOutcome {
+    INVOCATION_OUTCOME_UNSPECIFIED = 0;
+
+    // The handler returned and the platform served what it returned.
+    INVOCATION_OUTCOME_OK = 1;
+
+    // The application's own failure: an uncaught exception, or a 5xx it
+    // chose to answer with.
+    INVOCATION_OUTCOME_APPLICATION_ERROR = 2;
+
+    // Cut off by the wall-clock execution budget.
+    INVOCATION_OUTCOME_EXECUTION_TIMEOUT = 3;
+
+    // Cut off by the op dispatch rate limiter.
+    INVOCATION_OUTCOME_RATE_LIMITED = 4;
+
+    // Cut off by the isolate's heap ceiling.
+    INVOCATION_OUTCOME_MEMORY_LIMIT = 5;
+
+    // The platform failed around the application: the bundle would not load,
+    // the handler answered with something unparseable, a dependency was
+    // unreachable. Not the application's fault and not a budget.
+    INVOCATION_OUTCOME_INTERNAL_ERROR = 6;
+
+    // Cut off by the CPU-time ceiling. Its own value rather than sharing
+    // EXECUTION_TIMEOUT's: a duration cut-off usually points downstream of
+    // the application, a CPU cut-off always points at the application.
+    INVOCATION_OUTCOME_CPU_LIMIT = 7;
+}
+
+// One invocation of one application.
+//
+// Higher volume than logs by construction - one record per invocation,
+// whether or not the application logged anything - so producers sample and
+// this service keeps them for fewer days than logs. Both of those losses are
+// counted rather than silent; see PushTracesRequest.
+message TraceRecord {
+    // Ties this invocation to the log lines it wrote: LogEntry.trace_id
+    // carries the same value, so LogService.Query with this trace_id is the
+    // invocation's log.
+    string trace_id = 1;
+
+    // When the invocation started (microseconds since the Unix epoch).
+    int64 started_us = 2;
+
+    // How long it ran, in microseconds. Includes the time a cut-off
+    // invocation ran before it was stopped.
+    int64 duration_us = 3;
+
+    // The application, not the storage tenant, so a query for an application
+    // answers with every environment of it.
+    string app_id = 4;
+
+    // The environment half of the tenant, e.g. "production", "preview".
+    string environment = 5;
+
+    // The node that ran it. This service has no node dimension of its own;
+    // the node travels here because two nodes serving one application
+    // otherwise produce records nobody can tell apart.
+    string node = 6;
+
+    InvocationKind kind = 7;
+    InvocationOutcome outcome = 8;
+
+    // What the invocation was aimed at: the request URL, the queue name, the
+    // cron expression, the WebSocket path.
+    string target = 9;
+
+    // HTTP method. Empty for every other kind.
+    string method = 10;
+
+    // HTTP status the client was given; 0 when the invocation has no status.
+    int32 status = 11;
+
+    // The uncaught exception, or why the platform cut the invocation off.
+    // Empty when it ended cleanly.
+    string error = 12;
+
+    // Extra dimensions: a queue batch's message counts, a retry number.
+    map<string, string> attributes = 13;
+}
+
+// Push trace records.
+message PushTracesRequest {
+    // Batched records
+    repeated TraceRecord records = 1;
+
+    // Invocations the producer deliberately did not record since its previous
+    // push, because sampling did not select them. A gap in the traces is then
+    // a number an operator can read rather than nothing at all.
+    uint64 sampled_out = 2;
+
+    // Records the producer built and then lost because its own buffer was
+    // full. Unlike `sampled_out` this is a fault, not a policy.
+    uint64 dropped = 3;
+
+    // Request metadata
+    map<string, string> metadata = 4;
+}
+
+// Push trace records response
+message PushTracesResponse {
+    // Number of records successfully accepted
+    int32 accepted_count = 1;
+
+    // Number of records rejected
+    int32 rejected_count = 2;
+
+    // Error message (if any)
+    string error_message = 3;
+}
+
+// Query stored traces. Every filter is optional; filters combine with AND.
+//
+// "Which invocations failed in the last hour" is this message with
+// `start_us` an hour ago and `outcomes` listing everything but
+// INVOCATION_OUTCOME_OK.
+message QueryTracesRequest {
+    // Only this application; empty matches every application
+    string app_id = 1;
+
+    // Only this environment; empty matches every environment
+    string environment = 2;
+
+    // Inclusive lower bound on started_us; 0 means unbounded
+    int64 start_us = 3;
+
+    // Exclusive upper bound on started_us; 0 means unbounded
+    int64 end_us = 4;
+
+    // Empty matches every kind
+    repeated InvocationKind kinds = 5;
+
+    // Empty matches every outcome
+    repeated InvocationOutcome outcomes = 6;
+
+    // Exact trace ID; empty matches every trace
+    string trace_id = 7;
+
+    // Only invocations that ran at least this long; 0 means no floor
+    int64 min_duration_us = 8;
+
+    // Case-insensitive substring of `target`; empty matches every target
+    string target_contains = 9;
+
+    // Page size. 0 selects the server default, values above the server
+    // maximum are clamped down to it.
+    int32 limit = 10;
+
+    // Opaque continuation token taken from a previous QueryTracesResponse
+    string cursor = 11;
+}
+
+// Trace query result page, newest invocation first
+message QueryTracesResponse {
+    repeated TraceRecord records = 1;
+
+    // Token to pass back as QueryTracesRequest.cursor for the next, older
+    // page. Empty when this page is the last one.
+    string next_cursor = 2;
+
+    // True when at least one older matching record exists
+    bool has_more = 3;
+}
+
+// Follow traces as they are ingested. Only records that arrive after the
+// call are streamed; use QueryTraces for anything already stored.
+message TailTracesRequest {
+    // Only this application; empty follows every application
+    string app_id = 1;
+
+    // Only this environment; empty follows every environment
+    string environment = 2;
+
+    // Empty follows every kind
+    repeated InvocationKind kinds = 3;
+
+    // Empty follows every outcome
+    repeated InvocationOutcome outcomes = 4;
 }
 
 // One numeric sample of one metric at one point in time

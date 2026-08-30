@@ -27,6 +27,7 @@ use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 use std::sync::{Arc, Mutex};
@@ -98,15 +99,238 @@ enum Watched {
     WebSocketMessage,
 }
 
+/// How much CPU time one OS thread has consumed, readable from another
+/// thread.
+///
+/// # Why `/proc` and not `clock_gettime`
+///
+/// The finer instrument is `pthread_getcpuclockid` plus
+/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`: nanosecond resolution, no
+/// filesystem, no parsing. `CLOCK_THREAD_CPUTIME_ID` on its own is useless
+/// here -- it always names the *calling* thread, and the whole point of the
+/// watchdog is that it is not the thread being measured -- so it has to be
+/// paired with `pthread_getcpuclockid`, and that means declaring `pthread_t`,
+/// `clockid_t` and `timespec`. This crate does not depend on `libc`, and
+/// hand-written declarations of those three would be a silent-corruption
+/// hazard on any target where `time_t` is not what the declaration assumed
+/// (32-bit Linux with 64-bit `time_t` being the live example). A limit
+/// enforced against a misread clock is worse than one enforced coarsely.
+///
+/// `/proc/<pid>/task/<tid>/stat` needs nothing but `std`. Its cost is
+/// resolution: `utime` and `stime` are counted in scheduler ticks, 100 per
+/// second on every Linux build in practice, so the reading advances in 10ms
+/// steps. That is why `crate::config::MIN_CPU_TIME_LIMIT_MS` is 100ms -- the
+/// quantisation is at most a tenth of the smallest ceiling an operator can
+/// set, and a fifth of a percent of the default -- and why the watchdog never
+/// samples faster than one tick, since a faster sample cannot learn anything
+/// the last one did not already say.
+///
+/// # Where it is not available
+///
+/// Anywhere without `/proc/thread-self`: macOS, Windows, a container with
+/// `/proc` hidden, a Linux older than 3.17. [`Self::for_current_thread`]
+/// answers `None` there and [`Watchdog::start`] says so once per process at
+/// `error`, naming the ceiling that is not being enforced and what is left
+/// enforcing anything. A ceiling that quietly does not apply is worse than one
+/// that was never offered, and this is the one place that could have been
+/// quiet.
+#[derive(Clone, Debug)]
+struct ThreadCpuClock {
+    /// `/proc/<pid>/task/<tid>/stat` for one specific thread. Resolved once,
+    /// because the path is what pins the reading to that thread rather than
+    /// to whoever is reading it. Shared rather than owned: every arming clones
+    /// this twice -- once for the watchdog thread, once for the guard that
+    /// charges the application -- and that is twice per request.
+    stat_path: Arc<Path>,
+}
+
+impl ThreadCpuClock {
+    /// The clock of the thread calling this, or `None` where the platform
+    /// does not expose one.
+    ///
+    /// `/proc/thread-self` is the kernel's own name for "the calling thread's
+    /// directory", so reading the link here -- and only here -- is what binds
+    /// the returned clock to this thread and lets any other thread read it
+    /// afterwards.
+    fn for_current_thread() -> Option<Self> {
+        let link = std::fs::read_link("/proc/thread-self").ok()?;
+        let clock = Self {
+            stat_path: Arc::from(Path::new("/proc").join(link).join("stat")),
+        };
+        // Proved readable now rather than at the first cut-off: a clock that
+        // cannot be read is the case that has to be announced at startup, and
+        // announcing it under load is announcing it too late.
+        clock.consumed().map(|_| clock)
+    }
+
+    /// Total CPU time -- user plus system -- this thread has consumed since it
+    /// started. `None` once the thread is gone and its entry with it.
+    fn consumed(&self) -> Option<Duration> {
+        let stat = std::fs::read_to_string(&self.stat_path).ok()?;
+        // Field 2 is the thread's name in parentheses, and a thread may be
+        // named `my ) thread`; everything up to the *last* `)` is therefore
+        // skipped rather than split on. What follows starts at field 3, so
+        // `utime` (field 14) is at offset 11 and `stime` (field 15) follows
+        // it.
+        let rest = stat.get(stat.rfind(')')? + 1..)?;
+        let mut fields = rest.split_ascii_whitespace();
+        let utime: u64 = fields.nth(11)?.parse().ok()?;
+        let stime: u64 = fields.next()?.parse().ok()?;
+        let ticks = utime.checked_add(stime)?;
+        Some(Duration::from_nanos(
+            ticks.saturating_mul(1_000_000_000 / clock_ticks_per_second()),
+        ))
+    }
+}
+
+/// `USER_HZ`: how many units of `utime`/`stime` make a second.
+///
+/// Taken from the process's own auxiliary vector rather than assumed, because
+/// assuming it is how a CPU ceiling ends up enforced ten times too early or
+/// ten times too late on an architecture nobody tested. 100 is the fallback
+/// and is what every mainstream Linux reports; it is only reached if
+/// `/proc/self/auxv` cannot be read, on a platform where the clock itself
+/// would not have resolved either.
+fn clock_ticks_per_second() -> u64 {
+    static TICKS: OnceCell<u64> = OnceCell::new();
+    *TICKS.get_or_init(|| clock_ticks_from_auxv().unwrap_or(100))
+}
+
+fn clock_ticks_from_auxv() -> Option<u64> {
+    /// `AT_CLKTCK`, from the kernel's `linux/auxvec.h`.
+    const AT_CLKTCK: usize = 17;
+    let raw = std::fs::read("/proc/self/auxv").ok()?;
+    let width = std::mem::size_of::<usize>();
+    for entry in raw.chunks_exact(width * 2) {
+        let key = usize::from_ne_bytes(entry[..width].try_into().ok()?);
+        let value = usize::from_ne_bytes(entry[width..].try_into().ok()?);
+        if key == AT_CLKTCK {
+            return (value > 0).then_some(value as u64);
+        }
+    }
+    None
+}
+
+/// The CPU half of one armed cut-off.
+#[derive(Clone)]
+struct CpuBudget {
+    /// The clock of the thread the watched code is running on, captured when
+    /// the cut-off was armed -- on that thread, which is the only place it can
+    /// be captured.
+    clock: ThreadCpuClock,
+    /// Where that clock stood at arming. The budget is what has been spent
+    /// since, not what the thread has spent in its life.
+    at_arm: Duration,
+    /// The ceiling, or `None` for a stretch that is measured but not held to
+    /// one. Module evaluation is the only such stretch: parsing and compiling
+    /// a bundle is CPU-bound by nature, an application's per-request ceiling
+    /// says nothing about how long its code takes to compile, and holding a
+    /// deployment to it would refuse large bundles for the wrong reason. It is
+    /// bounded by [`MODULE_EVALUATION_BUDGET_MS`] instead, and still measured
+    /// here so that the line an operator reads carries the number.
+    limit: Option<Duration>,
+}
+
+impl CpuBudget {
+    /// CPU consumed since this cut-off was armed, or `None` if the thread's
+    /// entry has gone.
+    fn used(&self) -> Option<Duration> {
+        Some(self.clock.consumed()?.saturating_sub(self.at_arm))
+    }
+}
+
+/// Never sample the CPU clock more often than it can change.
+///
+/// `/proc` counts in scheduler ticks, so two reads inside one tick return the
+/// same number; a tighter loop would spend the watchdog's own CPU learning
+/// nothing. It is also the worst-case overshoot of the ceiling, because a
+/// thread spinning flat out can consume one tick of CPU between two samples.
+const CPU_SAMPLE_FLOOR: Duration = Duration::from_millis(10);
+
+/// Which ceiling ended an execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CutOffKind {
+    /// The invocation ran too long, whatever it was doing.
+    WallClock,
+    /// The invocation spent too much CPU. A different fault with a different
+    /// remedy, which is why it is never reported as a duration.
+    CpuTime,
+}
+
+/// One cut-off, with both measurements, because either one alone points an
+/// operator at the wrong thing.
+///
+/// A handler killed at 30 seconds having spent 40ms of CPU was waiting on
+/// something and the fault is upstream. A handler killed at 30 seconds having
+/// spent 30 seconds of CPU was computing and the fault is its own. The old
+/// line said "still running 30000ms into a request" for both.
+#[derive(Clone, Copy, Debug)]
+struct CutOff {
+    kind: CutOffKind,
+    /// Wall-clock time since the cut-off was armed.
+    elapsed: Duration,
+    /// CPU time this stretch had spent, where the platform can measure it.
+    cpu_used: Option<Duration>,
+    /// The CPU ceiling this stretch was held to, where there was one. It is
+    /// what [`CutOffKind::CpuTime`] crossed; on a wall-clock cut-off it is
+    /// carried only so the two numbers can be read against it.
+    cpu_limit: Option<Duration>,
+}
+
+impl CutOff {
+    /// The clause that names the ceiling and gives both numbers. Written once
+    /// so the six paths below cannot word it six ways.
+    fn describe(&self, budget_ms: u64) -> String {
+        let elapsed_ms = self.elapsed.as_millis();
+        match (self.kind, self.cpu_used, self.cpu_limit) {
+            (CutOffKind::CpuTime, Some(used), Some(limit)) => format!(
+                "spent {}ms of CPU time, above its {}ms CPU ceiling, after {}ms of wall clock -- \
+                 this is the CPU limit and not the {}ms duration limit, so the code was computing \
+                 rather than waiting",
+                used.as_millis(),
+                limit.as_millis(),
+                elapsed_ms,
+                budget_ms
+            ),
+            (CutOffKind::WallClock, Some(used), _) => format!(
+                "ran {elapsed_ms}ms of wall clock, above its {budget_ms}ms duration ceiling, \
+                 spending {}ms of CPU time doing it",
+                used.as_millis()
+            ),
+            _ => format!(
+                "ran {elapsed_ms}ms of wall clock, above its {budget_ms}ms duration ceiling (this \
+                 node cannot measure CPU time, so there is no second number)"
+            ),
+        }
+    }
+
+    /// The error an application-facing path hands back, so that a caller which
+    /// only ever sees an error -- and not this node's logs -- is still told
+    /// which ceiling it crossed.
+    fn as_error(&self, app_id: &str, budget_ms: u64) -> anyhow::Error {
+        anyhow::anyhow!(
+            "app {} was cut off: it {}",
+            app_id,
+            self.describe(budget_ms)
+        )
+    }
+}
+
 /// One armed cut-off, as the watchdog thread sees it.
 struct Watch {
     generation: u64,
+    /// When the watched stretch started, so the line an operator reads can say
+    /// how much wall clock a CPU cut-off actually took.
+    armed_at: Instant,
     deadline: Instant,
     what: Watched,
     /// The queue, cron expression or socket the work belongs to, when there
     /// is one; it is what an operator needs to find the cause.
     detail: Option<String>,
     budget_ms: u64,
+    /// The CPU clock of the thread running this stretch, and its ceiling.
+    /// `None` only where the platform exposes no per-thread CPU clock.
+    cpu: Option<CpuBudget>,
 }
 
 enum WatchCommand {
@@ -126,9 +350,11 @@ struct WatchState {
     /// -- otherwise it would kill whatever the isolate went on to do next.
     generation: u64,
     armed: bool,
-    /// The generation the cut-off last fired on, so the runtime thread can
-    /// tell a cut-off apart from an ordinary error.
-    fired_on: Option<u64>,
+    /// The generation the cut-off last fired on and why, so the runtime thread
+    /// can tell a cut-off apart from an ordinary error -- and tell the two
+    /// kinds of cut-off apart from each other, which are different faults with
+    /// different remedies.
+    fired_on: Option<(u64, CutOff)>,
 }
 
 /// The cut-off behind every execution budget in this file.
@@ -165,6 +391,26 @@ struct Watchdog {
     /// to outlive the execution it is watching.
     orders: Arc<WatchOrders>,
     thread: Option<thread::JoinHandle<()>>,
+    /// The CPU clock of the thread this isolate lives on, resolved once.
+    ///
+    /// Resolving it here is what makes it *this* thread's: `/proc/thread-self`
+    /// names whoever reads it, so it can only be read from the watched thread,
+    /// and `AppRuntime::new` and every `arm` below run on the one thread the
+    /// isolate is pinned to (`super::pool` hosts one isolate per thread, and a
+    /// `JsRuntime` cannot leave the thread that built it). `arm` asserts that
+    /// in debug builds, because a future refactor that broke it would measure
+    /// the wrong thread and no test would notice.
+    cpu_clock: Option<ThreadCpuClock>,
+    /// The thread `cpu_clock` belongs to; see above.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    clock_thread: thread::ThreadId,
+    /// Handed to each [`Armed`] guard so that what an invocation cost in CPU
+    /// is recorded when it ends, on the ordinary path as well as the cut-off
+    /// one.
+    metrics: Arc<MetricsRegistry>,
+    /// The same identity as `app_id`, shared rather than cloned per arming:
+    /// every invocation of every application on this node takes one of these.
+    tenant: Arc<str>,
 }
 
 /// The half of the watchdog an [`Armed`] guard keeps a hold of.
@@ -185,6 +431,31 @@ impl Watchdog {
         app_id: String,
         metrics: Arc<MetricsRegistry>,
     ) -> Result<Self> {
+        // Read on the thread the isolate will run on, which is the only thread
+        // that can name its own `/proc` entry; see the field's documentation.
+        let cpu_clock = ThreadCpuClock::for_current_thread();
+        if cpu_clock.is_none() {
+            // Once per process, not once per isolate: it is a property of the
+            // machine, and a node with fifty applications would otherwise say
+            // it fifty times. `error` because an operator has to act -- either
+            // move the node to a platform where this can be measured, or
+            // accept that one tenant can hold a core for the whole duration
+            // budget and plan the node's capacity for that.
+            static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+            ANNOUNCED.call_once(|| {
+                tracing::error!(
+                    target: "app",
+                    "This node cannot read a thread's CPU time (/proc/thread-self is not \
+                     readable here), so default_execution_limits.cpu_time_limit_ms is enforced \
+                     for no application on it. The wall-clock timeout is the only ceiling left, \
+                     and under it a handler that spins holds one core for the whole budget while \
+                     a handler that merely waits costs nothing -- the two are indistinguishable \
+                     again. Run deis-runtime on Linux with /proc mounted, or size this node for \
+                     the duration limit alone"
+                );
+            });
+        }
+
         let (commands, orders) = std::sync::mpsc::channel::<WatchCommand>();
         let shared = Arc::new(WatchOrders {
             state: Mutex::new(WatchState::default()),
@@ -192,6 +463,7 @@ impl Watchdog {
         });
         let state_in_thread = shared.clone();
         let app_id_in_thread = app_id.clone();
+        let metrics_for_guards = metrics.clone();
 
         let thread = thread::Builder::new()
             .name(format!("deis-watchdog-{app_id}"))
@@ -211,34 +483,90 @@ impl Watchdog {
                         },
                     };
 
-                    let remaining = watch.deadline.saturating_duration_since(Instant::now());
-                    match orders.recv_timeout(remaining) {
-                        Ok(WatchCommand::Disarm) => continue,
-                        // An arm with no disarm before it: the invocation that
-                        // armed the previous one is over, so watch the newer.
-                        Ok(WatchCommand::Arm(next)) => pending = Some(next),
-                        Ok(WatchCommand::Stop) => return,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // Held across the terminate so that a disarm
-                            // arriving now either happens entirely before it
-                            // -- and then the generation check below refuses
-                            // to fire -- or entirely after, and reads
-                            // `fired_on`. Without the lock the cut-off could
-                            // land on the next invocation.
-                            let mut state = state_in_thread
-                                .state
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            if !state.armed || state.generation != watch.generation {
-                                continue;
-                            }
-                            state.fired_on = Some(watch.generation);
-                            metrics.record_timeout_cutoff(&app_id_in_thread);
-                            warn_cut_off(&app_id_in_thread, &watch);
-                            isolate.terminate_execution();
+                    // One armed stretch, watched in slices. The wall clock
+                    // alone could be waited out in a single sleep; the CPU
+                    // ceiling cannot, because CPU time only advances while the
+                    // watched thread runs and there is no way to be woken by
+                    // it. So the thread wakes, reads the clock, and works out
+                    // the earliest instant the ceiling could next be reached.
+                    // That instant is exact rather than a poll: a thread
+                    // cannot spend more CPU time than wall-clock time, so the
+                    // CPU still owing is a lower bound on how long it must run
+                    // to spend it. Code that is waiting on IO therefore wakes
+                    // this thread a handful of times over a 30-second request,
+                    // and code that spins wakes it once.
+                    let fired = loop {
+                        let now = Instant::now();
+                        if now >= watch.deadline {
+                            break Some(CutOff {
+                                kind: CutOffKind::WallClock,
+                                elapsed: now.saturating_duration_since(watch.armed_at),
+                                cpu_used: watch.cpu.as_ref().and_then(CpuBudget::used),
+                                cpu_limit: watch.cpu.as_ref().and_then(|cpu| cpu.limit),
+                            });
                         }
+
+                        let mut slice = watch.deadline.saturating_duration_since(now);
+                        if let Some(cpu) = watch.cpu.as_ref() {
+                            // A clock that stopped reading means the thread is
+                            // gone, and the wall clock is left holding this
+                            // stretch; the isolate is about to be dropped
+                            // anyway.
+                            if let (Some(used), Some(limit)) = (cpu.used(), cpu.limit) {
+                                if used >= limit {
+                                    break Some(CutOff {
+                                        kind: CutOffKind::CpuTime,
+                                        elapsed: now.saturating_duration_since(watch.armed_at),
+                                        cpu_used: Some(used),
+                                        cpu_limit: Some(limit),
+                                    });
+                                }
+                                slice = slice.min((limit - used).max(CPU_SAMPLE_FLOOR));
+                            }
+                        }
+
+                        match orders.recv_timeout(slice) {
+                            Ok(WatchCommand::Disarm) => break None,
+                            // An arm with no disarm before it: the invocation
+                            // that armed the previous one is over, so watch
+                            // the newer.
+                            Ok(WatchCommand::Arm(next)) => {
+                                pending = Some(next);
+                                break None;
+                            }
+                            Ok(WatchCommand::Stop) => return,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                            // The slice elapsed; look again.
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    };
+
+                    let Some(cut_off) = fired else {
+                        continue;
+                    };
+
+                    // Held across the terminate so that a disarm arriving now
+                    // either happens entirely before it -- and then the
+                    // generation check below refuses to fire -- or entirely
+                    // after, and reads `fired_on`. Without the lock the cut-off
+                    // could land on the next invocation.
+                    let mut state = state_in_thread
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if !state.armed || state.generation != watch.generation {
+                        continue;
                     }
+                    state.fired_on = Some((watch.generation, cut_off));
+                    match cut_off.kind {
+                        CutOffKind::WallClock => metrics.record_timeout_cutoff(&app_id_in_thread),
+                        // The CPU *spent* is recorded on every path out of
+                        // an invocation, by `Armed`; this counts only the
+                        // crossings, so the two are not double counted.
+                        CutOffKind::CpuTime => metrics.record_cpu_cutoff(&app_id_in_thread),
+                    }
+                    warn_cut_off(&app_id_in_thread, &watch, &cut_off);
+                    isolate.terminate_execution();
                 }
             })
             .map_err(|e| {
@@ -249,9 +577,13 @@ impl Watchdog {
             })?;
 
         Ok(Self {
+            tenant: Arc::from(app_id.as_str()),
             app_id,
             orders: shared,
             thread: Some(thread),
+            cpu_clock,
+            clock_thread: thread::current().id(),
+            metrics: metrics_for_guards,
         })
     }
 
@@ -260,13 +592,38 @@ impl Watchdog {
     /// The returned guard gives the budget back when it is dropped, so a path
     /// that returns early -- a script that fails to start, an error carried out
     /// with `?` -- cannot leave a cut-off armed on the next invocation.
+    ///
+    /// `cpu_limit` is the CPU-time ceiling for this stretch; `None` leaves the
+    /// stretch measured but unbounded, which is what module evaluation gets.
+    /// It is read here, on the watched thread, because the baseline has to be
+    /// the clock as it stood *before* the code ran: sampled by the watchdog
+    /// thread when the order arrived, a handler that started spinning
+    /// immediately would already have burnt part of its budget into the
+    /// baseline and the ceiling would fire late.
     fn arm(
         &self,
         deadline: Instant,
         what: Watched,
         detail: Option<String>,
         budget_ms: u64,
+        cpu_limit: Option<Duration>,
     ) -> Armed {
+        debug_assert_eq!(
+            thread::current().id(),
+            self.clock_thread,
+            "the CPU clock was resolved on the thread that built the isolate; arming from another \
+             thread would measure that thread instead of the one running the application"
+        );
+
+        let armed_at = Instant::now();
+        let cpu = self.cpu_clock.as_ref().and_then(|clock| {
+            Some(CpuBudget {
+                at_arm: clock.consumed()?,
+                clock: clock.clone(),
+                limit: cpu_limit,
+            })
+        });
+
         let generation = {
             let mut state = self
                 .orders
@@ -280,10 +637,12 @@ impl Watchdog {
 
         let sent = self.orders.commands.send(WatchCommand::Arm(Watch {
             generation,
+            armed_at,
             deadline,
             what,
             detail,
             budget_ms,
+            cpu: cpu.clone(),
         }));
         if sent.is_err() {
             // Only reachable if the thread ended, which it does only when this
@@ -301,13 +660,17 @@ impl Watchdog {
             orders: self.orders.clone(),
             generation,
             stopped: false,
+            cpu,
+            metrics: self.metrics.clone(),
+            tenant: self.tenant.clone(),
         }
     }
 }
 
 impl WatchOrders {
-    /// Stop watching generation `generation`, and say whether it had fired.
-    fn stop(&self, generation: u64) -> bool {
+    /// Stop watching generation `generation`, and say how it ended: `None` if
+    /// the code finished on its own, the cut-off otherwise.
+    fn stop(&self, generation: u64) -> Option<CutOff> {
         let fired = {
             let mut state = self
                 .state
@@ -316,7 +679,10 @@ impl WatchOrders {
             if state.generation == generation {
                 state.armed = false;
             }
-            state.fired_on == Some(generation)
+            match state.fired_on {
+                Some((fired_on, cut_off)) if fired_on == generation => Some(cut_off),
+                _ => None,
+            }
         };
         let _ = self.commands.send(WatchCommand::Disarm);
         fired
@@ -341,23 +707,54 @@ struct Armed {
     orders: Arc<WatchOrders>,
     generation: u64,
     stopped: bool,
+    /// This stretch's CPU clock and baseline, kept on this side too so the
+    /// CPU it spent can be charged to the application when it ends.
+    cpu: Option<CpuBudget>,
+    metrics: Arc<MetricsRegistry>,
+    tenant: Arc<str>,
 }
 
 impl Armed {
-    /// Stop watching, and say whether the cut-off had already fired -- which
-    /// is how a caller tells "the application threw" from "the platform killed
-    /// it", two things that reach the runtime thread as the same error.
-    fn disarm(mut self) -> bool {
+    /// Stop watching, and say whether the cut-off had already fired and on
+    /// which ceiling -- which is how a caller tells "the application threw"
+    /// from "the platform killed it", two things that reach the runtime thread
+    /// as the same error, and how it tells a handler that computed too long
+    /// from one that waited too long.
+    fn disarm(mut self) -> Option<CutOff> {
+        self.settle()
+    }
+
+    /// Give the budget back exactly once, and charge the application for the
+    /// CPU this stretch spent.
+    ///
+    /// The charge happens here rather than in the watchdog thread because it
+    /// belongs on *every* path out of an invocation. A counter that only moved
+    /// when a ceiling was crossed would answer "who got cut off" and not
+    /// "which application is burning this node", and the second question is the
+    /// one an operator asks first -- usually about a tenant that is nowhere
+    /// near its ceiling and is simply being run a thousand times a second.
+    ///
+    /// One `/proc` read per invocation, a few microseconds, on a path that has
+    /// just run a V8 execution.
+    fn settle(&mut self) -> Option<CutOff> {
+        if self.stopped {
+            return None;
+        }
         self.stopped = true;
+        if let Some(used) = self.cpu.as_ref().and_then(CpuBudget::used) {
+            self.metrics.record_cpu_time(&self.tenant, used);
+        }
         self.orders.stop(self.generation)
     }
 }
 
 impl Drop for Armed {
+    /// The guard exists so that a path returning early -- a script that fails
+    /// to start, an error carried out with `?` -- still gives the budget back
+    /// and still charges what it spent. [`Self::settle`] is idempotent, so the
+    /// drop that follows an explicit `disarm` does nothing.
     fn drop(&mut self) {
-        if !self.stopped {
-            self.orders.stop(self.generation);
-        }
+        self.settle();
     }
 }
 
@@ -366,59 +763,85 @@ impl Drop for Armed {
 /// One place rather than six, so the six paths cannot drift into saying the
 /// same thing six ways -- and so that every one of them says what the cut-off
 /// costs, which differs per path and is the part that matters.
-fn warn_cut_off(app_id: &str, watch: &Watch) {
+///
+/// Which ceiling was crossed, and both measurements, are [`CutOff::describe`]:
+/// worded once, because a CPU cut-off reported as a duration sends an operator
+/// looking for a slow upstream that does not exist.
+fn warn_cut_off(app_id: &str, watch: &Watch, cut_off: &CutOff) {
     let budget_ms = watch.budget_ms;
     let detail = watch.detail.as_deref().unwrap_or("");
+    let ceiling = cut_off.describe(budget_ms);
+    let limit = match cut_off.kind {
+        CutOffKind::WallClock => "wall_clock",
+        CutOffKind::CpuTime => "cpu_time",
+    };
+    let cpu_ms = cut_off.cpu_used.map(|used| used.as_millis() as u64);
+    let elapsed_ms = cut_off.elapsed.as_millis() as u64;
     match watch.what {
         Watched::ModuleEvaluation => tracing::warn!(
             target: "app",
             app_id = %app_id,
+            limit,
             budget_ms,
-            "The module evaluation of app {app_id} was still running after {budget_ms}ms and has \
-             been cut off. The load fails and the runtime thread goes back to serving; until this \
-             was bounded, top-level code that never returned held that thread for the life of the \
-             process"
+            elapsed_ms,
+            cpu_ms,
+            "The module evaluation of app {app_id} was cut off: it {ceiling}. The load fails \
+             and the runtime thread goes back to serving; until this was bounded, top-level code \
+             that never returned held that thread for the life of the process"
         ),
         Watched::Request => tracing::warn!(
             target: "app",
             app_id = %app_id,
+            limit,
             budget_ms,
-            "App {app_id} was still running {budget_ms}ms into a request and has been cut off. \
-             The request fails. A handler that never yields is only stopped here, so this line is \
-             also the only sign that one exists"
+            elapsed_ms,
+            cpu_ms,
+            "App {app_id} was cut off on one request: it {ceiling}. The request fails. A \
+             handler that never yields is only stopped here, so this line is also the only sign \
+             that one exists"
         ),
         Watched::WaitUntilTail => tracing::warn!(
             target: "app",
             app_id = %app_id,
+            limit,
             budget_ms,
-            "The waitUntil tail of app {app_id} was still running {budget_ms}ms after its \
-             invocation was answered, and has been cut off. The invocation itself succeeded, so \
-             this line is the only sign of it: background work this application started is being \
-             killed"
+            elapsed_ms,
+            cpu_ms,
+            "The waitUntil tail of app {app_id} was cut off after its invocation was answered: \
+             it {ceiling}. The invocation itself succeeded, so this line is the only sign of it: \
+             background work this application started is being killed"
         ),
         Watched::QueueBatch => tracing::warn!(
             target: "app",
             app_id = %app_id,
             queue = %detail,
+            limit,
             budget_ms,
-            "App {app_id} took longer than {budget_ms}ms on a batch from queue {detail}. \
-             Terminating the isolate; the whole batch goes back to deis-queue and will be \
-             delivered again"
+            elapsed_ms,
+            cpu_ms,
+            "App {app_id} was cut off on a batch from queue {detail}: it {ceiling}. Terminating \
+             the isolate; the whole batch goes back to deis-queue and will be delivered again"
         ),
         Watched::ScheduledRun => tracing::warn!(
             target: "app",
             app_id = %app_id,
             cron = %detail,
+            limit,
             budget_ms,
-            "App {app_id} took longer than {budget_ms}ms on the scheduled run for {detail}. \
+            elapsed_ms,
+            cpu_ms,
+            "App {app_id} was cut off on the scheduled run for {detail}: it {ceiling}. \
              Terminating the isolate; this tick did not finish and is not retried"
         ),
         Watched::WebSocketMessage => tracing::warn!(
             target: "app",
             app_id = %app_id,
             ws_id = %detail,
+            limit,
             budget_ms,
-            "App {app_id} took longer than {budget_ms}ms on one message from WebSocket {detail}. \
+            elapsed_ms,
+            cpu_ms,
+            "App {app_id} was cut off on one message from WebSocket {detail}: it {ceiling}. \
              Terminating the isolate; that message is dropped and the gateway closes the \
              connection, while the application keeps serving everything else on this thread"
         ),
@@ -577,6 +1000,16 @@ pub struct AppRuntime {
     /// run once the response has been sent. Its own limit, not what is left of
     /// `timeout_ms`: see [`crate::config::ExecutionLimits::wait_until_timeout_ms`].
     wait_until_timeout_ms: u64,
+    /// Maximum CPU time (ms) one stretch of this application's code may spend
+    /// on the runtime thread before the isolate is terminated.
+    ///
+    /// The ceiling that measures what this application costs the node, as
+    /// opposed to how long its callers wait; see
+    /// [`crate::config::ExecutionLimits::cpu_time_limit_ms`]. Applied per
+    /// armed stretch, exactly as the wall-clock budgets are: a request, a
+    /// `waitUntil` tail, a queue batch, a cron tick and one WebSocket message
+    /// each get the whole of it.
+    cpu_time_limit_ms: u64,
     /// Configured JS-op dispatch rate limit (ops/sec) for this isolate.
     /// Kept alongside the live `RateLimiter` (captured in the op-metrics
     /// closure) purely so tests can assert the configured value reached
@@ -636,6 +1069,7 @@ impl AppRuntime {
             timeout_ms,
             wait_until_timeout_ms,
             rate_limit_ops_per_sec,
+            cpu_time_limit_ms,
         } = limits;
 
         // The node's own configuration knows where deis-control and
@@ -949,6 +1383,7 @@ impl AppRuntime {
             route_patterns,
             timeout_ms,
             wait_until_timeout_ms,
+            cpu_time_limit_ms,
             rate_limit_ops_per_sec,
             metrics,
             execution_deadline,
@@ -981,6 +1416,17 @@ impl AppRuntime {
     /// tail is nonetheless not allowed to run forever.
     fn arm_wait_until_budget(&self) -> Instant {
         self.arm_budget(self.wait_until_timeout_ms)
+    }
+
+    /// The CPU ceiling one stretch of application code is held to.
+    ///
+    /// The same value for a request, a tail, a batch, a tick and a message,
+    /// for the same reason the wall-clock budget is re-armed rather than
+    /// shared: each is a separate piece of work the application chose to
+    /// start, and what the node is protecting itself from is any one of them
+    /// holding a core.
+    fn cpu_budget(&self) -> Option<Duration> {
+        Some(Duration::from_millis(self.cpu_time_limit_ms))
     }
 
     fn arm_budget(&self, budget_ms: u64) -> Instant {
@@ -1170,20 +1616,27 @@ impl AppRuntime {
             Watched::WaitUntilTail,
             None,
             self.wait_until_timeout_ms,
+            self.cpu_budget(),
         );
 
         let outcome = self
             .settle_script(script_name, "__deis_runtime_wait_until_all()".to_string())
             .await;
 
-        cut_off.disarm();
+        let fired = cut_off.disarm();
         self.disarm_execution_budget();
         self.clear_termination();
         // The tail's last act is `js/runtime.js`'s own sweep, so on this path
         // `end_invocation` has nothing left to clear. A tail that was cut off
         // did not get there, and leaves the flag alone.
         self.timers_swept = outcome.is_ok();
-        outcome
+        // A cut-off reaches here as V8's "execution terminated", which does
+        // not say which ceiling ended it; the caller logs whatever it is
+        // handed, so it is handed the one that does.
+        match fired {
+            Some(cut_off) => Err(cut_off.as_error(&self.app_id, self.wait_until_timeout_ms)),
+            None => outcome,
+        }
     }
 
     /// Start a script and drive the event loop until the promise it evaluated
@@ -1225,11 +1678,15 @@ impl AppRuntime {
         self.clear_termination();
         self.begin_invocation();
         let deadline = self.arm_budget(MODULE_EVALUATION_BUDGET_MS);
+        // No CPU ceiling on this one; see [`CpuBudget::limit`]. Compiling a
+        // bundle is CPU-bound by nature and has nothing to do with what one
+        // request of this application is allowed to cost.
         let watchdog = self.watchdog.arm(
             deadline,
             Watched::ModuleEvaluation,
             None,
             MODULE_EVALUATION_BUDGET_MS,
+            None,
         );
 
         let outcome = self.evaluate_module().await;
@@ -1244,24 +1701,26 @@ impl AppRuntime {
                 self.module_id = Some(module_id);
                 Ok(())
             }
-            Err(e) if cut_off => {
-                tracing::debug!(
-                    target: "app",
-                    app_id = %self.app_id,
-                    error = %e,
-                    "Module evaluation of app {} ended in the cut-off",
-                    self.app_id
-                );
-                Err(anyhow::anyhow!(
-                    "the module evaluation of {} exceeded the {}ms ceiling and was cut off; the \
-                     application is not loaded. Top-level code runs once, before any request, and \
-                     has to finish -- work that takes longer belongs inside the handler, where it \
-                     has the request's own budget",
-                    self.app_id,
-                    MODULE_EVALUATION_BUDGET_MS
-                ))
-            }
-            Err(e) => Err(e),
+            Err(e) => match cut_off {
+                Some(cut_off) => {
+                    tracing::debug!(
+                        target: "app",
+                        app_id = %self.app_id,
+                        error = %e,
+                        "Module evaluation of app {} ended in the cut-off",
+                        self.app_id
+                    );
+                    Err(anyhow::anyhow!(
+                        "the module evaluation of {} {}, and was cut off; the application is not \
+                         loaded. Top-level code runs once, before any request, and has to finish \
+                         -- work that takes longer belongs inside the handler, where it has the \
+                         request's own budget",
+                        self.app_id,
+                        cut_off.describe(MODULE_EVALUATION_BUDGET_MS)
+                    ))
+                }
+                None => Err(e),
+            },
         }
     }
 
@@ -1488,9 +1947,13 @@ impl AppRuntime {
         // The guard gives the budget back on every path out of this function,
         // including the `?` below, so a script that fails to start cannot
         // leave a cut-off watching the next invocation.
-        let cut_off = self
-            .watchdog
-            .arm(deadline, Watched::Request, None, self.timeout_ms);
+        let cut_off = self.watchdog.arm(
+            deadline,
+            Watched::Request,
+            None,
+            self.timeout_ms,
+            self.cpu_budget(),
+        );
 
         let result = match self.runtime.execute_script("<fetch>", code) {
             Ok(promise) => {
@@ -1507,15 +1970,27 @@ impl AppRuntime {
             Err(e) => Err(e.into()),
         };
 
-        cut_off.disarm();
+        let fired = cut_off.disarm();
         self.disarm_execution_budget();
 
         // The timeout task and the rate limiter both work by terminating the
         // isolate, and that flag outlives the execution it killed.
         self.clear_termination();
 
-        // Check results. A terminated isolate (timeout or rate-limit cut-off)
-        // and a script error both land here, and both cost the request.
+        // A cut-off arrives from V8 as "execution terminated", which names no
+        // ceiling at all. Replaced with the error that names one and carries
+        // both measurements, so the 500 the dispatcher builds and the warn
+        // line the watchdog wrote say the same thing -- an operator reading
+        // only one of the two must not be sent looking for a slow upstream
+        // when the handler was computing.
+        let result = match fired {
+            Some(cut_off) => Err(cut_off.as_error(&self.app_id, self.timeout_ms)),
+            None => result.map_err(anyhow::Error::from),
+        };
+
+        // Check results. A terminated isolate (timeout, CPU or rate-limit
+        // cut-off) and a script error both land here, and both cost the
+        // request.
         if let Err(e) = &result {
             self.metrics
                 .record_request(&self.app_id, started.elapsed(), RequestOutcome::Error);
@@ -1707,6 +2182,7 @@ impl AppRuntime {
             Watched::QueueBatch,
             Some(queue.clone()),
             self.timeout_ms,
+            self.cpu_budget(),
         );
 
         let result = match self.runtime.execute_script("<queue>", code) {
@@ -1718,12 +2194,15 @@ impl AppRuntime {
             }
             Err(e) => Err(e.into()),
         };
-        cut_off.disarm();
+        let fired = cut_off.disarm();
         self.disarm_execution_budget();
         // Without this the batch that ran long would also be the last thing
         // this isolate ever did: every following batch would be handed back
         // and the app's messages would end up dead lettered.
         self.clear_termination();
+        if let Some(cut_off) = fired {
+            return Err(cut_off.as_error(&self.app_id, self.timeout_ms));
+        }
         result?;
 
         let json_str = {
@@ -1817,6 +2296,7 @@ impl AppRuntime {
             Watched::ScheduledRun,
             Some(cron.clone()),
             self.timeout_ms,
+            self.cpu_budget(),
         );
 
         let result = match self.runtime.execute_script("<scheduled>", code) {
@@ -1828,9 +2308,12 @@ impl AppRuntime {
             }
             Err(e) => Err(e.into()),
         };
-        cut_off.disarm();
+        let fired = cut_off.disarm();
         self.disarm_execution_budget();
         self.clear_termination();
+        if let Some(cut_off) = fired {
+            return Err(cut_off.as_error(&self.app_id, self.timeout_ms));
+        }
         result?;
 
         let json_str = {
@@ -1929,11 +2412,12 @@ impl AppRuntime {
             Watched::WebSocketMessage,
             Some(ws_id.clone()),
             self.timeout_ms,
+            self.cpu_budget(),
         );
 
         let outcome = self.settle_script("<ws_message>", code).await;
 
-        cut_off.disarm();
+        let fired = cut_off.disarm();
         // A budget armed and never given back is spent by whatever runs next in
         // this isolate -- the next message, or a request -- which would be told
         // its time was already gone. Same trap as `execute_fetch`. The rest of
@@ -1942,7 +2426,10 @@ impl AppRuntime {
         // handler can, and there is no `waitUntil` tail here to clean up after
         // it.
         self.end_invocation();
-        outcome
+        match fired {
+            Some(cut_off) => Err(cut_off.as_error(&self.app_id, self.timeout_ms)),
+            None => outcome,
+        }
     }
 
     /// Tell the application one of its WebSocket clients has gone.
@@ -1986,16 +2473,20 @@ impl AppRuntime {
             Watched::WebSocketMessage,
             Some(ws_id.clone()),
             self.timeout_ms,
+            self.cpu_budget(),
         );
 
         let outcome = self.settle_script("<ws_close>", js_code).await;
 
-        cut_off.disarm();
+        let fired = cut_off.disarm();
         self.disarm_execution_budget();
         self.clear_termination();
         // A close listener can arm a timer and open a socket exactly as a
         // message listener can, and there is no tail here to sweep after it.
         self.end_invocation();
+        if let Some(cut_off) = fired {
+            return Err(cut_off.as_error(&self.app_id, self.timeout_ms));
+        }
         outcome?;
 
         let ws_manager_opt = {
@@ -2065,6 +2556,15 @@ impl AppRuntime {
     #[cfg(test)]
     pub fn rate_limit_ops_per_sec(&self) -> f64 {
         self.rate_limit_ops_per_sec
+    }
+
+    /// Exposes the effective CPU ceiling for this isolate, for the same reason
+    /// as `timeout_ms` above: it is set from its own config key and its own
+    /// per-app override, so an isolate handed the wrong one behaves correctly
+    /// on every path except the one where an application computes too long.
+    #[cfg(test)]
+    pub fn cpu_time_limit_ms(&self) -> u64 {
+        self.cpu_time_limit_ms
     }
 
     pub fn op_metrics_summary(&self) -> OpMetricsSummary {

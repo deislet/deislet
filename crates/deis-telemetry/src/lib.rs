@@ -1,4 +1,23 @@
-//! Deislet log aggregation and metrics.
+//! Deislet log aggregation, per-invocation traces and metrics.
+//!
+//! Three surfaces, one database and one process:
+//!
+//! - **logs** - lines an application or a component wrote;
+//! - **traces** - one record per *invocation*: which application, which kind
+//!   of invocation, what it was aimed at, how long it ran, and how the
+//!   platform decided it ended. A log line says something happened; a trace
+//!   says an invocation happened, which is what makes "show me the requests
+//!   that failed in the last hour" answerable at all, including for an
+//!   application that fails without logging a word. Traces carry the same
+//!   `trace_id` an application's log lines carry, so one query joins them;
+//! - **metrics** - numeric samples, exported in the Prometheus text format.
+//!
+//! Traces are higher volume than logs by construction, so they are kept for
+//! fewer days (`trace_retention_days`) and producers are expected to sample.
+//! Neither loss is silent: a producer reports what sampling skipped and what
+//! its own buffer lost on every push, and both come back out on `/metrics` as
+//! `deis_telemetry_traces_sampled_out_total` and
+//! `deis_telemetry_traces_dropped_by_producer_total`.
 //!
 //! This service is deliberately "dumb": it knows only `app_id` as an
 //! application dimension, and knows nothing about versions, environments or
@@ -27,9 +46,12 @@
 //! home-grown health RPC would only add an answer that could disagree.
 //!
 //! Layout:
-//! - [`store`]   SQLite: day-partitioned logs, a metric time series, retention
-//! - [`tail`]    live fan-out to `Tail` subscribers, dropping for slow ones
-//! - [`service`] the two gRPC services, `LogService` and `MetricService`
+//! - [`store`]   SQLite: day-partitioned logs and traces, a metric time
+//!   series, retention
+//! - [`tail`]    live fan-out to `Tail` and `TailTraces` subscribers,
+//!   dropping for slow ones
+//! - [`service`] the three gRPC services: `LogService`, `TraceService` and
+//!   `MetricService`
 //! - [`http`]    the Prometheus scrape endpoint on its own port
 //! - [`prom`]    exposition-format rendering
 //! - [`stats`]   this process's own counters

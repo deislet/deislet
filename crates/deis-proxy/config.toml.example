@@ -93,10 +93,55 @@ level = "info"  # trace | debug | info | warn | error; RUST_LOG overrides
 # format = "$time_local $remote_addr $host $app_id $method $uri $status $request_time $upstream_addr"
 
 # Control (deis-control). Omit this table to run standalone.
+#
+# `secret` is one of the control plane's node_preshared_keys. It is the
+# credential for both directions of the relationship: the gRPC channel this
+# instance registers on, and the HTTP read of the routing table below.
 # [control]
 # addr = "http://127.0.0.1:8085"
 # associated_id = "deis-proxy-01"
 # secret = "<64 hex characters>"
 # heartbeat_interval = 30
+
+# The catalog's routing table: which application a request belongs to.
+#
+# This instance reads GET /api/routing-table from the control plane every
+# control_poll_interval_secs seconds and swaps the whole table in at once. A
+# route created through the control plane API or the dashboard takes effect
+# within one interval, with no restart and no reload.
+#
+# When the control plane is unreachable the last table this process accepted
+# stays in force indefinitely: traffic keeps being served exactly as it was,
+# and the only thing lost is the ability to change routing. Each failed poll
+# logs at ERROR saying which table is still routing and how old it is.
+#
+# Needs [control] above. Without it there is no table to fetch and only the
+# applications configured on this machine are routed.
+# [routing]
+# control_poll_interval_secs = 5
+# Ceiling on the fetched table, in bytes (default 8 MiB, roughly one line of
+# JSON per route). A table larger than this is refused whole and the previous
+# one stays in force.
+# max_table_bytes = 8388608
+# Automatic per-environment addresses. Unset - the default - turns them off
+# entirely; only routes an operator created exist.
+#
+# With a zone set, every environment of every application is reachable at
+#     <env>--<app>.<zone>
+# and the default environment (production) also at
+#     <app>.<zone>
+# so environment `pr-42` of app `shop` under `preview.example.com` answers at
+# pr-42--shop.preview.example.com.
+#
+# One DNS label rather than two (`pr-42.shop.<zone>`) on purpose: a wildcard
+# certificate matches exactly one label, so `*.preview.example.com` covers
+# every application and environment at once. The two-label form would need a
+# new `*.shop.preview.example.com` certificate for every application created.
+#
+# Point a wildcard DNS record at this instance and give it a certificate for
+# the zone - tls.default_certificate above is the usual place - or these
+# names resolve to nothing and the TLS handshake fails. An explicit route in
+# the catalog always wins over the automatic address for the same name.
+# preview_zone = "preview.example.com"
 
 # [cache] is parsed and validated but not applied to traffic yet; leave it out.

@@ -63,6 +63,19 @@ const REMOVED_CONFIG_KEYS: &[(&str, &str)] = &[("bundles.max_bundle_bytes", "bun
 /// discovered from failing traffic.
 const MIN_TIMEOUT_MS: u64 = 100;
 
+/// Smallest CPU-time ceiling that can be configured, in milliseconds.
+///
+/// Two reasons for a floor an order of magnitude above [`MIN_TIMEOUT_MS`].
+/// The first is the same one: below this every handler that does real work is
+/// cut off, and the node answers 500 to traffic it could have served. The
+/// second is measurement. The watched thread's CPU time is read out of
+/// `/proc`, where it is counted in scheduler ticks -- 10ms on every Linux
+/// build in practice -- so a ceiling near that granularity would be enforced
+/// with an error of tens of percent, and two identical requests would land on
+/// opposite sides of it. At 100ms the quantisation is at most a tenth of the
+/// budget, and at the 5s default it is a fifth of a percent.
+const MIN_CPU_TIME_LIMIT_MS: u64 = 100;
+
 /// Smallest V8 heap ceiling that can be configured, in MB.
 ///
 /// The isolate's own bootstrap -- the runtime's JavaScript, the module it
@@ -477,6 +490,32 @@ pub struct ExecutionLimits {
     /// terminated and the in-flight request fails.
     #[serde(default = "default_rate_limit_ops_per_sec")]
     pub rate_limit_ops_per_sec: f64,
+
+    /// Maximum CPU time (ms) one invocation may consume on the thread that is
+    /// running it, before the isolate is terminated.
+    ///
+    /// A separate ceiling from `timeout_ms`, and the one that measures what
+    /// the node actually pays. A handler that waits 25 seconds on a slow
+    /// upstream and a handler that spins for 25 seconds are the same thing to
+    /// a wall clock, and differ by orders of magnitude to the machine: the
+    /// first is an application doing IO and costs a parked thread, the second
+    /// is one tenant holding a core that every other application on this node
+    /// is queued behind. Only this limit can tell them apart, and on a box the
+    /// operator owns it is the limit that matters.
+    ///
+    /// Enforced by the same watchdog thread as `timeout_ms`, which samples the
+    /// watched thread's CPU clock; see `crate::runtime::isolate`. It applies
+    /// per armed stretch of application code -- one request, one `waitUntil`
+    /// tail, one queue batch, one cron tick, one WebSocket message -- exactly
+    /// as the wall-clock budget does, and is re-armed with the same
+    /// granularity.
+    ///
+    /// Setting it at or above `timeout_ms` disables it in practice: a single
+    /// thread cannot burn more CPU time than wall-clock time, so the duration
+    /// limit would always fire first. `ApplicationManager` says so per
+    /// application at startup rather than leaving it to be discovered.
+    #[serde(default = "default_cpu_time_limit_ms")]
+    pub cpu_time_limit_ms: u64,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -495,12 +534,32 @@ fn default_rate_limit_ops_per_sec() -> f64 {
     1000.0
 }
 
+/// 5 seconds of CPU, against a 30-second wall clock.
+///
+/// The two numbers are deliberately far apart, because they bound different
+/// things. A request-shaped handler spends single- or double-digit
+/// milliseconds of CPU; even a heavy one -- resizing an image, hashing a few
+/// megabytes -- stays under a second. 5s is therefore two orders of magnitude
+/// above what an honest handler costs, so no legitimate application meets it,
+/// while a handler that spins holds a core for a sixth of the time the
+/// duration limit alone would have let it, and a handler that is merely
+/// waiting on a slow upstream still gets its full 30 seconds.
+///
+/// An operator who runs deliberately CPU-heavy applications raises this; one
+/// running a node full of small IO-bound handlers can drop it to a few hundred
+/// milliseconds and get a much earlier warning about the tenant that is
+/// burning the box.
+fn default_cpu_time_limit_ms() -> u64 {
+    5_000
+}
+
 impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             timeout_ms: default_timeout_ms(),
             wait_until_timeout_ms: default_wait_until_timeout_ms(),
             rate_limit_ops_per_sec: default_rate_limit_ops_per_sec(),
+            cpu_time_limit_ms: default_cpu_time_limit_ms(),
         }
     }
 }
@@ -690,6 +749,14 @@ impl RuntimeConfig {
                 &value,
                 "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_RATE_LIMIT_OPS_PER_SEC",
                 "a decimal ops-per-second rate",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_CPU_TIME_LIMIT_MS") {
+            self.default_execution_limits.cpu_time_limit_ms = parse_env(
+                &value,
+                "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_CPU_TIME_LIMIT_MS",
+                "a whole number of milliseconds",
             )?;
         }
 
@@ -895,6 +962,17 @@ impl RuntimeConfig {
                  before the work it was handed could finish",
                 limits.wait_until_timeout_ms,
                 MIN_TIMEOUT_MS
+            ));
+        }
+
+        if limits.cpu_time_limit_ms < MIN_CPU_TIME_LIMIT_MS {
+            return Err(anyhow!(
+                "default_execution_limits.cpu_time_limit_ms is {}, which is below the {}ms floor; \
+                 the CPU clock this is measured against advances in scheduler ticks, so a ceiling \
+                 that small is enforced with an error of tens of percent and would cut off \
+                 handlers that are doing nothing unusual",
+                limits.cpu_time_limit_ms,
+                MIN_CPU_TIME_LIMIT_MS
             ));
         }
 
@@ -1156,6 +1234,41 @@ mod tests {
         assert_eq!(limits.timeout_ms, 30_000);
         assert_eq!(limits.wait_until_timeout_ms, 30_000);
         assert_eq!(limits.rate_limit_ops_per_sec, 1000.0);
+        assert_eq!(limits.cpu_time_limit_ms, 5_000);
+    }
+
+    #[test]
+    fn a_config_that_names_no_cpu_ceiling_gets_the_default() {
+        // Every configuration file written before this setting existed omits
+        // it, and those are the nodes the ceiling has to reach: a default that
+        // only a test can produce is the shape the heap ceiling had for
+        // months, where the mechanism was correct and nothing ever fed it a
+        // value.
+        let config: RuntimeConfig =
+            toml::from_str("[default_execution_limits]\ntimeout_ms = 5000\n").unwrap();
+        assert_eq!(config.default_execution_limits.cpu_time_limit_ms, 5_000);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn the_cpu_ceiling_is_configured_on_its_own() {
+        let toml_str = r#"
+            [default_execution_limits]
+            timeout_ms = 30000
+            cpu_time_limit_ms = 250
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.default_execution_limits.timeout_ms, 30_000);
+        assert_eq!(config.default_execution_limits.cpu_time_limit_ms, 250);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_cpu_ceiling_below_floor() {
+        let mut config = RuntimeConfig::default();
+        config.default_execution_limits.cpu_time_limit_ms = MIN_CPU_TIME_LIMIT_MS - 1;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("cpu_time_limit_ms"), "{err}");
     }
 
     #[test]
@@ -1432,6 +1545,10 @@ mod tests {
             "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_RATE_LIMIT_OPS_PER_SEC",
             "42.5",
         );
+        env::set_var(
+            "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_CPU_TIME_LIMIT_MS",
+            "777",
+        );
 
         let mut config = RuntimeConfig::default();
         config.apply_env_overrides().unwrap();
@@ -1439,10 +1556,12 @@ mod tests {
         env::remove_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_TIMEOUT_MS");
         env::remove_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_WAIT_UNTIL_TIMEOUT_MS");
         env::remove_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_RATE_LIMIT_OPS_PER_SEC");
+        env::remove_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_CPU_TIME_LIMIT_MS");
 
         assert_eq!(config.default_execution_limits.timeout_ms, 12345);
         assert_eq!(config.default_execution_limits.wait_until_timeout_ms, 54321);
         assert_eq!(config.default_execution_limits.rate_limit_ops_per_sec, 42.5);
+        assert_eq!(config.default_execution_limits.cpu_time_limit_ms, 777);
     }
 
     #[test]
@@ -1702,6 +1821,14 @@ mod tests {
         assert_eq!(
             config.assets.cache_control,
             "public, max-age=0, must-revalidate"
+        );
+        // Read out of the file rather than taken from the default, so a
+        // ceiling that exists in the code and not in the file an operator
+        // copies is a failing test rather than a setting nobody can find.
+        assert_eq!(config.default_execution_limits.cpu_time_limit_ms, 5_000);
+        assert_eq!(
+            config.default_execution_limits.wait_until_timeout_ms,
+            30_000
         );
     }
 

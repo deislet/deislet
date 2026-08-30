@@ -1,9 +1,18 @@
 //! The control plane's HTTP API, as this CLI uses it.
 //!
-//! Every type here mirrors what `deis-control` already serves; nothing is
-//! invented. Only the fields the CLI prints are deserialised, so an added
-//! field on the server does not break an older CLI.
+//! Every type here mirrors what `deis-control` already serves, with one
+//! documented exception: [`Control::storage_credentials`] names a route
+//! `deis-control` does not yet have, needed so `deis kv`, `deis db` and `deis
+//! blob` can reach deis-store the way every other platform command reaches
+//! its service - through the credential already on file, not a secret pasted
+//! by hand. Its doc comment is the contract; see there before assuming it
+//! works against a running platform.
+//!
+//! Every other field the CLI prints is deserialised straight off what the
+//! server already returns, so an added field there does not break an older
+//! CLI.
 
+pub mod storage;
 pub mod telemetry;
 
 use anyhow::{Context, Result, bail};
@@ -133,6 +142,23 @@ pub struct SecretChangeResponse {
 pub struct SecretDeletedResponse {
     pub deleted: String,
     pub delivery: DeliveryReport,
+}
+
+/// What `deis kv`, `deis db` and `deis blob` need to reach deis-store as one
+/// tenant.
+///
+/// Both fields are optional for the same reason they are optional in
+/// `deis-control`'s own `delivery::StorageWiring`: a platform with no
+/// deis-store configured has no `store_endpoint`, and a deis-store bound to
+/// loopback with no `auth_secret` needs no `token` at all - the tenant header
+/// alone is enough there, which is why `token` absent is a normal answer and
+/// not a failure to authenticate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageCredentials {
+    #[serde(default)]
+    pub store_endpoint: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// One runtime node as the control plane knows it.
@@ -530,6 +556,43 @@ impl Control {
                 &format!("/api/apps/{app_id}/environments/{environment}/secrets/{name}"),
             ),
             &format!("deleting secret {name} of {environment}"),
+        )
+        .await
+    }
+
+    // ---- storage --------------------------------------------------------
+
+    /// The address and capability token `deis kv`, `deis db` and `deis blob`
+    /// need to act as one tenant of deis-store.
+    ///
+    /// **This route does not exist on `deis-control` yet.** It belongs beside
+    /// the other `/api/apps/:app_id/environments/:environment/*` routes,
+    /// behind the same bearer-token middleware as the rest of this file, and
+    /// its handler is a thin read of what `deis-control` already computes for
+    /// a deployment: `delivery::StorageWiring::from_config(&config).store`
+    /// for the address and `.token_for(app_id, environment)` for the token -
+    /// see that type's doc comment for why each is optional. Minting the
+    /// token there rather than handing this CLI the shared `auth_secret`
+    /// keeps the secret itself on the control plane and the store, which is
+    /// the whole point of a capability token: a leaked CLI credential (the
+    /// bearer token in `credentials.toml`) still only ever proves the holder
+    /// may deploy and inspect *through the control plane's own checks*, never
+    /// hands out the key every tenant's token is derived from.
+    ///
+    /// Until that route exists, every call here fails with a 404 that the
+    /// generic error path below reports as "the control plane answered 404";
+    /// that is expected and is not a bug in this CLI.
+    pub async fn storage_credentials(
+        &self,
+        app_id: &str,
+        environment: &str,
+    ) -> Result<StorageCredentials> {
+        self.send(
+            self.request(
+                Method::GET,
+                &format!("/api/apps/{app_id}/environments/{environment}/storage-token"),
+            ),
+            &format!("obtaining a storage capability token for {environment} of app {app_id}"),
         )
         .await
     }

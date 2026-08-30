@@ -1,28 +1,48 @@
-//! Live fan-out of freshly ingested logs to `Tail` subscribers.
+//! Live fan-out of freshly ingested records to `Tail` and `TailTraces`
+//! subscribers.
 //!
-//! The rule this module exists to enforce: **a slow tail consumer must never
-//! slow down ingestion.** Everything is pushed into a bounded broadcast
-//! buffer, which overwrites its oldest slot when full. A consumer that falls
-//! behind loses entries - for that consumer only - and the loss is counted and
+//! The rule this module exists to enforce: **a slow consumer must never slow
+//! down ingestion.** Everything is pushed into a bounded broadcast buffer,
+//! which overwrites its oldest slot when full. A consumer that falls behind
+//! loses records - for that consumer only - and the loss is counted and
 //! logged rather than propagated back to the writer.
 //!
-//! The stored copy is never affected: whatever a tail stream misses is still
-//! in SQLite and comes back through `Query`.
+//! The stored copy is never affected: whatever a stream misses is still in
+//! SQLite and comes back through `Query` or `QueryTraces`.
+//!
+//! Logs and traces share the machinery and nothing else. [`LiveHub`] is
+//! generic over what it carries, and each family brings its own counters, so
+//! "log entries a slow follower missed" and "trace records a slow follower
+//! missed" stay two numbers an operator can tell apart.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::stats::ServiceStats;
-use crate::store::LogRecord;
+use crate::store::{LogRecord, TraceRecord};
 
-/// How many entries one tail stream may have queued toward its client before
-/// the pump stops pulling. Back-pressure stops here: it turns into broadcast
-/// lag (dropped entries for this stream), never into a stalled writer.
+/// How many records one stream may have queued toward its client before the
+/// pump stops pulling. Back-pressure stops here: it turns into broadcast lag
+/// (dropped records for this stream), never into a stalled writer.
 const SUBSCRIBER_QUEUE: usize = 256;
 
-/// Which live entries a subscriber wants. `None` means "no restriction".
+/// Which live records a subscriber wants.
+///
+/// Implemented per family rather than shared, because the two families are
+/// filtered on different things: a log stream narrows by severity, a trace
+/// stream narrows by what the platform decided about the invocation.
+pub trait LiveFilter<T>: Send + 'static {
+    fn matches(&self, record: &T) -> bool;
+
+    /// How the filter reads in this stream's log lines, so an operator can
+    /// tell two open streams apart.
+    fn describe(&self) -> String;
+}
+
+/// Which live log entries a subscriber wants. `None` means "no restriction".
 #[derive(Debug, Clone, Default)]
 pub struct TailFilter {
     pub app_id: Option<String>,
@@ -30,8 +50,8 @@ pub struct TailFilter {
     pub min_level: Option<i32>,
 }
 
-impl TailFilter {
-    pub fn matches(&self, record: &LogRecord) -> bool {
+impl LiveFilter<LogRecord> for TailFilter {
+    fn matches(&self, record: &LogRecord) -> bool {
         if let Some(app_id) = &self.app_id
             && &record.app_id != app_id
         {
@@ -44,47 +64,167 @@ impl TailFilter {
         }
         true
     }
+
+    fn describe(&self) -> String {
+        format!(
+            "app_id={} min_level={}",
+            self.app_id.as_deref().unwrap_or("*"),
+            self.min_level.unwrap_or(0)
+        )
+    }
 }
 
-/// Fan-out point between the ingest path and every open tail stream.
-pub struct TailHub {
-    tx: broadcast::Sender<Arc<LogRecord>>,
-    /// Flipped once on shutdown. Without it a client that is following logs
-    /// would keep its stream - and therefore the whole gRPC server's graceful
-    /// shutdown - open forever, because a tail stream has no natural end.
+/// Which live trace records a subscriber wants. An empty list means "every
+/// value of that field", which is what makes `TailTraces` with nothing set
+/// follow every invocation on the node.
+#[derive(Debug, Clone, Default)]
+pub struct TraceTailFilter {
+    pub app_id: Option<String>,
+    pub environment: Option<String>,
+    /// `InvocationKind` ordinals.
+    pub kinds: Vec<i32>,
+    /// `InvocationOutcome` ordinals. This is how a follower asks to be shown
+    /// only the invocations that failed.
+    pub outcomes: Vec<i32>,
+}
+
+impl LiveFilter<TraceRecord> for TraceTailFilter {
+    fn matches(&self, record: &TraceRecord) -> bool {
+        if let Some(app_id) = &self.app_id
+            && &record.app_id != app_id
+        {
+            return false;
+        }
+        if let Some(environment) = &self.environment
+            && &record.environment != environment
+        {
+            return false;
+        }
+        if !self.kinds.is_empty() && !self.kinds.contains(&record.kind) {
+            return false;
+        }
+        if !self.outcomes.is_empty() && !self.outcomes.contains(&record.outcome) {
+            return false;
+        }
+        true
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "app_id={} environment={} kinds={:?} outcomes={:?}",
+            self.app_id.as_deref().unwrap_or("*"),
+            self.environment.as_deref().unwrap_or("*"),
+            self.kinds,
+            self.outcomes
+        )
+    }
+}
+
+/// The counters one hub keeps, named by projection out of [`ServiceStats`].
+///
+/// Passing the accessors rather than the numbers is what lets one hub
+/// implementation serve two families without either family's counters
+/// standing in for the other's.
+#[derive(Clone, Copy)]
+pub struct HubMeters {
+    pub streams_started: fn(&ServiceStats) -> &AtomicU64,
+    pub streams_open: fn(&ServiceStats) -> &AtomicU64,
+    pub entries_dropped: fn(&ServiceStats) -> &AtomicU64,
+}
+
+/// Fan-out point between the ingest path and every open stream of one family.
+pub struct LiveHub<T> {
+    tx: broadcast::Sender<Arc<T>>,
+    /// Flipped once on shutdown. Without it a client that is following would
+    /// keep its stream - and therefore the whole gRPC server's graceful
+    /// shutdown - open forever, because a follow stream has no natural end.
     stop: watch::Sender<bool>,
     stats: Arc<ServiceStats>,
+    meters: HubMeters,
+    /// What the records are called in this hub's log lines.
+    family: &'static str,
 }
+
+/// The hub `LogService.Tail` streams from.
+pub type TailHub = LiveHub<LogRecord>;
+
+/// The hub `TraceService.TailTraces` streams from.
+pub type TraceHub = LiveHub<TraceRecord>;
 
 impl TailHub {
     /// `capacity` is how many entries the shared live buffer holds. Bigger
     /// buffers tolerate slower consumers at the cost of memory.
     pub fn new(capacity: usize, stats: Arc<ServiceStats>) -> Self {
+        Self::with_meters(
+            capacity,
+            stats,
+            "log entry",
+            HubMeters {
+                streams_started: |s| &s.tail_streams_started,
+                streams_open: |s| &s.tail_streams_open,
+                entries_dropped: |s| &s.tail_entries_dropped,
+            },
+        )
+    }
+}
+
+impl TraceHub {
+    /// A hub for trace records. Traces arrive at one record per invocation
+    /// rather than one per log line, so this buffer is normally configured
+    /// larger than the log one.
+    pub fn new(capacity: usize, stats: Arc<ServiceStats>) -> Self {
+        Self::with_meters(
+            capacity,
+            stats,
+            "trace record",
+            HubMeters {
+                streams_started: |s| &s.trace_tail_streams_started,
+                streams_open: |s| &s.trace_tail_streams_open,
+                entries_dropped: |s| &s.trace_tail_entries_dropped,
+            },
+        )
+    }
+}
+
+impl<T: Send + Sync + 'static> LiveHub<T> {
+    fn with_meters(
+        capacity: usize,
+        stats: Arc<ServiceStats>,
+        family: &'static str,
+        meters: HubMeters,
+    ) -> Self {
         let (tx, _) = broadcast::channel(capacity.max(1));
         let (stop, _) = watch::channel(false);
-        Self { tx, stop, stats }
+        Self {
+            tx,
+            stop,
+            stats,
+            meters,
+            family,
+        }
     }
 
-    /// End every open tail stream. Called on shutdown; following logs must
-    /// not be able to hold the service open.
+    /// End every open stream. Called on shutdown; following must not be able
+    /// to hold the service open.
     pub fn close(&self) {
         let open = self.subscriber_count();
         self.stop.send_replace(true);
         if open > 0 {
             info!(
                 streams = open,
-                "closing tail streams because the service is shutting down; \
+                family = self.family,
+                "closing follow streams because the service is shutting down; \
                  followers must reconnect after the restart"
             );
         }
     }
 
-    /// Hand freshly stored entries to every open tail stream.
+    /// Hand freshly stored records to every open stream.
     ///
-    /// Never blocks and never fails: with no subscribers the entries are
+    /// Never blocks and never fails: with no subscribers the records are
     /// discarded, and with a slow subscriber the buffer overwrites its oldest
     /// slot, which that subscriber later observes as a drop.
-    pub fn publish(&self, records: &[Arc<LogRecord>]) {
+    pub fn publish(&self, records: &[Arc<T>]) {
         if self.tx.receiver_count() == 0 {
             return;
         }
@@ -94,46 +234,62 @@ impl TailHub {
         }
     }
 
-    /// How many tail streams are currently attached.
+    /// How many streams are currently attached.
     pub fn subscriber_count(&self) -> usize {
         self.tx.receiver_count()
     }
 
-    /// Open a tail stream. `label` identifies the subscriber in log lines.
-    pub fn subscribe(&self, label: String, filter: TailFilter) -> mpsc::Receiver<Arc<LogRecord>> {
+    /// Open a stream. `label` identifies the subscriber in log lines.
+    pub fn subscribe<F: LiveFilter<T>>(&self, label: String, filter: F) -> mpsc::Receiver<Arc<T>> {
         let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
         let stats = Arc::clone(&self.stats);
         let live = self.tx.subscribe();
         let stop = self.stop.subscribe();
-        tokio::spawn(pump(label, filter, live, tx, stop, stats));
+        tokio::spawn(pump(
+            label,
+            filter,
+            live,
+            tx,
+            stop,
+            stats,
+            self.meters,
+            self.family,
+        ));
         rx
     }
 }
 
-/// Move entries from the shared live buffer into one subscriber's queue,
+/// Move records from the shared live buffer into one subscriber's queue,
 /// applying that subscriber's filter and accounting for what it missed.
-async fn pump(
+#[allow(clippy::too_many_arguments)]
+async fn pump<T, F>(
     label: String,
-    filter: TailFilter,
-    mut live: broadcast::Receiver<Arc<LogRecord>>,
-    out: mpsc::Sender<Arc<LogRecord>>,
+    filter: F,
+    mut live: broadcast::Receiver<Arc<T>>,
+    out: mpsc::Sender<Arc<T>>,
     mut stop: watch::Receiver<bool>,
     stats: Arc<ServiceStats>,
-) {
+    meters: HubMeters,
+    family: &'static str,
+) where
+    T: Send + Sync + 'static,
+    F: LiveFilter<T>,
+{
     if *stop.borrow() {
         debug!(
             subscriber = %label,
-            "tail stream requested while the service is shutting down, closing it right away"
+            family,
+            "follow stream requested while the service is shutting down, closing it right away"
         );
         return;
     }
-    ServiceStats::incr(&stats.tail_streams_started);
-    ServiceStats::incr(&stats.tail_streams_open);
+    ServiceStats::incr((meters.streams_started)(&stats));
+    ServiceStats::incr((meters.streams_open)(&stats));
     info!(
         subscriber = %label,
-        app_id = filter.app_id.as_deref().unwrap_or("*"),
-        min_level = filter.min_level.unwrap_or(0),
-        "tail stream opened"
+        family,
+        filter = %filter.describe(),
+        "follow stream opened"
     );
 
     let mut dropped_total: u64 = 0;
@@ -141,7 +297,7 @@ async fn pump(
     loop {
         let next = tokio::select! {
             _ = stop.changed() => {
-                debug!(subscriber = %label, "service is shutting down, closing this tail stream");
+                debug!(subscriber = %label, family, "service is shutting down, closing this stream");
                 break;
             }
             next = live.recv() => next,
@@ -159,6 +315,7 @@ async fn pump(
                     _ = stop.changed() => {
                         debug!(
                             subscriber = %label,
+                            family,
                             "service is shutting down while this stream was backed up, closing it"
                         );
                         break;
@@ -168,7 +325,8 @@ async fn pump(
                 if sent.is_err() {
                     debug!(
                         subscriber = %label,
-                        "tail client disconnected, closing its stream"
+                        family,
+                        "follow client disconnected, closing its stream"
                     );
                     break;
                 }
@@ -176,19 +334,21 @@ async fn pump(
             }
             Err(broadcast::error::RecvError::Lagged(missed)) => {
                 dropped_total = dropped_total.saturating_add(missed);
-                ServiceStats::add(&stats.tail_entries_dropped, missed);
+                ServiceStats::add((meters.entries_dropped)(&stats), missed);
                 warn!(
                     subscriber = %label,
+                    family,
                     missed,
                     dropped_total,
-                    "tail consumer fell behind the live buffer; those entries are \
+                    "follow consumer fell behind the live buffer; those records are \
                      skipped for this stream only - ingestion was never slowed and \
-                     the entries are still queryable from storage"
+                     the records are still queryable from storage"
                 );
             }
             Err(broadcast::error::RecvError::Closed) => {
                 debug!(
                     subscriber = %label,
+                    family,
                     "live buffer closed, service is shutting down"
                 );
                 break;
@@ -196,12 +356,13 @@ async fn pump(
         }
     }
 
-    ServiceStats::decr(&stats.tail_streams_open);
+    ServiceStats::decr((meters.streams_open)(&stats));
     info!(
         subscriber = %label,
+        family,
         forwarded,
         dropped_total,
-        "tail stream closed"
+        "follow stream closed"
     );
 }
 
@@ -223,6 +384,24 @@ mod tests {
         })
     }
 
+    fn trace(app_id: &str, environment: &str, kind: i32, outcome: i32) -> Arc<TraceRecord> {
+        Arc::new(TraceRecord {
+            trace_id: "t".into(),
+            started_us: 1,
+            duration_us: 1,
+            app_id: app_id.into(),
+            environment: environment.into(),
+            node: "node-a".into(),
+            kind,
+            outcome,
+            target: "https://example.test/".into(),
+            method: "GET".into(),
+            status: 200,
+            error: String::new(),
+            attributes: BTreeMap::new(),
+        })
+    }
+
     #[test]
     fn filter_matches_on_app_and_level() {
         let filter = TailFilter {
@@ -233,6 +412,37 @@ mod tests {
         assert!(!filter.matches(&record("shop", 3, "routine")));
         assert!(!filter.matches(&record("blog", 5, "boom")));
         assert!(TailFilter::default().matches(&record("blog", 1, "trace")));
+    }
+
+    #[test]
+    fn a_trace_filter_narrows_to_the_invocations_that_failed() {
+        // The question the trace surface exists for: show me the failures,
+        // and nothing else, as they happen.
+        let filter = TraceTailFilter {
+            outcomes: vec![2, 3, 4, 5, 6],
+            ..TraceTailFilter::default()
+        };
+        assert!(filter.matches(&trace("shop", "production", 1, 3)));
+        assert!(!filter.matches(&trace("shop", "production", 1, 1)));
+    }
+
+    #[test]
+    fn a_trace_filter_separates_environments_of_one_application() {
+        let filter = TraceTailFilter {
+            app_id: Some("shop".into()),
+            environment: Some("preview".into()),
+            ..TraceTailFilter::default()
+        };
+        assert!(filter.matches(&trace("shop", "preview", 1, 1)));
+        assert!(!filter.matches(&trace("shop", "production", 1, 1)));
+        assert!(!filter.matches(&trace("blog", "preview", 1, 1)));
+    }
+
+    #[test]
+    fn an_empty_trace_filter_follows_every_invocation() {
+        let filter = TraceTailFilter::default();
+        assert!(filter.matches(&trace("shop", "production", 1, 1)));
+        assert!(filter.matches(&trace("blog", "preview", 3, 4)));
     }
 
     #[tokio::test]
@@ -260,6 +470,73 @@ mod tests {
 
         assert_eq!(rx.recv().await.expect("entry").message, "kept");
         assert_eq!(rx.recv().await.expect("entry").message, "kept too");
+    }
+
+    #[tokio::test]
+    async fn a_trace_stream_forwards_only_the_outcomes_it_asked_for() {
+        let stats = Arc::new(ServiceStats::new());
+        let hub = TraceHub::new(64, Arc::clone(&stats));
+        let mut rx = hub.subscribe(
+            "test".into(),
+            TraceTailFilter {
+                outcomes: vec![3],
+                ..TraceTailFilter::default()
+            },
+        );
+        while hub.subscriber_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut cut_off = trace("shop", "production", 1, 3);
+        Arc::get_mut(&mut cut_off).expect("sole owner").target = "https://shop.test/slow".into();
+        hub.publish(&[trace("shop", "production", 1, 1), cut_off]);
+
+        assert_eq!(
+            rx.recv().await.expect("record").target,
+            "https://shop.test/slow"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_trace_follower_does_not_spend_the_log_drop_counter() {
+        // Two families, two numbers: an operator asking "did I lose logs?"
+        // must not be answered with a trace follower's arithmetic.
+        let stats = Arc::new(ServiceStats::new());
+        let hub = TraceHub::new(4, Arc::clone(&stats));
+        let live = hub.tx.subscribe();
+        for _ in 0..10 {
+            hub.publish(&[trace("shop", "production", 1, 1)]);
+        }
+        let (out, mut rx) = mpsc::channel(16);
+        let stop = hub.stop.subscribe();
+        let pump = tokio::spawn(pump(
+            "slow".into(),
+            TraceTailFilter::default(),
+            live,
+            out,
+            stop,
+            Arc::clone(&stats),
+            HubMeters {
+                streams_started: |s| &s.trace_tail_streams_started,
+                streams_open: |s| &s.trace_tail_streams_open,
+                entries_dropped: |s| &s.trace_tail_entries_dropped,
+            },
+            "trace record",
+        ));
+
+        for _ in 0..4 {
+            rx.recv().await.expect("record");
+        }
+        assert_eq!(ServiceStats::get(&stats.trace_tail_entries_dropped), 6);
+        assert_eq!(
+            ServiceStats::get(&stats.tail_entries_dropped),
+            0,
+            "a trace follower's loss must never be reported as lost log entries"
+        );
+
+        drop(hub);
+        pump.await
+            .expect("pump task must finish when the hub is gone");
     }
 
     #[tokio::test]
@@ -351,6 +628,12 @@ mod tests {
             out,
             stop,
             Arc::clone(&stats),
+            HubMeters {
+                streams_started: |s| &s.tail_streams_started,
+                streams_open: |s| &s.tail_streams_open,
+                entries_dropped: |s| &s.tail_entries_dropped,
+            },
+            "log entry",
         ));
 
         // Only the last 4 entries survived in the buffer; the other 6 were

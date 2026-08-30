@@ -1,10 +1,10 @@
 # deis-telemetry configuration. Every key is optional; the values below are
 # the defaults, so an empty file starts a working service.
 
-# gRPC endpoint. Three services share it: LogService (PushLogs / Query /
-# Tail), MetricService (PushMetrics / QueryMetrics) and the standard
-# grpc.health.v1 service, which is the only liveness surface this process
-# offers.
+# gRPC endpoint. Four services share it: LogService (PushLogs / Query /
+# Tail), TraceService (PushTraces / QueryTraces / TailTraces), MetricService
+# (PushMetrics / QueryMetrics) and the standard grpc.health.v1 service, which
+# is the only liveness surface this process offers.
 listen = "127.0.0.1:8092"
 
 # Prometheus scrape endpoint (HTTP GET /metrics). A separate port so a
@@ -22,6 +22,13 @@ log_retention_days = 7
 # Days of metric samples to keep.
 metric_retention_days = 30
 
+# Days of traces to keep. Traces live in one table per UTC day like logs and
+# the sweeper drops whole expired tables. Shorter than log_retention_days on
+# purpose: there is one trace per invocation whether or not the application
+# logged anything, so this table grows with traffic rather than with how
+# chatty the code is. Raise it only after looking at the disk it costs.
+trace_retention_days = 3
+
 # Seconds between retention sweeps. A sweep also runs once at startup.
 retention_sweep_interval_secs = 3600
 
@@ -29,6 +36,11 @@ retention_sweep_interval_secs = 3600
 # consumer that falls this far behind loses entries - for that stream only.
 # Ingestion is never slowed down, and the entries stay queryable.
 tail_capacity = 1024
+
+# Records held in the live trace fan-out buffer shared by all TailTraces
+# streams. Separate from tail_capacity, and larger, because traces arrive at
+# one record per invocation.
+trace_tail_capacity = 4096
 
 # Page size used when a query does not ask for one, and the ceiling a caller
 # may ask for (larger requests are clamped, not refused).

@@ -21,10 +21,11 @@ use crate::config::Config;
 use crate::http::{self, MetricsState};
 use crate::proto::log_service_server::LogServiceServer;
 use crate::proto::metric_service_server::MetricServiceServer;
-use crate::service::{LogService, MetricService, QueryLimits};
+use crate::proto::trace_service_server::TraceServiceServer;
+use crate::service::{LogService, MetricService, QueryLimits, TraceService};
 use crate::stats::ServiceStats;
 use crate::store::TelemetryStore;
-use crate::tail::TailHub;
+use crate::tail::{TailHub, TraceHub};
 use crate::{MAX_GRPC_MESSAGE_BYTES, now_us};
 
 /// A started service: both listeners are already bound, so `grpc_addr` and
@@ -36,6 +37,7 @@ pub struct RunningServer {
     pub store: TelemetryStore,
     pub stats: Arc<ServiceStats>,
     hub: Arc<TailHub>,
+    trace_hub: Arc<TraceHub>,
     shutdown: watch::Sender<bool>,
     grpc: JoinHandle<()>,
     metrics: JoinHandle<()>,
@@ -46,10 +48,11 @@ impl RunningServer {
     /// Ask every task to stop and wait for them.
     pub async fn shutdown(self) -> Result<()> {
         info!("deis-telemetry shutting down, draining in-flight requests");
-        // Tail streams have no natural end, so they are closed first.
+        // Follow streams have no natural end, so they are closed first.
         // Otherwise the gRPC server would wait for them and the process would
-        // never stop while anyone is following logs.
+        // never stop while anyone is following logs or traces.
         self.hub.close();
+        self.trace_hub.close();
         // A send failure only means every receiver is already gone, which is
         // the state we are trying to reach anyway.
         let _ = self.shutdown.send(true);
@@ -118,11 +121,21 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
     let store = TelemetryStore::open(&config.data_dir)?;
     let stats = Arc::new(ServiceStats::new());
     let hub = Arc::new(TailHub::new(config.tail_capacity, Arc::clone(&stats)));
+    let trace_hub = Arc::new(TraceHub::new(
+        config.trace_tail_capacity,
+        Arc::clone(&stats),
+    ));
     let limits = QueryLimits {
         default_limit: config.query_default_limit,
         max_limit: config.query_max_limit,
     };
     let logs = LogService::new(store.clone(), Arc::clone(&hub), Arc::clone(&stats), limits);
+    let traces = TraceService::new(
+        store.clone(),
+        Arc::clone(&trace_hub),
+        Arc::clone(&stats),
+        limits,
+    );
     let metrics_service = MetricService::new(store.clone(), Arc::clone(&stats), limits);
 
     let grpc_listener = TcpListener::bind(&config.listen)
@@ -155,12 +168,20 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         .set_serving::<LogServiceServer<LogService>>()
         .await;
     health_reporter
+        .set_serving::<TraceServiceServer<TraceService>>()
+        .await;
+    health_reporter
         .set_serving::<MetricServiceServer<MetricService>>()
         .await;
 
     // Log batches are the reason this ceiling exists: a runtime shipping a few
     // thousand lines at once must not be cut off at tonic's 4 MB default.
     let log_service = LogServiceServer::new(logs)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+    // Trace batches need the same ceiling for the same reason: a busy node
+    // hands over one record per invocation, not one per log line.
+    let trace_service = TraceServiceServer::new(traces)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
     let metric_service = MetricServiceServer::new(metrics_service)
@@ -172,6 +193,7 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         let result = Server::builder()
             .add_service(health_service)
             .add_service(log_service)
+            .add_service(trace_service)
             .add_service(metric_service)
             .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), grpc_shutdown)
             .await;
@@ -207,6 +229,7 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         RetentionPolicy {
             log_days: config.log_retention_days,
             metric_days: config.metric_retention_days,
+            trace_days: config.trace_retention_days,
             interval: Duration::from_secs(config.retention_sweep_interval_secs),
         },
         subscribe(&shutdown),
@@ -218,6 +241,7 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         data_dir = %config.data_dir.display(),
         log_retention_days = config.log_retention_days,
         metric_retention_days = config.metric_retention_days,
+        trace_retention_days = config.trace_retention_days,
         "deis-telemetry started"
     );
 
@@ -227,6 +251,7 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         store,
         stats,
         hub,
+        trace_hub,
         shutdown,
         grpc,
         metrics,
@@ -250,6 +275,7 @@ fn subscribe(
 struct RetentionPolicy {
     log_days: u32,
     metric_days: u32,
+    trace_days: u32,
     interval: Duration,
 }
 
@@ -267,6 +293,7 @@ async fn retention_loop(
     info!(
         log_days = policy.log_days,
         metric_days = policy.metric_days,
+        trace_days = policy.trace_days,
         interval_secs = policy.interval.as_secs(),
         "retention sweeper started; expired data is deleted permanently"
     );
@@ -286,7 +313,7 @@ async fn sweep_once(store: &TelemetryStore, stats: &Arc<ServiceStats>, policy: R
     let store = store.clone();
     let now = now_us();
     let outcome = tokio::task::spawn_blocking(move || {
-        store.sweep_retention(now, policy.log_days, policy.metric_days)
+        store.sweep_retention(now, policy.log_days, policy.metric_days, policy.trace_days)
     })
     .await;
     match outcome {
@@ -296,6 +323,11 @@ async fn sweep_once(store: &TelemetryStore, stats: &Arc<ServiceStats>, policy: R
             }
             let partitions: Vec<&str> = outcome
                 .dropped_partitions
+                .iter()
+                .map(|p| p.table.as_str())
+                .collect();
+            let trace_partitions: Vec<&str> = outcome
+                .dropped_trace_partitions
                 .iter()
                 .map(|p| p.table.as_str())
                 .collect();
@@ -311,13 +343,24 @@ async fn sweep_once(store: &TelemetryStore, stats: &Arc<ServiceStats>, policy: R
                 &stats.retention_metric_samples_dropped,
                 outcome.deleted_metric_samples as u64,
             );
+            ServiceStats::add(
+                &stats.retention_trace_partitions_dropped,
+                outcome.dropped_trace_partitions.len() as u64,
+            );
+            ServiceStats::add(
+                &stats.retention_trace_rows_dropped,
+                outcome.dropped_trace_rows().max(0) as u64,
+            );
             info!(
                 partitions = ?partitions,
+                trace_partitions = ?trace_partitions,
                 log_rows = outcome.dropped_log_rows(),
+                trace_rows = outcome.dropped_trace_rows(),
                 metric_samples = outcome.deleted_metric_samples,
                 log_retention_days = policy.log_days,
                 metric_retention_days = policy.metric_days,
-                "retention dropped expired data; those logs and samples are gone for good"
+                trace_retention_days = policy.trace_days,
+                "retention dropped expired data; those logs, traces and samples are gone for good"
             );
         }
         Ok(Err(e)) => error!(

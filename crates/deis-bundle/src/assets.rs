@@ -82,11 +82,24 @@ impl AssetIndex {
     /// can still ask for one, and answering it would be a traversal. The check
     /// runs *after* decoding, or `%2e%2e` would walk straight past it.
     pub fn lookup(&self, request_path: &str) -> Option<AssetMatch<'_>> {
-        let path = percent_decode(request_path.split(['?', '#']).next().unwrap_or(""));
+        self.lookup_decoded(&percent_decode(
+            request_path.split(['?', '#']).next().unwrap_or(""),
+        ))
+    }
+
+    /// The same lookup for a path that is already decoded.
+    ///
+    /// A `_redirects` rewrite target is built by substituting decoded captures
+    /// into a decoded template, so it is text, not escapes. Handing it to
+    /// [`AssetIndex::lookup`] would decode it a second time and make a file
+    /// whose name contains a literal `%2f` unreachable through a rewrite while
+    /// it is reachable directly - one asset with two answers, which is the
+    /// kind of difference that only shows up in one deployment.
+    pub fn lookup_decoded(&self, path: &str) -> Option<AssetMatch<'_>> {
         if path.split('/').any(|seg| seg == "..") {
             return None;
         }
-        let key = normalise(&path);
+        let key = normalise(path);
 
         if let Some(asset) = self.by_path.get(&key) {
             return Some(self.to_match(asset, false));

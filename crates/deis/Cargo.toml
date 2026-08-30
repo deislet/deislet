@@ -28,6 +28,9 @@ toml = "0.8"
 chrono = "0.4"
 sha2 = "0.10"
 hex = "0.4"
+# Renders a KV value or a blob object in --json output without doubling a
+# binary payload into a much larger array of per-byte JSON numbers.
+base64 = "0.22"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tonic = "0.12"
 prost = "0.13"

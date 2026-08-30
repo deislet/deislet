@@ -1,6 +1,7 @@
-//! gRPC surface: [`LogService`] (ingest, query, live follow) and
-//! [`MetricService`] (sample ingest and query). Both are served on the same
-//! port and share one database.
+//! gRPC surface: [`LogService`] (ingest, query, live follow), [`TraceService`]
+//! (per-invocation records: ingest, query, live follow) and [`MetricService`]
+//! (sample ingest and query). All three are served on the same port and share
+//! one database.
 //!
 //! The service stores what it is given and gives it back. It never evaluates
 //! whether anything it stored is healthy, never raises an alert and never
@@ -24,16 +25,19 @@ use crate::now_us;
 // only so both can be named in this file.
 use crate::proto::log_service_server::LogService as LogServiceRpc;
 use crate::proto::metric_service_server::MetricService as MetricServiceRpc;
+use crate::proto::trace_service_server::TraceService as TraceServiceRpc;
 use crate::proto::{
     LogEntry, MetricSample, PushLogsRequest, PushLogsResponse, PushMetricsRequest,
-    PushMetricsResponse, QueryMetricsRequest, QueryMetricsResponse, QueryRequest, QueryResponse,
-    TailRequest,
+    PushMetricsResponse, PushTracesRequest, PushTracesResponse, QueryMetricsRequest,
+    QueryMetricsResponse, QueryRequest, QueryResponse, QueryTracesRequest, QueryTracesResponse,
+    TailRequest, TailTracesRequest, TraceRecord as ProtoTraceRecord,
 };
 use crate::stats::ServiceStats;
 use crate::store::{
     LogCursor, LogFilter, LogRecord, MetricCursor, MetricFilter, MetricRecord, TelemetryStore,
+    TraceCursor, TraceFilter, TraceRecord,
 };
-use crate::tail::{TailFilter, TailHub};
+use crate::tail::{TailFilter, TailHub, TraceHub, TraceTailFilter};
 
 /// Longest message body kept verbatim. Anything longer is stored cut short:
 /// a runaway `console.log` must not be able to bloat the database, and a
@@ -51,6 +55,21 @@ const MAX_FUTURE_SKEW_US: i64 = 3_600_000_000;
 
 /// Highest defined `LogLevel` ordinal (`FATAL`).
 const MAX_LOG_LEVEL: i32 = 6;
+
+/// Highest defined `InvocationKind` ordinal (`WEBSOCKET_MESSAGE`).
+const MAX_INVOCATION_KIND: i32 = 4;
+
+/// Highest defined `InvocationOutcome` ordinal (`CPU_LIMIT`).
+const MAX_INVOCATION_OUTCOME: i32 = 7;
+
+/// Longest `target` kept verbatim. A URL is attacker-supplied - a query
+/// string can be megabytes - and one record per invocation multiplies
+/// whatever a single one costs, so it is cut rather than stored whole.
+pub const MAX_TRACE_TARGET_BYTES: usize = 2 * 1024;
+
+/// Longest `error` kept verbatim. A stack trace is worth keeping; a stack
+/// trace repeated for every invocation of a failing application is not.
+pub const MAX_TRACE_ERROR_BYTES: usize = 8 * 1024;
 
 /// Page-size policy, taken from the configuration.
 #[derive(Debug, Clone, Copy)]
@@ -125,6 +144,37 @@ impl MetricService {
     }
 }
 
+/// Serves `deis.telemetry.TraceService`.
+///
+/// One record per invocation, which is a different volume from logs and a
+/// different consumer: `deis trace` and the request panel read this, while
+/// `deis tail` reads [`LogService`]. It shares the database and the counters
+/// with both, and keeps its own live hub so a slow trace follower cannot cost
+/// a log follower its entries.
+#[derive(Clone)]
+pub struct TraceService {
+    store: TelemetryStore,
+    hub: Arc<TraceHub>,
+    stats: Arc<ServiceStats>,
+    limits: QueryLimits,
+}
+
+impl TraceService {
+    pub fn new(
+        store: TelemetryStore,
+        hub: Arc<TraceHub>,
+        stats: Arc<ServiceStats>,
+        limits: QueryLimits,
+    ) -> Self {
+        Self {
+            store,
+            hub,
+            stats,
+            limits,
+        }
+    }
+}
+
 /// Run a blocking storage call off the reactor.
 ///
 /// `op` names the operation so a failure says which one failed; the caller
@@ -191,16 +241,7 @@ fn to_record(
     if !(0..=MAX_LOG_LEVEL).contains(&entry.level) {
         return Err(Rejection::Level(entry.level));
     }
-    let message = if entry.message.len() > MAX_LOG_MESSAGE_BYTES {
-        *truncated += 1;
-        let mut cut = MAX_LOG_MESSAGE_BYTES;
-        while cut > 0 && !entry.message.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!("{}{TRUNCATION_MARKER}", &entry.message[..cut])
-    } else {
-        entry.message
-    };
+    let message = truncate_to(entry.message, MAX_LOG_MESSAGE_BYTES, truncated);
     Ok(LogRecord {
         timestamp_us,
         level: entry.level,
@@ -211,6 +252,23 @@ fn to_record(
         trace_id: entry.trace_id,
         span_id: entry.span_id,
     })
+}
+
+/// Cut `value` to `cap` bytes on a character boundary, marking the cut.
+///
+/// Storing a cut string beats refusing the record it belongs to: an operator
+/// looking at a failed invocation is better served by most of the URL than by
+/// no record at all.
+fn truncate_to(value: String, cap: usize, truncated: &mut u64) -> String {
+    if value.len() <= cap {
+        return value;
+    }
+    *truncated += 1;
+    let mut cut = cap;
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{TRUNCATION_MARKER}", &value[..cut])
 }
 
 fn to_entry(record: &LogRecord) -> LogEntry {
@@ -463,6 +521,313 @@ impl LogServiceRpc for LogService {
     }
 }
 
+/// Why a trace record could not be stored.
+#[derive(Debug)]
+enum TraceRejection {
+    Timestamp(i64),
+    Duration(i64),
+    Kind(i32),
+    Outcome(i32),
+}
+
+impl TraceRejection {
+    fn describe(&self) -> String {
+        match self {
+            Self::Timestamp(ts) => format!(
+                "started_us {ts} is negative or more than an hour ahead of the server clock"
+            ),
+            Self::Duration(us) => format!("duration_us {us} is negative"),
+            Self::Kind(kind) => {
+                format!("kind {kind} is outside the InvocationKind range 0..={MAX_INVOCATION_KIND}")
+            }
+            Self::Outcome(outcome) => format!(
+                "outcome {outcome} is outside the InvocationOutcome range \
+                 0..={MAX_INVOCATION_OUTCOME}"
+            ),
+        }
+    }
+}
+
+/// Convert a wire trace record into a storable one, or say why it cannot be.
+///
+/// A record with no `started_us` is stamped with the server receive time, the
+/// same repair a log entry gets: a producer whose clock is unset is still
+/// telling the truth about what happened, only not about when.
+fn to_trace_record(
+    record: ProtoTraceRecord,
+    now_us: i64,
+    truncated: &mut u64,
+    stamped: &mut u64,
+) -> Result<TraceRecord, TraceRejection> {
+    let started_us = if record.started_us == 0 {
+        *stamped += 1;
+        now_us
+    } else if record.started_us < 0 || record.started_us > now_us + MAX_FUTURE_SKEW_US {
+        return Err(TraceRejection::Timestamp(record.started_us));
+    } else {
+        record.started_us
+    };
+    // A negative duration would sort ahead of every real one under a
+    // `min_duration_us` floor and would read as a clock that ran backwards.
+    if record.duration_us < 0 {
+        return Err(TraceRejection::Duration(record.duration_us));
+    }
+    if !(0..=MAX_INVOCATION_KIND).contains(&record.kind) {
+        return Err(TraceRejection::Kind(record.kind));
+    }
+    if !(0..=MAX_INVOCATION_OUTCOME).contains(&record.outcome) {
+        return Err(TraceRejection::Outcome(record.outcome));
+    }
+    Ok(TraceRecord {
+        trace_id: record.trace_id,
+        started_us,
+        duration_us: record.duration_us,
+        app_id: record.app_id,
+        environment: record.environment,
+        node: record.node,
+        kind: record.kind,
+        outcome: record.outcome,
+        target: truncate_to(record.target, MAX_TRACE_TARGET_BYTES, truncated),
+        method: record.method,
+        status: record.status,
+        error: truncate_to(record.error, MAX_TRACE_ERROR_BYTES, truncated),
+        attributes: record.attributes.into_iter().collect(),
+    })
+}
+
+fn to_proto_trace(record: &TraceRecord) -> ProtoTraceRecord {
+    ProtoTraceRecord {
+        trace_id: record.trace_id.clone(),
+        started_us: record.started_us,
+        duration_us: record.duration_us,
+        app_id: record.app_id.clone(),
+        environment: record.environment.clone(),
+        node: record.node.clone(),
+        kind: record.kind,
+        outcome: record.outcome,
+        target: record.target.clone(),
+        method: record.method.clone(),
+        status: record.status,
+        error: record.error.clone(),
+        attributes: record
+            .attributes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    }
+}
+
+/// Drop the "unspecified" placeholder out of a repeated enum filter.
+///
+/// A client that sends nothing gets an empty list, which means "every value".
+/// A client that sends `[UNSPECIFIED]` almost certainly meant the same thing
+/// rather than "only records nobody could classify", and answering the latter
+/// would silently return an empty page.
+fn enum_selection(values: Vec<i32>) -> Vec<i32> {
+    values.into_iter().filter(|value| *value > 0).collect()
+}
+
+#[tonic::async_trait]
+impl TraceServiceRpc for TraceService {
+    type TailTracesStream =
+        Pin<Box<dyn Stream<Item = Result<ProtoTraceRecord, Status>> + Send + 'static>>;
+
+    async fn push_traces(
+        &self,
+        request: Request<PushTracesRequest>,
+    ) -> Result<Response<PushTracesResponse>, Status> {
+        let request = request.into_inner();
+        ServiceStats::incr(&self.stats.trace_pushes);
+
+        // Counted before the early return: a producer whose sampling threw
+        // the whole interval away still has to report the hole, and that push
+        // carries no records at all.
+        if request.sampled_out > 0 {
+            ServiceStats::add(&self.stats.traces_sampled_out, request.sampled_out);
+            debug!(
+                sampled_out = request.sampled_out,
+                "a producer reported invocations it deliberately did not record; \
+                 the trace history has that many gaps by policy"
+            );
+        }
+        if request.dropped > 0 {
+            ServiceStats::add(&self.stats.traces_dropped_by_producer, request.dropped);
+            warn!(
+                dropped = request.dropped,
+                "a producer reported trace records it built and then lost because its own \
+                 buffer was full; those invocations happened and will never be queryable. \
+                 Either the producer cannot reach this service or its trace buffer is too \
+                 small for its traffic"
+            );
+        }
+
+        let received = request.records.len();
+        if received == 0 {
+            return Ok(Response::new(PushTracesResponse::default()));
+        }
+
+        let now = now_us();
+        let mut records = Vec::with_capacity(received);
+        let mut truncated = 0u64;
+        let mut stamped = 0u64;
+        let mut rejected = 0u64;
+        let mut first_rejection: Option<String> = None;
+        for record in request.records {
+            match to_trace_record(record, now, &mut truncated, &mut stamped) {
+                Ok(record) => records.push(record),
+                Err(reason) => {
+                    rejected += 1;
+                    if first_rejection.is_none() {
+                        first_rejection = Some(reason.describe());
+                    }
+                }
+            }
+        }
+
+        if rejected > 0 {
+            warn!(
+                rejected,
+                received,
+                reason = first_rejection.as_deref().unwrap_or(""),
+                "trace records were malformed and are dropped; those invocations will never \
+                 appear in QueryTraces or TailTraces"
+            );
+            ServiceStats::add(&self.stats.traces_rejected, rejected);
+        }
+        if truncated > 0 {
+            warn!(
+                truncated,
+                target_cap_bytes = MAX_TRACE_TARGET_BYTES,
+                error_cap_bytes = MAX_TRACE_ERROR_BYTES,
+                "trace targets or error messages exceeded their size cap and are stored cut \
+                 short; the tail of those strings is lost"
+            );
+            ServiceStats::add(&self.stats.traces_truncated, truncated);
+        }
+        if stamped > 0 {
+            debug!(
+                stamped,
+                "trace records arrived without a start time and were stamped with the server \
+                 receive time"
+            );
+        }
+
+        let accepted = records.len();
+        if accepted > 0 {
+            let store = self.store.clone();
+            let stored = blocking("store trace batch", move || {
+                store.insert_traces(&records)?;
+                Ok(records)
+            })
+            .await?;
+            ServiceStats::add(&self.stats.traces_accepted, accepted as u64);
+            // Fan out only after the write committed, so a follower can never
+            // see a record a later QueryTraces would not find.
+            let live: Vec<Arc<TraceRecord>> = stored.into_iter().map(Arc::new).collect();
+            self.hub.publish(&live);
+            debug!(
+                accepted,
+                rejected,
+                trace_streams = self.hub.subscriber_count(),
+                "stored a trace batch"
+            );
+        }
+
+        Ok(Response::new(PushTracesResponse {
+            accepted_count: accepted as i32,
+            rejected_count: rejected as i32,
+            error_message: first_rejection.unwrap_or_default(),
+        }))
+    }
+
+    async fn query_traces(
+        &self,
+        request: Request<QueryTracesRequest>,
+    ) -> Result<Response<QueryTracesResponse>, Status> {
+        let request = request.into_inner();
+        ServiceStats::incr(&self.stats.trace_queries);
+        check_window(request.start_us, request.end_us).map_err(Status::invalid_argument)?;
+        if request.min_duration_us < 0 {
+            return Err(Status::invalid_argument(format!(
+                "min_duration_us must not be negative, got {}",
+                request.min_duration_us
+            )));
+        }
+        let limit = self
+            .limits
+            .resolve(request.limit)
+            .map_err(Status::invalid_argument)?;
+        let cursor = if request.cursor.is_empty() {
+            None
+        } else {
+            Some(TraceCursor::decode(&request.cursor).map_err(|e| {
+                warn!(cursor = %request.cursor, error = ?e, "a client sent an unreadable trace page cursor, the request is refused");
+                Status::invalid_argument("cursor is not a token produced by this service")
+            })?)
+        };
+        let filter = TraceFilter {
+            app_id: optional(request.app_id),
+            environment: optional(request.environment),
+            start_us: optional_time(request.start_us),
+            end_us: optional_time(request.end_us),
+            kinds: enum_selection(request.kinds),
+            outcomes: enum_selection(request.outcomes),
+            trace_id: optional(request.trace_id),
+            min_duration_us: optional_time(request.min_duration_us),
+            target_contains: optional(request.target_contains),
+        };
+
+        let store = self.store.clone();
+        let describe = format!("{filter:?}");
+        let page = blocking("query traces", move || {
+            store.query_traces(&filter, limit, cursor)
+        })
+        .await?;
+        debug!(
+            returned = page.records.len(),
+            has_more = page.has_more,
+            limit,
+            filter = %describe,
+            "answered a trace query"
+        );
+
+        Ok(Response::new(QueryTracesResponse {
+            records: page.records.iter().map(to_proto_trace).collect(),
+            next_cursor: page.next_cursor.map(|c| c.encode()).unwrap_or_default(),
+            has_more: page.has_more,
+        }))
+    }
+
+    // Same generated-trait constraint as `LogService::tail`: the stream item
+    // carries a `tonic::Status`, which clippy reads as a large `Err`.
+    #[allow(clippy::result_large_err)]
+    async fn tail_traces(
+        &self,
+        request: Request<TailTracesRequest>,
+    ) -> Result<Response<Self::TailTracesStream>, Status> {
+        let peer = request
+            .remote_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "unknown-peer".to_string());
+        let request = request.into_inner();
+        let filter = TraceTailFilter {
+            app_id: optional(request.app_id),
+            environment: optional(request.environment),
+            kinds: enum_selection(request.kinds),
+            outcomes: enum_selection(request.outcomes),
+        };
+        let label = format!("{peer}/{}", uuid::Uuid::new_v4().simple());
+        info!(
+            subscriber = %label,
+            app_id = filter.app_id.as_deref().unwrap_or("*"),
+            "opening a trace stream; only invocations recorded from now on are streamed"
+        );
+        let rx = self.hub.subscribe(label, filter);
+        let stream = ReceiverStream::new(rx).map(|record| Ok(to_proto_trace(&record)));
+        Ok(Response::new(Box::pin(stream) as Self::TailTracesStream))
+    }
+}
+
 #[tonic::async_trait]
 impl MetricServiceRpc for MetricService {
     async fn push_metrics(
@@ -674,6 +1039,87 @@ mod tests {
             timestamp_us: 1,
         };
         assert!(to_metric_record(sample, 10).is_err());
+    }
+
+    fn proto_trace() -> ProtoTraceRecord {
+        ProtoTraceRecord {
+            trace_id: "abc".into(),
+            started_us: 1_700_000_000_000_000,
+            duration_us: 1_500,
+            app_id: "shop".into(),
+            environment: "production".into(),
+            node: "node-a".into(),
+            kind: 1,
+            outcome: 1,
+            target: "https://shop.test/checkout".into(),
+            method: "POST".into(),
+            status: 200,
+            error: String::new(),
+            attributes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_trace_without_a_start_time_is_stamped_on_arrival() {
+        let mut truncated = 0;
+        let mut stamped = 0;
+        let mut record = proto_trace();
+        record.started_us = 0;
+        let stored =
+            to_trace_record(record, 42, &mut truncated, &mut stamped).expect("must be accepted");
+        assert_eq!(stored.started_us, 42);
+        assert_eq!(stamped, 1);
+    }
+
+    #[test]
+    fn a_negative_duration_is_refused() {
+        // It would sort ahead of every real invocation under a duration floor
+        // and would read as a clock that ran backwards.
+        let mut record = proto_trace();
+        record.duration_us = -1;
+        let err = to_trace_record(record, 1_700_000_000_000_001, &mut 0, &mut 0)
+            .expect_err("must be rejected");
+        assert!(err.describe().contains("duration_us"));
+    }
+
+    #[test]
+    fn an_unknown_kind_or_outcome_is_refused() {
+        // An out-of-range ordinal would come back out of storage as a value
+        // no reader can name, and a query filtering on outcome would silently
+        // skip it.
+        let mut kind = proto_trace();
+        kind.kind = 99;
+        assert!(to_trace_record(kind, 1_700_000_000_000_001, &mut 0, &mut 0).is_err());
+
+        let mut outcome = proto_trace();
+        outcome.outcome = 99;
+        assert!(to_trace_record(outcome, 1_700_000_000_000_001, &mut 0, &mut 0).is_err());
+    }
+
+    #[test]
+    fn an_oversized_target_is_cut_short_not_dropped() {
+        // A URL is attacker-supplied and there is one trace per invocation,
+        // so the record is kept and the tail of the string is not.
+        let mut record = proto_trace();
+        record.target = "x".repeat(MAX_TRACE_TARGET_BYTES + 500);
+        let mut truncated = 0;
+        let stored = to_trace_record(record, 1_700_000_000_000_001, &mut truncated, &mut 0)
+            .expect("must be accepted");
+        assert_eq!(truncated, 1);
+        assert!(stored.target.ends_with(TRUNCATION_MARKER));
+        assert_eq!(
+            stored.target.len(),
+            MAX_TRACE_TARGET_BYTES + TRUNCATION_MARKER.len()
+        );
+    }
+
+    #[test]
+    fn an_unspecified_enum_in_a_filter_means_no_restriction() {
+        // A client that sends the zero value almost certainly meant "every
+        // outcome"; answering "only the ones nobody could classify" would
+        // hand back an empty page and look like an outage.
+        assert!(enum_selection(vec![0]).is_empty());
+        assert_eq!(enum_selection(vec![0, 2, 3]), vec![2, 3]);
     }
 
     #[test]

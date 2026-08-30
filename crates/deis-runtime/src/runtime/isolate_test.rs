@@ -4,7 +4,8 @@ mod tests {
     use crate::runtime::bindings::{ServiceDeclaration, ServiceEndpoints, ServiceWiring};
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::metrics::{
-        recorder, EXECUTION_MS_COUNT, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL,
+        recorder, CPU_CUTOFFS_TOTAL, CPU_MS_SUM, EXECUTION_MS_COUNT, REQUESTS_TOTAL,
+        REQUEST_ERRORS_TOTAL, TIMEOUT_CUTOFFS_TOTAL,
     };
     use crate::runtime::queue_client::LeasedMessage;
     use std::collections::HashMap;
@@ -1723,6 +1724,7 @@ export default function handler(context: any): Response {
                     timeout_ms: 5_000,
                     wait_until_timeout_ms: 7_500,
                     rate_limit_ops_per_sec: 42.5,
+                    cpu_time_limit_ms: 1_250,
                 },
                 ..Default::default()
             },
@@ -1740,6 +1742,7 @@ export default function handler(context: any): Response {
         assert_eq!(runtime.timeout_ms(), 5_000);
         assert_eq!(runtime.wait_until_timeout_ms(), 7_500);
         assert_eq!(runtime.rate_limit_ops_per_sec(), 42.5);
+        assert_eq!(runtime.cpu_time_limit_ms(), 1_250);
     }
 
     #[test]
@@ -1762,6 +1765,7 @@ export default function handler(context: any): Response {
         assert_eq!(runtime.timeout_ms(), 30_000);
         assert_eq!(runtime.wait_until_timeout_ms(), 30_000);
         assert_eq!(runtime.rate_limit_ops_per_sec(), 1000.0);
+        assert_eq!(runtime.cpu_time_limit_ms(), 5_000);
     }
 
     /// A `console.log` from an application must reach deis-telemetry tagged
@@ -2129,6 +2133,188 @@ export default function handler(context: any): Response {
         let (status, _, body) = rx.await.unwrap().unwrap();
         assert_eq!(status, 200);
         assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+    }
+
+    /// The whole point of a CPU ceiling: two handlers that a wall clock cannot
+    /// tell apart, and which cost the node amounts that differ by orders of
+    /// magnitude.
+    ///
+    /// Both run with a 10-second duration budget, so neither can be stopped by
+    /// it inside this test. One spins, the other waits 1.5 seconds on a timer
+    /// -- five times the 300ms CPU ceiling in wall clock, and next to nothing
+    /// in CPU. The first has to be cut off and the second has to be served,
+    /// and if the ceiling were measuring duration the results would be the
+    /// other way round.
+    #[tokio::test]
+    async fn the_cpu_ceiling_stops_a_spinning_handler_and_not_a_waiting_one() {
+        const CPU_CEILING_MS: u64 = 300;
+        const WALL_BUDGET_MS: u64 = 10_000;
+        const SLEEP_MS: u64 = 1_500;
+
+        let code = format!(
+            r#"
+            export default async function handler(context) {{
+                if (new URL(context.request.url).pathname === "/spin") {{
+                    while (true) {{}}
+                }}
+                await new Promise((resolve) => setTimeout(resolve, {SLEEP_MS}));
+                return new Response("waited");
+            }}
+        "#
+        );
+
+        let limits = ExecutionLimits {
+            timeout_ms: WALL_BUDGET_MS,
+            cpu_time_limit_ms: CPU_CEILING_MS,
+            ..ExecutionLimits::default()
+        };
+
+        // Two isolates rather than two requests to one, so each application's
+        // counters are its own and the assertions below cannot be satisfied by
+        // the other one's numbers.
+        let waiting_app = "cpu_ceiling_waiting_app";
+        let mut waiting = AppRuntime::new(
+            waiting_app.to_string(),
+            code.clone(),
+            None,
+            IsolateSpec {
+                limits: limits.clone(),
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let (tx, rx) = oneshot::channel();
+        waiting
+            .execute_fetch(
+                "http://localhost/wait".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("a handler that waits five times its CPU ceiling must still be served");
+        let waited = started.elapsed();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(text(body).as_deref(), Some("waited"));
+        assert!(
+            waited >= std::time::Duration::from_millis(SLEEP_MS - 100),
+            "the waiting handler returned in {waited:?}, so it never actually outlived the \
+             {CPU_CEILING_MS}ms ceiling and the test proves nothing"
+        );
+        assert_eq!(
+            recorder().value(CPU_CUTOFFS_TOTAL, waiting_app),
+            0.0,
+            "waiting on a timer is not spending CPU, and must not be charged as if it were"
+        );
+        assert_eq!(
+            recorder().value(TIMEOUT_CUTOFFS_TOTAL, waiting_app),
+            0.0,
+            "the duration budget was {WALL_BUDGET_MS}ms and the handler took {waited:?}"
+        );
+
+        let spinning_app = "cpu_ceiling_spinning_app";
+        let mut spinning = AppRuntime::new(
+            spinning_app.to_string(),
+            code,
+            None,
+            IsolateSpec {
+                limits,
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let (tx, rx) = oneshot::channel();
+        let outcome = spinning
+            .execute_fetch(
+                "http://localhost/spin".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await;
+        let spun = started.elapsed();
+        assert!(rx.await.is_err(), "a cut-off request answers nobody");
+
+        let error = outcome
+            .expect_err("a spinning handler must be cut off")
+            .to_string();
+        // The distinction the ceiling exists to make, in the words an operator
+        // reads: a message that said "timed out" here would send them looking
+        // for a slow upstream that does not exist.
+        assert!(
+            error.contains("CPU"),
+            "the cut-off must name CPU time, not duration; it said: {error}"
+        );
+        assert!(
+            error.contains("wall clock"),
+            "the cut-off must give both numbers so the two faults can be told apart; it said: \
+             {error}"
+        );
+
+        // The wall clock is what proves which ceiling fired. The duration
+        // budget was 10 seconds and could not have been reached; anything near
+        // the CPU ceiling can only have come from the CPU ceiling. Generous
+        // upwards against a loaded machine, and still far below the budget it
+        // is being distinguished from.
+        assert!(
+            spun < std::time::Duration::from_millis(WALL_BUDGET_MS / 2),
+            "a {CPU_CEILING_MS}ms CPU ceiling did not stop a spin; it ran {spun:?} against a \
+             {WALL_BUDGET_MS}ms duration budget"
+        );
+        assert_eq!(
+            recorder().value(TIMEOUT_CUTOFFS_TOTAL, spinning_app),
+            0.0,
+            "the spin was stopped by the CPU ceiling, so nothing may be counted as a timeout"
+        );
+        assert_eq!(
+            recorder().value(CPU_CUTOFFS_TOTAL, spinning_app),
+            1.0,
+            "one CPU cut-off has to be countable per application, or \"which application is \
+             burning this node\" has no answer"
+        );
+
+        // The counter that answers the question when nobody is being cut off:
+        // the spin spent at least its ceiling, the wait spent almost nothing,
+        // and the two are orders of magnitude apart.
+        let spinning_cpu_ms = recorder().value(CPU_MS_SUM, spinning_app);
+        let waiting_cpu_ms = recorder().value(CPU_MS_SUM, waiting_app);
+        assert!(
+            spinning_cpu_ms >= CPU_CEILING_MS as f64,
+            "the spinning app was charged {spinning_cpu_ms}ms of CPU, less than the \
+             {CPU_CEILING_MS}ms it had to burn to be cut off"
+        );
+        assert!(
+            waiting_cpu_ms < spinning_cpu_ms,
+            "waiting {SLEEP_MS}ms was charged {waiting_cpu_ms}ms of CPU and spinning was charged \
+             {spinning_cpu_ms}ms; if a wait costs as much as a spin, this counter is measuring \
+             duration again"
+        );
+
+        // A CPU cut-off costs one request, not the isolate: the termination
+        // flag has to be cleared the same way a duration cut-off's is.
+        let (tx, rx) = oneshot::channel();
+        spinning
+            .execute_fetch(
+                "http://localhost/wait".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the isolate serves again after a CPU cut-off");
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(text(body).as_deref(), Some("waited"));
     }
 
     #[tokio::test]

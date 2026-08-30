@@ -114,6 +114,27 @@ service_stats! {
     tail_entries_dropped: Counter =
         "tail_entries_dropped_total",
         "Entries skipped for slow tail consumers; storage is unaffected";
+    trace_pushes: Counter = "trace_pushes_total", "PushTraces calls served";
+    traces_accepted: Counter = "traces_accepted_total", "Trace records written to storage";
+    traces_rejected: Counter =
+        "traces_rejected_total", "Trace records refused as malformed and never stored";
+    traces_truncated: Counter =
+        "traces_truncated_total",
+        "Trace records stored with an oversized target or error message cut short";
+    trace_queries: Counter = "trace_queries_total", "QueryTraces calls served";
+    traces_sampled_out: Counter =
+        "traces_sampled_out_total",
+        "Invocations a producer reported as deliberately not recorded; sampling policy, not loss";
+    traces_dropped_by_producer: Counter =
+        "traces_dropped_by_producer_total",
+        "Trace records a producer built and then lost because its own buffer was full";
+    trace_tail_streams_started: Counter =
+        "trace_tail_streams_started_total", "TailTraces streams opened since start";
+    trace_tail_streams_open: Gauge =
+        "trace_tail_streams_open", "TailTraces streams currently open";
+    trace_tail_entries_dropped: Counter =
+        "trace_tail_entries_dropped_total",
+        "Trace records skipped for slow TailTraces consumers; storage is unaffected";
     metric_pushes: Counter = "metric_pushes_total", "PushMetrics calls served";
     metric_samples_accepted: Counter =
         "metric_samples_accepted_total", "Metric samples written to storage";
@@ -126,6 +147,12 @@ service_stats! {
         "retention_log_rows_dropped_total", "Log rows lost with expired partitions since start";
     retention_metric_samples_dropped: Counter =
         "retention_metric_samples_dropped_total", "Metric samples deleted by retention since start";
+    retention_trace_partitions_dropped: Counter =
+        "retention_trace_partitions_dropped_total",
+        "Expired daily trace partitions dropped since start";
+    retention_trace_rows_dropped: Counter =
+        "retention_trace_rows_dropped_total",
+        "Trace records lost with expired partitions since start";
 }
 
 impl Default for ServiceStats {

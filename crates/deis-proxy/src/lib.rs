@@ -6,7 +6,13 @@
 //! application routing, configuration layering (defaults + local file +
 //! control), and the control client that registers the instance with
 //! deis-control.
+//!
+//! Which application a request belongs to is answered by the control
+//! plane's catalog, polled by [`catalog`]; the local application list adds
+//! what to do with the request once the application is known - its
+//! certificates, its cache policy, whether it is enabled at all.
 
+pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod control;

@@ -98,20 +98,35 @@ pub struct VendorConfig {
     pub options: Option<HashMap<String, serde_json::Value>>,
 }
 
-/// Where the project's static files live.
+/// Where the project's static files live, and what happens to a path none of
+/// them answers.
 ///
 /// The directory is copied into the bundle under `assets/` with its structure
-/// intact, so `public/css/app.css` is served at `/css/app.css`.
+/// intact, so `public/css/app.css` is served at `/css/app.css`. Two files in
+/// that directory are read rather than served - `_redirects` and `_headers`;
+/// see `deis_bundle::redirects` and `deis_bundle::headers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetsConfig {
     #[serde(default = "default_assets_dir")]
     pub dir: String,
+    /// What to answer for a path that named no file, matched no redirect rule
+    /// and belongs to no function route: `"none"`, `"404-page"` (serve
+    /// `404.html` with a 404) or `"single-page-app"` (serve `index.html` with
+    /// a 200).
+    ///
+    /// Absent is not the same as `"none"`: a project that ships a `404.html`
+    /// and says nothing gets `"404-page"`, because that is what shipping the
+    /// file means everywhere else and requiring a config key to make it work
+    /// would be a trap. Writing `"none"` turns that off.
+    #[serde(rename = "notFound", alias = "not_found", default)]
+    pub not_found: Option<String>,
 }
 
 impl Default for AssetsConfig {
     fn default() -> Self {
         Self {
             dir: default_assets_dir(),
+            not_found: None,
         }
     }
 }
@@ -240,6 +255,25 @@ mod tests {
         let mut json = minimal();
         json["assets"] = serde_json::json!({});
         let config = parse(json);
-        assert_eq!(config.assets.unwrap().dir, "./public");
+        let assets = config.assets.unwrap();
+        assert_eq!(assets.dir, "./public");
+        assert!(
+            assets.not_found.is_none(),
+            "absent means \"work it out from the files\", not \"none\""
+        );
+    }
+
+    #[test]
+    fn the_not_found_behaviour_takes_either_spelling_of_its_key() {
+        for key in ["notFound", "not_found"] {
+            let mut json = minimal();
+            json["assets"] = serde_json::json!({ key: "single-page-app" });
+            let config = parse(json);
+            assert_eq!(
+                config.assets.unwrap().not_found.as_deref(),
+                Some("single-page-app"),
+                "key {key}"
+            );
+        }
     }
 }

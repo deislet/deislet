@@ -3,6 +3,7 @@ pub mod cache;
 pub mod compression;
 pub mod https;
 pub mod log;
+pub mod routing;
 pub mod tls;
 pub mod upstream;
 
@@ -18,6 +19,7 @@ pub use cache::CacheConfig;
 pub use compression::{CompressionAlgo, CompressionConfig};
 pub use https::HttpsConfig;
 pub use log::*;
+pub use routing::RoutingConfig;
 pub use tls::TlsConfig;
 pub use upstream::UpstreamServer;
 
@@ -118,6 +120,10 @@ pub struct SystemConfig {
     pub max_request_body_bytes: Option<usize>,
     /// Control (deis-control) connection. Absent means standalone mode.
     pub control: Option<ControlConfig>,
+    /// How the catalog's routing table reaches this instance, and whether
+    /// environments get an automatic address. Only meaningful with
+    /// `control` set: without a control plane there is no table to fetch.
+    pub routing: Option<RoutingConfig>,
 }
 
 impl SystemConfig {
@@ -149,6 +155,7 @@ impl SystemConfig {
             compression: Some(CompressionConfig::default()),
             control: None,
             max_request_body_bytes: Some(DEFAULT_MAX_REQUEST_BODY_BYTES),
+            routing: Some(RoutingConfig::default()),
         }
     }
 
@@ -232,6 +239,11 @@ impl SystemConfig {
             self.upstream_read_timeout_secs
                 .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_SECS),
         )
+    }
+
+    /// Routing-table settings, or the defaults when the section is absent.
+    pub fn routing(&self) -> RoutingConfig {
+        self.routing.clone().unwrap_or_default()
     }
 
     /// Largest request body this instance carries to an upstream.
@@ -361,6 +373,9 @@ impl Validatable for SystemConfig {
                     message: e.to_string(),
                 })?;
         }
+        if let Some(routing) = &self.routing {
+            routing.validate()?;
+        }
         Ok(())
     }
 }
@@ -402,6 +417,7 @@ impl Add<SystemConfig> for SystemConfig {
             compression: other.compression.or(self.compression),
             control: other.control.or(self.control),
             max_request_body_bytes: other.max_request_body_bytes.or(self.max_request_body_bytes),
+            routing: other.routing.or(self.routing),
         }
     }
 }

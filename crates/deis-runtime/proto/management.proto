@@ -172,7 +172,11 @@ message ResourceLimits {
     // Memory limit (MB)
     int32 memory_mb = 1;
 
-    // CPU limit (millicores)
+    // CPU *share* in millicores. Carried since the first version of this
+    // message and enforced by nothing: a share only means something to a
+    // scheduler that hands out fractions of a core, and a node here pins one
+    // isolate to one thread. What is actually enforced is cpu_time_limit_ms
+    // below. Kept so older control planes keep parsing.
     int32 cpu_milli = 2;
 
     // Maximum concurrent requests
@@ -188,6 +192,14 @@ message ResourceLimits {
     // Per-app override of the platform default JS-op rate limit (ops/sec).
     // 0 means "use the platform default".
     double rate_limit_ops_per_sec = 6;
+
+    // Per-app override of the platform default CPU-time ceiling (ms) for one
+    // invocation. 0 means "use the platform default".
+    //
+    // Narrowing only: a value above the node's ceiling is refused and the
+    // node's is applied. CPU time is the node's resource, not the
+    // application's, so an app may give itself less of it but never more.
+    int64 cpu_time_limit_ms = 7;
 }
 
 // Routing rule.

@@ -218,6 +218,20 @@ impl RouteTable {
         self.tls_apps.contains(&app.id)
             || (!app.certificates.is_empty() && self.default_cert.is_some())
     }
+
+    /// Whether a TLS handshake for this host name can succeed, without an
+    /// application configuration to ask about.
+    ///
+    /// This is the question for an application only the control plane's
+    /// catalog knows: it has no entry here and therefore no certificates of
+    /// its own, so what decides is whether *some* certificate would be
+    /// served for the name - a wildcard covering a whole preview zone, or
+    /// `tls.default_certificate`. The test is exactly what the SNI callback
+    /// will do at handshake time, so the redirect cannot point at a port
+    /// that would then reject the client.
+    pub fn https_available_for_host(&self, host: &str) -> bool {
+        self.certificate_for(Some(host)).is_some()
+    }
 }
 
 /// Lowercase a host name and strip a trailing port (`example.com:8080`,
