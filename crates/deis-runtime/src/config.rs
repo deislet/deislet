@@ -540,6 +540,32 @@ pub struct ExecutionLimits {
     /// application at startup rather than leaving it to be discovered.
     #[serde(default = "default_cpu_time_limit_ms")]
     pub cpu_time_limit_ms: u64,
+
+    /// Most outbound calls one invocation may make before the next one is
+    /// refused.
+    ///
+    /// The limit that bounds *fan-out*, which none of the others do. A
+    /// handler that answers one inbound request with two hundred outbound
+    /// ones is spending this node's outbound capacity, its sockets and its
+    /// upstreams' patience, and it does so while looking perfectly healthy on
+    /// every other ceiling here: the calls are concurrent, so the wall clock
+    /// sees one slow request, the CPU clock sees almost nothing, and the op
+    /// rate limit sees a couple of hundred dispatches spread over a second.
+    /// One tenant can take a node's egress that way without ever tripping
+    /// anything, which is why Cloudflare bounds subrequests per invocation
+    /// and why this exists beside the others rather than inside one of them.
+    ///
+    /// Counted per armed stretch of application code, exactly as the
+    /// wall-clock and CPU budgets are: a request together with its `waitUntil`
+    /// tail, one queue batch, one cron tick, one WebSocket message. Every
+    /// destination that is actually dialled costs one, redirect hops
+    /// included -- `js/bootstrap.js` follows redirects by hand, and each hop
+    /// is a connection this node opens.
+    ///
+    /// An application may narrow it in its manifest (`limits.max_subrequests`)
+    /// and may not widen it, like every other limit here.
+    #[serde(default = "default_max_subrequests")]
+    pub max_subrequests: u32,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -592,6 +618,20 @@ fn default_cpu_time_limit_ms() -> u64 {
     5_000
 }
 
+/// Fifty outbound calls per invocation, which is Cloudflare's number for a
+/// Worker on its free plan.
+///
+/// Chosen against what handlers actually do rather than against what a node
+/// could survive: an API that talks to a database and two upstreams uses three
+/// or four, a page that assembles a dozen fragments uses a dozen, and both are
+/// an order of magnitude under this. What it refuses is the shape nothing else
+/// on this node refuses -- one inbound request fanning out to hundreds -- and
+/// an operator running deliberate fan-out raises it knowing that the number is
+/// multiplied by every concurrent request the node is serving.
+fn default_max_subrequests() -> u32 {
+    50
+}
+
 impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
@@ -600,6 +640,7 @@ impl Default for ExecutionLimits {
             stream_timeout_ms: default_stream_timeout_ms(),
             rate_limit_ops_per_sec: default_rate_limit_ops_per_sec(),
             cpu_time_limit_ms: default_cpu_time_limit_ms(),
+            max_subrequests: default_max_subrequests(),
         }
     }
 }
@@ -805,6 +846,14 @@ impl RuntimeConfig {
                 &value,
                 "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_CPU_TIME_LIMIT_MS",
                 "a whole number of milliseconds",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_MAX_SUBREQUESTS") {
+            self.default_execution_limits.max_subrequests = parse_env(
+                &value,
+                "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_MAX_SUBREQUESTS",
+                "a whole number of outbound calls per invocation",
             )?;
         }
 
@@ -1031,6 +1080,15 @@ impl RuntimeConfig {
                  handlers that are doing nothing unusual",
                 limits.cpu_time_limit_ms,
                 MIN_CPU_TIME_LIMIT_MS
+            ));
+        }
+
+        if limits.max_subrequests == 0 {
+            return Err(anyhow!(
+                "default_execution_limits.max_subrequests is 0; no application on this node \
+                 could make a single outbound call, so every fetch() would be refused. Leave it \
+                 out for the default of {}",
+                default_max_subrequests()
             ));
         }
 

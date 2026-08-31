@@ -1772,6 +1772,7 @@ export default function handler(context: any): Response {
                     stream_timeout_ms: 60_000,
                     rate_limit_ops_per_sec: 42.5,
                     cpu_time_limit_ms: 1_250,
+                    max_subrequests: 50,
                 },
                 ..Default::default()
             },

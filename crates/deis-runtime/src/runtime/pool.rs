@@ -1058,7 +1058,7 @@ impl RuntimePool {
                 tenant.to_string(),
                 spec.name,
                 client.clone(),
-                ConsumerSettings::for_app(spec.batch_size, execution_timeout),
+                ConsumerSettings::for_app(spec.batch_size, spec.max_concurrency, execution_timeout),
                 invoker,
             ));
         }

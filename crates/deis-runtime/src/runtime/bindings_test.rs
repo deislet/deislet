@@ -50,9 +50,54 @@ mod tests {
             wiring.consumers,
             vec![QueueConsumerSpec {
                 name: "jobs".to_string(),
-                batch_size: Some(5)
+                batch_size: Some(5),
+                max_concurrency: None,
             }]
         );
+    }
+
+    /// The consumer entries are positional, so a queue that named only its
+    /// concurrency still has to occupy the batch-size slot.
+    ///
+    /// A round trip rather than a string comparison, because what matters is
+    /// that the writer and the reader agree: the node writes this map out of
+    /// the version's manifest and reads it back to start its pollers, and a
+    /// disagreement would show up as a consumer quietly running with the
+    /// wrong numbers rather than as a failure.
+    #[test]
+    fn a_consumer_carries_its_concurrency_through_the_env_encoding() {
+        let original = ServiceWiring {
+            declaration: ServiceDeclaration::from_names(["queue"]),
+            endpoints: ServiceEndpoints {
+                store: None,
+                queue: Some("http://queue:8091".to_string()),
+            },
+            storage_token: None,
+            consumers: vec![
+                QueueConsumerSpec {
+                    name: "jobs".to_string(),
+                    batch_size: Some(10),
+                    max_concurrency: Some(3),
+                },
+                // The awkward one: no batch size, but a concurrency after it.
+                QueueConsumerSpec {
+                    name: "emails".to_string(),
+                    batch_size: None,
+                    max_concurrency: Some(2),
+                },
+            ],
+        };
+
+        let mut map = HashMap::new();
+        original.write_to_env(&mut map);
+        assert_eq!(
+            map.get(QUEUE_CONSUMERS_KEY).map(String::as_str),
+            Some("jobs:10:3,emails:0:2"),
+            "0 is the spelling for a batch size nobody declared"
+        );
+
+        let read_back = ServiceWiring::take_from_env(&mut map);
+        assert_eq!(read_back.consumers, original.consumers);
     }
 
     #[test]
@@ -80,10 +125,12 @@ mod tests {
                 QueueConsumerSpec {
                     name: "jobs".to_string(),
                     batch_size: Some(10),
+                    max_concurrency: None,
                 },
                 QueueConsumerSpec {
                     name: "emails".to_string(),
                     batch_size: None,
+                    max_concurrency: None,
                 },
             ],
         };
@@ -130,11 +177,13 @@ mod tests {
             vec![
                 QueueConsumerSpec {
                     name: "jobs".to_string(),
-                    batch_size: None
+                    batch_size: None,
+                    max_concurrency: None,
                 },
                 QueueConsumerSpec {
                     name: "emails".to_string(),
-                    batch_size: Some(2)
+                    batch_size: Some(2),
+                    max_concurrency: None,
                 },
             ]
         );
@@ -322,6 +371,7 @@ mod tests {
             consumers: vec![QueueConsumerSpec {
                 name: "jobs".to_string(),
                 batch_size: None,
+                max_concurrency: None,
             }],
         };
         assert!(wiring.active_consumers("demo.production").is_empty());
@@ -339,6 +389,7 @@ mod tests {
             consumers: vec![QueueConsumerSpec {
                 name: "jobs".to_string(),
                 batch_size: None,
+                max_concurrency: None,
             }],
         };
         assert!(wiring.active_consumers("demo.production").is_empty());
@@ -356,6 +407,7 @@ mod tests {
             consumers: vec![QueueConsumerSpec {
                 name: "jobs".to_string(),
                 batch_size: None,
+                max_concurrency: None,
             }],
         };
         assert_eq!(wiring.active_consumers("demo.production").len(), 1);

@@ -163,6 +163,16 @@ pub struct QueueConsumerConfig {
     /// How many messages to pull at once. Absent lets the runtime decide.
     #[serde(rename = "batchSize", alias = "batch_size", default)]
     pub batch_size: Option<u32>,
+    /// How many batches of this queue the node may hold at once. Absent lets
+    /// the runtime decide, which is one.
+    ///
+    /// It bounds *outstanding* batches, not parallel ones: one application in
+    /// one environment is a single isolate on a single thread, so its handler
+    /// runs one batch at a time whatever this says. See
+    /// `deis_bundle::QueueConsumer::max_concurrency` for what raising it buys
+    /// and what it costs in lease time.
+    #[serde(rename = "maxConcurrency", alias = "max_concurrency", default)]
+    pub max_concurrency: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +237,10 @@ pub struct LimitsConfig {
     /// table at once.
     #[serde(rename = "resourceTableMax", alias = "resource_table_max", default)]
     pub resource_table_max: Option<u32>,
+    /// How many outbound calls one invocation may make. Every hop counts, so
+    /// a `fetch()` that follows two redirects costs three.
+    #[serde(rename = "maxSubrequests", alias = "max_subrequests", default)]
+    pub max_subrequests: Option<u32>,
 }
 
 #[cfg(test)]
@@ -320,6 +334,40 @@ mod tests {
         let config = parse(json);
         let sizes: Vec<Option<u32>> = config.queues.iter().map(|q| q.batch_size).collect();
         assert_eq!(sizes, vec![Some(10), Some(5), None]);
+    }
+
+    #[test]
+    fn a_queue_consumer_takes_either_spelling_of_its_concurrency() {
+        let mut json = minimal();
+        json["queues"] = serde_json::json!([
+            { "name": "jobs", "batchSize": 10, "maxConcurrency": 2 },
+            { "name": "mail", "max_concurrency": 3 },
+            { "name": "slow" }
+        ]);
+        let config = parse(json);
+        let outstanding: Vec<Option<u32>> =
+            config.queues.iter().map(|q| q.max_concurrency).collect();
+        assert_eq!(outstanding, vec![Some(2), Some(3), None]);
+    }
+
+    #[test]
+    fn the_subrequest_ceiling_takes_either_spelling_and_a_typo_is_refused() {
+        let mut json = minimal();
+        json["limits"] = serde_json::json!({ "maxSubrequests": 6 });
+        assert_eq!(parse(json).limits.unwrap().max_subrequests, Some(6));
+
+        let mut json = minimal();
+        json["limits"] = serde_json::json!({ "max_subrequests": 6 });
+        assert_eq!(parse(json).limits.unwrap().max_subrequests, Some(6));
+
+        // The whole point of `deny_unknown_fields`: a ceiling that looks set
+        // and is not would be found on the day it was needed.
+        let mut json = minimal();
+        json["limits"] = serde_json::json!({ "maxSubRequests": 6 });
+        assert!(
+            serde_json::from_value::<ProjectConfig>(json).is_err(),
+            "a misspelled limit must fail the build, not be dropped"
+        );
     }
 
     #[test]

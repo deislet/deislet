@@ -336,4 +336,53 @@ mod tests {
             "an undeclared service must say so rather than list nothing: {body}"
         );
     }
+
+    /// The fan-out allowance: what it counts and what it refuses.
+    ///
+    /// The charge has to be taken and committed with no await between the two,
+    /// which is why this is a plain counter rather than a check followed by a
+    /// commit: two hundred `fetch` calls started at once would all pass a
+    /// check made before the destination was resolved and committed after it,
+    /// and the ceiling would bound nothing in exactly the case it exists for.
+    #[test]
+    fn a_subrequest_allowance_is_spent_once_per_call_and_refunded_when_nothing_left_the_isolate() {
+        use crate::runtime::ops::SubrequestBudget;
+
+        let budget = SubrequestBudget::new(3);
+        assert_eq!(budget.charge(), Ok(1), "the first call of an invocation");
+        assert_eq!(budget.charge(), Ok(2));
+        assert_eq!(budget.charge(), Ok(3));
+        assert_eq!(
+            budget.charge(),
+            Err(3),
+            "the refusal reports the ceiling, which is what the message has to name"
+        );
+
+        // A destination the policy refused, or one abandoned before a socket
+        // was opened, never left the isolate and gives its charge back.
+        budget.refund();
+        assert_eq!(budget.charge(), Ok(3));
+
+        // A new invocation starts with the whole allowance again.
+        budget.reset();
+        assert_eq!(budget.charge(), Ok(1));
+    }
+
+    /// A refund with no charge behind it must not hand out an unbounded
+    /// allowance.
+    ///
+    /// It cannot happen through the two call sites as they are written, which
+    /// is exactly why the saturation is worth pinning: a third caller added
+    /// later that refunds on a path it did not charge on would otherwise turn
+    /// the ceiling off, and nothing would report it.
+    #[test]
+    fn an_unmatched_refund_cannot_wrap_the_counter_round() {
+        use crate::runtime::ops::SubrequestBudget;
+
+        let budget = SubrequestBudget::new(1);
+        budget.refund();
+        budget.refund();
+        assert_eq!(budget.charge(), Ok(1));
+        assert_eq!(budget.charge(), Err(1));
+    }
 }

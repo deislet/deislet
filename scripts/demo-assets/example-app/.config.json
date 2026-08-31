@@ -17,11 +17,12 @@
     "kv": { "enabled": true },
     "queue": { "enabled": true }
   },
-  "queues": [{ "name": "jobs", "batchSize": 10 }],
+  "queues": [{ "name": "jobs", "batchSize": 10, "maxConcurrency": 2 }],
   "cron": ["* * * * *"],
   "limits": {
     "timeoutMs": 1000,
-    "memoryMb": 32
+    "memoryMb": 32,
+    "maxSubrequests": 6
   },
   "assets": {
     "dir": "./public",

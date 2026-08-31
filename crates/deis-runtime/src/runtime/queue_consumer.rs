@@ -19,6 +19,32 @@
 //! [`ConsumerSettings::idle_backoff_max`] while there is nothing to do, and
 //! snaps back to the minimum the moment a pull returns work.
 //!
+//! # What `max_concurrency` means here, and what it does not
+//!
+//! It bounds how many batches this poller may have **outstanding** -- leased
+//! from deis-queue and not yet settled -- and nothing else. It is not
+//! parallelism, and on this platform it cannot be: one `(application,
+//! environment)` is one isolate on one runtime thread on each node, so two
+//! batches of the same application never execute at the same time. The
+//! handler is serialised by the isolate no matter what this number says.
+//!
+//! What raising it does buy is real but narrow. A batch's life is pull ->
+//! wait for the runtime thread -> run -> ack or nack, and only the third of
+//! those is the isolate. With one batch outstanding the pull for the next one
+//! does not even start until the previous batch has been acknowledged, so the
+//! queue's round trips and the wait for the thread are dead time on a busy
+//! queue. With two, the next batch is already leased and queued behind the
+//! current one when the handler finishes.
+//!
+//! And it has a cost that grows with it: every outstanding batch has had its
+//! lease running since it was pulled, and a batch waiting its turn on the
+//! runtime thread spends that lease doing nothing. Past a point the lease
+//! lapses while the batch is still queued, deis-queue hands the same messages
+//! to somebody else, and the application processes them twice. That is why
+//! the default is one, why [`MAX_OUTSTANDING_BATCHES`] is small, and why
+//! [`spawn_with_registry`] says out loud what a value above one actually
+//! bought.
+//!
 //! # Delivery guarantees the app has to live with
 //!
 //! At-least-once. A node that dies between handling a message and
@@ -33,7 +59,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::BoxFuture;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
+use tokio::task::JoinSet;
 
 use super::metrics::{recorder, MetricsRegistry};
 use super::queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};
@@ -140,10 +167,37 @@ pub struct ConsumerSettings {
     pub idle_backoff_max: Duration,
     /// How long a failed message waits before it is handed out again.
     pub retry_delay_seconds: u32,
+    /// Batches this poller may hold at once: leased, waiting for the runtime
+    /// thread, running, or being settled.
+    ///
+    /// Never parallelism -- see the module docs. One is the default and means
+    /// exactly what this loop did before the setting existed: nothing is
+    /// pulled until the previous batch has been acknowledged.
+    pub max_concurrency: u32,
 }
 
 /// Messages leased per pull when the manifest does not say.
 pub const DEFAULT_BATCH_SIZE: u32 = 10;
+
+/// Batches outstanding at once when the manifest does not say.
+///
+/// One, so an application that declares nothing behaves exactly as this
+/// consumer did before the setting existed. Anything higher is a trade an
+/// application has to make deliberately, because what it spends is lease time
+/// on messages it is not working on yet.
+pub const DEFAULT_MAX_CONCURRENCY: u32 = 1;
+
+/// The most batches this node will hold for one queue, whatever a manifest
+/// asks for.
+///
+/// Small on purpose, and not because of memory. Each outstanding batch is
+/// `batch_size` messages whose lease is already running while they wait for a
+/// runtime thread they share with every other application on it, so the
+/// number of messages at risk of a lapsed lease is this times the batch size:
+/// eight batches of ten is eighty messages that may be redelivered if the
+/// thread is busy. Beyond a small number the extra batches are not overlap,
+/// they are queue depth with an expiry on it.
+pub const MAX_OUTSTANDING_BATCHES: u32 = 8;
 
 /// Slack added to the app's execution timeout when deriving the lease.
 ///
@@ -174,7 +228,11 @@ const SETTLE_RESERVE: Duration = Duration::from_secs(5);
 
 impl ConsumerSettings {
     /// Settings for an app whose isolate is bounded by `execution_timeout`.
-    pub fn for_app(batch_size: Option<u32>, execution_timeout: Duration) -> Self {
+    pub fn for_app(
+        batch_size: Option<u32>,
+        max_concurrency: Option<u32>,
+        execution_timeout: Duration,
+    ) -> Self {
         let lease = execution_timeout + LEASE_SLACK;
         Self {
             batch_size: batch_size
@@ -184,13 +242,16 @@ impl ConsumerSettings {
             idle_backoff_min: Duration::from_secs(1),
             idle_backoff_max: Duration::from_secs(30),
             retry_delay_seconds: 10,
+            max_concurrency: max_concurrency
+                .filter(|outstanding| *outstanding > 0)
+                .unwrap_or(DEFAULT_MAX_CONCURRENCY),
         }
     }
 }
 
 impl Default for ConsumerSettings {
     fn default() -> Self {
-        Self::for_app(None, Duration::from_secs(30))
+        Self::for_app(None, None, Duration::from_secs(30))
     }
 }
 
@@ -252,16 +313,52 @@ pub fn spawn_with_registry(
     let task_app_id = app_id.clone();
     let task_queue = queue.clone();
 
+    // Clamped here rather than in `for_app` so that the number an application
+    // asked for and the number in force appear in the same line: `for_app` is
+    // also what every test and default goes through, and it does not know
+    // which application it is building settings for.
+    let mut settings = settings;
+    if settings.max_concurrency > MAX_OUTSTANDING_BATCHES {
+        tracing::warn!(
+            app_id = %app_id,
+            queue = %queue,
+            requested = settings.max_concurrency,
+            applied = MAX_OUTSTANDING_BATCHES,
+            batch_size = settings.batch_size,
+            "App {} asks to hold {} batches of queue {} at once; this node allows {}. Every \
+             outstanding batch has its lease running while it waits for a runtime thread, so \
+             {} batches of {} messages is already {} messages that can be redelivered if the \
+             thread is busy",
+            app_id,
+            settings.max_concurrency,
+            queue,
+            MAX_OUTSTANDING_BATCHES,
+            MAX_OUTSTANDING_BATCHES,
+            settings.batch_size,
+            MAX_OUTSTANDING_BATCHES * settings.batch_size
+        );
+        settings.max_concurrency = MAX_OUTSTANDING_BATCHES;
+    }
+
+    // The concurrency half of this line says what the number means, because
+    // the name it arrives under -- `maxConcurrency` in a project file -- reads
+    // as parallelism on every other platform and is not parallelism here. An
+    // operator reading the log has to be able to see that without opening the
+    // source.
     tracing::info!(
         app_id = %app_id,
         queue = %queue,
         batch_size = settings.batch_size,
         lease_seconds = settings.lease_seconds,
-        "Consuming queue {} for app {}: up to {} messages per pull, {}s leases",
+        max_concurrency = settings.max_concurrency,
+        "Consuming queue {} for app {}: up to {} messages per pull, {}s leases, at most {} \
+         batch(es) outstanding at once. Outstanding, not parallel: this app is one isolate on \
+         one thread, so its handler runs one batch at a time however many are held",
         queue,
         app_id,
         settings.batch_size,
-        settings.lease_seconds
+        settings.lease_seconds,
+        settings.max_concurrency
     );
 
     let join = tokio::spawn(async move {
@@ -286,6 +383,17 @@ pub fn spawn_with_registry(
 }
 
 /// The polling loop.
+///
+/// One permit per batch this poller is allowed to hold, taken *before* the
+/// pull and given back when the batch has been settled. Taking it first is
+/// the point: a lease starts running the moment deis-queue hands the messages
+/// over, so pulling a batch this poller has nowhere to put would spend that
+/// lease waiting for a permit.
+///
+/// At `max_concurrency = 1` -- the default, and what every application that
+/// declares nothing gets -- this is exactly the sequential loop it replaced:
+/// the single permit is only free again once the previous batch has been
+/// acknowledged or handed back.
 async fn run(
     app_id: String,
     queue: String,
@@ -301,7 +409,18 @@ async fn run(
     // actually failed.
     let mut lease_shortfall_reported = false;
 
+    let permits = Arc::new(Semaphore::new(settings.max_concurrency as usize));
+    // Batches handed off and not yet settled. Drained before this task
+    // returns, so `ConsumerHandle::stop` still means "every batch this poller
+    // holds is finished and answered for" rather than only the last one.
+    let mut outstanding: JoinSet<()> = JoinSet::new();
+
     loop {
+        // Reaped without waiting, so a finished batch stops being tracked at
+        // the top of the next round. Nothing is reported here: the task
+        // itself has already logged whatever happened to its batch.
+        while outstanding.try_join_next().is_some() {}
+
         // Checked before the pull as well as during the wait, so a stop that
         // arrives while a batch is being handled takes effect at the top of
         // the next round instead of starting one more.
@@ -312,6 +431,21 @@ async fn run(
             Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
             Err(oneshot::error::TryRecvError::Empty) => {}
         }
+
+        // Waiting for a permit is also a place a stop has to be able to
+        // arrive: with every batch outstanding and a slow runtime thread,
+        // this is where the poller spends its time.
+        let permit = tokio::select! {
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                // The semaphore is never closed while this loop owns it, so
+                // this is unreachable; treated as a stop rather than an
+                // unwrap, because polling on with no bound on outstanding
+                // batches is the one behaviour that must not happen.
+                Err(_) => break,
+            },
+            _ = &mut stop => break,
+        };
 
         let messages = match client
             .pull_messages(&queue, settings.batch_size, settings.lease_seconds)
@@ -331,6 +465,7 @@ async fn run(
                     app_id,
                     backoff.as_secs()
                 );
+                drop(permit);
                 if wait(&mut stop, backoff).await == Wake::Stopped {
                     break;
                 }
@@ -340,6 +475,7 @@ async fn run(
         };
 
         if messages.is_empty() {
+            drop(permit);
             if wait(&mut stop, backoff).await == Wake::Stopped {
                 break;
             }
@@ -352,17 +488,54 @@ async fn run(
             lease_shortfall_reported =
                 report_lease_shortfall(&app_id, &queue, &settings, &messages);
         }
-        handle_batch(
-            &app_id,
-            &queue,
-            client.as_ref(),
-            &settings,
-            &invoke,
-            &metrics,
-            messages,
-        )
-        .await;
+
+        let task_app_id = app_id.clone();
+        let task_queue = queue.clone();
+        let task_client = client.clone();
+        let task_settings = settings.clone();
+        let task_invoke = invoke.clone();
+        let task_metrics = metrics.clone();
+        outstanding.spawn(async move {
+            handle_batch(
+                &task_app_id,
+                &task_queue,
+                task_client.as_ref(),
+                &task_settings,
+                &task_invoke,
+                &task_metrics,
+                messages,
+            )
+            .await;
+            // Held until the batch is settled -- acknowledged or handed back
+            // -- and not merely until the handler returned, because a batch
+            // whose ack is still in flight is still this poller's.
+            drop(permit);
+        });
     }
+
+    // Every batch still in flight is answered for before this poller reports
+    // that it stopped. Leaving them would abort the tasks mid-ack: the
+    // messages would stay leased until deis-queue expired them and then be
+    // handed out again, which is work done twice for an application that was
+    // merely being unloaded.
+    // Reaped once more first: `len` counts tasks that have finished and not
+    // yet been taken out, and a line that named those as still being waited
+    // for would send an operator looking for a batch that is already settled.
+    while outstanding.try_join_next().is_some() {}
+    let still_held = outstanding.len();
+    if still_held > 0 {
+        tracing::debug!(
+            app_id = %app_id,
+            queue = %queue,
+            batches = still_held,
+            "Waiting for {} outstanding batch(es) of queue {} to be settled before app {} stops \
+             consuming",
+            still_held,
+            queue,
+            app_id
+        );
+    }
+    while outstanding.join_next().await.is_some() {}
 
     tracing::info!(
         app_id = %app_id,

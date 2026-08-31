@@ -85,7 +85,10 @@ pub const STORE_ENDPOINT_KEY: &str = deis_wire::conventions::STORE_ENDPOINT_ENV;
 pub const QUEUE_ENDPOINT_KEY: &str = deis_wire::conventions::QUEUE_ENDPOINT_ENV;
 
 /// Reserved deployment-env key listing the queues this app consumes, as
-/// `name[:batch_size]` entries separated by commas, e.g. `jobs:10,emails`.
+/// `name[:batch_size[:max_concurrency]]` entries separated by commas, e.g.
+/// `jobs:10:2,emails`. A field left out is the runtime's own default, and the
+/// fields are positional, so a consumer that wants only the second one spells
+/// the first as well.
 pub const QUEUE_CONSUMERS_KEY: &str = "DEIS_QUEUE_CONSUMERS";
 
 /// Reserved deployment-env key holding this tenant's storage capability
@@ -270,6 +273,14 @@ pub struct QueueConsumerSpec {
     /// Messages to lease per poll. `None` leaves the choice to the consumer's
     /// own default.
     pub batch_size: Option<u32>,
+    /// Batches this node may have outstanding for this queue at once. `None`
+    /// leaves the choice to the consumer's own default, which is one.
+    ///
+    /// Outstanding, not parallel; see
+    /// [`deis_bundle::QueueConsumer::max_concurrency`] and
+    /// [`super::queue_consumer::ConsumerSettings::max_concurrency`], which is
+    /// where the value is clamped and applied.
+    pub max_concurrency: Option<u32>,
 }
 
 /// Everything about an application's platform services that has to survive the
@@ -323,6 +334,7 @@ impl ServiceWiring {
                 .map(|queue| QueueConsumerSpec {
                     name: queue.name.clone(),
                     batch_size: queue.batch_size,
+                    max_concurrency: queue.max_concurrency,
                 })
                 .collect(),
         }
@@ -379,10 +391,20 @@ impl ServiceWiring {
             let list = self
                 .consumers
                 .iter()
-                .map(|consumer| match consumer.batch_size {
-                    Some(size) => format!("{}:{}", consumer.name, size),
-                    None => consumer.name.clone(),
-                })
+                .map(
+                    |consumer| match (consumer.batch_size, consumer.max_concurrency) {
+                        // Positional fields, so a consumer that named only the
+                        // concurrency still has to occupy the batch-size slot.
+                        // `0` is the spelling for "leave it to the runtime": it is
+                        // never a legal batch size, and `parse_consumers` reads it
+                        // back as absent.
+                        (None, None) => consumer.name.clone(),
+                        (Some(size), None) => format!("{}:{}", consumer.name, size),
+                        (size, Some(concurrency)) => {
+                            format!("{}:{}:{}", consumer.name, size.unwrap_or(0), concurrency)
+                        }
+                    },
+                )
                 .collect::<Vec<_>>()
                 .join(",");
             env.insert(QUEUE_CONSUMERS_KEY.to_string(), list);
@@ -435,9 +457,14 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.trim().is_empty())
 }
 
-/// Parse `name[:batch_size]` entries. An entry whose batch size does not
-/// parse keeps the queue but drops the size, which is the recoverable half:
-/// the consumer polls with its own default rather than not at all.
+/// Parse `name[:batch_size[:max_concurrency]]` entries. A field that does not
+/// parse keeps the queue but drops that field, which is the recoverable half:
+/// the consumer polls with the runtime's own default rather than not at all.
+///
+/// `0` in either numeric field means "the runtime decides". It is the spelling
+/// [`ServiceWiring::write_to_env`] uses for a batch size nobody declared when
+/// a concurrency after it was, because the fields are positional and the slot
+/// still has to be filled.
 fn parse_consumers(list: &str) -> Vec<QueueConsumerSpec> {
     let mut consumers = Vec::new();
     for entry in list.split(',') {
@@ -445,32 +472,51 @@ fn parse_consumers(list: &str) -> Vec<QueueConsumerSpec> {
         if entry.is_empty() {
             continue;
         }
-        let (name, batch_size) = match entry.split_once(':') {
-            Some((name, size)) => match size.trim().parse::<u32>() {
-                Ok(size) => (name.trim(), Some(size)),
-                Err(_) => {
-                    tracing::warn!(
-                        queue = name.trim(),
-                        value = size.trim(),
-                        "Queue consumer {:?} declares an unreadable batch size {:?}; polling it \
-                         with the runtime default instead",
-                        name.trim(),
-                        size.trim()
-                    );
-                    (name.trim(), None)
-                }
-            },
-            None => (entry, None),
-        };
+        let mut fields = entry.split(':');
+        let name = fields.next().unwrap_or("").trim();
         if name.is_empty() {
             continue;
         }
+        let batch_size = consumer_number(name, "batch size", fields.next());
+        let max_concurrency = consumer_number(name, "max concurrency", fields.next());
         consumers.push(QueueConsumerSpec {
             name: name.to_string(),
             batch_size,
+            max_concurrency,
         });
     }
     consumers
+}
+
+/// One positional number of a `DEIS_QUEUE_CONSUMERS` entry.
+///
+/// Absent and `0` both mean "leave it to the runtime". Anything else that does
+/// not read as a number is said out loud and then treated as absent: a queue
+/// consumed with the default batch size is a queue that still gets consumed,
+/// while refusing the whole entry would leave the messages piling up in
+/// deis-queue with nothing saying why.
+fn consumer_number(queue: &str, field: &str, value: Option<&str>) -> Option<u32> {
+    let text = value?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    match text.parse::<u32>() {
+        Ok(0) => None,
+        Ok(number) => Some(number),
+        Err(_) => {
+            tracing::warn!(
+                queue,
+                field,
+                value = text,
+                "Queue consumer {:?} declares an unreadable {} {:?}; polling it with the runtime \
+                 default for that setting instead",
+                queue,
+                field,
+                text
+            );
+            None
+        }
+    }
 }
 
 /// A channel that has not dialled anything yet.

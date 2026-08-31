@@ -131,6 +131,27 @@ stream_timeout_ms = 300000
 # the in-flight request fails. Must be a finite value greater than 0.
 rate_limit_ops_per_sec = 1000.0
 
+# Most outbound calls one invocation may make before the next one is refused.
+# Must be at least 1.
+#
+# The ceiling that bounds fan-out, which none of the others reaches. An
+# invocation answering one inbound request with two hundred outbound ones is
+# spending this node's sockets and outbound bandwidth, both shared with every
+# other tenant on the box, while looking healthy on everything above: the calls
+# run concurrently, so the wall clock sees one slow request, the CPU clock sees
+# almost nothing, and the op rate limit sees a couple of hundred dispatches
+# spread over a second.
+#
+# Counted per armed stretch of application code -- a request together with its
+# waitUntil tail, one queue batch, one cron tick, one WebSocket message. Every
+# destination actually dialled costs one, and a redirect chain costs one per
+# hop, because this platform follows redirects itself and each hop is a
+# separate connection. An outbound WebSocket spends the same allowance.
+#
+# An application's own limits.max_subrequests may ask for less and gets what it
+# asked for; one asking for more is refused and held to this value.
+max_subrequests = 50
+
 # Log shipping to deis-telemetry. While disabled, this node's logs exist only in
 # its own output; "deis tail" shows nothing for it.
 [logging]

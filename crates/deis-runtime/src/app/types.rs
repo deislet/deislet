@@ -167,6 +167,21 @@ pub struct ResourceLimits {
     /// compute instead.
     #[serde(default)]
     pub cpu_time_limit_ms: Option<u64>,
+
+    /// Narrowing override of `crate::config::ExecutionLimits::max_subrequests`:
+    /// how many outbound calls one invocation of this app may make. `None`
+    /// means "use the platform default".
+    ///
+    /// Narrowing only, and this is the field where that matters most
+    /// obviously. The ceiling exists to stop one application's fan-out from
+    /// taking the node's outbound capacity away from every other tenant on it,
+    /// so an application that could raise its own would be deciding how much
+    /// of a shared resource it may have. An application that narrows it is
+    /// buying something for itself instead: a handler that should call two
+    /// upstreams and starts calling twenty fails loudly on the change that
+    /// introduced it.
+    #[serde(default)]
+    pub max_subrequests: Option<u32>,
 }
 
 /// One application, in one environment, as this node holds it.

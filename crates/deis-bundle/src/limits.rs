@@ -57,6 +57,16 @@ pub struct DeclaredLimits {
     /// table at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_table_max: Option<u32>,
+
+    /// How many outbound calls one invocation of this application may make.
+    ///
+    /// Counted per invocation - one request and its `waitUntil` tail, one
+    /// queue batch, one cron tick - and every hop counts: a `fetch()` that
+    /// follows two redirects costs three, because three connections left the
+    /// node. An application that knows it calls one upstream twice sets this
+    /// to two and is told the moment a change makes it call ten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_subrequests: Option<u32>,
 }
 
 impl DeclaredLimits {
@@ -84,6 +94,9 @@ impl DeclaredLimits {
         }
         if let Some(max) = self.resource_table_max {
             parts.push(format!("{max} resource-table entries"));
+        }
+        if let Some(max) = self.max_subrequests {
+            parts.push(format!("{max} subrequests per invocation"));
         }
         if parts.is_empty() {
             "nothing".to_string()
@@ -127,6 +140,13 @@ impl DeclaredLimits {
                     .to_string(),
             );
         }
+        if self.max_subrequests == Some(0) {
+            return Err(
+                "limits.max_subrequests is 0; the application could not make a single outbound \
+                        call. Leave it out to use the node's default"
+                    .to_string(),
+            );
+        }
         if let Some(rate) = self.rate_limit_ops_per_sec
             && !(rate.is_finite() && rate > 0.0)
         {
@@ -142,6 +162,29 @@ impl DeclaredLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subrequest_ceiling_is_described_and_a_zero_one_is_refused() {
+        let limits = DeclaredLimits {
+            max_subrequests: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(limits.describe(), "4 subrequests per invocation");
+        assert_eq!(
+            serde_json::to_string(&limits).unwrap(),
+            r#"{"max_subrequests":4}"#
+        );
+
+        // Zero is the wire's spelling for "unset", so an application that
+        // wrote it would silently get the node's number instead of the
+        // refusal it deserves for asking to make no calls at all.
+        let zero = DeclaredLimits {
+            max_subrequests: Some(0),
+            ..Default::default()
+        };
+        let err = zero.validate().expect_err("a zero ceiling must be refused");
+        assert!(err.contains("max_subrequests"), "{err}");
+    }
 
     #[test]
     fn describe_names_only_what_was_asked_for() {

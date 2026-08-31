@@ -655,15 +655,17 @@ globalThis.WebSocketPair = WebSocketPair;
 
 // The Cache API, which Edge Canon makes a basic feature every application may
 // assume (SPECIFICATION_BASIC.md section 7): put a Response away under a
-// request's URL, read it back, drop it. Reached two ways, both of them this
-// same store: `context.services.cache`, which is what the canon specifies, and
-// `globalThis.caches.default`, which is what a handler ported from Cloudflare
-// reaches for.
+// request's URL, read it back, drop it. The default cache is reached two ways,
+// both of them the same namespace: `context.services.cache`, which is what the
+// canon specifies, and `globalThis.caches.default`, which is what a handler
+// ported from Cloudflare reaches for. `caches.open(name)` gives an application
+// caches of its own beside it.
 //
 // Scope: one store per isolate, so an entry is visible to later requests for
 // the same application on the same node and to nothing else - not another
 // node, not the replacement isolate a new version is loaded into. A hit is an
-// optimisation; nothing may depend on one.
+// optimisation; nothing may depend on one. `caches.scope` below is how an
+// application checks that rather than having to know it.
 
 // The key one of these calls is about. The canon's own examples pass all
 // three of these: a string, the `Request`, and a `URL` built from the
@@ -717,6 +719,14 @@ function refusesToBeStored(response) {
 }
 
 class Cache {
+  // `name` is the namespace this instance reads and writes; see
+  // `runtime/cache_ops.rs`. `caches.default` and `ctx.services.cache` are the
+  // one named "default", so an application that writes through one and reads
+  // through the other sees its own entry, and a cache opened by any other
+  // name shares nothing with them.
+  constructor(name) {
+    this.name = name;
+  }
   async put(request, response) {
     const key = cacheKeyOf(request);
 
@@ -748,6 +758,7 @@ class Cache {
       headers: Object.fromEntries(response.headers.entries())
     };
     await DenoCore.ops.op_cache_set(
+      this.name,
       key,
       JSON.stringify(meta),
       body,
@@ -756,7 +767,7 @@ class Cache {
   }
   async match(request) {
     const key = cacheKeyOf(request);
-    const hit = await DenoCore.ops.op_cache_get(key);
+    const hit = await DenoCore.ops.op_cache_get(this.name, key);
     if (!hit) return undefined;
     try {
       const meta = JSON.parse(hit.meta);
@@ -774,17 +785,78 @@ class Cache {
     }
   }
   async delete(request) {
-    return await DenoCore.ops.op_cache_delete(cacheKeyOf(request));
+    return await DenoCore.ops.op_cache_delete(this.name, cacheKeyOf(request));
   }
 }
+
+// The namespace `caches.default` and `context.services.cache` share.
+//
+// Named once here rather than on both sides of the boundary: the ops take
+// whatever name they are given and know nothing about which one is the
+// default, so this is the only place the two spellings could ever come apart
+// and there is only one of it.
+const DEFAULT_CACHE_NAME = "default";
 
 // One instance, reached under both names, so an application that writes
 // through `caches.default` and reads through `context.services.cache` sees
 // its own entry.
-const defaultCache = new Cache();
+const defaultCache = new Cache(DEFAULT_CACHE_NAME);
+
+// What this cache is and how long it lasts, read once per isolate.
+//
+// The store lives in this isolate's memory: it dies when a new version is
+// deployed, when the node restarts, and it is not shared with the other nodes
+// of the installation. That is the platform's decision rather than a gap, and
+// this object is what makes it something an application can *check* instead of
+// something it has to have read. A miss has two very different causes -- the
+// entry was evicted or went stale in a store that is still the one that was
+// written to, or the store itself is new and everything went at once -- and
+// only the second one invalidates an application's reasoning about what it has
+// already done. `scope.id` tells them apart: record it beside anything cached
+// that a decision depends on, and a value that no longer matches means the
+// cache went with the old isolate.
+//
+// Read here, at isolate build, rather than on every access: it cannot change
+// while this isolate lives, and a property that dispatched an op per read
+// would spend an application's op-rate budget on a constant.
+const cacheScope = Object.freeze(DenoCore.ops.op_cache_scope());
 
 globalThis.caches = {
-  default: defaultCache
+  default: defaultCache,
+  scope: cacheScope,
+  // A cache of this application's own, under a name it chooses. Namespaced
+  // inside the one isolate store, so opening a name costs nothing and two
+  // names never see each other's entries.
+  //
+  // Async because `CacheStorage.open` is, and because code ported from
+  // Cloudflare awaits it. Nothing here needs to wait for anything.
+  async open(name) {
+    if (typeof name !== "string" || name === "") {
+      throw new TypeError(
+        "caches.open: a non-empty cache name is required, got " +
+          (name === "" ? "an empty string" : typeof name)
+      );
+    }
+    return new Cache(name);
+  },
+  // Drop everything in one named cache, and say whether it held anything.
+  //
+  // A named cache here is a namespace rather than an object that was created,
+  // so there is no such thing as a cache that exists and is empty: `false`
+  // means nothing was stored under that name, which is the same answer an
+  // application gets for a name it never used. That is the honest reading of
+  // `CacheStorage.delete` on a store built this way, and it is written down
+  // here because the specification's answer means something slightly
+  // different.
+  async delete(name) {
+    if (typeof name !== "string" || name === "") {
+      throw new TypeError(
+        "caches.delete: a non-empty cache name is required, got " +
+          (name === "" ? "an empty string" : typeof name)
+      );
+    }
+    return (await DenoCore.ops.op_cache_clear(name)) > 0;
+  }
 };
 
 // What a KV value is stored as, and what a read is asked to hand back.
@@ -1629,30 +1701,110 @@ function blobWholeNumber(call, name, value) {
 }
 
 
+// The queue carries bytes, so this is where a message becomes bytes.
+//
+// A string is UTF-8 encoded and an object is JSON encoded first, which is
+// what an application already expected: `queue.send("text")` and
+// `queue.send({ json: true })` reach the consumer as they always did. A
+// buffer is sent as it stands, byte for byte -- the case the queue could
+// not carry at all while its wire type was a string, even though the dead
+// letter table has always been able to show one.
+//
+// Lifted out of `send` so that `sendBatch` encodes a body by exactly the same
+// rules. Two copies of these four branches would eventually disagree, and the
+// symptom would be a consumer that reads one shape from `send` and another
+// from `sendBatch` for the same value.
+function queueMessageBytes(message) {
+  if (typeof message === "string") {
+    return new TextEncoder().encode(message);
+  }
+  if (message instanceof ArrayBuffer) {
+    return new Uint8Array(message);
+  }
+  if (ArrayBuffer.isView(message)) {
+    return new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+  }
+  return new TextEncoder().encode(JSON.stringify(message));
+}
+
 class Queue {
   constructor(name = "default") {
     this.name = name;
   }
-  // The queue carries bytes, so this is where a message becomes bytes.
-  //
-  // A string is UTF-8 encoded and an object is JSON encoded first, which is
-  // what an application already expected: `queue.send("text")` and
-  // `queue.send({ json: true })` reach the consumer as they always did. A
-  // buffer is sent as it stands, byte for byte -- the case the queue could
-  // not carry at all while its wire type was a string, even though the dead
-  // letter table has always been able to show one.
   async send(message) {
-    let bytes;
-    if (typeof message === "string") {
-      bytes = new TextEncoder().encode(message);
-    } else if (message instanceof ArrayBuffer) {
-      bytes = new Uint8Array(message);
-    } else if (ArrayBuffer.isView(message)) {
-      bytes = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
-    } else {
-      bytes = new TextEncoder().encode(JSON.stringify(message));
+    await DenoCore.ops.op_queue_send(this.name, queueMessageBytes(message));
+  }
+  // Enqueue a whole array in one call, as one unit.
+  //
+  // Two properties an application cannot get from `send` in a loop:
+  //
+  //   * the batch is ATOMIC. deis-queue stores it in one transaction, so a
+  //     rejected `sendBatch` has enqueued nothing at all. There is no state
+  //     where half an array arrived and the caller has to work out which
+  //     half, which is what makes a retry of the same array safe;
+  //   * it is ONE op dispatch and one round trip. Fifty separate `send` calls
+  //     are fifty dispatches counted against this application's
+  //     `rate_limit_ops_per_sec` and fifty chances for the invocation's
+  //     budget to run out part way through the array.
+  //
+  // How many messages one batch may hold is deis-queue's decision, not this
+  // side's -- `max_batch_messages`, 100 unless an operator changed it -- and
+  // an over-long batch is refused there with nothing stored. Deciding it here
+  // would mean an application setting how long one producer may hold the
+  // queue's write lock.
+  //
+  // Each entry must be an object with a `body`, which is Cloudflare's shape
+  // and is deliberately NOT the shape `send` takes. `send({ body: x })` means
+  // "JSON-encode this object", so an array of bare values and an array of
+  // `{ body }` wrappers cannot both be read here without one of them silently
+  // meaning the other: code ported from Cloudflare would enqueue the literal
+  // text `{"body":"..."}` and nothing would report it. Requiring the wrapper
+  // makes the two readings impossible to confuse, and a bare value is refused
+  // with a message that says what to write instead.
+  async sendBatch(messages) {
+    if (!Array.isArray(messages)) {
+      throw new TypeError(
+        "queue.sendBatch: expected an array of messages, got " + typeof messages
+      );
     }
-    await DenoCore.ops.op_queue_send(this.name, bytes);
+    if (messages.length === 0) {
+      throw new TypeError(
+        "queue.sendBatch: the array is empty, so there is nothing to enqueue. " +
+          "Check the array before calling rather than sending an empty batch"
+      );
+    }
+
+    // Encoded into one flat buffer plus the length of each body: that is the
+    // shape `op_queue_send_batch` splits back apart, and it costs one
+    // JavaScript-to-Rust buffer conversion for the whole array instead of one
+    // per message.
+    const bodies = [];
+    const lengths = [];
+    let total = 0;
+    for (let i = 0; i < messages.length; i++) {
+      const entry = messages[i];
+      if (entry === null || typeof entry !== "object" || !("body" in entry)) {
+        throw new TypeError(
+          "queue.sendBatch: entry " + i + " must be an object with a \"body\" " +
+            "property, e.g. { body: " + JSON.stringify("your message") + " }; got " +
+            (entry === null ? "null" : typeof entry) +
+            ". Nothing was enqueued"
+        );
+      }
+      const bytes = queueMessageBytes(entry.body);
+      bodies.push(bytes);
+      lengths.push(bytes.byteLength);
+      total += bytes.byteLength;
+    }
+
+    const joined = new Uint8Array(total);
+    let offset = 0;
+    for (let i = 0; i < bodies.length; i++) {
+      joined.set(bodies[i], offset);
+      offset += bodies[i].byteLength;
+    }
+
+    await DenoCore.ops.op_queue_send_batch(this.name, joined, lengths);
   }
   // A queue other than this app's default one, e.g.
   // ctx.services.queue.to("jobs").send({ ... }).

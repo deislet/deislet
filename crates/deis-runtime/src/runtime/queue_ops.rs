@@ -1,4 +1,4 @@
-//! `ctx.services.queue.send`: the producer half of queueing.
+//! `ctx.services.queue.send` and `.sendBatch`: the producer half of queueing.
 //!
 //! Consumption is the other half and does not go through an op at all: the
 //! node polls deis-queue and calls the app's `queue` handler, see
@@ -22,7 +22,19 @@ use deno_error::JsErrorBox;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// What `send` answers when this app has no queue client.
+/// How many bytes of message bodies one batch may carry to deis-queue.
+///
+/// Not a policy of this platform's: it is the transport's own ceiling
+/// ([`crate::MAX_GRPC_MESSAGE_BYTES`]), less a margin for the queue name, the
+/// per-message framing and the metadata headers. The check exists here rather
+/// than being left to tonic because tonic refuses an over-long message with a
+/// protobuf encoder error, which tells an application author nothing about
+/// what they did or what to do instead. deis-queue's own `max_batch_messages`
+/// is still the ceiling on how *many* messages a batch may hold; this is the
+/// one the wire imposes on how *large* they are together.
+const MAX_BATCH_BYTES: usize = crate::MAX_GRPC_MESSAGE_BYTES - 64 * 1024;
+
+/// What `send` and `sendBatch` answer when this app has no queue client.
 ///
 /// It names the consequence rather than only the condition: the application
 /// is holding a rejected promise and has to know that the message is not
@@ -87,8 +99,136 @@ async fn op_queue_send(
         .map_err(|e| service_call_failed("queue.send", e))
 }
 
-extension!(deis_runtime_queue_ops, ops = [op_queue_send],);
+/// Enqueue a whole array of messages in one call, as one unit.
+///
+/// # Why this is not `send` in a loop
+///
+/// Two things a loop cannot give an application. deis-queue writes the batch
+/// in one SQLite transaction, so either every message is stored or none is --
+/// there is no state in which half an array arrived and the application has
+/// to work out which half. And it is *one* op dispatch: fifty messages sent
+/// one at a time are fifty dispatches against `rate_limit_ops_per_sec`, fifty
+/// round trips to deis-queue, and fifty chances for the invocation's budget to
+/// run out part way through.
+///
+/// # How the bodies travel
+///
+/// One buffer holding every body end to end, plus the length of each. A queue
+/// body is bytes (see [`op_queue_send`]), and an array of buffers would be one
+/// V8-to-Rust conversion per message; framing them into a single buffer that
+/// `js/runtime.js` builds once costs one. The lengths are what split it back
+/// apart, so they and the buffer are two halves of one argument: a mismatch
+/// between them is a bug in `js/runtime.js` and is refused rather than
+/// guessed at, because a wrong split would enqueue bodies no application ever
+/// wrote.
+#[op2]
+async fn op_queue_send_batch(
+    state: Rc<RefCell<OpState>>,
+    #[string] queue_name: String,
+    #[buffer] bodies: JsBuffer,
+    #[serde] lengths: Vec<u32>,
+) -> Result<(), JsErrorBox> {
+    let (client_opt, app_id) = {
+        let state_borrow = state.borrow();
+        (
+            state_borrow.try_borrow::<QueueClient>().cloned(),
+            state_borrow
+                .try_borrow::<AppId>()
+                .map(|app| app.0.clone())
+                .unwrap_or_default(),
+        )
+    };
+
+    let Some(client) = client_opt else {
+        tracing::warn!(
+            target: "app",
+            app_id,
+            queue = %queue_name,
+            messages = lengths.len(),
+            "Refused a batch of {} message(s) to queue {}: no deis-queue is bound to this app, \
+             so none of them was enqueued and the app was told so. Declare \"queue\" in the \
+             manifest and give the deployment a queue address",
+            lengths.len(),
+            queue_name
+        );
+        return Err(queue_unavailable(&queue_name));
+    };
+
+    let total: usize = lengths.iter().map(|len| *len as usize).sum();
+    if total != bodies.len() {
+        return Err(JsErrorBox::generic(format!(
+            "queue.sendBatch({queue_name:?}): the {} message length(s) add up to {total} bytes \
+             but {} bytes of bodies were handed over; nothing was enqueued",
+            lengths.len(),
+            bodies.len()
+        )));
+    }
+
+    if total > MAX_BATCH_BYTES {
+        tracing::warn!(
+            target: "app",
+            app_id,
+            queue = %queue_name,
+            messages = lengths.len(),
+            bytes = total,
+            limit = MAX_BATCH_BYTES,
+            "Refused a batch of {} message(s) to queue {}: their bodies come to {} bytes and one \
+             gRPC message may carry {}. Nothing was enqueued; send the batch in smaller pieces \
+             or put the payloads in blob storage and queue their keys",
+            lengths.len(),
+            queue_name,
+            total,
+            MAX_BATCH_BYTES
+        );
+        return Err(JsErrorBox::generic(format!(
+            "queue.sendBatch({queue_name:?}): the {} message bodies come to {total} bytes, and a \
+             batch may carry {MAX_BATCH_BYTES}. Nothing was enqueued",
+            lengths.len()
+        )));
+    }
+
+    // Split once, into owned bodies, because that is what the proto message
+    // takes. The buffer is this invocation's own and is dropped straight
+    // after.
+    let bytes = bodies.to_vec();
+    let mut messages = Vec::with_capacity(lengths.len());
+    let mut offset = 0usize;
+    for len in &lengths {
+        let end = offset + *len as usize;
+        messages.push(bytes[offset..end].to_vec());
+        offset = end;
+    }
+
+    let ids = client
+        .send_batch(queue_name.clone(), messages)
+        .await
+        .map_err(|e| service_call_failed("queue.sendBatch", e))?;
+
+    // Debug rather than info: a healthy application may do this on every
+    // request, and the interesting events -- a refusal, a short answer -- are
+    // already errors by the time they get here.
+    tracing::debug!(
+        target: "app",
+        app_id,
+        queue = %queue_name,
+        messages = ids.len(),
+        bytes = total,
+        "Enqueued {} message(s) to queue {} as one transaction",
+        ids.len(),
+        queue_name
+    );
+    Ok(())
+}
+
+extension!(
+    deis_runtime_queue_ops,
+    ops = [op_queue_send, op_queue_send_batch],
+);
 
 pub fn init_queue_extension() -> deno_core::Extension {
     deis_runtime_queue_ops::init()
 }
+
+#[cfg(test)]
+#[path = "queue_ops_test.rs"]
+mod queue_ops_test;

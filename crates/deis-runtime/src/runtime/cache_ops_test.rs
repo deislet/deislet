@@ -68,20 +68,19 @@ mod tests {
         let code = r#"
             (async () => {
                 await Deno.core.ops.op_cache_set(
-                    "test_key", "{\"status\":200}", bytes("test_value"), 0);
+                    "default", "test_key", "{\"status\":200}", bytes("test_value"), 0);
             })()
         "#;
 
         run(&mut runtime, code).await;
 
         // Verify by directly accessing CacheStore
-        let cache = {
-            let op_state = runtime.op_state();
-            let state = op_state.borrow();
-            state.borrow::<CacheStore>().clone()
-        };
+        let cache = store(&runtime);
 
-        let value = cache.get("test_key").await.expect("the entry was written");
+        let value = cache
+            .entry("default", "test_key")
+            .await
+            .expect("the entry was written");
         assert_eq!(value.meta, "{\"status\":200}");
         assert_eq!(value.body, b"test_value".to_vec());
     }
@@ -92,20 +91,14 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_get("nonexistent_key");
+                await Deno.core.ops.op_cache_get("default", "nonexistent_key");
             })()
         "#;
 
         run(&mut runtime, code).await;
 
-        let cache = {
-            let op_state = runtime.op_state();
-            let state = op_state.borrow();
-            state.borrow::<CacheStore>().clone()
-        };
-
-        let value = cache.get("nonexistent_key").await;
-        assert_eq!(value, None);
+        let cache = store(&runtime);
+        assert_eq!(cache.entry("default", "nonexistent_key").await, None);
     }
 
     #[tokio::test]
@@ -114,98 +107,136 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("key_to_delete", "{}", bytes("value"), 0);
-                await Deno.core.ops.op_cache_delete("key_to_delete");
+                await Deno.core.ops.op_cache_set(
+                    "default", "key_to_delete", "{}", bytes("value"), 0);
+                await Deno.core.ops.op_cache_delete("default", "key_to_delete");
             })()
         "#;
 
         run(&mut runtime, code).await;
 
-        let cache = {
-            let op_state = runtime.op_state();
-            let state = op_state.borrow();
-            state.borrow::<CacheStore>().clone()
-        };
-
-        let value = cache.get("key_to_delete").await;
-        assert_eq!(value, None);
+        let cache = store(&runtime);
+        assert_eq!(cache.entry("default", "key_to_delete").await, None);
     }
 
+    /// Two names, one store, and nothing crosses between them.
+    ///
+    /// This is what `caches.open(name)` is worth: a cache an application opens
+    /// for its own purpose must not be able to answer a `caches.default` read
+    /// with the wrong page.
     #[tokio::test]
-    async fn test_cache_has() {
+    async fn a_named_cache_cannot_see_the_default_cache_s_entries() {
         let mut runtime = setup_test_runtime();
 
-        let code = r#"
+        run(
+            &mut runtime,
+            r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("exists_key", "{}", bytes("value"), 0);
+                await Deno.core.ops.op_cache_set(
+                    "default", "shared_key", "{}", bytes("from-default"), 0);
+                await Deno.core.ops.op_cache_set(
+                    "pages", "shared_key", "{}", bytes("from-pages"), 0);
             })()
-        "#;
+        "#,
+        )
+        .await;
 
-        run(&mut runtime, code).await;
-
-        let cache = {
-            let op_state = runtime.op_state();
-            let state = op_state.borrow();
-            state.borrow::<CacheStore>().clone()
-        };
-
-        let has_exists = cache.contains_key("exists_key");
-        let has_not_exists = cache.contains_key("not_exists_key");
-
-        assert!(has_exists);
-        assert!(!has_not_exists);
+        let cache = store(&runtime);
+        assert_eq!(
+            cache.entry("default", "shared_key").await.unwrap().body,
+            b"from-default".to_vec()
+        );
+        assert_eq!(
+            cache.entry("pages", "shared_key").await.unwrap().body,
+            b"from-pages".to_vec()
+        );
+        // One store, two namespaces: both entries are really there.
+        assert_eq!(cache.len().await, 2);
     }
 
+    /// The composition of a name and a key is injective.
+    ///
+    /// Without the length prefix, `open("ab")` with key `"c"` and `open("a")`
+    /// with key `"b:c"` would land on the same string, and an application that
+    /// named a cache after anything a visitor controls could read and
+    /// overwrite another of its own caches.
     #[tokio::test]
-    async fn test_cache_clear() {
+    async fn a_cache_name_containing_the_separator_cannot_reach_another_cache() {
         let mut runtime = setup_test_runtime();
 
-        let code = r#"
+        run(
+            &mut runtime,
+            r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("key1", "{}", bytes("value1"), 0);
-                await Deno.core.ops.op_cache_set("key2", "{}", bytes("value2"), 0);
-                await Deno.core.ops.op_cache_clear();
+                await Deno.core.ops.op_cache_set("ab", "c", "{}", bytes("one"), 0);
+                await Deno.core.ops.op_cache_set("a", "b:c", "{}", bytes("two"), 0);
             })()
-        "#;
+        "#,
+        )
+        .await;
 
-        run(&mut runtime, code).await;
-
-        let cache = {
-            let op_state = runtime.op_state();
-            let state = op_state.borrow();
-            state.borrow::<CacheStore>().clone()
-        };
-
-        cache.run_pending_tasks().await;
-        let count = cache.entry_count();
-
-        assert_eq!(count, 0);
+        let cache = store(&runtime);
+        assert_eq!(cache.entry("ab", "c").await.unwrap().body, b"one".to_vec());
+        assert_eq!(cache.entry("a", "b:c").await.unwrap().body, b"two".to_vec());
+        assert_eq!(cache.len().await, 2, "the two keys collided");
     }
 
+    /// `caches.delete(name)` empties one namespace and leaves the others.
     #[tokio::test]
-    async fn test_cache_stats() {
+    async fn clearing_one_named_cache_leaves_the_others_alone() {
         let mut runtime = setup_test_runtime();
 
-        let code = r#"
+        run(
+            &mut runtime,
+            r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("stat_key1", "{}", bytes("value1"), 0);
-                await Deno.core.ops.op_cache_set("stat_key2", "{}", bytes("value2"), 0);
-                await Deno.core.ops.op_cache_set("stat_key3", "{}", bytes("value3"), 0);
+                await Deno.core.ops.op_cache_set("pages", "one", "{}", bytes("a"), 0);
+                await Deno.core.ops.op_cache_set("pages", "two", "{}", bytes("b"), 0);
+                await Deno.core.ops.op_cache_set("default", "kept", "{}", bytes("c"), 0);
+                const dropped = await Deno.core.ops.op_cache_clear("pages");
+                const none = await Deno.core.ops.op_cache_clear("never_used");
+                // Parked in the store rather than read back through a v8
+                // scope: the answers under test are values the op returned.
+                await Deno.core.ops.op_cache_set(
+                    "default", "answers", "{}", bytes(dropped + "," + none), 0);
             })()
-        "#;
+        "#,
+        )
+        .await;
 
-        run(&mut runtime, code).await;
+        let cache = store(&runtime);
+        assert_eq!(
+            cache.entry("default", "answers").await.unwrap().body,
+            b"2,0".to_vec(),
+            "clear must report how many entries it dropped"
+        );
+        assert_eq!(cache.entry("pages", "one").await, None);
+        assert_eq!(cache.entry("pages", "two").await, None);
+        assert_eq!(
+            cache.entry("default", "kept").await.unwrap().body,
+            b"c".to_vec()
+        );
+    }
 
-        let cache = {
-            let op_state = runtime.op_state();
-            let state = op_state.borrow();
-            state.borrow::<CacheStore>().clone()
-        };
+    /// The scope an application reads as `caches.scope`.
+    ///
+    /// The identity is what lets an application tell a miss in the store it
+    /// wrote to from a miss in a store that replaced it, so two stores must
+    /// never carry the same one.
+    #[test]
+    fn every_store_has_an_identity_of_its_own_and_reports_the_node_s_numbers() {
+        let one = create_cache_store(10_000, 600);
+        let two = create_cache_store(10_000, 600);
 
-        cache.run_pending_tasks().await;
-        let count = cache.entry_count();
-
-        assert_eq!(count, 3);
+        assert_eq!(one.scope().kind, "isolate");
+        assert_ne!(
+            one.scope().id,
+            two.scope().id,
+            "two isolates' caches must not look like the same store"
+        );
+        assert_eq!(one.scope().max_entries, 10_000);
+        assert_eq!(one.scope().default_ttl_seconds, 600);
+        assert!(one.scope().since > 0, "the store has to know when it began");
     }
 
     #[tokio::test]
@@ -214,24 +245,20 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("multi1", "{}", bytes("value1"), 0);
-                await Deno.core.ops.op_cache_set("multi2", "{}", bytes("value2"), 0);
-                await Deno.core.ops.op_cache_set("multi3", "{}", bytes("value3"), 0);
-                await Deno.core.ops.op_cache_delete("multi2");
+                await Deno.core.ops.op_cache_set("default", "multi1", "{}", bytes("value1"), 0);
+                await Deno.core.ops.op_cache_set("default", "multi2", "{}", bytes("value2"), 0);
+                await Deno.core.ops.op_cache_set("default", "multi3", "{}", bytes("value3"), 0);
+                await Deno.core.ops.op_cache_delete("default", "multi2");
             })()
         "#;
 
         run(&mut runtime, code).await;
 
-        let cache = {
-            let op_state = runtime.op_state();
-            let state = op_state.borrow();
-            state.borrow::<CacheStore>().clone()
-        };
+        let cache = store(&runtime);
 
-        let v1 = cache.get("multi1").await;
-        let v2 = cache.get("multi2").await;
-        let v3 = cache.get("multi3").await;
+        let v1 = cache.entry("default", "multi1").await;
+        let v2 = cache.entry("default", "multi2").await;
+        let v3 = cache.entry("default", "multi3").await;
 
         assert_eq!(v1.map(|entry| entry.body), Some(b"value1".to_vec()));
         assert!(v2.is_none());
@@ -248,8 +275,8 @@ mod tests {
             &mut runtime,
             r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("with_ttl", "{}", bytes("value"), 120);
-                await Deno.core.ops.op_cache_set("without_ttl", "{}", bytes("value"), 0);
+                await Deno.core.ops.op_cache_set("default", "with_ttl", "{}", bytes("value"), 120);
+                await Deno.core.ops.op_cache_set("default", "without_ttl", "{}", bytes("value"), 0);
             })()
         "#,
         )
@@ -257,12 +284,15 @@ mod tests {
 
         let cache = store(&runtime);
         assert_eq!(
-            cache.get("with_ttl").await.unwrap().ttl,
+            cache.entry("default", "with_ttl").await.unwrap().ttl,
             Some(Duration::from_secs(120))
         );
         // Zero is not "expire immediately"; it is "the response named no
         // lifetime", and the store's own default applies.
-        assert_eq!(cache.get("without_ttl").await.unwrap().ttl, None);
+        assert_eq!(
+            cache.entry("default", "without_ttl").await.unwrap().ttl,
+            None
+        );
     }
 
     #[test]
@@ -325,13 +355,15 @@ mod tests {
             &mut runtime,
             r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("present", "{}", bytes("value"), 0);
-                const removedPresent = await Deno.core.ops.op_cache_delete("present");
-                const removedAbsent = await Deno.core.ops.op_cache_delete("never_written");
+                await Deno.core.ops.op_cache_set("default", "present", "{}", bytes("value"), 0);
+                const removedPresent =
+                    await Deno.core.ops.op_cache_delete("default", "present");
+                const removedAbsent =
+                    await Deno.core.ops.op_cache_delete("default", "never_written");
                 // Parked in the cache itself rather than read back through a
                 // v8 scope: the answer under test is a value the op returned.
                 await Deno.core.ops.op_cache_set(
-                    "answers", "{}", bytes(removedPresent + "," + removedAbsent), 0);
+                    "default", "answers", "{}", bytes(removedPresent + "," + removedAbsent), 0);
             })()
         "#,
         )
@@ -339,11 +371,11 @@ mod tests {
 
         let cache = store(&runtime);
         assert_eq!(
-            cache.get("answers").await.unwrap().body,
+            cache.entry("default", "answers").await.unwrap().body,
             b"true,false".to_vec(),
             "delete() must report a hit as true and a miss as false"
         );
-        assert!(cache.get("present").await.is_none());
+        assert!(cache.entry("default", "present").await.is_none());
     }
 
     /// A cached body that is not text comes back byte for byte.
@@ -434,5 +466,96 @@ mod tests {
         assert_eq!(seen["status"], 200);
         assert_eq!(seen["emptyStatus"], 204);
         assert_eq!(seen["emptyLength"], 0);
+    }
+
+    /// `caches.open`, `caches.delete` and `caches.scope`, from an application.
+    ///
+    /// Driven through a real `AppRuntime` because the whole of this feature is
+    /// in the JavaScript half: the ops only see a name and a key, and what has
+    /// to be true is that an application reaching for `caches.open("pages")`
+    /// gets a cache that does not answer `caches.default`'s reads, that
+    /// `caches.delete` empties it, and that `caches.scope` says what kind of
+    /// cache the application is holding before it depends on one.
+    #[tokio::test]
+    async fn an_application_opens_a_named_cache_and_can_see_what_kind_of_cache_it_is() {
+        use crate::runtime::isolate::{AppRuntime, IsolateSpec};
+        use crate::runtime::ServiceWiring;
+        use std::collections::HashMap;
+
+        let code = r#"
+            export default async function handler() {
+                const key = "https://example.invalid/page";
+                const pages = await caches.open("pages");
+
+                await caches.default.put(key, new Response("from-default"));
+                await pages.put(key, new Response("from-pages"));
+
+                const fromDefault = await caches.default.match(key);
+                const fromPages = await pages.match(key);
+
+                // Emptying one name must leave the other name's entry alone.
+                const emptied = await caches.delete("pages");
+                const neverUsed = await caches.delete("no-such-cache");
+                const afterDelete = await pages.match(key);
+                const stillThere = await caches.default.match(key);
+
+                return new Response(JSON.stringify({
+                    fromDefault: await fromDefault.text(),
+                    fromPages: await fromPages.text(),
+                    emptied,
+                    neverUsed,
+                    afterDelete: afterDelete === undefined,
+                    stillThere: await stillThere.text(),
+                    scopeKind: caches.scope.kind,
+                    scopeHasId: typeof caches.scope.id === "string"
+                        && caches.scope.id.length > 0,
+                    scopeStable: caches.scope.id === caches.scope.id,
+                    maxEntries: caches.scope.maxEntries,
+                }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "named_cache_app.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _headers, body) = rx.await.unwrap().unwrap();
+        let body = String::from_utf8(body.into_bytes().unwrap_or_default()).unwrap();
+        assert_eq!(status, 200, "the handler failed: {body}");
+
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(seen["fromDefault"], "from-default");
+        assert_eq!(seen["fromPages"], "from-pages");
+        assert_eq!(
+            seen["emptied"], true,
+            "caches.delete must report the cache it emptied"
+        );
+        assert_eq!(
+            seen["neverUsed"], false,
+            "a name nothing was ever stored under holds nothing to delete"
+        );
+        assert_eq!(seen["afterDelete"], true);
+        assert_eq!(seen["stillThere"], "from-default");
+        assert_eq!(seen["scopeKind"], "isolate");
+        assert_eq!(seen["scopeHasId"], true);
+        assert_eq!(seen["scopeStable"], true);
+        assert_eq!(seen["maxEntries"], 10_000);
     }
 }

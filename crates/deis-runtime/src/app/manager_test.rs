@@ -379,6 +379,7 @@ mod tests {
             timeout_ms: Some(5_000),
             rate_limit_ops_per_sec: Some(10.0),
             cpu_time_limit_ms: None,
+            max_subrequests: None,
         };
         let effective = manager.effective_limits(&key("app_b"), Some(&limits));
         assert_eq!(effective.timeout_ms, 5_000);
@@ -397,6 +398,7 @@ mod tests {
             timeout_ms: Some(5_000),
             rate_limit_ops_per_sec: None,
             cpu_time_limit_ms: None,
+            max_subrequests: None,
         };
         let effective = manager.effective_limits(&key("app_c"), Some(&limits));
         assert_eq!(effective.timeout_ms, 5_000);

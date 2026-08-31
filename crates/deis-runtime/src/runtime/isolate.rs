@@ -9,6 +9,7 @@ use super::metrics::{
 };
 use super::ops::{
     AppId, EnvStore, ExecutionDeadline, PendingRequestBody, PendingResponseBody, ResponseStore,
+    SubrequestBudget,
 };
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
@@ -1102,6 +1103,12 @@ pub struct AppRuntime {
     /// with the isolate's `OpState` so `js/bootstrap.js` can bound an outbound
     /// `fetch` by it. See [`ExecutionDeadline`].
     execution_deadline: ExecutionDeadline,
+    /// How many outbound calls the invocation currently running has left,
+    /// shared with the isolate's `OpState` so the fetch guard and the outbound
+    /// WebSocket dial spend the same allowance. Reset by
+    /// [`Self::begin_invocation`]; see [`SubrequestBudget`] for why fan-out
+    /// needs a ceiling none of the other budgets provides.
+    subrequest_budget: Rc<SubrequestBudget>,
     /// Which of the platform's answers this application gets. See
     /// [`IsolateSpec::compatibility`]: this is the one thing this isolate asks
     /// when an old answer and a better one both exist, and it is a bit test,
@@ -1164,6 +1171,7 @@ impl AppRuntime {
             stream_timeout_ms,
             rate_limit_ops_per_sec,
             cpu_time_limit_ms,
+            max_subrequests,
         } = limits;
 
         // The node's own configuration knows where deis-control and
@@ -1288,6 +1296,7 @@ impl AppRuntime {
         let _ = isolate_handle_cell.set(runtime.v8_isolate().thread_safe_handle());
 
         let execution_deadline: ExecutionDeadline = Rc::new(Cell::new(None));
+        let subrequest_budget = Rc::new(SubrequestBudget::new(max_subrequests));
 
         {
             let sys = RealSys;
@@ -1396,6 +1405,12 @@ impl AppRuntime {
             // aborts itself instead of running on past the budget and holding
             // the runtime thread every other application on it is waiting for.
             state.put(execution_deadline.clone());
+
+            // The invocation's outbound-call allowance, read and spent by
+            // `op_deis_fetch_guard` and by the outbound WebSocket dial. Zero
+            // is refused by configuration validation and by the manifest
+            // clamp, so an isolate always has a usable ceiling here.
+            state.put(subrequest_budget.clone());
 
             // The same policy the HTTP client's resolver was built with, put
             // where `op_deis_fetch_guard` can read it. Both halves have to see
@@ -1508,6 +1523,7 @@ impl AppRuntime {
             rate_limit_ops_per_sec,
             metrics,
             execution_deadline,
+            subrequest_budget,
             compatibility,
             timers_swept: false,
         })
@@ -1580,6 +1596,13 @@ impl AppRuntime {
     /// one here. Paired with [`Self::end_invocation`] on every path out.
     fn begin_invocation(&mut self) {
         self.timers_swept = false;
+        // The outbound-call allowance belongs to one invocation, exactly as
+        // the wall-clock and CPU budgets do. Reset here and not in
+        // `end_invocation`, because a response stream's producer runs on after
+        // the request has been answered and must keep spending the same
+        // allowance: a handler that could reset it by returning would have as
+        // many calls as it liked from inside a stream.
+        self.subrequest_budget.reset();
         if let Some(sockets) = self.outbound_sockets() {
             sockets.begin_invocation();
         }

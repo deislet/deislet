@@ -103,6 +103,16 @@
 //! may run. [`MAX_OPEN_SOCKETS`] is what one isolate may hold at once; past it
 //! the connection is refused with a message that names the limit, rather than
 //! being queued behind sockets that may never close.
+//!
+//! That cap bounds how many are open *at the same time*, which is not the same
+//! question as how many an invocation may open. A handler that opens a socket,
+//! closes it and opens the next never holds more than one and can still make
+//! this node perform hundreds of connections for a single inbound request, so
+//! a connection here also costs one of the invocation's subrequests
+//! ([`SubrequestBudget`]) -- the same allowance an outbound `fetch` spends,
+//! because it is the same shared thing being spent: the node's outbound
+//! capacity. A connection the policy refuses gives its charge back; one that
+//! was dialled and did not come up does not, because it left the isolate.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -132,7 +142,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::runtime::fetch_policy::{loggable, FetchPolicy};
 use crate::runtime::isolate::OutboundSockets;
-use crate::runtime::ops::{AppId, ExecutionDeadline};
+use crate::runtime::ops::{AppId, ExecutionDeadline, SubrequestBudget};
 
 /// How many outbound sockets one isolate may hold open at once.
 ///
@@ -869,7 +879,7 @@ async fn op_deis_ws_connect(
     budget_ms: f64,
     #[serde] protocols: Vec<String>,
 ) -> Result<Opened, JsErrorBox> {
-    let (policy, app_id, deadline, sockets, asked_in) = {
+    let (policy, app_id, deadline, subrequests, sockets, asked_in) = {
         let mut state = state.borrow_mut();
         let policy = state.try_borrow::<FetchPolicy>().cloned();
         let app_id = state
@@ -879,9 +889,10 @@ async fn op_deis_ws_connect(
         let deadline = state
             .try_borrow::<ExecutionDeadline>()
             .and_then(|slot| slot.get());
+        let subrequests = state.try_borrow::<Rc<SubrequestBudget>>().cloned();
         let sockets = ws_state(&mut state);
         let asked_in = sockets.epoch.get();
-        (policy, app_id, deadline, sockets, asked_in)
+        (policy, app_id, deadline, subrequests, sockets, asked_in)
     };
 
     let destination = loggable(&url);
@@ -973,11 +984,46 @@ async fn op_deis_ws_connect(
         Duration::from_millis(budget_ms as u64).min(remaining)
     };
 
+    // One of the invocation's outbound calls, charged before anything is
+    // dialled and before the awaits below, for the reason
+    // [`SubrequestBudget::charge`] gives: a count committed after an await
+    // would not bound a burst of connections started at once. The socket cap
+    // above is a different question -- how many may be open together -- and
+    // neither answers the other.
+    if let Some(budget_left) = subrequests.as_ref() {
+        if let Err(ceiling) = budget_left.charge() {
+            tracing::warn!(
+                target: "app",
+                app_id = %app_id,
+                destination = %destination,
+                ceiling,
+                "Refused an outbound WebSocket from {} to {}: this invocation has already made \
+                 {} outbound call(s), which is the ceiling for this application. Nothing was \
+                 dialled. Outbound WebSockets and fetches share the allowance. Raise \
+                 limits.max_subrequests in the manifest, or the node's \
+                 default_execution_limits.max_subrequests",
+                app_id,
+                destination,
+                ceiling
+            );
+            return Err(JsErrorBox::type_error(format!(
+                "WebSocket to {destination} was refused: this invocation has already made \
+                 {ceiling} outbound call(s), which is the ceiling for this application. Outbound \
+                 WebSockets and fetches spend the same allowance"
+            )));
+        }
+    }
+
     let opened = match tokio::time::timeout(allowance, dial(&policy, &app_id, &url, &protocols))
         .await
     {
         Ok(Ok(opened)) => opened,
         Ok(Err(failure)) => {
+            if let (DialFailure::Refused(_), Some(budget_left)) = (&failure, subrequests.as_ref()) {
+                // Refused before a socket was opened, so it gives its charge
+                // back; an `Unreachable` was dialled and keeps it.
+                budget_left.refund();
+            }
             match &failure {
                 DialFailure::Refused(reason) => tracing::warn!(
                     target: "app",

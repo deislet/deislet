@@ -234,6 +234,7 @@ impl ApplicationManager {
         let timeout_ms = self.effective_timeout_ms(key, limits);
         let rate_limit_ops_per_sec = self.effective_rate_limit(key, limits);
         let cpu_time_limit_ms = self.effective_cpu_time_limit_ms(key, limits);
+        let max_subrequests = self.effective_max_subrequests(key, limits);
 
         // A thread cannot burn more CPU time than wall-clock time, so a CPU
         // ceiling at or above the duration ceiling can never be the one that
@@ -272,7 +273,73 @@ impl ApplicationManager {
             stream_timeout_ms: self.default_limits.stream_timeout_ms,
             rate_limit_ops_per_sec,
             cpu_time_limit_ms,
+            max_subrequests,
         }
+    }
+
+    /// Resolve the outbound-call ceiling for one invocation of one app: the
+    /// node's default, narrowed by the app's own
+    /// `ResourceLimits.max_subrequests` when it asked for less.
+    ///
+    /// Narrowing only, like every other limit here, and this one is squarely a
+    /// protection of something shared: an invocation that fans out to hundreds
+    /// of destinations is spending the node's outbound sockets and bandwidth,
+    /// which every other tenant on the box is also using. An application
+    /// asking for *fewer* is buying itself an alarm - a handler that should
+    /// call two upstreams and quietly starts calling twenty fails on the
+    /// change that did it, rather than a month later on a busy afternoon.
+    fn effective_max_subrequests(&self, key: &AppKey, limits: Option<&ResourceLimits>) -> u32 {
+        let node_default = self.default_limits.max_subrequests;
+        let Some(requested) = limits.and_then(|l| l.max_subrequests) else {
+            return node_default;
+        };
+
+        if requested == 0 {
+            // Zero is the wire's spelling for "unset", so it should never
+            // survive as a value here; applying it would refuse the first
+            // `fetch()` of every invocation.
+            tracing::warn!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                applied = node_default,
+                "App {} asks for a ceiling of 0 subrequests, which would refuse its first \
+                 outbound call on every invocation; it is held to this node's {} instead",
+                key,
+                node_default
+            );
+            return node_default;
+        }
+
+        if requested <= node_default {
+            tracing::info!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                "App {} narrows the default subrequest ceiling: {} per invocation (platform \
+                 default {})",
+                key,
+                requested,
+                node_default
+            );
+            return requested;
+        }
+
+        tracing::warn!(
+            target: "app",
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            requested,
+            applied = node_default,
+            "App {} asks to make {} subrequests per invocation, above this node's ceiling of {}; \
+             it is held to the node's value. Raise \
+             default_execution_limits.max_subrequests if this node is meant to carry \
+             applications that fan out that far",
+            key,
+            requested,
+            node_default
+        );
+        node_default
     }
 
     /// Resolve the wall-clock ceiling for one invocation of one app: the
@@ -1122,6 +1189,7 @@ mod memory_ceiling {
                 timeout_ms: None,
                 rate_limit_ops_per_sec: None,
                 cpu_time_limit_ms: None,
+                max_subrequests: None,
             }),
             ..AppConfig::default()
         }
@@ -1278,6 +1346,7 @@ mod cpu_ceiling {
                 timeout_ms: None,
                 rate_limit_ops_per_sec: None,
                 cpu_time_limit_ms,
+                max_subrequests: None,
             }),
             ..AppConfig::default()
         }

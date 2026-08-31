@@ -530,6 +530,12 @@ impl RuntimeManagement for RuntimeManagementService {
 /// node's own configuration is in scope.
 fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
     ResourceLimits {
+        // `max_subrequests` has no field in this message and is left absent
+        // here. It is not lost: `crate::deployment` fills in every limit the
+        // deployment did not carry from the version's own manifest, which is
+        // where the declaration was written in the first place. A control
+        // plane that grows a field for it will simply agree with what the
+        // bundle already says.
         memory_mb: limits.memory_mb.max(0) as usize,
         // Field 2 of the message, enforced by nothing on this node; carried
         // into the struct only so that what the control plane sent and what
@@ -542,6 +548,7 @@ fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
             .then_some(limits.rate_limit_ops_per_sec),
         cpu_time_limit_ms: (limits.cpu_time_limit_ms > 0)
             .then_some(limits.cpu_time_limit_ms as u64),
+        max_subrequests: None,
     }
 }
 

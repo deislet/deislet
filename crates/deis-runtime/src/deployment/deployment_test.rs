@@ -1199,3 +1199,91 @@ fn tree_contains(root: &std::path::Path, needle: &[u8]) -> bool {
     }
     false
 }
+
+/// A manifest with a `limits` block, as a bundle carries it.
+fn manifest_declaring(limits: &str) -> deis_bundle::Manifest {
+    deis_bundle::Manifest::parse(&format!(
+        r#"{{"schema":1,"app":"demo","entry":"worker/index.js","limits":{limits}}}"#
+    ))
+    .expect("the manifest parses")
+}
+
+/// A limit the deployment did not carry is read out of the version's own
+/// manifest.
+///
+/// The case that makes this matter: `deis.management.ResourceLimits` has no
+/// field for `max_subrequests`, so a push carries nothing for it. Without the
+/// fallback the node would apply its own default while the application's
+/// manifest went on saying otherwise, and the first anybody would know is the
+/// day the ceiling was needed.
+#[test]
+fn a_limit_the_deployment_did_not_carry_is_read_out_of_the_bundle() {
+    let key = AppKey::new("demo", "production");
+    let carried = ResourceLimits {
+        timeout_ms: Some(1_500),
+        ..ResourceLimits::default()
+    };
+
+    let merged = limits_with_manifest(
+        Some(carried),
+        &manifest_declaring(r#"{"timeout_ms":1500,"max_subrequests":6,"memory_mb":32}"#),
+        &key,
+    )
+    .expect("the manifest declares limits");
+
+    assert_eq!(merged.max_subrequests, Some(6), "read out of the bundle");
+    assert_eq!(merged.memory_mb, 32, "0 is the wire's spelling for unset");
+    assert_eq!(merged.timeout_ms, Some(1_500));
+}
+
+/// What the deployment carried always wins.
+///
+/// The two can only ever agree - the bundle's sha is checked, so this is the
+/// same file the control plane read - but the direction still has to be fixed,
+/// because a bundle recovered from this node's own disk is the one place they
+/// could drift, and the control plane is the half that validated what it sent.
+#[test]
+fn the_manifest_fills_gaps_and_never_overrides_what_was_delivered() {
+    let key = AppKey::new("demo", "production");
+    let carried = ResourceLimits {
+        timeout_ms: Some(900),
+        max_subrequests: Some(3),
+        memory_mb: 64,
+        ..ResourceLimits::default()
+    };
+
+    let merged = limits_with_manifest(
+        Some(carried),
+        &manifest_declaring(r#"{"timeout_ms":9000,"max_subrequests":40,"memory_mb":256}"#),
+        &key,
+    )
+    .expect("the manifest declares limits");
+
+    assert_eq!(merged.timeout_ms, Some(900));
+    assert_eq!(merged.max_subrequests, Some(3));
+    assert_eq!(merged.memory_mb, 64);
+}
+
+/// A version whose manifest declares nothing leaves the delivery untouched,
+/// including a delivery that was itself absent.
+#[test]
+fn a_manifest_without_a_limits_block_changes_nothing() {
+    let key = AppKey::new("demo", "production");
+    let bare =
+        deis_bundle::Manifest::parse(r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#)
+            .expect("the manifest parses");
+
+    assert!(limits_with_manifest(None, &bare, &key).is_none());
+    assert_eq!(
+        limits_with_manifest(
+            Some(ResourceLimits {
+                timeout_ms: Some(700),
+                ..ResourceLimits::default()
+            }),
+            &bare,
+            &key
+        )
+        .and_then(|limits| limits.timeout_ms),
+        Some(700)
+    );
+}

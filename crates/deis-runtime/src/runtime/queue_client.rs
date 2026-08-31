@@ -239,6 +239,71 @@ impl QueueClient {
         Ok(inner.message_id)
     }
 
+    /// Enqueue several messages as one unit, returning the ids deis-queue
+    /// assigned them in the order the bodies were given.
+    ///
+    /// **The batch is atomic.** deis-queue writes the whole of it in one
+    /// SQLite transaction (`deis_queue::queue::Queue::send_batch`), so a
+    /// refused batch leaves nothing behind: an application that is told the
+    /// call failed can retry the same array without first working out which
+    /// half of it arrived. `send` in a loop cannot offer that, and it is why
+    /// this exists beside it rather than as a convenience wrapper.
+    ///
+    /// The ceiling on how many messages one batch may carry is the server's
+    /// (`max_batch_messages`, 100 by default), not this client's: a caller
+    /// that could set its own would be setting how long one producer may hold
+    /// the queue's write lock.
+    pub async fn send_batch(
+        &self,
+        queue_name: String,
+        messages: Vec<Vec<u8>>,
+    ) -> Result<Vec<String>> {
+        let sent = messages.len();
+        let request = self.identity.stamp(SendBatchRequest {
+            queue_name: queue_name.clone(),
+            messages,
+        });
+
+        let mut client = self.client.clone();
+        let response = client
+            .send_batch(request)
+            .await
+            .with_context(|| format!("sending {sent} message(s) to queue {queue_name:?}"))?;
+        let inner = response.into_inner();
+
+        // Same reasoning as `send`: a refusal arrives as a gRPC status, so an
+        // OK response always carries success = true. Checked anyway, because a
+        // batch believed stored and never written is this call's worst
+        // failure.
+        if !inner.success {
+            anyhow::bail!(
+                "queue {queue_name:?} refused a batch of {sent} message(s): {}",
+                if inner.error.is_empty() {
+                    "no reason given"
+                } else {
+                    &inner.error
+                }
+            );
+        }
+
+        // One id per message is what makes the batch atomic observable from
+        // here. A server that stored some and answered with fewer ids would
+        // have broken the all-or-nothing promise this method is sold on, and
+        // an application told "sent" would never find out which ones are
+        // missing; failing loudly is the only answer that keeps the promise
+        // honest.
+        if inner.message_ids.len() != sent {
+            anyhow::bail!(
+                "queue {queue_name:?} was given {sent} message(s) and answered with {} id(s); \
+                 the batch is meant to be all-or-nothing, so which of them are stored is now \
+                 unknown",
+                inner.message_ids.len()
+            );
+        }
+
+        Ok(inner.message_ids)
+    }
+
     /// Lease up to `max_messages` messages for `lease_seconds`.
     ///
     /// Returns an empty vector when the queue has nothing ready; that is the

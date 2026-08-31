@@ -187,6 +187,25 @@ pub struct QueueConsumer {
     /// How many messages to pull at once. None lets the runtime decide.
     #[serde(default)]
     pub batch_size: Option<u32>,
+    /// How many batches of this queue may be outstanding at once. None lets
+    /// the runtime decide, which is one.
+    ///
+    /// **Outstanding, not parallel.** One `(application, environment)` is one
+    /// isolate on one thread on each node, so two batches of the same queue
+    /// can never run at the same time whatever this says: the handler is
+    /// serialised by the isolate. What this raises is how many batches the
+    /// node's poller may hold at once -- leased from deis-queue, waiting their
+    /// turn on the runtime thread, or being acknowledged -- so that the next
+    /// batch is already in hand when the handler finishes instead of costing
+    /// a fresh round trip.
+    ///
+    /// Raising it costs lease time. Every outstanding batch has been leased
+    /// since it was pulled, and a batch waiting its turn is spending that
+    /// lease doing nothing; past a point the lease lapses while the batch is
+    /// still queued and deis-queue hands the same messages to somebody else.
+    /// `deis-runtime`'s consumer clamps the value and says what it applied.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
 }
 
 /// One static file carried in the bundle.

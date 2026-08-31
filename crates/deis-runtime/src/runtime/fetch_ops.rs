@@ -27,6 +27,19 @@
 //! the redirect section of [`super::fetch_policy`] for what the arrangement
 //! before that could not express.
 //!
+//! # The subrequest ceiling
+//!
+//! Because every hop comes through here, this is also where an invocation's
+//! outbound calls are counted, against [`SubrequestBudget`]. **A redirect
+//! chain costs one per hop, not one for the chain**: three hops are three
+//! connections this node opens, three name resolutions and three sets of
+//! response headers to read, and an accounting that charged a chain of ten as
+//! one would let an application spend the node's outbound capacity through a
+//! server it controls simply by answering with `Location:`. The refusal names
+//! the ceiling and the number reached, and says that hops count, because an
+//! author whose code contains four `fetch` calls and is told "you have made 50
+//! subrequests" needs to be able to work out where the other 46 came from.
+//!
 //! # The budget
 //!
 //! [`op_deis_fetch_budget_ms`] is the other half of what the wrapper needs: how
@@ -43,7 +56,7 @@ use deno_core::{extension, op2, OpState};
 use deno_error::JsErrorBox;
 
 use super::fetch_policy::{loggable, FetchPolicy};
-use super::ops::{AppId, ExecutionDeadline};
+use super::ops::{AppId, ExecutionDeadline, SubrequestBudget};
 
 /// How much of the invocation's budget an outbound call is allowed to keep for
 /// itself, so that what is left is enough for the handler to notice the
@@ -109,7 +122,7 @@ async fn op_deis_fetch_guard(
     state: Rc<RefCell<OpState>>,
     #[string] url: String,
 ) -> Result<(), JsErrorBox> {
-    let (policy, app_id, budget) = {
+    let (policy, app_id, budget, subrequests) = {
         let state = state.borrow();
         (
             state.try_borrow::<FetchPolicy>().cloned(),
@@ -118,6 +131,7 @@ async fn op_deis_fetch_guard(
                 .map(|app| app.0.clone())
                 .unwrap_or_default(),
             budget_ms(&state),
+            state.try_borrow::<Rc<SubrequestBudget>>().cloned(),
         )
     };
 
@@ -139,6 +153,40 @@ async fn op_deis_fetch_guard(
         ));
     };
 
+    // Charged before the destination is resolved, and before any await, so
+    // that a hundred calls started at once cannot all pass a check that is
+    // only committed later; see [`SubrequestBudget::charge`]. A call the
+    // policy then refuses, or one abandoned while the host was being looked
+    // up, gives its charge back below: nothing left the isolate.
+    //
+    // An isolate with no budget in its state was built by a path that
+    // installs none, which no path on a node does. It is not a hole worth
+    // refusing over -- the policy above is what keeps a destination legal --
+    // so the call proceeds uncounted rather than failing.
+    if let Some(budget_left) = subrequests.as_ref() {
+        if let Err(ceiling) = budget_left.charge() {
+            tracing::warn!(
+                target: "app",
+                app_id = %app_id,
+                destination = %loggable(&url),
+                ceiling,
+                "Refused an outbound fetch from {} to {}: this invocation has already made {} \
+                 outbound call(s), which is the ceiling for this application. Nothing was \
+                 dialled. Every destination counts, including each hop of a redirect chain. \
+                 Raise limits.max_subrequests in the manifest, or the node's \
+                 default_execution_limits.max_subrequests",
+                app_id,
+                loggable(&url),
+                ceiling
+            );
+            return Err(JsErrorBox::type_error(format!(
+                "fetch to {url} was refused: this invocation has already made {ceiling} \
+                 outbound call(s), which is the ceiling for this application. Each redirect hop \
+                 counts as one"
+            )));
+        }
+    }
+
     // The check resolves the host, and a resolver can hang as readily as a
     // connection can. Bounding it here matters because this runs *before* the
     // wrapper's `AbortSignal` has anything to abort: a name that never
@@ -152,6 +200,11 @@ async fn op_deis_fetch_guard(
         match tokio::time::timeout(allowance, policy.check(&url)).await {
             Ok(verdict) => verdict,
             Err(_) => {
+                // Nothing was dialled, so the call does not count against the
+                // invocation's fan-out allowance.
+                if let Some(budget_left) = subrequests.as_ref() {
+                    budget_left.refund();
+                }
                 tracing::warn!(
                     target: "app",
                     app_id = %app_id,
@@ -174,6 +227,11 @@ async fn op_deis_fetch_guard(
     match verdict {
         Ok(()) => Ok(()),
         Err(refusal) => {
+            // Refused before a socket was opened, so the charge taken above
+            // goes back: the ceiling counts what leaves the isolate.
+            if let Some(budget_left) = subrequests.as_ref() {
+                budget_left.refund();
+            }
             tracing::warn!(
                 target: "app",
                 app_id = %app_id,

@@ -25,8 +25,17 @@ pub(super) fn service_unavailable(service: &str) -> JsErrorBox {
 }
 
 /// A call that reached the client but did not come back.
+///
+/// `{error:#}` and not `{error}`: every caller hands over an `anyhow::Error`,
+/// whose plain `Display` prints only the outermost context. That is the
+/// sentence this crate added -- "sending 200 message(s) to queue \"jobs\"" --
+/// and the reason is always the one underneath it, which is the server's:
+/// "batch holds 200 messages, limit is 100". An application that is refused
+/// and told only what it was doing cannot act on it. The alternate form prints
+/// the whole chain; on anything that is not an `anyhow::Error` the flag is
+/// simply ignored.
 pub(super) fn service_call_failed(call: &str, error: impl std::fmt::Display) -> JsErrorBox {
-    JsErrorBox::generic(format!("{call} failed: {error}"))
+    JsErrorBox::generic(format!("{call} failed: {error:#}"))
 }
 
 /// KV Get operation.
@@ -406,6 +415,81 @@ fn op_deis_set_response_body(state: &mut OpState, #[buffer] body: JsBuffer) {
 /// by `AppRuntime` between executions and read by an op, and neither ever
 /// holds it across an await.
 pub type ExecutionDeadline = Rc<Cell<Option<Instant>>>;
+
+/// How many outbound calls the invocation currently running may still make.
+///
+/// The ceiling on *fan-out*, which no other budget in this runtime bounds. An
+/// invocation that answers one inbound request with two hundred outbound ones
+/// spends this node's sockets, its outbound bandwidth and its upstreams'
+/// patience -- all of them shared with every other tenant on the box -- while
+/// looking healthy on every other limit: the calls run concurrently, so the
+/// wall clock sees one slow request, the CPU clock sees almost nothing, and
+/// the op rate limit sees a couple of hundred dispatches spread over a second
+/// against a ceiling of a thousand. Cloudflare bounds subrequests per
+/// invocation for the same reason.
+///
+/// Reset by `AppRuntime::begin_invocation`, so the count belongs to one
+/// request together with its `waitUntil` tail, one queue batch, one cron tick
+/// or one inbound WebSocket message -- the same granularity the wall-clock and
+/// CPU budgets are armed at. It is deliberately *not* reset at the end of an
+/// invocation: a response stream's producer runs on after the request has been
+/// answered, and giving it a fresh allowance would let a handler have as many
+/// calls as it liked by making them from inside a stream.
+///
+/// `Cell` rather than an atomic: an isolate is one thread, every charge
+/// happens inside an op on that thread, and nothing holds the value across an
+/// await.
+#[derive(Debug)]
+pub struct SubrequestBudget {
+    ceiling: u32,
+    spent: Cell<u32>,
+}
+
+impl SubrequestBudget {
+    pub fn new(ceiling: u32) -> Self {
+        Self {
+            ceiling,
+            spent: Cell::new(0),
+        }
+    }
+
+    /// Take one call out of the invocation's allowance.
+    ///
+    /// `Ok(n)` is the call's own number -- 1 for the first of the invocation
+    /// -- and `Err(ceiling)` means the allowance is gone and the caller must
+    /// refuse rather than dial.
+    ///
+    /// Charged *before* the destination is judged and dialled, and with no
+    /// await in between, which is the only ordering that bounds anything: a
+    /// check made before an await and committed after it would let every one
+    /// of two hundred concurrent calls pass the check while the count was
+    /// still zero, which is exactly the fan-out this is here to stop. A call
+    /// that is then refused before anything leaves the isolate gives its
+    /// charge back through [`Self::refund`].
+    pub fn charge(&self) -> Result<u32, u32> {
+        let spent = self.spent.get();
+        if spent >= self.ceiling {
+            return Err(self.ceiling);
+        }
+        let mine = spent + 1;
+        self.spent.set(mine);
+        Ok(mine)
+    }
+
+    /// Give back a charge for a call that never left the isolate -- refused by
+    /// the outbound policy, or abandoned before a socket was opened.
+    ///
+    /// Saturating, so a refund that is somehow not matched by a charge cannot
+    /// wrap the counter round and hand an application an unbounded allowance.
+    pub fn refund(&self) {
+        self.spent.set(self.spent.get().saturating_sub(1));
+    }
+
+    /// Start the count again for a new invocation.
+    pub fn reset(&self) {
+        self.spent.set(0);
+    }
+}
 
 // Environment variables store
 pub type EnvStore = Rc<RefCell<HashMap<String, String>>>;

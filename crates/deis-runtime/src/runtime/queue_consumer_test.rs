@@ -160,6 +160,7 @@ mod tests {
             idle_backoff_min: std::time::Duration::from_millis(5),
             idle_backoff_max: std::time::Duration::from_millis(20),
             retry_delay_seconds: 7,
+            max_concurrency: 1,
         }
     }
 
@@ -438,7 +439,7 @@ mod tests {
     fn the_lease_outlasts_the_app_s_execution_timeout() {
         // A lease shorter than the handler means deis-queue hands the same
         // message to somebody else while it is still being processed.
-        let settings = ConsumerSettings::for_app(None, std::time::Duration::from_secs(30));
+        let settings = ConsumerSettings::for_app(None, None, std::time::Duration::from_secs(30));
         assert!(settings.lease_seconds > 30);
         assert_eq!(settings.batch_size, DEFAULT_BATCH_SIZE);
     }
@@ -446,11 +447,12 @@ mod tests {
     #[test]
     fn a_declared_batch_size_is_honoured_and_a_zero_is_not() {
         assert_eq!(
-            ConsumerSettings::for_app(Some(25), std::time::Duration::from_secs(30)).batch_size,
+            ConsumerSettings::for_app(Some(25), None, std::time::Duration::from_secs(30))
+                .batch_size,
             25
         );
         assert_eq!(
-            ConsumerSettings::for_app(Some(0), std::time::Duration::from_secs(30)).batch_size,
+            ConsumerSettings::for_app(Some(0), None, std::time::Duration::from_secs(30)).batch_size,
             DEFAULT_BATCH_SIZE,
             "asking for zero messages per pull would consume nothing at all"
         );
@@ -458,8 +460,209 @@ mod tests {
 
     #[test]
     fn an_enormous_timeout_still_asks_for_a_lease_the_queue_accepts() {
-        let settings = ConsumerSettings::for_app(None, std::time::Duration::from_secs(86_400));
+        let settings =
+            ConsumerSettings::for_app(None, None, std::time::Duration::from_secs(86_400));
         assert!(settings.lease_seconds <= 3600);
+    }
+
+    /// An invoker that holds every batch it is handed until the test lets go,
+    /// and publishes how many it is holding.
+    ///
+    /// This is the only way "outstanding" is observable from outside: a batch
+    /// that has been handed to the application and has not come back is
+    /// exactly a batch the poller is still holding a lease on.
+    fn holding_invoker(
+        handed: watch::Sender<usize>,
+        release: watch::Receiver<bool>,
+    ) -> BatchInvoker {
+        Arc::new(move |_queue, _messages| {
+            let handed = handed.clone();
+            let mut release = release.clone();
+            Box::pin(async move {
+                handed.send_modify(|count| *count += 1);
+                loop {
+                    if *release.borrow_and_update() {
+                        break;
+                    }
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(BatchOutcome::default())
+            })
+        })
+    }
+
+    /// `max_concurrency` above one lets the poller lease the next batch while
+    /// the previous one is still with the application.
+    ///
+    /// Two batches in the invoker's hands at the same moment is the whole
+    /// claim, and it is deliberately not a claim about parallel *execution*:
+    /// on a node the invoker posts the batch to the one runtime thread the
+    /// application lives on, so the second batch waits its turn there. What is
+    /// bought is that it is already leased and queued when the first finishes,
+    /// instead of costing a fresh round trip to deis-queue.
+    #[tokio::test]
+    async fn two_outstanding_batches_are_held_at_once_when_the_manifest_asks_for_two() {
+        let (queue, _journal) = FakeQueue::with_batches(vec![
+            vec![message("m1")],
+            vec![message("m2")],
+            vec![message("m3")],
+        ]);
+        let (handed_tx, mut handed) = watch::channel(0usize);
+        let (release_tx, release_rx) = watch::channel(false);
+
+        let handle = spawn_with_registry(
+            "demo".to_string(),
+            "jobs".to_string(),
+            queue.clone(),
+            ConsumerSettings {
+                max_concurrency: 2,
+                ..settings()
+            },
+            holding_invoker(handed_tx, release_rx),
+            Arc::new(MetricsRegistry::new()),
+        );
+
+        // Waits on the real event: the test proceeds the instant the second
+        // batch is handed over, and hangs on the condition rather than racing
+        // a timer if it never is.
+        while *handed.borrow_and_update() < 2 {
+            handed
+                .changed()
+                .await
+                .expect("the invoker outlives the wait");
+        }
+
+        // Never a third, because the third permit does not exist.
+        assert_eq!(*handed.borrow(), 2);
+
+        release_tx
+            .send(true)
+            .expect("the invoker is still listening");
+        handle.stop().await;
+    }
+
+    /// The default is one, and one means exactly the sequential loop this
+    /// consumer had before the setting existed.
+    ///
+    /// The claim is a negative -- nothing else is pulled while the first batch
+    /// is out -- so it needs a bound to be judged against; the timeout below
+    /// is that bound and not a coordination sleep. A consumer that ignored
+    /// `max_concurrency` would hand over the second batch immediately and fail
+    /// this long before the window ran out.
+    #[tokio::test]
+    async fn one_outstanding_batch_is_the_default_and_nothing_is_pulled_behind_it() {
+        let (queue, _journal) =
+            FakeQueue::with_batches(vec![vec![message("m1")], vec![message("m2")]]);
+        let (handed_tx, mut handed) = watch::channel(0usize);
+        let (release_tx, release_rx) = watch::channel(false);
+
+        let handle = spawn_with_registry(
+            "demo".to_string(),
+            "jobs".to_string(),
+            queue.clone(),
+            settings(),
+            holding_invoker(handed_tx, release_rx),
+            Arc::new(MetricsRegistry::new()),
+        );
+
+        while *handed.borrow_and_update() < 1 {
+            handed
+                .changed()
+                .await
+                .expect("the invoker outlives the wait");
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), handed.changed())
+                .await
+                .is_err(),
+            "a second batch was handed over while the first was still outstanding"
+        );
+
+        // Released, so the stop below does not have to abandon a batch.
+        release_tx
+            .send(true)
+            .expect("the invoker is still listening");
+        handle.stop().await;
+    }
+
+    /// Every batch still in flight is settled before the poller reports that
+    /// it stopped.
+    ///
+    /// Abandoning them would leave the messages leased until deis-queue
+    /// expired the leases and handed them out again -- the same work done
+    /// twice for an application that was only being unloaded.
+    #[tokio::test]
+    async fn stopping_waits_for_every_outstanding_batch_to_be_settled() {
+        // Exactly as many batches as the poller may hold, so what is
+        // acknowledged after the stop can only be the two it was holding.
+        let (queue, journal) =
+            FakeQueue::with_batches(vec![vec![message("m1")], vec![message("m2")]]);
+        let (handed_tx, mut handed) = watch::channel(0usize);
+        let (release_tx, release_rx) = watch::channel(false);
+
+        let handle = spawn_with_registry(
+            "demo".to_string(),
+            "jobs".to_string(),
+            queue.clone(),
+            ConsumerSettings {
+                max_concurrency: 2,
+                ..settings()
+            },
+            holding_invoker(handed_tx, release_rx),
+            Arc::new(MetricsRegistry::new()),
+        );
+
+        while *handed.borrow_and_update() < 2 {
+            handed
+                .changed()
+                .await
+                .expect("the invoker outlives the wait");
+        }
+
+        // Let both finish and stop in the same breath: `stop` has to wait for
+        // the two batches it is holding, not only for the loop to notice.
+        release_tx
+            .send(true)
+            .expect("the invoker is still listening");
+        handle.stop().await;
+
+        // Sorted: two batches settling at once have no order between them,
+        // and the claim is that both were settled, not which went first.
+        let mut acked = journal.lock().unwrap().acked.clone();
+        acked.sort();
+        assert_eq!(
+            acked,
+            vec!["m1".to_string(), "m2".to_string()],
+            "both outstanding batches must be acknowledged before the poller reports it stopped"
+        );
+    }
+
+    /// A manifest asking for more outstanding batches than this node allows is
+    /// held to the node's number, the way every other limit is.
+    #[test]
+    fn a_manifest_cannot_ask_for_more_outstanding_batches_than_the_node_allows() {
+        // `for_app` takes the declaration as written; the clamp happens where
+        // the application can be named in the log, which is `spawn`.
+        let asked = ConsumerSettings::for_app(
+            None,
+            Some(MAX_OUTSTANDING_BATCHES + 40),
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(asked.max_concurrency, MAX_OUTSTANDING_BATCHES + 40);
+
+        // Absent and zero both mean "the runtime decides", which is one.
+        assert_eq!(
+            ConsumerSettings::for_app(None, None, std::time::Duration::from_secs(30))
+                .max_concurrency,
+            DEFAULT_MAX_CONCURRENCY
+        );
+        assert_eq!(
+            ConsumerSettings::for_app(None, Some(0), std::time::Duration::from_secs(30))
+                .max_concurrency,
+            DEFAULT_MAX_CONCURRENCY
+        );
     }
 
     /// Wait until the consumer has pulled at least `n` times.

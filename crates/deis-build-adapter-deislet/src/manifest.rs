@@ -81,6 +81,7 @@ pub fn build_manifest(
             .map(|queue| QueueConsumer {
                 name: queue.name.clone(),
                 batch_size: queue.batch_size,
+                max_concurrency: queue.max_concurrency,
             })
             .collect(),
         assets: assets
@@ -129,6 +130,7 @@ fn limits(config: &ProjectConfig) -> Result<Option<DeclaredLimits>> {
         rate_limit_ops_per_sec: declared.rate_limit_ops_per_sec,
         cpu_time_limit_ms: declared.cpu_time_limit_ms,
         resource_table_max: declared.resource_table_max,
+        max_subrequests: declared.max_subrequests,
     };
     if limits.is_empty() {
         return Ok(None);
@@ -334,6 +336,46 @@ mod tests {
         assert_eq!(manifest.cron, vec!["0 */6 * * *"]);
         assert_eq!(manifest.queues[0].name, "jobs");
         assert_eq!(manifest.queues[0].batch_size, Some(10));
+    }
+
+    /// Both halves of a queue declaration reach the manifest.
+    ///
+    /// A value that stopped at the project file would leave an author reading
+    /// their own `maxConcurrency` and believing in a setting the node never
+    /// saw -- the shape of failure the `limits` block already had once.
+    #[test]
+    fn a_queue_consumers_concurrency_reaches_the_manifest() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({
+                "queues": [{ "name": "jobs", "batchSize": 10, "maxConcurrency": 2 }]
+            })),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(manifest.queues[0].max_concurrency, Some(2));
+    }
+
+    /// The subrequest ceiling reaches the manifest, and a zero is refused at
+    /// the build rather than at the upload.
+    #[test]
+    fn a_subrequest_ceiling_reaches_the_manifest_and_a_zero_fails_the_build() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({ "limits": { "maxSubrequests": 6 } })),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(manifest.limits.as_ref().unwrap().max_subrequests, Some(6));
+
+        let err = build_manifest(
+            &config(serde_json::json!({ "limits": { "maxSubrequests": 0 } })),
+            &[],
+            &[],
+        )
+        .expect_err("a ceiling of zero has no reading");
+        assert!(err.to_string().contains("max_subrequests"), "{err}");
     }
 
     #[test]

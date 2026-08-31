@@ -769,11 +769,13 @@ impl DeploymentManager {
         let config = AppConfig {
             env,
             routes: manifest.route_patterns(),
-            // Straight from the order, unjudged. `install_version` builds the
-            // isolate through `effective_limits`, which clamps each field
-            // against this node's own ceilings and says so in the log when an
-            // application asked for more than it may have.
-            limits,
+            // What the order carried, with anything it left out taken from
+            // the version's own manifest; unjudged either way.
+            // `install_version` builds the isolate through
+            // `effective_limits`, which clamps each field against this node's
+            // own ceilings and says so in the log when an application asked
+            // for more than it may have.
+            limits: limits_with_manifest(limits, &manifest, &key),
             // Resolved once, here, and asked as a bit test on every request
             // from here on; see `deis_bundle::compatibility`.
             compatibility,
@@ -918,6 +920,86 @@ impl DeploymentManager {
 
         Ok((bytes, false))
     }
+}
+
+/// The ceilings a version is held to: what the deployment carried, with every
+/// field it left out taken from the version's own manifest.
+///
+/// Two sources for one thing, which is worth explaining. The `limits` block is
+/// written by the application's author, inside the bundle. The control plane
+/// reads it there, checks it and relays it with the deployment so that a node
+/// has the numbers before it has unpacked anything - but by the time this runs
+/// the bundle *is* unpacked and its manifest is in hand, and the two can only
+/// ever say the same thing: the bundle's sha is checked, so this is the same
+/// file the control plane read.
+///
+/// So the manifest fills gaps and never overrides. A control plane older than
+/// this build - or one whose wire message has no field for a limit this build
+/// understands - carries nothing for it, and without this an application's
+/// declaration would silently not be in force: the node would apply its own
+/// default, the manifest would go on saying otherwise, and the first anybody
+/// would know is the day the ceiling was needed. `max_subrequests` is exactly
+/// that case today, because `deis.management.ResourceLimits` has no field for
+/// it.
+///
+/// Nothing is judged here. Whether a value is one this node will grant is
+/// `crate::app::ApplicationManager::effective_limits`'s decision, made once,
+/// where the node's own configuration is in scope.
+fn limits_with_manifest(
+    carried: Option<ResourceLimits>,
+    manifest: &deis_bundle::Manifest,
+    key: &AppKey,
+) -> Option<ResourceLimits> {
+    let Some(declared) = manifest.limits.as_ref() else {
+        return carried;
+    };
+
+    let mut limits = carried.unwrap_or_default();
+    let mut filled: Vec<&str> = Vec::new();
+
+    // `memory_mb` uses 0 for "unset" because the wire message does; the rest
+    // are already `Option`.
+    if let Some(mb) = declared.memory_mb.filter(|_| limits.memory_mb == 0) {
+        limits.memory_mb = mb as usize;
+        filled.push("memory_mb");
+    }
+    if limits.timeout_ms.is_none() && declared.timeout_ms.is_some() {
+        limits.timeout_ms = declared.timeout_ms;
+        filled.push("timeout_ms");
+    }
+    if limits.cpu_time_limit_ms.is_none() && declared.cpu_time_limit_ms.is_some() {
+        limits.cpu_time_limit_ms = declared.cpu_time_limit_ms;
+        filled.push("cpu_time_limit_ms");
+    }
+    if limits.rate_limit_ops_per_sec.is_none() && declared.rate_limit_ops_per_sec.is_some() {
+        limits.rate_limit_ops_per_sec = declared.rate_limit_ops_per_sec;
+        filled.push("rate_limit_ops_per_sec");
+    }
+    if let Some(max) = declared
+        .resource_table_max
+        .filter(|_| limits.resource_table_max.is_none())
+    {
+        limits.resource_table_max = Some(max as usize);
+        filled.push("resource_table_max");
+    }
+    if limits.max_subrequests.is_none() && declared.max_subrequests.is_some() {
+        limits.max_subrequests = declared.max_subrequests;
+        filled.push("max_subrequests");
+    }
+
+    if !filled.is_empty() {
+        debug!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            fields = ?filled,
+            "This deployment carried no value for {} limit(s) the version's manifest declares; \
+             they are read out of the bundle instead, so what the author wrote is what the node \
+             clamps against its own ceilings",
+            filled.len()
+        );
+    }
+
+    Some(limits)
 }
 
 /// A bundle taken apart into the three things a version needs.
