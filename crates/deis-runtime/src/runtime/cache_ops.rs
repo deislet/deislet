@@ -116,7 +116,7 @@ impl Expiry<String, CacheEntry> for ResponseFreshness {
 /// # Returns
 /// - `Some({ meta, body })`: hit, and still fresh.
 /// - `None`: never written, evicted, or past its lifetime.
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_cache_get(
     state: Rc<RefCell<OpState>>,
@@ -139,7 +139,7 @@ async fn op_cache_get(
 /// so that a body which is not text survives. `ttl_seconds` is the freshness
 /// the response asked for; zero means it asked for none and the store's
 /// default applies.
-#[op2(async)]
+#[op2]
 async fn op_cache_set(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
@@ -170,7 +170,7 @@ async fn op_cache_set(
 /// Returns whether there was one to drop, which is what the Cache API's
 /// `delete()` resolves to; answering `true` unconditionally would tell an
 /// application it had invalidated something it never had.
-#[op2(async)]
+#[op2]
 async fn op_cache_delete(state: Rc<RefCell<OpState>>, #[string] key: String) -> bool {
     let cache = {
         let state_borrow = state.borrow();
@@ -180,7 +180,7 @@ async fn op_cache_delete(state: Rc<RefCell<OpState>>, #[string] key: String) -> 
 }
 
 /// Whether a key is present and still fresh.
-#[op2(async)]
+#[op2]
 async fn op_cache_has(state: Rc<RefCell<OpState>>, #[string] key: String) -> bool {
     let cache = {
         let state_borrow = state.borrow();
@@ -190,7 +190,7 @@ async fn op_cache_has(state: Rc<RefCell<OpState>>, #[string] key: String) -> boo
 }
 
 /// Drop every cached response of this isolate.
-#[op2(async)]
+#[op2]
 async fn op_cache_clear(state: Rc<RefCell<OpState>>) {
     let cache = {
         let state_borrow = state.borrow();
@@ -207,7 +207,7 @@ async fn op_cache_clear(state: Rc<RefCell<OpState>>) {
 /// JSON object containing:
 /// - entry_count: Current number of entries
 /// - weighted_size: Weighted size
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_cache_stats(state: Rc<RefCell<OpState>>) -> serde_json::Value {
     let cache = {

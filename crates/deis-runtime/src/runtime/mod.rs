@@ -12,6 +12,7 @@ pub mod isolate;
 mod kv_client;
 pub mod loader;
 pub mod metrics;
+mod op_metrics;
 mod ops;
 mod pool;
 mod queue_client;
@@ -41,10 +42,10 @@ pub use db_ops::init_db_extension;
 pub use deno_telemetry_stub::init_deno_telemetry_extension;
 pub use fetch_ops::init_fetch_guard_extension;
 pub use fetch_policy::FetchPolicy;
-// pub use http_ops::init_http_extension;
 pub use isolate::IsolateSpec;
 pub use kv_client::{KvClient, KvRead};
 pub use metrics::{MetricShipper, MetricShipperConfig, MetricsRegistry};
+pub use op_metrics::{OpMetricsSummary, OpMetricsSummaryTracker};
 pub use pool::{RuntimePool, StagedVersion};
 pub use queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};
 pub use queue_consumer::{BatchOutcome, ConsumerSettings};
@@ -53,7 +54,6 @@ pub use runtime_init::{build_runtime_extensions, init_lazy_extensions};
 pub use snapshot::load_or_create_startup_snapshot;
 pub use tenant::Tenant;
 pub use tls_ops::init_tls_ops_extension;
-// pub use ws_ops::{create_ws_manager, init_ws_extension, WebSocketManager};
 pub use ws_server_ops::{
     create_ws_server_manager, init_ws_server_extension, WsServerManager, WsServerMessage,
 };

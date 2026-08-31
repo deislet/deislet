@@ -69,6 +69,12 @@ pub fn init_lazy_extensions(
         deno_web::deno_web::args(
             blob_store,
             Some(deno_core::url::Url::parse("file:///").unwrap()),
+            // The CSS parser behind the geometry types (DOMMatrix and the
+            // `transform` strings it can be built from) stays off. Nothing on
+            // an edge handler's path parses a stylesheet, and it is a parser
+            // reached from application input, so leaving it out is one less
+            // surface for no capability an application here would miss.
+            false,
             broadcast_channel,
         ),
         deno_fetch::deno_fetch::args(deno_fetch::Options {

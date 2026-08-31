@@ -47,7 +47,7 @@ fn queue_unavailable(queue_name: &str) -> JsErrorBox {
 /// find again. The JS binding does not hand it to the application -- `send()`
 /// resolves to nothing, the way Cloudflare's does -- so what an app learns
 /// from this op is only whether the queue took the message.
-#[op2(async)]
+#[op2]
 #[string]
 async fn op_queue_send(
     state: Rc<RefCell<OpState>>,

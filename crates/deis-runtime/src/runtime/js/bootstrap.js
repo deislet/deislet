@@ -42,45 +42,68 @@ import {
   op_deis_fetch_guard,
 } from "ext:core/ops";
 
-import "ext:deno_webidl/00_webidl.js";
-import "ext:deno_web/00_infra.js";
-import * as url from "ext:deno_web/00_url.js";
-import * as domException from "ext:deno_web/01_dom_exception.js";
-import "ext:deno_web/01_mimesniff.js";
-import "ext:deno_web/01_broadcast_channel.js";
-import "ext:deno_web/01_console.js";
-import * as urlPattern from "ext:deno_web/01_urlpattern.js";
-import * as event from "ext:deno_web/02_event.js";
-import "ext:deno_web/02_structured_clone.js";
-import * as timers from "ext:deno_web/02_timers.js";
-import * as abortSignal from "ext:deno_web/03_abort_signal.js";
-import "ext:deno_web/04_global_interfaces.js";
-import "ext:deno_web/05_base64.js";
-import * as streams from "ext:deno_web/06_streams.js";
-import "ext:deno_web/08_text_encoding.js";
-import * as file from "ext:deno_web/09_file.js";
-import "ext:deno_web/10_filereader.js";
-import "ext:deno_web/12_location.js";
-import * as messagePort from "ext:deno_web/13_message_port.js";
-import "ext:deno_web/14_compression.js";
-import "ext:deno_web/15_performance.js";
-import "ext:deno_web/16_image_data.js";
-import * as headers from "ext:deno_fetch/20_headers.js";
-import * as formData from "ext:deno_fetch/21_formdata.js";
-import "ext:deno_fetch/22_body.js";
-import "ext:deno_fetch/22_http_client.js";
-import * as request from "ext:deno_fetch/23_request.js";
-import * as response from "ext:deno_fetch/23_response.js";
-import * as fetchModule from "ext:deno_fetch/26_fetch.js";
-import "ext:deno_fetch/27_eventsource.js";
-import "ext:deno_websocket/01_websocket.js";
-import "ext:deno_websocket/02_websocketstream.js";
+// deno_web, deno_fetch, deno_crypto and deno_net stopped being ES modules.
+//
+// They used to be `esm` files this module imported by name; they are now
+// `lazy_loaded_js` scripts, each an IIFE that returns its exports, fetched with
+// `core.loadExtScript`. The mechanical difference is small - `import * as x
+// from "ext:y"` becomes `const x = core.loadExtScript("ext:y")` - but the
+// timing difference is not: nothing is evaluated until it is asked for.
+//
+// Everything this platform binds as a global is asked for right here, at
+// bootstrap, on purpose. These scripts read `globalThis.__bootstrap` for their
+// own plumbing, and this runtime deletes that object before any application
+// code runs (see `js/runtime.js`); a script first reached during a request
+// would find it gone. Loading them all now also keeps the cost where it
+// belongs, in building the isolate rather than in an arbitrary request.
+//
+// deno_webidl is loaded by the scripts that need it rather than from here, and
+// deno_websocket's two scripts are not loaded at all: the socket an
+// application gets is `ws_client.js` below, which goes through the outbound
+// fetch policy, and deno_websocket's own class would be a second way out of
+// the isolate that never reaches it.
+core.loadExtScript("ext:deno_web/00_infra.js");
+const url = core.loadExtScript("ext:deno_web/00_url.js");
+const domException = core.loadExtScript("ext:deno_web/01_dom_exception.js");
+core.loadExtScript("ext:deno_web/01_mimesniff.js");
+core.loadExtScript("ext:deno_web/01_console.js");
+const urlPattern = core.loadExtScript("ext:deno_web/01_urlpattern.js");
+const event = core.loadExtScript("ext:deno_web/02_event.js");
+core.loadExtScript("ext:deno_web/02_structured_clone.js");
+const timers = core.loadExtScript("ext:deno_web/02_timers.js");
+const abortSignal = core.loadExtScript("ext:deno_web/03_abort_signal.js");
+core.loadExtScript("ext:deno_web/04_global_interfaces.js");
+core.loadExtScript("ext:deno_web/05_base64.js");
+const streams = core.loadExtScript("ext:deno_web/06_streams.js");
+core.loadExtScript("ext:deno_web/08_text_encoding.js");
+const file = core.loadExtScript("ext:deno_web/09_file.js");
+core.loadExtScript("ext:deno_web/10_filereader.js");
+core.loadExtScript("ext:deno_web/12_location.js");
+const messagePort = core.loadExtScript("ext:deno_web/13_message_port.js");
+core.loadExtScript("ext:deno_web/14_compression.js");
+core.loadExtScript("ext:deno_web/15_performance.js");
+core.loadExtScript("ext:deno_web/16_image_data.js");
+const headers = core.loadExtScript("ext:deno_fetch/20_headers.js");
+const formData = core.loadExtScript("ext:deno_fetch/21_formdata.js");
+core.loadExtScript("ext:deno_fetch/22_body.js");
+core.loadExtScript("ext:deno_fetch/22_http_client.js");
+const request = core.loadExtScript("ext:deno_fetch/23_request.js");
+const response = core.loadExtScript("ext:deno_fetch/23_response.js");
+const fetchModule = core.loadExtScript("ext:deno_fetch/26_fetch.js");
+core.loadExtScript("ext:deno_fetch/27_eventsource.js");
+const crypto = core.loadExtScript("ext:deno_crypto/00_crypto.js");
+core.loadExtScript("ext:deno_net/01_net.js");
+core.loadExtScript("ext:deno_net/02_tls.js");
+
+// This repository's stand-in for deno_telemetry, which deno_fetch loads on
+// first use. Loaded here rather than left to that first use for the
+// `__bootstrap` reason above.
+core.loadExtScript("ext:deno_telemetry/telemetry.ts");
+core.loadExtScript("ext:deno_telemetry/util.ts");
+
+// Still an ES module: this extension is this repository's own and declares its
+// file with `esm`.
 import * as wsClient from "ext:deis_runtime_ws_client_ops/src/runtime/js/ws_client.js";
-import * as crypto from "ext:deno_crypto/00_crypto.js";
-import "ext:deno_net/01_net.js";
-import "ext:deno_net/02_tls.js";
-import "ext:deno_telemetry/telemetry.ts";
-import "ext:deno_telemetry/util.ts";
 
 const {
   ArrayPrototypeIncludes,

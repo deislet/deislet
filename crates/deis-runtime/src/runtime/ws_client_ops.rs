@@ -861,7 +861,7 @@ async fn pump(
 /// with the same margin left for the handler to notice a failure and answer
 /// it. It can only shorten what this op allows: the deadline in the isolate's
 /// own state is read here as well and is the ceiling.
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_deis_ws_connect(
     state: Rc<RefCell<OpState>>,
@@ -1290,7 +1290,7 @@ fn op_deis_ws_close(
 /// So the invocation is checked again on the way out. A frame the peer sent to
 /// the request that opened the socket is dropped there rather than dispatched
 /// as a `message` event inside the next request, on the next request's budget.
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_deis_ws_next_event(
     state: Rc<RefCell<OpState>>,

@@ -19,9 +19,9 @@ use crate::app::types::AppPermissions;
 use crate::config::ExecutionLimits;
 use anyhow::Result;
 use deno_ast::{MediaType, ParseParams};
-use deno_core::{
-    JsRuntime, OpMetricsSummary, OpMetricsSummaryTracker, PollEventLoopOptions, RuntimeOptions,
-};
+use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
+
+use super::{OpMetricsSummary, OpMetricsSummaryTracker};
 use deno_runtime::deno_permissions;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
@@ -1003,7 +1003,6 @@ pub struct AppRuntime {
     entry_specifier: deno_core::ModuleSpecifier,
     resource_table_max: Option<usize>,
     op_metrics: Rc<OpMetricsSummaryTracker>,
-    snapshot_loaded: bool,
     /// Route patterns (e.g. "/users/:id") from the app's manifest, used to
     /// populate `context.params` on each request. See `super::route_match`.
     route_patterns: Vec<String>,
@@ -1062,6 +1061,13 @@ impl AppRuntime {
     /// [`ServiceWiring::default()`] for an isolate that should reach no
     /// storage at all -- every `ctx.services` call then answers "service not
     /// available", which is what an app that declared nothing should get.
+    /// Must be called from inside a tokio runtime context. V8 posts delayed
+    /// tasks while the isolate is being built, and deno_core hands those to
+    /// the ambient tokio runtime; without one it aborts the process rather
+    /// than silently running them late. Every caller on a node already
+    /// satisfies this - a runtime thread builds its isolate inside
+    /// `Runtime::block_on` (`super::pool`) - so this is a note for a test or a
+    /// tool that reaches for `AppRuntime` directly.
     pub fn new(
         app_id: String,
         code: String,
@@ -1140,10 +1146,8 @@ impl AppRuntime {
         let app_id_clone = app_id.clone();
 
         let op_metrics_factory = Box::new(move |id, count, decl: &deno_core::OpDecl| {
-            let tracker_factory = op_metrics_tracker
-                .clone()
-                .op_metrics_factory_fn(|d| d.name.starts_with("op_"));
-            let tracker_fn = tracker_factory(id, count, decl);
+            let tracker_fn =
+                op_metrics_tracker.watch(id, count, decl, |d| d.name.starts_with("op_"));
 
             let limiter = limiter.clone();
             let handle_cell = isolate_handle_cell_clone.clone();
@@ -1198,7 +1202,6 @@ impl AppRuntime {
         }
 
         let startup_snapshot = load_or_create_startup_snapshot()?;
-        let snapshot_loaded = startup_snapshot.is_some();
         let mut runtime = JsRuntime::new(RuntimeOptions {
             create_params: Some(create_params),
             module_loader: Some(module_loader),
@@ -1269,12 +1272,24 @@ impl AppRuntime {
             // any path that reached `op_fetch` without passing the guard would
             // still be refused a private or loopback address here. See
             // `super::fetch_policy` on redirects.
+            // `None` when the list is empty, for the same reason `allow_net`
+            // reads back to front: deno takes `Some(vec![])` as the global
+            // form of the permission, so an empty *deny* list means "deny
+            // every destination", not "deny nothing". An allowlist that names
+            // a host leaves this list empty (see `denied_net_ranges`), and
+            // sending it as `Some(vec![])` refused every outbound call on
+            // exactly the nodes whose operator had opened one.
             let deny_net = fetch_policy.denied_net_ranges(&app_id);
+            let deny_net = if deny_net.is_empty() {
+                None
+            } else {
+                Some(deny_net)
+            };
 
             let permission_opts = deno_permissions::PermissionsOptions {
                 allow_env,
                 allow_net,
-                deny_net: Some(deny_net),
+                deny_net,
                 ..Default::default()
             };
 
@@ -1412,7 +1427,6 @@ impl AppRuntime {
             entry_specifier: specifier,
             resource_table_max,
             op_metrics,
-            snapshot_loaded,
             route_patterns,
             timeout_ms,
             wait_until_timeout_ms,
@@ -1760,20 +1774,13 @@ impl AppRuntime {
     /// Everything the load does, with no bookkeeping of its own: the caller
     /// arms the budget around this and gives it back on both paths.
     async fn evaluate_module(&mut self) -> Result<deno_core::ModuleId> {
-        // Skip bootstrap load if snapshot is already loaded
-        if !self.snapshot_loaded {
-            let bootstrap_specifier =
-                deno_core::ModuleSpecifier::parse("ext:bootstrap/src/runtime/js/bootstrap.js")?;
-            let bootstrap_id = self
-                .runtime
-                .load_side_es_module(&bootstrap_specifier)
-                .await?;
-            let bootstrap_eval = self.runtime.mod_evaluate(bootstrap_id);
-            self.runtime
-                .with_event_loop_promise(bootstrap_eval, PollEventLoopOptions::default())
-                .await?;
-        }
-
+        // `js/bootstrap.js` is not loaded here any more. It is the `bootstrap`
+        // extension's `esm_entry_point`, and deno_core evaluates every entry
+        // point itself while the runtime is being built - before this method
+        // is ever reached, and before an application's module exists. Loading
+        // it again from here would also be refused now: an `ext:` module may
+        // only be imported while the runtime is loading its own, or from
+        // another `ext:` module, and this referrer is neither.
         self.runtime
             .execute_script("<runtime>", include_str!("js/runtime.js"))?;
 

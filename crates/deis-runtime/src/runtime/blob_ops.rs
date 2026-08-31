@@ -25,7 +25,7 @@ fn client(state: &Rc<RefCell<OpState>>) -> Result<BlobClient, JsErrorBox> {
 /// `Vec<u8>` into a JavaScript array of numbers, so `blob.get` used to hand
 /// the application something that looked like data but had no `.byteLength`,
 /// could not be sliced and cost one JS object per byte.
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_blob_get(
     state: Rc<RefCell<OpState>>,
@@ -43,7 +43,7 @@ async fn op_blob_get(
 /// `#[serde] Vec<u8>` here refused every typed array with "invalid type", so
 /// the only way through was an array of plain numbers - which is not what any
 /// caller building bytes would pass.
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_blob_put(
     state: Rc<RefCell<OpState>>,
@@ -56,7 +56,7 @@ async fn op_blob_put(
         .map_err(|e| service_call_failed("blob.put", e))
 }
 
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_blob_delete(
     state: Rc<RefCell<OpState>>,

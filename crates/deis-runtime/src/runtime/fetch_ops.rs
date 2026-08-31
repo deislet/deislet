@@ -104,7 +104,7 @@ fn op_deis_fetch_budget_ms(state: &mut OpState) -> f64 {
 /// will actually be given -- the inner request's own, not the argument the
 /// application passed, so that what is judged and what is dialled cannot come
 /// apart.
-#[op2(async)]
+#[op2]
 async fn op_deis_fetch_guard(
     state: Rc<RefCell<OpState>>,
     #[string] url: String,

@@ -37,7 +37,7 @@ pub(super) fn service_call_failed(call: &str, error: impl std::fmt::Display) -> 
 /// that here would mean every value that is not UTF-8 -- an image, a
 /// compressed frame -- could not be read back at all. `js/runtime.js` turns
 /// the bytes into whatever `kv.get(key, { type })` asked for.
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_kv_get(
     state: Rc<RefCell<OpState>>,
@@ -101,7 +101,7 @@ pub struct KvReadResult {
 /// Takes a `Uint8Array` (or any `ArrayBufferView`) straight from V8, for the
 /// same reason [`op_kv_get`] answers with one: what an application stores is
 /// bytes, and `js/runtime.js` is where a string is encoded into them.
-#[op2(async)]
+#[op2]
 async fn op_kv_set(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
@@ -139,7 +139,7 @@ async fn op_kv_set(
 /// fields either way, so this costs no extra round trip. It exists separately
 /// because a value-only read is the common one and should not have to unpack a
 /// record.
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_kv_get_with_metadata(
     state: Rc<RefCell<OpState>>,
@@ -168,7 +168,7 @@ async fn op_kv_get_with_metadata(
 }
 
 /// KV Delete operation
-#[op2(async)]
+#[op2]
 async fn op_kv_delete(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
@@ -247,7 +247,7 @@ pub struct KvListPageResult {
 /// fit in one gRPC message, and an op that promised "all of them" would work
 /// in development and fail against the store on exactly the applications big
 /// enough to need it.
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_kv_list(
     state: Rc<RefCell<OpState>>,

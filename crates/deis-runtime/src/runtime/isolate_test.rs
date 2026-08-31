@@ -26,8 +26,8 @@ mod tests {
         Some(body.as_bytes().to_vec())
     }
 
-    #[test]
-    fn test_transform_esm_typescript() {
+    #[tokio::test]
+    async fn test_transform_esm_typescript() {
         let ts_code = r#"export default function handler(_request: Request): Response {
     return new Response("Hello from Runtime!", {
       status: 200,
@@ -51,8 +51,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_transform_counter_app() {
+    #[tokio::test]
+    async fn test_transform_counter_app() {
         let ts_code = r#"export default function handler(context: any): Response {
     const url = new URL(context.request.url);
     return new Response("ok");
@@ -72,8 +72,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_transform_with_interface() {
+    #[tokio::test]
+    async fn test_transform_with_interface() {
         let ts_code = r#"interface Todo {
   id: string;
   title: string;
@@ -98,8 +98,8 @@ export default function handler(context: any): Response {
         );
     }
 
-    #[test]
-    fn test_transform_echo_app() {
+    #[tokio::test]
+    async fn test_transform_echo_app() {
         let ts_code = r#"export default function handler(context: any): Response {
     const request = context.request;
     const url = new URL(request.url);
@@ -125,8 +125,8 @@ export default function handler(context: any): Response {
         );
     }
 
-    #[test]
-    fn test_create_runtime_with_valid_code() {
+    #[tokio::test]
+    async fn test_create_runtime_with_valid_code() {
         let code = r#"
             export default function handler() {
                     return new Response("Hello");
@@ -143,8 +143,8 @@ export default function handler(context: any): Response {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_create_runtime_with_invalid_code() {
+    #[tokio::test]
+    async fn test_create_runtime_with_invalid_code() {
         let invalid_code = "this is not valid javascript {{{";
         let result = AppRuntime::new(
             "test_app".to_string(),
@@ -1707,8 +1707,8 @@ export default function handler(context: any): Response {
         assert_eq!(body, Some("{}".to_string()));
     }
 
-    #[test]
-    fn test_new_stores_configured_timeout_and_rate_limit_overrides() {
+    #[tokio::test]
+    async fn test_new_stores_configured_timeout_and_rate_limit_overrides() {
         let code = r#"
             export default function handler() {
                 return new Response("ok");
@@ -1745,8 +1745,8 @@ export default function handler(context: any): Response {
         assert_eq!(runtime.cpu_time_limit_ms(), 1_250);
     }
 
-    #[test]
-    fn test_new_stores_platform_default_limits_when_not_overridden() {
+    #[tokio::test]
+    async fn test_new_stores_platform_default_limits_when_not_overridden() {
         let code = r#"
             export default function handler() {
                 return new Response("ok");
@@ -2907,7 +2907,7 @@ export default function handler(context: any): Response {
                 const response = await fetch(url);
                 return new Response("reached:" + response.status + ":" + (await response.text()));
             } catch (e) {
-                return new Response("refused:" + e.constructor.name + ":" + e.message);
+                return new Response("refused:" + e.constructor.name + ":" + e.message + " CAUSE=" + (e.cause && (e.cause.message || String(e.cause))));
             }
         }
     "#;

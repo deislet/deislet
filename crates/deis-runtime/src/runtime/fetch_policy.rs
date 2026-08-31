@@ -528,9 +528,28 @@ impl FetchPolicy {
     /// port-exact; it only means this backstop is coarser than the policy in
     /// front of it, which is what a backstop is allowed to be.
     ///
-    /// An allowlist entry that is a *name* needs no hole: deno compares the
-    /// URL's host against these entries, and a hostname never matches an
-    /// address range.
+    /// An allowlist entry that is a *name* cannot be punched out, and the
+    /// ranges are dropped whole when one is present.
+    ///
+    /// deno used to compare only the URL's host against this list, and a
+    /// hostname never matches an address range, so a named entry needed no
+    /// hole. It now re-checks the address the name *resolved to* as well
+    /// (`check_net_resolved`, the connector's own rebinding guard). That check
+    /// knows nothing about the allowlist, so on a node whose operator opened
+    /// `internal-api.svc` -- which is on a private range, that being the point
+    /// of opening it -- the backstop would veto the destination the operator
+    /// deliberately allowed, and the application would see a network error
+    /// naming a `--allow-net` flag this platform does not have.
+    ///
+    /// A named entry can resolve to any address, so there is no subset of the
+    /// ranges that both keeps the backstop and honours the allowlist. The
+    /// ranges therefore go, and what is left is the platform's own endpoints,
+    /// which no allowlist may reach at all. Nothing is lost that is not
+    /// checked elsewhere: [`PolicyResolver`] is inside the HTTP client and
+    /// applies this policy -- allowlist included -- to every address a name
+    /// resolves to, and `op_deis_fetch_guard` applies it to every URL and
+    /// every redirect hop before that. A node with no allowlist, which is the
+    /// default, keeps the ranges in full.
     pub fn denied_net_ranges(&self, app_id: &str) -> Vec<String> {
         let opened: Vec<IpAddr> = self
             .rules
@@ -538,11 +557,25 @@ impl FetchPolicy {
             .iter()
             .filter_map(|entry| entry.addr)
             .collect();
+        let named = self.rules.allow.iter().any(|entry| entry.addr.is_none());
 
         let mut denied = Vec::new();
-        for range in ranges_deno_can_deny() {
-            for piece in range.without(&opened) {
-                denied.push(piece.to_deno_descriptor());
+        if named {
+            tracing::info!(
+                target: "app",
+                app_id = %app_id,
+                "The outbound allowlist names a host rather than an address, so the address-range \
+                 backstop is not installed for {}: deno re-checks the address a name resolved to \
+                 against this list and would refuse the destination the operator opened. The \
+                 policy itself still decides every call and every redirect hop, and the \
+                 platform's own endpoints stay denied here",
+                app_id
+            );
+        } else {
+            for range in ranges_deno_can_deny() {
+                for piece in range.without(&opened) {
+                    denied.push(piece.to_deno_descriptor());
+                }
             }
         }
 
@@ -834,7 +867,7 @@ impl PolicyResolver {
 
     /// Wrap this in the shape `deno_fetch::Options` wants.
     pub fn into_resolver(self) -> deno_runtime::deno_fetch::dns::Resolver {
-        deno_runtime::deno_fetch::dns::Resolver::Custom(Arc::new(self))
+        deno_runtime::deno_fetch::dns::Resolver::custom(Arc::new(self))
     }
 }
 

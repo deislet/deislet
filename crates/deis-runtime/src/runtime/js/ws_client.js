@@ -39,7 +39,7 @@
 // what happened: it records the number when it is built and compares before
 // it answers.
 
-import { primordials } from "ext:core/mod.js";
+import { core, primordials } from "ext:core/mod.js";
 import {
   op_deis_fetch_budget_ms,
   op_deis_ws_buffered_amount,
@@ -51,11 +51,15 @@ import {
   op_deis_ws_send_text,
 } from "ext:core/ops";
 
-import * as domException from "ext:deno_web/01_dom_exception.js";
-import * as event from "ext:deno_web/02_event.js";
-import * as encoding from "ext:deno_web/08_text_encoding.js";
-import * as file from "ext:deno_web/09_file.js";
-import * as urlModule from "ext:deno_web/00_url.js";
+// deno_web's files are `lazy_loaded_js` scripts rather than ES modules, so
+// they are fetched by name instead of imported. `bootstrap.js` has already
+// loaded every one of these; `loadExtScript` returns the same evaluated
+// exports rather than running them again.
+const domException = core.loadExtScript("ext:deno_web/01_dom_exception.js");
+const event = core.loadExtScript("ext:deno_web/02_event.js");
+const encoding = core.loadExtScript("ext:deno_web/08_text_encoding.js");
+const file = core.loadExtScript("ext:deno_web/09_file.js");
+const urlModule = core.loadExtScript("ext:deno_web/00_url.js");
 
 const {
   ArrayBufferIsView,

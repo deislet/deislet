@@ -70,7 +70,7 @@ fn op_ws_server_accept(_state: Rc<RefCell<OpState>>, #[string] ws_id: String) ->
 ///
 /// # Returns
 /// - JSON object: { success: bool, error?: string }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_ws_server_send(
     state: Rc<RefCell<OpState>>,
@@ -129,7 +129,7 @@ async fn op_ws_server_send(
 ///
 /// # Returns
 /// - JSON object: { success: bool, error?: string }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_ws_server_send_binary(
     state: Rc<RefCell<OpState>>,
@@ -186,7 +186,7 @@ struct WsCloseRequest {
 ///
 /// # Returns
 /// - JSON object: { success: bool, error?: string }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_ws_server_close(
     state: Rc<RefCell<OpState>>,

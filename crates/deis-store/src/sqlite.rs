@@ -405,7 +405,13 @@ fn open(path: &Path, label: &str, authorizer: Option<SqlAuthorizer>) -> StoreRes
         // open a second file - and it catches `VACUUM`, which attaches its
         // destination without the parser ever spelling the word.
         conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
-        conn.authorizer(Some(authorizer));
+        // The result is not discardable. This call is the tenant SQL sandbox:
+        // if it fails and the connection is handed out anyway, every statement
+        // the authorizer exists to refuse - ATTACH to another tenant's file,
+        // VACUUM INTO an arbitrary path, a PRAGMA off the allowlist - runs
+        // unopposed on a connection that looks guarded. rusqlite 0.40 started
+        // reporting the failure; before that it could only be silent.
+        conn.authorizer(Some(authorizer))?;
         tracing::debug!(
             pool = %label,
             path = %path.display(),

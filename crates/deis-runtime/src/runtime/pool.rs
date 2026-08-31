@@ -9,7 +9,8 @@ use super::queue_consumer::{
 use crate::app_repo::AppRepo;
 use anyhow::Result;
 use deno_core::JsRuntime;
-use deno_core::OpMetricsSummary;
+
+use super::OpMetricsSummary;
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
 use std::thread;
@@ -26,7 +27,7 @@ type FetchResult = (u16, HashMap<String, String>, Option<Vec<u8>>);
 /// Initialize V8 platform (can only be called once per process)
 fn init_v8_platform() {
     V8_INIT.call_once(|| {
-        JsRuntime::init_platform(None, false);
+        JsRuntime::init_platform(None);
         tracing::debug!("V8 platform initialized");
     });
 }

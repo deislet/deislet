@@ -20,7 +20,7 @@ use deno_core::extension;
 
 extension!(
     deno_telemetry,
-    esm = [
+    lazy_loaded_js = [
         dir "src/runtime/deno_telemetry_stub",
         "ext:deno_telemetry/telemetry.ts" = "telemetry.ts",
         "ext:deno_telemetry/util.ts" = "util.ts",

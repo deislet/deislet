@@ -42,7 +42,7 @@ pub struct TransactionOptions {
 ///
 /// # Returns
 /// - JSON object: { rows_affected: number, last_insert_id?: number }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_execute(
     state: Rc<RefCell<OpState>>,
@@ -93,7 +93,7 @@ async fn op_db_execute(
 ///
 /// # Returns
 /// - JSON object: { rows: Array<Object>, columns: Array<string> }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_query(
     state: Rc<RefCell<OpState>>,
@@ -206,7 +206,7 @@ fn decode_batch_statements(
 ///   one entry per statement in the order they were sent
 /// - or `{ error }` when the batch was rolled back, naming the statement that
 ///   failed
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: String) -> JsonValue {
     // Get DbClient
@@ -262,7 +262,7 @@ async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: Str
 ///
 /// # Returns
 /// - statement_id: Prepared statement ID
-#[op2(async)]
+#[op2]
 #[string]
 async fn op_db_prepare(state: Rc<RefCell<OpState>>, #[string] sql: String) -> String {
     // Get DbClient
@@ -297,7 +297,7 @@ async fn op_db_prepare(state: Rc<RefCell<OpState>>, #[string] sql: String) -> St
 ///
 /// # Returns
 /// - JSON object: { rows_affected: number, last_insert_id?: number }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_execute_prepared(
     state: Rc<RefCell<OpState>>,
@@ -348,7 +348,7 @@ async fn op_db_execute_prepared(
 ///
 /// # Returns
 /// - JSON object: { rows: Array<Object>, columns: Array<string> }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_query_prepared(
     state: Rc<RefCell<OpState>>,
@@ -400,7 +400,7 @@ async fn op_db_query_prepared(
 ///
 /// # Returns
 /// - JSON object: { transaction_id: string, expires_in_ms: number }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_begin_transaction(
     state: Rc<RefCell<OpState>>,
@@ -446,7 +446,7 @@ async fn op_db_begin_transaction(
 ///
 /// # Returns
 /// - JSON object: { rows_affected: number, last_insert_id?: number }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_execute_in_transaction(
     state: Rc<RefCell<OpState>>,
@@ -494,7 +494,7 @@ async fn op_db_execute_in_transaction(
 ///
 /// # Returns
 /// - JSON object: { rows: Array<Object>, columns: Array<string> }
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_query_in_transaction(
     state: Rc<RefCell<OpState>>,
@@ -534,7 +534,7 @@ async fn op_db_query_in_transaction(
 ///
 /// # Returns
 /// - JSON object: `{}` when the work was applied, `{ error }` when it was not
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_commit_transaction(
     state: Rc<RefCell<OpState>>,
@@ -565,7 +565,7 @@ async fn op_db_commit_transaction(
 /// - JSON object: `{}` when the work was discarded, `{ error }` when the
 ///   store could not, which most often means it had already ended the
 ///   transaction at its deadline
-#[op2(async)]
+#[op2]
 #[serde]
 async fn op_db_rollback_transaction(
     state: Rc<RefCell<OpState>>,

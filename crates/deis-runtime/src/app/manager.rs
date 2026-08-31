@@ -5,10 +5,9 @@ use super::types::{App, AppConfig, AppState, ResourceLimits};
 use crate::app_repo::AppRepo;
 use crate::assets::AssetBundle;
 use crate::config::ExecutionLimits;
-use crate::runtime::{FetchPolicy, IsolateSpec, RuntimePool};
+use crate::runtime::{FetchPolicy, IsolateSpec, OpMetricsSummary, RuntimePool};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
-use deno_core::OpMetricsSummary;
 use std::sync::Arc;
 use std::time::SystemTime;
 
