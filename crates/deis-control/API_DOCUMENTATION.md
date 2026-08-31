@@ -68,6 +68,7 @@ PUT    /api/nodes/{node_id}/registration
 DELETE /api/nodes/{node_id}/registration
 GET    /api/nodes/{node_id}/assignments
 GET    /api/apps/{app_id}/versions/{version_id}/bundle
+GET    /api/routing-table
 ```
 
 They are authenticated with `node_preshared_keys` - the same credential a
@@ -76,6 +77,14 @@ effect on them**. Two reasons: the assignment list carries every
 environment's decrypted secret values, and registration decides which
 machines are delivery targets in the first place. A setting whose purpose is
 to make a dashboard convenient must not be able to open either.
+
+`/api/routing-table` is here for a third reason. It carries nothing secret -
+hostnames, path prefixes, app ids and environment names, all of which anyone
+who can make a request through the edge already sees - but together they are
+a map of the whole installation, so it stays behind the credential that
+cannot be switched off. deis-proxy is not a runtime node and holds one
+anyway: the `[control] secret` in its own file is a `node_preshared_keys`
+value, because that is what its gRPC control channel authenticates with.
 
 ```bash
 curl -H "Authorization: Bearer <one of node_preshared_keys>" \
@@ -425,6 +434,82 @@ letters, digits and `_`.
 
 Changing a secret does not create a version; it takes effect on the next
 deployment push.
+
+### Routing Table
+
+```http
+GET /api/routing-table
+```
+
+The whole table, in the shape the data plane consumes it. deis-proxy polls
+this every `routing.control_poll_interval_secs` seconds (5 by default) and
+resolves an application from it by host and path prefix.
+
+```json
+{
+  "version": "d1e5...",
+  "generated_at": 1756600000,
+  "routes": [
+    { "app_id": "shop", "environment": "production",
+      "host": "example.com", "path_prefix": "/api", "priority": 10 }
+  ],
+  "environments": [
+    { "app_id": "shop", "environment": "production" },
+    { "app_id": "shop", "environment": "pr-42" }
+  ]
+}
+```
+
+Three things this has that `GET /api/routes` next door does not, and each one
+is why it exists rather than being a formatting preference:
+
+- the environment's **name**, never its `env_id`. The name is what travels in
+  `x-deis-environment` and what the runtime branches on; an `env_id` reaching
+  an application as a uuid would be a silent mismatch.
+- **every** environment, whether or not it has a route of its own, so the edge
+  can synthesise an automatic address for one without inventing catalog rows
+  here.
+- a **version** for the table as a whole - a digest of everything except
+  `generated_at` - so a poller can tell "unchanged" from "changed" without
+  diffing, and the log line an operator reads names the table it is talking
+  about.
+
+The document is all or nothing on the consuming side: deis-proxy parses,
+validates and compiles the whole thing and swaps it in with one pointer
+write, and refuses a document with one unusable entry entirely rather than
+applying it with that entry skipped. Half a routing table sends live requests
+to the wrong application, which is worse than an old table - which is also why
+a failed poll changes nothing and the last accepted table keeps serving
+indefinitely.
+
+### Storage Token
+
+```http
+GET /api/apps/{app_id}/environments/{env}/storage-token
+```
+
+What `deis kv`, `deis db` and `deis blob` call before they talk to deis-store.
+Authenticated with the API key that deploys, on the human surface.
+
+```json
+{
+  "tenant": "shop.production",
+  "store_endpoint": "http://127.0.0.1:8090",
+  "token": "..."
+}
+```
+
+Every field is always present: an answer carrying an empty token would be one
+the caller cannot use, so that case is a refusal rather than a field left
+blank. `tenant` is the value the caller must send back in `x-deis-tenant` on
+every storage call, included so a caller never has to rebuild it and so the
+pair this control plane signed is visible to anyone debugging a refused call.
+
+`404` when the application or the environment is unknown, the same resolution
+every other endpoint under this prefix does. `409` when this control plane has
+no `store_endpoint` or no `storage_auth_secret` configured - there would be
+nowhere for the tenant's data to live, or no way to authorise reaching it, and
+the message names the field to set.
 
 ### Node Assignments
 

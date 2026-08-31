@@ -7,8 +7,9 @@
 > application can actually reach from inside an isolate is in
 > [README.md](README.md).
 >
-> Both halves of the telemetry link exist: `src/logging/shipper.rs` pushes logs
-> and `src/runtime/metrics.rs` pushes metrics.
+> All three halves of the telemetry link exist: `src/logging/shipper.rs` pushes
+> logs, and `src/runtime/metrics.rs` pushes metrics and one trace per
+> invocation.
 
 ## 🎯 Design Goal
 
@@ -105,10 +106,18 @@ keep serving.
   every other application's data, because deis-store believes the tenant header
   it is handed. See `src/runtime/fetch_policy.rs`.
 - **Sandboxing**:
-    - V8 heap ceiling per isolate, when the application sets one.
-    - Wall-clock timeout and an op-dispatch rate limit; there is no CPU time
-      limit and no egress policy.
-    - Permission-based capability access (Network, Env).
+    - V8 heap ceiling per isolate: this node's `default_memory_limit_mb`,
+      narrowed by the application's own `limits.memory_mb` when it asks for
+      less.
+    - Two ceilings on one invocation — wall clock and CPU time — enforced from
+      the same watchdog thread, plus an op-dispatch rate limit. The CPU one is
+      sampled from `/proc`, so it does not exist on a platform without it and
+      `Watchdog::start` says so at `error`.
+    - Every limit narrows only: `ApplicationManager::effective_limits` clamps
+      what the manifest asked for against this node's value and logs what it
+      clamped.
+    - The outbound policy above, and permission-based capability access
+      (Network, Env).
 
 ## 🚀 Lifecycle
 
@@ -179,7 +188,10 @@ max_bytes = 134217728
 
 ## 📦 Key Dependencies
 
-- **Runtime**: `deno_core`, `deno_runtime` (custom build)
+- **Runtime**: `deno_core` and `deno_runtime`, both from crates.io. There is
+  no fork any more: the one this repository carried existed to raise deno's
+  workspace `fqdn` past a yanked release, upstream did the same long ago, and
+  holding the fork was pinning the runtime 31 minor versions back.
 - **Async**: `tokio`, `axum`, `tonic` (gRPC)
 - **Data**: `rusqlite`, `arc-swap`, `dashmap`
 - **Observability**: `tracing`, `parking_lot` (high-perf locks)

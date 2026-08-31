@@ -49,7 +49,7 @@ flowchart TB
         direction LR
         deis["<b>deis</b> · CLI
         项目侧：init / dev / validate / build
-        平台侧：deploy / versions / rollback / status / secret / logs / tail"]
+        平台侧：deploy / versions / rollback / status / secret<br/>logs / tail / trace / kv / db / blob"]
         deis-build["<b>deis-build</b> · 编译器
         SWC 解析 + rolldown 打包 + 平台能力校验
         四个目标：cloudflare / deno / tencent / deislet"]
@@ -115,8 +115,9 @@ flowchart TB
 绿色是已经跑通的；虚线橙色是还没接进来的：只剩 coraza 与 capkit 两个外部件。
 
 `deis` 也是绿的：它已经补全到平台侧（deploy / versions / rollback / status /
-secret / logs / tail），`scripts/demo.sh` 的部署动作全部走 CLI，脚本里没有一处
-对控制面 REST 的 `curl`。
+secret / logs / tail），后来又加了读调用轨迹的 `trace` 和数据面的 `kv` / `db` /
+`blob`。`scripts/demo.sh` 的部署动作全部走 CLI，脚本里没有一处对控制面 REST 的
+`curl`。
 
 ### deis-runtime 的定位变化
 
@@ -213,10 +214,10 @@ deis-runtime 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪�
 | ENVIRONMENT | 有。`environments` 表；名字必须满足 `is_valid_tenant_part`（不许含 `.` `/` `\`，半边不超 64 字节），否则存储租户会被拆成三段而全废 |
 | VERSION | 有。`versions` 表，写入后永不修改；包体存控制面本地，`bundle_sha` 是内容哈希 |
 | DEPLOYMENT | 有。`deployments` 表只追加；某环境的当前版本 = 该 env 下最新一行 |
-| ROUTE | **有表、有 REST，但没人消费**。`routes` 表存 host + path_prefix + priority，`GET /api/routes` 能读出来，deis-proxy 却仍然只按域名或 `x-deis-app-id` 选应用（见 §4） |
+| ROUTE | 有，且被消费了。`routes` 表存 host + path_prefix + priority；`GET /api/routes` 给控制台看，另一条 `GET /api/routing-table` 给数据面看（多带环境名、所有存在的环境、整表版本号），deis-proxy 每 5 秒拉一次并按它选应用（见 §4） |
 | SECRET | 有。AES-256-GCM 落库，主密钥从 `secret_key_file` 读；面板与 CLI 只能写和删，读不回来 |
 | CRON | 有，且挂对了对象：调度器按 `(app_id, environment)` 维护，到点调某一个节点的 `Trigger.OnScheduled` |
-| ASSET | 有。打进包里，节点建内存索引，命中直接返回并带 ETag |
+| ASSET | 有。打进包里，节点建内存索引，命中直接返回并带 ETag。同一份包里还带着这个站点自己的规则——`_redirects`、`_headers` 和「路径谁都没认领时答什么」，构建期解析、装载时编译（见 §4） |
 | BINDING / NAMESPACE | **没建，也不打算建**。见 §8 |
 
 ---
@@ -281,12 +282,12 @@ sequenceDiagram
 ```mermaid
 flowchart TB
     req["请求进来"] --> tls["deis-proxy：TLS 握手<br/>按 SNI 选证书"]
-    tls --> pick["deis-proxy：选应用<br/>① x-deis-app-id 头（优先，未知即 404）<br/>② Host 精确<br/>③ Host 通配<br/>无任何应用配置时：透传"]
+    tls --> pick["deis-proxy：选应用<br/>① x-deis-app-id 头（优先）<br/>② 目录路由：Host 精确 → Host 通配 → 自动预览地址 → 不限域名<br/>（同一域名内先比 priority，再比前缀长度）<br/>③ 本机配置里的 Host<br/>本机和目录都没有任何应用时：透传"]
     pick -->|没匹配| e404["404"]
     pick --> stamp["deis-proxy：盖上<br/>x-deis-app-id + x-deis-environment"]
     stamp --> fwd["转发到 deis-runtime"]
     fwd --> asset{"deis-runtime：路径命中<br/>当前版本资产清单吗"}
-    asset -->|命中| serve["读本地文件返回<br/><b>不起 Isolate</b><br/>带 Cache-Control 与 ETag，支持 304"]
+    asset -->|命中| serve["从内存返回<br/><b>不起 Isolate</b><br/>先过这一版的 _redirects / _headers / 兜底<br/>带 Cache-Control 与 ETag，支持 304"]
     asset -->|未命中| fn["起 V8 Isolate 跑函数<br/>按 manifest.routes 填 context.params"]
     serve --> done["响应"]
     fn --> done
@@ -296,20 +297,36 @@ flowchart TB
     class tls,pick,stamp,fwd,asset,serve,fn,e404 done
 ```
 
-**环境怎么定**：deis-proxy 从它自己的应用配置里读出该应用的 `environment`，原样盖成
-`x-deis-environment`；客户端自己带的同名头会被覆盖，不能借它跳到别的环境。节点收到
-不带这个头的请求时按 `production` 处理，所以早于环境模型的调用方仍然落到生产。
+**环境怎么定**：deis-proxy 认出应用的同时也就认出了环境——目录里的一条路由指向的是
+一个 `(应用, 环境)`，自动预览地址更是一个环境一个地址；只有走 `x-deis-app-id` 头这条
+路时环境是补上去的默认值 `production`，因为那个头只说了应用。选中之后原样盖成
+`x-deis-environment`，客户端自己带的同名头会被覆盖，不能借它跳到别的环境。节点收到
+不带这个头的请求时也按 `production` 处理，所以早于环境模型的调用方仍然落到生产。
 
-**还没做的两件事，都卡在同一处**：
+**目录和本机配置都能答「这是哪个应用」时，目录赢**，因为目录是运维不碰机器就能改的
+那一份。本机的应用列表没有作废，它答的是另一个问题：这个应用的证书、缓存策略、有没有
+被停用——也就是「认出来之后怎么处置」。
 
-- **路径级路由**。控制面已经有 `routes` 表（host + path_prefix + priority）和
-  `GET /api/routes`，deis-proxy 却没有去读它——它的路由表只有域名维度。所以
-  `example.com/api/*` 给 API 应用、`example.com/*` 给站点应用暂时共存不了。
-- **预览子域**。预览环境本该靠 `<env>.<app>.<zone>` 自动子域访问，这依赖上面那条
-  链路，也依赖一张泛域名证书（`*.<zone>`）或 ACME 自动签发。
+**原来卡住的两件事已经通了**：
 
-**deis-proxy 的资产缓存也还没做**：原则 1 里「proxy 只做缓存」的那一半没有实现，
-每个资产请求都会走到节点，由节点从内存索引里回。
+- **路径级路由**。deis-proxy 现在每 5 秒向控制面拉一次 `GET /api/routing-table`，
+  按拉到的表选应用，所以 `example.com/api/*` 给 API 应用、`example.com/*` 给站点
+  应用可以共存了。这条链路的三个关键取舍：**用轮询不用推送**，因为轮询自愈——不管
+  是断连、控制面重启还是某次校验没过，下一次拉取都会修好，而推送方案最后都得再配
+  一个周期性全量对齐才敢信；**控制面不可达时最后一张表无限期继续生效**，一次管理面
+  故障不该变成一次用户可见的故障（只有从来没拉成功过的 proxy 例外，它退回本机配置里
+  的应用列表）；**一张表要么整份换上、要么整份不要**，半张路由表会把线上请求发给错的
+  应用，比一张旧表更糟，所以是整份解析、整份校验、整份编译，最后靠一次指针交换换上。
+- **预览子域**。运维在 proxy 配置里写 `routing.preview_zone`，每个环境就有了
+  `<环境>--<应用>.<域>`，默认环境另有一个短名 `<应用>.<域>`。分隔符是一个 DNS 标签
+  里的 `--` 而不是点，为的是证书：一张通配证书只覆盖一层标签，`*.<域>` 盖得住
+  `pr-42--shop.<域>`，盖不住 `pr-42.shop.<域>`。**这一条只做到了地址这一半**：那条
+  通配 DNS 记录和那张通配证书仍然要人手放，因为 ACME 自动签发还没做（见 §11）。
+
+**deis-proxy 的资产缓存仍然没做**：原则 1 里「proxy 只做缓存」的那一半没有实现，
+每个资产请求都会走到节点，由节点从内存索引里回。配置里的 `[cache]` 段目前没有任何
+读者——`DeisProxy` 没有实现 `request_cache_filter`，pingora 也是不带 `cache` 特性
+编的。
 
 ---
 
@@ -360,6 +377,7 @@ sequenceDiagram
     Note over X,L: ⑤ 日志与指标汇聚
     X-)L: LogService.PushLogs（批量、背压、丢弃最旧）
     X-)L: MetricService.PushMetrics
+    X-)L: TraceService.PushTraces（一次调用一条，带平台判的结局）
     L->>L: 落分表 SQLite，暴露 Prometheus
     R->>L: 查聚合指标
     Note over R: 存活判断另走 ③ 的直连健康检查
@@ -574,6 +592,8 @@ deis-control。
 | **查询 API** | `LogService.Query`，供控制面决策与面板展示 | 有 |
 | **Prometheus** | 独立 HTTP 端口上的 `/metrics` | 有 |
 | **实时 tail** | `LogService.Tail` 流式订阅 | 有，`deis tail` 是它的消费方 |
+| **调用轨迹** | `TraceService`：`PushTraces` / `QueryTraces` / `TailTraces`，一次调用一条，和日志那套并排放不混在一起 | 有，`deis trace` 是它的消费方。留存默认 3 天，比日志的 7 天短——不管应用写不写日志，每次调用都会产生一条 |
+| **耗时分位数** | 延迟按直方图存（14 个桶 + `_sum` + `_count`），`histogram_quantile` 直接能算 | 有。此前是一个只升不降的高水位数值，一次 30 秒的超时会把它永久钉在 30 秒 |
 
 deis-telemetry 自己的日志只写 stderr，不自摄入，避免递归。
 
@@ -650,10 +670,19 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 ## 9. 限额
 
 原先全部写死在代码里。现在是两层：**平台默认**（deis-runtime 配置的
-`[default_execution_limits]`，`timeout_ms` 与 `rate_limit_ops_per_sec`）→
-**应用覆盖**（`AppConfig` 里的同名字段）。V8 堆上限也可配，但方向和前两者相反：
-应用只能把堆往小里改，往大改会被拒——保护的是节点自己那份内存，覆盖只准让它
-更省，不准让它更贵。
+`[default_execution_limits]`：`timeout_ms` 墙钟、`wait_until_timeout_ms` 尾巴、
+`rate_limit_ops_per_sec` op 速率、`cpu_time_limit_ms` CPU 时间，另有
+`default_memory_limit_mb` 一份 V8 堆上限）→ **应用收窄**（包清单的 `limits` 块，
+控制面解析一次、随部署下发给每个节点）。
+
+**方向只有一个：往严里改。** 早先只有堆上限是这样，其余字段应用往哪边改都放行；
+现在每一个字段都在节点侧对着节点自己的天花板夹一次
+（`ApplicationManager::effective_limits`），写得比节点宽的值会被夹回节点的值，
+并留一条 warn 说明夹了什么、想真的放宽该去改节点的哪个配置项。理由对每个字段都一样：
+一次调用占着的是节点的一条线程和节点的那份内存，这个上限是节点的事，应用只能要求
+自己被管得更严。清单里写 0 会被当成「没填」而拒绝——0 在传输格式上就是「缺省」的
+哨兵值，一个写了 `"timeout_ms": 0` 的应用如果悄悄拿到节点默认值，它得不到自己应得的
+那句拒绝。
 
 模块顶层求值现在有一条应用怎么覆盖都碰不到的硬天花板：**5 秒**，写死在
 `crates/deis-runtime/src/runtime/isolate.rs` 的 `MODULE_EVALUATION_BUDGET_MS`
@@ -687,12 +716,20 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
 被裁断的那条线程主动交出控制权——V8 的 `terminate_execution()` 本来就允许
 从任意线程调用，这是它能被单独一条线程拿来当裁断手段的前提。
 
-还缺的两项（原先「怎么覆盖都不能超过的天花板」这一条，现在只对模块求值成立；
-下面这两个仍然是纯粹的应用覆盖，应用抬得比平台默认高多少都不拒）：
+**CPU 时间是墙钟之外的第二道闸**（默认 5 秒）。一个处理函数等一个慢上游 25 秒，
+和一个处理函数死算 25 秒，在墙钟上是一回事，对机器的代价差几个数量级：前者是一条
+停着的线程，后者是一个租户占着一颗核。这道闸由同一条看守线程执行，读的是被看守那条
+线程自己的 `/proc/<进程>/task/<线程>/stat`（用户时间加系统时间）。不用更精细的
+`clock_gettime` 是因为 `CLOCK_THREAD_CPUTIME_ID` 只认调用它的那条线程，而看守线程
+恰恰不是被测的那条，配它要手写 `pthread_t` / `clockid_t` / `timespec` 三个类型声明，
+在 `time_t` 宽度不同的目标上是一类静默错读——按错读的时钟执行的限额比粗糙的更坏。
+代价是分辨率：`/proc` 的数按调度时钟滴答计（实际都是每秒 100 次），读数 10 毫秒一跳，
+所以可配下限是 100 毫秒。**这条闸只在 Linux 上成立**：没有 `/proc/thread-self` 的
+地方（macOS、Windows、`/proc` 被藏起来的容器、3.17 以前的 Linux）读不到它，启动时
+会以 error 级别说一声，点名哪条限额没在执行、还剩哪条在执行。
 
-- **请求 / 队列 / cron 的超时没有硬上限**。应用通过 `ResourceLimits.timeout_ms`
-  覆盖平台默认，方向和堆上限相反：不管往哪边改都放行，没有「改到这里就拒绝」
-  的天花板。
+还缺的一项：
+
 - **一次没有自己超时的原生调用真卡死时，看守线程也救不回那条运行时线程**。
   看守线程能立刻打断的，是 V8 正在跑的字节码；一个处理函数卡在
   `await ctx.services.kv.get(...)` 上，如果背后那次到 deis-store 的 gRPC 调用
@@ -719,10 +756,10 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
 | **一 · A** | deis-store / deis-queue / deis-telemetry 三个新组件；控制面的产品模型（catalog）与 REST | **完成** |
 | **一 · B** | `Platform::Deislet` 与适配器：产出含函数入口、路由表、资产清单的应用包；`ctx.params` 随之成立 | **完成** |
 | **二** | 版本、环境与部署模型：建表、ApplyDeployment 指针下发、节点自举拉取与自取包 | **完成** |
-| **三** | 静态资产：包内带资产、节点资产优先命中 | **完成**（deis-proxy 的路径级路由与资产缓存、自动子域仍缺，见 §4） |
-| **四** | 可观测：deis-telemetry；节点侧日志与指标投递；真实状态上报 | **完成**（`deis logs` / `deis tail` 已有；控制面面板的日志视图仍缺） |
-| **五** | cron 修正、secrets、限额两层化 | **完成**；出网控制已随 `fetch` 落地（见 §9/§12），模块求值已有不可覆盖的硬上限，请求/队列/cron 超时仍是纯应用覆盖、没有天花板（见 §9） |
-| **六** | `deis` CLI 闭环：deploy / rollback / versions / tail / dev 接真运行时 | **完成**（`deis dev` 起的是真的 deis-runtime，走的是控制面同一个 `ApplyDeployment`） |
+| **三** | 静态资产：包内带资产、节点资产优先命中 | **完成**；随后又补上 `_redirects` / `_headers` / SPA 兜底 / 自定义 404 与 `env.ASSETS.fetch()`，路径级路由与自动子域也接通了（见 §4）。deis-proxy 的资产缓存仍缺 |
+| **四** | 可观测：deis-telemetry；节点侧日志与指标投递；真实状态上报 | **完成**（`deis logs` / `deis tail` 已有；随后又加了按次调用的轨迹与 `deis trace`，延迟从高水位改成直方图。控制面面板一直只覆盖机队运维——仪表盘、节点、控制通道、命令、事件、节点配置——日志、指标与目录那几半都没有页面） |
+| **五** | cron 修正、secrets、限额两层化 | **完成**；出网控制已随 `fetch` 落地（见 §9/§12），模块求值有不可覆盖的硬上限，其余每一项限额也都改成了「应用只能收窄、节点夹回」，另加了一道 CPU 时间闸（见 §9） |
+| **六** | `deis` CLI 闭环：deploy / rollback / versions / tail / dev 接真运行时 | **完成**（`deis dev` 起的是真的 deis-runtime，走的是控制面同一个 `ApplyDeployment`）；随后又补上数据面的 `deis kv` / `deis db` / `deis blob` 和读轨迹的 `deis trace` |
 
 ---
 
@@ -730,8 +767,9 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
 
 **边做边定**
 
-- 证书自动签发（ACME）。自动子域需要泛域名证书，届时一并考虑。`examples/pingap` 有
-  现成模块可参考。
+- 证书自动签发（ACME）。**这一条现在是自动子域唯一还欠的东西**：地址那一半已经做了
+  （`routing.preview_zone` 一配，每个环境就有 `<环境>--<应用>.<域>`），但那张 `*.<域>`
+  的泛域名证书仍然要运维手动放、手动续。`examples/pingap` 有现成模块可参考。
 - （已定）`deis dev` 怎么执行用户代码：起一个本地 `deis-runtime`，用控制面同一个
   `ApplyDeployment` 把包交给它。另外两条路——调 deno CLI、把 deno_core 嵌进 deis
   ——都不再考虑，因为它们跑的都不是线上那个引擎。
@@ -747,13 +785,13 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
 
 **已知缺口（不阻塞现有功能，但都会被踩到）**
 
-- **控制面的 routes 表没人消费**，deis-proxy 仍只按域名选应用（§4）。
+- ~~**控制面的 routes 表没人消费**~~ **已接上**：控制面另开了一条给数据面的 `GET /api/routing-table`，deis-proxy 每 5 秒拉一次并按它选应用，路径前缀和每环境的自动地址都成立了（§4）。仍然要人手做的只剩那条通配 DNS 记录和那张通配证书——ACME 还没做，见上面「边做边定」的第一条。
 - **只有 deis-runtime 在往 deis-telemetry 投递**，deis-proxy / deis-store /
   deis-queue / deis-control 都还只写自己的 stdout（§7）。
-- **`UpdateApp` 仍带 `bytes package_data`**，和被删掉的 `DeployApp` 是同一个毛病。
-  RPC 本身已改为 `Unimplemented` 并指向 `ApplyDeployment`，但消息里那个字段还在，
-  删它要同时改 `crates/deis-runtime/proto/management.proto` 与
-  `crates/deis-runtime/src/management/`。
+- ~~**`UpdateApp` 仍带 `bytes package_data`**~~ **已删**：那个字段现在是
+  `reserved 2` / `reserved "package_data"`，字段号和名字都留着不再启用，免得将来有人
+  拿同一个号装别的东西、和旧客户端悄悄对不上。RPC 本身仍是 `Unimplemented` 并指向
+  `ApplyDeployment`。
 - ~~**请求与响应体是 `String`**~~ **已补齐**：`JsRequest.body` / `JsResponse.body`
   过 Rust/JS 边界时是 `Option<Vec<u8>>`（`ops.rs::PendingRequestBody` /
   `PendingResponseBody`，op 边界上是 `#[buffer]` / `ToJsBuffer`），二进制主体原样
@@ -771,8 +809,9 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
   `BroadcastChannel`（真没实现：Isolate 之间没有消息总线）。
 - ~~**执行超时管不住卡在 await 上的处理函数**~~ **一半解决**（§9）。请求 /
   `waitUntil` / 队列 / cron / WebSocket / 模块求值六条路径现在都由一条独立的
-  OS 看守线程按 wall clock 裁断，不再依赖处理函数自己让出线程，所以一个不
-  `await` 任何东西、纯占 CPU 的 `while (true)` 已经管得住。没解决的是另一半：
+  OS 看守线程裁断——先按墙钟，Linux 上再加一道 CPU 时间——不再依赖处理函数自己让出
+  线程，所以一个不 `await` 任何东西、纯占 CPU 的 `while (true)` 已经管得住。
+  没解决的是另一半：
   看守线程能打断的是 V8 正在跑的字节码，一个卡在
   `await ctx.services.kv.get(...)` 上、背后那次到 deis-store 的 gRPC 调用
   自己没配超时的处理函数，此刻根本没有字节码在跑，裁断打不到它身上——这条运行时线程
@@ -781,8 +820,10 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
   卷回来；KV / SQL / 队列这几个调用 deis-store、deis-queue 的路径还没有这一层，
   真正的解法在调用的那一端——给这几个 gRPC 调用配上各自的超时。
 - **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent`
-  已经有了）。队列消费目前由节点自己按 `(应用, 环境)` 轮询，不经过这个消息，所以还没
-  被踩到；一旦有别的调用方用它投递批次，就会指不准环境。
+  已经有了），而且它的 `QueueMessage.body` 还是 `string`，与 `queue.proto` 那条真正
+  在用的路径已经改成 `bytes` 不一致。队列消费目前由节点自己按 `(应用, 环境)` 轮询，
+  走的是 `queue.proto`，不经过这个消息，所以两处都还没被踩到；一旦有别的调用方用
+  `Trigger/OnQueue` 投递批次，就会既指不准环境、又损坏二进制消息体。
 - **deis-store 是单点，也没有跨节点复制**（§6）。
 
 **涉及对外承诺**
@@ -987,7 +1028,7 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | 对象存储 | 成立 | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；Isolate 侧 `context.services.blob` 收字符串 / `ArrayBuffer` / `ArrayBufferView`，有顶着真 deis-store 的端到端测试 |
 | 消息队列 | 成立 | deis-queue 的 `Send`/`Pull`/`Ack`/`Nack` + 节点的 `queue_consumer` 轮询任务；消息体按字节走（`queue.proto` 的 `body` 是 `bytes`），`send()` 接受字符串、普通对象或 `ArrayBuffer`/`ArrayBufferView`；消费端 `message.body` 是发送时的原文，body 不是合法 UTF-8 时为 `null`，只能靠 `message.bytes()` 读 |
 | 定时任务 | 成立 | 控制面按 `(app, environment)` 调度 → 节点 `Trigger.OnScheduled` → 跑 `scheduled` 导出 |
-| 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match` |
+| 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match`。站点自己的规则也在：`_redirects`（按作者顺序，首条命中者胜；200 是改写、404 是带 404 状态返回目标）、`_headers`（所有命中的块叠加、靠后的覆盖靠前的，`! 名字` 去掉前面设过的）、以及 `assets.notFound` 三选一的兜底（`none` / `404-page` / `single-page-app`）。三样都在构建期解析、写错就构建失败并报出行号，在节点装载那一版时编译成表。函数想主动取包里的文件走 `env.ASSETS.fetch()`——`ASSETS` 是保留键，应用设不了同名变量把它顶掉 |
 | WebAssembly | 成立 | V8 自带 |
 | WebSocket | 成立 | 服务端（`WebSocketPair` 桥接）与客户端（走 `fetch_policy.rs` 出网策略的 `WebSocket` 全局）都有；HTTP 升级、经过 deis-proxy 的一跳、文本帧与二进制帧都有真测试覆盖（`websocket_bridging_test.rs`、`websocket_through_proxy_test.rs`，见 §11） |
 | BroadcastChannel | **不成立** | `deno_web` 带着 `01_broadcast_channel.js` 被 import 进来了，但没有把 `BroadcastChannel` 装到 `globalThis` 上——8.1 节没要求它，`bootstrap.js` 补全局时就没带上。探针实测：`typeof BroadcastChannel === "undefined"`。真要开还有一层要想清楚：进程内广播是跨应用的，得先按 (应用, 环境) 隔离 |
@@ -1055,3 +1096,26 @@ Workers AI 在项目配置里根本没有可声明的地方，所以编译器检
   `auth_secret` 后每次调用都要带能力令牌，见该节。
 - **维持 ❌**：BroadcastChannel、`addEventListener`、`Deno` / `__bootstrap`——理由
   不变。
+
+第四轮（2026-08-31，静态站点规则 + 目录路由 + 数据面 CLI + 轨迹 + CPU 上限 + 两次
+依赖升级）。这一轮**没有改动全局作用域那张表**，所以
+`the_isolate_global_surface_is_the_one_the_documents_describe` 的两列一个字没动；
+变的是它旁边这几格：
+
+- **静态资产那一格加了三样**：`_redirects`、`_headers`、兜底行为，外加
+  `env.ASSETS.fetch()`。见上面那张表里的这一行与 §4。
+- **限额那一格加了 CPU 时间**（只在 Linux 上成立），并且每一项限额都改成了「应用只能
+  收窄、节点夹回」，见 §9。
+- **可观测那一格加了按次调用的轨迹**：deis-telemetry 多了 `TraceService`，节点每处理
+  完一次调用发一条，`deis trace` 读它；延迟从只升不降的高水位改成直方图，
+  `histogram_quantile` 能直接算分位数。
+- **依赖**：前门从 pingora 0.5 升到 0.8.1（0.5 带两个请求走私漏洞，在多租户边缘上
+  意味着一个租户的请求被交给另一个租户的应用），顺带堵上我们自己一个洞——请求体上限
+  原来对任何带 `Upgrade` 头的请求一律放行，0.8 能看到节点到底有没有回 101，现在问的是
+  这个。运行时离开 deno 私有分支改用发布版 `deno_runtime` 0.266，`cargo audit` 从 13
+  条降到 4 条（连同前两轮是 17 条降到 4 条），剩下四条的理由写在 `.cargo/audit.toml`。
+  两处和本节结论有关的连带改动：deno_fetch 开始对「名字解析出来的地址」再查一次拒绝
+  名单，而拒绝名单写不出例外，所以运维用域名开的白名单在出现域名时不再装那份地址段
+  兜底——机制仍是策略本身（它在每个地址、每一跳上都认白名单，平台自身端点在任何情况下
+  都拒）；rusqlite 0.40 开始报告「授权器没装上」，deis-store 从丢弃这个结果改成让这条
+  连接直接失败，因为那个授权器就是租户的 SQL 沙箱。

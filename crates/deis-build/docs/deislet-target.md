@@ -18,6 +18,12 @@ dist/deislet/bundle.zip
 └── assets/             static files, directory structure preserved
 ```
 
+`manifest.json` carries a `site` block when the project has one — see **What a
+static site says about itself** below. `_redirects` and `_headers` are read out
+of the assets directory and **not** copied into `assets/`: their content is in
+the manifest, and shipping them as files as well would publish the site's own
+rules at `/_redirects`.
+
 Nothing else is left behind: the staging directories (`src/`,
 `_deis_internal/`) are removed once the archive is written, because a loose
 copy beside the archive is stale the moment the next build runs.
@@ -57,6 +63,111 @@ be a handler that never runs.
 for itself what to do with a method, and the file tree has no place to say
 otherwise.
 
+## What a static site says about itself
+
+Three things a site can do without writing a function. All three are parsed
+here, at build time, and travel in the manifest's `site` block; deis-runtime
+compiles them once when the version loads and applies them on every request
+that misses the asset index. **A rule that is wrong fails the build**, naming
+the file, the line number and the line's text — an author who mistyped a
+redirect finds out here rather than from a visitor.
+
+### `_redirects`
+
+One rule per line, at the root of the assets directory. First match wins, in
+the order the author wrote them: nothing sorts this table, because an author
+who put a broad rule above a narrow one meant the broad one to win.
+
+```text
+/old-post          /blog/new-post        301
+/blog/*            /news/:splat          301
+/news/:year/:slug  /archive/:year/:slug  302
+/app/*             /app/index.html       200
+/private/*         /404.html             404
+```
+
+The status defaults to `302`, and three of the seven allowed values do
+something other than redirect: **200** is a rewrite (the URL stays put and the
+target's bytes are served under it — this is how a pretty URL or a hand-written
+SPA fallback is spelled), **404** serves the target with a 404 status, and the
+rest are ordinary redirects with a `Location`. At most 2000 rules, because the
+table is scanned on every request that names no file.
+
+An absolute `http(s)://` target is allowed **for a redirect and refused for a
+rewrite**, and only when the host it names is a constant. Refused shapes: a
+capture anywhere in the scheme or authority (`/r/:host  https://:host/`, which
+would make the site somebody else's open redirector), userinfo, a scheme that
+is not http or https, and a protocol-relative `//host/path`. A rewrite to an
+absolute URL is refused outright: a rewrite serves bytes out of *this* bundle,
+so honouring one would have the node open a socket the author chose, from the
+asset path, past the platform's single outbound decision point.
+
+### `_headers`
+
+A path pattern on its own line, its headers indented under it.
+
+```text
+/*
+  X-Frame-Options: DENY
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/downloads/:file
+  Content-Disposition: attachment
+  ! X-Robots-Tag
+```
+
+`Name: value` sets a header and `! Name` removes one. **Every matching block
+applies and a later one wins** — the opposite of `_redirects`, and deliberately
+so: headers compose (a site-wide security block plus a per-directory caching
+block) while a redirect is one decision about where a request goes.
+
+`!` reaches only what these blocks set. Refused at build time, by name, with
+the line number: the framing and hop-by-hop headers (`content-length`,
+`transfer-encoding`, `connection`, `keep-alive`, `upgrade`, `te`, `trailer`,
+`proxy-authenticate`, `proxy-authorization`, `host`), `content-encoding` (the
+node and the proxy decide whether a response is compressed), `etag` (computed
+from the file's own digest, and a constant one pinned by an author would have
+caches keep the old file forever after a deploy), and anything beginning
+`x-deis-` (the platform routes and authorises on those).
+
+### The not-found behaviour
+
+`assets.notFound` in `.config.json`, one of three, spelled the way Cloudflare
+Pages spells them so an author arriving from there already knows the names:
+
+| Value | What a path nothing claimed gets |
+|---|---|
+| `none` | the request goes on to the isolate, which answers 404 itself |
+| `404-page` | `404.html`, with status 404 |
+| `single-page-app` | `index.html`, with status 200, so a client-side router can read the path |
+
+Unset, it is inferred: `404-page` when the bundle carries a `404.html`, `none`
+otherwise. Inferring the SPA behaviour is not possible the same way — every
+site has an `index.html`, and only the author knows whether an unmatched path
+is a client-side route or a mistake. A declared value naming a file the bundle
+does not carry fails the build.
+
+### The pattern language, and one deliberate narrowing
+
+`_redirects` sources and `_headers` patterns are written in the same language a
+function route is: literal segments, `:name` for exactly one segment, and `*`
+as the whole last segment for the rest of the path. A wildcard *inside* a
+segment — `/*.jpg` — is refused at build time rather than half understood,
+because a second dialect that only worked here would be a second thing to keep
+in agreement forever. Per-extension headers are written as a directory: put the
+files under `/img/` and match `/img/*`.
+
+### The way back in, from a function
+
+A handler that ran anyway and wants the asset layer's answer for a path of its
+own choosing calls `env.ASSETS.fetch(request | url | path)`. It runs the same
+pipeline with one difference — the function routes have already had their turn,
+so the fallback applies whatever it says — and always answers something, so a
+path that names nothing comes back as a 404 the handler can return rather than
+as an exception every handler would have to invent a response for.
+
 ## What the entry module does
 
 deis-runtime keeps one default export per app and calls it once per request,
@@ -82,7 +193,7 @@ untouched.
 {
   "name": "my-app",
   "functionRoot": "./functions",
-  "assets": { "dir": "./public" },
+  "assets": { "dir": "./public", "notFound": "single-page-app" },
   "environment": {
     "variables": { "LOG_LEVEL": "info" },
     "secrets": ["API_KEY"]
@@ -95,6 +206,7 @@ untouched.
   },
   "cron": ["0 */6 * * *"],
   "queues": [{ "name": "jobs", "batchSize": 10 }],
+  "limits": { "timeoutMs": 5000, "memoryMb": 64 },
   "vendors": { "deislet": { "enabled": true } }
 }
 ```
@@ -102,10 +214,22 @@ untouched.
 - `name` is the `app_id` the version is filed under in the control plane.
 - `assets.dir` defaults to `./public` when the key is absent; a missing
   directory simply means no static files, not a build failure.
+- `assets.notFound` is the not-found behaviour above; absent, it is inferred
+  from whether a `404.html` is there.
 - `secrets` carries **names only**. Values stay with the control plane and are
   delivered to a node at deploy time.
 - `cron` and `queues` are copied verbatim into the manifest; scheduling is the
   control plane's job.
+- `limits` is a request to be held to **less** than the node allows, and only
+  ever less: `memoryMb`, `timeoutMs`, `cpuTimeLimitMs`, `rateLimitOpsPerSec`
+  and `resourceTableMax`, each optional and each meaning "the node's default"
+  when absent. It is translated into the manifest's own `limits` block, which
+  the control plane checks at upload and every node clamps against its own
+  ceiling - a project asking for more gets the node's number and a log line
+  naming both. A misspelled key fails the build rather than being dropped: a
+  ceiling an author believes in and that was never in force is the failure this
+  whole key exists to avoid. A zero is refused for the same reason, because
+  zero is what "unset" looks like on the wire.
 
 ## The capability set says what works today
 

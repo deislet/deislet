@@ -335,10 +335,11 @@ non-zero: the pointer moved, but that machine is still serving what it had.
   consensus. The whole design assumes a single control plane, which is also
   why cron needs no leader election.
 - **RBAC, mTLS, audit log.**
-- **The routes table is not consumed.** Host and path-prefix routes are stored
-  and served at `/api/routes`, but deis-proxy still resolves an application by
-  `Host` or by `x-deis-app-id` only. Path-prefix routing and automatic preview
-  subdomains both wait on that link.
+- **No ACME.** The routing table now reaches deis-proxy — see
+  `GET /api/routing-table` below — so path-prefix routing and an automatic
+  per-environment address both work. What this control plane cannot do is get
+  the certificate those addresses need: the `*.<zone>` record and the
+  `*.<zone>` certificate are placed and renewed by a person.
 - **Only deis-runtime ships logs to deis-telemetry.** This component still
   writes to its own stdout.
 

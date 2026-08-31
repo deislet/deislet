@@ -1015,10 +1015,15 @@ impl WafMetrics {
 
 ## 附录 A：关键依赖
 
+这份附录是 2026-01-16 写的，当时 deis-proxy 用的是 pingora 0.5。**现在是 0.8.1**，
+升级的理由是 0.5 带着两个 CVSS 9.3 的请求走私漏洞（RUSTSEC-2026-0033 / -0034），在
+多租户边缘上，请求走私意味着一个租户的请求被交给另一个租户的应用。真要按这份方案动手，
+版本以 `crates/deis-proxy/Cargo.toml` 里那一行为准，别照抄下面这个。
+
 ```toml
 [dependencies]
 # 核心
-pingora = "0.5"
+pingora = "0.5"   # 已过时，见上；deis-proxy 现在是 0.8.1
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 

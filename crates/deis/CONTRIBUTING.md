@@ -55,6 +55,16 @@ change nobody will notice breaking.
 all English, in every `.rs`, `.js`, `.ts`, `.toml` and `.proto`. Markdown may
 be Chinese; name those files `*.zh.md`.
 
+**A feature is not finished until a request can reach it.** Written, tested and
+registered is not the same as reachable, and this repository has produced six
+of those at once: site rules only tests called, an `env.ASSETS` with a Rust
+half and no op, a counter nothing incremented — so an operator read "no isolate
+ever ran out of heap" from a number no code ever wrote — a manifest `limits`
+block the node dropped on the floor, traces with no reader, and a CLI calling
+a control-plane route that did not exist. The check that closes a piece of work
+is to walk outward from every new symbol looking for a caller, and to drive the
+thing the way a user drives it.
+
 **Documents must be true or gone.** If you change behaviour, change the
 document that describes it in the same commit. If a document is a snapshot of
 a moment rather than a statement of a contract, delete it — a stale status

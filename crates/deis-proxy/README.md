@@ -16,14 +16,27 @@ socket handling or process model.
 
 ## Request flow
 
-1. **Resolve the application.** A non-empty `x-deis-app-id` header names
-   the application and must match a configured id exactly; an unknown id
-   is a `404`, never a fallback to the `Host`. Without the header the
-   `Host` name is matched against the application list (exact domains
-   first, then `*.wildcard` domains). Unknown hosts get a `404` once any
-   application is configured. With no applications configured every
+1. **Resolve the application**, from two sources with a fixed precedence.
+   The **catalog's routing table**, polled from the control plane, is the
+   one an operator can change without touching a machine, so where both
+   can answer "which application", the catalog wins. The **local
+   application list** is still here and still matters, for a different
+   question: certificates, the cache policy, the enabled flag — what to do
+   with a request once the application is known.
+
+   A non-empty `x-deis-app-id` header names the application and nothing
+   else, so it is answered first: the local list, then the catalog's
+   default environment for that id. Without the header, the catalog is
+   matched on host **and path prefix** — exact host, then `*.wildcard`
+   (longest suffix first, so `*.eu.example.com` beats `*.example.com`),
+   then an automatic per-environment address, then a route naming no host
+   at all, which the catalog means as "any domain". Within one host,
+   candidates are ordered by `priority` and then by prefix length, so
+   `/api/v2` beats `/api` beats `/` and an operator can still override
+   that. If the catalog claims nothing, the local list is matched on host.
+   When neither the local list nor the catalog claims any host, every
    request is forwarded unchanged, so a bare instance is a plain reverse
-   proxy.
+   proxy; once either holds something, an unmatched request is a `404`.
 2. **Apply policy.** Disabled applications get a `403`. Plain HTTP requests
    for an application whose certificate is loaded (or that has a
    certificate configured and `tls.default_certificate` to fall back on)
@@ -39,6 +52,14 @@ socket handling or process model.
 Because the header is validated, deis-runtime's own targets such as
 `_inspect:<app>` and `_system` cannot be reached through deis-proxy; the
 inspector is meant to be used on deis-runtime's own port.
+
+A request body larger than `max_request_body_bytes` is refused rather than
+carried. A connection that has **completed** an upgrade is exempt, because
+its frames are a stream and not a body — the test is whether the node
+actually answered `101`, not whether the client asked for an upgrade. That
+distinction is the fix for a real hole: while it asked the request headers
+instead, an ordinary chunked upload that named an `Upgrade` it never
+completed was carried to the node unbounded.
 
 TLS certificates belong to applications. During the handshake the SNI name
 is looked up in the route table and that application's certificate is
@@ -65,7 +86,28 @@ the control pushes. Notable behaviour:
   they keep resolving the same way across upgrades. Certificate paths in
   application configurations pushed by the control are used as given;
   make them absolute.
-- `[cache]` is parsed and validated but not applied to traffic yet.
+- `[cache]` is parsed and validated but not applied to traffic yet: nothing
+  implements `request_cache_filter` and pingora is built without its `cache`
+  feature, so no response is stored and no `X-Cache-Status` is emitted.
+- `[routing]` is where the catalog's routing table is configured:
+  `control_poll_interval_secs` (5 by default), `max_table_bytes`, and
+  `preview_zone`. The poll uses the `[control]` address and secret. Leaving
+  `preview_zone` unset turns automatic addresses off entirely; setting it to,
+  say, `preview.example.com` puts every environment at
+  `<env>--<app>.preview.example.com`, with the default environment also at
+  `<app>.preview.example.com`. The separator is `--` inside one DNS label
+  rather than a dot because a wildcard certificate matches exactly one label:
+  `*.preview.example.com` covers `pr-42--shop.preview.example.com` and would
+  not cover `pr-42.shop.preview.example.com`. Point a wildcard DNS record at
+  this instance and give it a certificate for the zone, or those names resolve
+  to nothing and the handshake fails.
+- **A failed poll changes nothing.** The last table this process accepted keeps
+  routing indefinitely, because a data plane that starts refusing traffic when
+  its control plane is unreachable turns a management outage into a
+  customer-visible one. Each failure logs at `ERROR` saying which table is
+  still routing and how old it is. An instance that has never once fetched the
+  table has nothing to keep and falls back to the locally configured
+  applications.
 
 Applications (`id`, `description`, `domains`, `certificates`, `enabled`,
 `cache`) are not part of the file. They are pushed by the control and persisted in `database`
@@ -153,6 +195,7 @@ register against, so retry and reconnect behaviour is covered without deis-contr
 | `src/proxy/` | `ProxyHttp` implementation, upstream pool, access log. |
 | `src/tls.rs` | Certificate loading and SNI selection. |
 | `src/config/` | Configuration model, layering, persistence, route table. |
+| `src/catalog/` | The control plane's routing table: the poller, the wire shape, and the compiled table a request is matched against. |
 | `src/control/` | Control client and its background service. |
 | `src/restart.rs` | Upgrade and shutdown via pingora's signals. |
 | `src/cli.rs` | Command line parsing. |

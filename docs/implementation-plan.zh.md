@@ -43,10 +43,12 @@ deis init  →  写代码  →  deis dev  →  deis deploy
 唯一拿得到的界面，演示脚本要是绕过它去调 API，就只证明了控制面是对的，而把唯一有人
 真正敲的那个入口留在没人验过的状态。
 
-演示逐项验证十八条性质：CLI 部署与版本列表、资产 + ETag/304、路由占位符、
-密钥只见名不见值且不落盘、KV 往返、队列产销、cron 单节点执行、双环境并行、
-双环境 KV 互不可见、回滚（代码与静态资产一起回）、日志可查、`deis tail` 跟到
-开流之后才产生的那一行、节点自注册、`deis status` 报出真正在服务的节点。
+演示分十三组逐项验证二十五条性质：CLI 部署与版本列表、资产 + ETag/304、路由占位符、
+经 deis-proxy 的 WebSocket 握手与文本 / 二进制帧、出网策略的一通一堵、Web Crypto 的
+值本身、密钥只见名不见值且不落盘、KV 往返与「不带凭据令牌会被拒」、队列产销、
+cron 单节点执行、双环境并行、双环境 KV 互不可见、回滚（代码与静态资产一起回）、
+日志可查、`deis tail` 跟到开流之后才产生的那一行、节点自注册（含配置文件从未提过的
+节点靠登记入队）、`deis status` 报出真正在服务的节点。逐条见 `DEMO.md`。
 
 ---
 
@@ -54,16 +56,16 @@ deis init  →  写代码  →  deis dev  →  deis deploy
 
 | 组件 | 二进制 | 波次 A 之前 | 现在 |
 |---|---|---|---|
-| `deis-proxy` | `deis-proxy` | 完成度高 | 加了 `x-deis-environment` 盖章；路径级路由与资产缓存仍缺 |
+| `deis-proxy` | `deis-proxy` | 完成度高 | 加了 `x-deis-environment` 盖章；路径级路由与每环境的自动地址已接上（从控制面轮询路由表），资产缓存仍缺 |
 | `deis-runtime` | `deis-runtime` | 执行链路完整，无资产、无绑定注入、无队列消费 | 资产优先、`context.params`、存储绑定、队列消费、cron 处理、日志与指标投递都已接上 |
 | `deis-control` | `deis-control` | 节点管理完整，**产品模型为零** | catalog（应用/版本/环境/部署/路由/密钥）+ 节点自取通道 + cron 调度 |
 | `deis-build` | `deis-build` | 三个第三方目标可用 | 四个目标，deislet 产出 `bundle.zip` |
-| `deis` | `deis` | init/build/validate 可用，deploy 是桩 | 完整：deploy / versions / rollback / status / secret / logs / tail / config，`dev` 起真运行时 |
+| `deis` | `deis` | init/build/validate 可用，deploy 是桩 | 完整：deploy / versions / rollback / status / secret / logs / tail / trace / kv / db / blob / config，`dev` 起真运行时 |
 | `deis-wire` | — | 协议与模型完整 | 加了 `conventions`：头名、租户 id、消息上限、保留键 |
 | `deis-bundle` | — | **不存在** | 新建：包格式的唯一定义，编译器/控制面/节点三方共用 |
 | `deis-store` | `deis-store` | **不存在** | 有：KV / Database / Blob 三套 gRPC |
 | `deis-queue` | `deis-queue` | **不存在** | 有：Send / Pull / Ack / Nack / 死信 |
-| `deis-telemetry` | `deis-telemetry` | **不存在** | 有：PushLogs / Query / Tail / PushMetrics / Prometheus |
+| `deis-telemetry` | `deis-telemetry` | **不存在** | 有：PushLogs / Query / Tail、PushTraces / QueryTraces / TailTraces、PushMetrics / QueryMetrics / Prometheus |
 
 三个新组件各自独立进程、独立数据目录、独立端口。它们都是「哑」服务：只认**一个**租户维度，不认版本、不认部署、不回调任何人。
 
@@ -102,7 +104,13 @@ assets/                  # 静态资产，原样保留目录结构
   "queues": [ { "name": "jobs", "batch_size": 10 } ],
   "assets": [
     { "path": "index.html", "sha256": "…", "content_type": "text/html", "size": 512 }
-  ]
+  ],
+  "site": {
+    "redirects": [ { "from": "/old", "to": "/new", "status": 301 } ],
+    "headers": [ { "pattern": "/assets/*", "set": [ { "name": "cache-control", "value": "public, max-age=31536000" } ], "remove": ["x-robots-tag"] } ],
+    "not_found": "404-page"
+  },
+  "limits": { "timeout_ms": 1000, "memory_mb": 64 }
 }
 ```
 
@@ -110,6 +118,18 @@ assets/                  # 静态资产，原样保留目录结构
 
 - `secrets` 只列名字，值永远不进包。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
+- `site` 是静态站点自己带的规则，包里没有这些规则时整个键不出现。三样东西：
+  `redirects` 是 `_redirects` 解析出来的表（**顺序即语义**，首条命中者胜，200 是改写、
+  404 是带 404 状态返回目标）；`headers` 是 `_headers` 解析出来的表（所有命中的块叠加，
+  靠后的覆盖靠前的）；`not_found` 是 `none` / `404-page` / `single-page-app` 三选一。
+  `_redirects` 和 `_headers` 这两个文件本身**不进 `assets/`**——内容已经在这里，再当
+  文件发一份等于把站点自己的规则公开出去。格式由 `deis-bundle` 的 `site` / `redirects`
+  / `headers` 三个模块唯一定义，编译器解析、节点编译成表，两边共用同一份代码。
+- `limits` 是这个应用**要求自己被管得更严**的那几个上限：`memory_mb`、`timeout_ms`、
+  `rate_limit_ops_per_sec`、`cpu_time_limit_ms`、`resource_table_max`，都可省略，省略
+  就是「随节点的默认值」。控制面在上传时解析一次、随部署下发；节点拿到之后对着自己的
+  配置逐字段夹一次，所以这里写得比节点宽的值只会得到节点的值加一条告警。写 `0` 会被
+  拒绝而不是当成「没填」——传输格式上 `0` 就是缺省的哨兵值。
 - `routes[].pattern` 用 `:name` 占位，运行时据此填 `context.params`；`methods` 为空数组表示任意方法。字段名与 `management.proto` 的 `RouteRule.pattern` / `RouteRule.methods` 一一对应。
 - 通配捕获 `/api/*`（来自 `functions/api/[[catch]].ts`）由运行时匹配器支持，捕获到的剩余路径以 `*` 为键放进 `context.params`，同时也以文件里写的名字（上例是 `catch`）放一份。
 - **函数根下以下划线开头的文件不是路由**，而是平台自己调用的处理函数，由入口模块以具名导出的形式暴露：
@@ -195,9 +215,19 @@ CREATE TABLE secrets (
 `crates/deis-control/src/catalog/`。REST 在 `api/catalog/`：应用、版本（上传/下载）、
 环境、部署、回滚、路由、密钥。
 
-**一处例外**：`routes` 表建了、REST 有了，但**没有任何消费方**——deis-proxy 至今
-只按域名或 `x-deis-app-id` 选应用，不读 `path_prefix`。表里存进去的路径前缀现在
-不影响任何请求的去向。
+**这里曾经有一处例外**：`routes` 表建了、REST 有了，却没有任何消费方。现在有了——
+控制面在 `deis_wire::conventions::ROUTING_TABLE_ROUTE`（`GET /api/routing-table`）上
+另供一份给数据面用的路由表，deis-proxy 每 5 秒拉一次并按它选应用，`path_prefix` 真的
+影响请求的去向。这条路径和给控制台看的 `GET /api/routes` 形状不同：带环境的**名字**
+而不是内部主键（名字才是 `x-deis-environment` 上传的值）、带上**所有存在的环境**（哪怕
+它一条路由都没有，前门才好给它一个自动地址）、带一个整表版本号（拉的人不必逐行比对）。
+它挂在节点用的那套鉴权下面而不是人用的那套——一张不鉴权的路由表等于把这套装机的应用
+清单和域名清单发给任何能连上端口的人。
+
+同一轮还加了一条给数据面 CLI 用的端点：
+`GET /api/apps/:app_id/environments/:env/storage-token`，凭部署用的那把 API key，答出
+租户名、deis-store 地址和一枚能力令牌。`deis kv` / `deis db` / `deis blob` 靠它，
+省得运维自己去铸令牌。
 
 ---
 
@@ -419,10 +449,10 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 
 ### 仍然开着的
 
-- **`UpdateApp` 仍带 `bytes package_data`**，与被删的 `DeployApp` 同源。RPC 已是 `Unimplemented`，字段还在；删它要同时改 `crates/deis-runtime/proto/management.proto` 与 `crates/deis-runtime/src/management/{service.rs,service_test.rs}`。
-- **控制面的 `routes` 表没人消费**：表、REST（`GET /api/routes`）都有，deis-proxy 仍只按域名或 `x-deis-app-id` 选应用，`path_prefix` 不影响任何请求的去向。预览子域（`<env>.<app>.<zone>`）也卡在这条链路上。
+- ~~**`UpdateApp` 仍带 `bytes package_data`**~~ **已关闭**：字段删了，字段号和名字都写成 `reserved`，免得将来有人拿同一个号装别的东西、和旧客户端悄悄对不上。RPC 本身仍是 `Unimplemented` 并指向 `ApplyDeployment`。
+- ~~**控制面的 `routes` 表没人消费**~~ **已关闭**：控制面另供 `GET /api/routing-table`，deis-proxy 每 5 秒拉一次，路径前缀真的影响去向；每个环境还多了一个自动地址 `<环境>--<应用>.<域>`（默认环境另有短名 `<应用>.<域>`），由 proxy 配置里的 `routing.preview_zone` 打开。分隔符是标签内的 `--` 而不是点，因为一张通配证书只覆盖一层标签。**仍要人手做的**：那条通配 DNS 记录和那张通配证书——ACME 自动签发还没做。
 - **只有 deis-runtime 在往 deis-telemetry 投递**：deis-proxy / deis-store / deis-queue / deis-control 都还只写自己的 stdout。
-- **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent` 已经有了）。队列消费目前由节点自己按 `(应用, 环境)` 轮询，不走这个消息，所以还没被踩到。
+- **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent` 已经有了），而且它的 `QueueMessage.body` 还是 `string`，与真正在用的 `queue.proto`（已改成 `bytes`）不一致。队列消费目前由节点自己按 `(应用, 环境)` 轮询，走的是 `queue.proto`，不走这个消息，所以两处都还没被踩到；一旦有别的调用方用 `Trigger/OnQueue` 投递批次，就会既指不准环境、又损坏二进制消息体。
 - ~~**Web 标准的全局大半没装上，`fetch` 也在其中**~~ **已关闭**：这一条记的是
   2026-08-29 之前、`fetch` 本身都还没挂上全局名那个阶段的探针结果，早已被后续几轮
   超过。现状见 `docs/architecture.zh.md` §12「Web 标准这一格的实情」——
@@ -448,7 +478,9 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
   此刻根本没有字节码在跑，裁断打不到它身上，这条运行时线程还是会一直等下去——真正
   的解法是给 deis-store / deis-queue 的每次调用配自己的超时。模块顶层求值另外多了
   一条应用怎么覆盖都碰不到的硬上限（5 秒，`MODULE_EVALUATION_BUDGET_MS`，不进
-  `AppConfig`）；请求 / 队列 / cron 的超时仍是纯应用覆盖，没有这样的天花板。详见
+  `AppConfig`）。**「请求 / 队列 / cron 的超时没有天花板」这半句已经不成立**：现在
+  每一项限额都在节点侧对着节点自己的默认值夹一次，应用只能收窄；另外多了一道 CPU
+  时间闸（默认 5 秒，只在能读 `/proc` 的机器上成立）。详见
   `docs/architecture.zh.md` §9。
 - **`StartInspectRequest` 已加 `environment`**，但调试通道本身还只覆盖到单个环境的用法。
 
@@ -461,7 +493,30 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 | C3 | 文档与能力矩阵回填 | 完成：README、`architecture.zh.md`、本文与 `edge-canon/PLATFORM_MATRIX.md` 已按代码逐项核对 |
 | C4 | `scripts/demo.sh` 的部署动作改走 CLI，并补上 CLI 自身的验收 | 完成：deploy / secret set / rollback 不再打 REST，新增 6 条检查（部署、版本、密钥列名、tail、status、节点注册） |
 
-### 清掉的历史遗留（同一轮）
+### 波次 D（2026-08-30 起，对着 Cloudflare 评审的结论做的）
+
+`docs/cloudflare-comparison.zh.md` 逐面比过一遍之后，列出来的十三条真实缺口里关掉了
+五条，另有两次依赖升级。
+
+| 编号 | 内容 | 状态 |
+|---|---|---|
+| D1 | 静态站点规则：`_redirects` / `_headers` / SPA 兜底 / 自定义 404，加 `env.ASSETS.fetch()` | 完成。格式定义在 `deis-bundle`，编译器与节点共用；构建期解析、写错就构建失败并报行号；节点装载一版时编译成表，请求路径上应用 |
+| D2 | 控制面的路由接到 deis-proxy | 完成。`GET /api/routing-table` + 5 秒轮询；控制面不可达时最后一张表无限期继续生效；一张表要么整份换上要么整份不要 |
+| D3 | 数据面 CLI：`deis kv` / `deis db` / `deis blob` | 完成。配套的存储令牌端点也已提供 |
+| D4 | 按次调用的轨迹与延迟直方图 | 完成。deis-telemetry 的 `TraceService`，读的一头是 `deis trace`（可按结局、类型、状态码、时间段、耗时下限、轨迹号筛，也能 `--follow`） |
+| D5 | CPU 时间上限 | 完成，但只在能读 `/proc` 的机器上成立；读不到的机器启动时以 error 级别说明 |
+| D6 | 把「写好了但没有调用点」的六个功能接到真实请求路径上 | 完成。找法是从上一波每个新符号往外走看有没有调用者，这条检查从此是「关掉一条缺口」的收尾动作 |
+| D7 | 前门升到 pingora 0.8.1 | 完成。0.5 带两个请求走私漏洞；顺带堵上请求体上限对「自称升级」的请求一律放行那个洞 |
+| D8 | 运行时离开 deno 私有分支，改用发布版 `deno_runtime` 0.266 | 完成。`cargo audit` 从 13 条降到 4 条，剩下四条的理由写在 `.cargo/audit.toml` |
+
+D6 值得单独记一笔，因为它是这个仓库反复出现的第二种走样。第一种是「文档声称的能力
+代码里没有」；第二种是**代码里有、测试也有、注册也做了，但没有任何一条真实请求走得
+到它**。D1 的规则只有测试在调，HTTP 入口还在做朴素的索引查找；`env.ASSETS` 只有
+Rust 那一半；内存截断的计数器从来没人加过，于是运维从它读到的是「从来没有 isolate
+撑爆过堆」；清单里的 `limits` 块走到消息里就停住，节点建配置时写的是 `None`；轨迹
+有生产者没有读者；数据面 CLI 要调的端点控制面没提供。六条都是这一类。
+
+### 清掉的历史遗留（波次 C 同一轮）
 
 - `crates/deis-build/.github/` —— 编译器还是独立仓库时留下的 workflow。嵌套的
   `.github` 在 GitHub 上不生效，已删除。**本仓库现在没有任何 CI workflow**，要补

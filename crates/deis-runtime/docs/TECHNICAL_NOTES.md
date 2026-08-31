@@ -177,7 +177,12 @@ HTTP 请求流程；具体到多少个、哪些文件，`cargo test -p deis-runt
   两边互相校验，不会各说各的。
 - **认证授权**（应用面向自己用户的 API key / JWT / OAuth2）：这是应用要自己
   实现的东西，平台目前不提供现成组件。
-- **WebAssembly**：没有 WASM 模块支持。
+- **WebAssembly**：这一条以前写的是「没有 WASM 模块支持」，与代码不符。模块装载器
+  认 `.wasm`（`runtime/loader.rs` 把媒体类型是 Wasm 的条目按 `ModuleType::Wasm`
+  交给 `deno_core`），所以包里带一个 `.wasm` 可以直接 import。**没有的是端到端的
+  证据**：`loader.rs` 的两个测试只验到「分类对了」，仓库里没有任何测试真的实例化
+  一个 wasm 模块并调它的导出，`globalThis.WebAssembly` 也不在 `isolate_test.rs`
+  那份两向断言的全局清单里——它是 V8 自带的，但这里没有任何东西盯着它别丢。
 - **多地域部署**：没有跨地域同步机制；一个节点连一份控制面、服务一份配置表。
 
 KV/SQL/Blob 的持久化已经是真的——`crates/deis-store` 用每租户一个 SQLite 文件

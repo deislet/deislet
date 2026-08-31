@@ -11,7 +11,10 @@ English: [README.md](README.md)。
 ## 它做什么
 
 - **静态资产先于 Isolate**。请求路径命中包内资产清单时，直接从内存应答，ETag 就是
-  这个资产自己的 sha256；带 `If-None-Match` 再来就是 304。
+  这个资产自己的 sha256；带 `If-None-Match` 再来就是 304。这一版自己带的站点规则也在
+  这条路上生效：`_redirects`（按作者写的顺序，首条命中者胜）、`_headers`（所有命中的
+  块叠加，靠后的覆盖靠前的）、以及路径谁都没认领时的兜底（`none` / `404.html` 页 /
+  单页应用外壳）。处理函数想为自己挑的路径要同样的答案，调 `env.ASSETS.fetch()`。
 - **跑处理函数**。`export default function handler(context)`。包内 manifest 里的路由
   占位符进 `context.params`。
 - **消费队列、执行 cron**。按 manifest 声明的每个队列轮询 deis-queue，把消息交给应用
@@ -20,7 +23,10 @@ English: [README.md](README.md)。
   校验 sha256、装好，全部装好之后才报 healthy。之后新的部署以 gRPC 推送到达。那两条
   HTTP 路径是 `deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`，
   两条都要带节点凭据（`[control] secret`）——清单里带着解密后的密钥。
-- **投递日志与指标**给 deis-telemetry，攒批发送；缓冲满了丢最旧的，而不是一直涨。
+- **投递日志、指标与调用轨迹**给 deis-telemetry，攒批发送；缓冲满了丢最旧的，而不是
+  一直涨。轨迹是一次调用一条——请求、队列批次、cron 触发、WebSocket 消息各算一次——
+  记的是**这个节点做的判定**，所以「应用自己抛了」和「我们把它切断了」是两条不同的
+  记录。读的一头是 `deis trace`。
 
 它自己有一份本地 SQLite，控制面联系不上时照样能服务已有的东西——报 UNHEALTHY、
 持续重试，而不是停摆。「自治」指的是这一点；**「它从不外连」这句已经不成立了**。
@@ -45,14 +51,36 @@ TOML 路径大写、用下划线连起来、前面加 `DEIS_RUNTIME_`。
 
 | 限额 | 默认 | 在哪配 |
 |---|---|---|
-| 单次调用墙钟时间 | 30 秒 | `[default_execution_limits] timeout_ms`，应用可覆盖 |
-| op 派发速率 | 1000 次/秒 | `[default_execution_limits] rate_limit_ops_per_sec`，应用可覆盖 |
-| V8 堆 | V8 自己的默认 | 应用的 `ResourceLimits.memory_mb`；不设就不加天花板 |
+| 单次调用墙钟时间 | 30 秒 | `[default_execution_limits] timeout_ms` |
+| 单次调用 CPU 时间 | 5 秒 | `[default_execution_limits] cpu_time_limit_ms` |
+| `waitUntil` 尾巴 | 30 秒 | `[default_execution_limits] wait_until_timeout_ms`，没有按应用覆盖的字段 |
+| op 派发速率 | 1000 次/秒 | `[default_execution_limits] rate_limit_ops_per_sec` |
+| 单个 Isolate 的 V8 堆 | 256 MB | `default_memory_limit_mb` |
+| 请求体 | 32 MB | `max_request_body_bytes` |
 | 单个包的下载体积 | 256 MB | `[bundles] max_bytes` |
 | 单个版本常驻内存的资产总量 | 128 MB | `[assets] max_bytes` |
 
-有两样**不在**这张表里，而且要紧：**没有 CPU 时间限制**——30 秒是墙钟，一个卡在慢
-依赖上的处理函数能把它那条线程占满整整 30 秒；**没有出网策略**。
+**应用只能收窄，不能放宽。** 包清单里的 `limits` 块可以要更小的堆、更短的墙钟、更低的
+op 速率、更少的 CPU 时间或更小的资源表；控制面解析一次、随部署下发，节点再对着上面
+这张表里自己的值夹一次。一个要一小时 CPU 的清单拿到的是这个节点的上限，外加一条 warn
+说明夹了什么、真想让这台机器扛那么久该去改哪个配置项。字段写成 `0` 会被拒绝而不是当
+「没填」——传输格式上 `0` 就是「缺省」的哨兵值，一个写了 `"timeout_ms": 0` 的应用应该
+得到那句拒绝，而不是悄悄拿到节点默认值。
+
+关于那两道调用级的闸，有两点要说清楚：
+
+- **CPU 那道闸要有 `/proc`**。它读的是被看守那条线程自己的
+  `/proc/<进程>/task/<线程>/stat`，所以 macOS、Windows、`/proc` 被藏起来的容器上都
+  没有。`Watchdog::start` 每个进程说一次，级别是 **error**，点名哪条限额没在执行、
+  还剩哪条在执行。读数按调度时钟滴答走，实际是 10 毫秒一跳，所以可配的最小值是
+  100 毫秒。
+- **CPU 上限不比墙钟上限小就永远不会响**，因为一条线程烧掉的 CPU 时间不可能多过它
+  占用的墙钟时间。节点启动时按应用说出来，不留给人去撞。
+
+还有一样这张表写不进去：**一次自己没有超时的原生调用**。看守线程能打断的是 V8 正在
+跑的字节码，而一个卡在 `await ctx.services.kv.get(...)` 上的处理函数此刻没有字节码在
+跑。出站 `fetch` 是有覆盖的（见下文），但 kv、SQL、blob、队列这几个客户端没有各自的
+调用超时，所以一个收下连接却永不应答的存储进程，能把那条运行时线程一直占着。
 
 ## 应用能拿到什么
 
@@ -63,9 +91,10 @@ TOML 路径大写、用下划线连起来、前面加 `DEIS_RUNTIME_`。
 | `context.request` | 请求 |
 | `context.params` | manifest 里的路由占位符 |
 | `context.env` | 这个环境的变量与密钥；平台保留键在进 Isolate 之前已被取走 |
-| `context.services.kv` | `get` / `getWithMetadata` / `put` / `delete` —— deis-store |
-| `context.services.database` | `query` / `execute` —— deis-store，每租户一个 SQLite 文件 |
-| `context.services.blob` | `get` / `put` / `delete` —— deis-store，内容寻址 |
+| `context.env.ASSETS` | `fetch(请求 \| URL \| 路径)` —— 这一版自己的静态文件，走的是 HTTP 入口用的同一套 `_redirects` 与兜底规则。`ASSETS` 是保留键：部署里带了同名变量，在这张表变成 `context.env` 之前就被取走了 |
+| `context.services.kv` | `get` / `getWithMetadata` / `put` / `delete` / `list({ prefix, limit, cursor })` —— deis-store |
+| `context.services.database` | `query` / `execute` / `batch` / `transaction(回调)` —— deis-store，每租户一个 SQLite 文件。`transaction` 是真的交互式事务：`BEGIN IMMEDIATE` 在回调期间钉住一条连接，服务端有自己的硬超时，到点回滚并把连接放回去 |
+| `context.services.blob` | `get` / `put` / `delete` —— deis-store，内容寻址。没有 `list` / `head` / 按字节范围读：`BlobStore` 服务本身只有这三个调用 |
 | `context.services.queue` | `send`，以及 `to(name)` 投给默认队列以外的队列 —— deis-queue |
 | `context.services.cache` | Cache API，进程内、按 Isolate 隔离 |
 | `context.log` | `debug` / `info` / `warn` / `error`，在每条调用路径上都有，cron 与队列也不例外 |
@@ -120,8 +149,15 @@ Isolate 的时间侧信道——这个节点上好几个租户的 Isolate 共用
 
 这份清单不是一次性探针的结果。`src/runtime/isolate_test.rs` 里的
 `the_isolate_global_surface_is_the_one_the_documents_describe` 会在真 Isolate 里
-把上面两列逐个走一遍，而且**两个方向都断言**：该有的少一个红，不该有的多一个也红。
-所以往 `globalThis` 上加东西会直接把这条测试打红，逼着本节跟着改。
+跑一遍，而且**两个方向都断言**：该有的少一个红，不该有的多一个也红。所以往
+`globalThis` 上加东西会直接把这条测试打红，逼着本节跟着改。
+
+覆盖范围要说清楚：「有」那一列是**逐个都断言**的；「没有」那一列只断言前四个
+——`Deno`、`__bootstrap`、`addEventListener`、`BroadcastChannel`，这四个是**有意
+不给**的，各有各的理由。后面七个（`MessageChannel`、`MessagePort`、
+`CompressionStream`、`DecompressionStream`、`EventSource`、`FileReader`、
+`reportError`）只是还没人去挂，不是谁决定了不给，所以哪天挂上它们不该让这条测试
+变红。要把其中一个搬进测试那份清单，得先给出一个「就是不给」的理由。
 
 `Request`、`Response`、`Headers`、`URL`、几个流、定时器和 `crypto` 都是 Deno 的真类，
 所以 `Response.json()`、`response.arrayBuffer()` 和流式 body 的行为跟浏览器里一样。

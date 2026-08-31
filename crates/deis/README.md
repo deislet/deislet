@@ -8,8 +8,11 @@ apart is the point:
   produces what that vendor's own tooling deploys; this CLI never pushes to
   them.
 - **A Deislet platform.** `deis deploy`, `deis versions`, `deis rollback`,
-  `deis status`, `deis secret`, `deis logs` and `deis tail` talk to a
-  `deis-control` and, for logs, a `deis-telemetry`.
+  `deis status`, `deis secret`, `deis logs`, `deis tail`, `deis trace`,
+  `deis kv`, `deis db` and `deis blob` talk to a `deis-control`; for logs and
+  traces, also to a `deis-telemetry`; and for the last three, to a
+  `deis-store` whose address and capability token the control plane hands
+  out.
 
 `deis deploy` targets **this** platform only. There is deliberately no
 `--vendor` on it: it could never have pushed to Cloudflare or Deno, and a
@@ -199,9 +202,71 @@ one particular environment are always kept — they are usually the ones that
 explain why an application is not running.
 
 Neither command needs a control plane configured: reading logs is not a
-control-plane operation.
+control-plane operation. `deis trace` is the same — it reads deis-telemetry.
+`deis kv`, `deis db` and `deis blob` do need one, because that is where the
+capability token comes from.
 
 `Ctrl-C` ends a tail cleanly.
+
+### `deis trace`
+
+One row per invocation, from what the nodes report to deis-telemetry.
+`deis logs` shows what an application *said*; this shows what the platform
+*decided*.
+
+```bash
+deis trace --outcome failed --since 30m
+deis trace --kind queue --min-duration 500
+deis trace --status 5xx --limit 20
+deis trace --trace-id 4f2c…          # the same id deis logs --trace-id takes
+deis trace --follow
+```
+
+`--outcome` is one of `ok`, `app-error`, `timeout`, `rate-limited`,
+`memory-limit`, `cpu-limit`, `internal-error`, or `failed` for every one but
+`ok`; it is repeatable. So is `--kind` (`http`, `queue`, `cron`,
+`websocket`). `--status` takes a code (`500`) or a class (`5xx`) and is
+applied by this CLI rather than by deis-telemetry. `--since`/`--until`,
+`--target-contains` and `--min-duration` narrow further; `--follow` streams
+from now on and is exclusive with the range filters.
+
+The distinction that makes this worth having: an invocation the application
+threw in and one the platform cut off are different outcomes, so "show me
+what we killed today" is a question with an answer.
+
+### `deis kv`, `deis db` and `deis blob`
+
+The data plane, for the day an operator has to look at what an application
+actually stored.
+
+```bash
+deis kv list --prefix user: -e preview
+deis kv get session:abc --file ./out.bin
+deis kv put flag:beta on --ttl 3600
+deis db query "SELECT id, email FROM users WHERE id = ?" --param 42
+deis db execute "UPDATE users SET email = ? WHERE id = ?" --param a@b.c --param 42 -y
+deis blob get avatars/42.png --file ./42.png
+deis blob put avatars/42.png --file ./42.png --content-type image/png
+```
+
+Values go in from a file (or on stdin) and come out to a file, so binary
+content never has to pass through a shell; a value that is not valid UTF-8 is
+described — size and a hex preview — rather than printed at a terminal.
+`--param` is given once per `?` in order, and each one is read as JSON when it
+parses (`42`, `true`, `null`, `"quoted"`) and as a plain string otherwise.
+
+The three destructive verbs — `kv delete`, `db execute`, `blob delete` — ask
+for the tenant to be typed back before they run. `-y`/`--yes` skips that, for
+scripts. These commands do not talk to deis-store on their
+own authority: they ask the control plane for this `(app, environment)`'s
+capability token first, with the same credential that deploys, and the
+control plane answers with the tenant name, the store address and the token.
+Nothing is minted by hand.
+
+Two shapes deliberately missing, because the service behind them has no such
+call: `deis blob` has no `list` (`BlobStore` is `Put`/`Get`/`Delete` only),
+and `deis db` has no `batch` or interactive transaction — an application gets
+both through `context.services.database`, the command line does not.
 
 ### `deis config set|get|unset|list`
 

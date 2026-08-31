@@ -199,6 +199,27 @@ deis logs --since 15m -l error
 deis tail -e preview
 ```
 
+`deis logs` shows what the application said. When nothing was said — a request
+that timed out, or one the platform cut off — ask what the platform decided
+instead:
+
+```bash
+deis trace --outcome failed --since 15m
+deis trace --follow
+```
+
+One row per invocation, with the outcome the node chose: `timeout`,
+`rate-limited`, `memory-limit`, `cpu-limit`, `app-error`. Each row carries a
+trace id, and `deis logs --trace-id <id>` gives that invocation's own lines.
+
+To look at what the application actually stored:
+
+```bash
+deis kv list --prefix session:
+deis db query "SELECT count(*) FROM users"
+deis blob get avatars/42.png --file ./42.png
+```
+
 ```bash
 deis versions
 ```
@@ -249,11 +270,12 @@ deis status --json   | jq '.nodes[] | select(.reachable | not) | .id'
 deis deploy --json   | jq -e '.delivery.failed | length == 0'
 ```
 
-`deis tail --json` prints one object per line instead, because a stream has
-no end:
+`deis tail --json` and `deis trace --follow --json` print one object per line
+instead, because a stream has no end:
 
 ```bash
 deis tail --json | jq -r 'select(.level == "ERROR") | .message'
+deis trace --follow --json | jq -r 'select(.outcome != "ok") | .target'
 ```
 
 ## Where to look next

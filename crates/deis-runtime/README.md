@@ -14,7 +14,12 @@ Chinese: [README.zh.md](README.zh.md).
 
 - **Serves static assets before starting an isolate.** A request whose path
   names a file in the bundle's asset index is answered from memory with the
-  asset's own sha256 as the ETag; `If-None-Match` turns that into a 304.
+  asset's own sha256 as the ETag; `If-None-Match` turns that into a 304. The
+  version's own site rules apply on the way through — `_redirects` (author
+  order, first match wins), `_headers` (every matching block, later wins) and
+  the not-found behaviour (`none`, the `404.html` page, or the single-page
+  shell). A handler that wants the same answer for a path it chose calls
+  `env.ASSETS.fetch()`.
 - **Runs the handler.** `export default function handler(context)`. Route
   placeholders from the bundle's manifest land in `context.params`.
 - **Consumes queues and cron.** It polls deis-queue for every queue the
@@ -27,8 +32,11 @@ Chinese: [README.zh.md](README.zh.md).
   `deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`
   and both need the node credential (`[control] secret`), because the
   assignment list carries decrypted secrets.
-- **Ships logs and metrics** to deis-telemetry in batches, dropping the oldest
-  when the buffer fills rather than growing without bound.
+- **Ships logs, metrics and traces** to deis-telemetry in batches, dropping the
+  oldest when the buffer fills rather than growing without bound. One trace per
+  invocation — request, queue batch, cron tick, WebSocket message — carrying
+  the outcome *this node* decided, so "the app threw" and "we cut it off" are
+  different records. `deis trace` reads them back.
 
 It keeps its own state in a local SQLite database and can serve what it
 already has when the control plane is unreachable — it reports UNHEALTHY and
@@ -59,15 +67,43 @@ repository root brings up six processes with an example application deployed.
 
 | Limit | Default | Where |
 |---|---|---|
-| Wall-clock per invocation | 30 s | `[default_execution_limits] timeout_ms`, per-app override |
-| Op dispatch rate | 1000 ops/s | `[default_execution_limits] rate_limit_ops_per_sec`, per-app override |
-| V8 heap | V8's own default | per-app `ResourceLimits.memory_mb`; unset means no ceiling is imposed |
+| Wall-clock per invocation | 30 s | `[default_execution_limits] timeout_ms` |
+| CPU time per invocation | 5 s | `[default_execution_limits] cpu_time_limit_ms` |
+| `waitUntil` tail | 30 s | `[default_execution_limits] wait_until_timeout_ms` — no per-app key |
+| Op dispatch rate | 1000 ops/s | `[default_execution_limits] rate_limit_ops_per_sec` |
+| V8 heap per isolate | 256 MB | `default_memory_limit_mb` |
+| Request body | 32 MB | `max_request_body_bytes` |
 | Bundle download | 256 MB | `[bundles] max_bytes` |
 | Assets held in memory per version | 128 MB | `[assets] max_bytes` |
 
-Two things this list does **not** include, and they matter: there is no CPU
-time limit — the 30 s is wall clock, and a handler parked on a slow dependency
-holds its thread for the whole of it — and there is no egress policy.
+**An application narrows, it never widens.** A bundle manifest's `limits` block
+may ask for less memory, less wall clock, a lower op rate, less CPU time or a
+smaller resource table; the control plane parses it once and sends it with the
+deployment, and this node clamps every field against its own value above. A
+manifest asking for an hour of CPU gets this node's ceiling and a `warn` naming
+what was clamped and which setting to raise if the node really is meant to
+carry that. A field written as `0` is refused rather than read as "unset",
+because `0` *is* the absent sentinel on the wire and an application that wrote
+`"timeout_ms": 0` deserves the refusal rather than the node default.
+
+Two things about the two invocation ceilings:
+
+- **The CPU ceiling needs `/proc`.** It is sampled from the watched thread's
+  own `/proc/<pid>/task/<tid>/stat`, so it does not exist on macOS, on Windows,
+  or in a container with `/proc` hidden. `Watchdog::start` says so once per
+  process at `error`, naming the ceiling that is not being enforced and what is
+  left enforcing anything. The reading advances in scheduler ticks — 10 ms in
+  practice — which is why the smallest configurable value is 100 ms.
+- **A CPU ceiling at or above the wall-clock one can never fire**, because one
+  thread cannot spend more CPU time than wall-clock time. The node says so per
+  application at startup rather than leaving it to be discovered.
+
+There is one limit this table cannot express: a native call with no timeout of
+its own. The watchdog interrupts V8 bytecode, and a handler parked on
+`await ctx.services.kv.get(...)` is not running any. Outbound `fetch` is
+covered — see below — but the kv, SQL, blob and queue clients have no per-call
+deadline, so a storage process that accepts the connection and never answers
+keeps that runtime thread waiting.
 
 ## What an application can reach
 
@@ -78,9 +114,10 @@ holds its thread for the whole of it — and there is no egress policy.
 | `context.request` | the request |
 | `context.params` | route placeholders from the manifest's patterns |
 | `context.env` | the environment's variables and secrets, as delivered; platform-reserved keys are removed before the isolate sees them |
-| `context.services.kv` | `get`, `getWithMetadata`, `put`, `delete` — deis-store |
-| `context.services.database` | `query`, `execute` — deis-store, one SQLite file per tenant |
-| `context.services.blob` | `get`, `put`, `delete` — deis-store, content-addressed |
+| `context.env.ASSETS` | `fetch(request \| url \| path)` — this version's own static files, through the same `_redirects` and not-found rules the HTTP entry uses. A reserved key: a deployment shipping `ASSETS=...` has it removed before the map becomes `context.env` |
+| `context.services.kv` | `get`, `getWithMetadata`, `put`, `delete`, `list({ prefix, limit, cursor })` — deis-store |
+| `context.services.database` | `query`, `execute`, `batch`, `transaction(cb)` — deis-store, one SQLite file per tenant. `transaction` is a real interactive one: `BEGIN IMMEDIATE` pins a connection for the length of the callback, and the store rolls back and releases it on its own deadline |
+| `context.services.blob` | `get`, `put`, `delete` — deis-store, content-addressed. No `list`, `head` or range read: the `BlobStore` service has only those three calls |
 | `context.services.queue` | `send`, and `to(name)` for a queue other than the default — deis-queue |
 | `context.services.cache` | the Cache API, in-process per isolate |
 | `context.log` | `debug`, `info`, `warn`, `error` — the structured log line, on every invocation path including cron and queue |
@@ -145,11 +182,20 @@ own connector). The line is still deliberate — not "whatever deno_web
 happens to load" — it is just longer than section 8.1 alone.
 
 That measurement is not a one-off. `the_isolate_global_surface_is_the_one_the_documents_describe`
-in `src/runtime/isolate_test.rs` walks both lists in a real isolate and
-asserts **both directions**: a name that should be there and is not fails, and
-so does a name that should not be there and is. Adding a global therefore
-turns that test red until this section is updated with it, which is what keeps
-the two from drifting apart.
+in `src/runtime/isolate_test.rs` drives a real isolate and asserts **both
+directions**: a name that should be there and is not fails, and so does a name
+that should not be there and is. Adding a global therefore turns that test red
+until this section is updated with it, which is what keeps the two from
+drifting apart.
+
+The present list above is asserted in full. The absent list is not: the test
+names `Deno`, `__bootstrap`, `addEventListener` and `BroadcastChannel`, the
+four that are absent by decision and each carry a reason. The other seven —
+`MessageChannel`, `MessagePort`, `CompressionStream`, `DecompressionStream`,
+`EventSource`, `FileReader`, `reportError` — are absent because nobody has
+bound them, not because anything decided they should stay out, so binding one
+is a change this test is meant not to obstruct. Move it into the test's list
+only alongside a reason for keeping it out.
 
 `Request`, `Response`, `Headers`, `URL`, the streams, the timers and `crypto`
 are the real Deno classes, so `Response.json()`, `response.arrayBuffer()` and

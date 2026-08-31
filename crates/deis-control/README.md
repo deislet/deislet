@@ -58,18 +58,29 @@ cd web && npm run dev      # http://localhost:5173, proxying the API
 The production build (`npm run build`) writes `web/dist`, which the Rust build
 embeds; `deis-control` then serves it at `/`.
 
+The console covers **fleet operations only**: a dashboard, the nodes, the open
+control channels, commands, events and node configuration. The catalog half of
+this process — applications, versions, environments, deployments, secrets,
+routes — has no page. Every one of those has a REST endpoint below and `deis`
+drives them; nothing about them is reachable by clicking.
+
 ## Two audiences, two credentials
 
 This is the part worth reading before changing anything about authentication.
 
 - **The human surface** — everything the console and `deis` call — is guarded by
   an API key, and `api_auth_enabled` turns that on and off. It defaults to off.
-- **The node surface** — a node's registration, its assignment list, and the
-  bundle download — carries its own authentication, and `api_auth_enabled` does
-  not reach it. The assignment list answers with every environment's
-  **decrypted** secrets, because a node that restarts has to come back with the
-  environment it had. A convenience flag for a dashboard must not be able to
-  open that.
+- **The node surface** — a node's registration, its assignment list, the bundle
+  download, and the routing table deis-proxy polls — carries its own
+  authentication, and `api_auth_enabled` does not reach it. The assignment list
+  answers with every environment's **decrypted** secrets, because a node that
+  restarts has to come back with the environment it had. A convenience flag for
+  a dashboard must not be able to open that. The routing table is on this
+  surface for a different reason: it names nothing secret, but it is a map of
+  every application and hostname this installation serves, and deis-proxy
+  already holds a node credential — the `[control] secret` in its own file is a
+  `node_preshared_keys` value, because that is what its gRPC control channel
+  authenticates with.
 
 An API key is not accepted on the node endpoints, and a node credential is not
 accepted on the human ones.
@@ -101,12 +112,21 @@ Everything below is on the single configured port.
 | `/api/apps/:app_id/environments/:env/routes/:route_id` | PUT, DELETE | |
 | `/api/apps/:app_id/environments/:env/secrets` | GET | Names and times only — no endpoint returns a value |
 | `/api/apps/:app_id/environments/:env/secrets/:name` | PUT, DELETE | |
-| `/api/routes` | GET | Every route in the catalog |
+| `/api/routes` | GET | Every route in the catalog, keyed by `env_id`. The human-facing view; the data plane reads a different one, see below |
+| `/api/apps/:app_id/environments/:env/storage-token` | GET | A capability token for this tenant, the store address, and the tenant name. What `deis kv` / `deis db` / `deis blob` call so nobody has to mint a token by hand. 409 when no `store_endpoint` is configured |
 
 An upload whose bytes are identical to an existing version reuses that version
-instead of burning a new number. Route records are stored and served but
-**deis-proxy does not consume them yet**; it still resolves an application by
-`Host` or by `x-deis-app-id`.
+instead of burning a new number.
+
+Routes are consumed. deis-proxy polls a second view of the same table —
+`deis_wire::conventions::ROUTING_TABLE_ROUTE`, on the node surface — and
+resolves an application by host and path prefix from it. That view is a
+different shape from `/api/routes` on purpose: it carries the environment's
+**name** rather than its `env_id` (the name is what travels in
+`x-deis-environment`), it lists **every** environment whether or not it has a
+route of its own (so the edge can offer one an automatic address), and it
+carries a version for the table as a whole (so a poller can tell "unchanged"
+from "changed" without diffing).
 
 ### Fleet and nodes
 
