@@ -22,6 +22,7 @@ use std::io::{Cursor, Read};
 use serde::{Deserialize, Serialize};
 
 pub mod assets;
+pub mod compatibility;
 pub mod headers;
 pub mod limits;
 pub mod path;
@@ -30,6 +31,10 @@ pub mod routing;
 pub mod site;
 
 pub use assets::{AssetIndex, AssetMatch, guess_content_type};
+pub use compatibility::{
+    CompatibilityDate, CompatibilityProfile, DeclaredCompatibility, FLAGS, Flag, FlagSpec,
+    PLATFORM_KNOWN_THROUGH, flag_spec, known_flag_names,
+};
 pub use headers::{HeaderField, HeaderRule, HeaderTable, parse_headers};
 pub use limits::DeclaredLimits;
 pub use path::{percent_decode, percent_encode_uri};
@@ -143,6 +148,22 @@ pub struct Manifest {
     /// field does enforce is the spelling - see [`DeclaredLimits`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<DeclaredLimits>,
+    /// Which day's platform this application was written against, and any
+    /// behaviour it takes early or holds back by name. `None` when the
+    /// application predates the mechanism, which pins it to the oldest
+    /// behaviour the platform has - see [`CompatibilityProfile::resolve`].
+    ///
+    /// Not judged by [`Manifest::validate`], for the reason [`Self::limits`]
+    /// is not: whether a declaration can be honoured is a question about the
+    /// *build that is asking*, not about the manifest. The same bundle is
+    /// perfectly good on a node built after the date it names and unusable on
+    /// one built before it, and a check inside `validate` would have to answer
+    /// for both. [`Manifest::compatibility_profile`] is the single place that
+    /// answers it, and every component calls it - the build with the project
+    /// file still on screen, the control plane at upload and again at
+    /// delivery, the node when it installs the version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<DeclaredCompatibility>,
 }
 
 /// A route pattern the runtime matches against to fill `context.params`.
@@ -243,6 +264,35 @@ impl Manifest {
             )));
         }
         Ok(())
+    }
+
+    /// The resolved compatibility answers for this bundle, or a refusal.
+    ///
+    /// **The single reader of the `compatibility` block.** The build calls it
+    /// so an author learns at compile time, the control plane calls it at
+    /// upload and again when it builds a delivery, and a node calls it when it
+    /// installs the version. Four callers, one answer, and none of them
+    /// repeats the reasoning.
+    ///
+    /// `Err` means *this build* cannot honour what the manifest declares: a
+    /// flag name it does not know, two flags that contradict each other, or a
+    /// date later than [`PLATFORM_KNOWN_THROUGH`]. It is a real answer and not
+    /// a formality - the same bundle returns `Ok` on a newer build, which is
+    /// exactly the mixed-fleet case this exists for, and it is why the refusal
+    /// lives here rather than in [`Manifest::validate`], which has no way to
+    /// say "not on this one".
+    ///
+    /// A manifest that declares nothing resolves to the oldest behaviour,
+    /// which is what an application written before any of this existed was
+    /// written against.
+    pub fn compatibility_profile(&self) -> std::result::Result<CompatibilityProfile, String> {
+        match &self.compatibility {
+            Some(declared) => {
+                declared.validate()?;
+                CompatibilityProfile::resolve(declared)
+            }
+            None => Ok(CompatibilityProfile::default()),
+        }
     }
 
     /// Whether the app declared it uses a given platform service.

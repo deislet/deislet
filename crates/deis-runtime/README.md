@@ -70,6 +70,7 @@ repository root brings up six processes with an example application deployed.
 | Wall-clock per invocation | 30 s | `[default_execution_limits] timeout_ms` |
 | CPU time per invocation | 5 s | `[default_execution_limits] cpu_time_limit_ms` |
 | `waitUntil` tail | 30 s | `[default_execution_limits] wait_until_timeout_ms` — no per-app key |
+| One streaming response body | 5 min | `[default_execution_limits] stream_timeout_ms` — no per-app key |
 | Op dispatch rate | 1000 ops/s | `[default_execution_limits] rate_limit_ops_per_sec` |
 | V8 heap per isolate | 256 MB | `default_memory_limit_mb` |
 | Request body | 32 MB | `max_request_body_bytes` |
@@ -98,12 +99,72 @@ Two things about the two invocation ceilings:
   thread cannot spend more CPU time than wall-clock time. The node says so per
   application at startup rather than leaving it to be discovered.
 
+The streaming ceiling is enforced differently from the two above it, and
+deliberately so. A response body that is still being produced has already been
+answered — the 200 and the headers left the node long ago — and it shares its
+isolate with every other request to the same application. So the node *closes
+the stream* when the budget runs out, rather than terminating the isolate: that
+client's transfer fails part-way, and the application's other streams and
+requests are untouched. The `warn` line names the stream, what it had sent and
+the ceiling it crossed. `cpu_time_limit_ms` is the other half and still
+terminates, because a producer that will not yield cannot be stopped any other
+way.
+
+One ceiling in the table applies to streaming without looking as though it
+does: `rate_limit_ops_per_sec`. One chunk written to a streaming body costs one
+op dispatch, so at the default a producer may write a thousand chunks a second
+whatever their size. An application writing very small chunks meets that
+ceiling long before it meets any byte rate; when it does, the node names the
+setting and the value rather than reporting the bare V8 unwind the limiter
+produces.
+
 There is one limit this table cannot express: a native call with no timeout of
 its own. The watchdog interrupts V8 bytecode, and a handler parked on
 `await ctx.services.kv.get(...)` is not running any. Outbound `fetch` is
 covered — see below — but the kv, SQL, blob and queue clients have no per-call
 deadline, so a storage process that accepts the connection and never answers
 keeps that runtime thread waiting.
+
+## Compatibility dates
+
+An application says which day's platform it was written against, in its project
+file and from there in its bundle manifest:
+
+```json
+"compatibilityDate": "2026-09-01",
+"compatibilityFlags": ["single_set_cookie_header"]
+```
+
+The date moves a batch of behaviours at once; a named flag moves exactly one,
+in either direction, so an application can take a fix early or hold one back.
+The vocabulary — the dates, the flag names, and what each one changes — is one
+table, `deis_bundle::compatibility::FLAGS`, shared by the build, the control
+plane, this node and the CLI.
+
+This node resolves the declaration once, when it installs a version, and every
+gate downstream asks `CompatibilityProfile::is_on(Flag::X)`. Nothing on the
+request path compares dates.
+
+**No date means the oldest behaviour, permanently.** An application deployed
+before any of this existed keeps every answer it was written against, and never
+receives a later fix that changes an observable behaviour. That is the only
+direction that cannot change a running application underneath it, and the price
+is paid out loud: the control plane warns at upload and at every delivery, this
+node warns when it installs one, `deis deploy` says so, and `deis versions`
+prints `none (oldest)` in its COMPAT column.
+
+**A date this build does not know is refused.** `PLATFORM_KNOWN_THROUGH` is
+where this build's knowledge stops, so "a date in the future" and "a date newer
+than this node" are the same question with the same answer. A push naming one
+is refused before the bundle is downloaded, and the response names both dates —
+the point being that a node which pretended would serve an application
+semantics it never asked for, with nothing downstream to say so.
+
+Today the table holds one behaviour: `multiple_set_cookie_headers`, on from
+2026-09-01. Before it, a response's headers left the isolate through a map, so
+a handler that set a session cookie and a CSRF cookie had one of them dropped —
+`Set-Cookie` is the one header the Fetch specification forbids combining. On,
+every one of them is sent.
 
 ## What an application can reach
 

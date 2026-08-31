@@ -1018,6 +1018,7 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_rolled_back() {
                 bundle_sha: sha.clone(),
                 env: HashMap::new(),
                 limits: None,
+                compatibility: None,
             })
             .await
             .unwrap();
@@ -1070,6 +1071,7 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
                 bundle_sha: sha.clone(),
                 env: HashMap::new(),
                 limits: None,
+                compatibility: None,
             })
             .await
             .unwrap();

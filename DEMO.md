@@ -46,9 +46,12 @@ curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
 过去，现在是控制面的目录说了算。自动预览地址不在演示范围内：那要在 proxy 配置里写
 `routing.preview_zone`，还要一条通配 DNS 记录和一张通配证书，演示里三样都没有。
 
-下面 `verify` 里发请求的各项，除了 WebSocket 那两项，都直接打节点，原因也在这里
-——要验的是控制面与节点这条线，让请求先绕一跳只会把失败点变多。WebSocket 那两项反过来专走 deis-proxy：升级是反向代理最容易弄坏的一种交换，
-这一跳需要单独证明代理没有把它搞砸，见下文「websockets」一节。
+下面 `verify` 里发请求的各项，除了 WebSocket 那两项和流式响应那几项，都直接打节点，
+原因也在这里——要验的是控制面与节点这条线，让请求先绕一跳只会把失败点变多。那两类
+反过来专走 deis-proxy，理由是同一条：它们是反向代理最容易弄坏的两种交换。升级见下文
+「websockets」一节；流式响应则是**前门有可能把它攒起来**——一个按 chunk 发的响应体，
+只要中间任何一层先收齐再转发，看起来就和从前那条「流不出去」的缺口一模一样，所以这
+一跳必须自己证明。
 
 ## 部署走的是真实路径
 
@@ -79,7 +82,7 @@ bundle_sha + 环境表），节点自己用 HTTP 把包拉下来、校验 sha256
 scripts/demo-assets/example-app/
   .config.json                     声明服务（kv + queue）、队列 jobs、cron「每分钟」、
                                    密钥名 DEMO_SECRET、变量 BUILD_LABEL 与 ASSETS、
-                                   资产目录与 notFound、limits（见下文）
+                                   资产目录与 notFound、limits 与 compatibilityDate（见下文）
   public/index.html                静态资产，`/` 直接命中它，不起 Isolate
   public/css/app.css
   public/404.html                  notFound = 404-page 时，无人认领的路径答的就是它
@@ -94,6 +97,8 @@ scripts/demo-assets/example-app/
   functions/api/slow.ts            -> /api/slow      按 ?ms= 空转这么久再应答
   functions/api/heap.ts            -> /api/heap      一直分配到把自己这只 Isolate 的堆撑爆
   functions/api/ws.ts              -> /api/ws        WebSocket 回声，见下文
+  functions/api/stream.ts          -> /api/stream    按 ?mode= 返回一条还在生产的响应体，见下文
+  functions/api/cookies.ts         -> /api/cookies   一次设两个 Set-Cookie，见下文
   functions/_queue.ts              队列消费函数（下划线开头 = 平台调用，不是路由）
   functions/_scheduled.ts          cron 处理函数，同上
 ```
@@ -106,6 +111,14 @@ scripts/demo-assets/example-app/
 所以证明的是二进制帧完整抵达了 Isolate（没被当成文本、没有丢字节），不是服务端向外
 发二进制帧的能力；后者另有独立的机制（`op_ws_server_send_binary`），这个示例处理函数
 没有用到它。
+
+`functions/api/stream.ts` 也不在仓库里，写进去的方式和上面那份一样
+（`scripts/demo.sh::add_stream_route`）。一个处理函数覆盖了流式检查需要的全部形状，靠
+`?mode=` 区分：`sse` 发若干帧再正常结束，`endless` 只要还有人读就一直发，`throw` 发几帧
+之后抛异常，`relay` 把 `?url=` 取回来的响应体原样交出去（自己一个字节都不读），`report`
+不是流——它回报「上一个被取消的生产者是谁」和「一共生产了多少帧」，这两个数是从外面
+分辨「客户端走了、生产者也停了」和「客户端走了、生产者还在写」的唯一办法。Isolate 会
+被后续请求复用，所以一个被取消的生产者能把这件事说给后来的请求听。
 
 `BUILD_LABEL` 是回滚那一项的抓手：v2 把它改成 `v2` 并顺手改了静态页面，回滚之后
 两样要一起变回 `v1`。
@@ -133,6 +146,18 @@ manifest，版本加载时编译一次，之后每个请求在**起 Isolate 之�
 两个处理函数：前者空转（不是 sleep——切断是靠终止 Isolate 生效的，在跑的代码才会立刻
 被切，睡着的代码要等事件循环下一次轮到它），后者一直分配稠密数组（不是字符串拼接——
 V8 用绳索表示拼接结果，看着像分配其实几乎不占内存）。
+
+`.config.json` 里的 `compatibilityDate` 是应用说自己是**照着哪一天的平台**写的。平台从
+那天起给出的答案会一直给它，之后的行为改动不会自己找上门；写日期是应用的事，构建不会
+替它填——填进去的日期会随日历自己动，同一份没改过的源码明天就编出另一种行为。`start`
+在暂存出来的第二版里把这个键**删掉**，于是同一台节点上一个环境写了日期、一个环境完全
+没有，两半同时在跑。挂在上面的行为是真的：一个处理函数一次设两个 `Set-Cookie`（登录
+同时发会话 cookie 和 CSRF cookie），此前只有最后那个能出去，另一个被无声丢掉——响应头
+离开 Isolate 时走的是一张 map，而 `Set-Cookie` 恰好是 Fetch 规范里唯一不许合并的头。
+`functions/api/cookies.ts`（`scripts/demo.sh::add_cookie_route` 写进暂存副本）就是让
+这条差别**真的被看见**的处理函数。没写日期的应用一律按最老那套行为跑，并且没人对此保持
+安静：上传、下发、装载各写一行告警，`deis deploy` 每次打印，`deis versions` 的 COMPAT
+列直接印 `none (oldest)`。
 
 `functions/api/fetch.ts` 是**故意写成中转**的：查询串给什么地址，它就往那个地址打。
 真项目里没人该这么写，但演示要验的恰恰是这一条——一个能被指挥去哪儿的应用，正是出网
@@ -178,6 +203,13 @@ API key 能不能从控制面领到那张令牌。
 | 路由 | `GET /hello/world` | 路由占位符进了 `context.params` |
 | WebSocket | 经 `deis-proxy` 亲手做一次握手（自己拼字节，不借客户端库） | 101 状态行、`Upgrade`/`Connection` 头与 `Sec-WebSocket-Accept` 都对得上 RFC 6455 给那个握手键定好的答案——升级是节点应的、经代理原样转发，不是代理自己应了 101 又或者把它压扁成一个普通响应 |
 | | 握手成功后各发一帧文本、一帧二进制 | 两帧都完整抵达了 Isolate：二进制帧里特意塞了几个非法 UTF-8 字节（`0xff`、`0xfe`、开头的 `0x80`），处理函数把收到的字节数与十六进制原样报回来（不是替换字符），证明这条链路没有把它当文本处理、也没有在中途丢字节。验的是字节完整送达 Isolate，不是服务端向外发二进制帧的能力——处理函数把两种输入都回成文本帧，见上文示例应用一节 |
+| 流式响应 | 经 `deis-proxy` 取一条 5 帧的 SSE，逐帧记到达时间 | 头 13 毫秒就到了，5 帧分别在 13/165/316/470/621 毫秒到——处理函数每帧之间停 150 毫秒，所以这个间隔不可能出自一个先攒齐再发的响应体。最后收到了结束块，客户端看到的是一次完整的响应 |
+| | 同一条响应的头与编码 | `Transfer-Encoding: chunked`、没有 `Content-Length`、并且请求明明带了 `Accept-Encoding: gzip` 却没有 `Content-Encoding`。有长度就说明有人收齐过它；有编码就说明前门把它压在压缩器里了——pingora 的压缩器不是每个 chunk 都 flush 的 |
+| | 经 `deis-proxy` 请求 `?mode=relay`，上游是一个慢慢往外写的地址 | 处理函数写的是 `new Response(upstream.body)`，六段照上游的节奏依次到达。一个先把上游读完再回答的处理函数，第一个字节不可能早于上游的最后一个字节 |
+| | `?mode=throw`：生产到一半抛异常 | 客户端先拿到 200 和两帧，然后是一次**没有结束块**的传输。200 早就发出去了，没有状态码可以改；这时唯一诚实的收尾就是让对方的读失败，而不是让它把半个答案当成完整的 |
+| | 读两帧就把 socket 关掉 | 应用写的 `cancel()` 跑了，而且随后两次请求读到的帧计数器一动不动——生产者是被叫停的，不是还在对着没人读的队列写 |
+| | 一条流开着的时候再发一个普通请求 | `GET /hello/parallel` 在 19 毫秒内答完，带着 `Content-Length`，走的还是那条老路。一个应用一条线程一只 Isolate，所以「流不占住 Isolate」只能这样验：请求不必等流结束 |
+| | 一条永不结束的流 | 节点按演示配置里的 4 秒 `stream_timeout_ms` 把它关掉（平台默认是 5 分钟，演示调短只是为了不让这一项等五分钟），客户端拿到的同样是一次没有结束块的传输，节点日志里有一行 warn 说明原因 |
 | Web 标准 | 处理函数里 `fetch` 打演示自己起的那个上游 | Isolate 里真有 `fetch`（`available`），而且这一发确实打了出去并把上游的响应体原样带回来了 |
 | | 同一个处理函数改打 `http://127.0.0.1:<deis-store 端口>` | **打不通**。它和刚刚打通的那个上游在同一块回环网卡上，只是端口不同，所以拦住它的是出网策略不是网络。这一项和存储小节里「不带凭据令牌」「不带 API key」那两条，是 `verify` 里仅有的三条「成功了算失败」的检查：应用只要连得上 deis-store，换个租户头就能读别的应用的数据。不校验措辞、状态码或错误文本——只看这一发有没有打出去 |
 | | `crypto.randomUUID()` 与 `crypto.subtle.digest()` | 值本身被检查：UUID 要是 v4 形状且两次不同；摘要要等于字符串 `deislet` 的已知 SHA-256。凭空造出的合法字节能过「没抛异常」，过不了这一项 |
@@ -195,6 +227,11 @@ API key 能不能从控制面领到那张令牌。
 | 资源上限 | production（v1，manifest 里写 `timeoutMs: 1000`）打 `/api/slow?ms=2000` 与 `?ms=200` | 前一发在约 1 秒被切、后一发正常返回：节点默认是 30000ms，两发都会过，所以在起作用的是应用自己报的那个数。节点日志里那句「narrows the default execution timeout: 1000ms（platform default 30000ms）」是它自己的说法 |
 | | preview（v2，manifest 里改成 `timeoutMs: 600000`） | 那个数确实随部署到了节点（`timeout_ms=Some(600000)`），但节点把它按下来了，并写了一句同时带着两个数字的告警；没有任何一行说这个环境「收窄」了什么，因为它要的是加宽。上限是节点的：一次调用整段占着一根运行线程，应用要是能给自己开十分钟，排在这根线程后面的其他租户就陪着等十分钟 |
 | | `GET /api/heap` | 应用声明 `memoryMb: 32`，处理函数一直分配到撞上这个堆上限。`deis trace` 把这次调用判成 `memory-limit`——这个判决只有 V8 的近堆上限回调给得出来，从请求那一侧看，被堆撑死和处理函数自己抛异常是同一个「执行被终止」。同一个回调也在给 `deis_runtime_memory_cutoffs_total` 记数 |
+| 兼容日期 | `deis deploy` 的报告与 `deis versions` 的 COMPAT 列 | 两处都印出这个版本跑在哪一天的平台行为下：production 是 `2026-09-01`，preview 是 `none (oldest)`。要回答「为什么它在生产上表现不一样」，不用去翻 bundle |
+| | production（`.config.json` 里写了 `compatibilityDate`）打 `/api/cookies` | 回来 2 个 `Set-Cookie`：会话 cookie 和 CSRF cookie 都到了 |
+| | preview（同一份处理函数，暂存版本里把这个键删掉了）打同一条路径 | 回来 1 个。同一台节点、同一秒、同一份源码，答案不同的只有一件事：manifest 里有没有日期。节点日志里写清了丢掉几个、以及改哪一行能全发。老答案是真会被依赖的——今天靠「后写的赢」去撤销前一个 cookie 的应用，两个都发之后那次撤销会真的生效 |
+| | 往控制面直传一个 manifest 里写着 `2099-01-01` 的包 | HTTP 400，回话里同时写着这个日期和本 build 认识到哪一天。平台的知识止于自己的发布日，装作能提供比拒绝更坏——同一句检查在构建、上传、下发和节点收到推送时各拦一次 |
+| | 往控制面直传一个写着不认识的 flag 的包 | 同样 400 并点名那个 flag。写错的开关被拒绝，而不是被忽略——被忽略的话，应用会以为自己拿到了一个其实没有的行为 |
 | 版本 | `deis deploy` v2 → `deis rollback` | 函数返回的标签和静态页面一起回到上一版。回滚不用报版本号：出事的人不该被要求先查一个号 |
 | 观测 | `LogService/Query` | 应用自己 `console.log` 的那行能从 deis-telemetry 按应用查回来，并带上是哪个环境写的 |
 | | `deis trace --follow` 开流 → 之后才发一个请求 | 跟到的那一行说的就是**这一次调用**（一次性探针路径确认）：方法、URL、状态码、耗时、判决、哪个节点。日志说应用讲了什么，trace 说平台决定了什么 |
@@ -215,7 +252,8 @@ deis-store，缺了会各自报为失败并说明原因，而不是悄悄跳过�
 一声、照常把别的都拉起来，这一项因为连不上上游而报失败；打 deis-store 那一项打的是
 平台自己的服务，不经上游，没有 `python3` 也照样通过。两项 WebSocket 检查是另一种依赖：
 `verify` 自己在这一步直接调用 `python3` 去拼字节做握手、收发帧，缺了它这两项同样各自
-报失败并写明原因。其余各项除 `curl` 与 `jq` 外没有额外依赖。cron 那一项最长要等一个
+报失败并写明原因。流式响应那七项同样如此，而且理由一样：要证的是**到达时间和分帧**，
+`curl` 两样都报不出来，所以那一步也是直接用 `python3` 开 socket、自己解 chunked。其余各项除 `curl` 与 `jq` 外没有额外依赖。cron 那一项最长要等一个
 tick 加一分钟，所以整体会跑一两分钟。
 
 ## 验证日志链路（手工）
@@ -301,8 +339,9 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
 
 - 需要本地安装 `cargo`、`curl`、`jq`，并确保 `ss`/`lsof`/`nc` 其一可用；
   `stop` 用 `timeout` 与 `tail --pid` 等进程退出（GNU coreutils）；`python3` 一处
-  用来起那个给应用 `fetch` 的上游，另一处被 `verify` 自己直接调用去拼字节做
-  WebSocket 握手，缺了会影响这几项，其余各项不受影响
+  用来起那个给应用 `fetch` 的上游（它同时提供一个慢慢往外写的 `/slow`，流式那一项
+  要它），另外被 `verify` 自己直接调用去拼字节做 WebSocket 握手、以及开 socket 读
+  流式响应并记每一帧的到达时间，缺了会影响这几项，其余各项不受影响
 - **第一次跑之前要先构建控制面的 Web 面板**：`crates/deis-control/web/dist` 被
   gitignore 掉了，而 `deis-control` 在编译期把它嵌进二进制，所以少了它
   `cargo build` 直接失败。`demo.sh` 不会替你做这一步：
@@ -322,8 +361,8 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
 - 出网只开了上游那一个地址（`[fetch] allow`）。想让示例应用够到别处，加
   `--deis-origin-port` 换端口或者自己改节点配置里的这一行；平台自己那几个服务地址
   改不动——它们在 allow 之后再被拒一次
-- `verify` 里发请求的各项，除 WebSocket 那两项要经 deis-proxy 之外（原因见上文
-  「websockets」一节），都直接打节点端口，不经 deis-proxy
+- `verify` 里发请求的各项，除 WebSocket 那两项和流式响应那几项要经 deis-proxy 之外
+  （原因见上文「部署走的是真实路径」一节），都直接打节点端口，不经 deis-proxy
 - deis-proxy 会去控制面拉路由表，拉不到不影响演示：目录里本来就没有路由，proxy 转发
   给它唯一的上游。控制面挂掉时 proxy 也不会开始拒绝流量——它继续用最后一次收下的那张
   表，没有期限

@@ -36,6 +36,18 @@ pub struct Version {
     pub created_at: i64,
     #[serde(default)]
     pub manifest: serde_json::Value,
+    /// Which day's platform this version was written against, and which
+    /// behaviours that leaves on, as the control plane resolved it out of the
+    /// manifest it stored.
+    ///
+    /// `None` covers two cases that read the same to a person: a control plane
+    /// too old to say, and a stored manifest it could not resolve. Both are
+    /// printed as "unknown", which is the honest answer - what is never
+    /// printed as unknown is a version that simply declares no date, because
+    /// that one comes back as `Some` with a null date and is exactly what an
+    /// operator is looking for.
+    #[serde(default)]
+    pub compatibility: Option<deis_bundle::CompatibilityProfile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

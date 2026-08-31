@@ -16,6 +16,9 @@ use super::proto::*;
 // rather than qualified at the call site so the one place that converts
 // between them names both halves.
 use super::proto::ResourceLimits as ResourceLimitsMessage;
+// Same reason as the alias above: the wire carries a date as text and a list
+// of names, while the node holds the resolved answers.
+use super::proto::CompatibilityDeclaration as CompatibilityDeclarationMessage;
 
 /// Runtime management service implementation
 pub struct RuntimeManagementService {
@@ -132,6 +135,49 @@ impl RuntimeManagement for RuntimeManagementService {
             );
         }
 
+        // Read before anything is downloaded. A node whose build is older
+        // than the date the version names cannot give that application the
+        // answers it asked for, and there is no honest way to serve it
+        // anyway: every behaviour this node could pick is one the application
+        // did not ask for. Refusing here costs the control plane one failed
+        // node in its report - which is what an operator needs to see - and
+        // costs this node nothing, because the bundle has not been fetched.
+        let compatibility = match req.compatibility.map(decode_compatibility).transpose() {
+            Ok(compatibility) => compatibility,
+            Err(reason) => {
+                let key = AppKey::new(req.app_id.clone(), req.environment.clone());
+                let kept = self.running_version(&key);
+                error!(
+                    app_id = %req.app_id,
+                    environment = %req.environment,
+                    version_id = %req.version_id,
+                    kept_version = %kept,
+                    reason = %reason,
+                    known_through = %deis_bundle::PLATFORM_KNOWN_THROUGH,
+                    "Refusing this deployment: it names platform behaviour this node's build \
+                     does not have, and running it on the answers this build does have would \
+                     give the application semantics it never asked for. Nothing was downloaded \
+                     and this environment keeps running version {}. Upgrade this node, or \
+                     rebuild the application against a date this build knows",
+                    kept
+                );
+                return Ok(Response::new(ApplyDeploymentResponse {
+                    success: false,
+                    message: reason,
+                    version_id: kept,
+                }));
+            }
+        };
+        if let Some(compatibility) = &compatibility {
+            info!(
+                app_id = %req.app_id,
+                version_id = %req.version_id,
+                compatibility = %compatibility.describe(),
+                "This deployment expects the platform behaviour of {}",
+                compatibility.describe()
+            );
+        }
+
         let order = DeploymentOrder {
             app_id: req.app_id.clone(),
             version_id: req.version_id.clone(),
@@ -140,6 +186,7 @@ impl RuntimeManagement for RuntimeManagementService {
             bundle_sha: req.bundle_sha,
             env: req.env,
             limits,
+            compatibility,
         };
 
         let key = order.key();
@@ -496,6 +543,36 @@ fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
         cpu_time_limit_ms: (limits.cpu_time_limit_ms > 0)
             .then_some(limits.cpu_time_limit_ms as u64),
     }
+}
+
+/// Read the wire's compatibility declaration into the resolved answers this
+/// node will give.
+///
+/// The message carries what the control plane resolved; this resolves it again
+/// against *this* build's own table, which is the point. The two builds can
+/// differ - that is the whole reason a fleet needs this - and a node that
+/// simply believed the flag names it was handed would be claiming to
+/// implement behaviour it may not have.
+///
+/// `Err` carries a message for the control plane's delivery report: a flag
+/// name this build does not know, or a date later than
+/// `deis_bundle::PLATFORM_KNOWN_THROUGH`.
+fn decode_compatibility(
+    declared: CompatibilityDeclarationMessage,
+) -> Result<deis_bundle::CompatibilityProfile, String> {
+    // Proto3 cannot tell an absent string from an empty one, and here the two
+    // mean the same thing: the application named no date and is held to the
+    // oldest behaviour.
+    let date = match declared.date.trim() {
+        "" => None,
+        text => Some(text.parse().map_err(|e: String| e)?),
+    };
+    let block = deis_bundle::DeclaredCompatibility {
+        date,
+        flags: declared.flags,
+    };
+    block.validate()?;
+    deis_bundle::CompatibilityProfile::resolve(&block)
 }
 
 #[cfg(test)]

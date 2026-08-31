@@ -6,6 +6,8 @@ use super::queue_client::LeasedMessage;
 use super::queue_consumer::{
     self, BatchInvoker, BatchOutcome, ConsumerHandle, ConsumerSettings, QueuePort,
 };
+use super::response_headers::HeaderPairs;
+use super::response_stream::ResponseBody;
 use crate::app_repo::AppRepo;
 use anyhow::Result;
 use deno_core::JsRuntime;
@@ -21,8 +23,12 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 static V8_INIT: Once = Once::new();
 
 /// Status, headers and body of one answered request; the same triple
-/// `super::isolate` produces. Bytes, not text -- see its definition there.
-type FetchResult = (u16, HashMap<String, String>, Option<Vec<u8>>);
+/// `super::isolate` produces. The body may be bytes or a body still being
+/// produced -- see [`ResponseBody`] and its definition there. The headers are
+/// a list rather than a map because one name may appear twice; by the time one
+/// of these exists the isolate has already decided, from the application's
+/// compatibility date, whether the repeats survive.
+type FetchResult = (u16, HeaderPairs, ResponseBody);
 
 /// Initialize V8 platform (can only be called once per process)
 fn init_v8_platform() {
@@ -202,7 +208,30 @@ impl RuntimeThread {
         // The one application runtime this thread hosts, if any.
         let mut hosted: Option<HostedApp> = None;
 
-        while let Some(msg) = rx.recv().await {
+        loop {
+            // An isolate with a response body still being produced has work of
+            // its own, and it has to get a turn: nothing else in this process
+            // drives that producer. It gets one *between* messages rather than
+            // instead of them -- an arriving request drops the pump wherever it
+            // is and is served at once, and the pump resumes afterwards -- so a
+            // client reading one stream slowly cannot delay another request to
+            // the same application by more than the time one chunk takes to
+            // produce.
+            let msg = match hosted
+                .as_mut()
+                .filter(|hosted| hosted.runtime.has_open_response_streams())
+            {
+                Some(hosted) => {
+                    tokio::select! {
+                        msg = rx.recv() => msg,
+                        () = hosted.runtime.pump_response_streams() => continue,
+                    }
+                }
+                None => rx.recv().await,
+            };
+            let Some(msg) = msg else {
+                break;
+            };
             match msg {
                 RuntimeMessage::LoadApp {
                     app_id,
@@ -1428,7 +1457,7 @@ mod tests {
         assert!(result.is_ok());
         let (status, _, body) = result.unwrap();
         assert_eq!(status, 200);
-        assert_eq!(body.as_deref(), Some(&b"Hello from pool!"[..]));
+        assert_eq!(body.into_bytes().as_deref(), Some(&b"Hello from pool!"[..]));
 
         // Cleanup
         let _ = pool.unload_app("test_load_exec_app").await;
@@ -1510,7 +1539,7 @@ mod tests {
             .await
             .expect("and it must serve");
         assert_eq!(status, 200);
-        assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+        assert_eq!(body.into_bytes().as_deref(), Some(&b"ok"[..]));
 
         pool.unload_app("after_spin_app.production").await.unwrap();
     }
@@ -1575,7 +1604,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{name} stopped serving: {e}"));
             assert_eq!(status, 200, "{name}");
-            assert_eq!(body.as_deref(), Some(&b"ok"[..]), "{name}");
+            assert_eq!(body.into_bytes().as_deref(), Some(&b"ok"[..]), "{name}");
         }
 
         assert!(
@@ -1679,7 +1708,8 @@ mod tests {
         let _ = pool.unload_app("env_wiring_app.production").await;
 
         assert_eq!(status, 200);
-        let body = String::from_utf8(body.unwrap_or_default()).expect("the handler answers JSON");
+        let body = String::from_utf8(body.into_bytes().unwrap_or_default())
+            .expect("the handler answers JSON");
         assert!(body.contains("LOG_LEVEL"), "{body}");
         assert!(
             !body.contains("DEIS_STORE_ENDPOINT") && !body.contains("DEIS_SERVICES"),
@@ -1768,7 +1798,7 @@ mod tests {
             .await
             .expect("the app is still serving while its replacement is built");
         assert_eq!(status, 200);
-        assert_eq!(body.as_deref(), Some(&b"v1"[..]));
+        assert_eq!(body.into_bytes().as_deref(), Some(&b"v1"[..]));
 
         let stats = pool.get_stats().await;
         assert_eq!(
@@ -1790,7 +1820,7 @@ mod tests {
             .await
             .expect("the app serves after the swap");
         assert_eq!(
-            body.as_deref(),
+            body.into_bytes().as_deref(),
             Some(&b"v2"[..]),
             "the swap did not make the new version the one that serves"
         );
@@ -1834,7 +1864,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("the working version stopped serving after {error}: {e}"));
         assert_eq!(status, 200);
-        assert_eq!(body.as_deref(), Some(&b"good"[..]));
+        assert_eq!(body.into_bytes().as_deref(), Some(&b"good"[..]));
 
         // The thread the failed build reserved is back in circulation.
         assert_eq!(pool.get_stats().await.get("staging_apps"), Some(&0));

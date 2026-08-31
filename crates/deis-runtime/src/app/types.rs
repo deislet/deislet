@@ -25,6 +25,24 @@ pub struct AppConfig {
 
     pub limits: Option<ResourceLimits>,
 
+    /// Which of the platform's answers this application gets, resolved once
+    /// from its bundle manifest when the version was installed.
+    ///
+    /// Not a date and not a list of names: the comparison against every
+    /// behaviour's own date happens once, in
+    /// `deis_bundle::compatibility::CompatibilityProfile::resolve`, and what
+    /// is kept here is the outcome. Everything downstream asks
+    /// `is_on(Flag::X)`, which is a bit test, so no part of the request path
+    /// ever compares dates.
+    ///
+    /// The default is the oldest behaviour, every flag off. That is what an
+    /// application deployed before any of this existed was written against,
+    /// and it is deliberately also what a path that forgot to carry a profile
+    /// would produce: the direction that cannot change an application's
+    /// behaviour underneath it.
+    #[serde(default)]
+    pub compatibility: deis_bundle::CompatibilityProfile,
+
     #[serde(default)]
     pub resources: Vec<String>,
 
@@ -46,6 +64,7 @@ impl std::fmt::Debug for AppConfig {
         f.debug_struct("AppConfig")
             .field("env", &format_args!("{names:?} = <redacted>"))
             .field("limits", &self.limits)
+            .field("compatibility", &self.compatibility.describe())
             .field("resources", &self.resources)
             .field("routes", &self.routes)
             .field("permissions", &self.permissions)

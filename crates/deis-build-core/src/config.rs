@@ -19,6 +19,27 @@ pub struct ProjectConfig {
     pub build: Option<BuildConfig>,
     #[serde(default)]
     pub limits: Option<LimitsConfig>,
+    /// The day this project's code was written against, as `YYYY-MM-DD`.
+    ///
+    /// Copied into the bundle manifest and carried to every node, where it
+    /// decides which of the platform's answers this application gets. Absent
+    /// means the oldest answers the platform has, for ever: a project without
+    /// a date never receives a fix that changes an observable behaviour. That
+    /// is the safe direction and it is the reason `deis deploy` says so out
+    /// loud on every deploy rather than choosing a date on an author's behalf:
+    /// a date the build filled in would move on its own, and the same
+    /// unchanged source would behave differently the next time it was built.
+    ///
+    /// Spelled the way the rest of this file spells a two-word key, with the
+    /// manifest's own snake_case accepted too.
+    #[serde(rename = "compatibilityDate", alias = "compatibility_date", default)]
+    pub compatibility_date: Option<String>,
+    /// Behaviours taken early or held back by name, overriding what
+    /// [`Self::compatibility_date`] alone would give. The names are the ones
+    /// in `deis_bundle::compatibility::FLAGS`; one this build does not know
+    /// fails the build rather than being ignored.
+    #[serde(rename = "compatibilityFlags", alias = "compatibility_flags", default)]
+    pub compatibility_flags: Vec<String>,
     /// Static files to carry in the bundle, served before any handler runs.
     #[serde(default)]
     pub assets: Option<AssetsConfig>,
@@ -248,6 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn the_compatibility_keys_take_either_spelling() {
+        for (date_key, flags_key) in [
+            ("compatibilityDate", "compatibilityFlags"),
+            ("compatibility_date", "compatibility_flags"),
+        ] {
+            let mut json = minimal();
+            json[date_key] = serde_json::json!("2026-09-01");
+            json[flags_key] = serde_json::json!(["single_set_cookie_header"]);
+            let config = parse(json);
+            assert_eq!(config.compatibility_date.as_deref(), Some("2026-09-01"));
+            assert_eq!(config.compatibility_flags, vec!["single_set_cookie_header"]);
+        }
+    }
+
+    #[test]
     fn a_config_without_the_new_fields_still_parses() {
         // Projects predate every field added here; none of them may become
         // required, or an existing project stops building.
@@ -255,6 +291,8 @@ mod tests {
         assert!(config.assets.is_none());
         assert!(config.cron.is_empty());
         assert!(config.queues.is_empty());
+        assert!(config.compatibility_date.is_none());
+        assert!(config.compatibility_flags.is_empty());
     }
 
     #[test]

@@ -75,6 +75,11 @@ DEMO_SECRET_VALUE="${DEMO_SECRET_VALUE:-demo-secret-do-not-log-me}"
 # from something else listening on that port - is not mistaken for a fetch
 # that worked.
 ORIGIN_BODY="the-demo-origin-answered"
+
+# How long the node lets one response body take to be produced; written into
+# the node's configuration at `start` and read back by the check that watches a
+# stream be closed for running past it.
+DEMO_STREAM_TIMEOUT_MS=4000
 # SHA-256 of the string "deislet", which functions/api/crypto.ts digests. A
 # `crypto.subtle.digest` that invented well-formed bytes would pass any
 # "did it throw?" test; it does not pass this one.
@@ -534,9 +539,69 @@ start_origin() {
     return 0
   fi
 
+  # `python3 -m http.server` with one path added.
+  #
+  # Everything under / is served from the directory exactly as that module
+  # would serve it, which is what the two egress checks use. /slow is the one
+  # addition: a body written a piece at a time with a pause between the
+  # pieces, and no length announced. It exists because "the upstream's body
+  # was passed through without being collected" cannot be shown against an
+  # upstream that answers instantly -- collected or not, the answer looks the
+  # same from outside. Against this one it does: a handler that collected the
+  # body could not send its first byte until the upstream had sent its last.
+  cat > "${dir}/origin.py" <<'ORIGIN_PY'
+import functools
+import http.server
+import socketserver
+import sys
+import time
+import urllib.parse
+
+
+class Origin(http.server.SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/slow":
+            self.send_slowly(urllib.parse.parse_qs(parsed.query))
+            return
+        super().do_GET()
+
+    def send_slowly(self, query):
+        pieces = int(query.get("pieces", ["6"])[0])
+        gap_ms = int(query.get("gapMs", ["150"])[0])
+        # No Content-Length and no Transfer-Encoding: the body is framed by the
+        # connection closing, which is the simplest way for a server this small
+        # to answer without knowing its own length in advance.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        for i in range(pieces):
+            if i:
+                time.sleep(gap_ms / 1000.0)
+            self.wfile.write(("piece %d\n" % (i + 1)).encode("utf-8"))
+            self.wfile.flush()
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+
+class Threaded(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+port = int(sys.argv[1])
+directory = sys.argv[2]
+handler = functools.partial(Origin, directory=directory)
+Threaded(("127.0.0.1", port), handler).serve_forever()
+ORIGIN_PY
+
   echo "🚀 Starting the fetch origin (HTTP: ${DEIS_ORIGIN_PORT})"
-  python3 -m http.server "$DEIS_ORIGIN_PORT" \
-    --bind 127.0.0.1 --directory "$dir" \
+  python3 "${dir}/origin.py" "$DEIS_ORIGIN_PORT" "$dir" \
     > "${LOG_DIR}/origin.log" 2>&1 &
   DEIS_ORIGIN_PID=$!
 
@@ -696,10 +761,24 @@ prepare_app_source() {
     sed -i "s/\"timeoutMs\": ${APP_TIMEOUT_MS}/\"timeoutMs\": ${GREEDY_TIMEOUT_MS}/" \
       "$dest/.config.json"
     sed -i "s/data-label=\"v1\"/data-label=\"${label}\"/" "$dest/public/index.html"
+    # And it names no compatibility date at all, where the app's own sources
+    # name one. That is what an application deployed before the mechanism
+    # existed looks like, and the demo runs one of each side by side on the
+    # same node: production is written against 2026-09-01 and gets every
+    # Set-Cookie header it sets, the preview names no date and gets the one
+    # answer this platform used to give. Neither environment can change the
+    # other's behaviour, which is the whole point of the date.
+    if command -v jq >/dev/null 2>&1; then
+      local undated
+      undated=$(jq 'del(.compatibilityDate)' "$dest/.config.json") \
+        && printf '%s\n' "$undated" > "$dest/.config.json"
+    fi
   fi
 
   add_websocket_route "$dest"
   add_blob_route "$dest"
+  add_stream_route "$dest"
+  add_cookie_route "$dest"
 
   echo "$dest"
 }
@@ -767,6 +846,184 @@ export default async function handler(context: any): Promise<Response> {
   });
 
   return new Response(null, { status: 101, webSocket: client });
+}
+TS
+}
+
+# The route the streaming checks talk to.
+STREAM_ROUTE="/api/stream"
+
+# Give the staged copy a streaming handler if the example app does not carry
+# one.
+#
+# Written here for the same reason the WebSocket and object-storage handlers
+# are: the checks below need an application that actually returns a body it is
+# still producing, and a feature nothing calls is a feature nobody has. The
+# moment `functions/api/stream.ts` appears in the example app's own sources
+# this stops writing anything.
+#
+# One handler covers every shape the checks need, chosen by `?mode=`, because
+# they are all the same mechanism seen from different ends: a feed that ends
+# normally, one that never ends, one that fails part-way, an upstream body
+# passed straight through, and a way to ask the isolate what became of a
+# producer whose client walked away.
+add_stream_route() {
+  local dest=$1
+  local handler="${dest}/functions${STREAM_ROUTE}.ts"
+
+  if [ -f "$handler" ]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$handler")"
+  cat > "$handler" <<'TS'
+// A response body that is produced after the head has gone out.
+//
+// `?mode=` picks the shape:
+//
+//   sse      the default: `frames` server-sent-events frames, `gapMs` apart,
+//            then the stream ends normally.
+//   endless  frames for as long as anyone reads. Used to watch a client hang
+//            up, and to watch the node close a stream that runs past its
+//            budget.
+//   throw    `after` frames and then an exception, which the client meets long
+//            after it was told 200.
+//   relay    `url` is fetched and its body handed straight on. Nothing here
+//            reads it, so nothing here holds it.
+//   report   not a stream at all: what became of the producers above.
+//
+// The two module-level values are deliberate. An isolate is reused across
+// requests for the same application, so a producer that was cancelled can say
+// so to a later request -- which is the only way, from outside, to tell "the
+// client went away and the producer stopped" from "the client went away and
+// the producer kept going".
+let lastCancelled: string | null = null;
+let framesProduced = 0;
+
+export default async function handler(context: any): Promise<Response> {
+  const url = new URL(context.request.url);
+  const mode = url.searchParams.get("mode") ?? "sse";
+
+  if (mode === "report") {
+    return new Response(
+      JSON.stringify({ lastCancelled, framesProduced }),
+      { headers: { "content-type": "application/json; charset=utf-8" } },
+    );
+  }
+
+  if (mode === "relay") {
+    const target = url.searchParams.get("url");
+    if (!target) {
+      return new Response("pass the upstream as ?url=<absolute http url>\n", {
+        status: 400,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
+    const upstream = await fetch(target);
+    // `upstream.body` is handed over, not read. The whole point: this handler
+    // never holds the object, so its size is the upstream's problem and not
+    // this isolate's heap.
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: {
+        "content-type":
+          upstream.headers.get("content-type") ?? "application/octet-stream",
+      },
+    });
+  }
+
+  const tag = url.searchParams.get("tag") ?? "";
+  const frames = Math.min(Math.max(Number(url.searchParams.get("frames")) || 5, 1), 100);
+  const gapMs = Math.min(Math.max(Number(url.searchParams.get("gapMs")) || 120, 0), 2000);
+  const throwAfter = mode === "throw"
+    ? Math.min(Math.max(Number(url.searchParams.get("after")) || 2, 1), 100)
+    : -1;
+
+  const encoder = new TextEncoder();
+  let sent = 0;
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      // The gap is what makes "frame by frame" visible from outside: frames
+      // produced in one burst would arrive in one burst no matter how they
+      // crossed the boundary, and would prove nothing.
+      if (gapMs > 0 && sent > 0) {
+        await new Promise((resolve) => setTimeout(resolve, gapMs));
+      }
+      if (throwAfter > 0 && sent >= throwAfter) {
+        throw new Error(
+          "the demo handler failed this stream on purpose after " + sent + " frame(s)",
+        );
+      }
+      if (mode === "sse" && sent >= frames) {
+        controller.close();
+        return;
+      }
+      sent += 1;
+      framesProduced += 1;
+      controller.enqueue(encoder.encode("data: frame " + sent + " at " + Date.now() + "\n\n"));
+    },
+    cancel(_reason) {
+      // Reached when the node tells this producer to stop: the client hung up,
+      // or the stream ran past the node's stream_timeout_ms.
+      lastCancelled = tag;
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+    },
+  });
+}
+TS
+}
+
+# The route the compatibility-date checks talk to.
+COOKIE_ROUTE="/api/cookies"
+
+# Give the staged copy a handler that sets two cookies in one response.
+#
+# Two, because one is the number this platform used to send however many a
+# handler set: the response header list went through a map on its way out of
+# the isolate, and a map keeps one value per name. `Set-Cookie` is the one
+# header the Fetch specification says must not be combined, so it is the one
+# header a map silently destroys - a session cookie and a CSRF cookie went in
+# and one came out, with nothing anywhere saying so.
+#
+# The handler is written here rather than in the example app for the same
+# reason the WebSocket and streaming handlers are: the moment
+# `functions/api/cookies.ts` appears in the app's own sources this stops
+# writing anything and the app's version is what gets deployed.
+add_cookie_route() {
+  local dest=$1
+  local handler="${dest}/functions${COOKIE_ROUTE}.ts"
+
+  if [ -f "$handler" ]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$handler")"
+  cat > "$handler" <<'TS'
+// Two cookies in one response, which is what a login that also issues a CSRF
+// token does.
+//
+// `headers.append` is the only way to say it: `Headers` combines repeated
+// names into one comma-joined value for every header except `Set-Cookie`,
+// which the Fetch specification exempts precisely because a cookie value may
+// contain a comma. Whether both survive the trip out of the isolate is decided
+// by this application's compatibility date, not by anything written here.
+export default async function handler(_context: any): Promise<Response> {
+  const headers = new Headers({
+    "content-type": "application/json; charset=utf-8",
+  });
+  headers.append("set-cookie", "session=abc123; Path=/; HttpOnly");
+  headers.append("set-cookie", "csrf=xyz789; Path=/");
+  return new Response(JSON.stringify({ cookiesSet: 2 }), {
+    status: 200,
+    headers,
+  });
 }
 TS
 }
@@ -1207,6 +1464,17 @@ retry_interval_secs = 2
 
 [fetch]
 allow = ["127.0.0.1:${DEIS_ORIGIN_PORT}"]
+
+# Four seconds, where the platform default is five minutes.
+#
+# This is the ceiling on how long one response body may take to be produced,
+# counted from the moment its head reached the client. It is short here for one
+# reason: the verification opens a stream that never ends and watches the node
+# close it, and a check that waited out the real default would take five
+# minutes. Everything else the streaming checks do finishes inside a second, so
+# the small number costs them nothing.
+[default_execution_limits]
+stream_timeout_ms = ${DEMO_STREAM_TIMEOUT_MS}
 EOF
 
     ACME_STORE_DIR="${DEMO_DIR}/acme"
@@ -1977,6 +2245,484 @@ check_websocket_through_proxy() {
   fi
 }
 
+# Read a streaming response over a raw socket, recording when each piece of the
+# body arrived.
+#
+# A socket rather than curl because the whole claim is about *timing and
+# framing*, and curl reports neither: what has to be shown is that the head
+# arrived long before the last byte, that each frame arrived on its own, that
+# the body is chunked, and -- for the failure cases -- that the terminating
+# zero-length chunk never came. All four are visible here and nowhere else.
+#
+# Arguments: port, app id, request target, how long to keep reading (ms), how
+# many frames to stop after (0 = until the body ends), and what to offer in
+# Accept-Encoding.
+#
+# Stopping after N frames closes the socket where it stands, which is exactly
+# what a client hanging up looks like to the node.
+stream_exchange() {
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PYSTREAM'
+import json
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+app_id = sys.argv[2]
+target = sys.argv[3]
+max_ms = int(sys.argv[4])
+stop_after = int(sys.argv[5])
+accept_encoding = sys.argv[6]
+
+report = {
+    "status_line": "",
+    "headers": {},
+    "frames": [],
+    "clean_end": False,
+    "error": None,
+}
+started = time.monotonic()
+
+
+def ms():
+    return int((time.monotonic() - started) * 1000)
+
+
+try:
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    request = (
+        "GET %s HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "x-deis-app-id: %s\r\n"
+        "Accept-Encoding: %s\r\n"
+        "Accept: text/event-stream\r\n"
+        "Connection: close\r\n\r\n" % (target, app_id, accept_encoding)
+    )
+    sock.sendall(request.encode("utf-8"))
+    sock.settimeout(0.2)
+
+    buf = b""
+    closed = False
+
+    def read_more():
+        # True: something arrived. False: the peer closed. None: nothing yet.
+        global buf, closed
+        try:
+            data = sock.recv(65536)
+        except socket.timeout:
+            return None
+        if not data:
+            closed = True
+            return False
+        buf += data
+        return True
+
+    while b"\r\n\r\n" not in buf:
+        if ms() > max_ms:
+            raise RuntimeError("no response header within %dms" % max_ms)
+        if read_more() is False:
+            raise RuntimeError("the connection closed before any header arrived")
+
+    head, buf = buf.split(b"\r\n\r\n", 1)
+    lines = head.decode("latin1").split("\r\n")
+    report["status_line"] = lines[0]
+    report["header_ms"] = ms()
+    for line in lines[1:]:
+        if ":" in line:
+            name, value = line.split(":", 1)
+            report["headers"][name.strip().lower()] = value.strip()
+    chunked = report["headers"].get("transfer-encoding", "").lower() == "chunked"
+    report["chunked"] = chunked
+
+    def record(payload):
+        report["frames"].append(
+            {"at_ms": ms(), "text": payload.decode("utf-8", "replace")}
+        )
+
+    while ms() <= max_ms:
+        if stop_after and len(report["frames"]) >= stop_after:
+            break
+        if chunked:
+            if b"\r\n" not in buf:
+                if read_more() is False:
+                    break
+                continue
+            size_line, rest = buf.split(b"\r\n", 1)
+            try:
+                size = int(size_line.split(b";")[0], 16)
+            except ValueError:
+                report["error"] = "unparsable chunk size %r" % size_line[:32]
+                break
+            if size == 0:
+                report["clean_end"] = True
+                break
+            if len(rest) < size + 2:
+                if read_more() is False:
+                    break
+                continue
+            record(rest[:size])
+            buf = rest[size + 2 :]
+        else:
+            if buf:
+                record(buf)
+                buf = b""
+                continue
+            state = read_more()
+            if state is False:
+                # No chunked framing: the body was delimited by the close, so
+                # reaching it is the end of a complete body.
+                report["clean_end"] = True
+                break
+    report["timed_out"] = ms() > max_ms
+    sock.close()
+except Exception as failure:
+    report["error"] = "%s: %s" % (type(failure).__name__, failure)
+
+print(json.dumps(report))
+PYSTREAM
+}
+
+# One field out of a streaming report, empty when it is not there.
+stream_field() {
+  jq -r "$2 // empty" < "$1" 2>/dev/null || true
+}
+
+# The frames a report collected, as "n@Xms" for the evidence string.
+stream_frame_times() {
+  jq -r '[.frames[] | "\(.at_ms)ms"] | join(", ")' < "$1" 2>/dev/null || true
+}
+
+check_server_sent_events_reach_the_client_frame_by_frame() {
+  local title="server-sent events reach a client through deis-proxy frame by frame"
+  local report="${LOG_DIR}/verify-sse.json"
+  local frames=5
+  local gap=150
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is not installed, so no stream was opened"
+    return
+  fi
+
+  stream_exchange "$DEIS_PROXY_PORT" "$APP_ID" \
+    "${STREAM_ROUTE}?mode=sse&frames=${frames}&gapMs=${gap}&tag=sse" \
+    6000 0 "gzip" > "$report" 2>"${LOG_DIR}/verify-sse.log" || true
+
+  local error
+  error=$(stream_field "$report" '.error')
+  if [ -n "$error" ]; then
+    fail_check "$title" "127.0.0.1:${DEIS_PROXY_PORT}${STREAM_ROUTE} -> ${error}"
+    return
+  fi
+
+  local status ctype count first last header_ms clean
+  status=$(stream_field "$report" '.status_line')
+  ctype=$(stream_field "$report" '.headers["content-type"]')
+  count=$(jq '.frames | length' < "$report")
+  first=$(jq -r '.frames[0].at_ms // -1' < "$report")
+  last=$(jq -r '.frames[-1].at_ms // -1' < "$report")
+  header_ms=$(stream_field "$report" '.header_ms')
+  clean=$(stream_field "$report" '.clean_end')
+
+  # The gap the handler was asked for is what makes this checkable: with
+  # ${frames} frames ${gap}ms apart the last one cannot exist until
+  # $(( (frames - 1) * gap ))ms after the first, so a body that had been
+  # collected before the head went out could not show this spread.
+  local spread=$(( last - first ))
+  local expected=$(( (frames - 1) * gap * 2 / 3 ))
+
+  case "$status" in
+    *200*) ;;
+    *)
+      fail_check "$title" "got \"${status}\" instead of HTTP 200; a demo started before this check existed serves 404 here - run \`demo.sh stop\` and \`demo.sh start\` again"
+      return
+      ;;
+  esac
+
+  if [ "$count" = "$frames" ] && [ "$clean" = "true" ] && [ "$spread" -ge "$expected" ]; then
+    pass_check "$title" \
+      "${status}, content-type ${ctype}; the head arrived at ${header_ms}ms and the ${count} frames at $(stream_frame_times "$report") - ${spread}ms apart end to end, for a handler that pauses ${gap}ms between them. The body ended with its terminating chunk, so the client saw a complete response"
+  else
+    fail_check "$title" \
+      "expected ${frames} frames spread over at least ${expected}ms and a clean end; got ${count} frame(s) at $(stream_frame_times "$report"), spread ${spread}ms, clean_end=${clean}"
+  fi
+}
+
+check_a_streamed_response_is_chunked_and_left_uncompressed() {
+  local title="a streamed response crosses deis-proxy chunked and uncompressed"
+  local report="${LOG_DIR}/verify-sse.json"
+
+  if [ ! -s "$report" ]; then
+    fail_check "$title" "the events check produced no report to read"
+    return
+  fi
+
+  local chunked length encoding
+  chunked=$(stream_field "$report" '.chunked')
+  length=$(stream_field "$report" '.headers["content-length"]')
+  encoding=$(stream_field "$report" '.headers["content-encoding"]')
+
+  # Both halves matter and they fail differently. A Content-Length would mean
+  # the node knew the size, which it can only do by having collected the body.
+  # A Content-Encoding would mean the proxy compressed it - and pingora's
+  # compressors are not flushed per chunk, so a 40-byte frame handed to gzip
+  # comes back out as nothing and the client waits for bytes the proxy is
+  # holding.
+  if [ "$chunked" = "true" ] && [ -z "$length" ] && [ -z "$encoding" ]; then
+    pass_check "$title" \
+      "Transfer-Encoding: chunked, no Content-Length, and no Content-Encoding even though the request offered \"Accept-Encoding: gzip\" - so nothing between the isolate and the client is holding the body to measure or compress it"
+  else
+    fail_check "$title" \
+      "chunked=${chunked}, Content-Length=\"${length}\", Content-Encoding=\"${encoding}\"; a length means the body was collected and an encoding means the proxy is buffering it inside a compressor"
+  fi
+}
+
+check_a_stream_fed_from_fetch_is_not_collected() {
+  local title="a body taken from fetch() is passed on without being collected"
+  local report="${LOG_DIR}/verify-stream-relay.json"
+  local pieces=6
+  local gap=150
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is not installed, so no stream was opened"
+    return
+  fi
+  if [ -z "${DEIS_ORIGIN_PORT:-}" ]; then
+    fail_check "$title" "the demo's origin server is not running, so there is nothing to relay"
+    return
+  fi
+
+  # The upstream writes its pieces slowly and announces no length. A handler
+  # that read the body before answering could not send its first byte until the
+  # upstream had sent its last, so the two timings below are the whole proof.
+  local upstream="http%3A//127.0.0.1%3A${DEIS_ORIGIN_PORT}/slow%3Fpieces%3D${pieces}%26gapMs%3D${gap}"
+  stream_exchange "$DEIS_PROXY_PORT" "$APP_ID" \
+    "${STREAM_ROUTE}?mode=relay&url=${upstream}" \
+    8000 0 "gzip" > "$report" 2>"${LOG_DIR}/verify-stream-relay.log" || true
+
+  local error
+  error=$(stream_field "$report" '.error')
+  if [ -n "$error" ]; then
+    fail_check "$title" "${error}"
+    return
+  fi
+
+  local status body count first last
+  status=$(stream_field "$report" '.status_line')
+  body=$(jq -r '[.frames[].text] | join("")' < "$report")
+  count=$(jq '.frames | length' < "$report")
+  first=$(jq -r '.frames[0].at_ms // -1' < "$report")
+  last=$(jq -r '.frames[-1].at_ms // -1' < "$report")
+  local spread=$(( last - first ))
+  local expected=$(( (pieces - 1) * gap * 2 / 3 ))
+
+  # Built the same way the body was read, so the trailing newline the upstream
+  # sends is stripped from both sides rather than from one of them.
+  local wanted
+  wanted=$(seq 1 "$pieces" | sed 's/^/piece /')
+
+  if [ "$status" != "${status#*200}" ] && [ "$body" = "$wanted" ] && [ "$spread" -ge "$expected" ]; then
+    pass_check "$title" \
+      "the handler returned new Response(upstream.body) and the ${pieces} pieces reached the client at $(stream_frame_times "$report") - ${spread}ms end to end, matching the pace the upstream wrote them at. The application's manifest asks for a 32MB heap and it never held the object at all"
+  else
+    fail_check "$title" \
+      "expected ${pieces} pieces spread over at least ${expected}ms; got ${count} frame(s) spread ${spread}ms, status \"${status}\", body $(printf '%s' "$body" | tr '\n' '/' | head -c 200)"
+  fi
+}
+
+check_a_stream_stops_when_the_client_hangs_up() {
+  local title="a client that hangs up mid-stream stops the producer"
+  local report="${LOG_DIR}/verify-stream-hangup.json"
+  local tag="hangup-$$"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is not installed, so no stream was opened"
+    return
+  fi
+
+  # Two frames and then the socket is closed where it stands, which is what a
+  # visitor closing a tab looks like from inside the node.
+  stream_exchange "$DEIS_RUNTIME_PORT" "$APP_ID" \
+    "${STREAM_ROUTE}?mode=endless&gapMs=80&tag=${tag}" \
+    6000 2 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-hangup.log" || true
+
+  local frames
+  frames=$(jq '.frames | length' < "$report")
+  if [ "$frames" -lt 2 ]; then
+    fail_check "$title" "the stream produced ${frames} frame(s) before the client left, so there was nothing to interrupt: $(stream_field "$report" '.error')"
+    return
+  fi
+
+  # Poll the application until its producer says it was cancelled. The isolate
+  # is reused across requests, so the handler that was cancelled can be asked
+  # about it by a later one; polling the fact itself rather than waiting a
+  # fixed time is what keeps this from being a race in either direction.
+  local waited=0 cancelled="" produced_first="" produced_second=""
+  while [ "$waited" -lt 100 ]; do
+    cancelled=$(app_request "${LOG_DIR}/verify-stream-hangup.headers" \
+      "${STREAM_ROUTE}?mode=report" | jq -r '.lastCancelled // empty')
+    [ "$cancelled" = "$tag" ] && break
+    waited=$(( waited + 1 ))
+  done
+
+  if [ "$cancelled" != "$tag" ]; then
+    fail_check "$title" \
+      "the producer was never told its client had gone: after ${waited} polls the isolate still reports lastCancelled=\"${cancelled}\". It would go on filling a queue nobody reads until stream_timeout_ms"
+    return
+  fi
+
+  produced_first=$(app_request "${LOG_DIR}/verify-stream-hangup.headers" \
+    "${STREAM_ROUTE}?mode=report" | jq -r '.framesProduced')
+  produced_second=$(app_request "${LOG_DIR}/verify-stream-hangup.headers" \
+    "${STREAM_ROUTE}?mode=report" | jq -r '.framesProduced')
+
+  if [ "$produced_first" = "$produced_second" ]; then
+    pass_check "$title" \
+      "the client read ${frames} frame(s) and closed the socket; the handler's cancel() ran with tag ${tag}, and the frame counter stood still at ${produced_first} across two later requests - the producer stopped rather than writing into nothing"
+  else
+    fail_check "$title" \
+      "cancel() ran, but the producer kept going: the frame counter moved from ${produced_first} to ${produced_second} after the client had gone"
+  fi
+}
+
+check_a_producer_that_throws_leaves_a_failed_transfer() {
+  local title="a producer that throws part-way leaves the client a failed transfer"
+  local report="${LOG_DIR}/verify-stream-throw.json"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is not installed, so no stream was opened"
+    return
+  fi
+
+  stream_exchange "$DEIS_PROXY_PORT" "$APP_ID" \
+    "${STREAM_ROUTE}?mode=throw&after=2&gapMs=80&tag=throw" \
+    6000 0 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-throw.log" || true
+
+  local status frames clean
+  status=$(stream_field "$report" '.status_line')
+  frames=$(jq '.frames | length' < "$report")
+  clean=$(stream_field "$report" '.clean_end')
+
+  # 200 and an incomplete body is the only honest ending available: the status
+  # line left the node before the handler failed, so there is no 500 left to
+  # send. What must not happen is a *clean* end, which the client would read as
+  # a short but complete answer.
+  if [ "$status" != "${status#*200}" ] && [ "$frames" -eq 2 ] && [ "$clean" != "true" ]; then
+    pass_check "$title" \
+      "${status} went out first, the 2 frames the handler managed arrived at $(stream_frame_times "$report"), and then the body ended without its terminating chunk - so the client's read fails instead of succeeding on half an answer"
+  else
+    fail_check "$title" \
+      "expected HTTP 200, 2 frames and no terminating chunk; got \"${status}\", ${frames} frame(s), clean_end=${clean}"
+  fi
+}
+
+check_a_stream_past_its_budget_is_closed_by_the_node() {
+  local title="a stream that runs past stream_timeout_ms is closed by the node"
+  local report="${LOG_DIR}/verify-stream-budget.json"
+  local tag="budget-$$"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is not installed, so no stream was opened"
+    return
+  fi
+
+  # Read for well past the ceiling. The node is what has to end this, and the
+  # client keeps asking until it does.
+  local patience=$(( DEMO_STREAM_TIMEOUT_MS * 3 ))
+  stream_exchange "$DEIS_RUNTIME_PORT" "$APP_ID" \
+    "${STREAM_ROUTE}?mode=endless&gapMs=120&tag=${tag}" \
+    "$patience" 0 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-budget.log" || true
+
+  local frames last clean timed_out
+  frames=$(jq '.frames | length' < "$report")
+  last=$(jq -r '.frames[-1].at_ms // -1' < "$report")
+  clean=$(stream_field "$report" '.clean_end')
+  timed_out=$(stream_field "$report" '.timed_out')
+
+  local floor=$(( DEMO_STREAM_TIMEOUT_MS / 2 ))
+  local ceiling=$(( DEMO_STREAM_TIMEOUT_MS * 2 ))
+  local logged
+  logged=$(grep -c "is past stream_timeout_ms" "${LOG_DIR}/deis-runtime.log" 2>/dev/null || echo 0)
+
+  if [ "$timed_out" != "true" ] && [ "$clean" != "true" ] \
+    && [ "$last" -ge "$floor" ] && [ "$last" -le "$ceiling" ] && [ "$logged" -ge 1 ]; then
+    pass_check "$title" \
+      "an endless stream ran for ${last}ms against the ${DEMO_STREAM_TIMEOUT_MS}ms ceiling this node is configured with, delivered ${frames} frame(s), and was then ended without its terminating chunk. The node's log says why, at warn, ${logged} time(s): \"is past stream_timeout_ms\""
+  else
+    fail_check "$title" \
+      "expected the node to close the stream between ${floor}ms and ${ceiling}ms and to say so; last frame at ${last}ms, clean_end=${clean}, client gave up=${timed_out}, log lines=${logged}"
+  fi
+}
+
+check_a_request_is_served_while_a_stream_is_open() {
+  local title="another request is answered while a stream is still open"
+  local report="${LOG_DIR}/verify-stream-parallel.json"
+  local tag="parallel-$$"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is not installed, so no stream was opened"
+    return
+  fi
+
+  # The application counts every frame it has ever produced, so "the stream is
+  # producing right now" is a fact that can be asked for rather than waited
+  # out. Each poll below is a real request to the same isolate, which is also
+  # what paces the loop.
+  local before
+  before=$(app_request "${LOG_DIR}/verify-stream-parallel.headers" \
+    "${STREAM_ROUTE}?mode=report" | jq -r '.framesProduced')
+
+  # Held open in the background for long enough to make an ordinary request
+  # underneath it. Both go to the same application, which on this node is one
+  # isolate on one thread -- the arrangement that would let a slow reader block
+  # everybody if a stream owned the isolate for its lifetime.
+  stream_exchange "$DEIS_RUNTIME_PORT" "$APP_ID" \
+    "${STREAM_ROUTE}?mode=endless&gapMs=200&tag=${tag}" \
+    4000 0 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-parallel.log" &
+  local holder=$!
+
+  local waited=0 producing=""
+  while [ "$waited" -lt 60 ]; do
+    producing=$(app_request "${LOG_DIR}/verify-stream-parallel.headers" \
+      "${STREAM_ROUTE}?mode=report" | jq -r '.framesProduced')
+    [ -n "$producing" ] && [ "$producing" -gt "$before" ] && break
+    waited=$(( waited + 1 ))
+  done
+
+  if [ -z "$producing" ] || [ "$producing" -le "$before" ]; then
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    fail_check "$title" \
+      "the stream never started producing: the frame counter stayed at ${before} across ${waited} requests. $(stream_field "$report" '.error')"
+    return
+  fi
+
+  local headers="${LOG_DIR}/verify-stream-parallel.headers"
+  local started ended body status length
+  started=$(date +%s%N)
+  body=$(app_request "$headers" "/hello/parallel")
+  ended=$(date +%s%N)
+  status=$(http_status "$headers")
+  length=$(header_value "$headers" "content-length")
+  local took=$(( (ended - started) / 1000000 ))
+
+  # Still running means the stream was open for the whole of the request above,
+  # which is the claim: the answer did not have to wait for the stream to end.
+  local still_open=no
+  kill -0 "$holder" 2>/dev/null && still_open=yes
+
+  wait "$holder" 2>/dev/null || true
+  local frames
+  frames=$(jq '.frames | length' < "$report")
+
+  if [ "$status" = "200" ] && [ "$still_open" = "yes" ] && [ -n "$length" ]; then
+    pass_check "$title" \
+      "the isolate had a stream open and producing (the frame counter had moved from ${before} to ${producing}) when GET /hello/parallel answered ${status} in ${took}ms with Content-Length ${length} - an ordinary answer on the ordinary road. The stream was still open afterwards and went on to deliver ${frames} frames"
+  else
+    fail_check "$title" \
+      "GET /hello/parallel answered \"${status}\" in ${took}ms (Content-Length \"${length}\", stream still open: ${still_open}) while the stream delivered ${frames} frame(s); a stream that owned the isolate would have queued this request behind it. Body: $(printf '%s' "$body" | head -c 200)"
+  fi
+}
+
 check_secret_delivery() {
   local headers="${LOG_DIR}/verify-secret.headers"
   local body
@@ -2734,6 +3480,198 @@ check_app_limits_clamped() {
 
   fail_check "$title" \
     "expected the node to log that ${APP_ID}.${PREVIEW_ENV_NAME} asked for ${GREEDY_TIMEOUT_MS}ms and was held to its own ceiling; the deployment line was $(if [ -n "$asked_line" ]; then echo "present"; else echo "absent"; fi), the clamp reports applying '${applied:-<none>}ms', and a \"narrows\" line for ${GREEDY_TIMEOUT_MS}ms was $(if [ -n "$narrowed" ]; then echo "written, so the request was granted"; else echo "absent"; fi)"
+}
+
+# ----------------------------------------------------------------------
+# Compatibility date and flags
+# ----------------------------------------------------------------------
+#
+# An application says which day's platform it was written against, and the
+# platform keeps giving it that day's answers. Without it, every fix that
+# changes an observable behaviour is a breaking change for the whole fleet,
+# delivered on a node restart nobody scheduled.
+#
+# The demo runs both sides at once, on one node, at the same moment:
+# production is built from sources naming 2026-09-01 and the preview tree has
+# the key deleted, which is what an application deployed before any of this
+# existed looks like. The behaviour they differ on is real and was a defect:
+# a response carrying two Set-Cookie headers used to arrive with one.
+
+# Ask the cookie handler and count the Set-Cookie headers that came back.
+set_cookie_count() {
+  local environment=$1
+  local headers="${LOG_DIR}/verify-cookies-${environment}.headers"
+  env_request "$environment" "$headers" "$COOKIE_ROUTE" > /dev/null
+  grep -ci '^set-cookie:' "$headers" || true
+}
+
+check_compatibility_date_is_visible() {
+  local title="deis deploy and deis versions name the date an application runs under"
+  local report="${LOG_DIR}/cli-deploy-v1.json"
+  local json="${LOG_DIR}/cli-compat-versions.json"
+  local text="${LOG_DIR}/cli-compat-versions.txt"
+
+  if ! deis_cli versions --json > "$json" 2> "${LOG_DIR}/cli-compat-versions.log" \
+    || ! deis_cli versions > "$text" 2>> "${LOG_DIR}/cli-compat-versions.log"; then
+    fail_check "$title" \
+      "deis versions failed: $(tail -n 3 "${LOG_DIR}/cli-compat-versions.log" | tr '\n' ' ')"
+    return
+  fi
+
+  local deployed live_date preview_date column
+  deployed=$(jq -r '.version.compatibility.date // empty' < "$report" 2>/dev/null || true)
+  live_date=$(jq -r --arg env "$ENV_NAME" \
+    '.versions[] | select(.environments | index($env)) | .compatibility.date // "none"' \
+    < "$json" 2>/dev/null || true)
+  preview_date=$(jq -r --arg env "$PREVIEW_ENV_NAME" \
+    '.versions[] | select(.environments | index($env)) | .compatibility.date // "none"' \
+    < "$json" 2>/dev/null || true)
+  column=$(grep -c 'COMPAT' "$text" || true)
+
+  if [ -n "$deployed" ] && [ "$live_date" = "$deployed" ] \
+    && [ "$preview_date" = "none" ] && [ "${column:-0}" -ge 1 ] \
+    && grep -q 'none (oldest)' "$text"; then
+    pass_check "$title" \
+      "the deploy report says the version it uploaded runs under ${deployed}; \`deis versions\` prints a COMPAT column where ${ENV_NAME}'s version reads ${live_date} and ${PREVIEW_ENV_NAME}'s reads \"none (oldest)\". Nobody had to open a bundle"
+  else
+    fail_check "$title" \
+      "deploy report date '${deployed:-<none>}', ${ENV_NAME} version date '${live_date:-<none>}', ${PREVIEW_ENV_NAME} version date '${preview_date:-<none>}', COMPAT header found ${column:-0} time(s); the table was: $(tr '\n' '|' < "$text" | cut -c1-400)"
+  fi
+}
+
+check_every_set_cookie_reaches_a_dated_application() {
+  local title="an application written against 2026-09-01 gets every Set-Cookie it sets"
+  local count
+  count=$(set_cookie_count "$ENV_NAME")
+
+  local date
+  date=$(jq -r '.version.compatibility.date // empty' \
+    < "${LOG_DIR}/cli-deploy-v1.json" 2>/dev/null || true)
+
+  if [ "$count" = "2" ]; then
+    pass_check "$title" \
+      "GET ${COOKIE_ROUTE} on ${ENV_NAME} returned ${count} Set-Cookie headers - the session cookie and the CSRF cookie the handler set with headers.append - because this version's manifest names compatibility date ${date:-<none>}"
+  else
+    fail_check "$title" \
+      "expected 2 Set-Cookie headers from ${ENV_NAME} (manifest date '${date:-<none>}'), got ${count}: $(tr -d '\r' < "${LOG_DIR}/verify-cookies-${ENV_NAME}.headers" | grep -i '^set-cookie' | tr '\n' ' ')"
+  fi
+}
+
+# The half that is the whole point: the old answer survives for the
+# application that was written against it, on the same node, in the same
+# second, from the same handler source.
+check_an_undated_application_keeps_the_old_answer() {
+  local title="an application with no compatibility date still gets the answer it was written against"
+  local count
+  count=$(set_cookie_count "$PREVIEW_ENV_NAME")
+
+  # The node's own account of what it dropped and why, so this quotes the
+  # node rather than this script's idea of it.
+  local dropped
+  dropped=$(node_log \
+    | grep -m 1 "App ${APP_ID}.${PREVIEW_ENV_NAME} set 2 Set-Cookie headers" || true)
+
+  if [ "$count" = "1" ] && [ -n "$dropped" ]; then
+    pass_check "$title" \
+      "the same handler on ${PREVIEW_ENV_NAME}, whose manifest names no date, returned ${count} Set-Cookie header where ${ENV_NAME} returned 2. The node said so: \"$(echo "$dropped" | log_message | cut -c1-200)\""
+  else
+    fail_check "$title" \
+      "expected exactly 1 Set-Cookie header from ${PREVIEW_ENV_NAME} and a node log line naming the drop; got ${count} header(s) and the line was $(if [ -n "$dropped" ]; then echo "present"; else echo "never written"; fi)"
+  fi
+}
+
+# Upload a bundle whose manifest has been altered, straight to the control
+# plane, and print the HTTP status.
+#
+# Past the CLI on purpose. Everything else in this demo goes through `deis`,
+# but the claim here is about what the *control plane* refuses to store, and
+# the CLI would have refused these bundles itself - which would have proved
+# the wrong half. A fleet where one node is older than the date a version
+# names is the case this protects, and the check that stops it is the one at
+# upload.
+upload_altered_bundle() {
+  local label=$1
+  local mutation=$2
+  local source="${DEMO_DIR}/app-v1/dist/deislet/bundle.zip"
+  local patched="${DEMO_DIR}/${label}.zip"
+  local body="${LOG_DIR}/${label}-upload.json"
+
+  python3 - "$source" "$patched" "$mutation" <<'ALTER' || return 1
+import json, sys, zipfile
+
+source, target, mutation = sys.argv[1], sys.argv[2], sys.argv[3]
+with zipfile.ZipFile(source) as archive:
+    entries = [(info.filename, archive.read(info.filename)) for info in archive.infolist()]
+
+with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out:
+    for name, data in entries:
+        if name == "manifest.json":
+            manifest = json.loads(data)
+            exec(mutation, {"manifest": manifest})
+            data = json.dumps(manifest).encode()
+        out.writestr(name, data)
+ALTER
+
+  curl -s -o "$body" -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${API_KEY}" \
+    -H "Content-Type: application/zip" \
+    --data-binary "@${patched}" \
+    "$(control_url)/api/apps/${APP_ID}/versions"
+}
+
+# Read whatever the control plane said about a refused upload.
+refusal_message() {
+  local file=$1
+  local message
+  message=$(jq -r '.error // .message // empty' < "$file" 2>/dev/null || true)
+  if [ -z "$message" ]; then
+    message=$(head -c 300 "$file" 2>/dev/null || true)
+  fi
+  echo "$message"
+}
+
+check_a_date_this_platform_cannot_honour_is_refused() {
+  local title="a bundle naming a compatibility date this build does not know is refused at upload"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is needed to alter a bundle's manifest"
+    return
+  fi
+
+  local status message
+  status=$(upload_altered_bundle "future-date-bundle" \
+    'manifest["compatibility"] = {"date": "2099-01-01"}')
+  message=$(refusal_message "${LOG_DIR}/future-date-bundle-upload.json")
+
+  if [ "$status" = "400" ] && echo "$message" | grep -q "2099-01-01"; then
+    pass_check "$title" \
+      "POST /api/apps/${APP_ID}/versions with a manifest naming 2099-01-01 answered HTTP ${status}: \"$(echo "$message" | cut -c1-220)\". No version row was written, so no node was ever asked for semantics this build does not have"
+  else
+    fail_check "$title" \
+      "expected HTTP 400 naming 2099-01-01, got HTTP ${status} and message '${message:-<empty>}'"
+  fi
+}
+
+check_an_unknown_compatibility_flag_is_refused() {
+  local title="a bundle naming a behaviour flag this build does not know is refused at upload"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is needed to alter a bundle's manifest"
+    return
+  fi
+
+  local status message
+  status=$(upload_altered_bundle "unknown-flag-bundle" \
+    'manifest["compatibility"] = {"flags": ["cookies_but_faster"]}')
+  message=$(refusal_message "${LOG_DIR}/unknown-flag-bundle-upload.json")
+
+  if [ "$status" = "400" ] && echo "$message" | grep -q "cookies_but_faster"; then
+    pass_check "$title" \
+      "POST /api/apps/${APP_ID}/versions with the flag \"cookies_but_faster\" answered HTTP ${status}: \"$(echo "$message" | cut -c1-220)\". A flag nothing implements is refused rather than ignored, so an application is never told it has a behaviour it does not"
+  else
+    fail_check "$title" \
+      "expected HTTP 400 naming cookies_but_faster, got HTTP ${status} and message '${message:-<empty>}'"
+  fi
 }
 
 # Which version an environment is on right now, straight from the control
@@ -3946,6 +4884,19 @@ verify_demo() {
   # Everything else addresses the node directly, so a proxy that mangled an
   # upgrade would have left every other check green.
   check_websocket_through_proxy
+  echo "-- streaming responses --"
+  # The first two go through deis-proxy for the same reason the WebSocket check
+  # does: it is the only hop that could quietly collect a body, and a proxy that
+  # buffered one would leave every other check here green.
+  check_server_sent_events_reach_the_client_frame_by_frame
+  check_a_streamed_response_is_chunked_and_left_uncompressed
+  check_a_stream_fed_from_fetch_is_not_collected
+  check_a_producer_that_throws_leaves_a_failed_transfer
+  check_a_stream_stops_when_the_client_hangs_up
+  check_a_request_is_served_while_a_stream_is_open
+  # Last of the streaming checks: it is the only one that waits, because the
+  # thing being watched is a ceiling running out.
+  check_a_stream_past_its_budget_is_closed_by_the_node
   echo "-- the web platform --"
   # Here rather than at the end: these are about what a handler finds on
   # `globalThis`, which is the same subject as the check above, and they run
@@ -3985,6 +4936,15 @@ verify_demo() {
   check_app_limits_narrowed
   check_app_limits_clamped
   check_memory_cutoff
+  echo "-- compatibility date --"
+  # Both halves need production on v1, whose sources name a date, and the
+  # preview on v2, whose staged copy has the key deleted. They run before the
+  # rollback for the same reason the limit checks do.
+  check_compatibility_date_is_visible
+  check_every_set_cookie_reaches_a_dated_application
+  check_an_undated_application_keeps_the_old_answer
+  check_a_date_this_platform_cannot_honour_is_refused
+  check_an_unknown_compatibility_flag_is_refused
   echo "-- versions --"
   # This one moves production to v2 and back, so it runs after every check
   # that expects production to be on v1.

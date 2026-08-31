@@ -150,7 +150,8 @@ async fn every_shape_queue_send_accepts_reaches_the_op_as_bytes() {
         .await
         .expect("the handler ran");
     let (_status, _headers, body) = rx.await.expect("an answer").expect("a response");
-    let reported = String::from_utf8(body.unwrap_or_default()).expect("the handler answers JSON");
+    let reported =
+        String::from_utf8(body.into_bytes().unwrap_or_default()).expect("the handler answers JSON");
 
     for shape in ["string", "object", "arraybuffer", "view"] {
         let line = format!("{shape}:queue service is not available to this app");

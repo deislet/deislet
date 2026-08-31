@@ -79,6 +79,21 @@ pub struct Assignment {
     /// until somebody deployed again.
     #[serde(default)]
     pub limits: Option<crate::app::types::ResourceLimits>,
+    /// Which of the platform's answers this version expects, exactly as a
+    /// push would have sent them. Absent from an older control plane, in
+    /// which case the version's own manifest is the only thing that says -
+    /// and it always does, because the declaration lives in the bundle.
+    ///
+    /// Held as the *declaration* rather than as resolved answers so that this
+    /// field can never fail to parse. A control plane newer than this node
+    /// will eventually send a flag name or a date this build has never heard
+    /// of, and a strict field here would take the whole list down with it -
+    /// one application this node cannot run would stop it reconciling the
+    /// other forty, which are fine. Resolving happens per application in
+    /// [`Assignment::into_order`], and the application this node genuinely
+    /// cannot honour is refused on its own when its bundle is unpacked.
+    #[serde(default)]
+    pub compatibility: Option<deis_bundle::DeclaredCompatibility>,
 }
 
 /// Hand-written so a `{:?}` on an assignment - in a log line, in an error
@@ -95,12 +110,39 @@ impl std::fmt::Debug for Assignment {
             .field("bundle_sha", &self.bundle_sha)
             .field("env", &format_args!("{names:?} = <redacted>"))
             .field("limits", &self.limits)
+            .field("compatibility", &self.compatibility)
             .finish()
     }
 }
 
 impl Assignment {
     fn into_order(self) -> DeploymentOrder {
+        // Resolved here, per application, so that a declaration this build
+        // cannot read costs only the cross-check in `install` and not the
+        // whole list. Nothing is decided by dropping it: the order's copy
+        // exists to catch a control plane and a bundle disagreeing, while the
+        // bundle's own manifest - which this node is about to unpack, and
+        // which is what the digest covers - is what actually refuses a version
+        // this node cannot honour.
+        let resolved = self.compatibility.as_ref().and_then(|declared| {
+            match deis_bundle::CompatibilityProfile::resolve(declared) {
+                Ok(profile) => Some(profile),
+                Err(reason) => {
+                    warn!(
+                        app_id = %self.app_id,
+                        environment = %self.environment,
+                        version_id = %self.version_id,
+                        reason = %reason,
+                        "The assignment list names platform behaviour this node's build does \
+                         not have. The declaration inside the bundle decides, and if it says \
+                         the same thing this version is refused when it is unpacked; nothing \
+                         else on this list is affected"
+                    );
+                    None
+                }
+            }
+        });
+
         DeploymentOrder {
             app_id: self.app_id,
             version_id: self.version_id,
@@ -109,6 +151,7 @@ impl Assignment {
             bundle_sha: self.bundle_sha,
             env: self.env,
             limits: self.limits,
+            compatibility: resolved,
         }
     }
 }

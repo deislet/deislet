@@ -68,6 +68,8 @@ const ObjectAssign = Object.assign;
 const ObjectCreate = Object.create;
 const ObjectDefineProperty = Object.defineProperty;
 const ObjectFreeze = Object.freeze;
+const NativeWeakSet = WeakSet;
+const NativeMap = Map;
 const hasOwn = typeof Object.hasOwn === "function"
   ? Object.hasOwn
   : (target, key) => Object.prototype.hasOwnProperty.call(target, key);
@@ -405,6 +407,13 @@ const WS_FRAME_BINARY = "\u0002";
 // directions are accepted here: anything the native constructor made counts.
 const NativeResponse = globalThis.Response;
 
+// Captured before any application code can replace the global: a body's road
+// out of the isolate must not be decided by a class the application swapped in.
+const ReadableStreamCtor = globalThis.ReadableStream;
+
+// The responses whose bodies are already bytes. See the constructor below.
+const bufferedBodies = new NativeWeakSet();
+
 class Response extends NativeResponse {
   constructor(body = null, init = undefined) {
     // No init means no init. This read `init ?? {}`, and an empty object
@@ -444,6 +453,29 @@ class Response extends NativeResponse {
     const socket = optionOf(options, "webSocket");
     if (socket) {
       this.webSocket = socket;
+    }
+
+    // Which road this response's body takes out of the isolate.
+    //
+    // A body the application handed over as bytes -- a string, a buffer, a
+    // Blob, nothing at all -- is already whole, and it leaves as one buffer
+    // exactly as it always has. A body handed over as a `ReadableStream` is
+    // one the application is still producing, and it leaves chunk by chunk;
+    // see `__deis_runtime_stream_begin`.
+    //
+    // Recorded in a WeakSet rather than as a property so that neither an
+    // application nor a `structuredClone` can move a response from one road to
+    // the other, and so that nothing is added to the shape of a Response.
+    //
+    // A Response this constructor did not build is one that came back from
+    // `fetch()` (or from `Response.prototype.clone`, which builds a native
+    // one), and it is not in the set: it streams. That is the point of the
+    // rule rather than a side effect of it -- `return fetch(url)` is the
+    // shortest reverse proxy anyone writes, and reading a large upstream into
+    // this isolate's heap before answering is what used to get such an
+    // application killed for a file it never needed to hold.
+    if (!(body instanceof ReadableStreamCtor)) {
+      bufferedBodies.add(this);
     }
   }
 
@@ -1829,6 +1861,9 @@ function createContext(requestData) {
 }
 
 globalThis.__deis_runtime_wait_until_all = async function() {
+  // The tail is the invocation's own work, not the work of any stream that
+  // invocation left open: what it starts is swept below, with the invocation.
+  StreamScope.leave();
   if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
     const promises = globalThis.__pending_wait_until;
     globalThis.__pending_wait_until = [];
@@ -2069,10 +2104,274 @@ function respond(status, headers, body) {
       typeof body === "string" ? new TextEncoder().encode(body) : body
     );
   }
-  return { status: status, headers: headers };
+  return { status: status, headers: headerPairs(headers) };
 }
 
+// Headers leave this isolate as a list of [name, value] pairs, never as an
+// object.
+//
+// One name may legitimately appear twice, and for `Set-Cookie` it has to: the
+// Fetch specification exempts that one header from being combined, so
+// iterating a `Headers` yields one entry per cookie. An object keeps one value
+// per key, so an answer that set a session cookie and a CSRF cookie used to
+// arrive at the client with exactly one of them and nothing said so.
+//
+// Whether the repeats survive is not decided here. The node decides it, once,
+// from the application's compatibility date -- see
+// `runtime/response_headers.rs` -- so an application written before the fix
+// still gets the bytes it was written against. This side's job is only to stop
+// throwing the information away before anyone can choose.
+function headerPairs(headers) {
+  if (Array.isArray(headers)) return headers;
+  const pairs = [];
+  for (const name of Object.keys(headers || {})) pairs.push([name, headers[name]]);
+  return pairs;
+}
+
+// ---------------------------------------------------------
+// Response bodies that are still being produced
+// ---------------------------------------------------------
+//
+// Almost every answer is a finished thing: a string, a JSON document, a
+// rendered page. Those leave this isolate as one buffer, through `respond`
+// above, and nothing below is on their path.
+//
+// A response whose body is a `ReadableStream` is different. Its head can go to
+// the client immediately -- status, headers, first byte -- while the body is
+// still being produced, and for three kinds of answer that is the only way
+// they work at all:
+//
+//   * server-sent events, whose body by definition never ends;
+//   * a large upstream being passed through, which must not be read into this
+//     isolate's heap first;
+//   * anything whose first byte is ready long before its last.
+//
+// # What the loop below is for
+//
+// The chunks cross to the node through `op_deis_stream_write`, which is an
+// async op that does not settle until the node's queue for this stream has
+// room. So the loop *is* the backpressure: a client that reads slowly leaves
+// the producer parked inside that await, holding no CPU and no chunk beyond
+// the two the node's queue allows.
+//
+// # Why the producer's fetch and interval have to be handed over
+//
+// Everything else this runtime does is swept when the stretch that started it
+// ends: an outbound `fetch` left in flight is aborted, an interval left armed
+// is cleared. A stream is the one thing that outlives its stretch on purpose,
+// and the call feeding it is usually the very `fetch` the handler made. So the
+// stream takes ownership of what the handler left open (`StreamScope.adopt`),
+// files what its producer opens afterwards in the same place
+// (`StreamScope.enter`), and gives all of it back when the stream ends
+// (`StreamScope.release`). See the ownership section in `js/bootstrap.js`.
+const StreamScope = globalThis.__deis_runtime_stream_scope;
+
+// Captured for the reason `ObjectAssign` above is: chunks are inspected on
+// every write, after the application has had every chance to replace a global.
+const NativeUint8Array = Uint8Array;
+const NativeArrayBuffer = ArrayBuffer;
+const isArrayBufferView = ArrayBuffer.isView;
+
+// The body of the response the handler just returned, waiting for the node to
+// open a queue for it.
+//
+// A slot rather than a return value because the head and the body leave by
+// different doors: `__deis_runtime_invoke` answers with the status and the
+// headers, `runtime/isolate.rs` sends those to the client, and only then --
+// once there is somewhere for the bytes to go -- does it call
+// `__deis_runtime_stream_begin`. Cleared at the start of every invocation, so
+// a stream that was never begun cannot become the next request's body.
+let pendingStreamBody = null;
+
+// The streams this isolate is producing right now, by the id the node gave
+// them. Several at once is ordinary: an application serving server-sent events
+// has one per connected browser.
+const openStreams = new NativeMap();
+
+// One chunk as bytes, or null if it is not something a body can carry.
+//
+// Strings are accepted and encoded as UTF-8. The web's own rule is that a body
+// stream carries `BufferSource` only, and refusing a string would be defensible
+// -- but every server-sent-events producer ever written enqueues text, and
+// making each one wrap a `TextEncoder` around itself buys nothing. Anything
+// else is refused by name rather than coerced, because `String({})` is
+// "[object Object]" and a body of that is worse than an error.
+function chunkBytes(value) {
+  if (value instanceof NativeUint8Array) return value;
+  if (isArrayBufferView(value)) {
+    return new NativeUint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof NativeArrayBuffer) return new NativeUint8Array(value);
+  if (typeof value === "string") return new TextEncoder().encode(value);
+  return null;
+}
+
+// Take a stream out of the isolate's books and give back everything it held.
+// Every ending goes through here, so none of them can forget the release.
+function retireStream(id, entry) {
+  if (entry.closed) return false;
+  entry.closed = true;
+  openStreams.delete(id);
+  StreamScope.release(entry.owner);
+  return true;
+}
+
+// The producer said it was finished. Closing the node's queue is what writes
+// the terminating chunk, so the client sees a complete response.
+function finishStream(id, entry) {
+  if (!retireStream(id, entry)) return;
+  DenoCore.ops.op_deis_stream_close(id);
+}
+
+// There is nobody left to write to: the client hung up, or the node closed the
+// stream because it ran past `stream_timeout_ms`. Not a failure of the
+// application, and there is no client left to tell about it either way.
+function abandonStream(id, entry, why) {
+  if (!retireStream(id, entry)) return;
+  try {
+    entry.reader.cancel(new Error(why));
+  } catch (_) {
+    // A reader that refuses to be cancelled must not become a second failure;
+    // the stream is off the books either way.
+  }
+  DenoCore.ops.op_deis_stream_close(id);
+}
+
+// The producer threw part-way through. The head went out long ago, so there is
+// no status left to change: the node ends the body without its terminating
+// chunk, which the client reports as a failed transfer rather than as a short
+// success. See `runtime/response_stream.rs`.
+function failStream(id, entry, message) {
+  if (!retireStream(id, entry)) return;
+  try {
+    entry.reader.cancel(new Error(message));
+  } catch (_) {
+    // As above.
+  }
+  DenoCore.ops.op_deis_stream_fail(id, message);
+}
+
+// Drain one stream into the node, one chunk at a time, until it ends, fails,
+// or the client goes away.
+async function pumpStream(id, entry) {
+  for (;;) {
+    // Set before the read rather than after it, because the application's own
+    // producer runs *inside* this await: a `pull` that calls `fetch` is filed
+    // against this stream, and so is swept when this stream ends rather than
+    // when the next request to this application does.
+    StreamScope.enter(entry.owner);
+
+    let step;
+    try {
+      step = await entry.reader.read();
+    } catch (e) {
+      failStream(id, entry, e && e.stack ? e.stack : String(e));
+      return;
+    }
+    if (entry.closed) return;
+    if (step.done) {
+      finishStream(id, entry);
+      return;
+    }
+
+    const bytes = chunkBytes(step.value);
+    if (bytes === null) {
+      failStream(
+        id,
+        entry,
+        "a response body stream enqueued a " + typeof step.value +
+          "; a body may only carry bytes (a Uint8Array or any other ArrayBuffer view) or a string",
+      );
+      return;
+    }
+    // A zero-length chunk is a legal thing to enqueue and means nothing, so it
+    // is dropped rather than written: written, it would cost a round trip
+    // through the node's queue for no bytes.
+    if (bytes.length === 0) continue;
+
+    StreamScope.enter(entry.owner);
+    try {
+      await DenoCore.ops.op_deis_stream_write(id, bytes);
+    } catch (_) {
+      abandonStream(id, entry, "the client stopped reading this response");
+      return;
+    }
+    if (entry.closed) return;
+  }
+}
+
+// Start producing the body of the response whose head has just gone out.
+//
+// Called by `runtime/isolate.rs` once the client has somewhere to receive
+// bytes. Synchronous on purpose: it hands the loop above to the event loop and
+// returns, so the invocation that produced the head can finish -- including its
+// `waitUntil` tail -- and the runtime thread goes back to serving other
+// requests for this application between chunks.
+globalThis.__deis_runtime_stream_begin = function(id) {
+  const source = pendingStreamBody;
+  pendingStreamBody = null;
+
+  if (source === null || source === undefined) {
+    DenoCore.ops.op_deis_stream_fail(
+      id,
+      "the runtime was asked to stream a response body it was not holding; this is a fault in " +
+        "the node, not in the application",
+    );
+    return;
+  }
+
+  // Adopted before the reader is taken: whatever the handler still has open
+  // belongs to this stream from here on, and its outbound calls are put on the
+  // stream's clock rather than on the request's, which is already spent.
+  const owner = StreamScope.adopt();
+
+  let reader;
+  try {
+    reader = source.getReader();
+  } catch (e) {
+    StreamScope.release(owner);
+    DenoCore.ops.op_deis_stream_fail(
+      id,
+      "the response body could not be read: " + (e && e.message ? e.message : String(e)),
+    );
+    return;
+  }
+
+  const entry = { reader, owner, closed: false };
+  openStreams.set(id, entry);
+  // Nothing in the loop should reach this catch -- every step it takes has one
+  // of its own -- but an unhandled rejection inside an isolate is not a local
+  // failure: deno_core reports it as an event-loop error, and
+  // `AppRuntime::pump_response_streams` would then abort every other stream
+  // this application has open along with this one.
+  pumpStream(id, entry).catch((e) => {
+    failStream(id, entry, e && e.stack ? e.stack : String(e));
+  });
+  // The pump ran up to its first await and left this stream as the owner of
+  // whatever is opened next. The `waitUntil` tail runs after this returns and
+  // is not this stream's work, so ownership goes back to the invocation.
+  StreamScope.leave();
+};
+
+// Stop producing: the client went away, or the stream ran out of time.
+//
+// Called by `runtime/isolate.rs`, which is where both of those are noticed. It
+// is what makes cancellation reach the application: without it a producer
+// would go on filling a queue nobody drains until its budget ran out.
+globalThis.__deis_runtime_stream_cancel = function(id, reason) {
+  const entry = openStreams.get(id);
+  if (entry === undefined) return false;
+  abandonStream(id, entry, reason);
+  return true;
+};
+
 globalThis.__deis_runtime_invoke = async function(requestPayload) {
+  // A stream the previous invocation stashed and never began would otherwise
+  // become this request's body. Ownership goes back to the invocation for the
+  // same reason: what this handler opens is this handler's, and is swept when
+  // it ends.
+  pendingStreamBody = null;
+  StreamScope.leave();
   try {
     let handler;
     if (globalThis.user_module && typeof globalThis.user_module.default === 'function') {
@@ -2103,9 +2402,9 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     // hands back a Response still carrying the upstream's framing, and a
     // Content-Length that disagrees with the bytes actually sent is a
     // truncated or hung response at the client.
-    const headers = {};
+    const headers = [];
     resp.headers.forEach((v, k) => {
-      if (!REFRAMED_HEADERS.has(k.toLowerCase())) headers[k] = v;
+      if (!REFRAMED_HEADERS.has(k.toLowerCase())) headers.push([k, v]);
     });
     
     // Check for WebSocket upgrade
@@ -2118,7 +2417,7 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     const attached = optionOf(resp, "webSocket");
     if (attached && optionOf(attached, "ws_id")) {
         webSocketId = attached.ws_id;
-        headers["X-Runtime-WebSocket-ID"] = webSocketId;
+        headers.push(["X-Runtime-WebSocket-ID", webSocketId]);
     }
 
     // Read body.
@@ -2127,6 +2426,16 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     // response with no body at all stays without one -- an upgrade, and the
     // 204/304/HEAD answers where a zero-length body is a different thing from
     // no body.
+    // A body the application is still producing goes out chunk by chunk
+    // instead. Nothing is read here: `arrayBuffer()` on such a body is exactly
+    // the wait this avoids -- for server-sent events it never returns at all,
+    // and for a large upstream it is the copy that gets the application killed
+    // for its heap.
+    if (!webSocketId && resp.body && !bufferedBodies.has(resp)) {
+      pendingStreamBody = resp.body;
+      return { status: resp.status, headers: headerPairs(headers), stream: true };
+    }
+
     let body = null;
     if (!webSocketId && resp.body) {
         body = new Uint8Array(await resp.arrayBuffer());
@@ -2228,6 +2537,8 @@ globalThis.user_module = {}; globalThis.__deis_runtime_set_response = (json) => 
 // the application's exports there once the module has evaluated.
 for (const name of [
   "__deis_runtime_invoke",
+  "__deis_runtime_stream_begin",
+  "__deis_runtime_stream_cancel",
   "__deis_runtime_invoke_queue",
   "__deis_runtime_invoke_scheduled",
   "__deis_runtime_wait_until_all",

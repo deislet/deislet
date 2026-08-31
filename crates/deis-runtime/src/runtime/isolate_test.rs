@@ -8,6 +8,7 @@ mod tests {
         REQUEST_ERRORS_TOTAL, TIMEOUT_CUTOFFS_TOTAL,
     };
     use crate::runtime::queue_client::LeasedMessage;
+    use crate::runtime::ResponseBody;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
@@ -17,13 +18,58 @@ mod tests {
     /// Most handlers in this file answer with a string, and this is the one
     /// place that says so; a body that is not UTF-8 here is a bug in the test,
     /// not in the runtime.
-    fn text(body: Option<Vec<u8>>) -> Option<String> {
-        body.map(|bytes| String::from_utf8(bytes).expect("this test's handler answers with text"))
+    fn text(body: ResponseBody) -> Option<String> {
+        body.into_bytes()
+            .map(|bytes| String::from_utf8(bytes).expect("this test's handler answers with text"))
     }
 
     /// A request body written as a string, for the tests whose payload is one.
     fn sent(body: &str) -> Option<Vec<u8>> {
         Some(body.as_bytes().to_vec())
+    }
+
+    /// Read a streaming body to its end, driving the isolate as
+    /// `runtime/pool.rs` does.
+    ///
+    /// The two halves have to run together: the producer only advances while
+    /// the isolate's event loop is being driven, and the pump only finishes
+    /// when the reader has taken everything. Awaiting either one alone hangs,
+    /// which is exactly the arrangement the runtime thread makes.
+    async fn drain_stream(
+        runtime: &mut AppRuntime,
+        body: ResponseBody,
+    ) -> (Vec<u8>, Option<String>) {
+        let ResponseBody::Stream(mut reader) = body else {
+            panic!("this test expected a body that is still being produced");
+        };
+        let read = async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = std::future::poll_fn(|cx| reader.poll_chunk(cx)).await {
+                bytes.extend_from_slice(&chunk);
+            }
+            (bytes, reader.failure())
+        };
+        let (collected, ()) = tokio::join!(read, runtime.pump_response_streams());
+        collected
+    }
+
+    /// Ask for one path and hand back whatever the handler answered.
+    async fn answer_to(
+        runtime: &mut AppRuntime,
+        path: &str,
+    ) -> (u16, crate::runtime::HeaderPairs, ResponseBody) {
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                format!("http://localhost{path}"),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        rx.await.expect("a response").expect("a response")
     }
 
     #[tokio::test]
@@ -471,7 +517,7 @@ export default function handler(context: any): Response {
 
         assert_eq!(status, 200);
         assert_eq!(
-            body.as_deref(),
+            body.into_bytes().as_deref(),
             Some(&payload[..]),
             "the body did not survive the trip through the isolate byte for byte"
         );
@@ -528,8 +574,8 @@ export default function handler(context: any): Response {
             .unwrap();
         let (status, _, body) = rx.await.unwrap().unwrap();
         assert_eq!(status, 204);
-        assert_eq!(
-            body, None,
+        assert!(
+            matches!(body, ResponseBody::None),
             "a body-less answer must stay body-less, and must not inherit the last one"
         );
     }
@@ -1723,6 +1769,7 @@ export default function handler(context: any): Response {
                 limits: ExecutionLimits {
                     timeout_ms: 5_000,
                     wait_until_timeout_ms: 7_500,
+                    stream_timeout_ms: 60_000,
                     rate_limit_ops_per_sec: 42.5,
                     cpu_time_limit_ms: 1_250,
                 },
@@ -2132,7 +2179,7 @@ export default function handler(context: any): Response {
             .expect("the isolate serves again after a cut-off");
         let (status, _, body) = rx.await.unwrap().unwrap();
         assert_eq!(status, 200);
-        assert_eq!(body.as_deref(), Some(&b"ok"[..]));
+        assert_eq!(body.into_bytes().as_deref(), Some(&b"ok"[..]));
     }
 
     /// The whole point of a CPU ceiling: two handlers that a wall clock cannot
@@ -3008,6 +3055,370 @@ export default function handler(context: any): Response {
         assert!(body.contains("ctx.services"), "{body}");
     }
 
+    // ---------------------------------------------------------------
+    // Response bodies that are still being produced
+    // ---------------------------------------------------------------
+
+    /// A handler that streams six numbered chunks, and a second route that
+    /// reports how many of them its producer has managed so far.
+    ///
+    /// The counter is what makes "incrementally" checkable without a clock: a
+    /// producer that had already finished would report six.
+    const STREAMING_APP: &str = r#"
+        let produced = 0;
+        export default async function handler(context) {
+          const path = new URL(context.request.url).pathname;
+          if (path === "/progress") {
+            return new Response("produced=" + produced);
+          }
+          let n = 0;
+          const stream = new ReadableStream({
+            pull(controller) {
+              if (n >= 6) { controller.close(); return; }
+              n += 1;
+              produced = n;
+              controller.enqueue("chunk" + n + "\n");
+            },
+          });
+          return new Response(stream, {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+    "#;
+
+    async fn streaming_runtime(app_id: &str, code: &str) -> AppRuntime {
+        let mut runtime = AppRuntime::new(
+            app_id.to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+        runtime
+    }
+
+    #[tokio::test]
+    async fn a_streaming_body_is_answered_before_a_byte_of_it_exists() {
+        // The head has to leave while the body is still being made. Before
+        // this, a handler returning a stream had its whole body collected
+        // first, so an events feed -- whose body never ends -- simply hit the
+        // execution deadline and the client got nothing at all.
+        let mut runtime = streaming_runtime("stream.production", STREAMING_APP).await;
+
+        let (status, headers, body) = answer_to(&mut runtime, "/feed").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            crate::runtime::response_headers::first_value(&headers, "content-type"),
+            Some("text/event-stream")
+        );
+        assert!(
+            matches!(body, ResponseBody::Stream(_)),
+            "the handler's stream was collected into a buffer instead"
+        );
+
+        let (bytes, failure) = drain_stream(&mut runtime, body).await;
+        assert_eq!(failure, None, "the producer finished, so nothing failed");
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "chunk1\nchunk2\nchunk3\nchunk4\nchunk5\nchunk6\n",
+            "every chunk has to arrive, in order and exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_request_is_served_while_a_stream_is_still_open() {
+        // The constraint that shapes the whole design: one isolate, one
+        // thread, and a stream that may run for minutes. A stream that held
+        // the isolate until its client finished reading would let one slow
+        // reader stop every other request for that application.
+        let mut runtime = streaming_runtime("interleave.production", STREAMING_APP).await;
+
+        let (_, _, body) = answer_to(&mut runtime, "/feed").await;
+        let ResponseBody::Stream(mut reader) = body else {
+            panic!("the handler answered with a stream");
+        };
+
+        // One chunk, and no more: the reader stops there, which is what a slow
+        // client looks like from inside the node.
+        let first = tokio::select! {
+            chunk = std::future::poll_fn(|cx| reader.poll_chunk(cx)) => chunk,
+            () = runtime.pump_response_streams() => panic!("the stream ended before its first chunk"),
+        };
+        assert_eq!(first.as_deref(), Some(&b"chunk1\n"[..]));
+
+        // The isolate now has an open stream whose reader is not reading. A
+        // second request must still be answered.
+        let (status, _, progress) = answer_to(&mut runtime, "/progress").await;
+        assert_eq!(
+            status, 200,
+            "a request arriving while a stream was open was not served"
+        );
+        let progress = text(progress).unwrap();
+        let produced: u32 = progress.trim_start_matches("produced=").parse().unwrap();
+        assert!(
+            (1..6).contains(&produced),
+            "the producer had made {produced} chunk(s) when the second request was answered; \
+             below 1 means nothing was produced, 6 means the whole body was collected after all"
+        );
+
+        // And the stream still finishes afterwards.
+        let read = async {
+            let mut rest = Vec::new();
+            while let Some(chunk) = std::future::poll_fn(|cx| reader.poll_chunk(cx)).await {
+                rest.extend_from_slice(&chunk);
+            }
+            (rest, reader.failure())
+        };
+        let ((rest, failure), ()) = tokio::join!(read, runtime.pump_response_streams());
+        assert_eq!(failure, None);
+        assert_eq!(
+            String::from_utf8(rest).unwrap(),
+            "chunk2\nchunk3\nchunk4\nchunk5\nchunk6\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_hangs_up_stops_the_producer() {
+        // Otherwise the producer goes on making chunks nobody will ever read,
+        // holding the isolate's attention until the stream's budget runs out --
+        // which is minutes of a runtime thread spent on a socket that is
+        // already closed.
+        let code = r#"
+            let cancelled = "no";
+            let made = 0;
+            export default async function handler(context) {
+              const path = new URL(context.request.url).pathname;
+              if (path === "/after") {
+                return new Response(cancelled + ":" + made);
+              }
+              const stream = new ReadableStream({
+                pull(controller) {
+                  made += 1;
+                  controller.enqueue("x".repeat(8));
+                },
+                cancel(reason) {
+                  cancelled = "yes";
+                },
+              });
+              return new Response(stream);
+            }
+        "#;
+        let mut runtime = streaming_runtime("hangup.production", code).await;
+
+        let (_, _, body) = answer_to(&mut runtime, "/endless").await;
+        let ResponseBody::Stream(mut reader) = body else {
+            panic!("the handler answered with a stream");
+        };
+        let first = tokio::select! {
+            chunk = std::future::poll_fn(|cx| reader.poll_chunk(cx)) => chunk,
+            () = runtime.pump_response_streams() => panic!("an endless stream ended on its own"),
+        };
+        assert_eq!(first.as_deref(), Some(&b"xxxxxxxx"[..]));
+
+        // The client goes away. Nothing else changes.
+        drop(reader);
+
+        // The pump returns, which it can only do once no stream is open: the
+        // producer was cancelled rather than left running.
+        runtime.pump_response_streams().await;
+        assert!(
+            !runtime.has_open_response_streams(),
+            "the stream stayed open after its client went away"
+        );
+
+        let (_, _, after) = answer_to(&mut runtime, "/after").await;
+        let after = text(after).unwrap();
+        let (cancelled, made) = after.split_once(':').unwrap();
+        assert_eq!(
+            cancelled, "yes",
+            "the producer was never told; it stopped only because nothing polled it"
+        );
+        let made: u32 = made.parse().unwrap();
+        assert!(
+            made <= 8,
+            "the producer made {made} chunks for a client that took one; the queue is not \
+             bounding it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_producer_that_throws_leaves_the_client_a_failed_transfer() {
+        // The 200 went out with the head, so there is no status left to
+        // change. What the client must not get is a body that ends cleanly:
+        // that would be a truncated answer it believes is complete.
+        let code = r#"
+            export default async function handler(context) {
+              let n = 0;
+              const stream = new ReadableStream({
+                pull(controller) {
+                  n += 1;
+                  if (n === 3) throw new Error("the third page could not be built");
+                  controller.enqueue("part" + n + " ");
+                },
+              });
+              return new Response(stream);
+            }
+        "#;
+        let mut runtime = streaming_runtime("throws.production", code).await;
+
+        let (status, _, body) = answer_to(&mut runtime, "/half").await;
+        assert_eq!(status, 200, "the head had already been decided");
+        let (bytes, failure) = drain_stream(&mut runtime, body).await;
+
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "part1 part2 ",
+            "everything produced before the throw still belongs to the client"
+        );
+        let failure = failure.expect(
+            "a stream that stopped part-way must be distinguishable from one that finished, or \
+             the client reads a truncated body as a whole one",
+        );
+        assert!(
+            failure.contains("the third page could not be built"),
+            "the reason has to name what threw, for the node's log: {failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_runs_past_its_budget_is_closed_by_the_node() {
+        // An unbounded stream is a queue, a socket and a producer this node
+        // holds for as long as the application feels like it. The budget is
+        // enforced by closing the stream rather than by terminating the
+        // isolate, so the application's other requests -- and its other
+        // streams -- are untouched.
+        let code = r#"
+            export default async function handler(context) {
+              if (new URL(context.request.url).pathname === "/plain") {
+                return new Response("still serving");
+              }
+              const stream = new ReadableStream({
+                pull(controller) { controller.enqueue("tick "); },
+              });
+              return new Response(stream);
+            }
+        "#;
+        let mut runtime = AppRuntime::new(
+            "budget.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec {
+                limits: ExecutionLimits {
+                    // Long enough that the first chunks are produced normally,
+                    // short enough that the test is not a wait.
+                    stream_timeout_ms: 300,
+                    // This producer has no pacing of its own, so it writes as
+                    // fast as the queue drains -- thousands of chunks a second,
+                    // one op dispatch each. At the platform default of 1000 the
+                    // op rate limiter would terminate the isolate first and the
+                    // test would be measuring that ceiling instead of this one.
+                    // A real producer writes far larger chunks far less often;
+                    // see `pump_response_streams` for what an application that
+                    // does not is told.
+                    rate_limit_ops_per_sec: 1_000_000.0,
+                    ..ExecutionLimits::default()
+                },
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let (_, _, body) = answer_to(&mut runtime, "/endless").await;
+        let (bytes, failure) = drain_stream(&mut runtime, body).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            !bytes.is_empty(),
+            "the client got nothing at all; the budget cut the stream before it started"
+        );
+        let failure = failure.expect("a stream cut off at its budget is not a stream that ended");
+        assert!(
+            failure.contains("stream_timeout_ms") && failure.contains("300"),
+            "the reason has to name the ceiling and its value: {failure}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the stream ran {elapsed:?} against a 300ms budget"
+        );
+
+        // The isolate is still healthy: the budget closed one stream, it did
+        // not kill the application.
+        let (status, _, plain) = answer_to(&mut runtime, "/plain").await;
+        assert_eq!(status, 200);
+        assert_eq!(text(plain).as_deref(), Some("still serving"));
+    }
+
+    #[tokio::test]
+    async fn a_producer_past_the_op_ceiling_is_told_which_ceiling_it_crossed() {
+        // One chunk costs one op dispatch, so a producer writing tiny chunks
+        // as fast as it can meets `rate_limit_ops_per_sec` long before it
+        // meets any byte rate. The limiter terminates the isolate from inside
+        // the dispatch, which surfaces as V8 unwinding mid-call -- a message
+        // that names neither the application nor the ceiling. Left as it
+        // arrives, an operator reading it would have nothing to act on.
+        let code = r#"
+            export default async function handler(context) {
+              const stream = new ReadableStream({
+                pull(controller) { controller.enqueue("x"); },
+              });
+              return new Response(stream);
+            }
+        "#;
+        let mut runtime = AppRuntime::new(
+            "opceiling.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec {
+                limits: ExecutionLimits {
+                    rate_limit_ops_per_sec: 50.0,
+                    stream_timeout_ms: 30_000,
+                    ..ExecutionLimits::default()
+                },
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (status, _, body) = answer_to(&mut runtime, "/flood").await;
+        assert_eq!(status, 200);
+        let (_, failure) = drain_stream(&mut runtime, body).await;
+
+        let failure = failure.expect("a stream cut off by the op ceiling did not end cleanly");
+        assert!(
+            failure.contains("op dispatches per second") && failure.contains("50"),
+            "the reason has to name the ceiling and its value so an operator can act on it: \
+             {failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_string_answer_still_takes_the_simple_road() {
+        // Most responses are a string, and none of the machinery above may get
+        // in their way: no queue, no deadline of its own, no producer. The
+        // body arrives whole, in the answer itself.
+        let mut runtime = streaming_runtime(
+            "plain.production",
+            r#"export default async function handler() { return new Response("just bytes"); }"#,
+        )
+        .await;
+
+        let (status, _, body) = answer_to(&mut runtime, "/").await;
+        assert_eq!(status, 200);
+        assert!(
+            !matches!(body, ResponseBody::Stream(_)),
+            "an ordinary answer was put on the streaming path"
+        );
+        assert_eq!(text(body).as_deref(), Some("just bytes"));
+        assert!(!runtime.has_open_response_streams());
+    }
+
     /// Serve one fixed body on loopback and hand back the address.
     async fn a_server_answering(body: &'static str) -> std::net::SocketAddr {
         use axum::routing::get;
@@ -3152,17 +3563,26 @@ export default function handler(context: any): Response {
             .await
             .unwrap();
         let (status, headers, body) = rx.await.unwrap().unwrap();
-        let body = text(body);
 
         assert_eq!(status, 200);
-        assert_eq!(body.as_deref(), Some("proxied body"));
+        // Streamed, not collected: the Response `fetch` hands back is one this
+        // runtime did not build, so it is an upstream body being passed
+        // through, and reading it into this isolate's heap first is what used
+        // to kill an application for proxying a file bigger than its heap.
+        assert!(
+            matches!(body, ResponseBody::Stream(_)),
+            "the upstream's body was collected before the handler could answer"
+        );
+        let (bytes, failure) = drain_stream(&mut runtime, body).await;
+        assert_eq!(failure, None, "the proxied body did not finish");
+        assert_eq!(String::from_utf8(bytes).unwrap(), "proxied body");
         // The upstream sent one; forwarding it would describe a body this node
         // is not sending, and a client would truncate or hang on the
         // difference.
         assert!(
             !headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("content-length")),
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-length")),
             "the upstream's framing was forwarded: {headers:?}"
         );
         // Everything that does describe the body still comes through.
@@ -4766,9 +5186,10 @@ export default function handler(context: any): Response {
         ran.expect("a cut-off tail must not be reported as a failed request");
 
         let (status, _, body) = rx.await.unwrap().unwrap();
-        assert_eq!(status, 200, "{:?}", text(body.clone()));
+        let body = text(body);
+        assert_eq!(status, 200, "{body:?}");
         assert_eq!(
-            text(body).as_deref(),
+            body.as_deref(),
             Some("answered"),
             "the response goes out before the tail runs at all"
         );
@@ -4851,8 +5272,9 @@ export default function handler(context: any): Response {
             .await
             .expect("the request runs");
         let (status, _, body) = rx.await.unwrap().unwrap();
-        assert_eq!(status, 200, "{:?}", text(body.clone()));
-        assert_eq!(text(body).as_deref(), Some("answered"));
+        let body = text(body);
+        assert_eq!(status, 200, "{body:?}");
+        assert_eq!(body.as_deref(), Some("answered"));
 
         let (tx, rx) = oneshot::channel();
         runtime

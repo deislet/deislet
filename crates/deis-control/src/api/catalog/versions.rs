@@ -28,6 +28,19 @@ pub struct VersionView {
     pub created_at: i64,
     /// The manifest as structured JSON, parsed from the stored text.
     pub manifest: Value,
+    /// Which day's platform this version was written against, and which
+    /// behaviours that leaves on, resolved from the same stored manifest.
+    ///
+    /// Lifted out of `manifest` deliberately. It is already in there, but the
+    /// question "why does this behave differently in production" has to be
+    /// answerable without reading a bundle or picking through a manifest, and
+    /// this is the field `deis versions` and `deis deploy` print. A version
+    /// that declares no date is `Some` with a null date - that is a complete
+    /// answer and the one an operator most needs to see.
+    ///
+    /// `None` means the stored manifest could not be read at all, which is the
+    /// same condition that leaves `manifest` holding a raw string.
+    pub compatibility: Option<crate::catalog::CompatibilityProfile>,
 }
 
 impl From<&Version> for VersionView {
@@ -43,6 +56,25 @@ impl From<&Version> for VersionView {
             );
             Value::String(version.manifest.clone())
         });
+        // Parsed a second time, as a manifest rather than as free JSON,
+        // because resolving the block is the shared reader's job and not this
+        // view's. A version whose manifest was accepted at upload always
+        // resolves; one that does not is a row written by an older build or
+        // tampered with, and saying "unknown" is the only honest answer.
+        let compatibility = deis_bundle::Manifest::parse(&version.manifest)
+            .ok()
+            .and_then(|manifest| match manifest.compatibility_profile() {
+                Ok(profile) => Some(profile),
+                Err(e) => {
+                    warn!(
+                        app_id = %version.app_id,
+                        version_id = %version.id,
+                        error = %e,
+                        "Stored manifest declares a compatibility date or flag this build cannot resolve, so this version is listed without one; a node would refuse to run it for the same reason"
+                    );
+                    None
+                }
+            });
         Self {
             id: version.id.clone(),
             app_id: version.app_id.clone(),
@@ -50,6 +82,7 @@ impl From<&Version> for VersionView {
             bundle_sha: version.bundle_sha.clone(),
             created_at: version.created_at,
             manifest,
+            compatibility,
         }
     }
 }

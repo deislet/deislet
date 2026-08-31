@@ -122,6 +122,7 @@ async fn a_bundled_site_is_served_from_its_assets_and_falls_through_on_a_miss() 
             bundle_sha: sha,
             env: HashMap::new(),
             limits: None,
+            compatibility: None,
         })
         .await
         .expect("the deployment should have been applied");

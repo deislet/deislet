@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use deis_build_core::ProjectConfig;
-use deis_bundle::{Asset, DeclaredLimits, Manifest, QueueConsumer, Route, SUPPORTED_SCHEMA};
+use deis_bundle::{
+    Asset, DeclaredCompatibility, DeclaredLimits, Manifest, QueueConsumer, Route, SUPPORTED_SCHEMA,
+};
 
 use crate::assets::StagedAsset;
 use crate::routing::RouteEntry;
@@ -93,6 +95,7 @@ pub fn build_manifest(
             .collect(),
         site,
         limits: limits(config)?,
+        compatibility: compatibility(config)?,
     };
 
     // Fail here rather than at upload: the checks are the control plane's, and
@@ -134,6 +137,45 @@ fn limits(config: &ProjectConfig) -> Result<Option<DeclaredLimits>> {
         .validate()
         .map_err(|e| anyhow::anyhow!("the project's \"limits\" block is not usable: {e}"))?;
     Ok(Some(limits))
+}
+
+/// The day this project says it was written against, and the behaviours it
+/// takes early or holds back by name.
+///
+/// Checked here, with the project file still on the author's screen: a date
+/// this build of the platform does not know, or a flag name nothing knows,
+/// fails the build rather than producing a bundle every node would refuse. The
+/// check itself is `deis_bundle`'s, so the build, the control plane and the
+/// node all refuse exactly the same declarations.
+///
+/// A project that names neither leaves the key out of the manifest entirely,
+/// which is what pins it to the oldest behaviour the platform has. Nothing is
+/// filled in on the author's behalf: a date this build chose would move with
+/// the calendar, and the same unchanged source would then compile to two
+/// bundles that behave differently. `deis deploy` is where an author is told
+/// their application has no date, once per deploy, with the date to write.
+fn compatibility(config: &ProjectConfig) -> Result<Option<DeclaredCompatibility>> {
+    let date = match config.compatibility_date.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(text) => Some(text.parse().map_err(|e| {
+            anyhow::anyhow!("the project's \"compatibilityDate\" is not usable: {e}")
+        })?),
+    };
+    let flags: Vec<String> = config
+        .compatibility_flags
+        .iter()
+        .map(|flag| flag.trim().to_string())
+        .filter(|flag| !flag.is_empty())
+        .collect();
+
+    let declared = DeclaredCompatibility { date, flags };
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    declared.validate().map_err(|e| {
+        anyhow::anyhow!("the project's compatibility declaration is not usable: {e}")
+    })?;
+    Ok(Some(declared))
 }
 
 /// Which platform services the app declares it uses.
@@ -292,6 +334,83 @@ mod tests {
         assert_eq!(manifest.cron, vec!["0 */6 * * *"]);
         assert_eq!(manifest.queues[0].name, "jobs");
         assert_eq!(manifest.queues[0].batch_size, Some(10));
+    }
+
+    #[test]
+    fn a_compatibility_date_and_its_flags_reach_the_manifest() {
+        let manifest = build_manifest(
+            &config(serde_json::json!({
+                "compatibilityDate": "2026-09-01",
+                "compatibilityFlags": ["single_set_cookie_header"]
+            })),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let declared = manifest.compatibility.as_ref().expect("declared");
+        assert_eq!(
+            declared.date.map(|d| d.to_string()).as_deref(),
+            Some("2026-09-01")
+        );
+        assert_eq!(declared.flags, vec!["single_set_cookie_header"]);
+        // The flag holds the behaviour back past the date that would have
+        // turned it on, which is the whole point of naming one.
+        let profile = manifest.compatibility_profile().unwrap();
+        assert!(!profile.is_on(deis_bundle::Flag::MultipleSetCookieHeaders));
+    }
+
+    #[test]
+    fn a_project_that_says_nothing_leaves_the_key_out() {
+        let manifest = build_manifest(&config(serde_json::json!({})), &[], &[]).unwrap();
+        assert!(
+            manifest.compatibility.is_none(),
+            "an empty block would put a compatibility line in every log of every delivery"
+        );
+        assert_eq!(manifest.compatibility_profile().unwrap().date(), None);
+    }
+
+    /// The failure this check exists to prevent: a build that produced a
+    /// bundle no node could load, discovered after an upload and a wait.
+    #[test]
+    fn a_date_this_build_cannot_honour_fails_the_build() {
+        let err = build_manifest(
+            &config(serde_json::json!({ "compatibilityDate": "2099-01-01" })),
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("2099-01-01"), "{err}");
+        assert!(
+            err.contains(&deis_bundle::PLATFORM_KNOWN_THROUGH.to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_date_fails_the_build_rather_than_being_dropped() {
+        let err = build_manifest(
+            &config(serde_json::json!({ "compatibilityDate": "2026-9-1" })),
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("YYYY-MM-DD"), "{err}");
+    }
+
+    #[test]
+    fn a_flag_nobody_knows_fails_the_build() {
+        let err = build_manifest(
+            &config(serde_json::json!({ "compatibilityFlags": ["all_the_cookies"] })),
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("all_the_cookies"), "{err}");
+        assert!(err.contains("multiple_set_cookie_headers"), "{err}");
     }
 
     #[test]

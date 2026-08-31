@@ -348,8 +348,11 @@ pub async fn handle_request(
             if status == 101 {
                 if let Some(ws_upgrade) = ws {
                     // Extract WebSocket ID
-                    if let Some(ws_id) = resp_headers.get("X-Runtime-WebSocket-ID") {
-                        let ws_id = ws_id.clone();
+                    if let Some(ws_id) = crate::runtime::response_headers::first_value(
+                        &resp_headers,
+                        "X-Runtime-WebSocket-ID",
+                    ) {
+                        let ws_id = ws_id.to_string();
                         let key_clone = key.clone();
                         let app_manager = state.app_manager.clone();
 
@@ -385,10 +388,7 @@ pub async fn handle_request(
                 response = response.header(key, value);
             }
 
-            response
-                .body(Body::from(resp_body.unwrap_or_default()))
-                .unwrap()
-                .into_response()
+            response.body(http_body(resp_body)).unwrap().into_response()
         }
         Err(e) => {
             tracing::error!(
@@ -399,6 +399,47 @@ pub async fn handle_request(
                 e
             );
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+/// The axum body for what the isolate answered with.
+///
+/// The first two arms are the road every response but a handful takes: a body
+/// of known length, framed by hyper with a `Content-Length`, exactly as before
+/// streaming existed.
+///
+/// The third is a body the application is still producing. It is handed over as
+/// a stream, so hyper frames it chunked and writes each chunk as it arrives
+/// rather than waiting for a length it cannot know. Two things follow from
+/// that and both are the point: the head reaches the client before the first
+/// chunk exists, and dropping this body -- which is what hyper does when the
+/// client hangs up -- closes the queue, which is how the isolate learns to stop
+/// producing.
+fn http_body(body: crate::runtime::ResponseBody) -> Body {
+    use crate::runtime::ResponseBody;
+    match body {
+        ResponseBody::None => Body::empty(),
+        ResponseBody::Bytes(bytes) => Body::from(bytes),
+        ResponseBody::Stream(mut reader) => {
+            Body::from_stream(futures_util::stream::poll_fn(move |cx| {
+                let chunk = std::task::ready!(reader.poll_chunk(cx));
+                std::task::Poll::Ready(match chunk {
+                    Some(chunk) => Some(Ok(chunk)),
+                    // The producer is done. If it stopped badly the reason is
+                    // waiting beside the queue, and the body ends with an error
+                    // rather than with its terminating chunk: the client was
+                    // answered 200 long ago, so a failed transfer is the only
+                    // way left to tell it the answer is incomplete. A clean end
+                    // here would leave it believing a truncated body was the
+                    // whole of one.
+                    None => reader.failure().map(|reason| {
+                        Err(std::io::Error::other(format!(
+                            "the response body was not finished: {reason}"
+                        )))
+                    }),
+                })
+            }))
         }
     }
 }

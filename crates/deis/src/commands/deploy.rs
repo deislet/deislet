@@ -14,7 +14,7 @@ use colored::Colorize;
 
 use crate::commands::{Session, build, project_dir};
 use crate::platform::{DeliveryReport, DeploymentResponse};
-use crate::render::{Output, short_digest};
+use crate::render::{Output, compatibility_line, short_digest};
 use crate::settings::Overrides;
 
 pub struct Args {
@@ -148,6 +148,7 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
                 "id": deployment.version.id,
                 "sha256": deployment.version.bundle_sha,
                 "created_at": deployment.version.created_at,
+                "compatibility": deployment.version.compatibility,
             },
             "deployment": deployment.deployment,
             "delivery": deployment.delivery,
@@ -170,6 +171,19 @@ fn print_result(deployment: &DeploymentResponse) {
         deployment.version.number.to_string().bold(),
         short_digest(&deployment.version.bundle_sha)
     );
+
+    // Printed on every deploy, dated or not. Which day's platform behaviour an
+    // application is running under decides answers a developer will otherwise
+    // debug from the outside, and the one deploy where it is cheapest to
+    // notice is the one that has just happened.
+    let compatibility = deployment.version.compatibility.as_ref();
+    let dated = compatibility.and_then(|c| c.date()).is_some();
+    let line = compatibility_line(compatibility);
+    if dated {
+        println!("  {} {}", "✓".green(), line);
+    } else {
+        println!("  {} {}", "•".yellow(), line.yellow());
+    }
 
     match &deployment.delivery {
         Some(delivery) => print_delivery(delivery),

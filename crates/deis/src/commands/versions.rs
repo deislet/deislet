@@ -6,12 +6,18 @@
 //! column is the part that cannot be read off the version list alone: it is
 //! assembled from each environment's current pointer, which is the only
 //! thing that says what is actually running.
+//!
+//! COMPAT is the day's platform behaviour each version was written against.
+//! It is here because a person debugging "why does this behave differently in
+//! production" has to be able to see it without opening a bundle, and because
+//! `none (oldest)` in this column is the answer to "which of my applications
+//! will never get a behaviour fix".
 
 use anyhow::Result;
 use colored::Colorize;
 
 use crate::commands::Session;
-use crate::render::{Output, Table, age, short_digest, timestamp};
+use crate::render::{Output, Table, age, compatibility_cell, short_digest, timestamp};
 use crate::settings::Overrides;
 
 pub async fn execute(app: Option<String>, limit: usize, output: Output) -> Result<()> {
@@ -40,6 +46,7 @@ pub async fn execute(app: Option<String>, limit: usize, output: Output) -> Resul
                     "id": version.id,
                     "sha256": version.bundle_sha,
                     "created_at": version.created_at,
+                    "compatibility": version.compatibility,
                     "environments": environments_of(&running, &version.id),
                 })
             })
@@ -73,7 +80,19 @@ pub async fn execute(app: Option<String>, limit: usize, output: Output) -> Resul
         return Ok(());
     }
 
-    let mut table = Table::new(&["VERSION", "DIGEST", "CREATED", "AGE", "ENVIRONMENTS"]);
+    // COMPAT is here rather than in `deis status` because it is a property of
+    // a version, not of an environment: two environments of one application
+    // can be on versions written against different days, and the question
+    // "why does this behave differently in production" is answered by
+    // comparing this column between two rows.
+    let mut table = Table::new(&[
+        "VERSION",
+        "DIGEST",
+        "CREATED",
+        "AGE",
+        "COMPAT",
+        "ENVIRONMENTS",
+    ]);
     for version in &shown {
         let environments = environments_of(&running, &version.id);
         table.row(vec![
@@ -81,6 +100,7 @@ pub async fn execute(app: Option<String>, limit: usize, output: Output) -> Resul
             short_digest(&version.bundle_sha),
             timestamp(version.created_at),
             age(version.created_at),
+            compatibility_cell(version.compatibility.as_ref()),
             if environments.is_empty() {
                 "-".to_string()
             } else {

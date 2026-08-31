@@ -81,10 +81,12 @@ async fn test_websocket_direct_bridging() {
         .expect("Fetch returned error");
 
     assert_eq!(status, 101);
-    let ws_id = resp_headers
-        .get("X-Runtime-WebSocket-ID")
-        .expect("Missing WebSocket ID header")
-        .clone();
+    let ws_id = deis_runtime::runtime::response_headers::first_value(
+        &resp_headers,
+        "X-Runtime-WebSocket-ID",
+    )
+    .expect("Missing WebSocket ID header")
+    .to_string();
 
     // 4. Setup Bridge Channels
     // Channel for JS -> Rust messages

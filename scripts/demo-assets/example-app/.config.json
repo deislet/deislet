@@ -4,6 +4,7 @@
   "runtime": "standard-v1",
   "language": "typescript",
   "functionRoot": "./functions",
+  "compatibilityDate": "2026-09-01",
   "environment": {
     "variables": {
       "BUILD_LABEL": "v1",

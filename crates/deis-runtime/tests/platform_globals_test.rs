@@ -38,7 +38,8 @@ async fn request(runtime: &mut AppRuntime, path: &str) -> serde_json::Value {
         .await
         .expect("the request runs");
     let (status, _headers, body) = rx.await.unwrap().unwrap();
-    let body = String::from_utf8(body.unwrap_or_default()).expect("the answer is text");
+    let body =
+        String::from_utf8(body.into_bytes().unwrap_or_default()).expect("the answer is text");
     assert_eq!(status, 200, "the handler failed: {body}");
     serde_json::from_str(&body).expect("the handler answers with JSON")
 }

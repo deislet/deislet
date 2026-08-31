@@ -422,7 +422,7 @@ mod tests {
             .await
             .unwrap();
         let (status, _headers, body) = rx.await.unwrap().unwrap();
-        let body = String::from_utf8(body.unwrap_or_default()).unwrap();
+        let body = String::from_utf8(body.into_bytes().unwrap_or_default()).unwrap();
         assert_eq!(status, 200, "the handler failed: {body}");
 
         let seen: serde_json::Value = serde_json::from_str(&body).unwrap();

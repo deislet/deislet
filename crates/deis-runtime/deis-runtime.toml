@@ -61,8 +61,8 @@ default_memory_limit_mb = 256
 # Default execution limits applied to each app's isolate. An individual app may
 # override timeout_ms, rate_limit_ops_per_sec and cpu_time_limit_ms through its
 # own ResourceLimits; these are the fallback used when it does not. The CPU
-# ceiling narrows only -- see below -- and wait_until_timeout_ms has no per-app
-# override at all.
+# ceiling narrows only -- see below -- and wait_until_timeout_ms and
+# stream_timeout_ms have no per-app override at all.
 [default_execution_limits]
 # Maximum wall-clock time (ms) a single fetch invocation may run before the
 # isolate is terminated and the request fails. Must be at least 100.
@@ -100,6 +100,32 @@ cpu_time_limit_ms = 5000
 # refuse every tail. No per-app override; every application on this node is
 # held to the value set here.
 wait_until_timeout_ms = 30000
+
+# Maximum wall-clock time (ms) one streaming response body may take, counted
+# from the moment its head reached the client. Must be at least 100.
+#
+# A handler that answers with a ReadableStream is answered immediately and
+# writes its body afterwards, chunk by chunk. timeout_ms is the wrong ceiling
+# for that: it bounds how long a caller waits for an answer, and this body has
+# already been answered. A server-sent-events feed, a progress channel or a
+# large object being passed through is expected to run for minutes.
+#
+# It still needs one, because an open stream is a queue, a socket and a
+# producer this node holds on the application's behalf. When it runs out the
+# node closes the stream: the client's transfer fails part-way -- there is no
+# status left to change, the 200 went out with the head -- and the node logs
+# the number it was held to. Enforced by the node rather than by terminating
+# the isolate, so one overrunning stream does not take the other streams and
+# requests of the same application with it.
+#
+# No per-app override; every application on this node is held to the value set
+# here.
+#
+# One further ceiling applies to a stream without being named here: one chunk
+# costs one op dispatch, so rate_limit_ops_per_sec bounds how many chunks a
+# second a producer may write. An application writing very small chunks meets
+# that ceiling long before it meets any byte rate, and is told so by name.
+stream_timeout_ms = 300000
 
 # Maximum rate (ops/sec) of JS-op dispatch before the isolate is terminated and
 # the in-flight request fails. Must be a finite value greater than 0.

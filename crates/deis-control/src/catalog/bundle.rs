@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use deis_bundle::MANIFEST_ENTRY;
 use deis_bundle::{Manifest, read_manifest};
 
+use super::compatibility::CompatibilityProfile;
 use super::limits::DeclaredLimits;
 use super::model::validate_app_id;
 use super::{CatalogError, CatalogResult};
@@ -37,6 +38,11 @@ pub struct StoredBundle {
     /// The `limits` block of that manifest, already checked. `None` when the
     /// application declared none and is held to the node's own ceilings.
     pub limits: Option<DeclaredLimits>,
+    /// Which of the platform's answers this version expects, resolved from the
+    /// manifest's `compatibility` block. A version that declares nothing
+    /// resolves to the oldest behaviour rather than to an error - see
+    /// `super::compatibility`.
+    pub compatibility: CompatibilityProfile,
     /// True when the identical file was already on disk, so nothing was
     /// written. The version row may still be new.
     pub already_present: bool,
@@ -148,6 +154,43 @@ impl BundleStore {
             );
         }
 
+        // Read here for the reason the limits above are, and refused rather
+        // than degraded. A limits block nobody can read costs an application
+        // the node's own ceiling, which is never wider than what it asked for;
+        // a compatibility block nobody can read would leave every node
+        // guessing which of two answers to give, which is the silent
+        // behaviour change the whole mechanism exists to stop.
+        let compatibility = super::compatibility::declared_compatibility(&manifest).map_err(|e| {
+            warn!(
+                app_id,
+                bundle_sha = %sha256,
+                reason = %e,
+                "Rejected bundle upload: its manifest declares a compatibility date or flag this build of the platform cannot honour, and accepting it would have run the application on answers it never asked for"
+            );
+            CatalogError::invalid(e)
+        })?;
+        match compatibility.date() {
+            Some(date) => info!(
+                app_id,
+                bundle_sha = %sha256,
+                compatibility_date = %date,
+                compatibility = %compatibility.describe(),
+                "This version is written against the platform as of {}: {}",
+                date,
+                compatibility.describe()
+            ),
+            // A warning, not a note. Every undated version on this platform is
+            // pinned to the oldest behaviour for the rest of its life, and the
+            // only moment an operator can act on that cheaply is the upload
+            // that created it.
+            None => warn!(
+                app_id,
+                bundle_sha = %sha256,
+                "This version's manifest names no compatibility date, so it is held to the oldest behaviour this platform has and no later fix that changes an observable behaviour will ever reach it: {}",
+                super::compatibility::describe_version(&compatibility)
+            ),
+        }
+
         let path = self.path_for(app_id, &sha256);
         let already_present = path.exists();
         if !already_present {
@@ -182,6 +225,7 @@ impl BundleStore {
             manifest_json,
             manifest,
             limits,
+            compatibility,
             already_present,
         })
     }
@@ -364,6 +408,73 @@ pub(crate) mod tests {
         );
         let err = read_manifest(&no_entry).unwrap_err();
         assert!(err.to_string().contains("not in the archive"), "got {err}");
+    }
+
+    /// The refusal that protects the fleet: a bundle asking for platform
+    /// behaviour this build does not have never becomes a deployable version.
+    /// Accepting it would leave the control plane promising a date it cannot
+    /// keep and every node refusing the deployment one at a time.
+    #[test]
+    fn rejects_a_compatibility_date_this_build_cannot_honour() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BundleStore::new(dir.path());
+        let bytes = bundle_with_manifest(
+            r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+                "compatibility":{"date":"2099-01-01"}}"#,
+            true,
+        );
+
+        let err = store.store("demo", &bytes, None).unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, CatalogError::Invalid(_)), "{message}");
+        assert!(message.contains("2099-01-01"), "{message}");
+        assert!(
+            message.contains(&deis_bundle::PLATFORM_KNOWN_THROUGH.to_string()),
+            "{message}"
+        );
+        assert!(
+            !dir.path().join("demo").exists(),
+            "a version nothing can run must not be written"
+        );
+    }
+
+    #[test]
+    fn rejects_a_compatibility_flag_nobody_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BundleStore::new(dir.path());
+        let bytes = bundle_with_manifest(
+            r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+                "compatibility":{"flags":["cookies_but_faster"]}}"#,
+            true,
+        );
+
+        let err = store.store("demo", &bytes, None).unwrap_err();
+        assert!(err.to_string().contains("cookies_but_faster"), "{err}");
+    }
+
+    #[test]
+    fn keeps_the_compatibility_answers_of_a_bundle_it_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BundleStore::new(dir.path());
+        let bytes = bundle_with_manifest(
+            r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+                "compatibility":{"date":"2026-09-01"}}"#,
+            true,
+        );
+
+        let stored = store.store("demo", &bytes, None).unwrap();
+        assert_eq!(
+            stored
+                .compatibility
+                .date()
+                .map(|d| d.to_string())
+                .as_deref(),
+            Some("2026-09-01")
+        );
+
+        // And an ordinary bundle, which declares nothing, is not an error.
+        let plain = store.store("demo", &sample_bundle("demo"), None).unwrap();
+        assert_eq!(plain.compatibility.date(), None);
     }
 
     #[test]

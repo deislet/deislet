@@ -28,12 +28,16 @@
 //!   cheap as a deploy.
 
 pub mod bundle;
+pub mod compatibility;
 pub mod limits;
 pub mod model;
 pub mod secrets;
 pub mod store;
 
 pub use bundle::{BundleStore, StoredBundle};
+pub use compatibility::{
+    CompatibilityProfile, DeclaredCompatibility, declared_compatibility, describe_version,
+};
 pub use deis_bundle::Manifest as BundleManifest;
 pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{

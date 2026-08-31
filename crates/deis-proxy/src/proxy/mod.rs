@@ -764,6 +764,63 @@ impl ProxyHttp for DeisProxy {
         stamp_routing_headers(upstream_request, ctx)
     }
 
+    /// Take compression off a response the node is still producing.
+    ///
+    /// A node answers with a `Content-Length` for everything it already holds
+    /// -- a rendered page, a static file, a JSON document -- and without one
+    /// only when the body is being written as it is made: a server-sent-events
+    /// feed, a large object being passed through, any handler that returned a
+    /// `ReadableStream`. That absence is the whole test here.
+    ///
+    /// Compression has to go for those, because the compressors are not flushed
+    /// per chunk. `flate2` holds the bytes it was given until it has a block
+    /// worth of them, so a 40-byte events frame handed to gzip comes back out
+    /// as nothing at all, and the client sits waiting while the node believes
+    /// it has already answered. What is meant to arrive frame by frame arrives
+    /// in one lump minutes later, or not at all -- which is the same failure
+    /// the whole streaming path exists to remove, moved from the isolate to the
+    /// front door.
+    ///
+    /// The cost is real and small: a streamed body crosses the last hop
+    /// uncompressed. Every response whose length the node knows -- which is
+    /// nearly all of them, and all of the large static ones -- is compressed
+    /// exactly as before.
+    async fn response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut RequestCtx,
+    ) -> pingora::Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // 1xx is not the answer yet, and 101 is an upgrade the compression
+        // module already leaves alone.
+        if upstream_response.status.is_informational() {
+            return Ok(());
+        }
+        if upstream_response.headers.contains_key("content-length") {
+            return Ok(());
+        }
+        if let Some(module) = session
+            .downstream_modules_ctx
+            .get_mut::<ResponseCompression>()
+        {
+            // Level 0 is how this module is told to do nothing; it is the
+            // state it is registered in, and `early_request_filter` is what
+            // raised it for this request.
+            module.adjust_level(0);
+            debug!(
+                host = %ctx.host,
+                app_id = ?ctx.app_id,
+                status = upstream_response.status.as_u16(),
+                "the node is streaming this response, so it is relayed uncompressed: a \
+                 compressor would hold each chunk until it had a block worth of them"
+            );
+        }
+        Ok(())
+    }
+
     async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut RequestCtx) {
         if let Some(log) = &self.access_log {
             log.record(session, ctx);

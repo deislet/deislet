@@ -26,7 +26,7 @@ pub mod proto {
 }
 
 use proto::runtime_management_client::RuntimeManagementClient;
-use proto::{ApplyDeploymentRequest, HealthCheckRequest};
+use proto::{ApplyDeploymentRequest, CompatibilityDeclaration, HealthCheckRequest};
 
 /// Environment variable naming the deis-runtime binary to start.
 pub const ENV_RUNTIME_BIN: &str = "DEIS_RUNTIME_BIN";
@@ -136,7 +136,23 @@ impl DevNode {
         bundle_url: &str,
         bundle_sha: &str,
         env: HashMap<String, String>,
+        manifest: &deis_bundle::Manifest,
     ) -> Result<()> {
+        // The same declaration the control plane would send, read out of the
+        // same manifest. A dev node that ran on the platform's newest
+        // behaviour while production ran on the application's declared date
+        // would make `deis dev` a worse test than no test: the behaviours a
+        // compatibility date pins are exactly the ones nobody notices until
+        // they differ.
+        manifest.compatibility_profile().map_err(|e| {
+            anyhow::anyhow!(
+                "this bundle's manifest declares a compatibility date or flag this build cannot \
+                 honour: {e}"
+            )
+        })?;
+        // The manifest's own words, exactly as the control plane would send
+        // them; the node answers them with its own table.
+        let compatibility = manifest.compatibility.clone().unwrap_or_default();
         let response = self
             .client
             .apply_deployment(ApplyDeploymentRequest {
@@ -155,6 +171,13 @@ impl DevNode {
                 // are the same defaults an application with no declared
                 // limits gets in production.
                 limits: None,
+                compatibility: Some(CompatibilityDeclaration {
+                    date: compatibility
+                        .date
+                        .map(|date| date.to_string())
+                        .unwrap_or_default(),
+                    flags: compatibility.flags,
+                }),
             })
             .await
             .map_err(|e| {

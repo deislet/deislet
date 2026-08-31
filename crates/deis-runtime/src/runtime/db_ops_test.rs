@@ -173,6 +173,7 @@ mod tests {
             .expect("the request runs");
         let (status, _, body) = rx.await.expect("a response").expect("a response");
         let body = body
+            .into_bytes()
             .map(|bytes| String::from_utf8(bytes).expect("these handlers answer with JSON"))
             .unwrap_or_default();
         assert_eq!(status, 200, "{body}");

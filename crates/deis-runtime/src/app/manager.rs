@@ -264,6 +264,12 @@ impl ApplicationManager {
             // No per-app override: `ResourceLimits` has no key for the tail
             // budget, so every app on this node is held to the platform value.
             wait_until_timeout_ms: self.default_limits.wait_until_timeout_ms,
+            // Nor for the stream budget, and for the same reason. An open
+            // stream costs the node a queue and a producer for as long as it
+            // lives, so how long that may be is the operator's number, not the
+            // tenant's; an application that needs longer belongs on a node
+            // whose operator set `stream_timeout_ms` higher.
+            stream_timeout_ms: self.default_limits.stream_timeout_ms,
             rate_limit_ops_per_sec,
             cpu_time_limit_ms,
         }
@@ -545,6 +551,11 @@ impl ApplicationManager {
             // This path loads code without a bundle -- the node's own system
             // app, and tests -- so there is nothing for `env.ASSETS` to serve.
             assets: None,
+            // Whatever the caller put on the config, which for the system app
+            // and for tests is the default: the oldest behaviour. Code that
+            // came from no bundle declared no date, and answering as though it
+            // had would be inventing a claim on its behalf.
+            compatibility: config.compatibility,
         };
         match self
             .runtime_pool
@@ -721,6 +732,12 @@ impl ApplicationManager {
             route_patterns: record.config.routes.clone(),
             limits: self.effective_limits(key, record.config.limits.as_ref()),
             fetch_policy: self.fetch_policy.clone(),
+            // Resolved once, when the deployment was installed, out of the
+            // version's own manifest. Copied rather than recomputed here so
+            // that every isolate this version is ever rebuilt into -- a
+            // version swap, a pool restart -- answers exactly what the
+            // deployment said it would.
+            compatibility: record.config.compatibility,
             // The same bundle the HTTP entry serves from, so `env.ASSETS`
             // inside the isolate and asset-first outside it answer a path
             // identically. Shared, not copied: it is an `Arc` over bytes that
@@ -854,9 +871,16 @@ impl ApplicationManager {
 
     /// Execute application.
     ///
-    /// The request body goes in as bytes and the response body comes back as
-    /// bytes: what an application receives and answers with is not always
-    /// text, and text is what this used to be.
+    /// The request body goes in as bytes: what an application receives is not
+    /// always text, and text is what this used to be. The response body comes
+    /// back as a [`crate::runtime::ResponseBody`], which is bytes for nearly
+    /// every answer and a body still being produced for the few that stream.
+    ///
+    /// The response headers come back as a list rather than a map: one name
+    /// may legitimately appear twice - `Set-Cookie` always may - and a map
+    /// here silently kept one of them. Whether repeats survive was already
+    /// decided inside the isolate, from the application's compatibility date;
+    /// see `crate::runtime::response_headers`.
     pub async fn execute_app(
         &self,
         key: &AppKey,
@@ -866,8 +890,8 @@ impl ApplicationManager {
         body: Option<Vec<u8>>,
     ) -> Result<(
         u16,
-        std::collections::HashMap<String, String>,
-        Option<Vec<u8>>,
+        crate::runtime::HeaderPairs,
+        crate::runtime::ResponseBody,
     )> {
         self.require_running(key)?;
 
@@ -1113,7 +1137,7 @@ mod memory_ceiling {
                 None,
             )
             .await
-            .map(|(status, _, body)| (status, body))
+            .map(|(status, _, body)| (status, body.into_bytes()))
     }
 
     /// The bug this ceiling exists for: nothing ever set `memory_limit_mb`, so

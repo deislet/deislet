@@ -218,7 +218,8 @@ fn briefly(url: &str, policy: FetchPolicy, timeout_ms: u64) -> IsolateSpec {
     spec
 }
 
-fn text(body: Option<Vec<u8>>) -> String {
+fn text(body: crate::runtime::ResponseBody) -> String {
+    let body = body.into_bytes();
     String::from_utf8(body.unwrap_or_default()).unwrap()
 }
 
@@ -235,7 +236,7 @@ async fn one_request(runtime: &mut AppRuntime) -> String {
 async fn a_request_to(
     runtime: &mut AppRuntime,
     path: &str,
-) -> (u16, HashMap<String, String>, String) {
+) -> (u16, crate::runtime::HeaderPairs, String) {
     let (tx, rx) = oneshot::channel();
     runtime
         .execute_fetch(
@@ -969,7 +970,9 @@ async fn a_polluted_object_prototype_does_not_decide_a_later_response() {
 
     let (status, headers, body) = a_request_to(&mut runtime, "/plain").await;
     assert_eq!((status, body.as_str()), (200, "plain"));
-    assert!(!headers.contains_key("X-Runtime-WebSocket-ID"));
+    assert!(
+        crate::runtime::response_headers::first_value(&headers, "X-Runtime-WebSocket-ID").is_none()
+    );
 
     let polluting = a_request_to(&mut runtime, "/pollute").await;
 
@@ -985,7 +988,8 @@ async fn a_polluted_object_prototype_does_not_decide_a_later_response() {
              Object.prototype"
         );
         assert!(
-            !headers.contains_key("X-Runtime-WebSocket-ID"),
+            crate::runtime::response_headers::first_value(&headers, "X-Runtime-WebSocket-ID")
+                .is_none(),
             "request {attempt} after the pollution was answered as a WebSocket \
              upgrade: {headers:?}"
         );
@@ -996,7 +1000,7 @@ async fn a_polluted_object_prototype_does_not_decide_a_later_response() {
     let (status, headers, body) = polluting;
     assert_eq!((status, body.as_str()), (200, "polluted"));
     assert!(
-        !headers.contains_key("X-Runtime-WebSocket-ID"),
+        crate::runtime::response_headers::first_value(&headers, "X-Runtime-WebSocket-ID").is_none(),
         "{headers:?}"
     );
 }
@@ -1036,7 +1040,10 @@ async fn a_response_used_as_an_init_still_carries_its_status_and_headers() {
 
     let (status, headers, body) = a_request_to(&mut runtime, "/").await;
     assert_eq!((status, body.as_str()), (201, "rewritten"));
-    assert_eq!(headers.get("x-kept").map(String::as_str), Some("yes"));
+    assert_eq!(
+        crate::runtime::response_headers::first_value(&headers, "x-kept"),
+        Some("yes")
+    );
 }
 
 /// Construct a socket and answer without waiting for it, which is what a

@@ -51,6 +51,16 @@ fn bundle(app: &str, code: &str, assets: &[(&str, &str)], env: &[(&str, &str)]) 
     bundle_with_services(app, code, assets, env, &[])
 }
 
+/// The same, for an app whose manifest declares which day's platform it was
+/// written against.
+fn bundle_with_compatibility(
+    app: &str,
+    code: &str,
+    compatibility: serde_json::Value,
+) -> TestBundle {
+    bundle_inner(app, code, &[], &[], &[], Some(compatibility))
+}
+
 /// The same, for an app whose manifest declares platform services.
 fn bundle_with_services(
     app: &str,
@@ -58,6 +68,17 @@ fn bundle_with_services(
     assets: &[(&str, &str)],
     env: &[(&str, &str)],
     services: &[&str],
+) -> TestBundle {
+    bundle_inner(app, code, assets, env, services, None)
+}
+
+fn bundle_inner(
+    app: &str,
+    code: &str,
+    assets: &[(&str, &str)],
+    env: &[(&str, &str)],
+    services: &[&str],
+    compatibility: Option<serde_json::Value>,
 ) -> TestBundle {
     let asset_entries: Vec<serde_json::Value> = assets
         .iter()
@@ -79,7 +100,7 @@ fn bundle_with_services(
         .map(|name| ((*name).to_string(), serde_json::Value::from(true)))
         .collect();
 
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schema": 1,
         "app": app,
         "entry": "worker/index.js",
@@ -89,6 +110,9 @@ fn bundle_with_services(
         "routes": [{ "pattern": "/api/users/:id", "methods": [] }],
         "assets": asset_entries,
     });
+    if let Some(compatibility) = compatibility {
+        manifest["compatibility"] = compatibility;
+    }
 
     let mut buf = Vec::new();
     {
@@ -201,6 +225,7 @@ fn order_for(
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect(),
         limits: None,
+        compatibility: None,
     }
 }
 
@@ -506,7 +531,7 @@ async fn secrets_reach_the_isolate_and_never_the_disk() {
         .await
         .unwrap();
     assert_eq!(status, 200);
-    let seen: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
     assert_eq!(seen["env"]["API_KEY"], secret, "the secret never arrived");
     assert_eq!(
         seen["env"]["LOG_LEVEL"], "info",
@@ -560,7 +585,7 @@ async fn a_declared_service_gets_a_client_built_from_the_address_the_order_carri
         )
         .await
         .unwrap();
-    let seen: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
     let outcome = seen["outcome"].as_str().unwrap();
     assert!(
         outcome.contains("failed"),
@@ -611,7 +636,7 @@ async fn an_app_that_declares_no_service_is_told_so_rather_than_given_one() {
         )
         .await
         .unwrap();
-    let seen: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
     assert!(
         seen["outcome"]
             .as_str()
@@ -665,6 +690,193 @@ async fn a_version_that_will_not_load_never_interrupts_the_one_serving() {
         .await
         .unwrap();
     assert_eq!(status, 200, "the working version stopped serving");
+}
+
+/// Two cookies in one response - the shape of a login that also issues a CSRF
+/// token, and the only case where a header list must carry one name twice.
+const TWO_COOKIES_HANDLER: &str = r#"
+export default function handler(context) {
+  const headers = new Headers({ "content-type": "text/plain" });
+  headers.append("set-cookie", "session=abc; Path=/");
+  headers.append("set-cookie", "csrf=xyz; Path=/");
+  return new Response("ok", { status: 200, headers });
+}
+"#;
+
+/// Every `Set-Cookie` a response carries, in the order it was set.
+async fn cookies_from(apps: &ApplicationManager, key: &AppKey) -> Vec<String> {
+    let (status, headers, _) = apps
+        .execute_app(
+            key,
+            "http://localhost/".to_string(),
+            "GET".to_string(),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .expect("the handler answers");
+    assert_eq!(status, 200);
+    headers
+        .into_iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// The gate, end to end on the node: manifest to isolate to response headers.
+///
+/// Nothing here reads a date. The version says which day it was written
+/// against, the install resolves that once, and the isolate answers what that
+/// day's platform answered.
+#[tokio::test]
+async fn a_version_written_against_the_fix_sends_every_set_cookie() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle_with_compatibility(
+        "demo",
+        TWO_COOKIES_HANDLER,
+        serde_json::json!({ "date": deis_bundle::PLATFORM_KNOWN_THROUGH.to_string() }),
+    );
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    deployer
+        .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cookies_from(&apps, &demo()).await,
+        vec!["session=abc; Path=/", "csrf=xyz; Path=/"],
+        "both cookies the handler set have to reach the client"
+    );
+}
+
+/// The other half, and the reason the mechanism exists: an application that
+/// predates the fix keeps the answer it was written against, on the same node,
+/// at the same moment.
+#[tokio::test]
+async fn a_version_with_no_date_still_gets_only_the_last_set_cookie() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle("demo", TWO_COOKIES_HANDLER, &[], &[]);
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    deployer
+        .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cookies_from(&apps, &demo()).await,
+        vec!["csrf=xyz; Path=/"],
+        "an undated application must keep the exact bytes it was getting"
+    );
+}
+
+/// A flag takes the fix without a date, which is what an application deployed
+/// before any of this existed has to be able to do without claiming to have
+/// been written against a day it was not.
+#[tokio::test]
+async fn a_named_flag_takes_the_fix_without_a_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle_with_compatibility(
+        "demo",
+        TWO_COOKIES_HANDLER,
+        serde_json::json!({ "flags": ["multiple_set_cookie_headers"] }),
+    );
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    deployer
+        .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(cookies_from(&apps, &demo()).await.len(), 2);
+}
+
+/// A node that cannot honour what a version names refuses it, and keeps
+/// serving nothing rather than serving it wrong.
+///
+/// This is the mixed-fleet case stated as a test: the control plane may be
+/// newer than this node and may accept a date this build has never heard of.
+/// Pretending would give the application semantics it did not ask for, with
+/// nothing anywhere saying so.
+#[tokio::test]
+async fn a_date_this_build_cannot_honour_is_refused_rather_than_approximated() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle_with_compatibility(
+        "demo",
+        ECHO_HANDLER,
+        serde_json::json!({ "date": "2099-01-01" }),
+    );
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    let err = deployer
+        .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .await
+        .expect_err("a date this build does not know must not be run");
+
+    let message = err.to_string();
+    assert!(matches!(err, DeployError::Compatibility(_)), "{message}");
+    assert!(message.contains("2099-01-01"), "{message}");
+    assert!(
+        message.contains(&deis_bundle::PLATFORM_KNOWN_THROUGH.to_string()),
+        "the refusal has to name the date this build does know: {message}"
+    );
+    assert!(
+        apps.installed_version(&demo()).is_none(),
+        "nothing may be left running from a version that was refused"
+    );
+}
+
+/// The reason the bundle's manifest is the authority on the node and the
+/// delivery message is not.
+///
+/// A node that comes back without a control plane reads its own disk, where no
+/// order was ever stored. If the date lived only in the delivery, every node
+/// restart would quietly move undated-by-accident applications onto today's
+/// answers - the exact unscheduled fleet-wide change this whole mechanism is
+/// for.
+#[tokio::test]
+async fn a_versions_compatibility_date_comes_back_with_it_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle_with_compatibility(
+        "demo",
+        TWO_COOKIES_HANDLER,
+        serde_json::json!({ "date": deis_bundle::PLATFORM_KNOWN_THROUGH.to_string() }),
+    );
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    {
+        let apps = Arc::new(ApplicationManager::new());
+        let deployer = deployer_in(dir.path(), apps.clone()).await;
+        deployer
+            .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+            .await
+            .unwrap();
+    }
+
+    // A restart with nobody to ask: the order is gone, the bundle is not.
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    assert_eq!(deployer.recover_from_disk().await, 1);
+
+    assert_eq!(
+        cookies_from(&apps, &demo()).await.len(),
+        2,
+        "a restart must not change which answers an application gets"
+    );
 }
 
 #[tokio::test]
@@ -961,7 +1173,7 @@ async fn secret_seen(apps: &ApplicationManager, key: &AppKey) -> String {
         )
         .await
         .expect("the app is loaded");
-    let seen: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
     seen["env"]["API_KEY"]
         .as_str()
         .unwrap_or_default()

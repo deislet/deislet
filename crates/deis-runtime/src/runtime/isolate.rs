@@ -4,13 +4,17 @@ use super::bindings::{AppServices, ServiceWiring};
 use super::cache_ops::{create_cache_store, CacheStore};
 use super::fetch_policy::FetchPolicy;
 use super::loader::DbModuleLoader;
-use super::metrics::{recorder, MetricsRegistry, RequestFacts, RequestOutcome};
+use super::metrics::{
+    recorder, MetricsRegistry, RequestFacts, RequestOutcome, RATE_LIMIT_CUTOFFS_TOTAL,
+};
 use super::ops::{
     AppId, EnvStore, ExecutionDeadline, PendingRequestBody, PendingResponseBody, ResponseStore,
 };
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
 use super::rate_limit::RateLimiter;
+use super::response_headers::{count_of, fold_duplicate_names, HeaderPairs};
+use super::response_stream::{response_streams, ResponseBody, ResponseStreams};
 use super::route_match::{match_routes, path_from_url};
 use super::runtime_init::{build_runtime_extensions, init_lazy_extensions};
 use super::snapshot::load_or_create_startup_snapshot;
@@ -97,6 +101,10 @@ enum Watched {
     QueueBatch,
     ScheduledRun,
     WebSocketMessage,
+    /// One stretch of producing the bodies of the response streams this
+    /// isolate has open. Not one stream: a stretch advances all of them, and
+    /// what is being protected is the runtime thread they share.
+    ResponseStream,
 }
 
 /// How much CPU time one OS thread has consumed, readable from another
@@ -845,6 +853,21 @@ fn warn_cut_off(app_id: &str, watch: &Watch, cut_off: &CutOff) {
              Terminating the isolate; that message is dropped and the gateway closes the \
              connection, while the application keeps serving everything else on this thread"
         ),
+        Watched::ResponseStream => tracing::warn!(
+            target: "app",
+            app_id = %app_id,
+            streams = %detail,
+            limit,
+            budget_ms,
+            elapsed_ms,
+            cpu_ms,
+            "App {app_id} was cut off while producing {detail} response stream(s): it \
+             {ceiling}. Every stream this isolate had open is aborted mid-body, because a \
+             producer that will not yield can only be stopped by terminating the isolate it \
+             shares with them. Clients of those streams see a truncated transfer. This is \
+             the CPU half of the stream budget: a stream that merely runs long is closed \
+             gracefully at stream_timeout_ms instead"
+        ),
     }
 }
 
@@ -852,8 +875,13 @@ fn warn_cut_off(app_id: &str, watch: &Watch, cut_off: &CutOff) {
 ///
 /// The body is bytes, not text: a handler may answer with an image, a
 /// compressed frame, or anything else `fetch()` brought back from upstream,
-/// and a `String` here corrupted every one of them.
-type FetchResult = (u16, HashMap<String, String>, Option<Vec<u8>>);
+/// and a `String` here corrupted every one of them. It may also be a body that
+/// has not been produced yet; see [`ResponseBody`].
+///
+/// The headers are a *list*, not a map, and repeats have already been folded
+/// or kept according to the application's compatibility date by the time one
+/// of these is built; see [`super::response_headers`].
+type FetchResult = (u16, HeaderPairs, ResponseBody);
 
 /// The request as `js/runtime.js` sees it -- everything except the body.
 ///
@@ -930,8 +958,20 @@ struct JsScheduledResult {
 #[derive(Deserialize)]
 struct JsResponse {
     status: u16,
+    /// `[[name, value], ...]`, in the order the handler set them, repeats
+    /// included. A map here is what used to drop every `Set-Cookie` but the
+    /// last one - see [`super::response_headers`] - so the decision about
+    /// repeats is made below, where this application's compatibility profile
+    /// is in scope, and never by the shape of this field.
     #[serde(default)]
-    headers: HashMap<String, String>,
+    headers: HeaderPairs,
+    /// Set when the handler answered with a body it is still producing.
+    ///
+    /// The bytes are then not in [`PendingResponseBody`] at all: the head goes
+    /// to the client first and `js/runtime.js` writes the body afterwards,
+    /// chunk by chunk, through `super::response_stream`.
+    #[serde(default)]
+    stream: bool,
 }
 
 /// Everything one isolate needs beyond its identity and its source.
@@ -990,6 +1030,19 @@ pub struct IsolateSpec {
     /// [`crate::app::ApplicationManager::load_app`]. `env.ASSETS.fetch()` then
     /// answers 404, which is what an empty bundle answers.
     pub assets: Option<Arc<crate::assets::AssetBundle>>,
+
+    /// Which of the platform's answers this application gets, resolved from
+    /// its bundle manifest when the version was installed.
+    ///
+    /// **The one place this isolate asks.** Every behaviour that has an old
+    /// answer and a better one branches on
+    /// `compatibility.is_on(Flag::Something)` at the point where the two
+    /// answers differ, and nowhere in this crate compares a date. The default
+    /// is the oldest behaviour, so an isolate built by a path that says
+    /// nothing about compatibility -- the node's own system app, a test --
+    /// gets what an application written before any of this existed was
+    /// written against.
+    pub compatibility: deis_bundle::CompatibilityProfile,
 }
 
 pub struct AppRuntime {
@@ -1013,6 +1066,16 @@ pub struct AppRuntime {
     /// run once the response has been sent. Its own limit, not what is left of
     /// `timeout_ms`: see [`crate::config::ExecutionLimits::wait_until_timeout_ms`].
     wait_until_timeout_ms: u64,
+    /// Maximum wall-clock time (ms) one response stream may stay open, counted
+    /// from the moment its head went to the client.
+    ///
+    /// Its own limit for the same reason the tail has one, and a much larger
+    /// one: a stream is meant to outlive the request's budget -- a
+    /// server-sent-events feed that answered in 30 seconds would be useless --
+    /// while an ungoverned stream would pin a queue, a socket and a producer
+    /// on this node for as long as the application felt like it. See
+    /// [`crate::config::ExecutionLimits::stream_timeout_ms`].
+    stream_timeout_ms: u64,
     /// Maximum CPU time (ms) one stretch of this application's code may spend
     /// on the runtime thread before the isolate is terminated.
     ///
@@ -1024,10 +1087,13 @@ pub struct AppRuntime {
     /// each get the whole of it.
     cpu_time_limit_ms: u64,
     /// Configured JS-op dispatch rate limit (ops/sec) for this isolate.
-    /// Kept alongside the live `RateLimiter` (captured in the op-metrics
-    /// closure) purely so tests can assert the configured value reached
-    /// this isolate; not read outside of `#[cfg(test)]`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// Kept alongside the live `RateLimiter`, which is captured in the
+    /// op-metrics closure and cannot be read back from here. It is the number
+    /// [`Self::pump_response_streams`] names when a stream's producer is cut
+    /// off by it -- the limiter terminates the isolate from inside an op
+    /// dispatch and says nothing this side can catch, so without this the
+    /// application would be told only that V8 unwound.
     rate_limit_ops_per_sec: f64,
     /// Where this isolate's request, error, execution-time and cut-off
     /// counters go. See `super::metrics`.
@@ -1036,6 +1102,11 @@ pub struct AppRuntime {
     /// with the isolate's `OpState` so `js/bootstrap.js` can bound an outbound
     /// `fetch` by it. See [`ExecutionDeadline`].
     execution_deadline: ExecutionDeadline,
+    /// Which of the platform's answers this application gets. See
+    /// [`IsolateSpec::compatibility`]: this is the one thing this isolate asks
+    /// when an old answer and a better one both exist, and it is a bit test,
+    /// not a date comparison.
+    compatibility: deis_bundle::CompatibilityProfile,
     /// Whether the timers this invocation armed have already been cleared.
     ///
     /// `js/runtime.js` clears them itself at the end of the `waitUntil` tail,
@@ -1085,10 +1156,12 @@ impl AppRuntime {
             limits,
             fetch_policy,
             assets,
+            compatibility,
         } = spec;
         let ExecutionLimits {
             timeout_ms,
             wait_until_timeout_ms,
+            stream_timeout_ms,
             rate_limit_ops_per_sec,
             cpu_time_limit_ms,
         } = limits;
@@ -1430,10 +1503,12 @@ impl AppRuntime {
             route_patterns,
             timeout_ms,
             wait_until_timeout_ms,
+            stream_timeout_ms,
             cpu_time_limit_ms,
             rate_limit_ops_per_sec,
             metrics,
             execution_deadline,
+            compatibility,
             timers_swept: false,
         })
     }
@@ -2135,18 +2210,95 @@ impl AppRuntime {
             },
         );
 
+        // A body the handler is still producing does not travel as bytes at
+        // all. The head goes out now and the bytes follow it as they are made;
+        // see [`Self::begin_response_stream`].
+        //
         // Absent means the handler answered without a body -- a 204, a 304,
         // the answer to a HEAD, a WebSocket upgrade -- which is not the same
         // as an empty one, so nothing is invented here.
-        let response_body = {
+        let response_body = if response.stream {
+            match self.begin_response_stream() {
+                Ok(reader) => ResponseBody::Stream(reader),
+                Err(e) => {
+                    // Nothing has reached the client yet, so this is still an
+                    // ordinary failed request rather than a broken body. The
+                    // invocation itself has already been counted a few lines
+                    // above -- the handler did answer -- so it is not counted
+                    // again here; what the caller gets is the error, which
+                    // becomes a 500.
+                    tracing::error!(
+                        target: "app",
+                        app_id = %self.app_id,
+                        error = %e,
+                        "App {} answered with a streaming body and this node could not start \
+                         producing it: {}. The request fails with 500; this is a fault on the \
+                         node, not in the application",
+                        self.app_id,
+                        e
+                    );
+                    let _ = response_tx.send(Err(e));
+                    return Ok(());
+                }
+            }
+        } else {
             let op_state = self.runtime.op_state();
             let mut state = op_state.borrow_mut();
-            state
+            match state
                 .try_borrow_mut::<PendingResponseBody>()
                 .and_then(|pending| pending.0.take())
+            {
+                Some(bytes) => ResponseBody::Bytes(bytes),
+                None => ResponseBody::None,
+            }
         };
 
-        let _ = response_tx.send(Ok((response.status, response.headers, response_body)));
+        // The one gate in this crate that a compatibility date decides, asked
+        // the way every future one should be: a bit test on the profile this
+        // version was installed with, no date arithmetic here.
+        //
+        // Off is the old answer, and it is the answer for every application
+        // that predates the fix: one value per header name, the last one
+        // written winning. On is the answer the Fetch specification gives -
+        // every `Set-Cookie` the handler set reaches the client.
+        let headers = if self
+            .compatibility
+            .is_on(deis_bundle::Flag::MultipleSetCookieHeaders)
+        {
+            response.headers
+        } else {
+            let cookies = count_of(&response.headers, "set-cookie");
+            let folded = fold_duplicate_names(response.headers);
+            if cookies > 1 {
+                // Not a failure of the application and not one of the node:
+                // the application asked for the platform of a day when this
+                // was the answer, and it is getting it. Said out loud because
+                // an operator looking at a client that received one cookie
+                // needs the reason to be findable, and because it names the
+                // single edit that changes it.
+                tracing::info!(
+                    target: "app",
+                    app_id = %self.app_id,
+                    set_cookie_headers = cookies,
+                    compatibility = %self.compatibility.describe(),
+                    "App {} set {} Set-Cookie headers and only the last one was sent. It runs \
+                     under {}, and this platform began sending every Set-Cookie on {}. Give the \
+                     project a compatibilityDate of {} or later, or the compatibility flag \
+                     \"multiple_set_cookie_headers\", to have them all sent; until then the \
+                     client sees one cookie",
+                    self.app_id,
+                    cookies,
+                    self.compatibility.describe(),
+                    deis_bundle::flag_spec(deis_bundle::Flag::MultipleSetCookieHeaders)
+                        .default_on,
+                    deis_bundle::flag_spec(deis_bundle::Flag::MultipleSetCookieHeaders)
+                        .default_on,
+                );
+            }
+            folded
+        };
+
+        let _ = response_tx.send(Ok((response.status, headers, response_body)));
 
         // The response is gone; what the handler handed to `waitUntil` runs
         // from here, under the tail's own budget. A failure past this point
@@ -2202,6 +2354,380 @@ impl AppRuntime {
         );
 
         Ok(())
+    }
+
+    /// Open a queue for a body the handler is still producing, and set its
+    /// producer going.
+    ///
+    /// Returns the reading end, which travels to `dispatcher/handlers.rs` and
+    /// becomes the client's response body. The producer runs in this isolate
+    /// afterwards, driven by [`Self::pump_response_streams`] from the runtime
+    /// thread's own message loop -- so the thread is free to serve other
+    /// requests for this application between chunks, which is the whole reason
+    /// the stream is not simply awaited here.
+    ///
+    /// What this does *not* change is how the invocation is measured: the
+    /// request has been recorded by the time this runs, with the duration it
+    /// took to answer. That is the right number -- it is what the caller waited
+    /// for -- but it means a five-minute stream shows up as a two-millisecond
+    /// request, and the bytes that followed are counted nowhere. The stream's
+    /// own tally goes to the log when it ends.
+    ///
+    /// The deadline is published to the isolate before the producer starts,
+    /// and that ordering matters: `js/bootstrap.js` re-arms the outbound calls
+    /// the handler left open against whatever budget is in force at that
+    /// moment. Published afterwards, `return new Response(upstream.body)` would
+    /// have its upstream aborted at the request's deadline -- 30 seconds by
+    /// default -- part-way through a body that was allowed to take minutes.
+    fn begin_response_stream(&mut self) -> Result<super::response_stream::StreamReader> {
+        let deadline = Instant::now() + Duration::from_millis(self.stream_timeout_ms);
+        let (id, reader) = self.response_streams().borrow_mut().open(deadline);
+
+        self.execution_deadline.set(Some(deadline));
+
+        match self.runtime.execute_script(
+            "<stream_begin>",
+            format!("__deis_runtime_stream_begin({id})"),
+        ) {
+            Ok(_) => {
+                tracing::debug!(
+                    target: "app",
+                    app_id = %self.app_id,
+                    stream_id = id,
+                    budget_ms = self.stream_timeout_ms,
+                    "App {} answered with a body it is still producing; the head goes out now \
+                     and the stream has {}ms to finish",
+                    self.app_id,
+                    self.stream_timeout_ms
+                );
+                Ok(reader)
+            }
+            Err(e) => {
+                // The reader would otherwise be handed to a client that never
+                // gets a byte and never gets an end either, because nothing is
+                // producing for it.
+                self.response_streams().borrow_mut().close(id);
+                Err(anyhow::anyhow!(
+                    "the producer of app {}'s streaming response would not start: {e}",
+                    self.app_id
+                ))
+            }
+        }
+    }
+
+    /// This isolate's open response streams.
+    fn response_streams(&self) -> Rc<RefCell<ResponseStreams>> {
+        let op_state = self.runtime.op_state();
+        let mut state = op_state.borrow_mut();
+        response_streams(&mut state)
+    }
+
+    /// Whether any response body of this application is still being produced.
+    ///
+    /// `runtime/pool.rs` asks before every message it waits for: an isolate
+    /// with an open stream has work of its own to make progress on, and the
+    /// thread has to offer it a turn between requests.
+    pub fn has_open_response_streams(&self) -> bool {
+        !self.response_streams().borrow().is_empty()
+    }
+
+    /// How far past a stream's own deadline the isolate is given before it is
+    /// terminated instead of closed.
+    ///
+    /// The wall clock of a stream is enforced gracefully: the node closes the
+    /// stream and the producer is told, which leaves every *other* stream in
+    /// the isolate alone. That only works if the isolate yields, and a producer
+    /// spinning in a loop never does. So the cut-off is armed as well, a little
+    /// later, and it is the one that catches the spinning case -- at the cost
+    /// of taking every stream in the isolate with it, which is why it is not
+    /// the primary mechanism. A quarter of a second is far more than the
+    /// graceful path needs (it is one timer firing on a thread that is already
+    /// awake) and far less than any client would notice.
+    const STREAM_GRACE: Duration = Duration::from_millis(250);
+
+    /// Drive the open streams until they are all finished.
+    ///
+    /// Not the same thing as owning the isolate for the life of a stream: this
+    /// future is one arm of the runtime thread's `select!`, so an arriving
+    /// request drops it wherever it happens to be and is served at once. The
+    /// producers stay exactly where they were -- their promises are in the
+    /// isolate, not in this future -- and the thread comes back here when the
+    /// request has been answered.
+    ///
+    /// What the isolate spends inside here is watched exactly as a request is,
+    /// with one difference: the wall clock belongs to each *stream* and is
+    /// enforced by closing that stream, while the CPU ceiling belongs to this
+    /// *stretch* and is enforced by terminating the isolate. See
+    /// [`Self::STREAM_GRACE`].
+    pub async fn pump_response_streams(&mut self) {
+        // Nothing left to produce: the caller goes back to waiting for
+        // messages, which is where an isolate with no open stream belongs.
+        let mut idle = false;
+        while self.has_open_response_streams() {
+            let (deadline, open) = {
+                let streams = self.response_streams();
+                let streams = streams.borrow();
+                match streams.earliest_deadline() {
+                    Some(deadline) => (deadline, streams.len()),
+                    None => return,
+                }
+            };
+            let sinks = self.response_streams().borrow().sinks();
+            // Read before the drive, not after a failure: the rate limiter
+            // terminates the isolate without going through the watchdog, so
+            // this counter moving is the only thing that tells the two kinds
+            // of failure apart.
+            let rate_limit_cutoffs = self.metrics.value(RATE_LIMIT_CUTOFFS_TOTAL, &self.app_id);
+
+            // Published so an outbound `fetch` a producer starts from here on
+            // is bounded by the stream's clock. Between stretches the deadline
+            // is cleared, and a call made with no deadline at all would hold
+            // this runtime thread with nothing to stop it.
+            self.execution_deadline.set(Some(deadline));
+            let cut_off = self.watchdog.arm(
+                deadline + Self::STREAM_GRACE,
+                Watched::ResponseStream,
+                Some(open.to_string()),
+                self.stream_timeout_ms,
+                self.cpu_budget(),
+            );
+
+            let terminated = if idle {
+                // The isolate has nothing pending: every producer is waiting
+                // on something that is not an operation this runtime is
+                // driving. Polling the event loop again would return at once
+                // and spin the thread, so the wait is for the two things that
+                // can still change -- the deadline, and the client.
+                Self::until_deadline_or_client_gone(deadline, sinks).await;
+                None
+            } else {
+                let mut event_loop =
+                    std::pin::pin!(self.runtime.run_event_loop(PollEventLoopOptions::default()));
+                tokio::select! {
+                    outcome = &mut event_loop => {
+                        idle = outcome.is_ok();
+                        outcome.err()
+                    }
+                    () = Self::until_deadline_or_client_gone(deadline, sinks) => None,
+                }
+            };
+
+            let fired = cut_off.disarm();
+            self.execution_deadline.set(None);
+            self.clear_termination();
+
+            if let Some(cut_off) = fired {
+                // Terminating is the only way to stop a producer that will not
+                // yield, and it stops all of them. Every open stream is ended
+                // as a failure so that each client's read fails rather than
+                // succeeding on a body that simply stopped.
+                let reason = cut_off.as_error(&self.app_id, self.stream_timeout_ms);
+                self.fail_open_response_streams(&reason.to_string());
+                return;
+            }
+
+            // The op rate limiter terminates the isolate from inside an op
+            // dispatch, without going through the watchdog and without leaving
+            // an error this side can catch: sometimes V8 unwinds mid-dispatch
+            // and the event loop reports something that names neither the
+            // application nor the ceiling ("Missing promise"), and sometimes it
+            // reports nothing at all and the producers are simply gone. The
+            // counter is the only thing that tells this apart from either.
+            //
+            // One chunk costs one op dispatch, so this is a ceiling a stream
+            // can plausibly meet: it is what an application writing very small
+            // chunks reaches long before it reaches any byte rate.
+            let rate_limited =
+                self.metrics.value(RATE_LIMIT_CUTOFFS_TOTAL, &self.app_id) > rate_limit_cutoffs;
+            if rate_limited || terminated.is_some() {
+                let reason = if rate_limited {
+                    format!(
+                        "app {} went past its ceiling of {} op dispatches per second while it \
+                         was producing a response stream. One chunk costs one dispatch, so a \
+                         producer writing very small chunks meets this ceiling long before it \
+                         meets any byte rate: write larger chunks, or raise \
+                         default_execution_limits.rate_limit_ops_per_sec",
+                        self.app_id, self.rate_limit_ops_per_sec
+                    )
+                } else {
+                    terminated
+                        .as_ref()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default()
+                };
+                tracing::error!(
+                    target: "app",
+                    app_id = %self.app_id,
+                    error = ?terminated.as_ref().map(|e| e.to_string()),
+                    streams = open,
+                    "App {} could not go on producing {} response stream(s): {}. All of them \
+                     are aborted mid-body, so every one of those clients sees a transfer that \
+                     fails part-way",
+                    self.app_id,
+                    open,
+                    reason
+                );
+                self.fail_open_response_streams(&reason);
+                return;
+            }
+
+            if self.reap_response_streams() > 0 {
+                // A reap runs script, so there is something to poll again.
+                idle = false;
+            }
+
+            if idle && self.has_open_response_streams() {
+                // The isolate has no operation, no timer and no module load
+                // outstanding, and a stream is still open. Nothing can wake a
+                // producer that is waiting on none of those, so this stream
+                // will never produce another byte: the handler abandoned it
+                // without closing it, or its code was terminated out from under
+                // it. Waiting out `stream_timeout_ms` instead would leave the
+                // client hanging on a body nobody is writing, for minutes.
+                tracing::warn!(
+                    target: "app",
+                    app_id = %self.app_id,
+                    streams = open,
+                    "App {} left {} response stream(s) with nothing left to produce them: the \
+                     isolate has no operation or timer outstanding, so no producer can wake \
+                     again. Each client's transfer fails part-way rather than waiting out \
+                     stream_timeout_ms on a body nobody is writing",
+                    self.app_id,
+                    open
+                );
+                self.fail_open_response_streams(
+                    "the handler stopped producing this body without ending it, and nothing in \
+                     the isolate can wake it again",
+                );
+                return;
+            }
+        }
+    }
+
+    /// Wait for the first of: a stream running out of time, or a client
+    /// hanging up.
+    ///
+    /// Both are things the isolate cannot see for itself -- one is a clock, the
+    /// other is a socket the node owns -- so this is what turns them into a
+    /// wake-up for the loop above.
+    async fn until_deadline_or_client_gone(
+        deadline: Instant,
+        sinks: Vec<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    ) {
+        let gone = async move {
+            if sinks.is_empty() {
+                // No stream, no client to lose. Never resolves, so the
+                // deadline is the only thing left in the race.
+                std::future::pending::<()>().await;
+            }
+            let waits: Vec<_> = sinks.iter().map(|sink| Box::pin(sink.closed())).collect();
+            let _ = futures_util::future::select_all(waits).await;
+        };
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline.into()) => {}
+            () = gone => {}
+        }
+    }
+
+    /// Close the streams that have run out of time or lost their client, and
+    /// say how many were closed.
+    fn reap_response_streams(&mut self) -> usize {
+        let now = Instant::now();
+        let (expired, abandoned) = {
+            let streams = self.response_streams();
+            let streams = streams.borrow();
+            (streams.expired(now), streams.abandoned())
+        };
+
+        for id in &expired {
+            let reason = format!(
+                "the response stream ran past this node's stream_timeout_ms of {}ms",
+                self.stream_timeout_ms
+            );
+            let tally = self
+                .response_streams()
+                .borrow_mut()
+                .close_with_failure(*id, reason.clone());
+            tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                stream_id = id,
+                budget_ms = self.stream_timeout_ms,
+                chunks = tally.map(|t| t.chunks).unwrap_or(0),
+                bytes = tally.map(|t| t.bytes).unwrap_or(0),
+                "A response stream of app {} was closed after {}ms, having sent {} bytes in {} \
+                 chunk(s): it is past stream_timeout_ms. The client was answered 200 long ago, \
+                 so what it sees is a transfer that fails part-way rather than an error page. \
+                 Raise default_execution_limits.stream_timeout_ms if streams of this length are \
+                 expected",
+                self.app_id,
+                self.stream_timeout_ms,
+                tally.map(|t| t.bytes).unwrap_or(0),
+                tally.map(|t| t.chunks).unwrap_or(0)
+            );
+            self.cancel_producer(*id, &reason);
+        }
+
+        for id in &abandoned {
+            let tally = self.response_streams().borrow_mut().close(*id);
+            tracing::debug!(
+                target: "app",
+                app_id = %self.app_id,
+                stream_id = id,
+                chunks = tally.map(|t| t.chunks).unwrap_or(0),
+                bytes = tally.map(|t| t.bytes).unwrap_or(0),
+                "The client of one of app {}'s response streams went away after {} bytes; the \
+                 producer is being cancelled rather than left writing into nothing",
+                self.app_id,
+                tally.map(|t| t.bytes).unwrap_or(0)
+            );
+            self.cancel_producer(*id, "the client stopped reading this response");
+        }
+
+        expired.len() + abandoned.len()
+    }
+
+    /// End every open stream as a failure, because the isolate can no longer
+    /// produce any of them.
+    fn fail_open_response_streams(&mut self, reason: &str) {
+        // The ids are taken out of the borrow before anything is closed:
+        // holding the registry's borrow across the loop would panic on the
+        // first close, which is a `borrow_mut` of the same cell.
+        let open = self.response_streams().borrow().ids();
+        for id in open {
+            self.response_streams()
+                .borrow_mut()
+                .close_with_failure(id, reason.to_string());
+        }
+    }
+
+    /// Tell the isolate to stop producing one stream.
+    ///
+    /// This is what makes cancellation reach the application: the queue is
+    /// already gone by the time this runs, so without it the producer would go
+    /// on reading its source and calling a write op that only ever rejects,
+    /// for as long as it felt like it.
+    fn cancel_producer(&mut self, id: u32, reason: &str) {
+        // The reason is written into the source text of a script, so it is
+        // escaped rather than quoted: the strings here are this file's own, but
+        // a future one carrying an application's message must not be able to
+        // close the literal.
+        let reason = serde_json::to_string(reason).unwrap_or_else(|_| "\"\"".to_string());
+        if let Err(e) = self.runtime.execute_script(
+            "<stream_cancel>",
+            format!("__deis_runtime_stream_cancel({id}, {reason})"),
+        ) {
+            tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                stream_id = id,
+                error = %e,
+                "App {}'s producer for a closed response stream could not be cancelled: {}. It \
+                 will stop at its next write, which fails because the queue is already gone",
+                self.app_id,
+                e
+            );
+        }
     }
 
     /// Hand one batch of leased queue messages to the app's `queue` handler.
@@ -2667,6 +3193,27 @@ impl AppRuntime {
 
 impl Drop for AppRuntime {
     fn drop(&mut self) {
+        // A body still being produced when the isolate goes -- the version was
+        // rolled back, the application was unloaded, the node is draining --
+        // has no producer any more. Dropping the isolate would end each of
+        // those bodies cleanly, and a client would read a truncated response as
+        // a complete one; ended as failures, its read fails instead.
+        let open = self.response_streams().borrow().ids();
+        if !open.is_empty() {
+            tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                streams = open.len(),
+                "The isolate of app {} is going away with {} response stream(s) still open; \
+                 each client's transfer fails part-way rather than appearing to complete",
+                self.app_id,
+                open.len()
+            );
+            self.fail_open_response_streams(
+                "the application's isolate was taken off this node while the body was still \
+                 being produced",
+            );
+        }
         tracing::debug!("Dropping runtime for app: {}", self.app_id);
     }
 }

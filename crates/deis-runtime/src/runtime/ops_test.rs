@@ -95,6 +95,7 @@ mod tests {
             .expect("the request runs");
         let (status, _, body) = rx.await.expect("a response").expect("a response");
         let body = body
+            .into_bytes()
             .map(|bytes| String::from_utf8(bytes).expect("these handlers answer with JSON"))
             .unwrap_or_default();
         assert_eq!(status, 200, "{body}");
@@ -329,7 +330,7 @@ mod tests {
             .await
             .expect("the request runs");
         let (_, _, body) = rx.await.expect("a response").expect("a response");
-        let body = String::from_utf8(body.unwrap_or_default()).expect("text");
+        let body = String::from_utf8(body.into_bytes().unwrap_or_default()).expect("text");
         assert!(
             body.contains("kv service is not available"),
             "an undeclared service must say so rather than list nothing: {body}"

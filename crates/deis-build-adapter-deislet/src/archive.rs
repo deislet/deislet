@@ -130,6 +130,7 @@ mod tests {
             assets: Vec::new(),
             site: Default::default(),
             limits: None,
+            compatibility: None,
         }
     }
 

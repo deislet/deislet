@@ -21,8 +21,8 @@ use crate::deployment::DeploymentManager;
 use crate::health::NodeHealth;
 use crate::management::proto::runtime_management_server::RuntimeManagement;
 use crate::management::proto::{
-    ConfigType, ExecuteCommandRequest, GetStatusRequest, PushConfigRequest, StartInspectRequest,
-    UnloadAppRequest, UpdateAppRequest,
+    ApplyDeploymentRequest, CompatibilityDeclaration, ConfigType, ExecuteCommandRequest,
+    GetStatusRequest, PushConfigRequest, StartInspectRequest, UnloadAppRequest, UpdateAppRequest,
 };
 use crate::runtime::metrics::{recorder, RequestOutcome};
 
@@ -277,6 +277,137 @@ async fn an_inspect_session_attaches_to_the_environment_the_request_names() {
     assert_eq!(status.code(), tonic::Code::Internal);
 
     unload_all(&apps, "status-inspect", &environments).await;
+}
+
+/// The wire carries the manifest's words, and this node answers them with its
+/// own table.
+///
+/// The case that makes the distinction matter: a version naming a date *and* a
+/// flag that holds one of that date's behaviours back. Any list of "what is
+/// on" has already lost the flag, so a node that trusted such a list would
+/// apply the date and turn the behaviour on again - handing the application
+/// the exact answer its author wrote a line to avoid.
+#[test]
+fn a_flag_that_holds_a_behaviour_back_is_honoured_after_the_wire() {
+    let profile = super::decode_compatibility(CompatibilityDeclaration {
+        date: "2026-09-01".to_string(),
+        flags: vec!["single_set_cookie_header".to_string()],
+    })
+    .expect("both the date and the flag are ones this build knows");
+
+    assert_eq!(
+        profile.date().map(|d| d.to_string()).as_deref(),
+        Some("2026-09-01")
+    );
+    assert!(
+        !profile.is_on(deis_bundle::Flag::MultipleSetCookieHeaders),
+        "the date alone would have turned this on; the flag is what holds it back"
+    );
+}
+
+/// An empty date is proto3's absent string, and here the two mean the same
+/// thing: the application named no day and takes the oldest behaviour.
+#[test]
+fn an_empty_declaration_on_the_wire_is_the_oldest_behaviour() {
+    let profile = super::decode_compatibility(CompatibilityDeclaration {
+        date: String::new(),
+        flags: Vec::new(),
+    })
+    .expect("declaring nothing is not an error");
+
+    assert_eq!(profile.date(), None);
+    assert!(!profile.is_on(deis_bundle::Flag::MultipleSetCookieHeaders));
+}
+
+/// The mixed-fleet refusal, at the door.
+///
+/// A control plane built after this node accepts a date this node has never
+/// heard of and pushes it here. There is no honest way to run it: every
+/// behaviour this build could give the application is one the application did
+/// not ask for. So the push is refused before a byte of the bundle is
+/// downloaded, the response names the version this environment keeps serving,
+/// and the control plane's delivery report shows this node as failed - which
+/// is what tells an operator to upgrade it.
+#[tokio::test]
+async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_anything_is_fetched()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let guard = test_host::take();
+    let (apps, service) = service_with(dir.path(), "compat-app", &["production"]).await;
+
+    let response = service
+        .apply_deployment(Request::new(ApplyDeploymentRequest {
+            app_id: "compat-app".to_string(),
+            version_id: "v9".to_string(),
+            environment: "production".to_string(),
+            // Unreachable on purpose: nothing may try to fetch it.
+            bundle_url: "http://127.0.0.1:1/bundle".to_string(),
+            bundle_sha: "0".repeat(64),
+            env: Default::default(),
+            limits: None,
+            compatibility: Some(CompatibilityDeclaration {
+                date: "2099-01-01".to_string(),
+                flags: Vec::new(),
+            }),
+        }))
+        .await
+        .expect("the call itself succeeds; the answer is the refusal")
+        .into_inner();
+
+    assert!(!response.success, "{}", response.message);
+    assert!(
+        response.message.contains("2099-01-01"),
+        "{}",
+        response.message
+    );
+    assert!(
+        response
+            .message
+            .contains(&deis_bundle::PLATFORM_KNOWN_THROUGH.to_string()),
+        "the refusal has to name the date this build does know: {}",
+        response.message
+    );
+
+    unload_all(&apps, "compat-app", &["production"]).await;
+    drop(guard);
+}
+
+/// A flag name this build does not know is the same refusal, for the same
+/// reason: a node that dropped it would be running an application without the
+/// behaviour it asked for and saying nothing.
+#[tokio::test]
+async fn a_deployment_naming_a_flag_this_node_does_not_know_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = test_host::take();
+    let (apps, service) = service_with(dir.path(), "flag-app", &["production"]).await;
+
+    let response = service
+        .apply_deployment(Request::new(ApplyDeploymentRequest {
+            app_id: "flag-app".to_string(),
+            version_id: "v9".to_string(),
+            environment: "production".to_string(),
+            bundle_url: "http://127.0.0.1:1/bundle".to_string(),
+            bundle_sha: "0".repeat(64),
+            env: Default::default(),
+            limits: None,
+            compatibility: Some(CompatibilityDeclaration {
+                date: String::new(),
+                flags: vec!["behaviour_from_a_later_build".to_string()],
+            }),
+        }))
+        .await
+        .expect("the call itself succeeds; the answer is the refusal")
+        .into_inner();
+
+    assert!(!response.success, "{}", response.message);
+    assert!(
+        response.message.contains("behaviour_from_a_later_build"),
+        "{}",
+        response.message
+    );
+
+    unload_all(&apps, "flag-app", &["production"]).await;
+    drop(guard);
 }
 
 #[tokio::test]

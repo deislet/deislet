@@ -98,6 +98,7 @@ pub async fn run(options: Options) -> Result<()> {
         &bundles.url,
         &bundle.digest,
         env,
+        &bundle.manifest,
     )
     .await?;
 
@@ -229,7 +230,14 @@ async fn reload(
     bundles.replace(bundle.bytes.clone()).await;
 
     match node
-        .apply(app, &options.environment, &bundles.url, &bundle.digest, env)
+        .apply(
+            app,
+            &options.environment,
+            &bundles.url,
+            &bundle.digest,
+            env,
+            &bundle.manifest,
+        )
         .await
     {
         Ok(()) => println!(

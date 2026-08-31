@@ -42,8 +42,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::catalog::secrets::secret_aad;
 use crate::catalog::{
-    CatalogError, CatalogResult, CatalogStore, DeclaredLimits, Environment, SecretsBackend,
-    Version, declared_limits,
+    CatalogError, CatalogResult, CatalogStore, DeclaredCompatibility, DeclaredLimits, Environment,
+    SecretsBackend, Version, declared_compatibility, declared_limits,
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
 
@@ -281,6 +281,24 @@ pub struct DeploymentPayload {
     /// (`ApplicationManager::effective_limits`), so what travels here is a
     /// request to be held to less, never a grant of more.
     pub limits: Option<DeclaredLimits>,
+    /// Which day's platform this version was written against, *verbatim* from
+    /// its manifest.
+    ///
+    /// The declaration, not this control plane's resolution of it, and that is
+    /// load bearing. Resolved answers are lossy in one direction: a manifest
+    /// naming a date and then a flag that holds one behaviour *back* resolves
+    /// to a set of enabled names that no longer mentions the flag, and a node
+    /// re-reading that set would apply the date and turn the behaviour on
+    /// again. Sending what the author wrote lets each build answer it with its
+    /// own table, which is the whole point of a fleet where the control plane
+    /// and a node may be on different versions.
+    ///
+    /// Carried at all so a node can refuse a deployment it cannot honour
+    /// before it downloads a bundle. Not an override: the same declaration is
+    /// inside the bundle, and once the node has unpacked it that copy is the
+    /// authority, which keeps a version's semantics attached to the version
+    /// rather than to the message that happened to deliver it.
+    pub compatibility: DeclaredCompatibility,
 }
 
 impl std::fmt::Debug for DeploymentPayload {
@@ -304,6 +322,7 @@ impl std::fmt::Debug for DeploymentPayload {
                 &redacted(&self.storage.token_for(&self.app_id, &self.environment)),
             )
             .field("limits", &self.limits)
+            .field("compatibility", &self.compatibility)
             .finish()
     }
 }
@@ -360,7 +379,30 @@ impl DeploymentPayload {
             bundle_sha: self.bundle_sha.clone(),
             env: env.into_iter().collect(),
             limits: self.limits.as_ref().map(limits_to_wire),
+            compatibility: Some(compatibility_to_wire(&self.compatibility)),
         }
+    }
+}
+
+/// Put a version's compatibility declaration on the wire, word for word.
+///
+/// Deliberately not this control plane's resolution of it. Two builds resolve
+/// the same declaration with their own tables and that is intended; a resolved
+/// list, by contrast, cannot express "the date would turn this on and the
+/// author asked for it to stay off", so a node re-reading one would silently
+/// turn the behaviour back on.
+///
+/// Always sent, including for a version that declares nothing: an empty date
+/// with no flags is a complete answer ("the oldest behaviour"), and an absent
+/// message would be indistinguishable from an older control plane that has no
+/// opinion, which would leave a node guessing.
+fn compatibility_to_wire(declared: &DeclaredCompatibility) -> proto::CompatibilityDeclaration {
+    proto::CompatibilityDeclaration {
+        date: declared
+            .date
+            .map(|date| date.to_string())
+            .unwrap_or_default(),
+        flags: declared.flags.clone(),
     }
 }
 
@@ -553,6 +595,49 @@ impl DeploymentDeliverer {
             ),
         }
 
+        // Read from the same stored manifest, and refused rather than
+        // degraded - the opposite of the limits above, on purpose. A version
+        // whose limits cannot be read still runs correctly, just on the node's
+        // own ceilings; a version whose compatibility declaration cannot be
+        // read has no correct behaviour to fall back on, because every answer
+        // this platform could pick is one the application did not ask for.
+        // Refusing the delivery leaves whatever is currently deployed running.
+        // Resolved for the log line and for the refusal below; what travels is
+        // the declaration itself, a few lines down.
+        let resolved = declared_compatibility(&manifest).map_err(|reason| {
+            error!(
+                app_id = %env.app_id,
+                environment = %env.name,
+                version_id = %version_id,
+                reason = %reason,
+                "This version's manifest declares a compatibility date or flag this build of the control plane cannot honour, so the deployment is refused; the environment keeps running whatever it was running. Rebuild the bundle against a date this platform knows, or upgrade the platform"
+            );
+            CatalogError::invalid(format!(
+                "version {version_id} declares a compatibility date or flag this platform cannot \
+                 honour: {reason}"
+            ))
+        })?;
+        match resolved.date() {
+            Some(date) => info!(
+                app_id = %env.app_id,
+                environment = %env.name,
+                version_id = %version_id,
+                compatibility_date = %date,
+                compatibility = %resolved.describe(),
+                "Delivering under the platform behaviour of {}: {}",
+                date,
+                resolved.describe()
+            ),
+            None => warn!(
+                app_id = %env.app_id,
+                environment = %env.name,
+                version_id = %version_id,
+                "Delivering a version that names no compatibility date, so every node holds it to the oldest behaviour this platform has: {}",
+                crate::catalog::describe_version(&resolved)
+            ),
+        }
+        let compatibility = manifest.compatibility.clone().unwrap_or_default();
+
         let ciphertexts = self.store.secret_ciphertexts(&env.id).await?;
         let mut secret_names = Vec::with_capacity(ciphertexts.len());
         if !ciphertexts.is_empty() {
@@ -621,6 +706,7 @@ impl DeploymentDeliverer {
             secret_names,
             storage: self.storage.clone(),
             limits,
+            compatibility,
         })
     }
 
@@ -1053,6 +1139,108 @@ mod tests {
         // The secret wins over the placeholder the manifest carried.
         assert_eq!(request.env.get("API_KEY").unwrap(), "s3cr3t");
         assert_eq!(request.bundle_sha, "abc123");
+    }
+
+    /// What a node has to be told before it downloads anything: which day's
+    /// platform this version expects.
+    #[tokio::test]
+    async fn a_manifest_that_names_a_compatibility_date_puts_it_on_the_wire() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let manifest = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+            "compatibility":{"date":"2026-09-01"}}"#;
+
+        let payload = deliverer
+            .payload(&env, &version(manifest), "http://control.test")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            payload.compatibility.date.map(|d| d.to_string()).as_deref(),
+            Some("2026-09-01")
+        );
+
+        let wire = payload
+            .to_request()
+            .compatibility
+            .expect("the wire message must always carry an answer, even an empty one");
+        assert_eq!(wire.date, "2026-09-01");
+        assert!(
+            wire.flags.is_empty(),
+            "the manifest named no flag, so neither does the wire"
+        );
+    }
+
+    /// The reason the declaration travels rather than the answers it resolves
+    /// to: a flag that holds a behaviour *back* past its date disappears from
+    /// any list of what is on, and a node reading such a list would apply the
+    /// date and turn the behaviour on again - silently giving the application
+    /// the one answer its author wrote a line to avoid.
+    #[tokio::test]
+    async fn a_flag_that_holds_a_behaviour_back_survives_the_wire() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let manifest = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+            "compatibility":{"date":"2026-09-01","flags":["single_set_cookie_header"]}}"#;
+
+        let wire = deliverer
+            .payload(&env, &version(manifest), "http://control.test")
+            .await
+            .unwrap()
+            .to_request()
+            .compatibility
+            .expect("an answer always travels");
+
+        assert_eq!(wire.date, "2026-09-01");
+        assert_eq!(wire.flags, vec!["single_set_cookie_header"]);
+    }
+
+    /// A version that declares nothing is not a version with nothing to say.
+    /// The empty answer travels too, because an absent message on the wire
+    /// would be indistinguishable from a control plane too old to have an
+    /// opinion - and a node that had to guess between those two is the whole
+    /// failure this mechanism exists to prevent.
+    #[tokio::test]
+    async fn a_manifest_with_no_date_still_puts_an_answer_on_the_wire() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+
+        assert_eq!(payload.compatibility.date, None);
+        let wire = payload
+            .to_request()
+            .compatibility
+            .expect("an undated version still carries its answer");
+        assert_eq!(wire.date, "");
+        assert!(wire.flags.is_empty());
+    }
+
+    /// A stored version this build cannot honour stops the delivery, where an
+    /// unreadable `limits` block only costs the application its own narrower
+    /// ceiling. The two are not the same kind of failure: an application run
+    /// on the node's ceilings is slower than it asked to be, while an
+    /// application run on answers it never named is wrong in a way nothing
+    /// downstream will report.
+    #[tokio::test]
+    async fn a_stored_version_this_build_cannot_honour_is_not_delivered() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let manifest = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+            "compatibility":{"date":"2099-01-01"}}"#;
+
+        let err = deliverer
+            .payload(&env, &version(manifest), "http://control.test")
+            .await
+            .expect_err("a date this build cannot honour must not be delivered");
+        let message = err.to_string();
+        assert!(message.contains("2099-01-01"), "{message}");
     }
 
     /// The gap this closed: `ApplyDeploymentRequest` carried `env` and

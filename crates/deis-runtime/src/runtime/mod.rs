@@ -19,6 +19,8 @@ mod queue_client;
 pub mod queue_consumer;
 mod queue_ops;
 pub mod rate_limit;
+pub mod response_headers;
+mod response_stream;
 pub mod route_match;
 mod runtime_init;
 mod snapshot;
@@ -50,6 +52,10 @@ pub use pool::{RuntimePool, StagedVersion};
 pub use queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};
 pub use queue_consumer::{BatchOutcome, ConsumerSettings};
 pub use queue_ops::init_queue_extension;
+pub use response_headers::HeaderPairs;
+pub use response_stream::{
+    init_response_stream_extension, response_streams, ResponseBody, ResponseStreams, StreamReader,
+};
 pub use runtime_init::{build_runtime_extensions, init_lazy_extensions};
 pub use snapshot::load_or_create_startup_snapshot;
 pub use tenant::Tenant;

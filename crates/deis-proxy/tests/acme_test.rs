@@ -267,11 +267,16 @@ async fn a_restart_finds_the_certificate_on_disk_and_asks_the_authority_for_noth
     // Encrypt's fifty certificates a week per registered domain on restarts,
     // and once that is spent nothing under the domain can be issued at all.
     let mut fixture = Fixture::start(vec![app("shop", &[NAME])], CaOptions::default(), 30).await;
-    until("the first process obtains a certificate", || {
-        fixture.ca.issued_count() == 1
+    // The condition is the chain being *on disk*, not the authority having
+    // issued it. The authority counts the issue as it answers, and the proxy
+    // writes the file a moment later; waiting on the count and then reading the
+    // file races that gap, and loses often enough to be seen.
+    until("the first process stores a certificate", || {
+        fixture.chain_path(NAME).exists()
     })
     .await;
     let before = std::fs::read(fixture.chain_path(NAME)).expect("the stored chain");
+    assert_eq!(fixture.ca.issued_count(), 1);
     assert_eq!(fixture.ca.account_count(), 1);
 
     fixture.proxy.stop();

@@ -486,6 +486,30 @@ pub struct ExecutionLimits {
     #[serde(default = "default_wait_until_timeout_ms")]
     pub wait_until_timeout_ms: u64,
 
+    /// Maximum wall-clock time (ms) one streaming response body may take, from
+    /// the moment its head reached the client to the moment its last byte does.
+    ///
+    /// A limit of its own for the same reason the tail has one, and a much
+    /// larger one, because it bounds something different. `timeout_ms` is how
+    /// long a caller waits for an *answer*; a stream has already answered. A
+    /// server-sent-events feed, a progress channel or a large object being
+    /// passed through is expected to run for minutes, and holding it to the
+    /// request's ceiling would refuse the whole feature.
+    ///
+    /// It still needs a ceiling, because an open stream is a queue, a socket
+    /// and a producer this node holds on the application's behalf, and a
+    /// producer that never finishes would hold them for the life of the
+    /// process. When it runs out the node closes the stream: the client's
+    /// transfer fails part-way -- there is no status left to change, the 200
+    /// went out with the head -- and the node logs the number it was held to.
+    ///
+    /// Enforced by the node rather than by terminating the isolate, so that one
+    /// overrunning stream does not take the other streams and requests of the
+    /// same application with it. The CPU half is `cpu_time_limit_ms`, which is
+    /// what catches a producer that will not yield at all.
+    #[serde(default = "default_stream_timeout_ms")]
+    pub stream_timeout_ms: u64,
+
     /// Maximum rate (ops/sec) of JS-op dispatch before the isolate is
     /// terminated and the in-flight request fails.
     #[serde(default = "default_rate_limit_ops_per_sec")]
@@ -530,6 +554,21 @@ fn default_wait_until_timeout_ms() -> u64 {
     30_000
 }
 
+/// Five minutes, against a 30-second request budget.
+///
+/// The two numbers are an order of magnitude apart because they bound
+/// different things; see `stream_timeout_ms` above. Five minutes is chosen
+/// against what the shapes that need streaming actually look like: a browser's
+/// `EventSource` reconnects on its own, so an events feed cut at five minutes
+/// resumes without the visitor seeing anything, and a large object passed
+/// through at even a single megabyte a second is 300 MB inside the budget. An
+/// operator running feeds that must stay up longer than that raises it; one
+/// running a node of ordinary request-shaped applications can drop it to a few
+/// seconds and find out immediately which of them stream at all.
+fn default_stream_timeout_ms() -> u64 {
+    300_000
+}
+
 fn default_rate_limit_ops_per_sec() -> f64 {
     1000.0
 }
@@ -558,6 +597,7 @@ impl Default for ExecutionLimits {
         Self {
             timeout_ms: default_timeout_ms(),
             wait_until_timeout_ms: default_wait_until_timeout_ms(),
+            stream_timeout_ms: default_stream_timeout_ms(),
             rate_limit_ops_per_sec: default_rate_limit_ops_per_sec(),
             cpu_time_limit_ms: default_cpu_time_limit_ms(),
         }
@@ -740,6 +780,14 @@ impl RuntimeConfig {
                 &value,
                 "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_WAIT_UNTIL_TIMEOUT_MS",
                 "a whole number of milliseconds",
+            )?;
+        }
+
+        if let Some(value) = env_var("DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_STREAM_TIMEOUT_MS") {
+            self.default_execution_limits.stream_timeout_ms = parse_env(
+                &value,
+                "DEIS_RUNTIME_DEFAULT_EXECUTION_LIMITS_STREAM_TIMEOUT_MS",
+                "a number of milliseconds",
             )?;
         }
 
@@ -961,6 +1009,16 @@ impl RuntimeConfig {
                  floor; the waitUntil tail of every invocation on this node would be terminated \
                  before the work it was handed could finish",
                 limits.wait_until_timeout_ms,
+                MIN_TIMEOUT_MS
+            ));
+        }
+
+        if limits.stream_timeout_ms < MIN_TIMEOUT_MS {
+            return Err(anyhow!(
+                "default_execution_limits.stream_timeout_ms is {}, which is below the {}ms floor; \
+                 every streaming response on this node would be cut off before its producer had \
+                 written a second chunk, and the client would see a transfer that fails part-way",
+                limits.stream_timeout_ms,
                 MIN_TIMEOUT_MS
             ));
         }

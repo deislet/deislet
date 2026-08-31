@@ -81,6 +81,25 @@ pub struct DeploymentOrder {
     /// only place that knows what this node allows. What travels here is a
     /// request to be held to *less*.
     pub limits: Option<ResourceLimits>,
+    /// Which of the platform's answers this version expects, as the control
+    /// plane resolved them out of the manifest it stored.
+    ///
+    /// `None` means the control plane said nothing - an older one, or the
+    /// recovery path below, which reads nothing off the wire at all. It does
+    /// **not** mean "the oldest behaviour": the bundle's own manifest carries
+    /// the declaration and is what [`DeploymentManager::install`] resolves, so
+    /// a version recovered from this node's disk comes back on exactly the
+    /// date it was deployed with. That is the one difference from
+    /// [`Self::limits`], which cannot survive a disk recovery, and it is
+    /// deliberate: a narrower ceiling lost for a while is a slower
+    /// application, while a compatibility date lost for a while is an
+    /// application that quietly behaves differently.
+    ///
+    /// What this field is for is the refusal that has to happen *before* a
+    /// bundle is downloaded, and the cross-check afterwards: if the control
+    /// plane and the bundle disagree about what a version declared, one of
+    /// them is wrong and an operator has to be told which.
+    pub compatibility: Option<deis_bundle::CompatibilityProfile>,
 }
 
 impl DeploymentOrder {
@@ -102,6 +121,7 @@ impl std::fmt::Debug for DeploymentOrder {
             .field("bundle_sha", &self.bundle_sha)
             .field("env", &format_args!("{names:?} = <redacted>"))
             .field("limits", &self.limits)
+            .field("compatibility", &self.compatibility.map(|c| c.describe()))
             .finish()
     }
 }
@@ -121,6 +141,15 @@ pub enum DeployError {
     Assets(AssetError),
     /// The bundle is fine but the node could not put it on disk.
     Storage(String),
+    /// The version names a compatibility date or a behaviour flag this build
+    /// of the node cannot honour.
+    ///
+    /// Its own variant rather than a `Bundle` or a `Load`, because it is the
+    /// one refusal that is about *this node* rather than about the bundle: the
+    /// same bundle runs fine on a node built after the date it names. The
+    /// message says both dates so an operator reads it as "upgrade this node",
+    /// not "the application is broken".
+    Compatibility(String),
     /// The isolate would not take the new code.
     Load(String),
 }
@@ -133,6 +162,9 @@ impl std::fmt::Display for DeployError {
             Self::Bundle(e) => write!(f, "{e}"),
             Self::Assets(e) => write!(f, "{e}"),
             Self::Storage(m) => write!(f, "could not store the bundle: {m}"),
+            Self::Compatibility(m) => {
+                write!(f, "this node cannot honour what the version declares: {m}")
+            }
             Self::Load(m) => write!(f, "the bundle would not load: {m}"),
         }
     }
@@ -399,6 +431,15 @@ impl DeploymentManager {
                 // narrowing until the control plane redelivers, which is why
                 // the recovery log below says so.
                 limits: None,
+                // Nothing is lost here, unlike the limits above: the
+                // compatibility declaration lives in the bundle's own
+                // manifest, which is on this node's disk, so `install` reads
+                // it back and the application comes up on the same date it
+                // was deployed with. A node restart that quietly moved an
+                // application onto different platform answers is exactly the
+                // failure the mechanism exists to prevent, so it must not be
+                // the recovery path that causes it.
+                compatibility: None,
             };
 
             match self.install(order, true).await {
@@ -585,6 +626,77 @@ impl DeploymentManager {
             );
         }
 
+        // The bundle's own manifest is the authority on which of the
+        // platform's answers this version expects. It has to be: it is inside
+        // the archive whose digest this node just verified, it is what the
+        // control plane read, and it is still here on the recovery path where
+        // no order was ever received. A version's semantics belong to the
+        // version, not to the message that happened to deliver it.
+        //
+        // Refused rather than defaulted when it cannot be resolved. Every
+        // answer this node could pick for an application whose declaration it
+        // does not understand is an answer that application did not ask for,
+        // and the node that quietly picks one is the node nobody can debug.
+        let compatibility = manifest.compatibility_profile().map_err(|e| {
+            error!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                version_id = %order.version_id,
+                error = %e,
+                "This version's manifest declares a compatibility date or behaviour flag \
+                 this build of the node cannot honour, so the deployment is refused and this \
+                 environment keeps running whatever it was running. Upgrade this node, or \
+                 rebuild the application against a date this build knows"
+            );
+            DeployError::Compatibility(e)
+        })?;
+
+        // What the control plane said it was sending, against what the bundle
+        // actually carries. They can only differ if the two read different
+        // manifests for one version id, which is a platform fault rather than
+        // an application one - and one that would otherwise show up as an
+        // application behaving unlike what `deis versions` prints.
+        if order
+            .compatibility
+            .is_some_and(|delivered| delivered != compatibility)
+        {
+            let delivered = order
+                .compatibility
+                .expect("just checked that the order carries one");
+            error!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                version_id = %order.version_id,
+                delivered = %delivered.describe(),
+                in_bundle = %compatibility.describe(),
+                "The control plane and this version's bundle disagree about which platform \
+                 behaviour it was written against; the bundle wins, because that is what the \
+                 digest covers. The control plane's own listing of this version is wrong until \
+                 the version is uploaded again"
+            );
+        }
+
+        match compatibility.date() {
+            Some(date) => info!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                version_id = %order.version_id,
+                compatibility_date = %date,
+                compatibility = %compatibility.describe(),
+                "Installing this version under the platform behaviour of {}: {}",
+                date,
+                compatibility.describe()
+            ),
+            None => warn!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                version_id = %order.version_id,
+                "This version's manifest names no compatibility date, so it is held to the \
+                 oldest behaviour this platform has and no later fix that changes an observable \
+                 behaviour will reach it. Add \"compatibilityDate\" to the project and redeploy"
+            ),
+        }
+
         // The control plane already merges manifest variables with decrypted
         // secrets, so its map wins. The manifest's own variables are the base
         // so that a bundle recovered from disk still has them.
@@ -662,6 +774,9 @@ impl DeploymentManager {
             // against this node's own ceilings and says so in the log when an
             // application asked for more than it may have.
             limits,
+            // Resolved once, here, and asked as a bit test on every request
+            // from here on; see `deis_bundle::compatibility`.
+            compatibility,
             ..Default::default()
         };
 

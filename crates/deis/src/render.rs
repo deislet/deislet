@@ -173,6 +173,46 @@ pub fn age(seconds: i64) -> String {
 
 /// The first 12 characters of a digest, which is what fits in a table and is
 /// still enough to tell two versions apart by eye.
+/// How a version's compatibility date reads in a table cell.
+///
+/// Three answers, and the middle one is the reason this exists: a version with
+/// no date is not missing information, it is pinned to the oldest behaviour
+/// this platform has, for the rest of its life. It is printed as a word rather
+/// than a dash so that "which of my applications have no date" is a question a
+/// person can answer by looking at one column.
+pub fn compatibility_cell(profile: Option<&deis_bundle::CompatibilityProfile>) -> String {
+    match profile {
+        Some(profile) => match profile.date() {
+            Some(date) => date.to_string(),
+            None => "none (oldest)".to_string(),
+        },
+        None => "unknown".to_string(),
+    }
+}
+
+/// The same answer as a sentence, for a command that has room for one.
+pub fn compatibility_line(profile: Option<&deis_bundle::CompatibilityProfile>) -> String {
+    match profile {
+        Some(profile) => match profile.date() {
+            Some(date) => {
+                let flags = profile.enabled_flag_names();
+                if flags.is_empty() {
+                    format!("compatibility date {date}")
+                } else {
+                    format!("compatibility date {date} ({})", flags.join(", "))
+                }
+            }
+            None => format!(
+                "no compatibility date: this application is held to the oldest behaviour this \
+                 platform has and no later fix that changes an observable behaviour will reach \
+                 it. Add \"compatibilityDate\": \"{}\" to .config.json and deploy again to opt in",
+                deis_bundle::PLATFORM_KNOWN_THROUGH
+            ),
+        },
+        None => "compatibility date unknown: this control plane did not say".to_string(),
+    }
+}
+
 pub fn short_digest(digest: &str) -> String {
     digest.chars().take(12).collect()
 }

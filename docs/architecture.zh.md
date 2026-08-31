@@ -747,6 +747,42 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
   `localhost`、`[::1]`、`[::ffff:127.0.0.1]` 这些写法都拦得住。详见 §12「出网这一格」
   与 `crates/deis-runtime/src/runtime/fetch_policy.rs`。
 
+### 应用还能钉一件事：它是照哪一天的平台写的
+
+限额说的是「这个应用能用多少」，兼容日期说的是「这个应用该得到哪一套答案」。两件事同一
+条路走：项目文件 → 包清单 → 控制面上传时校验 → 随部署下发 → 节点装载时解析 → isolate。
+
+```json
+"compatibilityDate": "2026-09-01",
+"compatibilityFlags": ["single_set_cookie_header"]
+```
+
+日期一次挪一批行为，具名开关只挪一条、方向两边都可以。日期类型、行为表与解析器都在
+`deis-bundle`（`compatibility.rs`），构建、控制面、节点、CLI 共用一份——四份各写各的
+必然走样，而走样的症状是「应用拿到了它没要过的行为」，从外面看不出来。
+
+三条判断，各只有一处：
+
+- **没写日期 = 最老的那套行为，永远。** 给它今天的行为，就是这套机制本来要防的那种
+  「全机队在一次没人安排的重启里一起变」；直接拒绝，则会在机制上线后的第一次重启里把
+  所有已部署应用打掉。代价真实：这样的应用从此收不到任何会改变可观察行为的修复。所以
+  控制面在上传和每次下发时各写一行 warn，节点装载时写一行 warn，`deis deploy` 每次
+  打印，`deis versions` 的 COMPAT 列印 `none (oldest)`——运维能一眼看出哪些应用没日期。
+- **写了本 build 不认识的日期 = 拒绝。** 平台的知识止于自己的发布日
+  （`PLATFORM_KNOWN_THROUGH`），所以「未来的日期」和「比这台节点新的日期」是同一个
+  问题。混合机队里控制面可能比节点新，所以节点在**下载包之前**就用自己那份常量再判一次
+  并回绝，回话里带上两个日期。装作能提供，比拒绝更坏。
+- **运行时在哪里问 = 只有 `CompatibilityProfile::is_on(Flag::X)`。** 日期比较只在装载
+  版本时做一次，请求路径上是一次位测试。表长到三十行也还是能从上往下读完。
+
+包清单是节点这一侧的权威，下发消息不是——这一点和 `limits` 相反，也是故意的：清单在
+那个被校验过摘要的包里，节点断网从自己磁盘恢复时它还在。一次重启把应用悄悄挪到另一套
+答案上，正是这套机制存在的理由，不能由恢复路径来制造。
+
+目前挂在上面的行为有一条：一个处理函数一次设两个 `Set-Cookie`，此前只有最后一个能到
+客户端——响应头离开 isolate 时走的是一张 map，而 `Set-Cookie` 是 Fetch 规范里唯一不许
+合并的头。日期在 `2026-09-01` 及以后的应用两个都发得出去，更早的保持原样。
+
 ---
 
 ## 10. 落地顺序
@@ -861,7 +897,7 @@ SSR。
 | 特性 | 实况 | 依据 |
 |---|---|---|
 | HTTP Handler | 成立 | `dispatcher` → `RuntimePool` → Isolate |
-| Request / Response | 成立 | JS 侧是 deno_fetch 自己的 `Request` / `Response`，手写的最小实现已删除：`Response.json()` / `Response.redirect()` / `Response.error()`、`ok`、`arrayBuffer()` / `blob()` / `formData()`、`clone()`、`Headers.getSetCookie()`、`body` 是真 `ReadableStream`，都实测可用。此前唯一的保留——`JsRequest.body` / `JsResponse.body` 过 Rust↔JS 边界是 `Option<String>`，二进制主体会被有损转换——已改成 `Option<Vec<u8>>`（op 边界 `#[buffer]` / `ToJsBuffer`），二进制原样穿过 |
+| Request / Response | 成立 | JS 侧是 deno_fetch 自己的 `Request` / `Response`，手写的最小实现已删除：`Response.json()` / `Response.redirect()` / `Response.error()`、`ok`、`arrayBuffer()` / `blob()` / `formData()`、`clone()`、`Headers.getSetCookie()`、`body` 是真 `ReadableStream`，都实测可用。此前唯一的保留——`JsRequest.body` / `JsResponse.body` 过 Rust↔JS 边界是 `Option<String>`，二进制主体会被有损转换——已改成字节（op 边界 `#[buffer]` / `ToJsBuffer`），二进制原样穿过。响应方向后来又多了一种形状：`ResponseBody` 三选一——没有 body、一整块字节、一条还在生产的流。前两种就是原来那个`Option<Vec<u8>>` 的两半，绝大多数响应仍然走它；`new Response(stream)` 和 `fetch()` 答回来的响应走第三种，边生产边发，见 `runtime/response_stream.rs`。请求体仍然是整块的 |
 | 环境变量 | 成立 | 控制面下发的 `env` 表注入 `context.env`，平台保留键先被取走 |
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
 | KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本 |

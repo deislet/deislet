@@ -471,8 +471,10 @@ async function fetch(input, init = undefined) {
 const nativeSetTimeout = timers.setTimeout;
 const nativeClearTimeout = timers.clearTimeout;
 
-// Each entry is `{ controller, id }`: the `AbortController` bounding one
-// outbound call, and the timeout that trips it when the budget runs out.
+// Each entry is `{ controller, id, set }`: the `AbortController` bounding one
+// outbound call, the timeout that trips it when the budget runs out, and the
+// set the entry is filed in so the timeout can take itself out of the right
+// one. See `entryOwner` below for why there is more than one set.
 const budgetGuards = new SafeSet();
 
 // What an application is told when the budget ran out under it. A
@@ -505,18 +507,28 @@ function boundedByExecutionBudget(callerSignal) {
     // seen a moment later.
     controller.abort(budgetExpired());
   } else {
-    const guard = { controller, id: 0 };
-    guard.id = nativeSetTimeout(() => {
-      SetPrototypeDelete(budgetGuards, guard);
-      controller.abort(budgetExpired());
-    }, remaining);
-    SetPrototypeAdd(budgetGuards, guard);
+    armGuard(ownedGuards(), controller, remaining);
   }
 
   return abortSignal.createDependentAbortSignal(
     [callerSignal, controller.signal],
     "Failed to bound fetch() by the execution budget",
   );
+}
+
+// File one guard in `set` and start its countdown.
+//
+// The set is carried on the guard because the timeout has to remove the entry
+// from the set it is actually in, and a guard changes sets exactly once: when
+// a response stream adopts the call that is feeding it.
+function armGuard(set, controller, remaining) {
+  const guard = { controller, id: 0, set };
+  guard.id = nativeSetTimeout(() => {
+    SetPrototypeDelete(guard.set, guard);
+    controller.abort(budgetExpired());
+  }, remaining);
+  SetPrototypeAdd(set, guard);
+  return guard;
 }
 
 // End every outbound call still bounded by the budget when the invocation
@@ -529,8 +541,14 @@ function boundedByExecutionBudget(callerSignal) {
 // the handler never awaited -- closes its socket, so no outbound call outlives
 // the request that made it.
 function sweepBudgetTimers() {
+  return sweepGuardSet(budgetGuards);
+}
+
+// End every outbound call filed in one set. Written apart from the sweep above
+// because a response stream owns a set of its own and is released the same way.
+function sweepGuardSet(set) {
   let swept = 0;
-  for (const guard of new SafeSetIterator(budgetGuards)) {
+  for (const guard of new SafeSetIterator(set)) {
     nativeClearTimeout(guard.id);
     try {
       guard.controller.abort(budgetExpired());
@@ -540,7 +558,7 @@ function sweepBudgetTimers() {
     }
     swept++;
   }
-  SetPrototypeClear(budgetGuards);
+  SetPrototypeClear(set);
   return swept;
 }
 
@@ -580,26 +598,142 @@ const nativeClearInterval = timers.clearInterval;
 
 function setInterval(callback, delay, ...args) {
   const id = nativeSetInterval(callback, delay, ...args);
-  SetPrototypeAdd(liveIntervals, id);
+  SetPrototypeAdd(ownedIntervals(), id);
   return id;
 }
 
 function clearInterval(id) {
   nativeClearInterval(id);
   SetPrototypeDelete(liveIntervals, id);
+  if (entryOwner !== null) SetPrototypeDelete(entryOwner.intervals, id);
 }
 
 // Stop every interval still running and say how many there were, so the
 // caller can tell the application it left something behind.
 function sweepIntervals() {
+  return sweepIntervalSet(liveIntervals);
+}
+
+function sweepIntervalSet(set) {
   let swept = 0;
-  for (const id of new SafeSetIterator(liveIntervals)) {
+  for (const id of new SafeSetIterator(set)) {
     nativeClearInterval(id);
     swept++;
   }
-  SetPrototypeClear(liveIntervals);
+  SetPrototypeClear(set);
   return swept;
 }
+
+// ---------------------------------------------------------------------------
+// Who owns an outbound call or an interval
+// ---------------------------------------------------------------------------
+//
+// Everywhere else in this runtime, "as long as the request" is the answer, and
+// the two sweeps above are how it is kept: whatever a stretch of application
+// code left running is ended when that stretch ends.
+//
+// A response stream is the one thing that outlives the stretch that created it.
+// Its head has already gone to the client and its body is still being produced,
+// by code that legitimately holds the `fetch` it is copying from and the
+// interval that paces it. Sweeping those when the handler returned would cut
+// the stream's own source out from under it; leaving them in the shared sets
+// would mean the *next* request to this application sweeps them instead, which
+// is worse -- the failure would then depend on somebody else's traffic.
+//
+// So a stream takes ownership. `adopt` moves everything the handler still has
+// open into sets of the stream's own; `enter` points new entries at those sets;
+// `release` ends all of it when the stream does. `entryOwner` is `null` --
+// "the stretch running now owns it" -- on every path that existed before
+// streams did.
+//
+// `enter` is sticky, and that is the part worth reading twice. `js/runtime.js`
+// calls it immediately before each step of a stream's producer, and *nothing*
+// clears it except the start of the next armed stretch (`leave`, called at the
+// top of an invocation and of its `waitUntil` tail). It has to be sticky: a
+// producer's own code runs inside the `await` that follows `enter`, and its
+// continuations run in microtasks after that await has returned, so an owner
+// cleared on the way out of one step would leave the `fetch` a producer starts
+// in the next one filed in the shared set -- where the next request to this
+// application would sweep it.
+//
+// The cost of sticky is an attribution that can be off by one *stream*: while
+// two streams of the same application are producing at once, work one of them
+// starts outside its own step is filed against whichever stream stepped last.
+// Both are streams of this application and both are bounded by their own
+// budgets, so the entry is still swept, just possibly a little early or a
+// little late. What cannot happen -- and is the thing this whole section is
+// for -- is a producer's outbound call being swept by somebody else's request.
+let entryOwner = null;
+
+function ownedGuards() {
+  return entryOwner === null ? budgetGuards : entryOwner.guards;
+}
+
+function ownedIntervals() {
+  return entryOwner === null ? liveIntervals : entryOwner.intervals;
+}
+
+// Re-arm one owner's outbound calls against the budget now in force.
+//
+// A call the handler started was bounded by the *request's* deadline, which is
+// spent by the time the head has gone out. Left alone it would abort the
+// upstream feeding the stream some tens of seconds in, mid-body, for no fault:
+// `return new Response(upstream.body)` is exactly the shape this is for.
+// `runtime/isolate.rs` publishes the stream's own deadline before calling
+// `adopt`, so what `op_deis_fetch_budget_ms` answers here is the stream's.
+function rearmGuards(owner) {
+  const remaining = op_deis_fetch_budget_ms();
+  for (const guard of new SafeSetIterator(owner.guards)) {
+    nativeClearTimeout(guard.id);
+    if (remaining <= 0) {
+      SetPrototypeDelete(owner.guards, guard);
+      try {
+        guard.controller.abort(budgetExpired());
+      } catch (_) {
+        // Nothing here may become the error the stream reports.
+      }
+      continue;
+    }
+    guard.id = nativeSetTimeout(() => {
+      SetPrototypeDelete(guard.set, guard);
+      guard.controller.abort(budgetExpired());
+    }, remaining);
+  }
+}
+
+const streamScope = ObjectFreeze({
+  // Hand everything the stretch that just ran still has open to a new owner,
+  // and put its outbound calls on the stream's clock.
+  adopt() {
+    const owner = { guards: new SafeSet(), intervals: new SafeSet() };
+    for (const guard of new SafeSetIterator(budgetGuards)) {
+      guard.set = owner.guards;
+      SetPrototypeAdd(owner.guards, guard);
+    }
+    SetPrototypeClear(budgetGuards);
+    for (const id of new SafeSetIterator(liveIntervals)) {
+      SetPrototypeAdd(owner.intervals, id);
+    }
+    SetPrototypeClear(liveIntervals);
+    rearmGuards(owner);
+    return owner;
+  },
+  enter(owner) {
+    entryOwner = owner;
+  },
+  leave() {
+    entryOwner = null;
+  },
+  // End everything this stream held, and say how much there was.
+  //
+  // The owner is cleared if it is still the one in force: filing anything into
+  // a released set would leave it with nothing to sweep it, which is the leak
+  // this whole section exists to prevent.
+  release(owner) {
+    if (entryOwner === owner) entryOwner = null;
+    return sweepGuardSet(owner.guards) + sweepIntervalSet(owner.intervals);
+  },
+});
 
 // ---------------------------------------------------------------------------
 // The clock, and what this platform calls itself
@@ -846,6 +980,13 @@ ObjectDefineProperties(globalThis, {
   // running past the request that started it.
   __deis_runtime_sweep_intervals: propSealedNonEnumerable(sweepIntervals),
   __deis_runtime_sweep_fetch_budgets: propSealedNonEnumerable(sweepBudgetTimers),
+
+  // How a response stream keeps hold of the outbound call and the interval
+  // that feed it for as long as its body is being written, instead of losing
+  // them to the sweep that ends the request. Sealed for the same reason the
+  // sweeps are: an application that could replace it would keep work running
+  // on a runtime thread no request of its own still owns.
+  __deis_runtime_stream_scope: propSealedNonEnumerable(streamScope),
 
   // The event classes `js/runtime.js` builds its WebSocket events out of.
   // That file runs through `execute_script`, so it cannot import from

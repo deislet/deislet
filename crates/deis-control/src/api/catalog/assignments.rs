@@ -110,6 +110,19 @@ pub struct AssignmentView {
     /// there until the next deployment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limits: Option<crate::catalog::DeclaredLimits>,
+    /// Which day's platform this version was written against, exactly as the
+    /// `ApplyDeployment` push carries it: the manifest's own words, not this
+    /// control plane's resolution of them. Each build answers the declaration
+    /// with its own table - see `DeploymentPayload::compatibility` for why a
+    /// resolved list would be lossy.
+    ///
+    /// Always present, including for a version that declares nothing: an
+    /// application with no date is a complete answer ("the oldest behaviour"),
+    /// and leaving the field out would make it indistinguishable from a
+    /// control plane too old to have an opinion - at which point a restarting
+    /// node would have to guess, which is the one thing this field exists to
+    /// stop.
+    pub compatibility: crate::catalog::DeclaredCompatibility,
 }
 
 /// GET /api/nodes/:id/assignments
@@ -148,8 +161,16 @@ pub async fn for_node(
         // this answer with the reason said out loud. The node then simply
         // does not run it, which is the same outcome a refused deployment
         // has, rather than running it with a hole in its environment.
-        let (env, limits) = match state.deliverer.assignment_payload(assignment, &base).await {
-            Ok(payload) => (payload.env_for_wire(), payload.limits.clone()),
+        let (env, limits, compatibility) = match state
+            .deliverer
+            .assignment_payload(assignment, &base)
+            .await
+        {
+            Ok(payload) => (
+                payload.env_for_wire(),
+                payload.limits.clone(),
+                payload.compatibility,
+            ),
             Err(e) => {
                 error!(
                     node = %node_id,
@@ -176,6 +197,7 @@ pub async fn for_node(
             bundle_sha: assignment.bundle_sha.clone(),
             env,
             limits,
+            compatibility,
         });
     }
 

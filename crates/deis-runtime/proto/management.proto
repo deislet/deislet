@@ -152,6 +152,40 @@ message ApplyDeploymentRequest {
     // are, and the same values reach a restarting node through
     // GET /api/nodes/{node_id}/assignments.
     ResourceLimits limits = 7;
+
+    // Which day's platform this version was written against, as its bundle
+    // manifest declares it.
+    //
+    // Absent means the application declares nothing and is held to the oldest
+    // behaviour this platform has - see
+    // deis_bundle::compatibility::CompatibilityProfile::resolve for why that
+    // is the safe direction and what it costs.
+    //
+    // The node checks this before it downloads anything: a node whose build is
+    // older than the date named here cannot give the application the answers
+    // it asked for, and refuses the deployment rather than serving it
+    // different semantics in silence. The bundle's own manifest carries the
+    // same declaration and is the authority once the bundle is unpacked; this
+    // copy is what lets the refusal happen before a megabyte is fetched, and
+    // what a restarting node reads out of
+    // GET /api/nodes/{node_id}/assignments.
+    CompatibilityDeclaration compatibility = 8;
+}
+
+// A version's compatibility declaration, exactly as its manifest spells it.
+//
+// Not the resolved answers: the node resolves the date and the flags against
+// its own copy of the behaviour table, so that a node and the control plane
+// can be on different builds and each say what it can honour.
+message CompatibilityDeclaration {
+    // Calendar day as YYYY-MM-DD. Empty means the manifest names no date,
+    // which the receiver reads as "the oldest behaviour".
+    string date = 1;
+
+    // Behaviours taken early or held back by name, from
+    // deis_bundle::compatibility::FLAGS. A name the receiver does not know is
+    // a refusal, never something to ignore.
+    repeated string flags = 2;
 }
 
 // Apply deployment response
