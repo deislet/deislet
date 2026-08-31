@@ -7,16 +7,27 @@
 //! an application can reach its own data; this endpoint hands the same token
 //! to a person, which is what makes the three CLI commands usable at all.
 //!
-//! # Why the deploy credential is enough
+//! # Why this route has a verb of its own
 //!
-//! Minting here grants no authority the caller did not already have: whoever
-//! can deploy code into an application can read and write that application's
-//! data anyway, by deploying a handler that does it. What a token does change
-//! is the blast radius of a leaked credential - it is usable directly against
-//! deis-store, without going through this process at all, and it does not
-//! expire. So it is gated exactly as the deploy path is gated (the API-key
-//! layer this router is mounted behind, then the app and environment having
-//! to exist), and every mint is logged.
+//! Minting here grants no authority a deploy credential could not reach on
+//! its own: whoever can put code into an application can read and write that
+//! application's data anyway, by deploying a handler that does it. What a
+//! token changes is the blast radius of a leaked credential - it is usable
+//! directly against deis-store, without passing through this process again,
+//! and it does not expire.
+//!
+//! So it answers to [`crate::identity::Verb::Storage`], which no other verb
+//! implies, over a scope that has to name this exact application and this
+//! exact environment: `storage:myapp/production` reaches it and
+//! `storage:myapp/*` cannot be written down at all. A credential carrying
+//! `deploy:*/*` is refused here. The one credential that still gets through
+//! without naming the tenant is an unscoped one - a configuration-file
+//! `api_keys` entry, or the bootstrap token - because those are root by
+//! definition and are exactly what the scope model asks an operator to
+//! retire.
+//!
+//! Every mint is recorded in the audit log whatever its outcome, because what
+//! it hands back is a credential; see [`crate::api::authz`].
 //!
 //! # Why a missing secret is refused rather than answered with nothing
 //!
@@ -32,16 +43,15 @@
 use std::net::SocketAddr;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{ConnectInfo, Path, State},
-    http::HeaderMap,
 };
 use serde::Serialize;
 use tracing::{info, warn};
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::caller_description;
+use crate::identity::Principal;
 
 /// What a caller needs in order to act as one tenant of deis-store.
 ///
@@ -70,11 +80,18 @@ pub async fn storage_token(
     State(state): State<CatalogState>,
     Path((app_id, env_name)): Path<(String, String)>,
     peer: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
+    // Resolved by [`crate::api::authz::authorize`], which is the only thing
+    // that mounts this route. It is taken here rather than re-derived from
+    // the headers so that this line and the audit row name the same account
+    // and the same credential; deriving it twice is how the two would drift.
+    Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<StorageTokenResponse>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
     let tenant = deis_wire::conventions::tenant_id(&app_id, &env.name);
-    let caller = caller_description(&headers, peer.map(|ConnectInfo(addr)| addr));
+    let caller = match peer {
+        Some(ConnectInfo(addr)) => format!("{} from {addr}", principal.label()),
+        None => format!("{} from an unknown address", principal.label()),
+    };
 
     let Some(store_endpoint) = state.storage.store.clone() else {
         warn!(
@@ -106,10 +123,12 @@ pub async fn storage_token(
         )));
     };
 
-    // The audit trail. This platform has no accounts yet, so this line is
-    // the only record of who was handed a credential that works directly
-    // against deis-store, for how long that data lives - keep it, and keep
-    // it at info, until there are accounts to attribute a mint to instead.
+    // The mint is also a row in the audit log, written by the gate that let
+    // this call through (action `storage_token.mint`, recorded whatever the
+    // outcome). This line is here as well because it is the one an operator
+    // finds while reading the control plane's log for something else, and
+    // what was handed out - a credential that talks to deis-store directly
+    // and does not expire - is worth meeting twice.
     info!(
         app_id = %app_id,
         environment = %env.name,

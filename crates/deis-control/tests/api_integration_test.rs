@@ -333,6 +333,194 @@ async fn the_node_endpoints_take_the_node_key_and_the_api_key_takes_everything_e
     assert_eq!(register(Some("node-psk")).await, StatusCode::OK);
 }
 
+/// Accounts, tokens and the audit log on the router the binary actually
+/// assembles - not on a test router that mounts the same handlers.
+///
+/// What this is here to catch is the defect this repository keeps producing:
+/// a feature written, tested and registered, and then reachable from nowhere.
+/// Every claim below is made through `build_api_router`, so a route that was
+/// declared in the wrong place, or an authorisation gate that was layered
+/// around the wrong half of the router, fails here rather than in production.
+#[tokio::test]
+async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    // The shape of an installation that existed before accounts did: the
+    // requirement is on, and one flat key in the configuration file.
+    let config = ControlConfig {
+        api_auth_enabled: true,
+        api_keys: vec!["the-operators-old-key".to_string()],
+        node_preshared_keys: vec!["node-psk".to_string()],
+        ..Default::default()
+    };
+    let database = Arc::new(Database::init(":memory:").await.unwrap());
+    let sessions = Arc::new(SessionManager::new());
+    let config_manager = Arc::new(ConfigManager::new(
+        Arc::clone(&database),
+        Arc::clone(&sessions),
+    ));
+    let command_executor = Arc::new(CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&database),
+    ));
+    let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+    let api = deis_control::api::build_api_router(
+        sessions,
+        Arc::clone(&database),
+        config_manager,
+        command_executor,
+        metrics_collector,
+        Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
+        Arc::new(config),
+    );
+    // The same startup step the binary runs: it is what files the flat key
+    // where `deis token list` can show it.
+    deis_control::api::announce_authorization(&api.authz).await;
+
+    let call = |method: &str, uri: &str, credential: Option<&str>, body: &str| {
+        let router = api.router.clone();
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(credential) = credential {
+            builder = builder.header("Authorization", format!("Bearer {credential}"));
+        }
+        let request = builder.body(Body::from(body.to_string())).unwrap();
+        async move {
+            let response = router.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, value)
+        }
+    };
+
+    const OLD_KEY: &str = "the-operators-old-key";
+
+    // The flat key is listed, and listed as unscoped: that count is what an
+    // operator drives to zero.
+    let (status, listed) = call("GET", "/api/tokens", Some(OLD_KEY), "").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["unscoped"], 1);
+    assert_eq!(listed["tokens"][0]["origin"], "config");
+
+    // An account and a token for one environment of one application.
+    let (status, account) = call(
+        "POST",
+        "/api/accounts",
+        Some(OLD_KEY),
+        r#"{"name":"ci","role":"deployer"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{account}");
+    assert_eq!(account["role"], "deployer");
+
+    let (status, minted) = call(
+        "POST",
+        "/api/accounts/ci/tokens",
+        Some(OLD_KEY),
+        r#"{"name":"preview-pipeline","scopes":["deploy:demo/preview"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{minted}");
+    let secret = minted["secret"].as_str().unwrap().to_string();
+    let token_id = minted["token"]["id"].as_str().unwrap().to_string();
+    assert_eq!(minted["token"]["scopes"], "deploy:demo/preview");
+
+    // The secret exists in that one response and nowhere else: a listing
+    // afterwards must not carry it.
+    let (_, listed) = call("GET", "/api/tokens", Some(OLD_KEY), "").await;
+    assert!(
+        !listed.to_string().contains(&secret),
+        "a token listing must never carry a credential"
+    );
+
+    // What the scoped token may do, and what it may not, on the real router.
+    let (status, _) = call("POST", "/api/apps", Some(&secret), r#"{"id":"demo"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a CI credential creates its own app"
+    );
+
+    let (status, refused) = call(
+        "POST",
+        "/api/apps",
+        Some(&secret),
+        r#"{"id":"someone-elses"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        refused["details"]
+            .as_str()
+            .unwrap()
+            .contains("deploy:someone-elses"),
+        "{refused}"
+    );
+
+    for uri in ["/api/audit", "/api/tokens", "/api/accounts"] {
+        let (status, _) = call("GET", uri, Some(&secret), "").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{uri} is an administrator's, and this token is a deployer's"
+        );
+    }
+
+    // Revoked, and refused from the very next request - with no cache to
+    // expire and nothing to restart.
+    let (status, _) = call(
+        "DELETE",
+        &format!("/api/tokens/{token_id}"),
+        Some(OLD_KEY),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("GET", "/api/apps/demo", Some(&secret), "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // And all of it is on the record, readable through the route the CLI
+    // reads: the application that was created, the refusal, and the mint.
+    let (status, log) = call("GET", "/api/audit?limit=100", Some(OLD_KEY), "").await;
+    assert_eq!(status, StatusCode::OK, "{log}");
+    let actions: Vec<&str> = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["action"].as_str().unwrap())
+        .collect();
+    for expected in ["account.create", "token.mint", "token.revoke", "app.create"] {
+        assert!(
+            actions.contains(&expected),
+            "{expected} is missing: {actions:?}"
+        );
+    }
+
+    let refusal = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["outcome"] == "refused" && entry["action"] == "app.create")
+        .expect("the refused app.create has to be on the record");
+    assert_eq!(refusal["app_id"], "someone-elses");
+    assert_eq!(refusal["actor_account"], "ci");
+    assert_eq!(refusal["status"], 403);
+
+    // There is no way to take a line back out. Not for the unscoped key
+    // either, which is the most powerful credential this control plane has.
+    let before = log["entries"].as_array().unwrap().len();
+    let (status, _) = call("DELETE", "/api/audit", Some(OLD_KEY), "").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (_, after) = call("GET", "/api/audit?limit=100", Some(OLD_KEY), "").await;
+    assert!(after["entries"].as_array().unwrap().len() >= before);
+}
+
 /// The Restart button's whole round trip, in the shape the dashboard sends
 /// it. It used to post `{command_type: 'custom', command_data: ...}`, which
 /// the control plane could not deserialize at all: the command never reached

@@ -1,3 +1,5 @@
+pub mod account;
+pub mod audit;
 pub mod blob;
 pub mod build;
 pub mod config;
@@ -10,6 +12,7 @@ pub mod logs;
 pub mod rollback;
 pub mod secret;
 pub mod status;
+pub mod token;
 pub mod trace;
 pub mod validate;
 pub mod versions;

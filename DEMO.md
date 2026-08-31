@@ -358,6 +358,11 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
   「认证正常工作」一模一样。真人存自己那把 key 用 `deis config set control.token`；
   演示不能用文件，因为端口和密钥都是启动那一刻才定的。节点与 deis-proxy 走的是另一
   条通道（`node_preshared_keys`），`api_auth_enabled` 管不着它
+- 那把现场生成的 key 是**无作用域**的，也就是升级前的老写法：能做任何事。`verify`
+  里「accounts, scopes and the audit log」那一组会在它旁边建账号、铸几把带作用域的
+  token（`deploy:demo/preview`、`storage:demo/production` 之类），拿它们去撞该撞的
+  墙，再把结果读回审计日志。这些账号和 token 留在演示自己的 `deis-control.db` 里，
+  `deis account list` / `deis token list` / `deis audit` 可以直接翻
 - 出网只开了上游那一个地址（`[fetch] allow`）。想让示例应用够到别处，加
   `--deis-origin-port` 换端口或者自己改节点配置里的这一行；平台自己那几个服务地址
   改不动——它们在 allow 之后再被拒一次

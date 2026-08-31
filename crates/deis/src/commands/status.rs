@@ -12,6 +12,7 @@ use anyhow::Result;
 use colored::Colorize;
 
 use crate::commands::Session;
+use crate::platform::EnvironmentView;
 use crate::platform::{Node, NodeAppStatus};
 use crate::render::{Output, Table, age, short_digest, timestamp};
 use crate::settings::Overrides;
@@ -42,6 +43,8 @@ pub async fn execute(app: Option<String>, output: Output) -> Result<()> {
     let environments = session.control.list_environments(&app).await?;
     let mut deployed = Vec::new();
     for environment in &environments {
+        // A credential scoped to one environment is refused the others, and
+        // that is a row in the report rather than the end of the command.
         let current = session
             .control
             .current_deployment(&app, &environment.name)
@@ -62,8 +65,9 @@ pub async fn execute(app: Option<String>, output: Output) -> Result<()> {
             "environments": deployed
                 .iter()
                 .map(|(name, current)| match current {
-                    Some(deployment) => serde_json::json!({
+                    EnvironmentView::Running(deployment) => serde_json::json!({
                         "name": name,
+                        "visible": true,
                         "deployed": true,
                         "version_number": deployment.version.number,
                         "version_id": deployment.version.id,
@@ -71,7 +75,16 @@ pub async fn execute(app: Option<String>, output: Output) -> Result<()> {
                         "deployed_at": deployment.deployment.created_at,
                         "note": deployment.deployment.note,
                     }),
-                    None => serde_json::json!({ "name": name, "deployed": false }),
+                    EnvironmentView::NeverDeployed => serde_json::json!({
+                        "name": name, "visible": true, "deployed": false
+                    }),
+                    // Said as its own field rather than folded into
+                    // "deployed": false, because "nothing runs there" and "I
+                    // am not allowed to know" are different answers and a
+                    // script acting on the first must not act on the second.
+                    EnvironmentView::NotPermitted => serde_json::json!({
+                        "name": name, "visible": false
+                    }),
                 })
                 .collect::<Vec<_>>(),
             "nodes": reports
@@ -108,7 +121,7 @@ pub async fn execute(app: Option<String>, output: Output) -> Result<()> {
     Ok(())
 }
 
-fn print_environments(deployed: &[(String, Option<crate::platform::DeploymentResponse>)]) {
+fn print_environments(deployed: &[(String, EnvironmentView)]) {
     println!("\n{}", "Environments".bold());
     if deployed.is_empty() {
         println!(
@@ -128,7 +141,7 @@ fn print_environments(deployed: &[(String, Option<crate::platform::DeploymentRes
     ]);
     for (name, current) in deployed {
         match current {
-            Some(deployment) => table.row(vec![
+            EnvironmentView::Running(deployment) => table.row(vec![
                 name.clone(),
                 deployment.version.number.to_string(),
                 short_digest(&deployment.version.bundle_sha),
@@ -140,11 +153,22 @@ fn print_environments(deployed: &[(String, Option<crate::platform::DeploymentRes
                     .clone()
                     .unwrap_or_else(|| "-".to_string()),
             ]),
-            None => table.row(vec![
+            EnvironmentView::NeverDeployed => table.row(vec![
                 name.clone(),
                 "-".to_string(),
                 "-".to_string(),
                 "never deployed".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+            ]),
+            // Not "never deployed": this environment may well be running
+            // something, and what is missing is the authority to look. The
+            // row is kept so the reader can see the environment exists.
+            EnvironmentView::NotPermitted => table.row(vec![
+                name.clone(),
+                "-".to_string(),
+                "-".to_string(),
+                "not visible to this credential".to_string(),
                 "-".to_string(),
                 "-".to_string(),
             ]),

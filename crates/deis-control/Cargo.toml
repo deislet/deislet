@@ -29,7 +29,14 @@ prost = "0.13"
 tokio-stream = "0.1"
 
 # Database
-rusqlite = { workspace = true }
+# `fallible_uint` because several queries here bind a `usize` - a row limit, a
+# retention count - and rusqlite only implements `ToSql` for it behind that
+# feature. Every workspace build already turned it on, because the runtime's
+# deno dependencies ask for it, so this changes nothing at runtime; what it
+# fixes is that `cargo build -p deis-control` on its own used to fail with
+# "the trait bound `usize: ToSql` is not satisfied" in code that had compiled
+# for months.
+rusqlite = { workspace = true, features = ["fallible_uint"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

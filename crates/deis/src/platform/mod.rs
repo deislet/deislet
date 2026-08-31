@@ -164,6 +164,26 @@ pub struct StorageCredentials {
     pub token: Option<String>,
 }
 
+/// What this credential can see of one environment's current deployment.
+///
+/// A token scoped to one environment of an application can list that
+/// application's environments and is refused a look at the others, so "I may
+/// not see this one" is an ordinary answer here rather than a failure of the
+/// whole command. `deis status` and `deis versions` walk every environment an
+/// application has, and both would stop at the first refusal if this were an
+/// error; instead they print what the credential can see and say which rows
+/// it cannot.
+#[derive(Debug, Clone)]
+pub enum EnvironmentView {
+    /// It runs this version. Boxed because it is much larger than the other
+    /// two variants and every caller holds a list of these.
+    Running(Box<DeploymentResponse>),
+    /// It exists and has never been deployed. A state, not an error.
+    NeverDeployed,
+    /// The credential in hand does not reach this environment.
+    NotPermitted,
+}
+
 /// One runtime node as the control plane knows it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Node {
@@ -200,6 +220,114 @@ pub struct NodeAppStatus {
 pub struct NodeStatusResponse {
     #[serde(default)]
     pub apps: Vec<NodeAppStatus>,
+}
+
+/// One account, as the control plane records it.
+///
+/// The role is the ceiling on everything this account's tokens may do, so it
+/// is the first thing a listing shows: a token can only ever be narrower.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Account {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: i64,
+    /// Set while the account is switched off. Its tokens are refused and not
+    /// revoked, so switching it back on restores exactly those credentials.
+    #[serde(default)]
+    pub disabled_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountsResponse {
+    pub accounts: Vec<Account>,
+}
+
+/// One credential, as a listing shows it. There is deliberately no field a
+/// secret could arrive in: the control plane stores a digest and has no
+/// endpoint that reads a token back.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApiToken {
+    pub id: String,
+    pub account: String,
+    pub name: String,
+    /// `minted` for a token this control plane issued, `config` for an
+    /// `api_keys` entry in its configuration file.
+    pub origin: String,
+    /// The scope list, or the word `unscoped`.
+    pub scopes: String,
+    /// True when this credential answers to no scope at all - the old flat
+    /// key. Read as a field rather than by recognising the word above.
+    #[serde(default)]
+    pub unscoped: bool,
+    pub created_at: i64,
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+    #[serde(default)]
+    pub revoked_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokensResponse {
+    pub tokens: Vec<ApiToken>,
+    /// How many of them are unscoped, counted by the control plane so every
+    /// reader gets the same number.
+    #[serde(default)]
+    pub unscoped: usize,
+}
+
+/// What minting a token answers. The only message in this protocol that
+/// carries a credential.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MintedToken {
+    pub token: ApiToken,
+    pub secret: String,
+}
+
+/// One line of the audit log.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub at: i64,
+    pub actor_kind: String,
+    #[serde(default)]
+    pub actor_account: Option<String>,
+    #[serde(default)]
+    pub actor_credential: Option<String>,
+    pub action: String,
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub peer: Option<String>,
+    pub outcome: String,
+    pub status: i64,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditResponse {
+    pub entries: Vec<AuditEntry>,
+}
+
+/// What `deis audit` is asking for. Every field is optional and they are
+/// combined with "and", which is how an operator narrows a log down to the
+/// one thing they are chasing.
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    pub app: Option<String>,
+    pub environment: Option<String>,
+    pub account: Option<String>,
+    pub action: Option<String>,
+    pub outcome: Option<String>,
+    pub since: Option<i64>,
+    pub limit: Option<usize>,
 }
 
 /// A client for one control plane.
@@ -283,9 +411,16 @@ impl Control {
         };
 
         let advice = match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => match self.token.is_some() {
-                true => "\nThe credential this CLI sent was refused. Store the right one with \
-                         `deis config set control.token <value>`."
+            // 401 and 403 are different problems and lead to different next
+            // steps, so they are not one arm: the first is a credential that
+            // does not work at all, the second is one that works and does not
+            // reach this far. The control plane's own message already names
+            // the scope that would have been enough, so this only says who to
+            // ask.
+            StatusCode::UNAUTHORIZED => match self.token.is_some() {
+                true => "\nThe credential this CLI sent was refused: it is unknown to this \
+                         control plane, or it was revoked, or its account is switched off. Store \
+                         a working one with `deis config set control.token <value>`."
                     .to_string(),
                 false => format!(
                     "\nNo credential was sent. Store one with `deis config set control.token \
@@ -293,6 +428,11 @@ impl Control {
                     crate::settings::ENV_CONTROL_TOKEN
                 ),
             },
+            StatusCode::FORBIDDEN => "\nThis credential works and is not allowed to do that. Ask \
+                                      an owner of the platform for a token carrying the scope \
+                                      named above (`deis token create`), or for a wider role on \
+                                      your account."
+                .to_string(),
             StatusCode::NOT_FOUND => {
                 // Every 404 this CLI can provoke means the same thing: it
                 // named an application, environment or version the catalog
@@ -482,13 +622,13 @@ impl Control {
         .await
     }
 
-    /// The version an environment currently points at. `None` when it has
-    /// never been deployed, which is a state and not an error.
+    /// The version an environment currently points at, or why this credential
+    /// cannot say.
     pub async fn current_deployment(
         &self,
         app_id: &str,
         environment: &str,
-    ) -> Result<Option<DeploymentResponse>> {
+    ) -> Result<EnvironmentView> {
         let response = self
             .request(
                 Method::GET,
@@ -498,7 +638,13 @@ impl Control {
             .await
             .map_err(|e| self.transport_error(e))?;
         if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
+            return Ok(EnvironmentView::NeverDeployed);
+        }
+        // Not an error: a credential scoped to one environment is *meant* to
+        // be refused the others, and a command that walks every environment
+        // of an application must be able to say so rather than stop.
+        if response.status() == StatusCode::FORBIDDEN {
+            return Ok(EnvironmentView::NotPermitted);
         }
         let status = response.status();
         let body = response.bytes().await.unwrap_or_default();
@@ -509,9 +655,10 @@ impl Control {
                 &format!("reading what {environment} of app {app_id} runs")
             ));
         }
-        Ok(Some(serde_json::from_slice(&body).with_context(|| {
-            format!("reading what {environment} of app {app_id} runs")
-        })?))
+        Ok(EnvironmentView::Running(Box::new(
+            serde_json::from_slice(&body)
+                .with_context(|| format!("reading what {environment} of app {app_id} runs"))?,
+        )))
     }
 
     // ---- secrets ------------------------------------------------------
@@ -595,6 +742,127 @@ impl Control {
             &format!("obtaining a storage capability token for {environment} of app {app_id}"),
         )
         .await
+    }
+
+    // ---- accounts, tokens and the audit log ---------------------------
+
+    pub async fn list_accounts(&self) -> Result<Vec<Account>> {
+        let response: AccountsResponse = self
+            .send(
+                self.request(Method::GET, "/api/accounts"),
+                "listing the accounts",
+            )
+            .await?;
+        Ok(response.accounts)
+    }
+
+    pub async fn create_account(&self, name: &str, role: &str) -> Result<Account> {
+        self.send(
+            self.request(Method::POST, "/api/accounts")
+                .json(&serde_json::json!({ "name": name, "role": role })),
+            &format!("creating account {name}"),
+        )
+        .await
+    }
+
+    /// Change an account's role, switch it off, or switch it back on. Every
+    /// argument that is `None` leaves that half alone.
+    pub async fn update_account(
+        &self,
+        name: &str,
+        role: Option<&str>,
+        disabled: Option<bool>,
+    ) -> Result<Account> {
+        let mut body = serde_json::Map::new();
+        if let Some(role) = role {
+            body.insert("role".to_string(), serde_json::json!(role));
+        }
+        if let Some(disabled) = disabled {
+            body.insert("disabled".to_string(), serde_json::json!(disabled));
+        }
+        self.send(
+            self.request(Method::PATCH, &format!("/api/accounts/{name}"))
+                .json(&serde_json::Value::Object(body)),
+            &format!("updating account {name}"),
+        )
+        .await
+    }
+
+    /// Mint a token. The secret in the answer is the only copy that will ever
+    /// exist; the control plane keeps a digest and cannot show it again.
+    ///
+    /// `scopes` empty means "the account's role over every application",
+    /// which is what the control plane fills in; `unscoped` asks for the old
+    /// flat behaviour and is refused together with a scope list.
+    pub async fn create_token(
+        &self,
+        account: &str,
+        name: &str,
+        scopes: &[String],
+        unscoped: bool,
+    ) -> Result<MintedToken> {
+        let mut body = serde_json::Map::new();
+        body.insert("name".to_string(), serde_json::json!(name));
+        if unscoped {
+            body.insert("unscoped".to_string(), serde_json::json!(true));
+        } else if !scopes.is_empty() {
+            body.insert("scopes".to_string(), serde_json::json!(scopes));
+        }
+        self.send(
+            self.request(Method::POST, &format!("/api/accounts/{account}/tokens"))
+                .json(&serde_json::Value::Object(body)),
+            &format!("minting a token for account {account}"),
+        )
+        .await
+    }
+
+    /// Every credential the control plane knows about, and how many of them
+    /// answer to no scope at all.
+    pub async fn list_tokens(
+        &self,
+        account: Option<&str>,
+        include_revoked: bool,
+    ) -> Result<TokensResponse> {
+        let mut path = format!("/api/tokens?include_revoked={include_revoked}");
+        if let Some(account) = account {
+            path.push_str(&format!("&account={account}"));
+        }
+        self.send(self.request(Method::GET, &path), "listing the tokens")
+            .await
+    }
+
+    pub async fn revoke_token(&self, id: &str) -> Result<ApiToken> {
+        self.send(
+            self.request(Method::DELETE, &format!("/api/tokens/{id}")),
+            &format!("revoking token {id}"),
+        )
+        .await
+    }
+
+    pub async fn read_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>> {
+        let mut query: Vec<String> = Vec::new();
+        let mut push = |key: &str, value: Option<String>| {
+            if let Some(value) = value {
+                query.push(format!("{key}={value}"));
+            }
+        };
+        push("app", filter.app.clone());
+        push("environment", filter.environment.clone());
+        push("account", filter.account.clone());
+        push("action", filter.action.clone());
+        push("outcome", filter.outcome.clone());
+        push("since", filter.since.map(|s| s.to_string()));
+        push("limit", filter.limit.map(|l| l.to_string()));
+
+        let path = if query.is_empty() {
+            "/api/audit".to_string()
+        } else {
+            format!("/api/audit?{}", query.join("&"))
+        };
+        let response: AuditResponse = self
+            .send(self.request(Method::GET, &path), "reading the audit log")
+            .await?;
+        Ok(response.entries)
     }
 
     // ---- nodes --------------------------------------------------------

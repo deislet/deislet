@@ -127,12 +127,17 @@ pub async fn execute(app: Option<String>, limit: usize, output: Output) -> Resul
 /// Which version each environment of this application currently points at.
 ///
 /// An environment that has never been deployed simply contributes nothing;
-/// that is a state, not a failure, and it shows up as an empty column.
+/// that is a state, not a failure, and it shows up as an empty column. So
+/// does one this credential is not allowed to look at - a token scoped to a
+/// single environment sees its own in this column and the others not at all,
+/// rather than having the whole listing fail on the first refusal.
 async fn running_versions(session: &Session, app: &str) -> Result<Vec<(String, String)>> {
+    use crate::platform::EnvironmentView;
+
     let environments = session.control.list_environments(app).await?;
     let mut running = Vec::new();
     for environment in environments {
-        if let Some(deployment) = session
+        if let EnvironmentView::Running(deployment) = session
             .control
             .current_deployment(app, &environment.name)
             .await?

@@ -198,6 +198,12 @@ async fn main() -> Result<(), anyhow::Error> {
             deis_control::api::static_files::serve_fallback,
         ));
 
+    // Before the listener opens: record the configured api_keys so an
+    // operator can see which of their credentials are unscoped, mint a first
+    // owner token if this control plane demands authentication and has none,
+    // and say what the audit log already holds.
+    deis_control::api::announce_authorization(&api.authz).await;
+
     deis_control::api::log_api_ready(
         port,
         api.tls_enabled,

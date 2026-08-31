@@ -101,7 +101,7 @@ assets/                  # 静态资产，原样保留目录结构
   "secrets": ["API_KEY"],
   "routes": [ { "pattern": "/api/users/:id", "methods": ["GET"] } ],
   "cron": [ "0 */6 * * *" ],
-  "queues": [ { "name": "jobs", "batch_size": 10 } ],
+  "queues": [ { "name": "jobs", "batch_size": 10, "max_concurrency": 2 } ],
   "assets": [
     { "path": "index.html", "sha256": "…", "content_type": "text/html", "size": 512 }
   ],
@@ -126,8 +126,9 @@ assets/                  # 静态资产，原样保留目录结构
   文件发一份等于把站点自己的规则公开出去。格式由 `deis-bundle` 的 `site` / `redirects`
   / `headers` 三个模块唯一定义，编译器解析、节点编译成表，两边共用同一份代码。
 - `limits` 是这个应用**要求自己被管得更严**的那几个上限：`memory_mb`、`timeout_ms`、
-  `rate_limit_ops_per_sec`、`cpu_time_limit_ms`、`resource_table_max`，都可省略，省略
-  就是「随节点的默认值」。控制面在上传时解析一次、随部署下发；节点拿到之后对着自己的
+  `rate_limit_ops_per_sec`、`cpu_time_limit_ms`、`resource_table_max`、
+  `max_subrequests`，都可省略，省略就是「随节点的默认值」。`max_subrequests` 数的是一
+  次调用真正打出去的出站连接，重定向每一跳各算一次，出站 WebSocket 花的是同一份额度。控制面在上传时解析一次、随部署下发；节点拿到之后对着自己的
   配置逐字段夹一次，所以这里写得比节点宽的值只会得到节点的值加一条告警。写 `0` 会被
   拒绝而不是当成「没填」——传输格式上 `0` 就是缺省的哨兵值。
 - `routes[].pattern` 用 `:name` 占位，运行时据此填 `context.params`；`methods` 为空数组表示任意方法。字段名与 `management.proto` 的 `RouteRule.pattern` / `RouteRule.methods` 一一对应。
@@ -316,7 +317,14 @@ deis-store 与 deis-queue 按**租户**隔离数据，租户 id 是 `conventions
 
 运行时侧：对 manifest 里声明了 `queues` 的应用，各起一个轮询任务
 （`crates/deis-runtime/src/runtime/queue_consumer.rs`），拉到消息就调应用的 `queue`
-导出，成功 `Ack`、失败 `Nack`。
+导出，成功 `Ack`、失败 `Nack`。清单里的 `max_concurrency` 限的是这个轮询任务同时
+**握着**几个批次（拉下来了、还没结清），不是同时跑几个——一个应用在一个环境里就是一条
+线程上的一个 isolate，处理函数只能一批一批地跑。默认 1，节点上限 8，理由是每个在手的
+批次都在花租约，握太多会让排队等线程的那些批次租约过期、被交给别人做第二遍。
+
+生产侧 `SendBatch` 走同一个 op（`op_queue_send_batch`）：一次分发、一次往返，落库是
+一个事务，所以整批要么都进去、要么一条都没有。一批装多少条由服务端的
+`max_batch_messages` 说了算。
 
 **不要**做成 deis-queue 主动推给节点——那需要队列知道哪个节点跑哪个应用，破坏「哑服务」边界。
 

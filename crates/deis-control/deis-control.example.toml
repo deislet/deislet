@@ -46,7 +46,14 @@ node_preshared_keys = [
 # Enable HTTP API authentication (default: false)
 #
 # Covers the dashboard and the human API: with it on, every endpoint except
-# /health and /api/metrics requires one of the api_keys below.
+# /health and /api/metrics requires a credential - one of the api_keys below,
+# or a token minted with `deis token create` - and each one is checked against
+# the scopes it carries.
+#
+# With it OFF the human API is open to anyone who can reach this port, exactly
+# as it was before there were accounts: accounts and scopes are recorded and
+# not enforced. The audit log is written either way, attributing an
+# unauthenticated call to "anonymous".
 #
 # It does NOT cover the node endpoints, which always use
 # node_preshared_keys - see above. Turning this off makes a dashboard
@@ -57,6 +64,30 @@ api_auth_enabled = true
 # Clients can provide the API Key in either of the following ways:
 # 1. Authorization: Bearer <api_key>
 # 2. X-API-Key: <api_key>
+#
+# Every entry here is UNSCOPED: it may deploy any application, rotate any
+# secret, mint any tenant's storage capability token and delete anything, and
+# an audit line can only name the key rather than a person. That is what a
+# key in this list has always been, and it still is - upgrading changes
+# nothing about them.
+#
+# What to do instead, once the platform is running:
+#
+#   deis account create alice --role owner
+#   deis token create --account alice --scope 'admin:*/*' --scope 'deploy:*/*' laptop
+#   deis account create ci --role deployer
+#   deis token create --account ci --scope 'deploy:myapp/preview' preview-pipeline
+#
+# A minted token is shown once and stored only as a SHA-256, so a copy of the
+# database hands out no working credential. `deis token list` shows every
+# credential including these, marks the unscoped ones and counts them; drive
+# that count to zero by emptying this list. Removing an entry from here
+# revokes it at the next restart - this file is the authority for these keys,
+# and the database only records that they exist.
+#
+# With api_auth_enabled = true and this list empty, a first start mints one
+# owner token and prints it once, so an empty list is a way in rather than a
+# lock-out.
 api_keys = [
     "deis-control-admin-key-1234567890abcdef",      # Admin key
     "deis-control-readonly-key-fedcba0987654321",   # Read-only key (reserved for future use)
@@ -215,6 +246,8 @@ bundle_dir = "data/bundles"
 # 1. Copy this file to deis-control.toml
 # 2. Change node_preshared_keys and api_keys to secure random strings
 # 3. To enable the API key requirement, set api_auth_enabled = true
+# 3a. Then create accounts and scoped tokens with `deis account create` and
+#     `deis token create`, and empty api_keys - see the note above it
 # 4. Start Control: ./deis-control --config deis-control.toml
 #
 # This is the only example configuration for deis-control, matching

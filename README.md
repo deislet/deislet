@@ -70,6 +70,13 @@ evidence for each:
 | the node registered itself with the control plane | and the configured address survived its self-report |
 | a node the configuration never mentioned joins by registering | the fleet gains that id with `source: registered`, not `configured` |
 | `deis status` reports the node actually serving | the catalog's claim and the node's claim, side by side |
+| the `api_keys` entry from the configuration file is listed as unscoped | `deis token list` shows it and counts it, which is how an operator finds the credentials that are still root |
+| a token scoped to one environment deploys there and nowhere else | it re-deploys `preview`, and gets 403 on `production`, on its own environment's secrets, on the audit log and on the credential list |
+| minting a storage token needs that exact tenant written down | `deploy:*/* secrets:*/*` is refused; `storage:demo/production` is served; `storage:*/*` cannot even be created |
+| a revoked token is refused at its next call | and the caller cannot tell it from a token that never existed, while the control plane's log can |
+| the audit log names the secret that was written | its application, environment, author and source address — never the value |
+| a refused call is recorded as fully as an accepted one | with the scope that would have been enough |
+| no caller can erase a line of the audit log | `DELETE /api/audit` is 405 even to the unscoped key, and the line count does not move |
 
 ## The nine components
 

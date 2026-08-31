@@ -265,9 +265,31 @@ pub(crate) mod tests {
             // Both halves, mounted the way the API mounts them: the node
             // half brings its own authentication layer, so a test that
             // calls it is exercising the real check.
-            router: router(state.clone()).merge(node_router(state)),
+            //
+            // The human half is normally mounted behind
+            // `crate::api::authz::authorize`, which resolves the caller and
+            // leaves a `Principal` in the request. These tests are about the
+            // catalog rather than about who may reach it, so the gate is not
+            // in the way - but the principal it would have left has to be,
+            // or a handler that names its caller would fail to extract one.
+            router: router(state.clone())
+                .layer(axum::middleware::from_fn(supply_test_principal))
+                .merge(node_router(state)),
             _bundle_dir: bundle_dir,
         }
+    }
+
+    /// Stand in for the authorisation gate: an unauthenticated caller, which
+    /// is what a control plane with `api_auth_enabled` off resolves every
+    /// request to, and what these tests are.
+    async fn supply_test_principal(
+        mut request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        request
+            .extensions_mut()
+            .insert(crate::identity::Principal::anonymous());
+        next.run(request).await
     }
 
     pub(crate) async fn call(

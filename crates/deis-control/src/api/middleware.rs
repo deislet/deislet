@@ -2,8 +2,11 @@
 //!
 //! Two separate credentials, deliberately never merged:
 //!
-//! * [`AuthConfig`] is the dashboard and human API key. It is governed by
-//!   `api_auth_enabled`, which defaults to off.
+//! * The human API - dashboard and CLI - is guarded by
+//!   [`crate::api::authz::authorize`], which resolves an account, checks the
+//!   scope the route needs and writes the audit line. Whether it enforces
+//!   anything is still `api_auth_enabled`, which defaults to off;
+//!   [`AuthConfig`] is what the startup banner prints about it.
 //! * [`NodeAuthConfig`] is the credential a runtime node already shares with
 //!   the control plane to register (`node_preshared_keys`). It guards the
 //!   endpoints that exist for nodes, and `api_auth_enabled` has no say over
@@ -30,7 +33,12 @@ use tracing::{error, warn};
 
 use crate::config::ControlConfig;
 
-/// API authentication middleware state
+/// What the configuration file says about the human API's credential.
+///
+/// It no longer decides anything by itself: [`crate::api::authz::authorize`]
+/// is the gate, and it resolves an account and a scope list. This is the
+/// summary the startup banner prints - whether authentication is demanded at
+/// all, and how many flat `api_keys` entries the file still carries.
 #[derive(Clone)]
 pub struct AuthConfig {
     pub enabled: bool,
@@ -107,7 +115,7 @@ pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
 ///
 /// Spelled once so the node channel and the human API read a request the
 /// same way; only the list they check against differs.
-fn presented_credentials(headers: &HeaderMap) -> Vec<&str> {
+pub(crate) fn presented_credentials(headers: &HeaderMap) -> Vec<&str> {
     let mut found = Vec::with_capacity(2);
     if let Some(value) = headers
         .get(header::AUTHORIZATION)
@@ -119,38 +127,6 @@ fn presented_credentials(headers: &HeaderMap) -> Vec<&str> {
         found.push(value);
     }
     found
-}
-
-/// How an audit line names the caller of a request.
-///
-/// This platform has no accounts, so there is no name to print. What there is
-/// are two facts worth keeping: which credential was presented and where the
-/// request came from. The credential is reduced to the first bytes of its
-/// SHA-256 rather than printed - enough to tell two keys apart and to match a
-/// line against a key an operator still holds, useless to anyone who reads
-/// the log looking for a way in. Replace this with the account once accounts
-/// exist; until then it is what an audit line has.
-///
-/// `peer` is `None` when the server was built without connect info, which is
-/// why the caller passes an `Option` rather than this reaching for it: an
-/// audit line that failed to render would be worse than one missing an
-/// address.
-pub fn caller_description(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
-    let credential = match presented_credentials(headers).first() {
-        Some(presented) => format!("key:{}", credential_fingerprint(presented)),
-        None => "anonymous".to_string(),
-    };
-    match peer {
-        Some(addr) => format!("{credential} from {addr}"),
-        None => format!("{credential} from an unknown address"),
-    }
-}
-
-/// A short, stable, non-reversible name for one credential.
-fn credential_fingerprint(credential: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(credential.as_bytes());
-    hex::encode(&digest[..4])
 }
 
 /// Authentication for the endpoints that exist for runtime nodes.
@@ -207,51 +183,6 @@ pub async fn node_auth(
         .into_response()
 }
 
-/// API Key authentication middleware
-pub async fn api_key_auth(
-    auth_config: axum::extract::State<AuthConfig>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> Response {
-    // Bypass if authentication is disabled
-    if !auth_config.enabled {
-        return next.run(request).await;
-    }
-
-    // Skip endpoints that don't require authentication
-    // - /health: Health check
-    // - /api/metrics: Prometheus Metrics (Prometheus usually doesn't support auth)
-    let path = request.uri().path();
-    if path == "/health" || path == "/api/metrics" {
-        return next.run(request).await;
-    }
-
-    // "Authorization: Bearer <key>", a bare "Authorization: <key>", or
-    // "X-API-Key: <key>" - all three are accepted.
-    if presented_credentials(&headers)
-        .into_iter()
-        .any(|presented| {
-            auth_config
-                .api_keys
-                .iter()
-                .any(|key| secret_eq(key, presented))
-        })
-    {
-        return next.run(request).await;
-    }
-
-    // Authentication failed
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({
-            "error": "Unauthorized",
-            "details": "Valid API key required. Provide it via 'Authorization: Bearer <key>' or 'X-API-Key: <key>' header."
-        })),
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,208 +211,6 @@ mod tests {
         let config = crate::config::ControlConfig::default();
         let auth_config = AuthConfig::from_control_config(&config);
         assert!(!auth_config.enabled);
-    }
-
-    #[tokio::test]
-    async fn test_auth_middleware_disabled() {
-        use axum::Router;
-        use axum::routing::get;
-
-        // Create a simple route
-        async fn test_handler() -> &'static str {
-            "OK"
-        }
-
-        let auth_config = AuthConfig {
-            enabled: false,
-            api_keys: Arc::new(vec![]),
-        };
-
-        let app = Router::new().route("/test", get(test_handler)).layer(
-            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
-        );
-
-        // Send request without authentication
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Should succeed (auth disabled)
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_auth_middleware_no_key() {
-        use axum::Router;
-        use axum::routing::get;
-
-        async fn test_handler() -> &'static str {
-            "OK"
-        }
-
-        let auth_config = AuthConfig {
-            enabled: true,
-            api_keys: Arc::new(vec!["valid-key-123".to_string()]),
-        };
-
-        let app = Router::new().route("/test", get(test_handler)).layer(
-            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
-        );
-
-        // Send request without API key
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Should return 401
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn test_auth_middleware_bearer_token() {
-        use axum::Router;
-        use axum::routing::get;
-
-        async fn test_handler() -> &'static str {
-            "OK"
-        }
-
-        let auth_config = AuthConfig {
-            enabled: true,
-            api_keys: Arc::new(vec!["valid-key-123".to_string()]),
-        };
-
-        let app = Router::new().route("/test", get(test_handler)).layer(
-            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
-        );
-
-        // Use Bearer token
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/test")
-                    .header("Authorization", "Bearer valid-key-123")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Should succeed
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_auth_middleware_x_api_key() {
-        use axum::Router;
-        use axum::routing::get;
-
-        async fn test_handler() -> &'static str {
-            "OK"
-        }
-
-        let auth_config = AuthConfig {
-            enabled: true,
-            api_keys: Arc::new(vec!["valid-key-123".to_string()]),
-        };
-
-        let app = Router::new().route("/test", get(test_handler)).layer(
-            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
-        );
-
-        // Use X-API-Key header
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/test")
-                    .header("X-API-Key", "valid-key-123")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Should succeed
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_auth_middleware_invalid_key() {
-        use axum::Router;
-        use axum::routing::get;
-
-        async fn test_handler() -> &'static str {
-            "OK"
-        }
-
-        let auth_config = AuthConfig {
-            enabled: true,
-            api_keys: Arc::new(vec!["valid-key-123".to_string()]),
-        };
-
-        let app = Router::new().route("/test", get(test_handler)).layer(
-            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
-        );
-
-        // Use invalid API key
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/test")
-                    .header("Authorization", "Bearer wrong-key")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Should return 401
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn test_health_endpoint_bypass() {
-        use axum::Router;
-        use axum::routing::get;
-
-        async fn health_handler() -> &'static str {
-            "OK"
-        }
-
-        let auth_config = AuthConfig {
-            enabled: true,
-            api_keys: Arc::new(vec!["valid-key-123".to_string()]),
-        };
-
-        let app = Router::new().route("/health", get(health_handler)).layer(
-            axum::middleware::from_fn_with_state(auth_config, api_key_auth),
-        );
-
-        // /health endpoint does not require authentication
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Should succeed (even without API key)
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// The node channel must not follow `api_auth_enabled`: that flag is
@@ -620,41 +349,5 @@ mod tests {
         assert!(!secret_eq("abc", "ab"));
         assert!(!secret_eq("abc", "abcd"));
         assert!(!secret_eq("abc", "abd"));
-    }
-
-    #[tokio::test]
-    async fn test_metrics_endpoint_bypass() {
-        use axum::Router;
-        use axum::routing::get;
-
-        async fn metrics_handler() -> &'static str {
-            "OK"
-        }
-
-        let auth_config = AuthConfig {
-            enabled: true,
-            api_keys: Arc::new(vec!["valid-key-123".to_string()]),
-        };
-
-        let app = Router::new()
-            .route("/api/metrics", get(metrics_handler))
-            .layer(axum::middleware::from_fn_with_state(
-                auth_config,
-                api_key_auth,
-            ));
-
-        // /api/metrics endpoint does not require authentication (needed for Prometheus)
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Should succeed (even without API key)
-        assert_eq!(response.status(), StatusCode::OK);
     }
 }

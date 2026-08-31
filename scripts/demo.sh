@@ -539,16 +539,22 @@ start_origin() {
     return 0
   fi
 
-  # `python3 -m http.server` with one path added.
+  # `python3 -m http.server` with two paths added.
   #
   # Everything under / is served from the directory exactly as that module
-  # would serve it, which is what the two egress checks use. /slow is the one
+  # would serve it, which is what the two egress checks use. /slow is the first
   # addition: a body written a piece at a time with a pause between the
   # pieces, and no length announced. It exists because "the upstream's body
   # was passed through without being collected" cannot be shown against an
   # upstream that answers instantly -- collected or not, the answer looks the
   # same from outside. Against this one it does: a handler that collected the
   # body could not send its first byte until the upstream had sent its last.
+  #
+  # /redirect is the second: it answers 302 to itself with one hop fewer until
+  # the hops run out and it points at /payload.txt. It exists for the
+  # subrequest ceiling, which counts every hop a redirect chain takes -- so a
+  # handler containing exactly one `fetch` can exhaust the ceiling, and that
+  # cannot be shown against a destination that answers straight away.
   cat > "${dir}/origin.py" <<'ORIGIN_PY'
 import functools
 import http.server
@@ -566,7 +572,20 @@ class Origin(http.server.SimpleHTTPRequestHandler):
         if parsed.path == "/slow":
             self.send_slowly(urllib.parse.parse_qs(parsed.query))
             return
+        if parsed.path == "/redirect":
+            self.send_redirect(urllib.parse.parse_qs(parsed.query))
+            return
         super().do_GET()
+
+    def send_redirect(self, query):
+        # One hop fewer each time, ending at a real file, so ?hops=3 is three
+        # 302s and then a 200: four connections in all for one fetch() call.
+        hops = int(query.get("hops", ["1"])[0])
+        target = "/redirect?hops=%d" % (hops - 1) if hops > 1 else "/payload.txt"
+        self.send_response(302)
+        self.send_header("Location", target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def send_slowly(self, query):
         pieces = int(query.get("pieces", ["6"])[0])
@@ -3273,6 +3292,105 @@ check_queue_roundtrip() {
   fi
 }
 
+# The producer half of queueing past one message at a time.
+#
+# Fifty messages sent with `send` in a loop are fifty op dispatches against
+# this application's op-rate ceiling and fifty round trips to deis-queue, and
+# there is no point at which the fifty are one thing: a handler cut off half
+# way has enqueued half of them. `sendBatch` is one dispatch, one round trip
+# and one transaction on the queue's side, so the array either arrives whole or
+# not at all.
+#
+# What can be observed from outside is the two ends: one request goes in, and
+# every message comes out of the consumer. The middle - that it was one call
+# rather than five - is read off the handler's own log line, which only the
+# `sendBatch` path writes.
+check_queue_send_batch() {
+  local title="a producer enqueues a whole array in one call and every message arrives"
+  local stamp="batch-$$-${RANDOM}"
+  local headers="${LOG_DIR}/verify-queue-batch.headers"
+  local size=5
+
+  local jobs="[" i
+  for i in $(seq 1 $size); do
+    [ "$i" = 1 ] || jobs="${jobs},"
+    jobs="${jobs}{\"key\":\"${stamp}-${i}\",\"value\":\"batched-${i}\"}"
+  done
+  jobs="${jobs}]"
+
+  local sent
+  sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+    -H 'content-type: application/json' -d "$jobs" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue-batch")
+  if [ "$(http_status "$headers")" != "202" ]; then
+    fail_check "$title" \
+      "POST /api/enqueue-batch answered $(http_status "$headers"): ${sent}"
+    return
+  fi
+
+  local queued
+  queued=$(echo "$sent" | jq -r '.queued // empty' 2>/dev/null || true)
+
+  # The consumer is a poller, so the only thing to do is wait for the effect.
+  # curl paces its own retries a second apart, and only the first key needs the
+  # long budget: the batch is one transaction and one delivery, so by the time
+  # one of them has been handled the rest are in the same batch.
+  local missing="" got
+  for i in $(seq 1 $size); do
+    got=$(curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
+      -H "x-deis-app-id: ${APP_ID}" \
+      "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/job:${stamp}-${i}" 2>/dev/null || echo '')
+    if [ "$(echo "$got" | jq -r '.value // empty' 2>/dev/null || true)" != "batched-${i}" ]; then
+      missing="${missing} job:${stamp}-${i}"
+    fi
+  done
+
+  # Written by the handler only on the `sendBatch` path; /api/enqueue logs one
+  # line per message and never this one.
+  local batch_line
+  batch_line=$(node_log | grep -m 1 "queued ${size} job(s) in one batch" || true)
+
+  if [ "$queued" = "$size" ] && [ -z "$missing" ] && [ -n "$batch_line" ]; then
+    pass_check "$title" \
+      "one POST to /api/enqueue-batch answered 202 with queued=${size}, the handler logged \"$(echo "$batch_line" | log_message)\", and the consumer wrote all ${size} keys job:${stamp}-1 .. job:${stamp}-${size}"
+  else
+    fail_check "$title" \
+      "expected 202 with queued=${size} (got '${queued:-<none>}'), all ${size} keys written (missing:${missing:- none}) and the handler's one-batch line (${batch_line:+present}${batch_line:-never written})"
+  fi
+}
+
+# What `maxConcurrency` means on a platform where one application in one
+# environment is one isolate on one thread.
+#
+# It cannot mean parallelism, because the handler is serialised by the isolate
+# whatever the number says. It means how many batches the node's poller may
+# hold at once - leased, waiting their turn on the runtime thread, or being
+# acknowledged - so the next batch is already in hand when the handler
+# finishes. The number is only half of what has to be true; the other half is
+# that the node says which of the two it is, because the name reads as
+# parallelism on every other platform.
+check_queue_consumer_concurrency() {
+  local title="a queue consumer holds the batches its manifest asks for, and the node says that is not parallelism"
+
+  local declared
+  declared=$(jq -r '.queues[0].maxConcurrency // empty' "${APP_SRC_DIR}/.config.json" \
+    2>/dev/null || true)
+  [ -n "$declared" ] || declared=2
+
+  local line applied
+  line=$(node_log | grep -m 1 "Consuming queue jobs for app ${APP_ID}.${ENV_NAME}:" || true)
+  applied=$(echo "$line" | sed -n 's/.*at most \([0-9]*\) batch(es).*/\1/p')
+
+  if [ "$applied" = "$declared" ] && [ -n "$line" ] \
+    && echo "$line" | grep -q "Outstanding, not parallel"; then
+    pass_check "$title" \
+      "the project asks for maxConcurrency ${declared} on queue jobs and the node reported \"$(echo "$line" | log_message)\""
+  else
+    fail_check "$title" \
+      "expected the node to log that it holds ${declared} batch(es) of queue jobs at once and to say the number is not parallelism; it reported '${applied:-<none>}' in the line $(if [ -n "$line" ]; then echo "\"$(echo "$line" | log_message)\""; else echo "which was never written"; fi)"
+  fi
+}
+
 check_cron() {
   # The whole cron path in one observation: the expression rode into the
   # control plane inside the bundle manifest, the scheduler rebuilt its task
@@ -3480,6 +3598,117 @@ check_app_limits_clamped() {
 
   fail_check "$title" \
     "expected the node to log that ${APP_ID}.${PREVIEW_ENV_NAME} asked for ${GREEDY_TIMEOUT_MS}ms and was held to its own ceiling; the deployment line was $(if [ -n "$asked_line" ]; then echo "present"; else echo "absent"; fi), the clamp reports applying '${applied:-<none>}ms', and a \"narrows\" line for ${GREEDY_TIMEOUT_MS}ms was $(if [ -n "$narrowed" ]; then echo "written, so the request was granted"; else echo "absent"; fi)"
+}
+
+# The ceiling on fan-out, which none of the other limits reaches.
+#
+# An invocation that answers one inbound request with two hundred outbound ones
+# is spending this node's sockets and its outbound bandwidth, both of which
+# every other tenant on the box is also using - and it does so while looking
+# healthy on every other ceiling: the calls run concurrently, so the wall clock
+# sees one slow request, the CPU clock sees almost nothing, and the op rate
+# limit sees a couple of hundred dispatches spread over a second against a
+# ceiling of a thousand.
+#
+# The example project narrows the node's number in its own manifest, which is
+# the same "narrowing only" path the timeout takes, so this also shows a second
+# limit travelling from a project file into a node's behaviour.
+check_subrequest_ceiling() {
+  local title="an invocation is held to a ceiling on outbound calls, and the refusal names it"
+  local headers="${LOG_DIR}/verify-subrequests.headers"
+
+  # Read out of the project the demo actually deployed rather than repeated
+  # here, so the number this check believes in cannot drift from the number
+  # the application asked for.
+  local declared
+  declared=$(jq -r '.limits.maxSubrequests // empty' "${APP_SRC_DIR}/.config.json" \
+    2>/dev/null || true)
+  [ -n "$declared" ] || declared=6
+
+  local target="http%3A%2F%2F127.0.0.1%3A${DEIS_ORIGIN_PORT}%2Fpayload.txt"
+  local under=$((declared - 2))
+  local over=$((declared + 3))
+
+  local within beyond within_done beyond_done refusal
+  within=$(app_request "$headers" "/api/fanout?n=${under}&url=${target}")
+  if [ "$(http_status "$headers")" != "200" ]; then
+    fail_check "$title" \
+      "GET /api/fanout?n=${under} answered $(http_status "$headers"): $(echo "$within" | head -c 200)"
+    return
+  fi
+  beyond=$(app_request "$headers" "/api/fanout?n=${over}&url=${target}")
+
+  within_done=$(echo "$within" | jq -r '.completed // empty' 2>/dev/null || true)
+  beyond_done=$(echo "$beyond" | jq -r '.completed // empty' 2>/dev/null || true)
+  refusal=$(echo "$beyond" | jq -r '.error // empty' 2>/dev/null || true)
+
+  # The node's own two lines: the one that says which number it applied, and
+  # the one that says it refused a call. The numbers quoted below are the
+  # node's rather than this script's idea of them.
+  local narrowed_line refused_line
+  narrowed_line=$(node_log \
+    | grep -m 1 "App ${APP_ID}.${ENV_NAME} narrows the default subrequest ceiling" || true)
+  refused_line=$(node_log \
+    | grep -m 1 "this invocation has already made ${declared} outbound call(s)" || true)
+
+  if [ "$within_done" = "$under" ] && [ "$beyond_done" = "$declared" ] \
+    && [ -n "$narrowed_line" ] && [ -n "$refused_line" ] \
+    && echo "$refusal" | grep -q "${declared} outbound call"; then
+    pass_check "$title" \
+      "the manifest asks for ${declared} outbound calls per invocation and the node logged \"$(echo "$narrowed_line" | log_message)\". GET /api/fanout?n=${under} made all ${within_done}; GET /api/fanout?n=${over} made ${beyond_done} and the ${beyond_done}th+1 came back to the handler as: $(echo "$refusal" | head -c 220)"
+  else
+    fail_check "$title" \
+      "expected ${under} of ${under} calls to complete (got '${within_done:-<none>}') and exactly ${declared} of ${over} (got '${beyond_done:-<none>}') with a refusal naming ${declared} (got '${refusal:-<none>}'); the node's narrowing line was $(if [ -n "$narrowed_line" ]; then echo "present"; else echo "never written"; fi) and its refusal line $(if [ -n "$refused_line" ]; then echo "present"; else echo "never written"; fi)"
+  fi
+}
+
+# What a redirect chain costs, which is the part an application author has to
+# be told rather than left to discover.
+#
+# `fetch` follows redirects, and this platform follows them by hand in
+# `js/bootstrap.js` so that every hop is judged by the same egress policy as
+# the destination the application named. Each hop is also a separate connection
+# leaving this node, so each hop costs one subrequest. The consequence is worth
+# demonstrating rather than asserting: a handler containing exactly one
+# `fetch` can exhaust the ceiling, and the only way that can happen is if hops
+# are counted.
+check_a_redirect_chain_costs_a_subrequest_per_hop() {
+  local title="each hop of a redirect chain costs one of the invocation's outbound calls"
+  local headers="${LOG_DIR}/verify-subrequest-redirects.headers"
+
+  local declared
+  declared=$(jq -r '.limits.maxSubrequests // empty' "${APP_SRC_DIR}/.config.json" \
+    2>/dev/null || true)
+  [ -n "$declared" ] || declared=6
+
+  # One fetch plus this many redirects is exactly the ceiling; one more hop is
+  # one connection too many.
+  local fits=$((declared - 1))
+  local spills=$declared
+
+  local base="http%3A%2F%2F127.0.0.1%3A${DEIS_ORIGIN_PORT}%2Fredirect%3Fhops%3D"
+  local within beyond within_done beyond_done refusal
+  within=$(app_request "$headers" "/api/fanout?n=1&url=${base}${fits}")
+  if [ "$(http_status "$headers")" != "200" ]; then
+    fail_check "$title" \
+      "GET /api/fanout over a ${fits}-hop chain answered $(http_status "$headers"): $(echo "$within" | head -c 200)"
+    return
+  fi
+  beyond=$(app_request "$headers" "/api/fanout?n=1&url=${base}${spills}")
+
+  within_done=$(echo "$within" | jq -r '.completed // empty' 2>/dev/null || true)
+  beyond_done=$(echo "$beyond" | jq -r '.completed // empty' 2>/dev/null || true)
+  refusal=$(echo "$beyond" | jq -r '.error // empty' 2>/dev/null || true)
+
+  if [ "$within_done" = "1" ] && [ "$beyond_done" = "0" ] \
+    && echo "$refusal" | grep -q "${declared} outbound call"; then
+    pass_check "$title" \
+      "one fetch() of a URL that redirects ${fits} times finished - ${declared} connections, exactly this application's ceiling - while the same single fetch() of a URL that redirects ${spills} times was refused: $(echo "$refusal" | head -c 220). The handler makes one call either way, so the ceiling can only have been reached by counting hops"
+    return
+  fi
+
+  fail_check "$title" \
+    "expected the ${fits}-hop chain to complete (completed='${within_done:-<none>}') and the ${spills}-hop chain to be refused with a message naming ${declared} (completed='${beyond_done:-<none>}', error='${refusal:-<none>}')"
 }
 
 # ----------------------------------------------------------------------
@@ -3946,6 +4175,59 @@ check_web_crypto() {
 
   pass_check "$title" \
     "randomUUID gave ${uuid} and a different one on the next call; subtle.digest('SHA-256', 'deislet') gave ${digest}, which is the known digest of that string"
+}
+
+# The Cache API past `caches.default`, and the honest half of it.
+#
+# Two things have to be true and they are different in kind. The first is
+# ordinary: a cache an application opens by name is its own namespace, so the
+# same key in two caches gives two answers and emptying one leaves the other
+# alone. A named cache that could answer the default cache's read with the
+# wrong page would be a correctness bug nothing would report.
+#
+# The second is the product decision. This cache lives in the isolate's own
+# memory: it is gone when a new version is deployed and it is not shared with
+# the other nodes of an installation. `caches.scope` is what makes that
+# checkable from inside an application rather than something an author has to
+# have read, because the two kinds of miss mean opposite things - an entry
+# evicted from the store you wrote to, against a store that is new and lost
+# everything at once. Two requests seeing the same `scope.id` is the store
+# outliving a request; an id that changed is the second kind of miss.
+check_named_caches() {
+  local title="an application opens a cache of its own, and can tell which store it is holding"
+  local headers="${LOG_DIR}/verify-cache.headers"
+
+  local first second
+  first=$(app_request "$headers" "/api/cache")
+  if [ "$(http_status "$headers")" != "200" ]; then
+    fail_check "$title" \
+      "GET /api/cache answered $(http_status "$headers"): $(echo "$first" | head -c 200)"
+    return
+  fi
+  # A second invocation of the same isolate. The scope is the store's
+  # identity, so this is what shows the cache outliving one request.
+  second=$(app_request "$headers" "/api/cache")
+
+  local from_default from_pages emptied empty_after survived kind first_id second_id
+  from_default=$(echo "$first" | jq -r '.fromDefault // empty' 2>/dev/null || true)
+  from_pages=$(echo "$first" | jq -r '.fromPages // empty' 2>/dev/null || true)
+  emptied=$(echo "$first" | jq -r '.emptied // empty' 2>/dev/null || true)
+  empty_after=$(echo "$first" | jq -r '.namedCacheEmptyAfterDelete // empty' 2>/dev/null || true)
+  survived=$(echo "$first" | jq -r '.defaultSurvived // empty' 2>/dev/null || true)
+  kind=$(echo "$first" | jq -r '.scopeKind // empty' 2>/dev/null || true)
+  first_id=$(echo "$first" | jq -r '.scopeId // empty' 2>/dev/null || true)
+  second_id=$(echo "$second" | jq -r '.scopeId // empty' 2>/dev/null || true)
+
+  if [ "$from_default" = "default-copy" ] && [ "$from_pages" = "pages-copy" ] \
+    && [ "$emptied" = "true" ] && [ "$empty_after" = "true" ] \
+    && [ "$survived" = "default-copy" ] && [ "$kind" = "isolate" ] \
+    && [ -n "$first_id" ] && [ "$first_id" = "$second_id" ]; then
+    pass_check "$title" \
+      "caches.default and caches.open(\"pages\") answered the same key with \"${from_default}\" and \"${from_pages}\"; caches.delete(\"pages\") emptied that one and left the default entry; and two requests both reported scope kind \"${kind}\" with the same store id ${first_id}, which is what tells an entry that was evicted from a store that is new"
+  else
+    fail_check "$title" \
+      "expected the default cache to answer 'default-copy' (got '${from_default:-<none>}'), the named cache 'pages-copy' (got '${from_pages:-<none>}'), delete to report true and empty the name (got '${emptied:-<none>}'/'${empty_after:-<none>}') while the default kept its entry (got '${survived:-<none>}'), and both requests to report scope kind 'isolate' (got '${kind:-<none>}') with one stable id (got '${first_id:-<none>}' then '${second_id:-<none>}')"
+  fi
 }
 
 check_telemetry_logs() {
@@ -4503,6 +4785,312 @@ check_cli_status() {
 # node that cannot register still fetches its own assignments and still serves
 # every request. What was lost was the control plane knowing about nodes
 # nobody had written into its configuration file.
+# ----------------------------------------------------------------------
+# Accounts, scoped tokens and the audit log
+# ----------------------------------------------------------------------
+#
+# `start` turns api_auth_enabled on and puts exactly one entry in api_keys,
+# which is the shape of every installation that existed before there were
+# accounts. These checks mint accounts and narrow tokens beside that key and
+# watch the control plane tell them apart: the old flat key still does
+# everything, a narrow one reaches one environment and nothing else, and both
+# of them leave a line behind that names what they did.
+#
+# They run late on purpose. One of them re-points the preview environment at
+# the version it is already running, which is a real deploy made with a real
+# scoped credential; every check that expects a particular version on preview
+# has finished by then.
+
+# Run the CLI as somebody other than the demo's flat key.
+#
+# The assignment after the array is what does it: `env` applies assignments
+# left to right, so this second DEIS_CONTROL_TOKEN replaces the one
+# `deis_cli_env` put in the array. Everything else - the endpoints, the
+# demo's own config home - stays exactly as `deis_cli` sets it, which is the
+# point: only the credential differs.
+deis_cli_as() {
+  local credential=$1
+  shift
+  deis_cli_env
+  env "${DEIS_CLI_ENV[@]}" "DEIS_CONTROL_TOKEN=${credential}" "${BIN_DIR}/deis" "$@"
+}
+
+# One request to the control plane with a chosen credential, answering with
+# the HTTP status alone. Used where the claim is about who is refused, which
+# `deis` deliberately reports as a message rather than as a number.
+control_status() {
+  local method=$1 path=$2 credential=$3 body=${4:-}
+  local args=(-s -o /dev/null -w '%{http_code}' -X "$method" "$(control_url)${path}")
+  if [ -n "$credential" ]; then
+    args+=(-H "Authorization: Bearer ${credential}")
+  fi
+  if [ -n "$body" ]; then
+    args+=(-H "Content-Type: application/json" --data "$body")
+  fi
+  curl "${args[@]}"
+}
+
+# The same, answering with the body, so a check can assert on what the caller
+# was told rather than only on the number.
+control_answer() {
+  local method=$1 path=$2 credential=$3
+  local args=(-s -X "$method" "$(control_url)${path}")
+  if [ -n "$credential" ]; then
+    args+=(-H "Authorization: Bearer ${credential}")
+  fi
+  curl "${args[@]}"
+}
+
+# A well-formed credential that was never minted, used to prove that a
+# revoked token and one that never existed look identical to the caller.
+NEVER_MINTED_TOKEN="deis_pat_00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff0011"
+
+# Create an account if it is not already there. `verify` can be run twice
+# against one demo, and the second run must not fail on a name that exists.
+ensure_account() {
+  deis_cli account create "$1" --role "$2" --json >/dev/null 2>&1 || true
+}
+
+check_the_configured_api_key_is_listed_as_unscoped() {
+  local title="the api_keys entry from the configuration file is visible, and visibly unscoped"
+  local listed
+  listed=$(deis_cli token list --json 2>/dev/null || echo '{}')
+
+  local unscoped origin scopes id
+  unscoped=$(echo "$listed" | jq -r '.unscoped // 0')
+  origin=$(echo "$listed" | jq -r '[.tokens[] | select(.origin == "config")] | length')
+  scopes=$(echo "$listed" | jq -r 'first(.tokens[] | select(.origin == "config") | .scopes) // "none"')
+  id=$(echo "$listed" | jq -r 'first(.tokens[] | select(.origin == "config") | .id) // "none"')
+
+  if [ "${origin:-0}" -ge 1 ] && [ "${unscoped:-0}" -ge 1 ] && [ "$scopes" = "unscoped" ]; then
+    pass_check "$title" \
+      "\`deis token list\` shows ${origin} credential(s) whose origin is the configuration file, filed under id ${id} with scopes \"${scopes}\", and reports ${unscoped} live unscoped credential(s) in total. That number is what an operator drives to zero; the key itself is not in the database at all, only this record of it"
+  else
+    fail_check "$title" \
+      "the listing reports ${origin:-0} configuration credential(s) with scopes '${scopes}' and ${unscoped:-0} unscoped in total; expected the demo's single api_keys entry to be listed and counted"
+  fi
+}
+
+check_a_scoped_token_reaches_one_environment_and_no_other() {
+  local title="a token scoped to one environment deploys there and is refused everywhere else"
+  ensure_account ci deployer
+
+  local minted token
+  minted=$(deis_cli token create --account ci \
+    --scope "deploy:${APP_ID}/${PREVIEW_ENV_NAME}" preview-pipeline --json 2>/dev/null || echo '{}')
+  token=$(echo "$minted" | jq -r '.secret // empty')
+  if [ -z "$token" ]; then
+    fail_check "$title" "could not mint a scoped token: ${minted}"
+    return
+  fi
+
+  # The version the preview environment already runs. Pointing it back at the
+  # same version is a real deploy - a pointer row, a push to the node - and
+  # changes nothing about what is being served, which is what makes it safe
+  # to make with somebody else's credential in the middle of a demo.
+  local preview_version
+  preview_version=$(deployed_version "$PREVIEW_ENV_NAME")
+
+  local allowed refused_env refused_secret refused_platform refused_token
+  allowed=$(control_status POST \
+    "/api/apps/${APP_ID}/environments/${PREVIEW_ENV_NAME}/deployments" "$token" \
+    "{\"version_id\":\"${preview_version}\",\"note\":\"deployed by a scoped token\"}")
+  refused_env=$(control_status POST \
+    "/api/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "$token" \
+    "{\"version_id\":\"${preview_version}\"}")
+  refused_secret=$(control_status PUT \
+    "/api/apps/${APP_ID}/environments/${PREVIEW_ENV_NAME}/secrets/CI_ATTEMPT" "$token" \
+    '{"value":"this must never be stored"}')
+  refused_platform=$(control_status GET "/api/audit" "$token")
+  refused_token=$(control_status GET "/api/tokens" "$token")
+
+  local told
+  told=$(control_answer POST \
+    "/api/apps/${APP_ID}/environments/${ENV_NAME}/deployments" "$token" \
+    | jq -r '.details // .error // empty')
+
+  # Narrow has to stay usable. `deis status` walks every environment of the
+  # application, so a credential that reaches one of them would break the
+  # command outright if a refusal on the others were an error rather than a
+  # row; this is the assertion that it is a row.
+  local status_json="${LOG_DIR}/verify-scoped-status.json"
+  local status_exit=0
+  deis_cli_as "$token" status --json > "$status_json" 2>/dev/null || status_exit=$?
+  local seen hidden
+  seen=$(jq -r --arg env "$PREVIEW_ENV_NAME" \
+    'first(.environments[] | select(.name == $env) | .version_number) // empty' \
+    < "$status_json" 2>/dev/null || true)
+  # `[...][0] | tostring` rather than jq's `//`: the value being looked for
+  # here is `false`, and `//` treats false exactly like a missing field, so
+  # the one answer this assertion is about would read as "no answer at all".
+  hidden=$(jq -r --arg env "$ENV_NAME" \
+    '[.environments[] | select(.name == $env) | .visible][0] | tostring' \
+    < "$status_json" 2>/dev/null || true)
+
+  if [ "$allowed" = "201" ] && [ "$refused_env" = "403" ] && [ "$refused_secret" = "403" ] \
+    && [ "$refused_platform" = "403" ] && [ "$refused_token" = "403" ] \
+    && [ "$status_exit" = "0" ] && [ -n "$seen" ] && [ "$hidden" = "false" ] \
+    && echo "$told" | grep -q "deploy:${APP_ID}/${ENV_NAME}"; then
+    pass_check "$title" \
+      "carrying only deploy:${APP_ID}/${PREVIEW_ENV_NAME}, the token re-deployed ${PREVIEW_ENV_NAME} to ${preview_version} (HTTP ${allowed}); the same call against ${ENV_NAME} answered ${refused_env}, writing a secret on its own environment ${refused_secret}, reading the audit log ${refused_platform} and listing credentials ${refused_token}. The refusal names the scope that would have worked: \"${told}\". \`deis status\` still works for it: ${PREVIEW_ENV_NAME} shows version ${seen} and ${ENV_NAME} comes back visible=${hidden} rather than failing the command"
+  else
+    fail_check "$title" \
+      "deploy to ${PREVIEW_ENV_NAME} answered ${allowed} (expected 201 Created); ${ENV_NAME} ${refused_env}, secret ${refused_secret}, audit ${refused_platform}, tokens ${refused_token} (expected 403 each). \`deis status\` exited ${status_exit} showing ${PREVIEW_ENV_NAME} version '${seen:-none}' and ${ENV_NAME} visible '${hidden:-none}'. The refusal said: ${told:-nothing}"
+  fi
+}
+
+check_a_wide_credential_cannot_mint_a_storage_token() {
+  local title="minting a storage token needs that exact tenant written down"
+  ensure_account data-team maintainer
+
+  local wide narrow blanket_status
+  wide=$(deis_cli token create --account data-team \
+    --scope 'deploy:*/*' --scope 'secrets:*/*' everything --json 2>/dev/null \
+    | jq -r '.secret // empty')
+  narrow=$(deis_cli token create --account data-team \
+    --scope "storage:${APP_ID}/${ENV_NAME}" one-tenant --json 2>/dev/null \
+    | jq -r '.secret // empty')
+
+  # A blanket storage grant is refused where it is written, not where it
+  # would be used: the token it hands out never expires and works against
+  # deis-store without this control plane in the path.
+  blanket_status=0
+  deis_cli token create --account data-team --scope 'storage:*/*' blanket --json \
+    >/dev/null 2>&1 || blanket_status=$?
+
+  local route="/api/apps/${APP_ID}/environments/${ENV_NAME}/storage-token"
+  local refused allowed tenant
+  refused=$(control_status GET "$route" "$wide")
+  allowed=$(control_status GET "$route" "$narrow")
+  tenant=$(control_answer GET "$route" "$narrow" | jq -r '.tenant // empty')
+
+  if [ "$refused" = "403" ] && [ "$allowed" = "200" ] \
+    && [ "$tenant" = "${APP_ID}.${ENV_NAME}" ] && [ "$blanket_status" -ne 0 ]; then
+    pass_check "$title" \
+      "a credential carrying deploy:*/* and secrets:*/* was refused GET ${route} (HTTP ${refused}); the one carrying storage:${APP_ID}/${ENV_NAME} was served (HTTP ${allowed}) for tenant ${tenant}. \`deis token create --scope storage:*/*\` was refused outright (exit ${blanket_status}), so there is no blanket form of the grant to hand out by accident"
+  else
+    fail_check "$title" \
+      "the wide credential answered ${refused} (expected 403), the tenant-scoped one ${allowed} for tenant '${tenant:-none}' (expected 200 for ${APP_ID}.${ENV_NAME}), and minting storage:*/* exited ${blanket_status} (expected non-zero)"
+  fi
+}
+
+check_a_revoked_token_stops_at_its_next_call() {
+  local title="a revoked token is refused at once, and looks like one that never existed"
+  ensure_account sre viewer
+
+  local minted token id
+  minted=$(deis_cli token create --account sre \
+    --scope "read:${APP_ID}/${ENV_NAME}" laptop --json 2>/dev/null || echo '{}')
+  token=$(echo "$minted" | jq -r '.secret // empty')
+  id=$(echo "$minted" | jq -r '.id // empty')
+  if [ -z "$token" ]; then
+    fail_check "$title" "could not mint a token to revoke: ${minted}"
+    return
+  fi
+
+  local route="/api/apps/${APP_ID}/environments/${ENV_NAME}/deployment"
+  local before after unknown revoked_body unknown_body
+  before=$(control_status GET "$route" "$token")
+  deis_cli token revoke "$id" --json >/dev/null 2>&1 || true
+  after=$(control_status GET "$route" "$token")
+  unknown=$(control_status GET "$route" "$NEVER_MINTED_TOKEN")
+  revoked_body=$(control_answer GET "$route" "$token")
+  unknown_body=$(control_answer GET "$route" "$NEVER_MINTED_TOKEN")
+
+  # The control plane's own log does tell the two apart, which is the point:
+  # "a revoked token was presented" means a credential is still deployed
+  # somewhere and someone has to go and replace it.
+  local said
+  said=$(grep -c 'the token presented was revoked' "${LOG_DIR}/deis-control.log" 2>/dev/null || true)
+
+  if [ "$before" = "200" ] && [ "$after" = "401" ] && [ "$unknown" = "401" ] \
+    && [ "$revoked_body" = "$unknown_body" ] && [ "${said:-0}" -ge 1 ]; then
+    pass_check "$title" \
+      "the token read ${route} (HTTP ${before}); after \`deis token revoke ${id}\` the very next request answered ${after}, byte-for-byte the same answer a token that was never minted gets (${unknown}). No cache had to expire: every request looks the row up. The control plane's log says \"the token presented was revoked\" ${said} time(s), which a stolen credential cannot see"
+  else
+    fail_check "$title" \
+      "before revoking ${before} (expected 200), after ${after} and an unknown token ${unknown} (expected 401 each); the two answers were $( [ "$revoked_body" = "$unknown_body" ] && echo identical || echo different ), and the log named a revoked token ${said:-0} time(s)"
+  fi
+}
+
+check_the_audit_log_names_who_changed_what() {
+  local title="the audit log names the secret that was written, its application and its author"
+  local report="${LOG_DIR}/verify-audit-secret.json"
+  deis_cli audit --action secret.write --limit 20 --json > "$report" 2>/dev/null || true
+
+  local total app environment target outcome actor from
+  total=$(jq -r '.total // 0' < "$report" 2>/dev/null || echo 0)
+  app=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .app_id) // empty' < "$report" 2>/dev/null || true)
+  environment=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .environment) // empty' < "$report" 2>/dev/null || true)
+  target=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .target) // empty' < "$report" 2>/dev/null || true)
+  outcome=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .outcome) // empty' < "$report" 2>/dev/null || true)
+  actor=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .actor_credential) // empty' < "$report" 2>/dev/null || true)
+  # "From where" is half of what the line is for, and it is the field most
+  # easily left empty: it comes from the connection rather than from the
+  # request, so a server assembled without connect info would record every
+  # call as coming from nowhere and nothing else would notice.
+  from=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .peer) // empty' < "$report" 2>/dev/null || true)
+
+  # The whole reason a secret write is recorded by name and never by value.
+  local leaked=no
+  grep -q "$DEMO_SECRET_VALUE" "$report" 2>/dev/null && leaked=yes
+
+  if [ "$app" = "$APP_ID" ] && [ "$environment" = "$ENV_NAME" ] && [ "$target" = "DEMO_SECRET" ] \
+    && [ "$outcome" = "accepted" ] && [ -n "$actor" ] && [ -n "$from" ] && [ "$leaked" = "no" ]; then
+    pass_check "$title" \
+      "\`deis audit --action secret.write\` returned ${total} line(s); the one for DEMO_SECRET names ${app}/${environment}, the secret ${target}, the credential ${actor} that wrote it, the address ${from} it came from and the outcome ${outcome}. The ${#DEMO_SECRET_VALUE}-character value is not in the report, and the audit table lives in the same database the secret sweep already greps"
+  else
+    fail_check "$title" \
+      "the line for DEMO_SECRET reports app '${app:-none}', environment '${environment:-none}', target '${target:-none}', outcome '${outcome:-none}', credential '${actor:-none}' from '${from:-nowhere}' out of ${total} line(s), and the value was $( [ "$leaked" = yes ] && echo PRESENT || echo absent )"
+  fi
+}
+
+check_a_refused_call_is_recorded_with_the_reason() {
+  local title="a refused call is recorded as fully as an accepted one"
+  local report="${LOG_DIR}/verify-audit-refused.json"
+  deis_cli audit --outcome refused --limit 50 --json > "$report" 2>/dev/null || true
+
+  local total deploy_refusal detail anonymous
+  total=$(jq -r '.total // 0' < "$report" 2>/dev/null || echo 0)
+  deploy_refusal=$(jq -r --arg app "$APP_ID" --arg env "$ENV_NAME" \
+    'first(.entries[] | select(.action == "deploy" and .app_id == $app and .environment == $env) | .status) // empty' \
+    < "$report" 2>/dev/null || true)
+  detail=$(jq -r --arg app "$APP_ID" --arg env "$ENV_NAME" \
+    'first(.entries[] | select(.action == "deploy" and .app_id == $app and .environment == $env) | .detail) // empty' \
+    < "$report" 2>/dev/null || true)
+  anonymous=$(jq -r '[.entries[] | select(.actor_kind == "anonymous")] | length' < "$report" 2>/dev/null || echo 0)
+
+  if [ "${total:-0}" -ge 1 ] && [ "$deploy_refusal" = "403" ] \
+    && echo "$detail" | grep -q "deploy:${APP_ID}/${ENV_NAME}"; then
+    pass_check "$title" \
+      "${total} refusal(s) are on the record, ${anonymous} of them from a caller who presented nothing at all. The scoped token's attempt to deploy ${APP_ID}/${ENV_NAME} is there as HTTP ${deploy_refusal} with the reason \"${detail}\" - which is how an operator finds a pipeline still holding a credential that was narrowed"
+  else
+    fail_check "$title" \
+      "the log holds ${total:-0} refusal(s); the refused deploy on ${APP_ID}/${ENV_NAME} reports status '${deploy_refusal:-none}' with detail '${detail:-none}'"
+  fi
+}
+
+check_the_audit_log_has_no_way_to_be_erased() {
+  local title="no caller of this API can erase a line of the audit log"
+  local before after removed created
+
+  before=$(deis_cli audit --limit 500 --json 2>/dev/null | jq -r '.total // 0')
+  # The flat api_keys entry is the most powerful credential this control
+  # plane has - it is unscoped, so it passes every scope check there is. If
+  # anything could delete a line, this would.
+  removed=$(control_status DELETE "/api/audit" "$API_KEY")
+  created=$(control_status POST "/api/audit" "$API_KEY" '{"action":"forged"}')
+  after=$(deis_cli audit --limit 500 --json 2>/dev/null | jq -r '.total // 0')
+
+  if [ "$removed" = "405" ] && [ "$created" = "405" ] && [ "${after:-0}" -ge "${before:-0}" ]; then
+    pass_check "$title" \
+      "DELETE /api/audit answered ${removed} and POST answered ${created} to the unscoped api_keys credential - the route is a read and there is no writing or deleting endpoint behind it. The log went from ${before} to ${after} line(s) across both attempts; removing one means holding the database file, which is the same access that holds the secret master key"
+    else
+    fail_check "$title" \
+      "DELETE answered ${removed} and POST answered ${created} (expected 405 for both), and the log went from ${before:-?} to ${after:-?} lines"
+  fi
+}
+
 check_node_registration() {
   local title="the node registers itself with the control plane"
   local fleet="${LOG_DIR}/verify-fleet.json"
@@ -4904,6 +5492,7 @@ verify_demo() {
   check_app_fetch_allowed
   check_app_fetch_refused
   check_web_crypto
+  check_named_caches
   echo "-- secrets --"
   # The list runs before the sweep: it writes its own output under LOG_DIR,
   # and the sweep is what would catch a value in it.
@@ -4924,6 +5513,8 @@ verify_demo() {
   check_cli_blob_conditional_write
   echo "-- queue --"
   check_queue_roundtrip
+  check_queue_send_batch
+  check_queue_consumer_concurrency
   echo "-- cron --"
   check_cron
   echo "-- environments --"
@@ -4935,6 +5526,11 @@ verify_demo() {
   # rollback puts v2 on production.
   check_app_limits_narrowed
   check_app_limits_clamped
+  # The subrequest ceiling, which is the one limit that bounds fan-out. Both
+  # halves talk to the demo's own origin, which is the single address this
+  # node's egress policy allows.
+  check_subrequest_ceiling
+  check_a_redirect_chain_costs_a_subrequest_per_hop
   check_memory_cutoff
   echo "-- compatibility date --"
   # Both halves need production on v1, whose sources name a date, and the
@@ -4957,6 +5553,18 @@ verify_demo() {
   check_node_registration
   check_dynamic_node_registration
   check_cli_status
+  echo "-- accounts, scopes and the audit log --"
+  # After every check that expects a particular version on the preview
+  # environment: the scoped-token check re-deploys preview to the version it
+  # is already running, which is what proves a narrow credential can really
+  # ship rather than only be refused.
+  check_the_configured_api_key_is_listed_as_unscoped
+  check_a_scoped_token_reaches_one_environment_and_no_other
+  check_a_wide_credential_cannot_mint_a_storage_token
+  check_a_revoked_token_stops_at_its_next_call
+  check_the_audit_log_names_who_changed_what
+  check_a_refused_call_is_recorded_with_the_reason
+  check_the_audit_log_has_no_way_to_be_erased
   echo "-- automatic certificates --"
   # Last, because the final check starts a second deis-proxy over the same
   # certificate store and registers it with the control plane; running that

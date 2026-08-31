@@ -467,6 +467,15 @@ sequenceDiagram
   作数——否则它会把别人正在处理的那条销掉。
 - **死信**：重试超过阈值进死信表，不再投递。`ListDeadLetters` 与 `ReplayDeadLetters`
   两个 RPC 让人能看见它们、并把它们放回队列，不必直接读库。
+- **批量投递**：`SendBatch` 一次收一整批，落库是**一个事务**——要么整批都进去，要么一
+  条都没有。所以被拒的批次不会留下半批，调用方把同一个数组原样重发是安全的。一批装多
+  少条由服务端的 `max_batch_messages`（默认 100）说了算，不由调用方说了算。
+- **在手的批次数**：清单里的 `queues[].maxConcurrency` 限的是节点同时**握着**几个批
+  次——已经拉下来、还没结清的——不是同时在跑几个。一个应用在一个环境里、在每个节点上
+  就是一条线程上的一个 isolate，处理函数只能一批一批地跑。多握一个的好处是上一批还在
+  跑时下一批已经拉回来了；代价是每一个在手的批次从拉下来那一刻就在花租约，花过头租约
+  到期、消息被交给别人，同一份活做两遍。默认 1，节点夹在 8 以内，启动那条日志会把「不
+  是并行」这句话直接写出来。
 
 不做成 deis-queue 主动推给节点——那需要队列知道哪个节点跑哪个应用，会破坏「哑服务」
 这条边界。
@@ -671,7 +680,8 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 
 原先全部写死在代码里。现在是两层：**平台默认**（deis-runtime 配置的
 `[default_execution_limits]`：`timeout_ms` 墙钟、`wait_until_timeout_ms` 尾巴、
-`rate_limit_ops_per_sec` op 速率、`cpu_time_limit_ms` CPU 时间，另有
+`rate_limit_ops_per_sec` op 速率、`cpu_time_limit_ms` CPU 时间、
+`max_subrequests` 一次调用能打出去多少个出站请求，另有
 `default_memory_limit_mb` 一份 V8 堆上限）→ **应用收窄**（包清单的 `limits` 块，
 控制面解析一次、随部署下发给每个节点）。
 
@@ -873,8 +883,12 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
   `websocket_through_proxy_test.rs` 起一个真的 `deis-proxy` 二进制，走真实的
   HTTP Upgrade 握手连过去，`scripts/demo.sh verify` 的「websockets」一组同样从这一跳
   发起，而不是直接打节点端口。
-- **deis-control 面板认证是 API Key 且默认关闭**（`api_auth_enabled` 默认 false），
-  没有用户与角色概念。节点通道另有独立鉴权，不受它影响（§8）。
+- **deis-control 面板认证默认关闭**（`api_auth_enabled` 默认 false）。打开之后有账号、
+  角色与作用域 token：作用域写成 `<动作>:<应用>/<环境>`（动作是 read / deploy /
+  secrets / storage / admin），角色是账号上限并且每个请求重新读一遍，token 在库里只留
+  SHA-256，吊销下一个请求就生效；改状态的调用和被拒的调用都写进审计日志，控制面里没有
+  任何接口能删掉一行。配置文件里的 `api_keys` 原样继续能用，被列成「无作用域」并计数。
+  关着的时候这一整套只记录、不拦截。节点通道另有独立鉴权，不受它影响（§8）。
 
 **明确推迟**
 
@@ -901,7 +915,7 @@ SSR。
 | 环境变量 | 成立 | 控制面下发的 `env` 表注入 `context.env`，平台保留键先被取走 |
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
 | KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本 |
-| Cache API | 成立 | 标准入口是 `context.services.cache`，`globalThis.caches.default` 指向同一个实例；后端是 moka 进程内缓存，`Cache-Control` 的 `max-age` / `s-maxage` 决定过期。语义上是单 Isolate 缓存：换节点、换版本都读不到。**此前这一格是有保留的**：body 过边界是字符串，写入前先当 UTF-8 解码，`0x80..=0xff` 的字节一律变成 `ef bf bd`——`caches.default` 是每个 Isolate 自带的，一张放进去的图片会在读出来时静默损坏，没有任何报错。现已改成按字节走（`op_cache_set` 收 `#[buffer] JsBuffer`，`op_cache_get` 答 `ToJsBuffer`），status/headers 仍是文本，因为那部分确实是文本 |
+| Cache API | 成立 | 标准入口是 `context.services.cache`，`globalThis.caches.default` 指向同一个实例；`caches.open(name)` 另开一个互不串门的命名空间（键在 Rust 侧按名字长度前缀合成，两个名字不可能撞在一起）；`caches.scope` 把这个 store 的身份和起始时刻交给应用，好让它分清「这一条被淘汰了」和「整个 store 换了一个」——后者才是发版那天会让应用重做已经做过的事的那一种。后端是 moka 进程内缓存，`Cache-Control` 的 `max-age` / `s-maxage` 决定过期。语义上是单 Isolate 缓存：换节点、换版本都读不到。**此前这一格是有保留的**：body 过边界是字符串，写入前先当 UTF-8 解码，`0x80..=0xff` 的字节一律变成 `ef bf bd`——`caches.default` 是每个 Isolate 自带的，一张放进去的图片会在读出来时静默损坏，没有任何报错。现已改成按字节走（`op_cache_set` 收 `#[buffer] JsBuffer`，`op_cache_get` 答 `ToJsBuffer`），status/headers 仍是文本，因为那部分确实是文本 |
 | 生命周期 `waitUntil` | 成立 | `runtime.js` 的 `__deis_runtime_wait_until_all` |
 | 结构化日志 | 成立 | 环形缓冲 + `LogShipper` → deis-telemetry，`Query` 能查回来 |
 | Web 标准 | 成立（8.1 节的部分） | 见下方「Web 标准这一格的实情」 |

@@ -35,17 +35,24 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     // the whole point: after the rollback the previous pointer is only
     // findable in the history, and "rolled back from what?" is the first
     // question anyone asks.
-    let before = session
+    let before = match session
         .control
         .current_deployment(&app, &environment)
         .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "environment {environment} of app {app} has never been deployed, so there is \
-                 nothing to roll back to. Deploy a version first with `deis deploy -e \
-                 {environment}`."
-            )
-        })?;
+    {
+        crate::platform::EnvironmentView::Running(deployment) => *deployment,
+        crate::platform::EnvironmentView::NeverDeployed => bail!(
+            "environment {environment} of app {app} has never been deployed, so there is nothing \
+             to roll back to. Deploy a version first with `deis deploy -e {environment}`."
+        ),
+        // The refusal is worth its own sentence: the environment may well be
+        // deployed, and what is missing is authority rather than a version.
+        crate::platform::EnvironmentView::NotPermitted => bail!(
+            "this credential may not look at {environment} of app {app}, so it cannot roll it \
+             back either. It would need a scope covering deploy:{app}/{environment}; ask an owner \
+             of the platform for one."
+        ),
+    };
 
     if let Some(number) = args.to
         && number == before.version.number

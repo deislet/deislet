@@ -1,10 +1,13 @@
 pub mod apps;
+pub mod audit;
+pub mod authz;
 pub mod catalog;
 pub mod commands;
 pub mod configs;
 pub mod error;
 pub mod events;
 pub mod grpc;
+pub mod identity;
 pub mod metrics;
 pub mod middleware;
 pub mod nodes;
@@ -22,12 +25,14 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{error, info, warn};
 
 use crate::{
+    audit::AuditStore,
     catalog::{BundleStore, CatalogStore, SecretsBackend},
     command::CommandExecutor,
     config::ControlConfig,
     config_manager::ConfigManager,
     database::Database,
     delivery::{DeploymentDeliverer, PublicAddress, StorageWiring},
+    identity::IdentityStore,
     metrics::MetricsCollector,
     runtime_client::RuntimeNodeManager,
     session::SessionManager,
@@ -42,6 +47,12 @@ pub struct AppState {
 pub struct ApiRouter {
     pub router: Router,
     pub auth_config: middleware::AuthConfig,
+    /// Accounts, scopes and the audit log, as the gate in front of the human
+    /// API sees them. Handed back so the binary can complete the startup that
+    /// needs a running async runtime - recording the configured `api_keys`,
+    /// minting a first credential when there is none, and saying out loud how
+    /// many credentials are still unscoped. See [`announce_authorization`].
+    pub authz: authz::AuthzState,
     /// The node channel's credential, reported at startup next to the API
     /// key so an operator sees both, rather than only the one that
     /// `api_auth_enabled` controls.
@@ -101,6 +112,24 @@ pub fn build_api_router(
     );
 
     let auth_config = middleware::AuthConfig::from_control_config(&config);
+
+    // One gate for the whole human surface. It resolves the credential into
+    // an account, checks the scope the route needs, and writes the audit
+    // line - so a route cannot be mounted here without all three.
+    let identity = Arc::new(IdentityStore::new(Arc::clone(&database)));
+    let audit_store = Arc::new(AuditStore::new(Arc::clone(&database)));
+    let authz_state = authz::AuthzState {
+        enforced: config.api_auth_enabled,
+        config_keys: Arc::new(config.api_keys.clone()),
+        identity: Arc::clone(&identity),
+        audit: Arc::clone(&audit_store),
+    };
+    let identity_state = identity::IdentityApiState {
+        identity: Arc::clone(&identity),
+    };
+    let audit_api_state = audit::AuditApiState {
+        audit: Arc::clone(&audit_store),
+    };
 
     let protected_routes = Router::new()
         // Not "/api/nodes": that prefix belongs to the endpoints nodes
@@ -175,12 +204,29 @@ pub fn build_api_router(
         .route("/api/runtime/:node/status", get(apps::node_status))
         .route("/api/runtime/:node/apps/:app_id", delete(apps::unload_app))
         .with_state(apps_state)
+        // Accounts and tokens: how authority is handed out and taken back.
+        .route(
+            "/api/accounts",
+            get(identity::list_accounts).post(identity::create_account),
+        )
+        .route(
+            "/api/accounts/:name",
+            get(identity::get_account).patch(identity::update_account),
+        )
+        .route("/api/accounts/:name/tokens", post(identity::create_token))
+        .route("/api/tokens", get(identity::list_tokens))
+        .route("/api/tokens/:id", delete(identity::revoke_token))
+        .with_state(identity_state)
+        // Read only, and no companion that could remove a line: the audit
+        // log has no delete anywhere in this process.
+        .route("/api/audit", get(audit::read_audit))
+        .with_state(audit_api_state)
         // The catalog brings its own state, so it is merged as a
         // finished router rather than threaded through the chain above.
         .merge(catalog::router(catalog_state.clone()))
         .layer(axum_middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::api_key_auth,
+            authz_state.clone(),
+            authz::authorize,
         ));
 
     // The endpoints nodes call carry their own authentication and must not be
@@ -217,9 +263,60 @@ pub fn build_api_router(
     ApiRouter {
         router: app,
         auth_config,
+        authz: authz_state,
         node_auth,
         tls_enabled,
     }
+}
+
+/// Finish the parts of startup that need the database.
+///
+/// Three things, in this order, all of them so an operator can see what their
+/// control plane will accept before the first request arrives:
+///
+/// 1. every `api_keys` entry gets a row, so `deis token list` shows the flat
+///    keys next to the scoped ones and says which are unscoped; a key that
+///    left the file has its row marked revoked, because the file is the
+///    authority for those;
+/// 2. a control plane that demands authentication and has no credential at
+///    all mints one owner token and prints it once - that combination used to
+///    be a control plane nobody could get into;
+/// 3. the count of unscoped credentials is said out loud, because driving it
+///    to zero is what adopting this model means.
+pub async fn announce_authorization(authz: &authz::AuthzState) {
+    let configured = match authz.identity.sync_config_keys(&authz.config_keys).await {
+        Ok(count) => count,
+        Err(e) => {
+            error!(
+                error = %e,
+                "Could not record this control plane's api_keys; they still authenticate, because they are checked against the configuration file, but `deis token list` will not show them and audit lines will name the key rather than an account"
+            );
+            authz.config_keys.len()
+        }
+    };
+
+    if authz.enforced {
+        match authz.identity.ensure_bootstrap_credential(configured).await {
+            Ok(Some(secret)) => warn!(
+                "api_auth_enabled is on and this control plane had no credential at all, so an                  owner token was minted and is printed here once:\n\n    {secret}\n\nStore it                  now - it is kept only as a SHA-256 and cannot be shown again. Use it to create                  accounts and scoped tokens (`deis account create`, `deis token create`), then                  revoke it with `deis token revoke`."
+            ),
+            Ok(None) => {}
+            Err(e) => error!(
+                error = %e,
+                "Could not mint a first credential; if this control plane has no api_keys and no token either, every call to the human API is refused and there is no way in short of adding an api_keys entry to the configuration file"
+            ),
+        }
+    }
+
+    let unscoped = authz.identity.unscoped_count().await.unwrap_or_else(|e| {
+        warn!(
+            error = %e,
+            "Could not count the unscoped credentials; the number below is reported as zero and may not be"
+        );
+        0
+    });
+    authz::log_authorization_ready(authz.enforced, configured, unscoped);
+    authz.audit.announce().await;
 }
 
 /// Assemble the state every catalog endpoint shares.
@@ -429,11 +526,13 @@ pub fn log_api_ready(
 
     if auth_config.enabled {
         info!(
-            "🔐 API key: ENABLED ({} keys configured)",
+            "🔐 Human API: AUTHENTICATED - accounts and scoped tokens, plus {} unscoped api_keys entries from the configuration file (`deis token list`)",
             auth_config.api_keys.len()
         );
     } else {
-        info!("⚠️  API key: DISABLED (the dashboard and the human API are public)");
+        info!(
+            "⚠️  Human API: OPEN (api_auth_enabled is off, so the dashboard and every catalog route are public; accounts and scopes are recorded and not enforced)"
+        );
     }
     // Said separately because it is a separate credential: this one is not
     // governed by api_auth_enabled, and it is the one that guards secrets.
@@ -499,6 +598,7 @@ pub async fn start_api_server(
     );
 
     let addr = format!("0.0.0.0:{}", port);
+    announce_authorization(&api.authz).await;
     log_api_ready(
         port,
         api.tls_enabled,

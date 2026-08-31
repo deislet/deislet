@@ -3,6 +3,7 @@
 pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 
 pub mod api;
+pub mod audit;
 pub mod catalog;
 pub mod command;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod config_manager;
 pub mod database;
 pub mod delivery;
 pub mod handler;
+pub mod identity;
 pub mod message;
 pub mod metrics;
 pub mod runtime_client;
@@ -19,6 +21,7 @@ pub mod session;
 pub mod shutdown;
 pub mod tls;
 
+pub use audit::{AuditEntry, AuditQuery, AuditRecord, AuditStore, Outcome as AuditOutcome};
 pub use catalog::{
     App, Assignment, BundleManifest, BundleStore, CatalogError, CatalogStore, DeployedVersion,
     Deployment, Environment, Route, SecretCipher, SecretsBackend, Version,
@@ -35,6 +38,9 @@ pub use delivery::{
     RemovalReport,
 };
 pub use handler::MessageHandler;
+pub use identity::{
+    Account, ApiToken, Authority, Demand, IdentityStore, Principal, Role, Scope, Verb,
+};
 pub use message::{
     AuthData, AuthResponse, ConfigUpdateAck, ConfigUpdateMessage, HeartbeatAck, HeartbeatRequest,
     Message, MessageType, NodeInfo, NodeRole, RegisterRequest, RegisterResponse,

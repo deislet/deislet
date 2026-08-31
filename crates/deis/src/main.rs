@@ -397,6 +397,159 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Manage the accounts that may call this platform.
+    ///
+    /// An account is what an audit line blames, and its role is the ceiling
+    /// on everything its tokens may do. Needs a credential carrying
+    /// `admin:*/*`.
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
+
+    /// Mint, list and revoke the credentials accounts call with.
+    ///
+    /// A minted secret is printed once and stored only as a digest, so a
+    /// control plane cannot show it again. Needs `admin:*/*`.
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+
+    /// Read what was done to this platform, by whom, and how it ended.
+    ///
+    /// Every deploy, rollback, secret change, token mint, account change and
+    /// route change is here, refusals included. Needs `admin:*/*`.
+    Audit {
+        #[command(flatten)]
+        format: Format,
+
+        /// Only this application.
+        #[arg(short = 'a', long, value_name = "APP")]
+        app: Option<String>,
+
+        /// Only this environment.
+        #[arg(short = 'e', long, value_name = "NAME")]
+        environment: Option<String>,
+
+        /// Only what this account did.
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
+
+        /// Only this operation, as the log names it: deploy, rollback,
+        /// secret.write, token.mint, storage_token.mint.
+        #[arg(long, value_name = "NAME")]
+        action: Option<String>,
+
+        /// Only accepted, refused or failed calls.
+        #[arg(long, value_name = "OUTCOME")]
+        outcome: Option<String>,
+
+        /// Only the last this many minutes.
+        #[arg(long, value_name = "MINUTES")]
+        since: Option<i64>,
+
+        /// Most lines to print, newest first.
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccountAction {
+    /// List every account and the role that caps its credentials.
+    List {
+        #[command(flatten)]
+        format: Format,
+    },
+
+    /// Create an account.
+    Create {
+        #[command(flatten)]
+        format: Format,
+
+        /// Name, as every audit line will print it.
+        name: String,
+
+        /// owner, maintainer, deployer or viewer. Required rather than
+        /// defaulted: the difference between viewer and owner is the point.
+        #[arg(long)]
+        role: String,
+    },
+
+    /// Change an account's role, or switch it off and back on.
+    Update {
+        #[command(flatten)]
+        format: Format,
+
+        /// Account to change.
+        name: String,
+
+        /// New role. Applies to every token this account already holds, at
+        /// their next request.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Refuse every token of this account without revoking any of them.
+        #[arg(long)]
+        disable: bool,
+
+        /// Undo `--disable`, restoring exactly the same credentials.
+        #[arg(long)]
+        enable: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// Mint a credential for an account. Its secret is printed once.
+    Create {
+        #[command(flatten)]
+        format: Format,
+
+        /// Which account it belongs to.
+        #[arg(long)]
+        account: String,
+
+        /// What it is for, in a word: ci-preview, alice-laptop. Printed in
+        /// every listing, so it is how a person decides which one to revoke.
+        name: String,
+
+        /// One scope, as `<verb>:<app>/<environment>` - for instance
+        /// `deploy:myapp/preview`. Repeatable. Leave it out and the token
+        /// gets its account's role over every application.
+        #[arg(long = "scope", value_name = "SCOPE")]
+        scopes: Vec<String>,
+
+        /// Mint a credential subject to no scope at all - the old flat
+        /// api_keys behaviour. Refused together with --scope.
+        #[arg(long)]
+        unscoped: bool,
+    },
+
+    /// List the credentials this platform knows about.
+    List {
+        #[command(flatten)]
+        format: Format,
+
+        /// Only this account's.
+        #[arg(long)]
+        account: Option<String>,
+
+        /// Include credentials that no longer work.
+        #[arg(long)]
+        include_revoked: bool,
+    },
+
+    /// Revoke a credential. It is refused from its very next request.
+    Revoke {
+        #[command(flatten)]
+        format: Format,
+
+        /// The token's id, as `deis token list` prints it.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -972,6 +1125,59 @@ async fn run(cli: Cli) -> Result<()> {
                     limit,
                     follow,
                 },
+                format.into(),
+            )
+            .await
+        }
+
+        Commands::Account { action } => match action {
+            AccountAction::List { format } => commands::account::list(format.into()).await,
+            AccountAction::Create { format, name, role } => {
+                commands::account::create(name, role, format.into()).await
+            }
+            AccountAction::Update {
+                format,
+                name,
+                role,
+                disable,
+                enable,
+            } => commands::account::update(name, role, disable, enable, format.into()).await,
+        },
+
+        Commands::Token { action } => match action {
+            TokenAction::Create {
+                format,
+                account,
+                name,
+                scopes,
+                unscoped,
+            } => commands::token::create(account, name, scopes, unscoped, format.into()).await,
+            TokenAction::List {
+                format,
+                account,
+                include_revoked,
+            } => commands::token::list(account, include_revoked, format.into()).await,
+            TokenAction::Revoke { format, id } => commands::token::revoke(id, format.into()).await,
+        },
+
+        Commands::Audit {
+            format,
+            app,
+            environment,
+            account,
+            action,
+            outcome,
+            since,
+            limit,
+        } => {
+            commands::audit::execute(
+                app,
+                environment,
+                account,
+                action,
+                outcome,
+                since,
+                limit,
                 format.into(),
             )
             .await

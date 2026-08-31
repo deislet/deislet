@@ -352,6 +352,106 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // ------------------------------------------------------------------
+    // Who may call this API, and what everybody did.
+    //
+    // Added after the catalog and, like it, only ever created: an existing
+    // database grows these three tables on the next start and keeps every
+    // row it had. A control plane that upgrades and never creates an account
+    // authenticates exactly as it did before, against `api_keys`.
+    // ------------------------------------------------------------------
+
+    // An account is the thing an audit line blames. `role` is a ceiling on
+    // what any of its tokens may do and is re-read on every request, so
+    // changing it narrows credentials that already exist.
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS accounts (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL UNIQUE,
+            role        TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            disabled_at INTEGER
+        )
+        "#,
+        [],
+    )?;
+
+    // One credential. `secret_hash` is SHA-256 of the token's secret half
+    // and is the only thing about a minted token that is written down; for
+    // an `api_keys` entry from the configuration file it is NULL, because
+    // that key is checked against the file and nothing about it belongs
+    // here. Either way a reader of this table holds no working credential.
+    //
+    // `unscoped` is a column of its own rather than "scopes is empty":
+    // an empty scope list is a token that can do nothing, and an unscoped
+    // one is a token that can do everything. Those two must never be one
+    // NULL check apart.
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id           TEXT PRIMARY KEY,
+            account_id   TEXT NOT NULL REFERENCES accounts(id),
+            name         TEXT NOT NULL,
+            origin       TEXT NOT NULL,
+            secret_hash  TEXT,
+            scopes       TEXT NOT NULL,
+            unscoped     INTEGER NOT NULL,
+            created_at   INTEGER NOT NULL,
+            last_used_at INTEGER,
+            revoked_at   INTEGER
+        )
+        "#,
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_api_tokens_account ON api_tokens(account_id)",
+        [],
+    )?;
+
+    // The audit log. Append-only by construction: nothing in this codebase
+    // updates or deletes a row, and no endpoint reaches one.
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            at               INTEGER NOT NULL,
+            actor_kind       TEXT NOT NULL,
+            actor_account    TEXT,
+            actor_credential TEXT,
+            action           TEXT NOT NULL,
+            app_id           TEXT,
+            environment      TEXT,
+            target           TEXT,
+            method           TEXT NOT NULL,
+            path             TEXT NOT NULL,
+            peer             TEXT,
+            outcome          TEXT NOT NULL,
+            status           INTEGER NOT NULL,
+            detail           TEXT
+        )
+        "#,
+        [],
+    )?;
+
+    // The three questions an operator asks after an incident: what happened
+    // to this application, what did this person do, and what was refused.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_app ON audit_log(app_id, id DESC)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_account ON audit_log(actor_account, id DESC)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_outcome ON audit_log(outcome, id DESC)",
+        [],
+    )?;
+
     info!("Database tables created successfully");
     Ok(())
 }
@@ -444,6 +544,9 @@ mod tests {
             "deployments",
             "routes",
             "secrets",
+            "accounts",
+            "api_tokens",
+            "audit_log",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
