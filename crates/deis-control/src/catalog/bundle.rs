@@ -129,7 +129,7 @@ impl BundleStore {
         // upload, rather than being dropped in silence on every node that
         // loads the bundle. The values themselves are not judged here: a node
         // owns its own ceilings and narrows anything greedier than they are.
-        let limits = super::limits::declared_limits(&manifest_json).map_err(|e| {
+        let limits = super::limits::declared_limits(&manifest).map_err(|e| {
             warn!(
                 app_id,
                 bundle_sha = %sha256,

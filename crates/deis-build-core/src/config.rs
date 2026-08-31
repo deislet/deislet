@@ -164,14 +164,48 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The ceilings a project asks to be held to, carried into the bundle
+/// manifest's `limits` block and from there to every node.
+///
+/// **Narrowing only.** A node clamps each of these against its own
+/// configuration, so a project asking for more than the node allows is held to
+/// the node's number and the node says so in its log. Asking for *less* is the
+/// use: an application that knows a request of its own should never take more
+/// than a second says so here, and a handler that goes wrong is cut off in a
+/// second instead of holding a runtime thread for the node's full ceiling.
+///
+/// Every field is optional and absent means "whatever the node allows". A
+/// misspelled one is refused rather than dropped: a limit that looks set and
+/// is not would be discovered on the day the ceiling an author believed in
+/// turned out never to have been in force.
+///
+/// The names are this file's camelCase, one for one with the snake_case the
+/// manifest and the node use - the same translation `notFound` and the queue
+/// entries already get. Both spellings are accepted here so that a manifest
+/// pasted into a project config still reads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
-    #[serde(default)]
-    pub timeout: Option<u32>,
-    #[serde(rename = "maxPayloadSize", default)]
-    pub max_payload_size: Option<usize>,
-    #[serde(rename = "maxConcurrency", default)]
-    pub max_concurrency: Option<u32>,
+    /// V8 heap ceiling for this application's isolates, in MB.
+    #[serde(rename = "memoryMb", alias = "memory_mb", default)]
+    pub memory_mb: Option<u32>,
+    /// Wall-clock ceiling for one invocation, in milliseconds.
+    #[serde(rename = "timeoutMs", alias = "timeout_ms", default)]
+    pub timeout_ms: Option<u64>,
+    /// Ceiling on the rate at which this application's code may dispatch ops.
+    #[serde(
+        rename = "rateLimitOpsPerSec",
+        alias = "rate_limit_ops_per_sec",
+        default
+    )]
+    pub rate_limit_ops_per_sec: Option<f64>,
+    /// CPU-time ceiling for one invocation, in milliseconds.
+    #[serde(rename = "cpuTimeLimitMs", alias = "cpu_time_limit_ms", default)]
+    pub cpu_time_limit_ms: Option<u64>,
+    /// How many entries this application's isolate may hold in its resource
+    /// table at once.
+    #[serde(rename = "resourceTableMax", alias = "resource_table_max", default)]
+    pub resource_table_max: Option<u32>,
 }
 
 #[cfg(test)]

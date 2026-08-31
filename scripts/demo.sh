@@ -52,6 +52,37 @@ ORIGIN_BODY="the-demo-origin-answered"
 # "did it throw?" test; it does not pass this one.
 DEISLET_SHA256="939a37e7f6ca53c6b3ba5ee5e748b1cc5dda0fe3b8d5ad6d428ab3bb5961c405"
 
+# What the example app's .config.json asks to be held to, and what the staged
+# copy of the second version is rewritten to ask for.
+#
+# The first is a narrowing: 1000ms is far below the node's own ceiling, so the
+# node applies it and a handler that overruns is cut off at the app's number
+# rather than at the node's. The second is the opposite request - ten minutes,
+# which no node here allows - and it exists so that `verify` can watch the
+# clamp refuse it. An application may ask to be held to less and never to
+# more; without a version that asks for more, nothing would ever exercise the
+# half of that sentence which is a security property.
+APP_TIMEOUT_MS="${APP_TIMEOUT_MS:-1000}"
+GREEDY_TIMEOUT_MS="${GREEDY_TIMEOUT_MS:-600000}"
+
+# Paths in the example app's static site that `verify` asserts on. They live
+# here rather than inline so the file the app ships and the check that reads it
+# name the same thing in one place.
+#
+# scripts/demo-assets/example-app/public/_redirects sends the first to the
+# second with a 301; public/_headers puts a year-long Cache-Control on
+# everything under /css/; and no file, no rule and no function route claims
+# SITE_MISSING_PATH, which is what makes it the path the app's not-found
+# behaviour answers.
+SITE_OLD_PATH="/old-home"
+SITE_REDIRECT_TARGET="/index.html"
+SITE_STYLESHEET="/css/app.css"
+SITE_STYLESHEET_CACHE_CONTROL="public, max-age=31536000, immutable"
+SITE_MISSING_PATH="/no-such-page"
+# A marker only public/404.html carries, so a check cannot mistake any other
+# 404 - the node's own, a handler's - for the page the bundle ships.
+SITE_NOT_FOUND_MARKER="the-bundles-own-404-page"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -311,6 +342,7 @@ DEIS_STORE_CONFIG=$DEIS_STORE_CONFIG
 DEIS_QUEUE_CONFIG=$DEIS_QUEUE_CONFIG
 DEIS_TELEMETRY_CONFIG=$DEIS_TELEMETRY_CONFIG
 SECRET=$SECRET
+API_KEY=$API_KEY
 STORAGE_AUTH_SECRET=$STORAGE_AUTH_SECRET
 SECRET_KEY_FILE=$SECRET_KEY_FILE
 APP_ID=$APP_ID
@@ -492,6 +524,16 @@ control_url() {
   echo "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 }
 
+# GET one of the control plane's human endpoints, presenting the API key.
+#
+# Used only where there is no CLI command for the question - the fleet view is
+# an operator's, not a developer's. Everything a developer does goes through
+# `deis`. The key is required now that `start` turns `api_auth_enabled` on, so
+# a caller that forgets it gets 401 rather than an answer.
+control_api() {
+  curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)$1"
+}
+
 # Run the developer CLI the way a developer would.
 #
 # Every deployment step below goes through this rather than through curl
@@ -522,6 +564,12 @@ deis_cli_env() {
     "DEIS_APP=${APP_ID}"
     "DEIS_ENVIRONMENT=${ENV_NAME}"
     "DEIS_CONFIG_HOME=${DEMO_DIR}/deis-config"
+    # The control plane requires it now, so the CLI has to carry it. In the
+    # environment rather than in a credentials file for the reason the endpoint
+    # is: the demo's key is minted at start time and a file committed to the
+    # repository cannot know it. A person stores theirs with
+    # `deis config set control.token`.
+    "DEIS_CONTROL_TOKEN=${API_KEY}"
   )
 }
 
@@ -548,8 +596,17 @@ prepare_app_source() {
   # Version 2 differs in two places, one on each side of the asset-first
   # split: the label a handler returns, and the static file itself. A
   # rollback has to bring both back.
+  #
+  # It also asks for a wall-clock ceiling ten minutes long, where the app's
+  # own sources ask for one second. That is the greedy direction, which no
+  # application is allowed to move in: the node clamps it back to its own
+  # ceiling and says so. The preview environment is deployed from this tree,
+  # so the demo runs one environment that narrowed its limits and one that
+  # tried to widen them, side by side on the same node.
   if [ "$label" != "v1" ]; then
     sed -i "s/\"BUILD_LABEL\": \"v1\"/\"BUILD_LABEL\": \"${label}\"/" "$dest/.config.json"
+    sed -i "s/\"timeoutMs\": ${APP_TIMEOUT_MS}/\"timeoutMs\": ${GREEDY_TIMEOUT_MS}/" \
+      "$dest/.config.json"
     sed -i "s/data-label=\"v1\"/data-label=\"${label}\"/" "$dest/public/index.html"
   fi
 
@@ -803,6 +860,16 @@ start_demo() {
   # what it looks like when only some of the three carry it.
   STORAGE_AUTH_SECRET=${STORAGE_AUTH_SECRET:-$(generate_secret)}
 
+  # The credential a person - the `deis` CLI, a dashboard - presents to the
+  # control plane's human API. A third value, and a third channel: SECRET
+  # authenticates a *node*, STORAGE_AUTH_SECRET authenticates a *storage call*,
+  # and this one authenticates *a caller who may deploy*. It is generated
+  # rather than left out because `api_auth_enabled` defaults to off, and a demo
+  # that left it off would leave every catalog route - the deploy, the version
+  # upload, the storage-token mint - open to anyone who can reach the port,
+  # while looking exactly like one where authentication works.
+  API_KEY=${API_KEY:-$(generate_secret)}
+
   # The master key that encrypts environment secrets. 32 bytes as 64 hex
   # characters, which is what `openssl rand -hex 32` produces. It never enters
   # the database and is never logged; without it every secret endpoint answers
@@ -851,6 +918,8 @@ start_demo() {
     cat > "$DEIS_CONTROL_CONFIG" <<EOF
 bind_addr = "0.0.0.0"
 port = ${DEIS_CONTROL_PORT}
+api_auth_enabled = true
+api_keys = ["${API_KEY}"]
 heartbeat_interval = 30
 heartbeat_timeout = 90
 node_preshared_keys = ["${SECRET}"]
@@ -1165,6 +1234,26 @@ http_status() {
   head -n 1 "$1" | tr -d '\r' | awk '{print $2}'
 }
 
+# The node's log with the terminal colouring taken out.
+#
+# tracing writes its field names and values wrapped in ANSI escapes when the
+# log is a file as much as when it is a terminal, so `keys=["ASSETS"]` on the
+# page is `keys` ESC [0m ESC [2m = ... in the bytes. A grep for what the line
+# says has to read what a person reads.
+node_log() {
+  sed 's/\x1b\[[0-9;]*m//g' "${LOG_DIR}/deis-runtime.log"
+}
+
+# What one log line says, without the timestamp, level, thread, tracing span
+# and trailing key=value fields around it.
+#
+# Quoting the node's own sentence is the point of the checks that read the log
+# - the numbers in it are the node's, not this script's idea of them - and a
+# quotation is only readable if it is the sentence rather than the whole line.
+log_message() {
+  sed 's/^[^ ]* *[A-Z]* *ThreadId([0-9]*) //; s/^request{[^}]*}: //; s/ app_id=.*//'
+}
+
 # base64(HMAC-SHA256(STORAGE_AUTH_SECRET, tenant)) - the identical
 # construction deis_wire::conventions::storage_token uses on every side of
 # the storage wire (crates/deis-wire/src/conventions.rs), so a call made with
@@ -1215,6 +1304,175 @@ check_static_asset() {
   else
     fail_check "If-None-Match on that ETag answers 304 with no body" \
       "got HTTP ${code} with ${length} bytes"
+  fi
+}
+
+# ----------------------------------------------------------------------
+# What a version's static site says about itself
+# ----------------------------------------------------------------------
+#
+# `_redirects`, `_headers` and the not-found behaviour are three files' worth
+# of behaviour an author gets without writing a function. They are parsed when
+# the bundle is built, travel in the manifest, are compiled once when the
+# version loads, and are applied by the HTTP entry before an isolate is
+# started - so every check below is answered without one.
+#
+# The example app ships all three (scripts/demo-assets/example-app/public).
+# Nothing else in this file would notice if the entry went back to a plain
+# index lookup: every other asset check asks for a path that names a real
+# file, which a lookup answers on its own.
+
+check_site_redirect() {
+  local title="a _redirects rule answers with a redirect, and the query rides along"
+  local headers="${LOG_DIR}/verify-site-redirect.headers"
+  # A query the target does not carry one of its own, so what arrives at the
+  # target can only have come from the request. A rule that dropped it would
+  # land a campaign link on the new page with the tracking the author was
+  # counting gone, and the redirect would still look correct.
+  local query="ref=demo-campaign"
+
+  app_request "$headers" "${SITE_OLD_PATH}?${query}" > /dev/null
+
+  local status location
+  status=$(http_status "$headers")
+  location=$(header_value "$headers" Location)
+
+  local expected="${SITE_REDIRECT_TARGET}?${query}"
+  if [ "$status" = "301" ] && [ "$location" = "$expected" ]; then
+    pass_check "$title" \
+      "GET ${SITE_OLD_PATH}?${query} answered HTTP ${status} with location: ${location}, without starting an isolate. 301 and not the 302 a two-field rule defaults to, because the rule in _redirects carries a third field"
+  else
+    fail_check "$title" \
+      "GET ${SITE_OLD_PATH}?${query} answered HTTP ${status} with location '${location:-<none>}'; expected HTTP 301 to ${expected}"
+  fi
+}
+
+check_site_headers() {
+  local title="a _headers block puts its header on the asset it names"
+  local styled="${LOG_DIR}/verify-site-headers-css.headers"
+  local plain="${LOG_DIR}/verify-site-headers-root.headers"
+
+  app_request "$styled" "$SITE_STYLESHEET" > /dev/null
+  app_request "$plain" "/" > /dev/null
+
+  local styled_cache plain_cache referrer
+  styled_cache=$(header_value "$styled" Cache-Control)
+  plain_cache=$(header_value "$plain" Cache-Control)
+  referrer=$(header_value "$styled" Referrer-Policy)
+
+  # Two files, not one. A node that applied every block to every response
+  # would put the year-long Cache-Control on the HTML too, and asking only
+  # about the stylesheet could not tell that apart from the block matching the
+  # path it names.
+  if [ "$styled_cache" = "$SITE_STYLESHEET_CACHE_CONTROL" ] \
+    && [ -n "$referrer" ] \
+    && [ "$plain_cache" != "$SITE_STYLESHEET_CACHE_CONTROL" ]; then
+    pass_check "$title" \
+      "GET ${SITE_STYLESHEET} carries cache-control: ${styled_cache} from the /css/* block and referrer-policy: ${referrer} from the /* block above it; GET / matches only the second and keeps the node's own cache-control: ${plain_cache}"
+  else
+    fail_check "$title" \
+      "expected ${SITE_STYLESHEET} to carry cache-control: ${SITE_STYLESHEET_CACHE_CONTROL} and a referrer-policy, and / to keep the node's default; got '${styled_cache:-<none>}' and '${referrer:-<none>}' on the stylesheet, '${plain_cache:-<none>}' on /"
+  fi
+}
+
+check_site_not_found() {
+  local title="a path naming no file falls back the way the app configured"
+  local headers="${LOG_DIR}/verify-site-404.headers"
+  local body
+  body=$(app_request "$headers" "$SITE_MISSING_PATH")
+
+  local status
+  status=$(http_status "$headers")
+
+  if [ "$status" = "404" ] && echo "$body" | grep -q "$SITE_NOT_FOUND_MARKER"; then
+    pass_check "$title" \
+      "GET ${SITE_MISSING_PATH} answered HTTP ${status} with the bundle's own 404.html - it carries ${SITE_NOT_FOUND_MARKER}, which nothing else does. The project asks for \"notFound\": \"404-page\", so that page is served instead of the isolate's plain \"Not Found\"; a path a function route claims is still handed to the isolate, which is why /hello/world answers from the handler and not from here"
+  else
+    fail_check "$title" \
+      "GET ${SITE_MISSING_PATH} answered HTTP ${status} with a body that does not carry ${SITE_NOT_FOUND_MARKER}: $(echo "$body" | tr '\n' ' ' | head -c 200)"
+  fi
+}
+
+# ----------------------------------------------------------------------
+# env.ASSETS
+# ----------------------------------------------------------------------
+#
+# The other half of asset-first: the entry answers a request for a file
+# before an isolate exists, and this is the way back in for the handler that
+# ran anyway and wants the asset layer's answer for a path of its own.
+#
+# functions/api/asset.ts reports what `context.env.ASSETS` actually is as well
+# as what it answered, which is what lets the second check below tell a
+# working binding from a string the application put there.
+
+check_assets_binding() {
+  local title="env.ASSETS.fetch() answers a handler with this version's own file"
+  local body
+  body=$(app_request "${LOG_DIR}/verify-assets-binding.headers" \
+    "/api/asset?path=${SITE_STYLESHEET}")
+  answered_json "$title" assets-binding "$body" || return
+
+  local status ctype got reported_bytes
+  status=$(echo "$body" | jq -r '.status // empty' 2>/dev/null || true)
+  ctype=$(echo "$body" | jq -r '.contentType // empty' 2>/dev/null || true)
+  got=$(echo "$body" | jq -r '.body // empty' 2>/dev/null || true)
+  # What the handler measured on its side of the boundary, which is the one
+  # number a shell cannot fake: `$(...)` eats a trailing newline, so a
+  # comparison of the text alone would accept an answer one byte short.
+  reported_bytes=$(echo "$body" | jq -r '.bytes // empty' 2>/dev/null || true)
+
+  # The bytes on disk, from the tree this version was built from. Comparing
+  # digests rather than eyeballing a prefix: a binding that answered with the
+  # right content type and half the file would pass anything looser.
+  local file="${DEMO_DIR}/app-v1/public${SITE_STYLESHEET}"
+  local expected want_digest got_digest on_disk_bytes
+  expected=$(cat "$file" 2>/dev/null || true)
+  on_disk_bytes=$(wc -c < "$file" 2>/dev/null | tr -d ' ' || true)
+  want_digest=$(printf '%s' "$expected" | openssl dgst -sha256 | awk '{print $NF}' | cut -c1-12)
+  got_digest=$(printf '%s' "$got" | openssl dgst -sha256 | awk '{print $NF}' | cut -c1-12)
+
+  if [ -z "$expected" ]; then
+    fail_check "$title" \
+      "the staged source tree has no ${file}, so there is nothing to compare the binding's answer against"
+    return
+  fi
+
+  if [ "$status" = "200" ] && [ "$got" = "$expected" ] \
+    && [ "$reported_bytes" = "$on_disk_bytes" ]; then
+    pass_check "$title" \
+      "the handler called env.ASSETS.fetch(\"${SITE_STYLESHEET}\") and got HTTP ${status}, content-type ${ctype} and ${reported_bytes} bytes - the size of ${file} on disk - whose text has sha256 ${got_digest}, the digest of that file. Nothing was fetched over the network: those bytes have been in the node's memory since the version loaded"
+  else
+    fail_check "$title" \
+      "env.ASSETS.fetch(\"${SITE_STYLESHEET}\") answered HTTP ${status:-<none>} with ${reported_bytes:-0} bytes and sha256 ${got_digest:-<none>}; expected 200 with ${on_disk_bytes:-0} bytes and ${want_digest} (the packaged file)"
+  fi
+}
+
+check_assets_binding_is_not_shadowable() {
+  local title="an application declaring ASSETS in its own env does not get its string"
+  local body
+  body=$(app_request "${LOG_DIR}/verify-assets-shadow.headers" "/api/asset")
+  answered_json "$title" assets-shadow "$body" || return
+
+  local kind callable leaked
+  kind=$(echo "$body" | jq -r '.bindingKind // empty' 2>/dev/null || true)
+  callable=$(echo "$body" | jq -r '.bindingIsCallable // false' 2>/dev/null || true)
+  leaked=$(echo "$body" | jq -r '.declaredValueVisible // empty' 2>/dev/null || true)
+
+  # The node's own account of what it did with the key, which is the half a
+  # response cannot show: an application that never declared ASSETS would
+  # produce the same JSON above.
+  local dropped
+  dropped=$(node_log \
+    | grep -m 1 'named like reserved platform keys' \
+    | grep 'ASSETS' || true)
+
+  if [ "$kind" = "object" ] && [ "$callable" = "true" ] && [ -z "$leaked" ] \
+    && [ -n "$dropped" ]; then
+    pass_check "$title" \
+      "the bundle's manifest declares an ordinary variable called ASSETS; the node dropped it before the map became context.env ($(echo "$dropped" | sed 's/.*keys=/keys=/')), and inside the isolate env.ASSETS is an ${kind} whose fetch() is a function, not the string the application shipped"
+  else
+    fail_check "$title" \
+      "env.ASSETS is a ${kind:-<none>} (callable: ${callable}), the application's own value is $(if [ -n "$leaked" ]; then echo "visible as '${leaked}'"; else echo "not visible"; fi), and the node's log $(if [ -n "$dropped" ]; then echo "reports the key dropped"; else echo "never reports dropping a reserved key"; fi)"
   fi
 }
 
@@ -1598,6 +1856,93 @@ check_storage_capability_token() {
   fi
 }
 
+# ----------------------------------------------------------------------
+# The credential `deis kv`, `deis db` and `deis blob` act with
+# ----------------------------------------------------------------------
+#
+# deis-store authorises a call by the tenant it names and the capability token
+# it presents. A deployment already carries one, which is how an application
+# reaches its own data; a person has none, which is why the control plane
+# mints one on
+# GET /api/apps/:app_id/environments/:env/storage-token. Without that route
+# the three data commands have nothing to authenticate with and every one of
+# them fails at the first call.
+
+check_data_cli_reads_the_apps_write() {
+  local title="deis kv reads back the value the application wrote"
+  local key="cli-kv-$$-${RANDOM}"
+  local value="written-by-the-handler-read-by-the-cli"
+  local headers="${LOG_DIR}/verify-cli-kv.headers"
+
+  # Written through the application, not through the CLI: the point is that
+  # the two arrive at the same row, so the write has to come from the side
+  # that is not being tested.
+  curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+    --data-binary "$value" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/${key}"
+  if [ "$(http_status "$headers")" != "201" ]; then
+    fail_check "$title" \
+      "the handler could not store ${key}: HTTP $(http_status "$headers")"
+    return
+  fi
+
+  local out="${LOG_DIR}/cli-kv-get.json"
+  if ! deis_cli kv get "$key" --json > "$out" 2> "${LOG_DIR}/cli-kv-get.log"; then
+    fail_check "$title" \
+      "deis kv get ${key} failed: $(tail -n 3 "${LOG_DIR}/cli-kv-get.log" | tr '\n' ' ')"
+    return
+  fi
+
+  # A KV value is whatever bytes an application wrote, so `--json` carries it
+  # base64 rather than as text it might not be. Decoding before comparing is
+  # what makes this a check on the bytes instead of on their encoding.
+  local tenant found read_back
+  tenant=$(jq -r '.tenant // empty' < "$out" 2>/dev/null || true)
+  found=$(jq -r '.found // false' < "$out" 2>/dev/null || true)
+  read_back=$(jq -r '.value_base64 // empty' < "$out" 2>/dev/null \
+    | openssl base64 -d -A 2>/dev/null || true)
+
+  if [ "$found" = "true" ] && [ "$read_back" = "$value" ] \
+    && [ "$tenant" = "${APP_ID}.${ENV_NAME}" ]; then
+    pass_check "$title" \
+      "the handler stored ${key} through context.services.kv; \`deis kv get\` asked the control plane for a storage token, presented it to deis-store as tenant ${tenant}, and read back \"${read_back}\" ($(printf '%s' "$read_back" | wc -c) bytes). The CLI never sees storage_auth_secret: it is handed a token for this one tenant"
+  else
+    fail_check "$title" \
+      "deis kv get ${key} reports tenant '${tenant:-<none>}', found=${found}, value '${read_back:-<none>}'; expected ${APP_ID}.${ENV_NAME} and \"${value}\""
+  fi
+}
+
+# The token is a credential that works directly against deis-store, without
+# going through this control plane at all, and it does not expire. So the
+# route that mints one is gated exactly as the deploy route is - and this is
+# the check that the gate is really there rather than being a comment about
+# one. Without it, `start` could leave api_auth_enabled off and every other
+# check in this file would pass unchanged.
+check_storage_token_requires_the_api_key() {
+  local title="the storage-token route refuses a caller with no API key"
+  local route="/api/apps/${APP_ID}/environments/${ENV_NAME}/storage-token"
+  local minted="${LOG_DIR}/verify-storage-token.json"
+
+  local anonymous authorised
+  anonymous=$(curl -s -o /dev/null -w '%{http_code}' "$(control_url)${route}")
+  authorised=$(curl -s -o "$minted" -w '%{http_code}' \
+    -H "Authorization: Bearer ${API_KEY}" "$(control_url)${route}")
+
+  local tenant endpoint token_length
+  tenant=$(jq -r '.tenant // empty' < "$minted" 2>/dev/null || true)
+  endpoint=$(jq -r '.store_endpoint // empty' < "$minted" 2>/dev/null || true)
+  token_length=$(jq -r '.token // empty' < "$minted" 2>/dev/null | tr -d '\n' | wc -c)
+
+  if [ "$anonymous" = "401" ] && [ "$authorised" = "200" ] \
+    && [ "$tenant" = "${APP_ID}.${ENV_NAME}" ] && [ "${token_length:-0}" -gt 0 ]; then
+    pass_check "$title" \
+      "GET ${route} with no credential answered HTTP ${anonymous} and no token; the same request carrying the API key answered HTTP ${authorised} with tenant ${tenant}, store_endpoint ${endpoint} and a ${token_length}-character token, which is not printed here - it reads and writes that tenant's data directly against deis-store and does not expire"
+  else
+    fail_check "$title" \
+      "anonymous GET ${route} answered HTTP ${anonymous} (expected 401) and the authenticated one HTTP ${authorised} for tenant '${tenant:-<none>}' with a ${token_length:-0}-character token (expected 200 for ${APP_ID}.${ENV_NAME})"
+  fi
+}
+
 check_queue_roundtrip() {
   local key="job-$$"
   local value="handled-by-the-queue-consumer"
@@ -1728,6 +2073,116 @@ check_environment_kv_isolation() {
     fail_check "a preview environment cannot see production's KV, or the reverse" \
       "production read \"${from_production:-<none>}\", the preview read \"${from_preview:-<none>}\", and the preview-only key answered ${absent_status} in production instead of 404"
   fi
+}
+
+# ----------------------------------------------------------------------
+# What an application may ask to be held to
+# ----------------------------------------------------------------------
+#
+# A bundle manifest can carry a `limits` block. It is read by the control
+# plane when the version is uploaded, travels to the node with the deployment,
+# and is clamped field by field against the node's own configuration when the
+# isolate is built. The direction is the whole point: an application may ask
+# to be held to *less* than the node allows and never to more.
+#
+# The demo runs both halves at once. Production is v1, whose sources ask for a
+# one-second wall clock where the node allows thirty; the preview is v2, whose
+# staged copy asks for ten minutes. One is applied, the other is refused, and
+# the two are the same application on the same node.
+
+# One request to the slow handler, answered with "<status> <seconds>".
+#
+# `%{time_total}` rather than a clock read either side of it, because what is
+# being measured is when the platform stopped the handler, and a shell's own
+# timing would add its process startup to the number being judged.
+timed_slow_request() {
+  local environment=$1
+  local ms=$2
+  curl -s -o /dev/null -w '%{http_code} %{time_total}' \
+    -H "x-deis-app-id: ${APP_ID}" -H "x-deis-environment: ${environment}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/slow?ms=${ms}"
+}
+
+check_app_limits_narrowed() {
+  local title="an application narrowing its own timeout is held to its number"
+
+  # Twice the app's ceiling and a small fraction of the node's, so the two
+  # possible outcomes are far apart: cut off at about a second means the app's
+  # number is in force, answered at about two means the node's is.
+  local over=$((APP_TIMEOUT_MS * 2))
+  local under=$((APP_TIMEOUT_MS / 5))
+
+  local overran within
+  overran=$(timed_slow_request "$ENV_NAME" "$over")
+  within=$(timed_slow_request "$ENV_NAME" "$under")
+
+  # The node's own account of the ceiling it installed, so the numbers below
+  # are the node's rather than this script's idea of them.
+  local applied_line node_default applied
+  applied_line=$(node_log \
+    | grep -m 1 "App ${APP_ID}.${ENV_NAME} narrows the default execution timeout" || true)
+  applied=$(echo "$applied_line" | sed -n 's/.*timeout: \([0-9]*\)ms.*/\1/p')
+  node_default=$(echo "$applied_line" | sed -n 's/.*platform default \([0-9]*\)ms.*/\1/p')
+
+  local cut_off_line
+  cut_off_line=$(node_log \
+    | grep -m 1 "App ${APP_ID}.${ENV_NAME} was cut off on one request" || true)
+
+  local over_status over_seconds within_status
+  over_status=${overran%% *}
+  over_seconds=${overran##* }
+  within_status=${within%% *}
+
+  if [ "$applied" = "$APP_TIMEOUT_MS" ] && [ -n "$node_default" ] \
+    && [ "$node_default" != "$APP_TIMEOUT_MS" ] \
+    && [ "$over_status" = "500" ] && [ "$within_status" = "200" ] \
+    && [ -n "$cut_off_line" ]; then
+    pass_check "$title" \
+      "the manifest asks for ${APP_TIMEOUT_MS}ms and the node's own ceiling is ${node_default}ms; the node logged \"$(echo "$applied_line" | log_message)\". GET /api/slow?ms=${over} was cut off after ${over_seconds}s with HTTP ${over_status} - under the node's ${node_default}ms it would have answered - while GET /api/slow?ms=${under} answered HTTP ${within_status}"
+  else
+    fail_check "$title" \
+      "expected the node to apply ${APP_TIMEOUT_MS}ms (it reports '${applied:-<none>}ms', platform default '${node_default:-<none>}ms'), /api/slow?ms=${over} to be cut off (got HTTP ${over_status} after ${over_seconds}s) and /api/slow?ms=${under} to answer 200 (got HTTP ${within_status}); the cut-off line was $(if [ -n "$cut_off_line" ]; then echo "present"; else echo "never written"; fi)"
+  fi
+}
+
+# The half that is a security property rather than a convenience.
+#
+# An invocation holds a runtime thread for its whole duration, so an
+# application that could set its own timeout to ten minutes could park one of
+# this node's threads for ten minutes, and every other tenant queued behind
+# that thread would wait with it. The ceiling is therefore the node's to set
+# and an application may only ask for less of it.
+#
+# The witness is the node's log, and deliberately so: what has to be shown is
+# that a number the application asked for never became the number in force,
+# and the only place both numbers appear together is the line the clamp
+# writes. Demonstrating it by request would mean a request that runs for the
+# node's full thirty seconds.
+check_app_limits_clamped() {
+  local title="an application asking for more than the node allows is held to the node's value"
+
+  local asked_line clamp_line applied narrowed
+  asked_line=$(node_log \
+    | grep -m 1 "timeout_ms=Some(${GREEDY_TIMEOUT_MS})" || true)
+  clamp_line=$(node_log \
+    | grep -m 1 "App ${APP_ID}.${PREVIEW_ENV_NAME} asks for a ${GREEDY_TIMEOUT_MS}ms execution timeout" || true)
+  applied=$(echo "$clamp_line" | sed -n "s/.*above this node's \([0-9]*\)ms ceiling.*/\1/p")
+
+  # The line that must *not* exist: "narrows" is what the node writes when it
+  # takes an application's number, so the greedy version producing one would
+  # mean the clamp had let it through.
+  narrowed=$(node_log \
+    | grep -m 1 "App ${APP_ID}.${PREVIEW_ENV_NAME} narrows the default execution timeout: ${GREEDY_TIMEOUT_MS}ms" || true)
+
+  if [ -n "$asked_line" ] && [ -n "$applied" ] \
+    && [ "$applied" != "$GREEDY_TIMEOUT_MS" ] && [ -z "$narrowed" ]; then
+    pass_check "$title" \
+      "the ${PREVIEW_ENV_NAME} version's manifest reached the node asking for timeout_ms=${GREEDY_TIMEOUT_MS}, and the node answered \"$(echo "$clamp_line" | log_message | sed 's/\. An invocation.*//')\". ${applied}ms is the number in force; no line says this environment narrowed anything, because it did not"
+    return
+  fi
+
+  fail_check "$title" \
+    "expected the node to log that ${APP_ID}.${PREVIEW_ENV_NAME} asked for ${GREEDY_TIMEOUT_MS}ms and was held to its own ceiling; the deployment line was $(if [ -n "$asked_line" ]; then echo "present"; else echo "absent"; fi), the clamp reports applying '${applied:-<none>}ms', and a \"narrows\" line for ${GREEDY_TIMEOUT_MS}ms was $(if [ -n "$narrowed" ]; then echo "written, so the request was granted"; else echo "absent"; fi)"
 }
 
 # Which version an environment is on right now, straight from the control
@@ -2218,7 +2673,7 @@ check_node_registration() {
 
   # No CLI command covers the fleet, so this reads the control plane's own
   # view of it. That is an operator question, not a deployment step.
-  curl -s "$(control_url)/api/runtime" > "$fleet" 2>/dev/null || true
+  control_api /api/runtime > "$fleet" 2>/dev/null || true
 
   local registered addr configured_addr
   registered=$(jq -r --arg id "$NODE_ID" \
@@ -2289,7 +2744,7 @@ check_dynamic_node_registration() {
     return
   fi
 
-  curl -s "$(control_url)/api/runtime" > "$fleet" 2>/dev/null || true
+  control_api /api/runtime > "$fleet" 2>/dev/null || true
 
   local source registered_at
   source=$(jq -r --arg id "$dynamic_id" \
@@ -2304,6 +2759,188 @@ check_dynamic_node_registration() {
     fail_check "$title" \
       "PUT .../registration for ${dynamic_id} answered HTTP ${status}, but the fleet shows source='${source:-<absent>}' registered_at='${registered_at:-<none>}' instead of a registered entry"
   fi
+}
+
+# ----------------------------------------------------------------------
+# `deis trace`
+# ----------------------------------------------------------------------
+#
+# A log line says something happened; a trace record says one invocation
+# happened and how the platform decided it ended. That second part is why the
+# command exists next to `deis logs`: an application that fails silently writes
+# no log line at all, and "the handler threw" and "we cut it off" are the same
+# 500 to everyone except the node that made the decision.
+#
+# Both checks below read the stream rather than the stored records, for the
+# reason check_cli_tail does: waiting for a record that is already there
+# proves nothing about the invocation this check just caused, and a node
+# buffers its traces and pushes them on a timer, so anything else would be a
+# poll with a guess in it.
+
+# Open `deis trace --follow` and return only once the stream is really open.
+#
+# The banner is the readiness signal. `deis trace --follow` prints it after the
+# TailTraces call has returned, and deis-telemetry registers the subscriber
+# inside that handler before it answers - so an invocation made from now on
+# reaches this stream. Doing it the other way round is the classic flake: the
+# record is pushed and broadcast while nobody is listening, and a follow that
+# correctly shows only new invocations looks broken.
+#
+# `exec` so that the pid is the CLI itself and not a shell around it, which
+# matters when it is interrupted; the coprocess file descriptors are global, so
+# the caller reads from ${DEIS_TRACE[0]} and closes with close_trace_stream.
+open_trace_stream() {
+  local environment=$1
+  local transcript=$2
+
+  deis_cli_env
+  coproc DEIS_TRACE {
+    exec env "${DEIS_CLI_ENV[@]}" "${BIN_DIR}/deis" trace --follow -e "$environment" 2>&1
+  }
+
+  local line
+  while IFS= read -r -t 30 -u "${DEIS_TRACE[0]}" line; do
+    printf '%s\n' "$line" >> "$transcript"
+    case "$line" in
+      *"following invocations from now on"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Read rows until one contains $1, keeping every line for the failure message.
+# Sets TRACE_ROW to the row that matched.
+await_trace_row() {
+  local wanted=$1
+  local transcript=$2
+  local line
+
+  TRACE_ROW=""
+  while IFS= read -r -t 60 -u "${DEIS_TRACE[0]}" line; do
+    printf '%s\n' "$line" >> "$transcript"
+    case "$line" in
+      *"$wanted"*)
+        TRACE_ROW=$line
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# SIGINT, not SIGKILL: `deis trace --follow` races Ctrl-C against the stream so
+# that it unwinds normally and closes the connection. That is the path a person
+# takes to stop it, so it is the one worth exercising.
+close_trace_stream() {
+  kill -INT "$DEIS_TRACE_PID" 2>/dev/null || true
+  wait "$DEIS_TRACE_PID" 2>/dev/null || true
+}
+
+check_cli_trace() {
+  local title="deis trace reports the invocation a request just made"
+  local out="${LOG_DIR}/verify-cli-trace.log"
+  : > "$out"
+
+  # A path nothing else asks for, so the row that arrives can only describe
+  # this check's own request. Matching on a path the demo uses elsewhere would
+  # pass on an invocation from a minute ago.
+  local probe="trace-probe-$$-${RANDOM}"
+
+  if ! open_trace_stream "$ENV_NAME" "$out"; then
+    close_trace_stream
+    fail_check "$title" \
+      "the stream never opened; deis trace said: $(tr '\n' ' ' < "$out" | head -c 300)"
+    return
+  fi
+
+  app_request "${LOG_DIR}/verify-cli-trace.headers" "/hello/${probe}" > /dev/null
+
+  if await_trace_row "$probe" "$out"; then
+    close_trace_stream
+    pass_check "$title" \
+      "GET /hello/${probe} was made after the stream opened, and deis trace printed: $(echo "$TRACE_ROW" | sed 's/[[:space:]][[:space:]]*/ /g')"
+  else
+    close_trace_stream
+    fail_check "$title" \
+      "the stream opened but no invocation naming ${probe} arrived within 60s; see ${out}"
+  fi
+}
+
+# The one verdict no other observer on this platform can produce.
+#
+# V8's near-heap-limit callback is the only place on a node that knows an
+# isolate died of its heap: from the request path an out-of-memory kill and a
+# handler that threw are the same terminated execution, and both answer 500.
+# The callback records `memory-limit` against the invocation and increments
+# `deis_runtime_memory_cutoffs_total` in the same breath, so a row that says
+# memory-limit is that callback having run.
+#
+# The counter itself is named in the evidence but is not what this check waits
+# on: a node pushes its counters every ten seconds and its traces every one, so
+# the verdict is here long before the sample is, and gating on the sample would
+# make the check a race against a timer rather than a statement about the
+# platform. The row is the deterministic witness; the counter is read once and
+# reported as it stands.
+# What deis-telemetry currently reports for this tenant's memory cut-offs, or
+# nothing when no node has pushed that series yet.
+memory_cutoff_counter() {
+  curl -s -m 5 "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" 2>/dev/null \
+    | grep "^deis_runtime_memory_cutoffs_total{app_id=\"${APP_ID}\",environment=\"${ENV_NAME}\"" \
+    | awk '{print $NF}' || true
+}
+
+check_memory_cutoff() {
+  local title="an isolate that exhausts its heap is cut off, and the platform says so"
+  local out="${LOG_DIR}/verify-memory-cutoff.log"
+  : > "$out"
+
+  # Read before anything is driven, so the number afterwards is this
+  # invocation's and not one left behind by an earlier `verify` against the
+  # same running demo.
+  local before
+  before=$(memory_cutoff_counter)
+
+  if ! open_trace_stream "$ENV_NAME" "$out"; then
+    close_trace_stream
+    fail_check "$title" \
+      "the stream never opened; deis trace said: $(tr '\n' ' ' < "$out" | head -c 300)"
+    return
+  fi
+
+  local answered status seconds
+  answered=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' \
+    -H "x-deis-app-id: ${APP_ID}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/heap")
+  status=${answered%% *}
+  seconds=${answered##* }
+
+  if ! await_trace_row "memory-limit" "$out"; then
+    close_trace_stream
+    fail_check "$title" \
+      "GET /api/heap answered HTTP ${status} after ${seconds}s, but no invocation ended as memory-limit within 60s - so either the ceiling was never reached or the near-heap-limit callback did not classify it; see ${out}"
+    return
+  fi
+  close_trace_stream
+
+  if [ "$status" != "500" ]; then
+    fail_check "$title" \
+      "an invocation was recorded as memory-limit, but GET /api/heap answered HTTP ${status} rather than failing; a handler killed for its heap cannot also have answered"
+    return
+  fi
+
+  local ceiling after counter_note
+  ceiling=$(node_log \
+    | sed -n "s/.*App ${APP_ID}.${ENV_NAME} narrows the default heap ceiling: \([0-9]*\)MB.*/\1/p" \
+    | head -n 1)
+  after=$(memory_cutoff_counter)
+  if [ -n "$after" ] && [ "$after" != "$before" ]; then
+    counter_note="deis_runtime_memory_cutoffs_total for this tenant went from ${before:-nothing} to ${after} while this check ran"
+  else
+    counter_note="deis_runtime_memory_cutoffs_total for this tenant still reads ${after:-nothing}, which is the cadence and not a gap: a node pushes its traces every second and its cumulative counters every ten, so the verdict arrives first and the sample follows"
+  fi
+
+  pass_check "$title" \
+    "GET /api/heap allocated past the ${ceiling:-?}MB heap this version's manifest asks for and answered HTTP ${status} after ${seconds}s. deis trace calls that invocation memory-limit, which nothing but the near-heap-limit callback can produce - from the request path an out-of-heap kill and a handler that threw are the same terminated execution: $(echo "$TRACE_ROW" | sed 's/[[:space:]][[:space:]]*/ /g'). The same callback increments deis_runtime_memory_cutoffs_total; ${counter_note}"
 }
 
 check_cli_tail() {
@@ -2395,6 +3032,15 @@ verify_demo() {
   check_cli_versions
   echo "-- asset-first serving --"
   check_static_asset
+  # The three files a static site configures itself with, and the way back
+  # into the asset layer from inside a function. All four run before the
+  # rollback moves production off v1, which is the version whose bundle
+  # carries them.
+  check_site_redirect
+  check_site_headers
+  check_site_not_found
+  check_assets_binding
+  check_assets_binding_is_not_shadowable
   echo "-- routing --"
   check_route_parameter
   echo "-- websockets --"
@@ -2417,6 +3063,8 @@ verify_demo() {
   echo "-- storage --"
   check_kv_roundtrip
   check_storage_capability_token
+  check_storage_token_requires_the_api_key
+  check_data_cli_reads_the_apps_write
   echo "-- queue --"
   check_queue_roundtrip
   echo "-- cron --"
@@ -2424,12 +3072,20 @@ verify_demo() {
   echo "-- environments --"
   check_second_environment
   check_environment_kv_isolation
+  echo "-- resource limits --"
+  # Both halves need production on v1 and the preview on v2: v1's manifest
+  # narrows its timeout and v2's asks to widen it, so these run before the
+  # rollback puts v2 on production.
+  check_app_limits_narrowed
+  check_app_limits_clamped
+  check_memory_cutoff
   echo "-- versions --"
   # This one moves production to v2 and back, so it runs after every check
   # that expects production to be on v1.
   check_rollback
   echo "-- observability --"
   check_telemetry_logs
+  check_cli_trace
   check_cli_tail
   echo "-- the fleet --"
   check_node_registration

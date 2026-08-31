@@ -1,0 +1,9 @@
+# The path this page used to live at. A visitor who bookmarked it, and a
+# crawler that indexed it, both still ask for it; this keeps them working
+# without a function and without an isolate.
+#
+# 301, not the 302 a two-field rule would default to: the move is permanent,
+# so a browser may stop asking. Whatever the visitor arrived with after the
+# ? rides along to the target, which is what keeps a campaign link's tracking
+# intact across a move.
+/old-home    /index.html    301

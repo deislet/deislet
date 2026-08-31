@@ -32,12 +32,22 @@
 curl -H 'x-deis-app-id: demo' http://127.0.0.1:8086/hello/world
 ```
 
-**8086 是节点的端口，不是 deis-proxy 的。** 演示里 deis-proxy 起着，但没有给它配
-任何应用，所以它处在「透传」模式：一个上游（就是节点），头原样转发。走
-`http://127.0.0.1:8087/hello/world` 也能通，只是它证明的是「pingora 在转发」，
-不是「deis-proxy 选对了应用」。下面 `verify` 里发请求的各项，除了 WebSocket 那两项，
-都直接打节点，原因也在这里——要验的是控制面与节点这条线，让请求先绕一跳只会把失败点
-变多。WebSocket 那两项反过来专走 deis-proxy：升级是反向代理最容易弄坏的一种交换，
+**8086 是节点的端口，不是 deis-proxy 的。** 演示里 deis-proxy 起着，但它自己的配置文件
+里一个应用都没写，控制面的目录里也没有人建过路由，所以它选不出应用：请求原样转发给它
+唯一的那个上游（就是节点）。走 `http://127.0.0.1:8087/hello/world` 也能通，只是它证明
+的是「pingora 在转发」，不是「deis-proxy 按域名或路径选对了应用」。
+
+有一处例外要说清楚，因为它是新加的：演示的 proxy 配置里写了 `[control]`，所以它每 5 秒
+去控制面拉一次路由表（`GET /api/routing-table`）。那张表里没有路由，但有环境——`demo`
+的 `production` 和 `preview` 都在里面。于是一个**带着 `x-deis-app-id: demo` 头**进来的
+请求（`verify` 里那两项 WebSocket 检查就是这样打的），proxy 现在能从这张表认出
+`demo/production`，转发前把 `x-deis-app-id` 和 `x-deis-environment` 盖成这两个值。盖上去
+的值和客户端自己带的一样，所以结果没有变化；变的是「谁说了算」——以前是客户端的头原样穿
+过去，现在是控制面的目录说了算。自动预览地址不在演示范围内：那要在 proxy 配置里写
+`routing.preview_zone`，还要一条通配 DNS 记录和一张通配证书，演示里三样都没有。
+
+下面 `verify` 里发请求的各项，除了 WebSocket 那两项，都直接打节点，原因也在这里
+——要验的是控制面与节点这条线，让请求先绕一跳只会把失败点变多。WebSocket 那两项反过来专走 deis-proxy：升级是反向代理最容易弄坏的一种交换，
 这一跳需要单独证明代理没有把它搞砸，见下文「websockets」一节。
 
 ## 部署走的是真实路径
@@ -68,14 +78,21 @@ bundle_sha + 环境表），节点自己用 HTTP 把包拉下来、校验 sha256
 ```
 scripts/demo-assets/example-app/
   .config.json                     声明服务（kv + queue）、队列 jobs、cron「每分钟」、
-                                   密钥名 DEMO_SECRET、变量 BUILD_LABEL、资产目录
+                                   密钥名 DEMO_SECRET、变量 BUILD_LABEL 与 ASSETS、
+                                   资产目录与 notFound、limits（见下文）
   public/index.html                静态资产，`/` 直接命中它，不起 Isolate
   public/css/app.css
+  public/404.html                  notFound = 404-page 时，无人认领的路径答的就是它
+  public/_redirects                重定向表，一行一条；不进包、也不对外服务
+  public/_headers                  响应头表，同上
   functions/hello/[name].ts        -> /hello/:name   占位符进 context.params
   functions/api/kv/[key].ts        -> /api/kv/:key   PUT 写、GET 读，经 deis-store
   functions/api/enqueue.ts         -> /api/enqueue   往 jobs 队列投一条消息
   functions/api/fetch.ts           -> /api/fetch     按 ?url= 往外打一发 fetch，回报结果
   functions/api/crypto.ts          -> /api/crypto    跑一遍 Web Crypto，把值本身回出来
+  functions/api/asset.ts           -> /api/asset     用 env.ASSETS.fetch() 取自己包里的文件
+  functions/api/slow.ts            -> /api/slow      按 ?ms= 空转这么久再应答
+  functions/api/heap.ts            -> /api/heap      一直分配到把自己这只 Isolate 的堆撑爆
   functions/api/ws.ts              -> /api/ws        WebSocket 回声，见下文
   functions/_queue.ts              队列消费函数（下划线开头 = 平台调用，不是路由）
   functions/_scheduled.ts          cron 处理函数，同上
@@ -92,6 +109,30 @@ scripts/demo-assets/example-app/
 
 `BUILD_LABEL` 是回滚那一项的抓手：v2 把它改成 `v2` 并顺手改了静态页面，回滚之后
 两样要一起变回 `v1`。
+
+`public/` 下那三样东西是**不写函数**就能让静态站点自我描述的全部：`_redirects`
+一行一条规则（`/old-home` 301 到 `/index.html`），`_headers` 按路径给响应加头
+（`/*` 加 `Referrer-Policy`，`/css/*` 把节点默认的「每次都来问」换成一年的强缓存），
+`.config.json` 里的 `assets.notFound` 选的是「无人认领的路径怎么答」——这里选
+`404-page`，于是答的是 `public/404.html` 本身、状态码 404。这三样在构建时解析、写进
+manifest，版本加载时编译一次，之后每个请求在**起 Isolate 之前**就被它们回掉；
+`_redirects` 与 `_headers` 本身不会进包，否则任何人问一句 `/_redirects` 就能把作者的
+路由表读走。函数路由仍然优先：`/hello/world` 走的是处理函数，不会被 404 页面吃掉。
+
+`.config.json` 里的 `environment.variables.ASSETS` 是**故意声明的**：`ASSETS` 是平台
+保留名，节点在把这张表交给 `context.env` 之前会把它摘掉，再把 `env.ASSETS` 这个绑定
+装上去。所以应用声明同名变量拿不到自己那串字符串，拿到的仍是绑定——
+`functions/api/asset.ts` 把 `env.ASSETS` 到底是什么一并回报出来，`verify` 就是照这个
+判的。
+
+`.config.json` 里的 `limits` 是应用给自己提的**上限申请**：这里写 `timeoutMs: 1000`
+（节点自己允许 30000）与 `memoryMb: 32`（节点自己允许 256）。方向是单向的——应用只能
+要求被卡得更紧，不能更松；`start` 在暂存出来的第二版里把 `timeoutMs` 改成 600000，
+于是同一台节点上一个环境「收窄成功」、另一个环境「加宽被驳回」，两半同时在跑。
+`functions/api/slow.ts` 与 `functions/api/heap.ts` 就是让这两条上限**真的被撞上**的
+两个处理函数：前者空转（不是 sleep——切断是靠终止 Isolate 生效的，在跑的代码才会立刻
+被切，睡着的代码要等事件循环下一次轮到它），后者一直分配稠密数组（不是字符串拼接——
+V8 用绳索表示拼接结果，看着像分配其实几乎不占内存）。
 
 `functions/api/fetch.ts` 是**故意写成中转**的：查询串给什么地址，它就往那个地址打。
 真项目里没人该这么写，但演示要验的恰恰是这一条——一个能被指挥去哪儿的应用，正是出网
@@ -115,12 +156,13 @@ deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条�
 演示据此摆了一个最小的对照组：脚本自己起一个上游（默认 8094），节点配置里
 `[fetch] allow` 只写这一个地址；deis-store 在同一块回环网卡的另一个端口上，不写。
 然后让**同一个处理函数**先后打这两个地址——一发通、一发不通，两者之间差的是策略而
-不是网络。`verify` 里「成功了反而算失败」的检查一共两项，这是第一项；第二项在下文
-「存储」小节，验的是缺一张凭据令牌照样能不能问到 deis-store。
+不是网络。`verify` 里「成功了反而算失败」的检查一共三项，这是第一项；另外两项都在
+下文「存储」小节：一项验的是缺一张凭据令牌照样能不能问到 deis-store，一项验的是不带
+API key 能不能从控制面领到那张令牌。
 
 ## verify 检查什么
 
-`./scripts/demo.sh verify` 分十三组跑二十五项，每项打印它据以判断的证据：
+`./scripts/demo.sh verify` 分十四组跑三十六项，每项打印它据以判断的证据：
 
 | 组 | 检查 | 证明了什么 |
 |---|---|---|
@@ -128,23 +170,34 @@ deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条�
 | | `deis versions` | 两版都列出来了，且标出 production 跑的是哪一版——版本不会自称「当前」，是环境指向它 |
 | 资产优先 | `GET /` | 返回的是包里那个文件本身，没起 Isolate；ETag 是资产自身的 sha256 |
 | | 带 `If-None-Match` 再打一次 | 回 304 且零字节 |
+| | `GET /old-home?ref=...` | `_redirects` 那条规则应了 301（写了第三个字段才是 301，两字段默认 302），`location` 是规则里的目标，而且请求带的查询串原样跟了过去——搬家不该把作者在数的那个来源参数丢掉 |
+| | `GET /css/app.css` 与 `GET /` 各一发 | `_headers` 里 `/css/*` 那一块的强缓存只落在它点名的文件上，`/` 保持节点自己的默认；`/*` 那一块的头两边都有。只问一个文件分不出「按路径匹配」和「全都加上」 |
+| | `GET /no-such-page` | 无人认领的路径按应用自己选的 `notFound` 回：404 状态 + 包里那份 `404.html`（页面上有个别处没有的标记）。函数路由不受影响，`/hello/world` 仍走处理函数 |
+| | `GET /api/asset?path=/css/app.css` | 处理函数里 `env.ASSETS.fetch()` 取回的就是本版包里那个文件：字节数与磁盘上那份一致、内容摘要一致。这条不走网络，字节自版本加载起就在节点内存里 |
+| | 同一处理函数回报的 `env.ASSETS` 是什么 | 应用在自己的 `environment.variables` 里声明了 `ASSETS`，节点在交出 `context.env` 之前把它摘掉并记了一行日志；Isolate 里 `env.ASSETS` 仍是那个带 `fetch()` 的绑定，不是应用发的字符串 |
 | 路由 | `GET /hello/world` | 路由占位符进了 `context.params` |
 | WebSocket | 经 `deis-proxy` 亲手做一次握手（自己拼字节，不借客户端库） | 101 状态行、`Upgrade`/`Connection` 头与 `Sec-WebSocket-Accept` 都对得上 RFC 6455 给那个握手键定好的答案——升级是节点应的、经代理原样转发，不是代理自己应了 101 又或者把它压扁成一个普通响应 |
 | | 握手成功后各发一帧文本、一帧二进制 | 两帧都完整抵达了 Isolate：二进制帧里特意塞了几个非法 UTF-8 字节（`0xff`、`0xfe`、开头的 `0x80`），处理函数把收到的字节数与十六进制原样报回来（不是替换字符），证明这条链路没有把它当文本处理、也没有在中途丢字节。验的是字节完整送达 Isolate，不是服务端向外发二进制帧的能力——处理函数把两种输入都回成文本帧，见上文示例应用一节 |
 | Web 标准 | 处理函数里 `fetch` 打演示自己起的那个上游 | Isolate 里真有 `fetch`（`available`），而且这一发确实打了出去并把上游的响应体原样带回来了 |
-| | 同一个处理函数改打 `http://127.0.0.1:<deis-store 端口>` | **打不通**。它和刚刚打通的那个上游在同一块回环网卡上，只是端口不同，所以拦住它的是出网策略不是网络。这一项和存储小节里「不带凭据令牌」的那条，是 `verify` 里仅有的两条「成功了算失败」的检查：应用只要连得上 deis-store，换个租户头就能读别的应用的数据。不校验措辞、状态码或错误文本——只看这一发有没有打出去 |
+| | 同一个处理函数改打 `http://127.0.0.1:<deis-store 端口>` | **打不通**。它和刚刚打通的那个上游在同一块回环网卡上，只是端口不同，所以拦住它的是出网策略不是网络。这一项和存储小节里「不带凭据令牌」「不带 API key」那两条，是 `verify` 里仅有的三条「成功了算失败」的检查：应用只要连得上 deis-store，换个租户头就能读别的应用的数据。不校验措辞、状态码或错误文本——只看这一发有没有打出去 |
 | | `crypto.randomUUID()` 与 `crypto.subtle.digest()` | 值本身被检查：UUID 要是 v4 形状且两次不同；摘要要等于字符串 `deislet` 的已知 SHA-256。凭空造出的合法字节能过「没抛异常」，过不了这一项 |
 | 密钥 | `deis secret list` | 只列出名字与最后修改时间；JSON 与人读两种输出都不含值，也没有任何命令能打印值 |
 | | 同一响应的 `secretPresent` | 加密存库的密钥被解开、随下发进了 Isolate |
 | | 递归 grep 数据目录与全部日志 | 解开后的明文哪儿都没落下 |
 | 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
 | | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
+| | 不带 API key 打 `GET /api/apps/:app/environments/:env/storage-token` | 401，什么也拿不到；同一发带上 key 才拿到租户名、deis-store 地址与令牌本身（令牌不打印）。这张令牌绕过控制面直接对 deis-store 生效、而且不过期，所以它和部署走同一道门——这是「成功了算失败」的第三项 |
+| | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾看不到 `storage_auth_secret`，它只拿到这一个租户的令牌 |
 | 队列 | `POST /api/enqueue` 后轮询 `/api/kv/job:<key>` | 消息进了 deis-queue，节点的轮询任务领到并交给 `_queue.ts` |
 | cron | 轮询 `/api/kv/cron:last-run` | 控制面到点挑了**一个**节点触发，应用的 `_scheduled.ts` 真的跑了 |
 | 环境 | 同一应用的 production 与 preview 各打一发 | 两个环境在同一台节点上并行，各返回各自版本的标签 |
 | | 在一个环境写 KV，去另一个环境读 | 读不到——两个环境是两个存储租户 |
+| 资源上限 | production（v1，manifest 里写 `timeoutMs: 1000`）打 `/api/slow?ms=2000` 与 `?ms=200` | 前一发在约 1 秒被切、后一发正常返回：节点默认是 30000ms，两发都会过，所以在起作用的是应用自己报的那个数。节点日志里那句「narrows the default execution timeout: 1000ms（platform default 30000ms）」是它自己的说法 |
+| | preview（v2，manifest 里改成 `timeoutMs: 600000`） | 那个数确实随部署到了节点（`timeout_ms=Some(600000)`），但节点把它按下来了，并写了一句同时带着两个数字的告警；没有任何一行说这个环境「收窄」了什么，因为它要的是加宽。上限是节点的：一次调用整段占着一根运行线程，应用要是能给自己开十分钟，排在这根线程后面的其他租户就陪着等十分钟 |
+| | `GET /api/heap` | 应用声明 `memoryMb: 32`，处理函数一直分配到撞上这个堆上限。`deis trace` 把这次调用判成 `memory-limit`——这个判决只有 V8 的近堆上限回调给得出来，从请求那一侧看，被堆撑死和处理函数自己抛异常是同一个「执行被终止」。同一个回调也在给 `deis_runtime_memory_cutoffs_total` 记数 |
 | 版本 | `deis deploy` v2 → `deis rollback` | 函数返回的标签和静态页面一起回到上一版。回滚不用报版本号：出事的人不该被要求先查一个号 |
 | 观测 | `LogService/Query` | 应用自己 `console.log` 的那行能从 deis-telemetry 按应用查回来，并带上是哪个环境写的 |
+| | `deis trace --follow` 开流 → 之后才发一个请求 | 跟到的那一行说的就是**这一次调用**（一次性探针路径确认）：方法、URL、状态码、耗时、判决、哪个节点。日志说应用讲了什么，trace 说平台决定了什么 |
 | | `deis tail` 开流 → 之后才发一个请求 | 跟到的是**开流之后**产生的那一行（用一次性探针名字确认），不是历史里捞的 |
 | 机队 | 控制面的 `/api/runtime` | 节点自己 `PUT .../registration` 登记上了；写在配置文件里的地址没有被节点自报的主机名覆盖掉 |
 | | 拿节点凭据给一个**没写在** `deis_runtime_nodes` 里的 id 也发一次 `PUT .../registration` | 机队里真的多出这个 id，且 `source` 是 `registered` 而非 `configured`——证明一台配置文件从未提过的机器，光靠自己登记就能加入机队，而不是全靠这行演示脚本里唯一的节点本来就在配置文件里、这条登记路径从没被真正走过 |
@@ -154,7 +207,10 @@ deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条�
 deis-store，缺了会各自报为失败并说明原因，而不是悄悄跳过或者放宽标准去凑一个通过。
 存储小节里直接问 `KvStore.Get` 那一项还需要 `openssl`——它要用来铸造 deis-store 现在
 要求的凭据令牌、再把答案里的 base64 值解出来比较，缺了同样报失败并说明原因；旁边
-「不带令牌」那一项不用铸令牌，没有 `openssl` 也能跑。`fetch` 那两项里只有打得通上游
+「不带令牌」那一项不用铸令牌，没有 `openssl` 也能跑。`deis kv` 那一项和
+`env.ASSETS.fetch()` 那一项同样用 `openssl`：一个用来把 `--json` 里的 base64 值解回
+原始字节（KV 值是应用写下的任意字节，没理由指望它是 UTF-8），一个用来对比取回的内容
+与磁盘上那份文件的摘要。`fetch` 那两项里只有打得通上游
 的那一项需要 `python3`——上游是 `python3 -m http.server` 起的，没有它 `start` 会说
 一声、照常把别的都拉起来，这一项因为连不上上游而报失败；打 deis-store 那一项打的是
 平台自己的服务，不经上游，没有 `python3` 也照样通过。两项 WebSocket 检查是另一种依赖：
@@ -238,7 +294,8 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
   正是它的内容，免得端口上换了个别的服务照样答 200 也算过
 - `app-v1/` / `app-v2/`：示例应用的构建副本（构建会往项目里写 `dist/`，所以不在仓库里做）
 - `logs/` 日志目录（含 `build.log`、每次构建的 `build-app-*.log`）
-- `state.env` 运行状态
+- `state.env` 运行状态（只有属主可读：里面有节点预共享密钥、存储凭据的共享密钥、
+  控制面的 API key，以及演示密钥的明文值——`verify` 要拿它去搜）
 
 ## 注意事项
 
@@ -251,14 +308,25 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
   `cargo build` 直接失败。`demo.sh` 不会替你做这一步：
   `cd crates/deis-control/web && npm ci && npm run build`
 - `verify` 里查日志的那一项，以及存储小节里直接问 deis-store 的两项，一共三项需要
-  `grpcurl`；其中直接问 `KvStore.Get` 那一项还需要 `openssl` 铸造 deis-store 现在
-  要求的凭据令牌。缺了 `grpcurl` 这三项各自报失败，缺了 `openssl` 单独影响那一项；
-  其余照跑
+  `grpcurl`。需要 `openssl` 的是另外三项：直接问 `KvStore.Get` 那一项（铸 deis-store
+  要求的凭据令牌，再把答案里的 base64 解回来）、`deis kv` 那一项（同样是解 base64，
+  因为 KV 值是应用写下的任意字节）、以及 `env.ASSETS.fetch()` 那一项（对比取回的内容
+  与磁盘上那份文件的摘要）。缺了谁，就是相关那几项各自报失败，其余照跑
+- 控制面的**人用 API 是开着认证的**：`start` 现场生成一把 API key，写进
+  `deis-control.toml` 的 `api_keys`（同时把 `api_auth_enabled` 打开），再通过
+  `DEIS_CONTROL_TOKEN` 交给 `deis`。这个开关默认是关的，演示要是照默认跑，部署、
+  传版本、领存储令牌这些路由对任何能连上这个端口的人都是敞开的，看起来却和
+  「认证正常工作」一模一样。真人存自己那把 key 用 `deis config set control.token`；
+  演示不能用文件，因为端口和密钥都是启动那一刻才定的。节点与 deis-proxy 走的是另一
+  条通道（`node_preshared_keys`），`api_auth_enabled` 管不着它
 - 出网只开了上游那一个地址（`[fetch] allow`）。想让示例应用够到别处，加
   `--deis-origin-port` 换端口或者自己改节点配置里的这一行；平台自己那几个服务地址
   改不动——它们在 allow 之后再被拒一次
 - `verify` 里发请求的各项，除 WebSocket 那两项要经 deis-proxy 之外（原因见上文
   「websockets」一节），都直接打节点端口，不经 deis-proxy
+- deis-proxy 会去控制面拉路由表，拉不到不影响演示：目录里本来就没有路由，proxy 转发
+  给它唯一的上游。控制面挂掉时 proxy 也不会开始拒绝流量——它继续用最后一次收下的那张
+  表，没有期限
 - 节点这次是自己去连控制面的：`[control] endpoint` 一配，节点启动就去拉自己的清单
   （`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`），把里面每一版拉下来装好才报
   healthy（原则 8）。节点也会用同一套凭据向控制面登记自己

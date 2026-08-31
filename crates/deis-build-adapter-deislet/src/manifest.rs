@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use deis_build_core::ProjectConfig;
-use deis_bundle::{Asset, Manifest, QueueConsumer, Route, SUPPORTED_SCHEMA};
+use deis_bundle::{Asset, DeclaredLimits, Manifest, QueueConsumer, Route, SUPPORTED_SCHEMA};
 
 use crate::assets::StagedAsset;
 use crate::routing::RouteEntry;
@@ -92,6 +92,7 @@ pub fn build_manifest(
             })
             .collect(),
         site,
+        limits: limits(config)?,
     };
 
     // Fail here rather than at upload: the checks are the control plane's, and
@@ -100,6 +101,39 @@ pub fn build_manifest(
     manifest.validate()?;
 
     Ok(manifest)
+}
+
+/// The ceilings the project asks to be held to, translated into the names the
+/// manifest, the delivery message and the node all use.
+///
+/// Checked here, with the project file still on the author's screen, rather
+/// than left to the upload: `deis-control` refuses a block no node could act
+/// on, and finding that out from a rejected deploy - after a build, an upload
+/// and a wait - is a worse way to learn that a timeout of zero is not a
+/// timeout.
+///
+/// A project that declares nothing, or a `"limits": {}` that says nothing,
+/// leaves the manifest without the key at all: there is no ceiling to record,
+/// and writing an empty object would put a "declares limits" line in the log
+/// of every delivery of it.
+fn limits(config: &ProjectConfig) -> Result<Option<DeclaredLimits>> {
+    let Some(declared) = config.limits.as_ref() else {
+        return Ok(None);
+    };
+    let limits = DeclaredLimits {
+        memory_mb: declared.memory_mb,
+        timeout_ms: declared.timeout_ms,
+        rate_limit_ops_per_sec: declared.rate_limit_ops_per_sec,
+        cpu_time_limit_ms: declared.cpu_time_limit_ms,
+        resource_table_max: declared.resource_table_max,
+    };
+    if limits.is_empty() {
+        return Ok(None);
+    }
+    limits
+        .validate()
+        .map_err(|e| anyhow::anyhow!("the project's \"limits\" block is not usable: {e}"))?;
+    Ok(Some(limits))
 }
 
 /// Which platform services the app declares it uses.

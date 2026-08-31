@@ -7,7 +7,8 @@
   "environment": {
     "variables": {
       "BUILD_LABEL": "v1",
-      "LOG_LEVEL": "info"
+      "LOG_LEVEL": "info",
+      "ASSETS": "an-application-cannot-take-this-name"
     },
     "secrets": ["DEMO_SECRET"]
   },
@@ -17,7 +18,14 @@
   },
   "queues": [{ "name": "jobs", "batchSize": 10 }],
   "cron": ["* * * * *"],
-  "assets": { "dir": "./public" },
+  "limits": {
+    "timeoutMs": 1000,
+    "memoryMb": 32
+  },
+  "assets": {
+    "dir": "./public",
+    "notFound": "404-page"
+  },
   "vendors": {
     "deislet": { "enabled": true }
   },

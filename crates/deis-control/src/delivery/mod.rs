@@ -523,7 +523,7 @@ impl DeploymentDeliverer {
         // because the alternative is an application that will not deploy at
         // all over a field that only ever narrows what it is allowed. It runs
         // on the node's ceilings and the reason is said out loud.
-        let limits = match declared_limits(&version.manifest) {
+        let limits = match declared_limits(&manifest) {
             Ok(limits) => limits,
             Err(reason) => {
                 warn!(

@@ -129,6 +129,7 @@ mod tests {
             queues: Vec::new(),
             assets: Vec::new(),
             site: Default::default(),
+            limits: None,
         }
     }
 

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod assets;
 pub mod headers;
+pub mod limits;
 pub mod path;
 pub mod redirects;
 pub mod routing;
@@ -30,6 +31,7 @@ pub mod site;
 
 pub use assets::{AssetIndex, AssetMatch, guess_content_type};
 pub use headers::{HeaderField, HeaderRule, HeaderTable, parse_headers};
+pub use limits::DeclaredLimits;
 pub use path::{percent_decode, percent_encode_uri};
 pub use redirects::{
     ParsedRedirects, RedirectAction, RedirectRule, RedirectTable, parse_redirects,
@@ -131,6 +133,16 @@ pub struct Manifest {
     /// custom 404 page. Absent in a bundle that ships none of them.
     #[serde(default, skip_serializing_if = "SiteConfig::is_empty")]
     pub site: SiteConfig,
+    /// The ceilings this application asks to be held to, or `None` when it
+    /// asks for nothing and takes each node's defaults.
+    ///
+    /// Read but not judged here: `Manifest::validate` says nothing about it,
+    /// because the values are a node's business and the only refusals worth
+    /// making are made once, at upload, where the person who wrote the block
+    /// is still watching (`deis_control::catalog::declared_limits`). What this
+    /// field does enforce is the spelling - see [`DeclaredLimits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<DeclaredLimits>,
 }
 
 /// A route pattern the runtime matches against to fill `context.params`.

@@ -4,7 +4,7 @@ use super::bindings::{AppServices, ServiceWiring};
 use super::cache_ops::{create_cache_store, CacheStore};
 use super::fetch_policy::FetchPolicy;
 use super::loader::DbModuleLoader;
-use super::metrics::{recorder, MetricsRegistry, RequestOutcome};
+use super::metrics::{recorder, MetricsRegistry, RequestFacts, RequestOutcome};
 use super::ops::{
     AppId, EnvStore, ExecutionDeadline, PendingRequestBody, PendingResponseBody, ResponseStore,
 };
@@ -1881,8 +1881,21 @@ impl AppRuntime {
                 // A rate-limit cut-off can fire while the module is still
                 // being evaluated, and leaves the same flag set as a timeout.
                 self.clear_termination();
-                self.metrics
-                    .record_request(&self.app_id, started.elapsed(), RequestOutcome::Error);
+                // The bundle would not load, so this is the platform failing
+                // around the application rather than the application failing,
+                // and a trace has to say which of the two it was.
+                self.metrics.record_request_with(
+                    &self.app_id,
+                    started.elapsed(),
+                    RequestOutcome::Error,
+                    RequestFacts {
+                        method: method.clone(),
+                        url: url.clone(),
+                        error: e.to_string(),
+                        platform_fault: true,
+                        ..RequestFacts::default()
+                    },
+                );
                 let _ = response_tx.send(Err(e));
                 return Ok(());
             }
@@ -1932,6 +1945,16 @@ impl AppRuntime {
                 pathname
             );
         }
+
+        // Kept before the request is built, because `JsRequest` takes both by
+        // value and they are what a trace is read by: an operator looking for
+        // the invocation that answered 500 has the URL and the method, and
+        // nothing else about a request is stable enough to search on.
+        let facts = RequestFacts {
+            method: method.clone(),
+            url: url.clone(),
+            ..RequestFacts::default()
+        };
 
         let request = JsRequest {
             url,
@@ -2032,8 +2055,15 @@ impl AppRuntime {
         // cut-off) and a script error both land here, and both cost the
         // request.
         if let Err(e) = &result {
-            self.metrics
-                .record_request(&self.app_id, started.elapsed(), RequestOutcome::Error);
+            self.metrics.record_request_with(
+                &self.app_id,
+                started.elapsed(),
+                RequestOutcome::Error,
+                RequestFacts {
+                    error: e.to_string(),
+                    ..facts.clone()
+                },
+            );
             tracing::debug!(
                 target: "app",
                 app_id = %self.app_id,
@@ -2052,10 +2082,18 @@ impl AppRuntime {
             match response {
                 Some(json) => json,
                 None => {
-                    self.metrics.record_request(
+                    // The handler ran and left nothing behind, which the
+                    // client meets as a 500 it cannot act on. The application
+                    // did not fail; the contract between it and this node did.
+                    self.metrics.record_request_with(
                         &self.app_id,
                         started.elapsed(),
                         RequestOutcome::Error,
+                        RequestFacts {
+                            error: "no response received from app".to_string(),
+                            platform_fault: true,
+                            ..facts.clone()
+                        },
                     );
                     anyhow::bail!("No response received from app");
                 }
@@ -2065,8 +2103,16 @@ impl AppRuntime {
         let response: JsResponse = match serde_json::from_str::<JsResponse>(&json_str) {
             Ok(response) => response,
             Err(e) => {
-                self.metrics
-                    .record_request(&self.app_id, started.elapsed(), RequestOutcome::Error);
+                self.metrics.record_request_with(
+                    &self.app_id,
+                    started.elapsed(),
+                    RequestOutcome::Error,
+                    RequestFacts {
+                        error: format!("the handler's response did not parse: {e}"),
+                        platform_fault: true,
+                        ..facts.clone()
+                    },
+                );
                 return Err(e.into());
             }
         };
@@ -2079,8 +2125,15 @@ impl AppRuntime {
         } else {
             RequestOutcome::Ok
         };
-        self.metrics
-            .record_request(&self.app_id, started.elapsed(), outcome);
+        self.metrics.record_request_with(
+            &self.app_id,
+            started.elapsed(),
+            outcome,
+            RequestFacts {
+                status: response.status,
+                ..facts
+            },
+        );
 
         // Absent means the handler answered without a body -- a 204, a 304,
         // the answer to a HEAD, a WebSocket upgrade -- which is not the same
