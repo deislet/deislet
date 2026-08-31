@@ -65,6 +65,46 @@ TLS certificates belong to applications. During the handshake the SNI name
 is looked up in the route table and that application's certificate is
 presented; `tls.default_certificate` covers names no application claims.
 
+## Automatic certificates
+
+Certificates can be obtained and renewed here instead of being placed by
+hand. It is off unless `[tls.acme]` turns it on: an instance with its own
+certificate files keeps exactly the behaviour above and never contacts an
+authority.
+
+- **`http-01`, not `dns-01`.** This proxy already owns port 80 for every name
+  it serves, so it answers the authority's fetch of
+  `/.well-known/acme-challenge/<token>` itself — no DNS provider credentials
+  and no per-provider integration. The price is wildcards, which RFC 8555
+  issues only against `dns-01`, so a preview zone still wants one wildcard
+  certificate placed by hand, or `include_preview_addresses` turned on to
+  certify each address on its own.
+- **The names are derived, never listed.** They come from the domains of the
+  applications configured here plus the exact hosts in the catalog's routing
+  table, so a domain added through the control plane gets a certificate with
+  nothing edited on this machine. A name an operator has already named a
+  certificate file for stays theirs; a wildcard, an address literal and a
+  single label are left out because `http-01` cannot certify them.
+- **The account key and the certificates live under `storage_dir`,** split by
+  the authority's host so switching from staging to production obtains
+  everything again rather than serving staging certificates nobody trusts.
+  A restart loads what is there and orders nothing.
+- **Renewal is a background pass** every `check_interval_secs`, ordering a
+  name once it is within `renew_before_days` of expiry. A failure is logged
+  at `WARN` while there is slack and at `ERROR` once the certificate is
+  within `alarm_before_days` of expiry, always saying when the next attempt
+  is, and retried with a doubling backoff up to `max_retry_backoff_secs`.
+- **The default authority is Let's Encrypt staging** and the startup log says
+  so. Set `directory_url` to production only once a name has been issued
+  successfully: production's rate limits are counted per registered domain
+  per week and cannot be given back. `max_names` bounds how many names this
+  instance will ever order for, for the same reason.
+
+Turning it on needs port 80 reachable from the internet at every name being
+certified, an email address the authority writes to when a certificate is
+about to expire, and an explicit `terms_of_service_agreed = true` — this
+process will not agree to an authority's terms on an operator's behalf.
+
 ## Configuration
 
 See [`config.toml.example`](config.toml.example) for every key. Values are
@@ -76,7 +116,8 @@ the control pushes. Notable behaviour:
   `upstreams` list is re-read on every `health_check_interval_secs` tick,
   so backends can be added and removed without a restart.
 - `listen_ports` are plain HTTP, `tls.ports` terminate TLS; a port may not
-  appear in both.
+  appear in both. `[tls.acme]` is refused with an empty `tls.ports`: a
+  certificate nothing can present is a rate limit spent for nothing.
 - `log.access_log` writes one line per request in the field order given by
   `format`; `log.error_log.path` redirects diagnostics to a file.
   `RUST_LOG` overrides the configured level.
@@ -194,6 +235,7 @@ register against, so retry and reconnect behaviour is covered without deis-contr
 | `src/main.rs` | Builds the pingora server from the configuration. |
 | `src/proxy/` | `ProxyHttp` implementation, upstream pool, access log. |
 | `src/tls.rs` | Certificate loading and SNI selection. |
+| `src/acme/` | Automatic certificates: the RFC 8555 client, the `http-01` responder the data plane answers from, the on-disk store and the renewal task. |
 | `src/config/` | Configuration model, layering, persistence, route table. |
 | `src/catalog/` | The control plane's routing table: the poller, the wire shape, and the compiled table a request is matched against. |
 | `src/control/` | Control client and its background service. |

@@ -161,6 +161,30 @@ async fn serve_one(mut stream: TcpStream, completed_uploads: Arc<AtomicUsize>) {
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
+/// Write applications into the proxy's database, in the shape the control
+/// plane would have pushed them.
+///
+/// Through the crate's own `ConfigDatabase` rather than by writing SQL here,
+/// so a test cannot end up seeding a schema the proxy does not read.
+async fn seed_apps(database: &Path, apps: &[serde_json::Value]) {
+    use std::collections::HashMap;
+    let mut db = deis_proxy::config::ConfigDatabase::init(database)
+        .await
+        .expect("the proxy's database opens");
+    let configs: HashMap<String, serde_json::Value> = apps
+        .iter()
+        .map(|app| {
+            (
+                app["id"].as_str().expect("every app has an id").to_string(),
+                app.clone(),
+            )
+        })
+        .collect();
+    db.save_all_app_configs(&configs, chrono::Utc::now())
+        .await
+        .expect("the applications are written");
+}
+
 /// Read a message head and stop on the blank line that ends it.
 ///
 /// One byte at a time on purpose: a buffered read would pull whatever follows
@@ -238,10 +262,63 @@ pub struct Proxy {
     child: Child,
     /// Plain HTTP listener.
     pub addr: SocketAddr,
-    /// TLS listener, present only when `start_with_tls` was used.
+    /// TLS listener, present only when a TLS port was asked for.
     pub tls_addr: Option<SocketAddr>,
     log: PathBuf,
-    _dir: tempfile::TempDir,
+    /// The directory holding the configuration, database and log. Kept
+    /// alive for as long as the proxy, and shared between two proxies when a
+    /// test restarts one.
+    dir: Arc<tempfile::TempDir>,
+}
+
+/// Everything a test can vary about the proxy it starts.
+///
+/// A struct rather than more constructors because the ACME tests need to
+/// choose the HTTP port before the proxy exists - the stub authority has to
+/// be told where to fetch the challenge from - and to hand two successive
+/// proxies the same directory, which is what "a restart finds what the last
+/// process left" means.
+pub struct ProxyOptions {
+    pub upstream: SocketAddr,
+    /// Plain HTTP port. `None` asks for one the kernel is not using.
+    pub http_port: Option<u16>,
+    /// TLS port, and the certificate to serve on it when one is named.
+    pub tls: Option<TlsOptions>,
+    /// Extra configuration appended verbatim, for tables this harness has no
+    /// opinion about.
+    pub extra_config: String,
+    /// Applications to write into the proxy's database before it starts, in
+    /// the shape the control plane would have pushed them.
+    pub apps: Vec<serde_json::Value>,
+    /// Reuse a directory a previous proxy used, so its database, its
+    /// certificate store and its account key are still there.
+    pub dir: Option<Arc<tempfile::TempDir>>,
+    /// Whether to wait for a request to come back from the backend before
+    /// returning. With applications configured, an unknown host is a 404
+    /// rather than a forwarded request, so that probe cannot be the readiness
+    /// test; `false` waits for the port to answer anything at all.
+    pub wait_for_forwarding: bool,
+}
+
+pub struct TlsOptions {
+    pub port: Option<u16>,
+    /// A certificate for `tls.default_certificate`, or nothing when the
+    /// certificates are expected to arrive some other way.
+    pub default_certificate: Option<(PathBuf, PathBuf)>,
+}
+
+impl Default for ProxyOptions {
+    fn default() -> Self {
+        Self {
+            upstream: SocketAddr::from(([127, 0, 0, 1], 0)),
+            http_port: None,
+            tls: None,
+            extra_config: String::new(),
+            apps: Vec::new(),
+            dir: None,
+            wait_for_forwarding: true,
+        }
+    }
 }
 
 impl Drop for Proxy {
@@ -274,19 +351,58 @@ impl Proxy {
             .port()
     }
 
+    /// A free port, exposed so a test can decide one before the proxy exists.
+    pub fn pick_port() -> u16 {
+        Proxy::free_port()
+    }
+
+    /// The proxy binary, for a test that needs to run it without this
+    /// harness waiting for it to become ready - a test of a startup that is
+    /// supposed to fail, for instance.
+    pub fn binary_path() -> PathBuf {
+        Proxy::binary()
+    }
+
     /// Plain HTTP in front of `upstream`.
     pub async fn start(upstream: SocketAddr) -> Proxy {
-        Proxy::launch(upstream, None).await
+        Proxy::launch(ProxyOptions {
+            upstream,
+            ..Default::default()
+        })
+        .await
     }
 
     /// As [`Proxy::start`], plus a TLS listener serving `cert_file` for every
     /// SNI name, since a bare configuration file can only carry the default
     /// certificate.
     pub async fn start_with_tls(upstream: SocketAddr, cert_file: &Path, key_file: &Path) -> Proxy {
-        Proxy::launch(upstream, Some((cert_file.to_owned(), key_file.to_owned()))).await
+        Proxy::launch(ProxyOptions {
+            upstream,
+            tls: Some(TlsOptions {
+                port: None,
+                default_certificate: Some((cert_file.to_owned(), key_file.to_owned())),
+            }),
+            ..Default::default()
+        })
+        .await
     }
 
-    async fn launch(upstream: SocketAddr, tls: Option<(PathBuf, PathBuf)>) -> Proxy {
+    /// The directory this proxy's files are in, for a test that wants to
+    /// start a second one over the same state.
+    pub fn dir(&self) -> Arc<tempfile::TempDir> {
+        Arc::clone(&self.dir)
+    }
+
+    pub async fn launch(options: ProxyOptions) -> Proxy {
+        let ProxyOptions {
+            upstream,
+            http_port,
+            tls,
+            extra_config,
+            apps,
+            dir,
+            wait_for_forwarding,
+        } = options;
         let binary = Proxy::binary();
         assert!(
             binary.exists(),
@@ -295,11 +411,20 @@ impl Proxy {
             binary.display()
         );
 
-        let dir = tempfile::tempdir().expect("a directory for the proxy's files");
-        let port = Proxy::free_port();
-        let tls_port = tls.as_ref().map(|_| Proxy::free_port());
+        let dir = dir.unwrap_or_else(|| {
+            Arc::new(tempfile::tempdir().expect("a directory for the proxy's files"))
+        });
+        let port = http_port.unwrap_or_else(Proxy::free_port);
+        let tls_port = tls
+            .as_ref()
+            .map(|tls| tls.port.unwrap_or_else(Proxy::free_port));
         let config = dir.path().join("deis-proxy.toml");
         let log = dir.path().join("deis-proxy-error.log");
+        let database = dir.path().join("deis-proxy.db");
+
+        if !apps.is_empty() {
+            seed_apps(&database, &apps).await;
+        }
 
         // No [control] section and no applications: standalone, so the proxy
         // is in plain reverse proxy mode and forwards every request to the
@@ -319,25 +444,29 @@ impl Proxy {
              [log.error_log]\n\
              level = \"debug\"\n\
              path = \"{log}\"\n",
-            db = dir.path().join("deis-proxy.db").display(),
+            db = database.display(),
             pid = dir.path().join("deis-proxy.pid").display(),
             sock = dir.path().join("upgrade.sock").display(),
             host = upstream.ip(),
             upstream_port = upstream.port(),
             log = log.display(),
         );
-        if let (Some(tls_port), Some((cert_file, key_file))) = (tls_port, tls.as_ref()) {
-            text.push_str(&format!(
-                "\n[tls]\n\
-                 ports = [{tls_port}]\n\
-                 \n\
-                 [tls.default_certificate]\n\
-                 cert_file = \"{cert}\"\n\
-                 key_file = \"{key}\"\n",
-                cert = cert_file.display(),
-                key = key_file.display(),
-            ));
+        if let Some(tls_port) = tls_port {
+            text.push_str(&format!("\n[tls]\nports = [{tls_port}]\n"));
+            if let Some((cert_file, key_file)) = tls
+                .as_ref()
+                .and_then(|tls| tls.default_certificate.as_ref())
+            {
+                text.push_str(&format!(
+                    "\n[tls.default_certificate]\n\
+                     cert_file = \"{cert}\"\n\
+                     key_file = \"{key}\"\n",
+                    cert = cert_file.display(),
+                    key = key_file.display(),
+                ));
+            }
         }
+        text.push_str(&extra_config);
         std::fs::write(&config, text).expect("the proxy configuration is written");
 
         let child = Command::new(&binary)
@@ -353,10 +482,76 @@ impl Proxy {
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
             tls_addr: tls_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p))),
             log,
-            _dir: dir,
+            dir,
         };
-        proxy.wait_until_forwarding().await;
+        if wait_for_forwarding {
+            proxy.wait_until_forwarding().await;
+        } else {
+            proxy.wait_until_answering().await;
+        }
         proxy
+    }
+
+    /// Block until the proxy answers anything at all on its HTTP port.
+    ///
+    /// The readiness test for a proxy that has applications configured: such
+    /// a proxy answers 404 to a host it does not know, so "the backend's body
+    /// came back" is not a signal it can ever produce. What is being waited
+    /// for is still a real condition - a complete HTTP response from the
+    /// process under test - and the process is re-checked on every round so a
+    /// proxy that died on bind is reported rather than waited out.
+    async fn wait_until_answering(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "deis-proxy exited during startup with {status}; its log said:\n{}",
+                    self.log_tail()
+                );
+            }
+            if let Ok(mut stream) = TcpStream::connect(self.addr).await {
+                let request = format!(
+                    "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                    self.addr
+                );
+                if stream.write_all(request.as_bytes()).await.is_ok() {
+                    let mut answer = String::new();
+                    if stream.read_to_string(&mut answer).await.is_ok()
+                        && answer.starts_with("HTTP/1.1 ")
+                    {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "deis-proxy never answered on {} within 30s; its log said:\n{}",
+            self.addr,
+            self.log_tail()
+        );
+    }
+
+    /// One plain HTTP request through the proxy, head and body together.
+    pub async fn request(&self, path: &str, host: &str) -> String {
+        let mut stream = TcpStream::connect(self.addr)
+            .await
+            .expect("the proxy accepts a connection");
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer).await;
+        answer
+    }
+
+    /// Stop the proxy and wait for it to be gone, leaving its directory
+    /// behind for whatever starts next.
+    pub fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// Block until a request comes back through the proxy from the backend.

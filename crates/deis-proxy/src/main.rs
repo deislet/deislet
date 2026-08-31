@@ -15,9 +15,11 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use deis_proxy::acme;
 use deis_proxy::catalog::{CatalogClient, CatalogPoller, ControlEndpoint};
 use deis_proxy::cli::CliConfig;
 use deis_proxy::config::system::LogLevel;
+use deis_proxy::config::system::acme::{LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING};
 use deis_proxy::config::{ConfigManager, SystemConfig};
 use deis_proxy::control::{ControlService, ProxyControlClient};
 use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic};
@@ -178,6 +180,52 @@ fn check_daemon_identity(system: &SystemConfig, upgrade: bool) -> Result<()> {
     Ok(())
 }
 
+/// Say, once, what turning automatic certificates on has committed this
+/// instance to, and warn about the two preconditions that are not checkable
+/// from inside the process.
+///
+/// Both warnings name a failure that would otherwise show up only as orders
+/// that never validate: a staging certificate no browser trusts, and a port
+/// 80 the authority cannot reach.
+fn announce_acme(system: &SystemConfig, settings: &deis_proxy::config::system::AcmeConfig) {
+    info!(
+        directory = %settings.directory_url,
+        contact = %settings.contact_email,
+        storage_dir = %settings.storage_dir,
+        "automatic certificates are on: names served by this instance are certified over http-01 \
+         and renewed here, and no certificate file has to be placed by hand for them"
+    );
+    if settings.is_staging_default() {
+        warn!(
+            directory = LETS_ENCRYPT_STAGING,
+            "the certificate authority is Let's Encrypt staging, which is the default. Staging \
+             issues from a root no browser trusts, so every visitor sees a certificate warning. \
+             That is the right place to start; set tls.acme.directory_url to \
+             {LETS_ENCRYPT_PRODUCTION} once a name has been issued successfully here"
+        );
+    } else if settings.is_production_authority() {
+        info!(
+            "the certificate authority is Let's Encrypt production: its rate limits are counted \
+             per registered domain per week and cannot be reset, so a name that keeps failing \
+             should be fixed rather than retried harder"
+        );
+    }
+
+    // The authority always fetches the challenge on port 80. Not being
+    // bound here is legitimate - a NAT or a service manager may forward it -
+    // so this cannot be a refusal, but it is by far the most common reason
+    // a first order never validates.
+    if !system.listen_ports().contains(&80) {
+        warn!(
+            listen_ports = ?system.listen_ports(),
+            "automatic certificates need port 80: the authority fetches \
+             http://<name>/.well-known/acme-challenge/<token> there and follows no other port. \
+             This instance does not listen on 80, so unless something in front of it forwards \
+             port 80 here, every order will fail validation"
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let cli = CliConfig::parse().context("parsing command line")?;
     cli.execute()?;
@@ -251,6 +299,28 @@ fn main() -> Result<()> {
         None => None,
     };
 
+    // Automatic certificates, when they are switched on. Built here, before
+    // the readiness announcement below, because it creates the storage
+    // directory and reads or writes the account key: a failure has to be an
+    // exit while this process is still just a process. Announced readiness
+    // is a promise, and the old one sends itself SIGQUIT on it.
+    let acme_runtime = match system.acme() {
+        Some(settings) => {
+            announce_acme(&system, settings);
+            Some(
+                acme::build(settings.clone(), Arc::clone(&config))
+                    .context("preparing automatic certificates")?,
+            )
+        }
+        None => {
+            info!(
+                "automatic certificates are off; every certificate served is a file named in the \
+                 configuration. Set tls.acme.enabled to have them obtained and renewed here"
+            );
+            None
+        }
+    };
+
     let opt = Opt {
         upgrade: cli.upgrade,
         daemon,
@@ -290,7 +360,14 @@ fn main() -> Result<()> {
     // daemon mode.
     init_runtime.shutdown_background();
 
-    let proxy = DeisProxy::new(Arc::clone(&config), balancer, access_log);
+    let proxy = DeisProxy::new(
+        Arc::clone(&config),
+        balancer,
+        access_log,
+        acme_runtime
+            .as_ref()
+            .map(|runtime| Arc::clone(&runtime.responder)),
+    );
     let mut service = http_proxy_service_with_name(&server.configuration, proxy, "deis_proxy");
 
     let tls_ports = system.tls_ports();
@@ -311,15 +388,37 @@ fn main() -> Result<()> {
         }
     }
     if !tls_ports.is_empty() && !config.routes().has_certificates() {
-        warn!(
-            "TLS ports are configured but no certificate is loaded; \
-             handshakes will fail until an app with a certificate or tls.default_certificate is configured"
-        );
+        if acme_runtime.is_some() {
+            // Ordinary on a first start: the renewal task is about to order
+            // one. Saying "configure a certificate" here would send an
+            // operator to fix something that is already being done.
+            info!(
+                "TLS ports are configured and no certificate is loaded yet; the first automatic \
+                 certificate has not been obtained. Handshakes fail until it is, which takes one \
+                 renewal pass once the name resolves to this machine"
+            );
+        } else {
+            warn!(
+                "TLS ports are configured but no certificate is loaded; handshakes will fail \
+                 until an app with a certificate, tls.default_certificate, or tls.acme is \
+                 configured"
+            );
+        }
     }
     // A listener that cannot be bound must take the process down, not leave
     // a daemon running without one.
     server.add_service(ExitOnPanic::new(service));
     server.add_services(vec![balancer_service]);
+
+    // Owned by the server like every other background task, so a
+    // zero-downtime upgrade replaces it rather than leaving two renewal
+    // loops ordering against the same account.
+    if let Some(runtime) = acme_runtime {
+        server.add_service(background_service(
+            "automatic certificates",
+            runtime.service,
+        ));
+    }
 
     let (commands, _) = broadcast::channel(8);
     server.add_service(background_service(

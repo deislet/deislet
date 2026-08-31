@@ -11,7 +11,14 @@
 //! plane's catalog, polled by [`catalog`]; the local application list adds
 //! what to do with the request once the application is known - its
 //! certificates, its cache policy, whether it is enabled at all.
+//!
+//! Those certificates can be obtained rather than placed: [`acme`] holds the
+//! RFC 8555 client, the `http-01` responder the data plane answers from, and
+//! the task that renews before expiry. It is off unless `[tls.acme]` turns
+//! it on, and an instance with certificate files of its own never
+//! constructs it.
 
+pub mod acme;
 pub mod catalog;
 pub mod cli;
 pub mod config;

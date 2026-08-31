@@ -10,13 +10,31 @@ use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::acme::AcmeStore;
 use crate::catalog::table::CatalogRoutes;
 use crate::catalog::wire::RoutingTableDocument;
 use crate::config::{
-    AppConfig, ConfigError, ControlSystemConfig, LocalConfig, RouteTable, SystemConfig, Validatable,
+    AppConfig, CertificateConfig, ConfigError, ControlSystemConfig, LocalConfig, RouteTable,
+    SystemConfig, Validatable,
 };
 
 pub use database::{AppConfigEntry, ConfigDatabase, DatabaseError};
+
+/// The certificates the ACME store holds, or nothing when automatic
+/// certificates are switched off.
+///
+/// Read from the directory on every rebuild rather than remembered, because
+/// the directory is the record: a certificate the renewal task has just
+/// written, one a previous process wrote before this one started, and one an
+/// operator dropped in by hand are all the same thing to the route table.
+/// This is also what makes a restart cost no order - the files are found
+/// before anything is asked of the authority.
+fn automatic_certificates(system: &SystemConfig) -> Vec<(String, CertificateConfig)> {
+    let Some(acme) = system.acme() else {
+        return Vec::new();
+    };
+    AcmeStore::new(Path::new(&acme.storage_dir), &acme.directory_url).stored_certificates()
+}
 
 /// How many added or removed routing rules are written out one by one when
 /// the table changes. Past this the log says how many more there were: a
@@ -102,6 +120,7 @@ impl ConfigManager {
                 .tls
                 .as_ref()
                 .and_then(|t| t.default_certificate.as_ref()),
+            &automatic_certificates(&system_config),
         );
 
         Ok(Self {
@@ -207,6 +226,7 @@ impl ConfigManager {
                 .tls
                 .as_ref()
                 .and_then(|t| t.default_certificate.as_ref()),
+            &automatic_certificates(&system),
         );
         info!(apps = routes.len(), "route table rebuilt");
         self.routes.store(Arc::new(routes));

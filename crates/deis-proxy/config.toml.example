@@ -40,6 +40,68 @@ listen_ports = [80]
 # ports = [443]
 # default_certificate = { cert_file = "/etc/deis-proxy/default.pem", key_file = "/etc/deis-proxy/default.key" }
 
+# Automatic certificates over ACME (RFC 8555). Off unless enabled is true; an
+# instance with its own certificate files needs none of this and never
+# contacts a certificate authority.
+#
+# What turning it on needs:
+#   - port 80 reachable from the internet at every name being certified. The
+#     authority fetches http://<name>/.well-known/acme-challenge/<token> there
+#     and follows no other port; this proxy answers it itself, so there is no
+#     webroot to share and nothing else to run. Put 80 in listen_ports, or
+#     forward it here.
+#   - tls.ports above, or the certificates could never be served.
+#   - an email address. It is where the authority writes when a certificate is
+#     close to expiring and renewal has been failing, which is the one warning
+#     that arrives before an outage.
+#   - terms_of_service_agreed = true. RFC 8555 registration carries an
+#     agreement to the authority's terms; this process will not agree to them
+#     on your behalf.
+#
+# What it certifies: the domains of the applications the control pushes, plus
+# the exact hosts in the catalog's routing table. Nothing is listed here - a
+# domain added through the control plane gets a certificate with no edit on
+# this machine. A name you have already named a certificate file for stays
+# yours. Wildcards are not certified: RFC 8555 issues those only against the
+# dns-01 challenge, which this implementation does not speak.
+#
+# [tls.acme]
+# enabled = true
+# Default: Let's Encrypt staging, which issues from a root no browser trusts.
+# That is the right place to start. Change it to
+# https://acme-v02.api.letsencrypt.org/directory only once a name has been
+# issued successfully here: production's limits are counted per registered
+# domain per week and cannot be given back.
+# directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+# contact_email = "ops@example.com"
+# terms_of_service_agreed = true
+# The account key and every issued certificate, kept across restarts. Split by
+# authority inside, so moving from staging to production obtains everything
+# again rather than leaving untrusted certificates in place.
+# storage_dir = "acme"
+# Renew once fewer than this many days of validity remain (default 30 on a
+# 90 day certificate), and log a failed renewal at error rather than warn once
+# fewer than alarm_before_days remain (default 7).
+# renew_before_days = 30
+# alarm_before_days = 7
+# Seconds between renewal passes (default 12 hours), and the retry backoff
+# after a failure: the first wait, doubled each time, up to the ceiling.
+# check_interval_secs = 43200
+# retry_backoff_secs = 60
+# max_retry_backoff_secs = 21600
+# Ceiling on how many names this instance will ever hold certificates for. A
+# route table that suddenly grew must not become an order per name: exhausting
+# the authority's weekly limit stops issuance for every name under the domain,
+# production included.
+# max_names = 20
+# Whether the automatic per-environment addresses under routing.preview_zone
+# get certificates of their own. Off by default: preview environments come and
+# go with branches and each one would spend one of those weekly certificates.
+# One wildcard for the zone covers them all and costs one - but a wildcard
+# needs dns-01. Turn this on for a handful of long-lived environments; place a
+# wildcard by hand for a zone that churns.
+# include_preview_addresses = false
+
 [https]
 # Redirect plain HTTP to HTTPS for applications that have a certificate.
 auto_redirect_to_https = true

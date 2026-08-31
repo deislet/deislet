@@ -16,7 +16,14 @@
 //! 2. Disabled applications get a 403. Plain HTTP requests for an application
 //!    whose certificate is actually loaded are redirected to HTTPS when the
 //!    policy says so.
-//! 3. A request body larger than `max_request_body_bytes` is answered 413,
+//! 3. When automatic certificates are on, a request under
+//!    `/.well-known/acme-challenge/` is answered here from the published
+//!    answers and never routed. It is answered before the application is
+//!    resolved, because the whole point of the challenge is that it arrives
+//!    for a name that may have no certificate, no route and no application
+//!    yet - and after the declared-body check, so the path cannot be used to
+//!    walk past the body ceiling.
+//! 4. A request body larger than `max_request_body_bytes` is answered 413,
 //!    either from what the client declared in `Content-Length` (before an
 //!    upstream is picked at all) or from the bytes as they stream past. The
 //!    body is not buffered here, so without this the whole over-large upload
@@ -24,13 +31,13 @@
 //!    A connection that has *completed* an upgrade is exempt: its frames are a
 //!    conversation with no total size, not a body a node will buffer. Asking
 //!    for an upgrade is not enough; `request_body_filter` says why not.
-//! 4. A backend is picked from the shared upstream pool and the request is
+//! 5. A backend is picked from the shared upstream pool and the request is
 //!    forwarded. `x-deis-app-id` is set to the id deis-proxy decided on and
 //!    `x-deis-environment` to that app's configured environment (defaulting
 //!    to production when the route names none), replacing whatever the
 //!    client sent for either header, so deis-runtime only ever sees values
 //!    that passed the checks above.
-//! 5. A request the upstream upgrades (a WebSocket handshake) becomes a
+//! 6. A request the upstream upgrades (a WebSocket handshake) becomes a
 //!    tunnel: everything after the 101 is relayed in both directions until
 //!    one end closes. The upstream read timeout is a bound on how long a
 //!    reply may take and is not applied to that tunnel, so a connection is
@@ -58,6 +65,7 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType};
 use tracing::{debug, warn};
 
+use crate::acme::{CHALLENGE_PREFIX, ChallengeResponder};
 use crate::catalog::table::{CatalogRoutes, MatchSource};
 use crate::config::routes::{RouteTable, normalize_host};
 use crate::config::system::{CompressionAlgo, DEFAULT_MAX_REQUEST_BODY_BYTES};
@@ -71,6 +79,10 @@ pub struct DeisProxy {
     config: Arc<ConfigManager>,
     balancer: Balancer,
     access_log: Option<AccessLog>,
+    /// The published `http-01` answers, present only when `[tls.acme]` is
+    /// switched on. `None` means the challenge path is routed like any other
+    /// path, which is what an instance with its own certificate files wants.
+    acme: Option<Arc<ChallengeResponder>>,
 }
 
 /// Per-request state shared between proxy phases.
@@ -136,11 +148,66 @@ impl DeisProxy {
         config: Arc<ConfigManager>,
         balancer: Balancer,
         access_log: Option<AccessLog>,
+        acme: Option<Arc<ChallengeResponder>>,
     ) -> Self {
         Self {
             config,
             balancer,
             access_log,
+            acme,
+        }
+    }
+
+    /// Answer the authority's `http-01` fetch, or refuse it.
+    ///
+    /// Always answers - a challenge request is never forwarded to a node.
+    /// The 404 matters as much as the 200: an authority that got a node's
+    /// page back instead of a refusal would have to guess at what went
+    /// wrong, and a token this instance never published must not be given
+    /// anything that could be mistaken for an answer.
+    async fn answer_acme_challenge(
+        &self,
+        session: &mut Session,
+        responder: &ChallengeResponder,
+        host: &str,
+    ) -> pingora::Result<bool> {
+        let path = session.req_header().uri.path().to_string();
+        match responder.answer_for_path(&path) {
+            Some(answer) => {
+                // Every fetch of a published answer is one step of a
+                // validation that is about to succeed or fail, and there are
+                // only a handful of them per certificate, so each is worth a
+                // line: it is the evidence that the name really does reach
+                // this process.
+                tracing::info!(
+                    host,
+                    "an http-01 challenge answer was served; the certificate authority reached \
+                     this instance for this name"
+                );
+                let mut response = ResponseHeader::build(200, Some(2))?;
+                // RFC 8555 section 8.3 asks for this content type, and an
+                // authority is entitled to be strict about it.
+                response.insert_header("Content-Type", "application/octet-stream")?;
+                response.insert_header("Content-Length", answer.len().to_string())?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from(answer)), true)
+                    .await?;
+                Ok(true)
+            }
+            None => {
+                debug!(
+                    host,
+                    path = %path,
+                    "an ACME challenge was requested for a token this instance never published"
+                );
+                session
+                    .respond_error_with_body(404, Bytes::from_static(b"no such acme challenge\n"))
+                    .await?;
+                Ok(true)
+            }
         }
     }
 }
@@ -425,6 +492,22 @@ impl ProxyHttp for DeisProxy {
                 .respond_error_with_body(413, over_the_body_ceiling(ctx.max_request_body_bytes))
                 .await?;
             return Ok(true);
+        }
+
+        // Before any routing decision. The authority fetches this path for a
+        // name that, by construction, may have no certificate, no route and
+        // no application here yet - so resolving an application first would
+        // answer the first certificate this instance ever ordered with a 404.
+        if let Some(responder) = &self.acme
+            && session
+                .req_header()
+                .uri
+                .path()
+                .starts_with(CHALLENGE_PREFIX)
+        {
+            let responder = Arc::clone(responder);
+            let host = ctx.host.clone();
+            return self.answer_acme_challenge(session, &responder, &host).await;
         }
 
         let routes = self.config.routes();
@@ -740,7 +823,7 @@ mod tests {
                 )
             })
             .collect();
-        RouteTable::build(&apps, None)
+        RouteTable::build(&apps, None, &[])
     }
 
     /// The catalog table the routing tests match against. `zone` turns the

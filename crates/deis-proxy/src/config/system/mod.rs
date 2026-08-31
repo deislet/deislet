@@ -1,3 +1,4 @@
+pub mod acme;
 pub mod balancing;
 pub mod cache;
 pub mod compression;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use deis_wire::ControlConfig;
 use serde::{Deserialize, Serialize};
 
+pub use acme::AcmeConfig;
 pub use balancing::BalancingStrategy;
 pub use cache::CacheConfig;
 pub use compression::{CompressionAlgo, CompressionConfig};
@@ -210,6 +212,16 @@ impl SystemConfig {
             .unwrap_or_default()
     }
 
+    /// The ACME settings if automatic certificates are switched on.
+    ///
+    /// One accessor rather than three `and_then` chains at the call sites:
+    /// the renewal task, the route table and the startup banner all have to
+    /// agree on what "on" means, and a caller that forgot `enabled` would
+    /// order certificates from a table an operator had switched off.
+    pub fn acme(&self) -> Option<&AcmeConfig> {
+        self.tls.as_ref().and_then(|tls| tls.acme_enabled())
+    }
+
     pub fn https(&self) -> HttpsConfig {
         self.https.clone().unwrap_or_default()
     }
@@ -284,13 +296,20 @@ impl SystemConfig {
                 resolve(&mut access.path);
             }
         }
-        if let Some(cert) = self
-            .tls
-            .as_mut()
-            .and_then(|t| t.default_certificate.as_mut())
-        {
-            resolve(&mut cert.cert_file);
-            resolve(&mut cert.key_file);
+        if let Some(tls) = self.tls.as_mut() {
+            if let Some(cert) = tls.default_certificate.as_mut() {
+                resolve(&mut cert.cert_file);
+                resolve(&mut cert.key_file);
+            }
+            // The account key and every issued certificate live under this
+            // directory, and both the renewal task and the route table read
+            // it after pingora's daemon mode has moved to `/`. A relative
+            // path left unresolved would make a replacement process look at
+            // `/acme`, find no account key, and register a second account
+            // with the authority on every restart.
+            if let Some(acme) = tls.acme.as_mut() {
+                resolve(&mut acme.storage_dir);
+            }
         }
     }
 }
@@ -549,6 +568,48 @@ path = "logs/access.log"
             log.access_log.as_ref().unwrap().path,
             "/srv/deis-proxy/logs/access.log"
         );
+    }
+
+    #[test]
+    fn the_acme_storage_directory_resolves_against_the_base() {
+        // Daemon mode moves the working directory to `/`, and the renewal
+        // task reads this directory long after that. Left relative it would
+        // become `/acme`, where there is no account key, and every restart
+        // would register a fresh account with the authority.
+        let local: SystemConfig = toml::from_str(
+            r#"
+[tls]
+ports = [443]
+[tls.acme]
+enabled = true
+contact_email = "ops@example.com"
+terms_of_service_agreed = true
+storage_dir = "var/acme"
+"#,
+        )
+        .unwrap();
+        let mut merged = SystemConfig::baseline() + local;
+        merged.resolve_paths(Path::new("/srv/deis-proxy"));
+        assert_eq!(
+            merged.acme().unwrap().storage_dir,
+            "/srv/deis-proxy/var/acme"
+        );
+    }
+
+    #[test]
+    fn a_switched_off_acme_table_is_not_reported_as_on() {
+        let local: SystemConfig = toml::from_str(
+            r#"
+[tls]
+ports = [443]
+[tls.acme]
+enabled = false
+"#,
+        )
+        .unwrap();
+        let merged = SystemConfig::baseline() + local;
+        assert!(merged.acme().is_none());
+        assert!(SystemConfig::baseline().acme().is_none());
     }
 
     #[test]

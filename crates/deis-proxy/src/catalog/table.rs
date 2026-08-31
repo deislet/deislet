@@ -309,6 +309,32 @@ impl CatalogRoutes {
         self.preview.len()
     }
 
+    /// Every exact host an operator created a route for.
+    ///
+    /// Wildcard routes and the catch-all are left out on purpose: a
+    /// certificate for `*.example.com` cannot be had over `http-01`, and a
+    /// route that matches any host names nothing to certify at all. The
+    /// renewal task in [`crate::acme`] reads this so a domain added through
+    /// the control plane gets a certificate without anyone editing a file on
+    /// this machine.
+    pub fn route_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self.by_host.keys().cloned().collect();
+        hosts.sort();
+        hosts
+    }
+
+    /// The automatic per-environment addresses, when a preview zone is set.
+    ///
+    /// Kept apart from [`CatalogRoutes::route_hosts`] because they are
+    /// treated differently: one wildcard certificate covers the whole zone,
+    /// and certifying each address on its own spends one of the authority's
+    /// weekly certificates per environment. See `tls.acme`.
+    pub fn preview_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self.preview.keys().cloned().collect();
+        hosts.sort();
+        hosts
+    }
+
     /// Which application and environment serves `host` + `path`.
     pub fn match_request(&self, host: &str, path: &str) -> Option<Match> {
         let host = normalize_host(host);
