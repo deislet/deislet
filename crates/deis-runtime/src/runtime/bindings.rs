@@ -98,14 +98,31 @@ pub const QUEUE_CONSUMERS_KEY: &str = "DEIS_QUEUE_CONSUMERS";
 /// key would be choosing the credential the node then presents for it.
 pub const STORAGE_TOKEN_KEY: &str = deis_wire::conventions::STORAGE_TOKEN_ENV;
 
+/// The name `env.ASSETS` is published under.
+///
+/// Not an address and not a credential: it is the one *binding* that arrives
+/// through this map's namespace rather than through it, an object
+/// `js/runtime.js` installs on the environment table for
+/// [`crate::assets::AssetBundle::fetch_asset`]. It is reserved for the same
+/// reason the endpoints are. A deployment that carried `ASSETS=...` as an
+/// ordinary variable would put a string where the binding goes, and whichever
+/// of the two wrote last would decide whether `env.ASSETS.fetch()` reached the
+/// version's own files or threw "fetch is not a function" -- with the choice
+/// belonging to the application rather than to the platform.
+///
+/// Bare, not `DEIS_`-prefixed, because it is the name an author writes; the
+/// spelling is Cloudflare's, so a Pages project's code reads the same here.
+pub const ASSETS_BINDING_KEY: &str = "ASSETS";
+
 /// Every key this module claims. Anything spelled this way in a deployment's
 /// env map is platform wiring and is removed before the app sees the map.
-pub const RESERVED_ENV_KEYS: [&str; 5] = [
+pub const RESERVED_ENV_KEYS: [&str; 6] = [
     SERVICES_KEY,
     STORE_ENDPOINT_KEY,
     QUEUE_ENDPOINT_KEY,
     QUEUE_CONSUMERS_KEY,
     STORAGE_TOKEN_KEY,
+    ASSETS_BINDING_KEY,
 ];
 
 /// How long one dial to a storage service may take before the call that
@@ -322,6 +339,12 @@ impl ServiceWiring {
         let queue = env.remove(QUEUE_ENDPOINT_KEY);
         let consumers = env.remove(QUEUE_CONSUMERS_KEY).unwrap_or_default();
         let storage_token = env.remove(STORAGE_TOKEN_KEY);
+        // Nothing is read out of it -- the binding is built from the version's
+        // own asset bundle, not from a string. Removing it is the whole point:
+        // `js/runtime.js` writes `env.ASSETS` over whatever this map held, and
+        // an application that shipped its own value would otherwise see it in
+        // `Deno.env` and in the map the queue and cron handlers are handed.
+        env.remove(ASSETS_BINDING_KEY);
 
         Self {
             declaration: ServiceDeclaration::from_names(services.split(',')),

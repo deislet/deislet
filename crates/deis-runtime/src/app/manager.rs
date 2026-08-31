@@ -214,40 +214,26 @@ impl ApplicationManager {
         self
     }
 
-    /// Resolve the effective execution limits for an app: its own
-    /// `ResourceLimits` override where present, the platform default
-    /// otherwise. Logs at info level whenever an app overrides a default, so
-    /// operators can see which apps deviate from the platform baseline.
+    /// Resolve the effective execution limits for an app: this node's
+    /// ceilings, narrowed by whatever the application asked to be held to.
+    ///
+    /// **Every limit narrows only.** The values in a `ResourceLimits` arrive
+    /// from an application's own bundle manifest, and a manifest is written by
+    /// the tenant, not by the operator. Taking one at face value would let any
+    /// application on a shared node raise its own ceiling - an hour of
+    /// wall-clock time per request, ten thousand ops a second - simply by
+    /// declaring it. So the node's configuration is the ceiling on every
+    /// field, and an application may only ask for less of it.
+    ///
+    /// Asking for more is not an error. It is a `warn` naming the application,
+    /// the value it asked for and the value it got, and then the node's value
+    /// is used: refusing the deployment outright would take an application off
+    /// the air over a number that is merely optimistic, and silently applying
+    /// the node's value would leave an operator reading a manifest that says
+    /// something the platform never did.
     fn effective_limits(&self, key: &AppKey, limits: Option<&ResourceLimits>) -> ExecutionLimits {
-        let timeout_override = limits.and_then(|l| l.timeout_ms);
-        let timeout_ms = timeout_override.unwrap_or(self.default_limits.timeout_ms);
-        if let Some(overridden) = timeout_override {
-            tracing::info!(
-                target: "app",
-                app_id = %key.app_id(),
-                environment = %key.environment(),
-                "App {} overrides default execution timeout: {}ms (platform default {}ms)",
-                key,
-                overridden,
-                self.default_limits.timeout_ms
-            );
-        }
-
-        let rate_limit_override = limits.and_then(|l| l.rate_limit_ops_per_sec);
-        let rate_limit_ops_per_sec =
-            rate_limit_override.unwrap_or(self.default_limits.rate_limit_ops_per_sec);
-        if let Some(overridden) = rate_limit_override {
-            tracing::info!(
-                target: "app",
-                app_id = %key.app_id(),
-                environment = %key.environment(),
-                "App {} overrides default rate limit: {} ops/sec (platform default {} ops/sec)",
-                key,
-                overridden,
-                self.default_limits.rate_limit_ops_per_sec
-            );
-        }
-
+        let timeout_ms = self.effective_timeout_ms(key, limits);
+        let rate_limit_ops_per_sec = self.effective_rate_limit(key, limits);
         let cpu_time_limit_ms = self.effective_cpu_time_limit_ms(key, limits);
 
         // A thread cannot burn more CPU time than wall-clock time, so a CPU
@@ -284,15 +270,145 @@ impl ApplicationManager {
         }
     }
 
+    /// Resolve the wall-clock ceiling for one invocation of one app: the
+    /// node's default, narrowed by the app's own `ResourceLimits.timeout_ms`
+    /// when it asked for less.
+    ///
+    /// Narrowing only, like every other limit here. A longer timeout is not
+    /// only the client's patience: an invocation holds the runtime thread it
+    /// is on for its whole duration, and every other application queued behind
+    /// that thread waits with it. An application that could set its own
+    /// timeout to an hour could park a thread for an hour, so this is the
+    /// node's number and an application may only ask for less of it.
+    ///
+    /// An application wanting a *longer* deadline than the node allows has a
+    /// placement question, not a configuration one: it belongs on a node whose
+    /// operator set `default_execution_limits.timeout_ms` that high.
+    fn effective_timeout_ms(&self, key: &AppKey, limits: Option<&ResourceLimits>) -> u64 {
+        let node_default = self.default_limits.timeout_ms;
+        let Some(requested) = limits.and_then(|l| l.timeout_ms) else {
+            return node_default;
+        };
+
+        if requested == 0 {
+            // Zero is what the wire uses for "unset", so it should never
+            // survive as a value here. If it does, it came from something that
+            // hand-built an assignment, and applying it would cut every
+            // invocation off before it ran.
+            tracing::warn!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                applied_ms = node_default,
+                "App {} asks for a 0ms execution timeout, which would fail every request before \
+                 it started; it is held to this node's {}ms default instead",
+                key,
+                node_default
+            );
+            return node_default;
+        }
+
+        if requested <= node_default {
+            tracing::info!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                "App {} narrows the default execution timeout: {}ms (platform default {}ms)",
+                key,
+                requested,
+                node_default
+            );
+            return requested;
+        }
+
+        tracing::warn!(
+            target: "app",
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            requested_ms = requested,
+            applied_ms = node_default,
+            "App {} asks for a {}ms execution timeout, above this node's {}ms ceiling; it is \
+             held to the node's value. An invocation holds a runtime thread for its whole \
+             duration, so this ceiling is the node's to set: raise \
+             default_execution_limits.timeout_ms if this node is meant to carry requests that \
+             long",
+            key,
+            requested,
+            node_default
+        );
+        node_default
+    }
+
+    /// Resolve the op-dispatch rate ceiling for one app: the node's default,
+    /// narrowed by the app's own `ResourceLimits.rate_limit_ops_per_sec` when
+    /// it asked for less.
+    ///
+    /// Narrowing only. Every op dispatch is work this node does on the
+    /// application's behalf, so the rate at which one tenant may ask for it is
+    /// the node's number; an application raising its own would be helping
+    /// itself to a bigger share of the box.
+    fn effective_rate_limit(&self, key: &AppKey, limits: Option<&ResourceLimits>) -> f64 {
+        let node_default = self.default_limits.rate_limit_ops_per_sec;
+        let Some(requested) = limits.and_then(|l| l.rate_limit_ops_per_sec) else {
+            return node_default;
+        };
+
+        // NaN compares false against everything, so it would slip past both
+        // branches below and be installed as a ceiling nothing can cross.
+        if !requested.is_finite() || requested <= 0.0 {
+            tracing::warn!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                requested_ops_per_sec = requested,
+                applied_ops_per_sec = node_default,
+                "App {} asks for a rate limit of {} ops/sec, which is not a usable rate; it is \
+                 held to this node's {} ops/sec default instead",
+                key,
+                requested,
+                node_default
+            );
+            return node_default;
+        }
+
+        if requested <= node_default {
+            tracing::info!(
+                target: "app",
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                "App {} narrows the default op rate limit: {} ops/sec (platform default {} \
+                 ops/sec)",
+                key,
+                requested,
+                node_default
+            );
+            return requested;
+        }
+
+        tracing::warn!(
+            target: "app",
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            requested_ops_per_sec = requested,
+            applied_ops_per_sec = node_default,
+            "App {} asks for {} ops/sec of op dispatch, above this node's {} ops/sec ceiling; it \
+             is held to the node's value. Raise \
+             default_execution_limits.rate_limit_ops_per_sec if this node is meant to carry \
+             applications that chatty",
+            key,
+            requested,
+            node_default
+        );
+        node_default
+    }
+
     /// Resolve the CPU-time ceiling for one app: the node's default, narrowed
     /// by the app's own `ResourceLimits.cpu_time_limit_ms` when it asked for
     /// less.
     ///
-    /// Narrowing only, exactly like the heap ceiling and unlike `timeout_ms`.
-    /// A duration ceiling bounds how long a client waits, which is the
-    /// application's business; CPU time is a core taken from every other
-    /// tenant on this node, which is the node's. So an app may hold itself to
-    /// less and may not help itself to more.
+    /// Narrowing only, like every other limit here. CPU time is a core taken
+    /// from every other tenant on this node, so an app may hold itself to less
+    /// and may not help itself to more.
     fn effective_cpu_time_limit_ms(&self, key: &AppKey, limits: Option<&ResourceLimits>) -> u64 {
         let node_default = self.default_limits.cpu_time_limit_ms;
         let Some(requested) = limits.and_then(|l| l.cpu_time_limit_ms) else {
@@ -427,6 +543,9 @@ impl ApplicationManager {
             route_patterns: config.routes.clone(),
             limits: self.effective_limits(&key, config.limits.as_ref()),
             fetch_policy: self.fetch_policy.clone(),
+            // This path loads code without a bundle -- the node's own system
+            // app, and tests -- so there is nothing for `env.ASSETS` to serve.
+            assets: None,
         };
         match self
             .runtime_pool
@@ -603,6 +722,11 @@ impl ApplicationManager {
             route_patterns: record.config.routes.clone(),
             limits: self.effective_limits(key, record.config.limits.as_ref()),
             fetch_policy: self.fetch_policy.clone(),
+            // The same bundle the HTTP entry serves from, so `env.ASSETS`
+            // inside the isolate and asset-first outside it answer a path
+            // identically. Shared, not copied: it is an `Arc` over bytes that
+            // were read once when the version loaded.
+            assets: Some(record.assets.clone()),
         }
     }
 
@@ -1199,6 +1323,173 @@ mod cpu_ceiling {
                 .effective_limits(&key("zero_means_unset"), unset.limits.as_ref())
                 .cpu_time_limit_ms,
             2_000
+        );
+    }
+}
+
+/// The two limits that used to pass straight through: an application's own
+/// `timeout_ms` and `rate_limit_ops_per_sec` were taken with `unwrap_or`, so
+/// the moment a deployment could actually carry them, a tenant could have
+/// raised its own ceiling on a machine it shares.
+#[cfg(test)]
+mod duration_and_rate_ceilings {
+    use super::*;
+    use crate::app::types::{AppConfig, ResourceLimits};
+    use crate::config::ExecutionLimits;
+
+    fn key(app_id: &str) -> AppKey {
+        AppKey::production(app_id)
+    }
+
+    fn asking(limits: ResourceLimits) -> AppConfig {
+        AppConfig {
+            limits: Some(limits),
+            ..AppConfig::default()
+        }
+    }
+
+    fn node(timeout_ms: u64, rate_limit_ops_per_sec: f64) -> ApplicationManager {
+        ApplicationManager::with_threads(Some(1)).with_limits(ExecutionLimits {
+            timeout_ms,
+            // Kept under the timeout so the "a CPU ceiling above the duration
+            // ceiling can never fire" warning does not fire in these tests and
+            // confuse whoever reads their output.
+            cpu_time_limit_ms: timeout_ms / 2,
+            rate_limit_ops_per_sec,
+            ..ExecutionLimits::default()
+        })
+    }
+
+    #[test]
+    fn an_app_that_declares_nothing_takes_the_node_numbers() {
+        let manager = node(30_000, 1_000.0);
+        let effective = manager.effective_limits(&key("silent"), None);
+        assert_eq!(effective.timeout_ms, 30_000);
+        assert_eq!(effective.rate_limit_ops_per_sec, 1_000.0);
+    }
+
+    #[test]
+    fn an_app_may_narrow_the_execution_timeout() {
+        let manager = node(30_000, 1_000.0);
+        let asked = asking(ResourceLimits {
+            timeout_ms: Some(2_000),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            manager
+                .effective_limits(&key("modest"), asked.limits.as_ref())
+                .timeout_ms,
+            2_000
+        );
+    }
+
+    /// The hole. An application declaring an hour used to *get* an hour, and
+    /// with it a runtime thread every other tenant on this node queues behind.
+    #[test]
+    fn an_app_may_not_widen_the_execution_timeout() {
+        let manager = node(30_000, 1_000.0);
+        let asked = asking(ResourceLimits {
+            timeout_ms: Some(3_600_000),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            manager
+                .effective_limits(&key("greedy"), asked.limits.as_ref())
+                .timeout_ms,
+            30_000,
+            "an application must not be able to raise the node's duration ceiling"
+        );
+    }
+
+    #[test]
+    fn a_zero_timeout_is_read_as_unset_rather_than_as_no_time_at_all() {
+        let manager = node(30_000, 1_000.0);
+        let asked = asking(ResourceLimits {
+            timeout_ms: Some(0),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            manager
+                .effective_limits(&key("zero"), asked.limits.as_ref())
+                .timeout_ms,
+            30_000
+        );
+    }
+
+    #[test]
+    fn an_app_may_narrow_the_op_rate_limit() {
+        let manager = node(30_000, 1_000.0);
+        let asked = asking(ResourceLimits {
+            rate_limit_ops_per_sec: Some(50.0),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            manager
+                .effective_limits(&key("quiet"), asked.limits.as_ref())
+                .rate_limit_ops_per_sec,
+            50.0
+        );
+    }
+
+    #[test]
+    fn an_app_may_not_widen_the_op_rate_limit() {
+        let manager = node(30_000, 1_000.0);
+        let asked = asking(ResourceLimits {
+            rate_limit_ops_per_sec: Some(1_000_000.0),
+            ..ResourceLimits::default()
+        });
+        assert_eq!(
+            manager
+                .effective_limits(&key("chatty"), asked.limits.as_ref())
+                .rate_limit_ops_per_sec,
+            1_000.0,
+            "op dispatch is work this node does; an application must not be able to award itself \
+             more of it"
+        );
+    }
+
+    /// NaN compares false against every bound, so a naive `requested <=
+    /// default` check would let it through and install a ceiling that nothing
+    /// can ever cross - a rate limit switched off by an application.
+    #[test]
+    fn a_rate_limit_that_is_not_a_number_is_refused() {
+        let manager = node(30_000, 1_000.0);
+        for asked_for in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            let asked = asking(ResourceLimits {
+                rate_limit_ops_per_sec: Some(asked_for),
+                ..ResourceLimits::default()
+            });
+            assert_eq!(
+                manager
+                    .effective_limits(&key("nonsense"), asked.limits.as_ref())
+                    .rate_limit_ops_per_sec,
+                1_000.0,
+                "{asked_for} is not a usable rate and must not become this app's ceiling"
+            );
+        }
+    }
+
+    /// All four limits at once, through the one call every isolate is built
+    /// from: two narrowed, two greedy, and the greedy pair held to the node's
+    /// numbers.
+    #[test]
+    fn a_deployment_that_narrows_two_limits_and_widens_two_gets_exactly_that() {
+        let manager = node(30_000, 1_000.0).with_memory_limit_mb(128);
+        let asked = asking(ResourceLimits {
+            memory_mb: 32,
+            timeout_ms: Some(90_000),
+            rate_limit_ops_per_sec: Some(25.0),
+            cpu_time_limit_ms: Some(600_000),
+            ..ResourceLimits::default()
+        });
+        let effective = manager.effective_limits(&key("mixed"), asked.limits.as_ref());
+        assert_eq!(effective.timeout_ms, 30_000, "widened; node's value wins");
+        assert_eq!(effective.cpu_time_limit_ms, 15_000, "widened; node's value");
+        assert_eq!(effective.rate_limit_ops_per_sec, 25.0, "narrowed; applied");
+        assert_eq!(
+            manager.effective_memory_limit_mb(&key("mixed"), asked.limits.as_ref()),
+            32,
+            "narrowed; applied"
         );
     }
 }

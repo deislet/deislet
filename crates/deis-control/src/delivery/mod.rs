@@ -42,7 +42,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::catalog::secrets::secret_aad;
 use crate::catalog::{
-    CatalogError, CatalogResult, CatalogStore, Environment, SecretsBackend, Version,
+    CatalogError, CatalogResult, CatalogStore, DeclaredLimits, Environment, SecretsBackend,
+    Version, declared_limits,
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
 
@@ -271,6 +272,15 @@ pub struct DeploymentPayload {
     /// lines stay about the application, and merged in only when the wire
     /// message is built.
     storage: StorageWiring,
+    /// What this version's manifest asked to be held to, or `None` when it
+    /// asked for nothing and takes the node's own ceilings.
+    ///
+    /// Plain configuration, not a secret: it is printed in this type's
+    /// `Debug`, logged with every delivery, and served in the assignment list
+    /// that a restarting node reads. Every value is clamped on the node
+    /// (`ApplicationManager::effective_limits`), so what travels here is a
+    /// request to be held to less, never a grant of more.
+    pub limits: Option<DeclaredLimits>,
 }
 
 impl std::fmt::Debug for DeploymentPayload {
@@ -293,6 +303,7 @@ impl std::fmt::Debug for DeploymentPayload {
                 "storage_token",
                 &redacted(&self.storage.token_for(&self.app_id, &self.environment)),
             )
+            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -348,7 +359,33 @@ impl DeploymentPayload {
             bundle_url: self.bundle_url.clone(),
             bundle_sha: self.bundle_sha.clone(),
             env: env.into_iter().collect(),
+            limits: self.limits.as_ref().map(limits_to_wire),
         }
+    }
+}
+
+/// Translate a manifest's `limits` block into the wire message.
+///
+/// The proto uses `0` for "not set" on every numeric field, which is why the
+/// declaration side refuses an explicit zero: the two would be
+/// indistinguishable here, and an application that asked for a zero budget
+/// would quietly get the node's default instead of being told its manifest is
+/// wrong.
+///
+/// `cpu_milli` and `max_concurrency` are left at zero on purpose. They are
+/// fields 2 and 3 of the message and nothing on a node enforces either of them
+/// (see `deis.management.ResourceLimits`); sending a number for something that
+/// is not applied is how a platform ends up documenting a limit it does not
+/// have.
+fn limits_to_wire(limits: &DeclaredLimits) -> proto::ResourceLimits {
+    proto::ResourceLimits {
+        memory_mb: limits.memory_mb.unwrap_or(0) as i32,
+        cpu_milli: 0,
+        max_concurrency: 0,
+        resource_table_max: limits.resource_table_max.unwrap_or(0) as i32,
+        timeout_ms: limits.timeout_ms.unwrap_or(0) as i64,
+        rate_limit_ops_per_sec: limits.rate_limit_ops_per_sec.unwrap_or(0.0),
+        cpu_time_limit_ms: limits.cpu_time_limit_ms.unwrap_or(0) as i64,
     }
 }
 
@@ -479,6 +516,43 @@ impl DeploymentDeliverer {
 
         let mut env_map: BTreeMap<String, String> = manifest.env.clone();
 
+        // The same block the upload already accepted, read again here because
+        // this is the message that carries it to a node. A version stored by
+        // an older build - or by a build that did not check - can still hold a
+        // limits block nothing can act on; that must not stop the deployment,
+        // because the alternative is an application that will not deploy at
+        // all over a field that only ever narrows what it is allowed. It runs
+        // on the node's ceilings and the reason is said out loud.
+        let limits = match declared_limits(&version.manifest) {
+            Ok(limits) => limits,
+            Err(reason) => {
+                warn!(
+                    app_id = %env.app_id,
+                    environment = %env.name,
+                    version_id = %version_id,
+                    reason = %reason,
+                    "This version's manifest declares resource limits that cannot be read, so none are sent with the deployment; the application runs on this node's default ceilings, which are never narrower than what it asked for. Rebuild and upload the bundle with a valid limits block"
+                );
+                None
+            }
+        };
+        match &limits {
+            Some(declared) => info!(
+                app_id = %env.app_id,
+                environment = %env.name,
+                version_id = %version_id,
+                limits = %declared.describe(),
+                "Delivering with the resource limits this version's manifest declares: {}. A node applies whichever is narrower, its own ceiling or this",
+                declared.describe()
+            ),
+            None => debug!(
+                app_id = %env.app_id,
+                environment = %env.name,
+                version_id = %version_id,
+                "This version declares no resource limits; every node holds it to its own default ceilings"
+            ),
+        }
+
         let ciphertexts = self.store.secret_ciphertexts(&env.id).await?;
         let mut secret_names = Vec::with_capacity(ciphertexts.len());
         if !ciphertexts.is_empty() {
@@ -546,6 +620,7 @@ impl DeploymentDeliverer {
             env: env_map,
             secret_names,
             storage: self.storage.clone(),
+            limits,
         })
     }
 
@@ -978,6 +1053,83 @@ mod tests {
         // The secret wins over the placeholder the manifest carried.
         assert_eq!(request.env.get("API_KEY").unwrap(), "s3cr3t");
         assert_eq!(request.bundle_sha, "abc123");
+    }
+
+    /// The gap this closed: `ApplyDeploymentRequest` carried `env` and
+    /// nothing else, so the `ResourceLimits` message existed on the wire and
+    /// no deployment ever filled it. Every application on every node ran on
+    /// the node defaults whatever its manifest said.
+    #[tokio::test]
+    async fn a_manifest_that_narrows_its_limits_puts_them_on_the_wire() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let manifest = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+            "limits":{"timeout_ms":2000,"cpu_time_limit_ms":250,"memory_mb":48,
+                      "rate_limit_ops_per_sec":40.0,"resource_table_max":16}}"#;
+
+        let payload = deliverer
+            .payload(&env, &version(manifest), "http://control.test")
+            .await
+            .unwrap();
+
+        let limits = payload
+            .limits
+            .clone()
+            .expect("the manifest declares limits, so the payload must carry them");
+        assert_eq!(limits.timeout_ms, Some(2_000));
+
+        let wire = payload
+            .to_request()
+            .limits
+            .expect("the wire message must carry what the payload holds");
+        assert_eq!(wire.timeout_ms, 2_000);
+        assert_eq!(wire.cpu_time_limit_ms, 250);
+        assert_eq!(wire.memory_mb, 48);
+        assert_eq!(wire.rate_limit_ops_per_sec, 40.0);
+        assert_eq!(wire.resource_table_max, 16);
+        // Fields nothing on a node enforces stay at the absent sentinel
+        // rather than carrying a number the platform would not apply.
+        assert_eq!(wire.cpu_milli, 0);
+        assert_eq!(wire.max_concurrency, 0);
+    }
+
+    #[tokio::test]
+    async fn an_application_that_declares_no_limits_sends_none() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+
+        assert!(payload.limits.is_none());
+        assert!(
+            payload.to_request().limits.is_none(),
+            "an absent limits block must not become a message full of zeroes, which a node would \
+             have to tell apart from a real declaration"
+        );
+    }
+
+    /// A version stored before the upload check existed can still hold a
+    /// limits block nothing can read. Refusing to deploy it would take a
+    /// running application off the air over a field that only ever narrows
+    /// what it is allowed, so the delivery goes out on the node's ceilings.
+    #[tokio::test]
+    async fn a_limits_block_that_cannot_be_read_does_not_stop_the_deployment() {
+        let (deliverer, store) = deliverer(true).await;
+        let env = environment(&store).await;
+
+        let manifest =
+            r#"{"schema":1,"app":"demo","entry":"worker/index.js","limits":{"timeout_ms":0}}"#;
+
+        let payload = deliverer
+            .payload(&env, &version(manifest), "http://control.test")
+            .await
+            .expect("an unreadable limits block must not fail the delivery");
+        assert!(payload.limits.is_none());
+        assert!(payload.to_request().limits.is_none());
     }
 
     #[tokio::test]

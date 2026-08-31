@@ -68,6 +68,17 @@ pub struct Assignment {
     /// would have sent them. Absent from an older control plane.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// What this version's manifest asked to be held to, exactly as a push
+    /// would have sent it. Absent from an older control plane, and absent for
+    /// an application that declared nothing; either way the node's own
+    /// ceilings apply.
+    ///
+    /// Carried here and not only on the push because this is the path a node
+    /// comes back on after a restart: without it an application that narrowed
+    /// its CPU budget would silently return to the node default and stay there
+    /// until somebody deployed again.
+    #[serde(default)]
+    pub limits: Option<crate::app::types::ResourceLimits>,
 }
 
 /// Hand-written so a `{:?}` on an assignment - in a log line, in an error
@@ -83,6 +94,7 @@ impl std::fmt::Debug for Assignment {
             .field("bundle_url", &self.bundle_url)
             .field("bundle_sha", &self.bundle_sha)
             .field("env", &format_args!("{names:?} = <redacted>"))
+            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -96,6 +108,7 @@ impl Assignment {
             bundle_url: self.bundle_url,
             bundle_sha: self.bundle_sha,
             env: self.env,
+            limits: self.limits,
         }
     }
 }

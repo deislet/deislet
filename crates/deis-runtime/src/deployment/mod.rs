@@ -40,7 +40,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
-use crate::app::types::AppConfig;
+use crate::app::types::{AppConfig, ResourceLimits};
 use crate::app::{AppKey, ApplicationManager, VersionInstall};
 use crate::assets::{AssetBundle, AssetError};
 use crate::config::RuntimeConfig;
@@ -72,6 +72,15 @@ pub struct DeploymentOrder {
     pub bundle_url: String,
     pub bundle_sha: String,
     pub env: HashMap<String, String>,
+    /// What this version's manifest asked to be held to, as the control plane
+    /// read it out of the manifest and sent it. `None` means the application
+    /// declared nothing and takes this node's own ceilings.
+    ///
+    /// Never a grant: every field is clamped against the node's configuration
+    /// in [`crate::app::ApplicationManager::effective_limits`], which is the
+    /// only place that knows what this node allows. What travels here is a
+    /// request to be held to *less*.
+    pub limits: Option<ResourceLimits>,
 }
 
 impl DeploymentOrder {
@@ -92,6 +101,7 @@ impl std::fmt::Debug for DeploymentOrder {
             .field("bundle_url", &self.bundle_url)
             .field("bundle_sha", &self.bundle_sha)
             .field("env", &format_args!("{names:?} = <redacted>"))
+            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -380,6 +390,15 @@ impl DeploymentManager {
                 bundle_url: String::new(),
                 bundle_sha: record.bundle_sha.clone(),
                 env: HashMap::new(),
+                // Not on disk, for the same reason the secrets are not: the
+                // record this node keeps is a pointer, and the limits arrive
+                // with the deployment. Coming back on the node's own ceilings
+                // is the safe direction - they are what the operator allows,
+                // and an application can only ever have asked for less - but
+                // an application that narrowed its own budget loses that
+                // narrowing until the control plane redelivers, which is why
+                // the recovery log below says so.
+                limits: None,
             };
 
             match self.install(order, true).await {
@@ -392,7 +411,8 @@ impl DeploymentManager {
                         "Recovered {} version {} from this node's own disk because the control \
                          plane could not be reached; it is serving, but any secret this app \
                          declares is missing until the control plane redelivers, because \
-                         secret values are never written to disk",
+                         secret values are never written to disk, and it runs on this node's \
+                         default ceilings rather than any narrower ones its manifest asked for",
                         record.app_id,
                         record.version_id
                     );
@@ -503,10 +523,12 @@ impl DeploymentManager {
     /// must already be on disk and is used as it stands.
     async fn install(
         &self,
-        order: DeploymentOrder,
+        mut order: DeploymentOrder,
         local_only: bool,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
+        // Taken before the rest of the order is consumed piece by piece below.
+        let limits = order.limits.take();
         // Both halves of the key become a directory name here and a storage
         // tenant later, so they are checked together and before anything is
         // written.
@@ -635,6 +657,11 @@ impl DeploymentManager {
         let config = AppConfig {
             env,
             routes: manifest.route_patterns(),
+            // Straight from the order, unjudged. `install_version` builds the
+            // isolate through `effective_limits`, which clamps each field
+            // against this node's own ceilings and says so in the log when an
+            // application asked for more than it may have.
+            limits,
             ..Default::default()
         };
 

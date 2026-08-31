@@ -100,6 +100,16 @@ pub struct AssignmentView {
     /// This is why the endpoint authenticates the caller as a node: the
     /// values in this map are the platform's secrets in the clear.
     pub env: BTreeMap<String, String>,
+    /// What this version's manifest asked to be held to, exactly as the
+    /// `ApplyDeployment` push carries it. Omitted when the application
+    /// declared nothing, so an older node sees the same body it always did.
+    ///
+    /// Here and not only on the push because this is how a restarting node
+    /// gets its applications back: without it, an application that narrowed
+    /// its own CPU budget would come back on the node's default and stay
+    /// there until the next deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<crate::catalog::DeclaredLimits>,
 }
 
 /// GET /api/nodes/:id/assignments
@@ -138,8 +148,8 @@ pub async fn for_node(
         // this answer with the reason said out loud. The node then simply
         // does not run it, which is the same outcome a refused deployment
         // has, rather than running it with a hole in its environment.
-        let env = match state.deliverer.assignment_payload(assignment, &base).await {
-            Ok(payload) => payload.env_for_wire(),
+        let (env, limits) = match state.deliverer.assignment_payload(assignment, &base).await {
+            Ok(payload) => (payload.env_for_wire(), payload.limits.clone()),
             Err(e) => {
                 error!(
                     node = %node_id,
@@ -165,6 +175,7 @@ pub async fn for_node(
             environment: assignment.environment.clone(),
             bundle_sha: assignment.bundle_sha.clone(),
             env,
+            limits,
         });
     }
 

@@ -137,6 +137,21 @@ message ApplyDeploymentRequest {
     // dashboard and the CLI can write and delete a secret and list its
     // name, never read it back.
     map<string, string> env = 6;
+
+    // What this version's bundle manifest asked to be held to. Absent means
+    // it asked for nothing and takes the node's own ceilings.
+    //
+    // Narrowing only, on every field. The node clamps each value against its
+    // own configuration and logs an application that tries to widen one, so
+    // this can never buy an application more of a shared machine than the
+    // operator allowed - see
+    // crates/deis-runtime/src/app/manager.rs::effective_limits.
+    //
+    // Read by the control plane out of the manifest it stored with the
+    // version, so a node never opens a bundle to find out what its ceilings
+    // are, and the same values reach a restarting node through
+    // GET /api/nodes/{node_id}/assignments.
+    ResourceLimits limits = 7;
 }
 
 // Apply deployment response

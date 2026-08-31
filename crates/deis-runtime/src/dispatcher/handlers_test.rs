@@ -1,97 +1,384 @@
-//! Serving an asset out of a loaded version.
+//! What the HTTP entry does before it starts an isolate.
 //!
-//! These exercise the response the HTTP entry builds once the index has
-//! resolved a path; that the index resolves the right path is
-//! `crate::assets`'s own test, and that a loaded version reaches the index is
-//! `crate::deployment`'s.
+//! Asset-first is the platform's first design principle, and until this wave
+//! only half of it ran: the entry looked a path up in the asset index and
+//! answered with the file, so `_redirects`, `_headers`, the SPA fallback and a
+//! custom 404 page were parsed at build time, compiled at load time, covered by
+//! tests -- and reachable from nothing a visitor could send. These drive the
+//! real entry, with a real bundle behind it, because "the rule is applied" is
+//! only true if a request can reach it.
 
-use std::sync::Arc;
+/// A version whose static half is a whole small site, answering through the
+/// dispatcher.
+mod the_static_site_answers_a_real_request {
+    use std::io::{Cursor, Write};
+    use std::sync::Arc;
 
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::any;
+    use axum::Router;
+    use deis_bundle::{Asset, HeaderField, HeaderRule, Manifest, NotFound, RedirectRule, Route};
+    use tower::ServiceExt;
 
-use crate::assets::AssetHit;
-use crate::dispatcher::handlers::asset_response;
+    use crate::app::types::AppConfig;
+    use crate::app::{AppKey, ApplicationManager, VersionInstall};
+    use crate::assets::AssetBundle;
+    use crate::config::default_max_request_body_bytes;
+    use crate::dispatcher::handlers::handle_request;
+    use crate::dispatcher::AppState;
+    use crate::APP_ID_HEADER;
 
-fn hit() -> AssetHit {
-    AssetHit {
-        path: "index.html".to_string(),
-        bytes: bytes::Bytes::from_static(b"<h1>hi</h1>"),
-        etag: "\"abc123\"".to_string(),
-        content_type: "text/html; charset=utf-8".to_string(),
-        cache_control: Arc::from("public, max-age=0, must-revalidate"),
+    const APP: &str = "static-site";
+    const SHELL: &str = "<!doctype html><title>shell</title>";
+    const STYLES: &str = "body{color:red}";
+
+    /// The application's own code: everything under `/api/` and nothing else.
+    ///
+    /// It reports which path reached it, so a test that expects a request to
+    /// stay out of the isolate fails loudly rather than silently passing on a
+    /// body that happens to look right.
+    const CODE: &str = r#"
+        export default async function handler(context) {
+            const url = new URL(context.request.url);
+            if (url.pathname === "/api/asset") {
+                return await context.env.ASSETS.fetch(context.request.url.replace("/api/asset", "/css/app.css"));
+            }
+            if (url.pathname === "/api/fallback") {
+                const answer = await context.env.ASSETS.fetch("/no/such/file");
+                return new Response(answer.status + ":" + (await answer.text()));
+            }
+            if (url.pathname === "/api/binding") {
+                let assignment = "accepted";
+                try {
+                    context.env.ASSETS = "mine";
+                } catch (e) {
+                    assignment = "refused";
+                }
+                return new Response([
+                    typeof context.env.ASSETS,
+                    typeof context.env.ASSETS.fetch,
+                    assignment,
+                    String(context.env.ASSETS_SHADOW),
+                ].join("|"));
+            }
+            return new Response("isolate:" + context.request.method + ":" + url.pathname);
+        }
+    "#;
+
+    fn archive(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            for (name, body) in files {
+                writer
+                    .start_file(*name, zip::write::FileOptions::default())
+                    .unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
     }
-}
 
-fn conditional_on(etag: &str) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(etag).unwrap());
-    headers
-}
+    /// The bundle a `deis build` of this site would produce: two files, a
+    /// redirect, a `_headers` block over the stylesheet, an SPA fallback, and
+    /// one function route that the fallback must not swallow.
+    fn bundle() -> AssetBundle {
+        let mut manifest =
+            Manifest::parse(r#"{"schema":1,"app":"static-site","entry":"worker/index.js"}"#)
+                .expect("the minimal manifest parses");
+        for path in ["index.html", "css/app.css"] {
+            manifest.assets.push(Asset {
+                path: path.to_string(),
+                sha256: None,
+                content_type: None,
+                size: None,
+            });
+        }
+        manifest.site.redirects.push(RedirectRule {
+            from: "/old-home".to_string(),
+            to: "/".to_string(),
+            status: 301,
+        });
+        manifest.site.headers.push(HeaderRule {
+            pattern: "/css/*".to_string(),
+            set: vec![
+                HeaderField {
+                    name: "cache-control".to_string(),
+                    value: "public, max-age=31536000, immutable".to_string(),
+                },
+                HeaderField {
+                    name: "x-served-by".to_string(),
+                    value: "the-asset-layer".to_string(),
+                },
+            ],
+            remove: Vec::new(),
+        });
+        manifest.site.not_found = NotFound::SinglePageApp;
+        manifest.routes.push(Route {
+            pattern: "/api/*".to_string(),
+            methods: Vec::new(),
+        });
 
-#[test]
-fn an_asset_is_sent_with_its_digest_type_and_cache_policy() {
-    let response = asset_response(hit(), &HeaderMap::new(), false);
+        let zip_bytes = archive(&[
+            ("worker/index.js", "export {}"),
+            ("assets/index.html", SHELL),
+            ("assets/css/app.css", STYLES),
+        ]);
+        let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        AssetBundle::from_archive(
+            &manifest,
+            &mut zip,
+            Arc::from("public, max-age=0, must-revalidate"),
+            1 << 20,
+        )
+        .expect("the version's assets load")
+    }
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let headers = response.headers();
-    assert_eq!(headers[header::ETAG], "\"abc123\"");
-    assert_eq!(headers[header::CONTENT_TYPE], "text/html; charset=utf-8");
-    assert_eq!(
-        headers[header::CACHE_CONTROL],
-        "public, max-age=0, must-revalidate"
-    );
-    assert_eq!(headers[header::CONTENT_LENGTH], "11");
-}
+    /// The real dispatcher, in front of a real installed version.
+    async fn node() -> Router {
+        let manager = Arc::new(ApplicationManager::with_threads(Some(1)));
+        let mut config = AppConfig {
+            routes: vec!["/api/*".to_string()],
+            ..AppConfig::default()
+        };
+        // An application variable spelled like the binding. The platform must
+        // win: see `runtime/bindings.rs::ASSETS_BINDING_KEY`.
+        config
+            .env
+            .insert("ASSETS".to_string(), "hijacked".to_string());
+        config
+            .env
+            .insert("ASSETS_SHADOW".to_string(), "an ordinary value".to_string());
 
-#[test]
-fn a_client_that_already_has_the_file_gets_a_304_with_no_body() {
-    let response = asset_response(hit(), &conditional_on("\"abc123\""), false);
+        manager
+            .install_version(VersionInstall {
+                key: AppKey::production(APP),
+                version_id: "v1".to_string(),
+                entry_point: "worker/index.js".to_string(),
+                code: CODE.to_string(),
+                config,
+                env_confirmed: true,
+                assets: Arc::new(bundle()),
+            })
+            .await
+            .expect("the version installs");
 
-    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
-    assert_eq!(response.headers()[header::ETAG], "\"abc123\"");
-    // Nothing to send is the entire point of answering 304.
-    assert!(response.headers().get(header::CONTENT_TYPE).is_none());
-}
+        Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(manager, default_max_request_body_bytes()))
+    }
 
-#[test]
-fn a_weak_tag_still_satisfies_a_conditional_request() {
-    let response = asset_response(hit(), &conditional_on("W/\"abc123\""), false);
-    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
-}
+    async fn send(router: &Router, method: &str, path: &str) -> axum::response::Response {
+        send_with(router, method, path, Vec::new()).await
+    }
 
-#[test]
-fn a_stale_tag_gets_the_file_rather_than_a_304() {
-    let response = asset_response(hit(), &conditional_on("\"an-older-build\""), false);
-    assert_eq!(response.status(), StatusCode::OK);
-}
+    async fn send_with(
+        router: &Router,
+        method: &str,
+        path: &str,
+        extra: Vec<(&str, String)>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(APP_ID_HEADER, APP);
+        for (name, value) in extra {
+            builder = builder.header(name, value);
+        }
+        router
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::empty())
+                    .expect("the request is buildable"),
+            )
+            .await
+            .expect("the node answers")
+    }
 
-#[test]
-fn a_head_request_describes_the_body_without_carrying_it() {
-    let response = asset_response(hit(), &HeaderMap::new(), true);
+    async fn body_of(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        String::from_utf8(bytes.to_vec()).expect("the body is text")
+    }
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[header::CONTENT_LENGTH], "11");
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "text/html; charset=utf-8"
-    );
-}
+    #[tokio::test]
+    async fn a_file_in_the_bundle_is_answered_with_the_headers_the_site_declared() {
+        let router = node().await;
+        let response = send(&router, "GET", "/css/app.css").await;
 
-#[test]
-fn a_content_type_that_cannot_be_a_header_does_not_fail_the_request() {
-    let mut hit = hit();
-    // A manifest is outside this process; a newline in a header value would
-    // be a response-splitting attempt if it were passed through.
-    hit.content_type = "text/html\r\nX-Injected: 1".to_string();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The `_headers` block wins over the node's default cache policy,
+        // which is the reason most `_headers` files exist.
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(response.headers()["x-served-by"], "the-asset-layer");
+        assert!(response.headers().get(header::ETAG).is_some());
+        assert_eq!(body_of(response).await, STYLES);
+    }
 
-    let response = asset_response(hit, &HeaderMap::new(), false);
+    #[tokio::test]
+    async fn a_redirects_rule_answers_the_visitor_rather_than_the_isolate() {
+        let router = node().await;
+        let response = send(&router, "GET", "/old-home").await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "application/octet-stream"
-    );
-    assert!(response.headers().get("x-injected").is_none());
+        assert_eq!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY,
+            "a _redirects rule was parsed and compiled but no request could reach it"
+        );
+        assert_eq!(response.headers()[header::LOCATION], "/");
+
+        // The query is carried to the target. It is not part of what the rule
+        // matched, so dropping it on the way in is invisible until somebody
+        // notices their campaign parameters stop arriving.
+        let with_query = send(&router, "GET", "/old-home?ref=newsletter").await;
+        assert_eq!(with_query.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            with_query.headers()[header::LOCATION],
+            "/?ref=newsletter",
+            "the request's query never reached the redirect table"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unclaimed_path_gets_the_single_page_shell_with_a_200() {
+        let router = node().await;
+        let response = send(&router, "GET", "/deep/client/route").await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the SPA fallback did not run, so a client-side route 404s"
+        );
+        assert_eq!(body_of(response).await, SHELL);
+    }
+
+    #[tokio::test]
+    async fn a_path_a_function_route_claims_still_reaches_the_isolate() {
+        // The fallback stands aside for the application's own routes; without
+        // that, an SPA fallback swallows the app's whole API.
+        let router = node().await;
+        let response = send(&router, "GET", "/api/whoami").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await, "isolate:GET:/api/whoami");
+    }
+
+    #[tokio::test]
+    async fn a_post_to_a_path_that_names_a_file_falls_through_to_the_isolate() {
+        // Only GET and HEAD are answered from the bundle: a POST to a path
+        // that happens to collide with a static file is far more likely to be
+        // a route the app implements.
+        let router = node().await;
+        let response = send(&router, "POST", "/css/app.css").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await, "isolate:POST:/css/app.css");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_already_has_the_file_is_answered_304() {
+        let router = node().await;
+        let first = send(&router, "GET", "/css/app.css").await;
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_string();
+
+        let again = send_with(
+            &router,
+            "GET",
+            "/css/app.css",
+            vec![("if-none-match", etag.clone())],
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(body_of(again).await, "");
+
+        // A weak tag names the same representation; RFC 9110 makes a
+        // conditional GET compare weakly.
+        let weak = send_with(
+            &router,
+            "GET",
+            "/css/app.css",
+            vec![("if-none-match", format!("W/{etag}"))],
+        )
+        .await;
+        assert_eq!(weak.status(), StatusCode::NOT_MODIFIED);
+
+        let stale = send_with(
+            &router,
+            "GET",
+            "/css/app.css",
+            vec![("if-none-match", "\"an-older-build\"".to_string())],
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_head_describes_the_body_without_carrying_it() {
+        let router = node().await;
+        let response = send(&router, "HEAD", "/css/app.css").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            STYLES.len().to_string()
+        );
+        assert_eq!(body_of(response).await, "");
+    }
+
+    #[tokio::test]
+    async fn a_function_reaches_the_same_files_through_env_assets() {
+        let router = node().await;
+        let response = send(&router, "GET", "/api/asset").await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "env.ASSETS.fetch() did not answer from the version's own bundle"
+        );
+        // The site's own `_headers` came with it, so the binding and the HTTP
+        // entry answer one path the same way.
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(body_of(response).await, STYLES);
+    }
+
+    #[tokio::test]
+    async fn env_assets_applies_the_fallback_even_on_a_path_the_function_owns() {
+        // The difference between the two callers: the HTTP entry lets a
+        // function route win, because the isolate has not run yet. By the time
+        // a handler calls the binding the route table has had its turn, so a
+        // path that names no file gets the site's not-found behaviour.
+        let router = node().await;
+        let response = send(&router, "GET", "/api/fallback").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await, format!("200:{SHELL}"));
+    }
+
+    #[tokio::test]
+    async fn an_application_variable_named_assets_cannot_take_the_binding() {
+        // The deployment carries `ASSETS=hijacked`. If it reached `ctx.env`,
+        // whichever of the two was written last would decide whether
+        // `env.ASSETS.fetch()` served this version's files or threw.
+        let router = node().await;
+        let response = send(&router, "GET", "/api/binding").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_of(response).await,
+            "object|function|refused|an ordinary value",
+            "the binding was replaceable, or an ordinary variable stopped reaching the app"
+        );
+    }
 }
 
 /// The HTTP entry itself, driven end to end: a request goes in as bytes and

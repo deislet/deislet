@@ -1,16 +1,8 @@
 //! The control plane's HTTP API, as this CLI uses it.
 //!
-//! Every type here mirrors what `deis-control` already serves, with one
-//! documented exception: [`Control::storage_credentials`] names a route
-//! `deis-control` does not yet have, needed so `deis kv`, `deis db` and `deis
-//! blob` can reach deis-store the way every other platform command reaches
-//! its service - through the credential already on file, not a secret pasted
-//! by hand. Its doc comment is the contract; see there before assuming it
-//! works against a running platform.
-//!
-//! Every other field the CLI prints is deserialised straight off what the
-//! server already returns, so an added field there does not break an older
-//! CLI.
+//! Every type here mirrors what `deis-control` already serves, and every
+//! field the CLI prints is deserialised straight off what the server
+//! returns, so an added field there does not break an older CLI.
 
 pub mod storage;
 pub mod telemetry;
@@ -147,12 +139,11 @@ pub struct SecretDeletedResponse {
 /// What `deis kv`, `deis db` and `deis blob` need to reach deis-store as one
 /// tenant.
 ///
-/// Both fields are optional for the same reason they are optional in
-/// `deis-control`'s own `delivery::StorageWiring`: a platform with no
-/// deis-store configured has no `store_endpoint`, and a deis-store bound to
-/// loopback with no `auth_secret` needs no `token` at all - the tenant header
-/// alone is enough there, which is why `token` absent is a normal answer and
-/// not a failure to authenticate.
+/// Both fields stay optional even though the control plane that serves this
+/// route today refuses rather than answering with either one missing: this
+/// is a deserialisation target for whatever a control plane sends, and an
+/// older or newer one that answers with only an address must be reported by
+/// the message below rather than by a parse failure that names a field.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageCredentials {
     #[serde(default)]
@@ -565,23 +556,20 @@ impl Control {
     /// The address and capability token `deis kv`, `deis db` and `deis blob`
     /// need to act as one tenant of deis-store.
     ///
-    /// **This route does not exist on `deis-control` yet.** It belongs beside
-    /// the other `/api/apps/:app_id/environments/:environment/*` routes,
-    /// behind the same bearer-token middleware as the rest of this file, and
-    /// its handler is a thin read of what `deis-control` already computes for
-    /// a deployment: `delivery::StorageWiring::from_config(&config).store`
-    /// for the address and `.token_for(app_id, environment)` for the token -
-    /// see that type's doc comment for why each is optional. Minting the
-    /// token there rather than handing this CLI the shared `auth_secret`
-    /// keeps the secret itself on the control plane and the store, which is
-    /// the whole point of a capability token: a leaked CLI credential (the
-    /// bearer token in `credentials.toml`) still only ever proves the holder
-    /// may deploy and inspect *through the control plane's own checks*, never
-    /// hands out the key every tenant's token is derived from.
+    /// Served by `deis-control`'s
+    /// `api::catalog::storage::storage_token`, behind the same API-key
+    /// middleware as the deploy route and gated on the same application and
+    /// environment having to exist. The token is minted there rather than
+    /// this CLI being handed the shared `auth_secret`, which is the whole
+    /// point of a capability token: a leaked CLI credential still only ever
+    /// proves the holder may deploy and inspect *through the control plane's
+    /// own checks*, and never hands out the key every tenant's token is
+    /// derived from.
     ///
-    /// Until that route exists, every call here fails with a 404 that the
-    /// generic error path below reports as "the control plane answered 404";
-    /// that is expected and is not a bug in this CLI.
+    /// A control plane with no deis-store address or no `storage_auth_secret`
+    /// answers 409 with a message naming the key to set, which the generic
+    /// error path below prints as it stands: the caller is told what to fix
+    /// rather than handed an empty token that fails later inside deis-store.
     pub async fn storage_credentials(
         &self,
         app_id: &str,

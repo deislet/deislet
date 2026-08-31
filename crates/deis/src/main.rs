@@ -7,9 +7,9 @@
 //!   produces what that vendor's own tooling deploys; this CLI never pushes
 //!   to them.
 //! * `deploy` / `versions` / `rollback` / `status` / `secret` / `logs` /
-//!   `tail` / `kv` / `db` / `blob` talk to a Deislet platform - a
-//!   `deis-control` and, for logs, a `deis-telemetry`, and for `kv`/`db`/
-//!   `blob`, also a `deis-store` reached *through* `deis-control` (see
+//!   `tail` / `trace` / `kv` / `db` / `blob` talk to a Deislet platform - a
+//!   `deis-control` and, for logs and traces, a `deis-telemetry`, and for
+//!   `kv`/`db`/`blob`, also a `deis-store` reached *through* `deis-control` (see
 //!   [`commands::Session::storage`]). Where those live and which credential
 //!   to present is [`settings`].
 //!
@@ -295,6 +295,73 @@ enum Commands {
         /// Show at most this many, newest first.
         #[arg(long, default_value = "200")]
         limit: usize,
+
+        /// Do not filter by environment.
+        #[arg(long)]
+        all_environments: bool,
+    },
+
+    /// List an application's invocations: how each one ended, and why.
+    ///
+    /// One row per invocation, from what the nodes report to
+    /// deis-telemetry. `deis logs` shows what an application said; this
+    /// shows what the platform decided - which invocations it cut off for
+    /// running too long, hammering the op layer or eating the heap, and
+    /// which threw on their own.
+    Trace {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Only invocations that ended this way. Repeatable.
+        ///
+        /// One of ok, app-error, timeout, rate-limited, memory-limit,
+        /// cpu-limit, internal-error, or `failed` for every one but ok.
+        #[arg(long, value_name = "OUTCOME")]
+        outcome: Vec<String>,
+
+        /// Only invocations of this kind: http, queue, cron, websocket.
+        /// Repeatable.
+        #[arg(long, value_name = "KIND")]
+        kind: Vec<String>,
+
+        /// Only invocations that answered this HTTP status (500) or class
+        /// (5xx). Applied by this CLI, not by deis-telemetry.
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
+
+        /// Start of the range: a duration back from now (30s, 15m, 2h, 3d)
+        /// or an RFC 3339 instant. Default 1h.
+        #[arg(long, value_name = "WHEN", conflicts_with = "follow")]
+        since: Option<String>,
+
+        /// End of the range, same forms. Omitted means now.
+        #[arg(long, value_name = "WHEN", conflicts_with = "follow")]
+        until: Option<String>,
+
+        /// Only the invocation carrying this trace id. The same id
+        /// `deis logs --trace-id` takes.
+        #[arg(long, value_name = "ID", conflicts_with = "follow")]
+        trace_id: Option<String>,
+
+        /// Only invocations whose target contains this, case-insensitively.
+        #[arg(long, value_name = "TEXT", conflicts_with = "follow")]
+        target_contains: Option<String>,
+
+        /// Only invocations that ran at least this long, in milliseconds.
+        #[arg(long, value_name = "MS", conflicts_with = "follow")]
+        min_duration: Option<u64>,
+
+        /// Show at most this many, newest first. Default 50.
+        #[arg(long, conflicts_with = "follow")]
+        limit: Option<usize>,
+
+        /// Follow invocations as they happen instead of reading stored
+        /// ones. Only what the nodes report from now on appears.
+        #[arg(long)]
+        follow: bool,
 
         /// Do not filter by environment.
         #[arg(long)]
@@ -778,6 +845,42 @@ async fn run(cli: Cli) -> Result<()> {
                     trace_id,
                     limit,
                     all_environments,
+                },
+                format.into(),
+            )
+            .await
+        }
+
+        Commands::Trace {
+            target,
+            format,
+            outcome,
+            kind,
+            status,
+            since,
+            until,
+            trace_id,
+            target_contains,
+            min_duration,
+            limit,
+            follow,
+            all_environments,
+        } => {
+            commands::trace::execute(
+                commands::trace::Args {
+                    app: target.app,
+                    environment: target.environment,
+                    all_environments,
+                    outcome,
+                    kind,
+                    status,
+                    since,
+                    until,
+                    trace_id,
+                    target: target_contains,
+                    min_duration_ms: min_duration,
+                    limit,
+                    follow,
                 },
                 format.into(),
             )

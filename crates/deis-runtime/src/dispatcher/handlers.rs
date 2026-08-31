@@ -2,7 +2,6 @@
 
 use super::AppState;
 use crate::app::AppKey;
-use crate::assets::{if_none_match_matches, AssetHit};
 use crate::{APP_ID_HEADER, ENVIRONMENT_HEADER};
 use axum::{
     body::{Body, Bytes},
@@ -212,23 +211,47 @@ pub async fn handle_request(
 
     // Asset-first, the platform's first design principle: a request whose path
     // names a file the bundle carries is answered from that file and never
-    // reaches an isolate. The index was built when the version loaded, so this
-    // is a hash probe, not a read of the zip.
+    // reaches an isolate. The index and the site's rules were built when the
+    // version loaded, so this is a hash probe and a scan of a compiled table,
+    // not a read of the zip.
+    //
+    // `AssetBundle::serve` rather than a plain index lookup, because a static
+    // site answers with more than the files it carries: a `_redirects` rule,
+    // the headers a `_headers` block sets, and the SPA shell or the custom 404
+    // page a path that names no file falls back to. Those were parsed at build
+    // time and compiled at load time, and this is the only place a visitor's
+    // request can reach them.
     //
     // Only GET and HEAD are answered this way. A POST to a path that happens
     // to collide with a static file is far more likely to be a route the app
     // implements than a request for the file, so those fall through.
     if matches!(method, Method::GET | Method::HEAD) {
         if let Some(assets) = state.app_manager.assets(&key) {
-            if let Some(hit) = assets.resolve(uri.path()) {
+            // Path *and* query. A `_redirects` rule matches on the path
+            // alone, but the query is carried through to the target it sends
+            // the visitor to, and there is nothing to carry if it was dropped
+            // here: `/old?ref=x` would land on `/new` with the campaign the
+            // author was tracking gone.
+            let request_target = uri
+                .path_and_query()
+                .map(|target| target.as_str())
+                .unwrap_or_else(|| uri.path());
+            if let Some(response) = assets.serve(request_target, &headers, method == Method::HEAD) {
+                // The bundle logs which file answered; it knows the
+                // application but not which of its environments this node is
+                // serving, and a node runs several. Without the environment
+                // here the line cannot answer "which one", so it is named
+                // where it is known.
                 tracing::debug!(
                     app_id = %key.app_id(),
                     environment = %key.environment(),
-                    path = %hit.path,
-                    bytes = hit.bytes.len(),
-                    "Served a static asset without entering an isolate"
+                    method = %method,
+                    path = %uri.path(),
+                    status = response.status().as_u16(),
+                    "Answered a request from this version's static site without entering an \
+                     isolate"
                 );
-                return asset_response(hit, &headers, method == Method::HEAD).into_response();
+                return response;
             }
         }
     }
@@ -392,73 +415,6 @@ pub(crate) fn requested_environment(headers: &HeaderMap) -> &str {
         .get(ENVIRONMENT_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
-}
-
-/// Turn a resolved asset into a response, honouring a conditional request.
-///
-/// The `ETag` is the asset's sha256, so it changes exactly when the file's
-/// content changes and never otherwise - which is what lets the default
-/// `Cache-Control` revalidate on every request without costing a body.
-pub(crate) fn asset_response(hit: AssetHit, headers: &HeaderMap, head_only: bool) -> Response {
-    let conditional = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|value| if_none_match_matches(value, &hit.etag))
-        .unwrap_or(false);
-
-    // The digest is hex, so this always parses; the other two come from a
-    // bundle manifest and from configuration, which is to say from outside
-    // this process. A value that cannot be a header is replaced rather than
-    // allowed to fail the request, because the bytes are still correct and
-    // the fallbacks are the safe interpretation.
-    let etag = header_value(&hit.etag, "\"unknown\"");
-    let cache_control = header_value(hit.cache_control.as_ref(), "no-store");
-    let content_type = header_value(&hit.content_type, "application/octet-stream");
-
-    if conditional {
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header(header::ETAG, etag)
-            .header(header::CACHE_CONTROL, cache_control)
-            .body(Body::empty())
-            .expect("a 304 carrying only validated header values is always buildable")
-            .into_response();
-    }
-
-    let length = hit.bytes.len();
-    // A HEAD answer must describe the body without carrying it, so the length
-    // is set explicitly rather than derived from the bytes being sent.
-    let body = if head_only {
-        Body::empty()
-    } else {
-        Body::from(hit.bytes)
-    };
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, length)
-        .header(header::ETAG, etag)
-        .header(header::CACHE_CONTROL, cache_control)
-        .body(body)
-        .expect("an asset response carrying only validated header values is always buildable")
-        .into_response()
-}
-
-/// Turn text into a header value, falling back when it cannot be one.
-fn header_value(value: &str, fallback: &'static str) -> axum::http::HeaderValue {
-    match axum::http::HeaderValue::from_str(value) {
-        Ok(header) => header,
-        Err(_) => {
-            tracing::warn!(
-                value,
-                fallback,
-                "An asset header value from the bundle or the node configuration is not a \
-                 legal HTTP header value; sending the fallback instead"
-            );
-            axum::http::HeaderValue::from_static(fallback)
-        }
-    }
 }
 
 /// Handle WebSocket connection (bridge mode)

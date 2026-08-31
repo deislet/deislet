@@ -315,6 +315,10 @@ fn build_catalog_state(
         store: Arc::clone(&store),
         bundles: Arc::new(bundles),
         secrets: Arc::clone(&secrets),
+        // The same wiring the deliverer writes into every deployment, so the
+        // token `deis kv` is handed is bit-for-bit the one the application's
+        // own storage calls carry.
+        storage: storage.clone(),
         deliverer: Arc::new(DeploymentDeliverer::new(
             store, secrets, nodes, address, storage,
         )),
@@ -360,17 +364,21 @@ pub async fn serve(
         }
     });
 
+    // With connect info, so a handler can see which address a request came
+    // from. Only the audit line on the storage-token mint reads it today,
+    // and it reads it through an `Option`, so this cannot become a 500 for
+    // any other route.
     let result = match tls {
         Some(tls) => {
             axum_server::from_tcp_rustls(listener, tls)
                 .handle(handle.clone())
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
         }
         None => {
             axum_server::from_tcp(listener)
                 .handle(handle.clone())
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
         }
     };

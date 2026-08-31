@@ -3,6 +3,7 @@ use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
+use crate::app::types::ResourceLimits;
 use crate::app::{AppKey, ApplicationManager};
 use crate::deployment::{Applied, DeploymentManager, DeploymentOrder};
 use crate::health::NodeHealth;
@@ -10,6 +11,11 @@ use crate::runtime::metrics::{recorder, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL};
 
 use super::proto::runtime_management_server::RuntimeManagement;
 use super::proto::*;
+// The wire type and the node's own type have the same name and different
+// shapes: the wire uses a zero sentinel where the node uses `Option`. Aliased
+// rather than qualified at the call site so the one place that converts
+// between them names both halves.
+use super::proto::ResourceLimits as ResourceLimitsMessage;
 
 /// Runtime management service implementation
 pub struct RuntimeManagementService {
@@ -111,6 +117,21 @@ impl RuntimeManagement for RuntimeManagementService {
             "Control plane asked this node to run a version"
         );
 
+        let limits = req.limits.map(decode_limits);
+        if let Some(limits) = &limits {
+            info!(
+                app_id = %req.app_id,
+                version_id = %req.version_id,
+                memory_mb = limits.memory_mb,
+                timeout_ms = ?limits.timeout_ms,
+                cpu_time_limit_ms = ?limits.cpu_time_limit_ms,
+                rate_limit_ops_per_sec = ?limits.rate_limit_ops_per_sec,
+                resource_table_max = ?limits.resource_table_max,
+                "This deployment asks to be held to limits of its own; each one is clamped to \
+                 this node's ceiling when the isolate is built"
+            );
+        }
+
         let order = DeploymentOrder {
             app_id: req.app_id.clone(),
             version_id: req.version_id.clone(),
@@ -118,6 +139,7 @@ impl RuntimeManagement for RuntimeManagementService {
             bundle_url: req.bundle_url,
             bundle_sha: req.bundle_sha,
             env: req.env,
+            limits,
         };
 
         let key = order.key();
@@ -444,6 +466,35 @@ impl RuntimeManagement for RuntimeManagementService {
             version: env!("CARGO_PKG_VERSION").to_string(),
             details: self.health.details(),
         }))
+    }
+}
+
+/// Read the wire's `ResourceLimits` into the node's own.
+///
+/// Proto3 has no way to tell an absent scalar from a zero one, so `0` is what
+/// every producer sends for "not set" and is what this reads it back as. The
+/// control plane refuses an explicit zero when it accepts the bundle
+/// (`deis_control::catalog::limits`), so a zero arriving here is an omission
+/// and never an application asking for a budget it could not run in.
+///
+/// Nothing is judged here. A value narrower than this node's ceiling and a
+/// value far above it look identical at this point; which one wins is
+/// [`ApplicationManager::effective_limits`]'s decision, made once, where the
+/// node's own configuration is in scope.
+fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
+    ResourceLimits {
+        memory_mb: limits.memory_mb.max(0) as usize,
+        // Field 2 of the message, enforced by nothing on this node; carried
+        // into the struct only so that what the control plane sent and what
+        // the node holds are the same value.
+        cpu_milli: limits.cpu_milli.max(0) as u32,
+        resource_table_max: (limits.resource_table_max > 0)
+            .then_some(limits.resource_table_max as usize),
+        timeout_ms: (limits.timeout_ms > 0).then_some(limits.timeout_ms as u64),
+        rate_limit_ops_per_sec: (limits.rate_limit_ops_per_sec > 0.0)
+            .then_some(limits.rate_limit_ops_per_sec),
+        cpu_time_limit_ms: (limits.cpu_time_limit_ms > 0)
+            .then_some(limits.cpu_time_limit_ms as u64),
     }
 }
 

@@ -28,12 +28,14 @@
 //!   cheap as a deploy.
 
 pub mod bundle;
+pub mod limits;
 pub mod model;
 pub mod secrets;
 pub mod store;
 
 pub use bundle::{BundleStore, StoredBundle};
 pub use deis_bundle::Manifest as BundleManifest;
+pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{
     App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, Route, SecretMeta,
     Version,

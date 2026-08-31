@@ -17,6 +17,15 @@ pub enum ApiError {
     /// for instance the secret master key. Retrying without fixing the
     /// control plane will not help, but the request itself was fine.
     ServiceUnavailable(String),
+    /// This control plane is deliberately not set up to do what was asked -
+    /// a storage token with no `storage_auth_secret`, say.
+    ///
+    /// Deliberately 4xx and not [`Self::ServiceUnavailable`]: nothing here is
+    /// unavailable or failing, and a 5xx tells every client and every proxy
+    /// in between to retry something that will answer the same way forever.
+    /// The message names the configuration key, because the caller is the
+    /// one who has to go and ask for it to be set.
+    NotConfigured(String),
     InternalError(String),
     DatabaseError(String),
 }
@@ -28,6 +37,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            ApiError::NotConfigured(msg) => (StatusCode::CONFLICT, msg),
             ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::DatabaseError(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

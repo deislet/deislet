@@ -14,6 +14,10 @@ use super::ops::init_ops_extension;
 use super::queue_ops::init_queue_extension;
 use super::tls_ops::init_tls_ops_extension;
 use super::ws_server_ops::init_ws_server_extension;
+use assets_ops::init_assets_extension;
+
+#[path = "assets_ops.rs"]
+mod assets_ops;
 
 #[path = "ws_client_ops.rs"]
 mod ws_client_ops;
@@ -35,6 +39,7 @@ pub fn build_runtime_extensions() -> Vec<Extension> {
         init_cache_extension(),
         init_db_extension(),
         init_blob_extension(),
+        init_assets_extension(),
         init_ws_server_extension(),
         ws_client_ops::init_ws_client_extension(),
         init_queue_extension(),

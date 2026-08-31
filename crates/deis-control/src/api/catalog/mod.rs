@@ -23,6 +23,7 @@ pub mod environments;
 pub mod routes;
 pub mod routing_table;
 pub mod secrets;
+pub mod storage;
 pub mod versions;
 
 use std::sync::Arc;
@@ -35,7 +36,7 @@ use axum::{
 
 use crate::api::middleware::{NodeAuthConfig, node_auth};
 use crate::catalog::{BundleStore, CatalogStore, SecretsBackend};
-use crate::delivery::DeploymentDeliverer;
+use crate::delivery::{DeploymentDeliverer, StorageWiring};
 
 /// Largest bundle the control plane will accept in one upload. Bundles
 /// carry the worker code plus every static asset, so this is generous;
@@ -51,6 +52,14 @@ pub struct CatalogState {
     /// Pushes a deployment out to the nodes. Deploy, rollback and secret
     /// change all end here; see [`crate::delivery`].
     pub deliverer: Arc<DeploymentDeliverer>,
+    /// Where storage lives and what proves a call to it may act as a tenant.
+    ///
+    /// The deliverer holds the same wiring and writes it into every
+    /// deployment; [`storage::storage_token`] reads it to hand the identical
+    /// token to a person instead of to a node. One value cloned into both,
+    /// never two built from the same configuration: a token minted here that
+    /// did not match the one a deployment carries would authorise nothing.
+    pub storage: StorageWiring,
     /// The credential the node endpoints demand.
     ///
     /// Handlers read it to learn whether this control plane can tell a node
@@ -112,6 +121,13 @@ pub fn router(state: CatalogState) -> Router {
         .route(
             "/api/apps/:app_id/environments/:env/secrets",
             get(secrets::list_secrets),
+        )
+        // Beside the secret routes and behind the same API key, because it
+        // hands out a credential: see `storage::storage_token` for why the
+        // credential that deploys is the right gate for it.
+        .route(
+            "/api/apps/:app_id/environments/:env/storage-token",
+            get(storage::storage_token),
         )
         .route(
             "/api/apps/:app_id/environments/:env/secrets/:name",
@@ -188,6 +204,30 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn harness_with(secrets_ready: bool, node_keys: Vec<String>) -> Harness {
+        harness_with_storage(secrets_ready, node_keys, storage_wiring(None)).await
+    }
+
+    /// The storage secret the harness mints tokens from when it is asked to
+    /// mint any. Not a realistic secret; what matters is that a test can
+    /// recompute the token the endpoint should have answered with, from the
+    /// same convention deis-store checks it against.
+    pub(crate) const TEST_STORAGE_SECRET: &str = "harness-storage-secret";
+
+    /// Wiring built the way the server builds it, so the harness cannot
+    /// drift from the real assembly of a delivery.
+    pub(crate) fn storage_wiring(auth_secret: Option<&str>) -> crate::delivery::StorageWiring {
+        crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
+            store_endpoint: Some("http://127.0.0.1:8090".to_string()),
+            storage_auth_secret: auth_secret.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) async fn harness_with_storage(
+        secrets_ready: bool,
+        node_keys: Vec<String>,
+        storage: crate::delivery::StorageWiring,
+    ) -> Harness {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
         let bundle_dir = tempfile::tempdir().unwrap();
         let secrets = if secrets_ready {
@@ -208,6 +248,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
             secrets: Arc::clone(&secrets),
+            storage: storage.clone(),
             // No runtime nodes: a delivery is reported as skipped, which
             // is exactly the shape these tests want to see travel through
             // the deploy and secret endpoints.
@@ -216,12 +257,7 @@ pub(crate) mod tests {
                 secrets,
                 Arc::new(RuntimeNodeManager::new(Vec::new(), 15)),
                 address,
-                // Built the way the server builds it, so the harness cannot
-                // drift from the real assembly of a delivery.
-                crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
-                    store_endpoint: Some("http://127.0.0.1:8090".to_string()),
-                    ..Default::default()
-                }),
+                storage,
             )),
             node_auth: NodeAuthConfig::new(node_keys),
         };

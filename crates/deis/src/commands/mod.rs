@@ -10,6 +10,7 @@ pub mod logs;
 pub mod rollback;
 pub mod secret;
 pub mod status;
+pub mod trace;
 pub mod validate;
 pub mod versions;
 
@@ -34,10 +35,10 @@ pub fn project_dir() -> Result<PathBuf> {
 /// Resolve every setting for a command running in the working directory.
 ///
 /// This is all a command that talks only to deis-telemetry needs. `deis
-/// logs` and `deis tail` deliberately stop here: reading an application's
-/// logs is not a control-plane operation, and a checkout that has never had
-/// a control plane configured must still be able to look at what its
-/// application is doing.
+/// logs`, `deis tail` and `deis trace` deliberately stop here: reading an
+/// application's logs or its invocation history is not a control-plane
+/// operation, and a checkout that has never had a control plane configured
+/// must still be able to look at what its application is doing.
 pub fn resolve(overrides: &Overrides) -> Result<Settings> {
     Settings::load(&project_dir()?, overrides)
 }
@@ -90,8 +91,7 @@ impl Session {
     /// can already run `deis deploy` also run `deis kv`/`deis db`/`deis
     /// blob` with no separate credential to manage, and what keeps the raw
     /// storage secret off every machine this CLI runs on. See
-    /// [`crate::platform::Control::storage_credentials`] for the contract -
-    /// including the fact that `deis-control` does not serve it yet.
+    /// [`crate::platform::Control::storage_credentials`] for the contract.
     pub async fn storage(&self) -> Result<StorageSession> {
         let app = self.app()?;
         let environment = self.environment()?;

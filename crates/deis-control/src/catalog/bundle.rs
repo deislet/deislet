@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use deis_bundle::MANIFEST_ENTRY;
 use deis_bundle::{Manifest, read_manifest};
 
+use super::limits::DeclaredLimits;
 use super::model::validate_app_id;
 use super::{CatalogError, CatalogResult};
 
@@ -33,6 +34,9 @@ pub struct StoredBundle {
     /// Verbatim manifest text, stored in the version row.
     pub manifest_json: String,
     pub manifest: Manifest,
+    /// The `limits` block of that manifest, already checked. `None` when the
+    /// application declared none and is held to the node's own ceilings.
+    pub limits: Option<DeclaredLimits>,
     /// True when the identical file was already on disk, so nothing was
     /// written. The version row may still be new.
     pub already_present: bool,
@@ -120,6 +124,30 @@ impl BundleStore {
             return Err(CatalogError::invalid(e.to_string()));
         }
 
+        // Read here so a limits block no node could act on - a misspelled key,
+        // a zero budget - is refused while somebody is still watching the
+        // upload, rather than being dropped in silence on every node that
+        // loads the bundle. The values themselves are not judged here: a node
+        // owns its own ceilings and narrows anything greedier than they are.
+        let limits = super::limits::declared_limits(&manifest_json).map_err(|e| {
+            warn!(
+                app_id,
+                bundle_sha = %sha256,
+                reason = %e,
+                "Rejected bundle upload: its manifest declares resource limits that cannot be applied, so accepting it would have left the application running on this node's defaults while its manifest said otherwise"
+            );
+            CatalogError::invalid(e)
+        })?;
+        if let Some(declared) = &limits {
+            info!(
+                app_id,
+                bundle_sha = %sha256,
+                limits = %declared.describe(),
+                "This version's manifest narrows its resource limits: {}. Each value is clamped to the node's own ceiling at load time",
+                declared.describe()
+            );
+        }
+
         let path = self.path_for(app_id, &sha256);
         let already_present = path.exists();
         if !already_present {
@@ -153,6 +181,7 @@ impl BundleStore {
             size: bytes.len() as u64,
             manifest_json,
             manifest,
+            limits,
             already_present,
         })
     }

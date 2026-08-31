@@ -328,3 +328,65 @@ async fn a_command_is_refused_rather_than_reported_as_a_failure() {
 
     unload_all(&apps, "status-command", &environments).await;
 }
+
+/// The wire's zero sentinel, read back into the node's `Option`s.
+///
+/// The gap this closed was one step earlier: `ApplyDeploymentRequest` had no
+/// limits field at all and this crate never mentioned the `ResourceLimits`
+/// message, so no application could narrow anything.
+mod decoding_the_limits_a_deployment_carries {
+    use super::super::decode_limits;
+    use crate::management::proto::ResourceLimits as Wire;
+
+    #[test]
+    fn a_message_of_zeroes_is_an_application_that_asked_for_nothing() {
+        let decoded = decode_limits(Wire::default());
+        assert_eq!(
+            decoded.memory_mb, 0,
+            "0MB is the unset sentinel, not a heap"
+        );
+        assert_eq!(decoded.timeout_ms, None);
+        assert_eq!(decoded.cpu_time_limit_ms, None);
+        assert_eq!(decoded.rate_limit_ops_per_sec, None);
+        assert_eq!(decoded.resource_table_max, None);
+    }
+
+    #[test]
+    fn every_field_an_application_can_narrow_survives_the_wire() {
+        let decoded = decode_limits(Wire {
+            memory_mb: 48,
+            cpu_milli: 500,
+            max_concurrency: 0,
+            resource_table_max: 16,
+            timeout_ms: 2_000,
+            rate_limit_ops_per_sec: 40.0,
+            cpu_time_limit_ms: 250,
+        });
+        assert_eq!(decoded.memory_mb, 48);
+        assert_eq!(decoded.timeout_ms, Some(2_000));
+        assert_eq!(decoded.rate_limit_ops_per_sec, Some(40.0));
+        assert_eq!(decoded.cpu_time_limit_ms, Some(250));
+        assert_eq!(decoded.resource_table_max, Some(16));
+        assert_eq!(decoded.cpu_milli, 500, "carried, though nothing applies it");
+    }
+
+    /// proto3 signs its integers, so a negative value is representable even
+    /// though nothing should ever send one. Read as unset rather than cast
+    /// into an enormous unsigned ceiling.
+    #[test]
+    fn a_negative_value_cannot_become_an_enormous_ceiling() {
+        let decoded = decode_limits(Wire {
+            memory_mb: -1,
+            timeout_ms: -1,
+            cpu_time_limit_ms: -1,
+            resource_table_max: -1,
+            rate_limit_ops_per_sec: -1.0,
+            ..Wire::default()
+        });
+        assert_eq!(decoded.memory_mb, 0);
+        assert_eq!(decoded.timeout_ms, None);
+        assert_eq!(decoded.cpu_time_limit_ms, None);
+        assert_eq!(decoded.resource_table_max, None);
+        assert_eq!(decoded.rate_limit_ops_per_sec, None);
+    }
+}

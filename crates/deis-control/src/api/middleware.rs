@@ -121,6 +121,38 @@ fn presented_credentials(headers: &HeaderMap) -> Vec<&str> {
     found
 }
 
+/// How an audit line names the caller of a request.
+///
+/// This platform has no accounts, so there is no name to print. What there is
+/// are two facts worth keeping: which credential was presented and where the
+/// request came from. The credential is reduced to the first bytes of its
+/// SHA-256 rather than printed - enough to tell two keys apart and to match a
+/// line against a key an operator still holds, useless to anyone who reads
+/// the log looking for a way in. Replace this with the account once accounts
+/// exist; until then it is what an audit line has.
+///
+/// `peer` is `None` when the server was built without connect info, which is
+/// why the caller passes an `Option` rather than this reaching for it: an
+/// audit line that failed to render would be worse than one missing an
+/// address.
+pub fn caller_description(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
+    let credential = match presented_credentials(headers).first() {
+        Some(presented) => format!("key:{}", credential_fingerprint(presented)),
+        None => "anonymous".to_string(),
+    };
+    match peer {
+        Some(addr) => format!("{credential} from {addr}"),
+        None => format!("{credential} from an unknown address"),
+    }
+}
+
+/// A short, stable, non-reversible name for one credential.
+fn credential_fingerprint(credential: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(credential.as_bytes());
+    hex::encode(&digest[..4])
+}
+
 /// Authentication for the endpoints that exist for runtime nodes.
 ///
 /// Runs whatever `api_auth_enabled` says, because the assignment list carries

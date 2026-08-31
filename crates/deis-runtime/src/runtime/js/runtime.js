@@ -66,6 +66,8 @@ delete globalThis.__bootstrap;
 // rest are on the global object, and an application can replace them.
 const ObjectAssign = Object.assign;
 const ObjectCreate = Object.create;
+const ObjectDefineProperty = Object.defineProperty;
+const ObjectFreeze = Object.freeze;
 const hasOwn = typeof Object.hasOwn === "function"
   ? Object.hasOwn
   : (target, key) => Object.prototype.hasOwnProperty.call(target, key);
@@ -1383,6 +1385,105 @@ function redact(obj) {
   return newObj;
 }
 
+// ---------------------------------------------------------
+// env.ASSETS
+// ---------------------------------------------------------
+//
+// The way back into asset-first from inside a function. The HTTP entry asks
+// the version's bundle about a path before it starts an isolate at all
+// (`dispatcher/handlers.rs`), so a request for a file never gets this far.
+// This is for the handler that ran anyway and wants the same answer for a path
+// it chose: a route that authenticates a visitor and then serves the file
+// behind it, a catch-all that answers `/` from `index.html`, an API that falls
+// back to the single-page shell.
+//
+// It is a *binding*, not a service. `ctx.services.*` is what a manifest
+// declares and what the control plane hands down an address for; nothing is
+// declared or dialled here, because the bundle is this version's own and is
+// already in memory. So it lives where the other env-shaped things live, under
+// the name Cloudflare uses, and code written against Pages reads the same.
+//
+// The name cannot be taken. `runtime/bindings.rs` reserves it: a deployment
+// carrying `ASSETS=...` has that key removed before the map becomes
+// `ctx.env`, and the property installed below is neither writable nor
+// configurable, so an application cannot put a string, or a function of its
+// own, where the platform's binding goes.
+const ASSETS_BINDING_NAME = "ASSETS";
+
+// What a relative path is resolved against. Only the path and the query are
+// sent to the asset layer -- a bundle is asked about its own paths and knows
+// nothing about hosts -- so this exists to make `new URL` accept a target like
+// "/index.html", and its host is never read.
+const ASSET_TARGET_BASE = "http://assets.deis.local/";
+
+// Captured for the same reason `ObjectAssign` is: the binding is used on every
+// invocation, which is after application code has had its chance to assign
+// over a global, and `URL` and `Response` are both writable in `bootstrap.js`
+// because an application replacing them is an ordinary thing to do. What the
+// platform hands back must still be the platform's own.
+const URLCtor = URL;
+const ResponseCtor = Response;
+
+// The path and query the asset layer is asked about.
+//
+// A Request, a URL or a string, which is what any `fetch` takes. Read by the
+// member that names the target rather than by `instanceof`, because the
+// application may have replaced the constructors these objects came from and
+// a request built from its `Request` is still a request. Anything else is
+// refused by name rather than coerced: `String({})` is "[object Object]",
+// which would be looked up as a path, answered 404, and leave the author
+// hunting for a file they never asked for.
+function assetTargetOf(input) {
+  let raw;
+  if (typeof input === "string") {
+    raw = input;
+  } else if (input !== null && typeof input === "object" && typeof input.url === "string") {
+    // A Request names its target `url`.
+    raw = input.url;
+  } else if (input !== null && typeof input === "object" && typeof input.href === "string") {
+    // A URL names it `href`.
+    raw = input.href;
+  } else {
+    throw new TypeError(
+      "env.ASSETS.fetch() takes a Request, a URL or a URL string; it was given " +
+      (input === null ? "null" : typeof input)
+    );
+  }
+
+  let url;
+  try {
+    url = new URLCtor(raw, ASSET_TARGET_BASE);
+  } catch (e) {
+    throw new TypeError(
+      "env.ASSETS.fetch() was given " + JSON.stringify(raw) + ", which is not a URL or a path"
+    );
+  }
+  return url.pathname + url.search;
+}
+
+// Frozen so that `env.ASSETS.fetch = ...` cannot replace the one function on
+// it; the property itself is locked where it is installed.
+const assetsBinding = ObjectFreeze({
+  // Answers a Response, the same object shape any other fetch answers, so a
+  // handler can `return await env.ASSETS.fetch(request)` unchanged.
+  //
+  // Always an answer and never a throw for a path that names nothing: a miss
+  // comes back as a 404 with a body, because a handler that had to invent its
+  // own would invent a different one on every route.
+  //
+  // Declared async although the op is synchronous -- the bytes have been in
+  // memory since the version loaded -- so that the shape an author writes is
+  // the one they write everywhere else.
+  async fetch(input) {
+    const target = assetTargetOf(input);
+    const answer = DenoCore.ops.op_deis_assets_fetch(target);
+    return new ResponseCtor(answer.body, {
+      status: answer.status,
+      headers: answer.headers,
+    });
+  },
+});
+
 // The half of the context that does not depend on there being a request:
 // the environment, the platform services, `log` and waitUntil. Shared by the
 // fetch path, the queue path and the cron path so a queue or scheduled handler
@@ -1395,8 +1496,21 @@ function redact(obj) {
 // example calls it, so a scheduled handler that found `context.log` undefined
 // would fail on the first line it wrote.
 function createServiceContext() {
+  // The application's own variables, plus the bindings the platform adds.
+  // `ASSETS` is defined rather than assigned, and locked: an application that
+  // ships a variable of that name has already had it removed on the Rust side,
+  // and one that assigns over it here in strict mode -- which every ES module
+  // is -- gets a TypeError rather than a silently disconnected binding.
+  const env = DenoCore.ops.op_get_env() || {};
+  ObjectDefineProperty(env, ASSETS_BINDING_NAME, {
+    value: assetsBinding,
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
+
   return {
-    env: DenoCore.ops.op_get_env() || {},
+    env,
     services: {
       kv: new NativeKV(),
       database: new NativeDB(),

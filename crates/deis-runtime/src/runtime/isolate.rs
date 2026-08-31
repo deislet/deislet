@@ -976,6 +976,20 @@ pub struct IsolateSpec {
     /// allowlist -- so an isolate built by a path that forgets to set it is
     /// closed rather than open.
     pub fetch_policy: FetchPolicy,
+
+    /// The static files of the version this isolate runs, so that
+    /// `env.ASSETS.fetch()` answers out of the bundle the code came with.
+    ///
+    /// The bundle, not a path to it: it was read out of the archive once when
+    /// the version loaded and is shared with the HTTP entry, so an isolate
+    /// holding it costs a refcount and the two halves of asset-first can never
+    /// disagree about what this version carries.
+    ///
+    /// `None` for an isolate that is not a deployed version -- the node's own
+    /// system app, and anything loaded through
+    /// [`crate::app::ApplicationManager::load_app`]. `env.ASSETS.fetch()` then
+    /// answers 404, which is what an empty bundle answers.
+    pub assets: Option<Arc<crate::assets::AssetBundle>>,
 }
 
 pub struct AppRuntime {
@@ -1064,6 +1078,7 @@ impl AppRuntime {
             route_patterns,
             limits,
             fetch_policy,
+            assets,
         } = spec;
         let ExecutionLimits {
             timeout_ms,
@@ -1323,6 +1338,15 @@ impl AppRuntime {
             // see `AppId`.
             state.put(AppId(app_id.clone()));
 
+            // The other half of asset-first: the HTTP entry answers a request
+            // for a file before an isolate is started, and this is what a
+            // handler that ran anyway reaches through `env.ASSETS.fetch()`.
+            // Absent for an isolate that is not a deployed version, which the
+            // op answers 404 for rather than failing.
+            if let Some(assets) = assets {
+                state.put(assets);
+            }
+
             // The storage bindings. Only what the app declared is present;
             // an op that finds its client missing answers "service not
             // available", which is the honest answer for a service the app
@@ -1346,6 +1370,14 @@ impl AppRuntime {
         if memory_limit_mb.is_some() {
             let handle = runtime.v8_isolate().thread_safe_handle();
             let app_id_clone = app_id.clone();
+            // This callback is the only place on the node that knows an
+            // isolate died of its heap rather than of anything else: by the
+            // time the request path sees it, an out-of-memory kill and a
+            // handler that threw are the same terminated execution. Without
+            // the counter below, `deis_runtime_memory_cutoffs_total` stayed at
+            // zero however often this fired, which reads to an operator as
+            // "this never happens" - worse than having no metric at all.
+            let metrics_for_cutoff = metrics.clone();
 
             runtime.add_near_heap_limit_callback(move |current, initial| {
                 tracing::error!(
@@ -1356,6 +1388,7 @@ impl AppRuntime {
                     current,
                     initial
                 );
+                metrics_for_cutoff.record_memory_cutoff(&app_id_clone);
 
                 // Terminate execution
                 handle.terminate_execution();

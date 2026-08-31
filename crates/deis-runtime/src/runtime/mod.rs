@@ -8,7 +8,6 @@ mod db_ops;
 mod deno_telemetry_stub;
 mod fetch_ops;
 pub mod fetch_policy;
-// mod http_ops;
 pub mod isolate;
 mod kv_client;
 pub mod loader;
@@ -26,7 +25,6 @@ mod tenant;
 #[cfg(test)]
 pub(crate) mod test_store;
 mod tls_ops;
-// mod ws_ops;
 mod ws_server_ops;
 
 pub use bindings::{

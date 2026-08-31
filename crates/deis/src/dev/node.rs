@@ -148,6 +148,13 @@ impl DevNode {
                 bundle_url: bundle_url.to_string(),
                 bundle_sha: bundle_sha.to_string(),
                 env,
+                // No per-application ceilings locally: in production the
+                // control plane fills these in from the manifest it stored
+                // with the version, and a dev node has no catalog to read
+                // one out of. It therefore runs on its own defaults, which
+                // are the same defaults an application with no declared
+                // limits gets in production.
+                limits: None,
             })
             .await
             .map_err(|e| {

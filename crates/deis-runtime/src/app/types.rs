@@ -62,7 +62,21 @@ pub struct AppPermissions {
     pub allow_env: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What one application asked to be held to, and never what it was granted.
+///
+/// These arrive from the application's own bundle manifest: the control plane
+/// reads the `limits` block out of it, sends it with the deployment
+/// (`ApplyDeployment.limits`, and the same shape in the assignment list), and
+/// this node stores it on the app's [`AppConfig`]. A manifest is written by
+/// the tenant, so **every field narrows only**: the node's configuration is
+/// the ceiling, and
+/// `crate::app::manager::ApplicationManager::effective_limits` clamps each
+/// value against it and warns when an application asked for more.
+///
+/// Deserialised straight from the assignment list's JSON, which is why the
+/// field names here are the manifest's own spelling and why every field has a
+/// `serde` default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Narrowing override of `crate::config::RuntimeConfig`'s
     /// `default_memory_limit_mb`: the V8 heap ceiling this app's isolate runs
@@ -98,13 +112,25 @@ pub struct ResourceLimits {
     #[serde(default)]
     pub resource_table_max: Option<usize>,
 
-    /// Override of `crate::config::ExecutionLimits::timeout_ms` for this app.
-    /// `None` means "use the platform default".
+    /// Narrowing override of `crate::config::ExecutionLimits::timeout_ms`: the
+    /// wall-clock ceiling on one invocation of this app. `None` means "use the
+    /// platform default".
+    ///
+    /// Narrowing only, like every other field here. An invocation holds the
+    /// runtime thread it is on for its whole duration, and every other
+    /// application queued behind that thread waits with it, so how long one
+    /// may run is the node's number to set. A value above the node's is
+    /// refused and the node's is applied.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 
-    /// Override of `crate::config::ExecutionLimits::rate_limit_ops_per_sec`
-    /// for this app. `None` means "use the platform default".
+    /// Narrowing override of
+    /// `crate::config::ExecutionLimits::rate_limit_ops_per_sec`: how fast this
+    /// app's code may dispatch ops. `None` means "use the platform default".
+    ///
+    /// Narrowing only. Every op dispatch is work the node does on the app's
+    /// behalf, so a value above the node's is refused and the node's is
+    /// applied.
     #[serde(default)]
     pub rate_limit_ops_per_sec: Option<f64>,
 
@@ -120,11 +146,6 @@ pub struct ResourceLimits {
     /// application asking for less is welcome to: a handler that knows it is
     /// IO-bound and sets 200ms gets told at once when a change makes it
     /// compute instead.
-    ///
-    /// Unlike `timeout_ms`, which moves in whichever direction the app asks
-    /// for, because a duration ceiling bounds how long a *client* waits and an
-    /// application is entitled to want that shorter or longer; CPU time is the
-    /// node's own resource.
     #[serde(default)]
     pub cpu_time_limit_ms: Option<u64>,
 }
