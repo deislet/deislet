@@ -1299,33 +1299,303 @@ class NativeDB {
   }
 }
 
+// A byte payload on its way into the store: a string is UTF-8 encoded, bytes
+// are stored exactly as given. Shared by put() so that one rule decides what
+// an application may hand this store.
+function blobEncode(call, data) {
+  if (typeof data === "string") return new TextEncoder().encode(data);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  throw new TypeError(
+    call + ": the body must be a string, an ArrayBuffer or a typed array, got " +
+      (data === null ? "null" : typeof data)
+  );
+}
+
+// One object as this store hands it over, with the bytes behind three
+// accessors and everything the store knows beside them.
+//
+// etag is the object's version identity: pass it back in `onlyIf` to make the
+// next write conditional, or put it in an HTTP ETag header. It is the sha256
+// of the whole object even on a ranged read, which is why a range also reports
+// where its bytes came from.
+function blobObject(read) {
+  const bytes = read.body;
+  return {
+    key: read.key,
+    etag: read.etag,
+    size: read.size,
+    contentType: read.contentType === undefined ? null : read.contentType,
+    uploadedAt: read.uploadedAt,
+    // { offset, length } for a ranged read, null for a whole one. With size,
+    // these are the three numbers a `Content-Range: bytes o-(o+l-1)/size`
+    // header needs, resolved by the store rather than recomputed here.
+    range: read.range === undefined ? null : read.range,
+    bytes: () => bytes,
+    arrayBuffer: async () =>
+      bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+        ? bytes.buffer
+        : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+    text: async () => new TextDecoder().decode(bytes),
+    json: async () => JSON.parse(new TextDecoder().decode(bytes))
+  };
+}
+
+// What a conditional write requires of the object first, in the two spellings
+// HTTP uses. Returns undefined for "no condition at all", which is what an
+// absent onlyIf and an empty one both mean.
+function blobCondition(call, options) {
+  const onlyIf = optionOf(options, "onlyIf");
+  if (onlyIf === undefined || onlyIf === null) return null;
+  if (typeof onlyIf !== "object") {
+    throw new TypeError(
+      call + ": onlyIf must be an object of { ifMatch } or { ifNoneMatch }, got " + typeof onlyIf
+    );
+  }
+  const ifMatch = optionOf(onlyIf, "ifMatch");
+  const ifNoneMatch = optionOf(onlyIf, "ifNoneMatch");
+  for (const [name, value] of [["ifMatch", ifMatch], ["ifNoneMatch", ifNoneMatch]]) {
+    if (value !== undefined && value !== null && typeof value !== "string") {
+      throw new TypeError(
+        call + ": onlyIf." + name + " must be the etag string a read answered with, or \"*\", got " +
+          typeof value
+      );
+    }
+  }
+  return {
+    ifMatch: ifMatch === undefined ? null : ifMatch,
+    ifNoneMatch: ifNoneMatch === undefined ? null : ifNoneMatch
+  };
+}
+
 class BlobStore {
-  async get(key) {
-    const data = await DenoCore.ops.op_blob_get(key);
-    if (!data) return null;
+  // get(key) -> the whole object, or null when the key is not there
+  // get(key, { range }) -> one slice of it
+  //
+  // The answer carries the bytes behind bytes() / arrayBuffer() / text() /
+  // json(), plus key, etag, size, contentType, uploadedAt and - for a ranged
+  // read - range.
+  //
+  // `range` is either an HTTP Range header value, which is what an application
+  // forwards when it was handed one:
+  //
+  //   const object = await blob.get(key, { range: request.headers.get("range") });
+  //
+  // or the same range as numbers: { offset, length } from a byte, or
+  // { suffix } for the last n bytes. offset with no length runs to the end.
+  //
+  // A range naming no byte of the object - starting at or past its end - is an
+  // exception, not null. That is the difference between "this object has no
+  // such bytes" (416) and "there is no such object" (null, then 404), and an
+  // application answering HTTP owes its caller different answers for the two.
+  async get(key, options) {
+    const asked = optionOf(options, "range");
+    let range = null;
+    if (asked !== undefined && asked !== null) {
+      if (typeof asked === "string") {
+        // Parsed on the Rust side, where the one implementation of RFC 9110's
+        // grammar on this platform lives.
+        range = { header: asked };
+      } else if (typeof asked === "object") {
+        range = {
+          offset: blobWholeNumber("blob.get", "range.offset", optionOf(asked, "offset")),
+          length: blobWholeNumber("blob.get", "range.length", optionOf(asked, "length")),
+          suffix: blobWholeNumber("blob.get", "range.suffix", optionOf(asked, "suffix"))
+        };
+      } else {
+        throw new TypeError(
+          "blob.get: range must be a Range header string or { offset, length, suffix }, got " +
+            typeof asked
+        );
+      }
+    }
+    const read = await DenoCore.ops.op_blob_get(key, { range: range });
+    if (!read) return null;
+    return blobObject(read);
+  }
+  // head(key) -> what the store knows about the object, without its body, or
+  // null when the key is not there.
+  //
+  // Same fields as get() minus the bytes: key, etag, size, contentType,
+  // uploadedAt. This is how an application learns an object's size or media
+  // type without paying for the object.
+  async head(key) {
+    const meta = await DenoCore.ops.op_blob_head(key);
+    if (!meta) return null;
     return {
-      arrayBuffer: async () => data.buffer,
-      text: async () => new TextDecoder().decode(data),
-      json: async () => JSON.parse(new TextDecoder().decode(data))
+      key: meta.key,
+      etag: meta.etag,
+      size: meta.size,
+      contentType: meta.contentType === undefined ? null : meta.contentType,
+      uploadedAt: meta.uploadedAt
     };
   }
-  async put(key, data) {
-    let buffer;
-    if (typeof data === 'string') {
-      buffer = new TextEncoder().encode(data);
-    } else if (data instanceof ArrayBuffer) {
-      buffer = new Uint8Array(data);
-    } else if (ArrayBuffer.isView(data)) {
-      buffer = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    } else {
-      throw new Error("Invalid data type for BlobStore.put");
+  // list() -> one page of every object this application has
+  // list("uploads/") -> one page of the objects under a prefix
+  // list({ prefix, delimiter, limit, cursor }) -> the same, spelled out
+  //
+  // Resolves to { objects, prefixes, list_complete, cursor }:
+  //
+  //   objects        an array of { key, etag, size, contentType, uploadedAt },
+  //                  in key order. No bodies: a page may hold a thousand
+  //                  objects, so a body is fetched by key afterwards.
+  //   prefixes       with a delimiter, the folder names rolled up at this
+  //                  level, each ending with the delimiter. Empty without one.
+  //   list_complete  true when this page was the end of the scan.
+  //   cursor         what to pass back as `cursor` for the next page, and
+  //                  undefined once list_complete is true.
+  //
+  // Page until list_complete, not until a page comes back short: a scan can
+  // fill a page exactly and still have nothing behind it, so a loop that
+  // stopped at the first short page would be right only by luck.
+  //
+  //   const all = [];
+  //   let page = { list_complete: false, cursor: undefined };
+  //   while (!page.list_complete) {
+  //     page = await blob.list({ prefix: "uploads/", limit: 100, cursor: page.cursor });
+  //     all.push(...page.objects);
+  //   }
+  //
+  // limit is a request, not a guarantee. deis-store substitutes its own page
+  // size (200) when none is given and caps anything larger than its ceiling
+  // (1000), so asking for a million yields a thousand objects and a cursor
+  // rather than an error. That ceiling is what stops one application with a
+  // million objects from asking the store to build a million-entry answer.
+  //
+  // delimiter is what makes a flat key space walkable one level at a time:
+  // list({ delimiter: "/" }) answers the top-level folders in `prefixes` and
+  // only the keys with no "/" left in them in `objects`.
+  async list(options) {
+    const bag = typeof options === "string" ? { prefix: options } : options;
+
+    const prefix = blobString("blob.list", "prefix", optionOf(bag, "prefix"));
+    const delimiter = blobString("blob.list", "delimiter", optionOf(bag, "delimiter"));
+    const cursor = blobString("blob.list", "cursor", optionOf(bag, "cursor"));
+
+    const askedLimit = optionOf(bag, "limit");
+    let limit = null;
+    if (askedLimit !== undefined && askedLimit !== null) {
+      limit = Number(askedLimit);
+      if (!Number.isFinite(limit) || Math.floor(limit) !== limit || limit <= 0) {
+        throw new TypeError(
+          "blob.list: limit must be a whole number of objects greater than 0, got " +
+            String(askedLimit)
+        );
+      }
+      // The op takes a 32-bit count. deis-store caps every limit at its own
+      // ceiling anyway, so handing over the largest one the decoder can hold
+      // keeps an absurd request answering with the ceiling and a cursor rather
+      // than with a message about integers.
+      if (limit > 2147483647) limit = 2147483647;
     }
-    await DenoCore.ops.op_blob_put(key, buffer);
+
+    const page = await DenoCore.ops.op_blob_list({
+      prefix: prefix,
+      delimiter: delimiter,
+      limit: limit,
+      cursor: cursor
+    });
+
+    const next = page.cursor === undefined || page.cursor === null ? undefined : page.cursor;
+    return {
+      objects: page.objects.map((object) => ({
+        key: object.key,
+        etag: object.etag,
+        size: object.size,
+        contentType: object.contentType === undefined ? null : object.contentType,
+        uploadedAt: object.uploadedAt
+      })),
+      prefixes: page.prefixes,
+      list_complete: next === undefined,
+      cursor: next
+    };
   }
-  async delete(key) {
-    await DenoCore.ops.op_blob_delete(key);
+  // put(key, data) -> { key, etag, size, contentType }
+  // put(key, data, { contentType, onlyIf }) -> the same, or null
+  //
+  // data is a string, an ArrayBuffer or a typed array. A string is UTF-8
+  // encoded; bytes are stored exactly as given.
+  //
+  // contentType is recorded beside the object and read back by get() and
+  // head(); the store never interprets it.
+  //
+  // onlyIf makes the write conditional, in HTTP's two spellings:
+  //
+  //   { ifNoneMatch: "*" }      write only if the key does not exist -- a
+  //                             create-once, and therefore a lock
+  //   { ifMatch: etag }         write only if the object still carries this
+  //                             etag -- a compare-and-set on the content an
+  //                             earlier read returned
+  //   { ifMatch: "*" }          write only if the key already exists
+  //   { ifNoneMatch: etag }     write unless the object carries this etag
+  //
+  // A conditional write that lost resolves to **null**, and nothing else here
+  // does. That is the one failure to answer by reading the object again and
+  // trying: every other failure throws, and an application must not retry
+  // those as they stand.
+  //
+  //   const current = await blob.head(key);
+  //   const next = update(await (await blob.get(key)).json());
+  //   const written = await blob.put(key, JSON.stringify(next), {
+  //     onlyIf: { ifMatch: current.etag }
+  //   });
+  //   if (written === null) { /* somebody else wrote first; read and retry */ }
+  async put(key, data, options) {
+    const contentType = blobString("blob.put", "contentType", optionOf(options, "contentType"));
+    const written = await DenoCore.ops.op_blob_put(key, blobEncode("blob.put", data), {
+      contentType: contentType,
+      onlyIf: blobCondition("blob.put", options)
+    });
+    if (!written) return null;
+    return {
+      key: written.key,
+      etag: written.etag,
+      size: written.size,
+      contentType: written.contentType === undefined ? null : written.contentType
+    };
+  }
+  // delete(key) -> true
+  // delete(key, { onlyIf }) -> true when it was deleted, false when the
+  // condition did not hold
+  //
+  // Deleting a key that is not there succeeds: "this key is gone" holds either
+  // way. With an onlyIf, false means the object was not in the state the
+  // caller required and is still stored - the same signal put() gives with
+  // null, and the same response: read it again.
+  async delete(key, options) {
+    return await DenoCore.ops.op_blob_delete(key, {
+      onlyIf: blobCondition("blob.delete", options)
+    });
   }
 }
+
+// A string option, or null when it was not given. Rejecting the wrong type
+// here rather than at the boundary is what makes the message name the option
+// an application actually wrote.
+function blobString(call, name, value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    throw new TypeError(call + ": " + name + " must be a string, got " + typeof value);
+  }
+  return value;
+}
+
+// A whole, non-negative number of bytes, or null when it was not given.
+// JavaScript has one number type, so "3.5 bytes" and "-1 bytes" both have to
+// be refused here or they reach the store as something else entirely.
+function blobWholeNumber(call, name, value) {
+  if (value === undefined || value === null) return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || Math.floor(number) !== number || number < 0) {
+    throw new TypeError(
+      call + ": " + name + " must be a whole number of bytes, 0 or more, got " + String(value)
+    );
+  }
+  return number;
+}
+
 
 class Queue {
   constructor(name = "default") {

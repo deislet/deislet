@@ -28,6 +28,14 @@ pub enum StoreError {
     Corrupt(String),
     /// The request exceeds a configured ceiling.
     TooLarge(String),
+    /// The caller asked for a byte range that names no byte of the object it
+    /// addressed. Deliberately not [`StoreError::InvalidArgument`]: the
+    /// request is perfectly well formed and would have been satisfiable
+    /// against a longer object, so what the caller has to change is the range
+    /// it asks for, not the shape of its request. This is the case HTTP
+    /// answers 416 for, and telling it apart from [`StoreError::NotFound`] is
+    /// what lets an application answer 416 rather than 404.
+    RangeNotSatisfiable(String),
     /// A per-server or per-tenant ceiling on how many of something may be
     /// open at once is already reached. Nothing the caller sent is wrong and
     /// the same request may well succeed later, which is what separates this
@@ -71,6 +79,7 @@ impl fmt::Display for StoreError {
             Self::NotFound(m) => write!(f, "not found: {m}"),
             Self::Corrupt(m) => write!(f, "corrupt: {m}"),
             Self::TooLarge(m) => write!(f, "too large: {m}"),
+            Self::RangeNotSatisfiable(m) => write!(f, "range not satisfiable: {m}"),
             Self::Exhausted(m) => write!(f, "at capacity: {m}"),
             Self::Expired(m) => write!(f, "expired: {m}"),
             Self::Refused(m) => write!(f, "refused: {m}"),
@@ -135,6 +144,11 @@ impl From<StoreError> for Status {
             // caller chose, so the answer to it is to wait rather than to
             // send something smaller.
             StoreError::TooLarge(_) | StoreError::Exhausted(_) => Code::ResourceExhausted,
+            // Its own code, and the only user of it: an application forwarding
+            // a `Range` header has to answer 416 for this and 404 for a
+            // missing key, and it can only do that if the two arrive as
+            // different codes rather than as two spellings of one.
+            StoreError::RangeNotSatisfiable(_) => Code::OutOfRange,
             // The caller ran out of time, not the store: telling it apart
             // from an internal fault is what lets a client retry instead of
             // paging whoever owns the store. `Expired` is the same story from
@@ -174,6 +188,10 @@ mod tests {
             (StoreError::NotFound("x".into()), Code::NotFound),
             (StoreError::Corrupt("x".into()), Code::DataLoss),
             (StoreError::TooLarge("x".into()), Code::ResourceExhausted),
+            (
+                StoreError::RangeNotSatisfiable("x".into()),
+                Code::OutOfRange,
+            ),
             (StoreError::Exhausted("x".into()), Code::ResourceExhausted),
             (StoreError::Stalled("x".into()), Code::DeadlineExceeded),
             (StoreError::Expired("x".into()), Code::DeadlineExceeded),

@@ -16,23 +16,99 @@ package deis.blob;
 // ("demo.production"). It is deliberately not the `x-deis-app-id` header of
 // the HTTP data path, which names the application alone. The service knows
 // nothing beyond that one id: no versions, no environments, no deployments.
+//
+// Every RPC below is scoped by that header alone. There is no field anywhere
+// in this file by which a caller could name a tenant, a bucket or a namespace,
+// so no request can be made to reach outside the one the header names - a
+// listing and a cursor included.
 service BlobStore {
   // Stream an object body out. The first response carries `info`, every
   // response after it carries one `chunk`, in order. An unknown key fails
   // with NOT_FOUND before any message is produced.
+  //
+  // With `range` set the stream carries that slice instead of the whole body;
+  // see GetRequest.range.
   rpc Get(GetRequest) returns (stream GetResponse);
+
+  // What the store knows about one object, without moving its body.
+  //
+  // Everything this answers is a column of the metadata row `Get` reads
+  // anyway, so learning an object's size or media type costs one row here
+  // instead of streaming the body out and throwing it away.
+  rpc Head(HeadRequest) returns (HeadResponse);
+
+  // One page of this tenant's keys, in key order.
+  //
+  // Paged, always: a tenant may hold millions of objects, and an RPC that
+  // promised all of them would work in development and fall over on exactly
+  // the applications big enough to need it. See ListRequest for the bounds.
+  rpc List(ListRequest) returns (ListResponse);
 
   // Stream an object body in. The first request must carry `header`, every
   // request after it carries one `chunk`, in order. An empty body (header and
   // nothing else) stores a zero-length object.
+  //
+  // With `header.precondition` set the write happens only if the object is in
+  // the state the caller requires; see Precondition.
   rpc Put(stream PutRequest) returns (PutResponse);
 
-  // Delete an object. Deleting a key that is already absent succeeds.
+  // Delete an object. Deleting a key that is already absent succeeds, unless
+  // a precondition says otherwise.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 }
 
 message GetRequest {
   string key = 1;
+  // Absent reads the whole object. Set reads one slice of it, and the stream
+  // then carries `range` on its header message and `range_sha256` on a final
+  // message; see GetResponse.
+  //
+  // A range that names no byte of the object - an offset at or past its end,
+  // a zero-length suffix, any range of an empty object - fails with
+  // OUT_OF_RANGE and nothing is streamed. That is deliberately a code of its
+  // own: it is the case HTTP answers 416 for, and an application forwarding
+  // this has to tell it apart from a missing key (NOT_FOUND) to answer 416
+  // rather than 404.
+  ByteRange range = 2;
+}
+
+// Part of an object, with the meaning RFC 9110 gives HTTP's `Range` header -
+// because forwarding one of those headers into this message is what an
+// application will do, and it must not have to invent a rule of its own to do
+// it.
+message ByteRange {
+  oneof spec {
+    // `bytes=<offset>-` or `bytes=<offset>-<last>`.
+    ByteSpan span = 1;
+    // `bytes=-<n>`: the last `n` bytes. An `n` larger than the object is the
+    // whole object rather than an error, which is what RFC 9110 says; `n` of
+    // zero names no byte and is unsatisfiable.
+    uint64 suffix = 2;
+  }
+}
+
+message ByteSpan {
+  // First byte wanted, counted from the start of the object.
+  uint64 offset = 1;
+  // How many bytes at most. Absent runs to the end of the object; a length
+  // that would run past the end is clamped to it rather than refused, so
+  // `bytes=0-1048575` on a 100-byte object answers the 100 bytes. Zero is
+  // refused as INVALID_ARGUMENT: a caller asking for no bytes has a bug, and
+  // answering it with an empty body would hide the bug rather than the range.
+  optional uint64 length = 2;
+}
+
+// Which bytes of the object a ranged stream actually carries.
+//
+// Resolved by the server, once: a suffix range, an open-ended range and a
+// length that ran past the end have all been turned into these two numbers
+// already. Together with `BlobInfo.size` they are exactly what
+// `Content-Range: bytes <offset>-<offset+length-1>/<size>` needs, so nothing
+// downstream recomputes the arithmetic and no two layers can disagree about
+// which bytes went out.
+message RangeInfo {
+  uint64 offset = 1;
+  uint64 length = 2;
 }
 
 message GetResponse {
@@ -40,20 +116,97 @@ message GetResponse {
     // Always the first message of the stream.
     BlobInfo info = 1;
     // One ordered slice of the body. Concatenating every chunk in arrival
-    // order reproduces the object byte for byte.
+    // order reproduces the object - or, for a ranged read, the requested
+    // slice of it - byte for byte.
     bytes chunk = 2;
   }
+
+  // Set on the `info` message of a ranged read, and on nothing else. Outside
+  // the oneof because it qualifies the header rather than standing in for it:
+  // a third kind of stream message would make every reader order three things
+  // instead of two.
+  RangeInfo range = 3;
+
+  // Set on the last message of a ranged read, whose `payload` is unset:
+  // lowercase hex sha256 of exactly the bytes this stream carried.
+  //
+  // A whole-object read is checked against `BlobInfo.sha256`, which a slice
+  // cannot match; without this a ranged read would be the one read on this
+  // platform that hands an application bytes nobody checked. The server
+  // hashes as it streams, one pass over bytes it is reading anyway.
+  optional string range_sha256 = 4;
 }
 
 // What the store knows about one object.
 message BlobInfo {
   string key = 1;
-  // Lowercase hex sha256 of the body; also the content address on disk.
+  // Lowercase hex sha256 of the body; also the content address on disk, and
+  // also this object's version identity - the value a conditional write
+  // compares against and the value an application puts in an HTTP `ETag`.
+  // One string, one meaning, spelled once: a second field carrying the same
+  // digest under a second name is a field that can drift.
   string sha256 = 2;
   uint64 size = 3;
   optional string content_type = 4;
   // Unix seconds at which this key was last written.
   int64 created_at = 5;
+}
+
+message HeadRequest {
+  string key = 1;
+}
+
+message HeadResponse {
+  // Absent when the key does not exist. Deliberately not a NOT_FOUND status
+  // the way `Get` answers one: "is this object there, and how big is it" is
+  // the question Head exists to answer, so "it is not there" is an answer and
+  // not a failure.
+  BlobInfo info = 1;
+}
+
+message ListRequest {
+  // Only keys starting with this. Empty lists everything this tenant has -
+  // the tenant is already the boundary and there is nothing wider to reach.
+  string prefix = 1;
+  // Entries this page may hold, counting `objects` and `prefixes` together.
+  // Absent takes the server's default; anything above the server's ceiling is
+  // capped rather than refused, so a caller asking for a million gets the
+  // ceiling and a cursor. The ceiling is not negotiable from here: it is what
+  // stops one tenant with a million objects from making the store build a
+  // million-entry message.
+  optional int32 limit = 2;
+  // The `next_cursor` of the previous page. Opaque - it encodes both where to
+  // resume and whether that bound is inclusive - so a caller passes back
+  // exactly what it was given and never builds one. A cursor that points
+  // outside `prefix` is ignored rather than honoured, because honouring it
+  // would widen the scan to keys the caller did not ask for.
+  //
+  // What the server adds to the front of a cursor is unreserved in a URL and
+  // is not a leading `-`, so a cursor over an ordinary key travels through a
+  // query string or a command line unescaped. The rest of it is a key the
+  // tenant chose, and needs escaping exactly where that key would.
+  optional string cursor = 3;
+  // Roll every key whose remainder after `prefix` contains this separator up
+  // into one entry in `prefixes`, the way S3's delimiter does. That is what
+  // turns a flat key space into something a file browser can walk one level
+  // at a time: `list(prefix="", delimiter="/")` answers the top-level folders
+  // rather than every key underneath them. Absent or empty lists flat.
+  optional string delimiter = 4;
+}
+
+message ListResponse {
+  // One entry per key on this page, in key order, carrying what Head would
+  // say about it.
+  repeated BlobInfo objects = 1;
+  // Common prefixes rolled up by `delimiter`, in key order, each ending with
+  // the delimiter. Empty when no delimiter was asked for. They are a separate
+  // list rather than interleaved with `objects`, which is the shape S3 uses:
+  // the two orders are each meaningful, the merge of them is not.
+  repeated string prefixes = 2;
+  // Where to resume. Absent means the scan reached the end of the prefix.
+  // That, and not a short page, is how a caller knows it is finished: a scan
+  // can fill a page exactly and still have nothing left behind it.
+  optional string next_cursor = 3;
 }
 
 message PutRequest {
@@ -68,6 +221,9 @@ message PutRequest {
 message PutHeader {
   string key = 1;
   optional string content_type = 2;
+  // Absent overwrites whatever is there. Set makes the write conditional; see
+  // Precondition.
+  Precondition precondition = 3;
 }
 
 message PutResponse {
@@ -76,13 +232,60 @@ message PutResponse {
   // Lowercase hex sha256 of what was stored.
   string sha256 = 3;
   uint64 size = 4;
+  // Set exactly when `success` is false because the precondition did not
+  // hold. See PreconditionFailure for why this is a field and not a sentence.
+  PreconditionFailure precondition_failed = 5;
 }
 
 message DeleteRequest {
   string key = 1;
+  // Absent deletes unconditionally, and deleting an absent key succeeds. Set
+  // makes the delete conditional; see Precondition.
+  Precondition precondition = 2;
 }
 
 message DeleteResponse {
   bool success = 1;
   optional string error = 2;
+  // Set exactly when `success` is false because the precondition did not
+  // hold.
+  PreconditionFailure precondition_failed = 3;
+}
+
+// A condition on the object as it stands, checked at the instant the write
+// commits and inside the same transaction that performs it - so two writers
+// racing on one key cannot both find their condition true.
+//
+// Spelled the way HTTP spells `If-Match` and `If-None-Match`, because an
+// application forwarding those headers must not have to translate them. The
+// version identity compared here is the object's `sha256`, which is its ETag;
+// see BlobInfo.
+message Precondition {
+  oneof condition {
+    // The object must exist and its etag must be exactly this. `*` accepts
+    // any existing object.
+    string if_match = 1;
+    // The object must not have this etag; a key that does not exist satisfies
+    // any etag. `*` accepts only a key that does not exist at all, which is
+    // how a caller creates an object exactly once and how two callers racing
+    // to create the same key learn which of them won.
+    string if_none_match = 2;
+  }
+}
+
+// A conditional write that did not happen because the object was not in the
+// state the caller required.
+//
+// Its own field rather than a sentence in `error`, because this is the one
+// write failure a caller is expected to answer by reading the object again
+// and retrying, and every other one it must not retry. A caller matching on
+// the text of an error message would start retrying the wrong failures the
+// first time somebody reworded one.
+message PreconditionFailure {
+  // The condition as it was sent, echoed so the caller can log what it asked
+  // for without keeping it.
+  string condition = 1;
+  // The object's etag at the moment the write was refused, which is what a
+  // caller re-reads against. Absent when the key does not exist.
+  optional string etag = 2;
 }

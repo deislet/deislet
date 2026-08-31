@@ -3716,6 +3716,188 @@ export default function handler(context: any): Response {
         assert_eq!(seen["deletedIsNull"], true);
     }
 
+    #[tokio::test]
+    async fn an_app_lists_heads_ranges_and_conditionally_writes_through_its_blob_binding() {
+        // The other four object-store verbs, exercised the only way that
+        // proves an application can reach them: through `ctx.services.blob` in
+        // a real isolate, against a real deis-store. Each of them exists on
+        // the wire and in the client, and each of them would still be
+        // unreachable if `js/runtime.js` did not spell the call.
+        let store = TestStore::start().await;
+
+        let wiring = ServiceWiring {
+            storage_token: None,
+            declaration: ServiceDeclaration::from_names(["blob"]),
+            endpoints: ServiceEndpoints {
+                store: Some(store.endpoint.clone()),
+                queue: None,
+            },
+            consumers: Vec::new(),
+        };
+
+        let code = r#"
+            export default async function handler(ctx) {
+                const blob = ctx.services.blob;
+
+                await blob.put("img/a.png", "aaaa", { contentType: "image/png" });
+                await blob.put("img/b.png", "bbbb");
+                await blob.put("index.html", "0123456789");
+
+                // What an object is, without moving it.
+                const head = await blob.head("img/a.png");
+
+                // One level of the key space, folders rolled up.
+                const top = await blob.list({ delimiter: "/" });
+
+                // A page smaller than the objects under a prefix, walked to
+                // the end the way the docs say to walk it.
+                const keys = [];
+                let page = { list_complete: false, cursor: undefined };
+                let pages = 0;
+                while (!page.list_complete && pages < 10) {
+                    page = await blob.list({ prefix: "img/", limit: 1, cursor: page.cursor });
+                    for (const object of page.objects) keys.push(object.key);
+                    pages++;
+                }
+
+                // A Range header, forwarded exactly as an application would
+                // forward the one it was handed.
+                const slice = await blob.get("index.html", { range: "bytes=2-5" });
+                const suffix = await blob.get("index.html", { range: { suffix: 3 } });
+
+                // Unsatisfiable: an application owes 416 here, not 404, so it
+                // has to arrive as something other than null.
+                let unsatisfiable = "no exception";
+                try {
+                    await blob.get("index.html", { range: { offset: 99 } });
+                } catch (error) {
+                    unsatisfiable = "threw";
+                }
+
+                // Create-once, then the same create again: the second must be
+                // told it lost rather than overwrite.
+                const created = await blob.put("lock", "mine", { onlyIf: { ifNoneMatch: "*" } });
+                const lost = await blob.put("lock", "yours", { onlyIf: { ifNoneMatch: "*" } });
+
+                // Compare-and-set on the etag an earlier write answered with.
+                const updated = await blob.put("lock", "second", {
+                    onlyIf: { ifMatch: created.etag }
+                });
+                const stale = await blob.put("lock", "third", {
+                    onlyIf: { ifMatch: created.etag }
+                });
+
+                const deletedStale = await blob.delete("lock", {
+                    onlyIf: { ifMatch: created.etag }
+                });
+                const deletedCurrent = await blob.delete("lock", {
+                    onlyIf: { ifMatch: updated.etag }
+                });
+
+                return new Response(JSON.stringify({
+                    headSize: head.size,
+                    headType: head.contentType,
+                    headEtagIsSha: /^[0-9a-f]{64}$/.test(head.etag),
+                    topKeys: top.objects.map((o) => o.key),
+                    topPrefixes: top.prefixes,
+                    pagedKeys: keys,
+                    sliceText: await slice.text(),
+                    sliceRange: slice.range,
+                    sliceTotal: slice.size,
+                    suffixText: await suffix.text(),
+                    unsatisfiable,
+                    createdWon: created !== null,
+                    lostIsNull: lost === null,
+                    updatedWon: updated !== null,
+                    staleIsNull: stale === null,
+                    deletedStale,
+                    deletedCurrent,
+                    goneAfterDelete: (await blob.head("lock")) === null,
+                }));
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "e2e_blob_verbs.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &wiring,
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = rx.await.unwrap().unwrap();
+        let body = text(body);
+        drop(store);
+
+        assert_eq!(status, 200, "body: {body:?}");
+        let seen: serde_json::Value = serde_json::from_str(&body.unwrap()).unwrap();
+
+        assert_eq!(seen["headSize"], 4);
+        assert_eq!(seen["headType"], "image/png");
+        assert_eq!(
+            seen["headEtagIsSha"], true,
+            "the etag an application conditions a write on is the body's sha256"
+        );
+
+        assert_eq!(
+            seen["topKeys"],
+            serde_json::json!(["index.html"]),
+            "with a delimiter, only the keys with no separator left belong at this level"
+        );
+        assert_eq!(seen["topPrefixes"], serde_json::json!(["img/"]));
+        assert_eq!(
+            seen["pagedKeys"],
+            serde_json::json!(["img/a.png", "img/b.png"]),
+            "paging one object at a time must visit every key exactly once"
+        );
+
+        assert_eq!(seen["sliceText"], "2345");
+        assert_eq!(
+            seen["sliceRange"],
+            serde_json::json!({"offset": 2, "length": 4})
+        );
+        assert_eq!(
+            seen["sliceTotal"], 10,
+            "a ranged read still reports the whole object's size, which is what a Content-Range's \
+             total is"
+        );
+        assert_eq!(seen["suffixText"], "789");
+        assert_eq!(
+            seen["unsatisfiable"], "threw",
+            "a range naming no byte must not read as a missing object"
+        );
+
+        assert_eq!(seen["createdWon"], true);
+        assert_eq!(
+            seen["lostIsNull"], true,
+            "the second create-if-absent must be told it lost, not silently overwrite"
+        );
+        assert_eq!(seen["updatedWon"], true);
+        assert_eq!(
+            seen["staleIsNull"], true,
+            "a write quoting an etag that has been superseded must not land"
+        );
+        assert_eq!(
+            seen["deletedStale"], false,
+            "a conditional delete against a stale etag must refuse"
+        );
+        assert_eq!(seen["deletedCurrent"], true);
+        assert_eq!(seen["goneAfterDelete"], true);
+    }
+
     // --- redirects ---------------------------------------------------------
     //
     // A redirect is the destination an application never named: whoever

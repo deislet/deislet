@@ -94,7 +94,7 @@ op 速率、更少的 CPU 时间或更小的资源表；控制面解析一次、
 | `context.env.ASSETS` | `fetch(请求 \| URL \| 路径)` —— 这一版自己的静态文件，走的是 HTTP 入口用的同一套 `_redirects` 与兜底规则。`ASSETS` 是保留键：部署里带了同名变量，在这张表变成 `context.env` 之前就被取走了 |
 | `context.services.kv` | `get` / `getWithMetadata` / `put` / `delete` / `list({ prefix, limit, cursor })` —— deis-store |
 | `context.services.database` | `query` / `execute` / `batch` / `transaction(回调)` —— deis-store，每租户一个 SQLite 文件。`transaction` 是真的交互式事务：`BEGIN IMMEDIATE` 在回调期间钉住一条连接，服务端有自己的硬超时，到点回滚并把连接放回去 |
-| `context.services.blob` | `get` / `put` / `delete` —— deis-store，内容寻址。没有 `list` / `head` / 按字节范围读：`BlobStore` 服务本身只有这三个调用 |
+| `context.services.blob` | `list` / `head` / `get` / `put` / `delete` —— deis-store，内容寻址。`get` 可以带一个范围（HTTP 的 `Range` 头原样转发也行），`list` 支持前缀、分隔符和游标，`put` / `delete` 可以带 `onlyIf` 做条件写：条件不成立时 `put` 返回 `null`、`delete` 返回 `false`，而不是抛异常 |
 | `context.services.queue` | `send`，以及 `to(name)` 投给默认队列以外的队列 —— deis-queue |
 | `context.services.cache` | Cache API，进程内、按 Isolate 隔离 |
 | `context.log` | `debug` / `info` / `warn` / `error`，在每条调用路径上都有，cron 与队列也不例外 |

@@ -542,6 +542,53 @@ enum DbAction {
 
 #[derive(Subcommand)]
 enum BlobAction {
+    /// List objects, newest page first.
+    ///
+    /// One page unless --all is given: an environment can hold far more
+    /// objects than fit on a terminal, so the walk is asked for rather than
+    /// assumed.
+    List {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Only keys starting with this. Omit it to list everything.
+        #[arg(default_value = "")]
+        prefix: String,
+
+        /// Roll every key up at this separator, so one folder is one line.
+        /// `--delimiter /` walks a key space one level at a time.
+        #[arg(long, value_name = "SEP")]
+        delimiter: Option<String>,
+
+        /// Objects per page. deis-store caps this at its own ceiling, so a
+        /// larger number pages rather than fails.
+        #[arg(long, value_name = "COUNT")]
+        limit: Option<i32>,
+
+        /// Resume from the cursor a previous page printed.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+
+        /// Keep paging until the listing ends.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show one object's size, media type and etag without downloading it.
+    Head {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Key to describe.
+        key: String,
+    },
+
     /// Read one object.
     Get {
         #[command(flatten)]
@@ -557,8 +604,21 @@ enum BlobAction {
         #[arg(long, value_name = "PATH")]
         file: Option<std::path::PathBuf>,
 
-        /// Largest object this command will hold in memory. Raise it for an
-        /// object bigger than the default.
+        /// First byte to read, counted from the start of the object.
+        #[arg(long, value_name = "BYTES")]
+        offset: Option<u64>,
+
+        /// How many bytes to read from --offset. Omit it to read to the end.
+        #[arg(long, value_name = "BYTES")]
+        length: Option<u64>,
+
+        /// Read the last n bytes instead. Cannot be combined with --offset or
+        /// --length.
+        #[arg(long, value_name = "BYTES")]
+        suffix: Option<u64>,
+
+        /// Largest read this command will hold in memory. Raise it, or ask
+        /// for a byte range, for an object bigger than the default.
         #[arg(long, value_name = "BYTES", default_value_t = commands::blob::default_max_bytes())]
         max_size: usize,
     },
@@ -581,6 +641,18 @@ enum BlobAction {
         /// Media type recorded alongside the object, e.g. image/png.
         #[arg(long, value_name = "TYPE")]
         content_type: Option<String>,
+
+        /// Write only if the object still carries this etag - the sha256
+        /// `deis blob head` prints. `*` accepts any existing object. A write
+        /// that loses exits 3 and stores nothing.
+        #[arg(long, value_name = "ETAG")]
+        if_match: Option<String>,
+
+        /// Write only if the object does not carry this etag. `*` accepts
+        /// only a key that does not exist, which is how a script creates one
+        /// exactly once.
+        #[arg(long, value_name = "ETAG", conflicts_with = "if_match")]
+        if_none_match: Option<String>,
     },
 
     /// Delete one object.
@@ -600,10 +672,17 @@ enum BlobAction {
         /// Skip the confirmation prompt. For scripts.
         #[arg(short = 'y', long)]
         yes: bool,
+
+        /// Delete only if the object still carries this etag. `*` accepts any
+        /// existing object. A delete that loses exits 3 and removes nothing.
+        #[arg(long, value_name = "ETAG")]
+        if_match: Option<String>,
+
+        /// Delete only if the object does not carry this etag. `*` accepts
+        /// only a key that does not exist.
+        #[arg(long, value_name = "ETAG", conflicts_with = "if_match")]
+        if_none_match: Option<String>,
     },
-    // No `List`: `BlobStore` in deis-store's proto has no List RPC. See the
-    // module comment on `crate::commands::blob` for why this is not offered
-    // rather than offered and broken.
 }
 
 #[derive(Subcommand)]
@@ -711,7 +790,18 @@ fn main() -> ExitCode {
             for cause in e.chain().skip(1) {
                 eprintln!("  {} {cause}", "caused by".dimmed());
             }
-            ExitCode::FAILURE
+            // A conditional write that lost gets its own exit code, because it
+            // is the one failure a script answers by reading the object again
+            // and retrying - and the only way to tell it from a refused token
+            // or an unreachable store without matching on the text of a
+            // message somebody may reword.
+            if e.downcast_ref::<commands::blob::PreconditionNotMet>()
+                .is_some()
+            {
+                ExitCode::from(commands::blob::PRECONDITION_EXIT_CODE)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -1028,11 +1118,52 @@ async fn run(cli: Cli) -> Result<()> {
         },
 
         Commands::Blob { action } => match action {
+            BlobAction::List {
+                target,
+                format,
+                prefix,
+                delimiter,
+                limit,
+                cursor,
+                all,
+            } => {
+                commands::blob::list(
+                    commands::blob::ListArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        prefix,
+                        delimiter,
+                        limit,
+                        cursor,
+                        all,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+            BlobAction::Head {
+                target,
+                format,
+                key,
+            } => {
+                commands::blob::head(
+                    commands::blob::HeadArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        key,
+                    },
+                    format.into(),
+                )
+                .await
+            }
             BlobAction::Get {
                 target,
                 format,
                 key,
                 file,
+                offset,
+                length,
+                suffix,
                 max_size,
             } => {
                 commands::blob::get(
@@ -1041,6 +1172,9 @@ async fn run(cli: Cli) -> Result<()> {
                         environment: target.environment,
                         key,
                         file,
+                        offset,
+                        length,
+                        suffix,
                         max_bytes: max_size,
                     },
                     format.into(),
@@ -1053,6 +1187,8 @@ async fn run(cli: Cli) -> Result<()> {
                 key,
                 file,
                 content_type,
+                if_match,
+                if_none_match,
             } => {
                 commands::blob::put(
                     commands::blob::PutArgs {
@@ -1061,6 +1197,8 @@ async fn run(cli: Cli) -> Result<()> {
                         key,
                         file,
                         content_type,
+                        if_match,
+                        if_none_match,
                     },
                     format.into(),
                 )
@@ -1071,6 +1209,8 @@ async fn run(cli: Cli) -> Result<()> {
                 format,
                 key,
                 yes,
+                if_match,
+                if_none_match,
             } => {
                 commands::blob::delete(
                     commands::blob::DeleteArgs {
@@ -1078,6 +1218,8 @@ async fn run(cli: Cli) -> Result<()> {
                         environment: target.environment,
                         key,
                         yes,
+                        if_match,
+                        if_none_match,
                     },
                     format.into(),
                 )
@@ -1221,14 +1363,55 @@ mod tests {
         }
     }
 
-    /// `BlobStore` has no `List` RPC (see `crates/deis-store/proto/blob.proto`),
-    /// so offering `deis blob list` would be a command that can never work.
+    /// Every verb `BlobStore` answers has to be reachable from the command
+    /// line, or the RPC is delivered to nobody. This is the parse-level half
+    /// of that: `scripts/demo.sh` runs the commands against a live store.
     #[test]
-    fn blob_has_no_list_subcommand() {
-        assert!(
-            Cli::try_parse_from(["deis", "blob", "list"]).is_err(),
-            "deis blob list must not parse: there is no BlobStore.List RPC to call"
-        );
+    fn blob_offers_every_verb_the_store_answers() {
+        for argv in [
+            vec!["deis", "blob", "list"],
+            vec!["deis", "blob", "list", "uploads/", "--delimiter", "/"],
+            vec![
+                "deis", "blob", "list", "--limit", "10", "--cursor", "=k", "--all",
+            ],
+            vec!["deis", "blob", "head", "mykey"],
+            vec![
+                "deis", "blob", "get", "mykey", "--offset", "10", "--length", "20",
+            ],
+            vec!["deis", "blob", "get", "mykey", "--suffix", "64"],
+            vec!["deis", "blob", "put", "mykey", "--if-none-match", "*"],
+            vec!["deis", "blob", "put", "mykey", "--if-match", "abc"],
+            vec!["deis", "blob", "delete", "mykey", "-y", "--if-match", "abc"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "{argv:?} must parse: deis-store answers this and nothing else offers it"
+            );
+        }
+    }
+
+    /// The two conditions are mutually exclusive: a write cannot require both
+    /// that the etag matches and that it does not, and there is no order in
+    /// which checking them both would mean anything.
+    #[test]
+    fn blob_refuses_both_conditions_at_once() {
+        for verb in ["put", "delete"] {
+            assert!(
+                Cli::try_parse_from([
+                    "deis",
+                    "blob",
+                    verb,
+                    "mykey",
+                    "-y",
+                    "--if-match",
+                    "a",
+                    "--if-none-match",
+                    "b",
+                ])
+                .is_err(),
+                "deis blob {verb} must refuse two preconditions at once"
+            );
+        }
     }
 
     /// A KV value comes from exactly one place per call - the CLI must not

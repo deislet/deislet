@@ -138,6 +138,38 @@ pub fn unix_seconds() -> i64 {
     }
 }
 
+/// The smallest string strictly greater than every string starting with
+/// `prefix`, or `None` when no such bound exists (empty prefix, or a prefix
+/// made only of the highest code point).
+///
+/// UTF-8 orders bytewise exactly as its code points order, which is what lets
+/// a plain `key >= prefix AND key < upper` range use the primary key index
+/// instead of scanning every row and testing `LIKE`.
+///
+/// At the crate root because two stores need the identical bound for the
+/// identical reason: [`kv`] pages a tenant's keys under a prefix, and [`blob`]
+/// pages a tenant's objects under one and additionally seeks past a whole
+/// rolled-up folder. Two copies of this would be two chances to disagree about
+/// where a prefix ends, and a listing that disagreed would either skip keys or
+/// return keys the caller did not ask for.
+pub fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bound = prefix.to_string();
+    while let Some(last) = bound.pop() {
+        let mut next = last as u32 + 1;
+        // The surrogate range is not valid in a Rust `char`; step over it.
+        if (0xD800..=0xDFFF).contains(&next) {
+            next = 0xE000;
+        }
+        if let Some(next) = char::from_u32(next) {
+            bound.push(next);
+            return Some(bound);
+        }
+        // `last` was char::MAX: it cannot be incremented, so carry into the
+        // character before it.
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
 

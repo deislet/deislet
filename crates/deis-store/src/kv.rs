@@ -18,7 +18,7 @@ use crate::proto::storage::{
 };
 use crate::sqlite::{PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
-use crate::unix_seconds;
+use crate::{prefix_upper_bound, unix_seconds};
 use rusqlite::OptionalExtension;
 use tonic::{Request, Response, Status};
 
@@ -398,31 +398,6 @@ fn clamp_limit(limit: Option<i32>) -> i32 {
         }
         Some(n) => n,
     }
-}
-
-/// The smallest string strictly greater than every string starting with
-/// `prefix`, or `None` when no such bound exists (empty prefix, or a prefix
-/// made only of the highest code point).
-///
-/// UTF-8 orders bytewise exactly as its code points order, which is what lets
-/// a plain `key >= prefix AND key < upper` range use the primary key index
-/// instead of scanning every row and testing `LIKE`.
-fn prefix_upper_bound(prefix: &str) -> Option<String> {
-    let mut bound = prefix.to_string();
-    while let Some(last) = bound.pop() {
-        let mut next = last as u32 + 1;
-        // The surrogate range is not valid in a Rust `char`; step over it.
-        if (0xD800..=0xDFFF).contains(&next) {
-            next = 0xE000;
-        }
-        if let Some(next) = char::from_u32(next) {
-            bound.push(next);
-            return Some(bound);
-        }
-        // `last` was char::MAX: it cannot be incremented, so carry into the
-        // character before it.
-    }
-    None
 }
 
 #[tonic::async_trait]

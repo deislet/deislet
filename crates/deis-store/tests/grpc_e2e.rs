@@ -678,6 +678,7 @@ async fn blob_put_and_get_stream_in_chunks() {
     let mut messages = vec![PutRequest {
         payload: Some(put_request::Payload::Header(PutHeader {
             key: "video.bin".to_string(),
+            precondition: None,
             content_type: Some("application/octet-stream".to_string()),
         })),
     }];
@@ -704,6 +705,7 @@ async fn blob_put_and_get_stream_in_chunks() {
         .get(as_tenant(
             "app-one.production",
             deis_store::proto::blob::GetRequest {
+                range: None,
                 key: "video.bin".to_string(),
             },
         ))
@@ -740,6 +742,239 @@ async fn blob_put_and_get_stream_in_chunks() {
     assert_eq!(received, body);
 }
 
+/// Everything `BlobStore` grew beside the original three RPCs, over the wire
+/// rather than through the storage type: `Head`, `List` with a delimiter and a
+/// cursor, a ranged `Get` with the trailer that lets the slice be checked, and
+/// a conditional `Put`. Each of those is a message shape two crates have to
+/// agree on, and the agreement is only real if it is exercised on a socket.
+#[tokio::test]
+async fn blob_head_list_range_and_conditional_writes_over_grpc() {
+    use deis_store::proto::blob::{
+        ByteRange, ByteSpan, DeleteRequest as BlobDeleteRequest, HeadRequest,
+        ListRequest as BlobListRequest, Precondition, byte_range, precondition,
+    };
+
+    let harness = Harness::start().await;
+    let mut blob = harness.blob().await;
+    let tenant = "app-one.production";
+
+    let store = |blob: BlobStoreClient<Channel>,
+                 key: &str,
+                 body: &[u8],
+                 condition: Option<Precondition>| {
+        let mut blob = blob;
+        let messages = vec![
+            PutRequest {
+                payload: Some(put_request::Payload::Header(PutHeader {
+                    key: key.to_string(),
+                    content_type: Some("text/plain".to_string()),
+                    precondition: condition,
+                })),
+            },
+            PutRequest {
+                payload: Some(put_request::Payload::Chunk(body.to_vec())),
+            },
+        ];
+        async move {
+            blob.put(as_tenant(tenant, tokio_stream::iter(messages)))
+                .await
+                .unwrap()
+                .into_inner()
+        }
+    };
+
+    for key in ["img/a.png", "img/b.png", "index.html"] {
+        let stored = store(blob.clone(), key, b"0123456789", None).await;
+        assert!(stored.success, "{:?}", stored.error);
+    }
+
+    // Head: the metadata without the body, and an absent key as an answer
+    // rather than a status.
+    let head = blob
+        .head(as_tenant(
+            tenant,
+            HeadRequest {
+                key: "index.html".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .info
+        .expect("the object exists");
+    assert_eq!(head.size, 10);
+    assert_eq!(head.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(head.sha256.len(), 64);
+    assert!(
+        blob.head(as_tenant(
+            tenant,
+            HeadRequest {
+                key: "nothing".to_string()
+            }
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .info
+        .is_none()
+    );
+
+    // List with a delimiter: one folder, one key, and a cursor because the
+    // page was filled exactly.
+    let page = blob
+        .list(as_tenant(
+            tenant,
+            BlobListRequest {
+                prefix: String::new(),
+                limit: Some(2),
+                cursor: None,
+                delimiter: Some("/".to_string()),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.prefixes, vec!["img/".to_string()]);
+    assert_eq!(
+        page.objects.iter().map(|o| &o.key).collect::<Vec<_>>(),
+        vec!["index.html"]
+    );
+    let cursor = page.next_cursor.expect("a full page answers a cursor");
+    let page = blob
+        .list(as_tenant(
+            tenant,
+            BlobListRequest {
+                prefix: String::new(),
+                limit: Some(2),
+                cursor: Some(cursor),
+                delimiter: Some("/".to_string()),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(page.objects.is_empty() && page.prefixes.is_empty());
+    assert!(page.next_cursor.is_none());
+
+    // A ranged Get: the header says which bytes are coming, the chunks carry
+    // them, and a final message with no payload carries the digest of exactly
+    // those bytes.
+    let mut stream = blob
+        .get(as_tenant(
+            tenant,
+            deis_store::proto::blob::GetRequest {
+                key: "index.html".to_string(),
+                range: Some(ByteRange {
+                    spec: Some(byte_range::Spec::Span(ByteSpan {
+                        offset: 2,
+                        length: Some(4),
+                    })),
+                }),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut served = None;
+    let mut body = Vec::new();
+    let mut range_digest = None;
+    let mut total = 0;
+    while let Some(message) = stream.message().await.unwrap() {
+        if let Some(digest) = message.range_sha256 {
+            range_digest = Some(digest);
+        }
+        match message.payload {
+            Some(get_response::Payload::Info(info)) => {
+                total = info.size;
+                served = message.range;
+            }
+            Some(get_response::Payload::Chunk(chunk)) => body.extend_from_slice(&chunk),
+            None => {}
+        }
+    }
+    assert_eq!(body, b"2345");
+    let served = served.expect("a ranged read says which bytes it sent");
+    assert_eq!((served.offset, served.length), (2, 4));
+    assert_eq!(
+        total, 10,
+        "the whole object's size is what a Content-Range's total is built from"
+    );
+    let digest = range_digest.expect("a ranged read carries the digest of its slice");
+    assert_eq!(
+        digest,
+        format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"2345")),
+        "the trailer must hash the bytes that were sent, not the object"
+    );
+
+    // A range naming no byte: its own status code, so an application can tell
+    // it from a missing key and answer 416 rather than 404.
+    let status = blob
+        .get(as_tenant(
+            tenant,
+            deis_store::proto::blob::GetRequest {
+                key: "index.html".to_string(),
+                range: Some(ByteRange {
+                    spec: Some(byte_range::Spec::Span(ByteSpan {
+                        offset: 10,
+                        length: None,
+                    })),
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::OutOfRange);
+
+    // A conditional Put that loses says so in its own field, not in prose.
+    let refused = store(
+        blob.clone(),
+        "index.html",
+        b"overwritten",
+        Some(Precondition {
+            condition: Some(precondition::Condition::IfNoneMatch("*".to_string())),
+        }),
+    )
+    .await;
+    assert!(!refused.success);
+    let failure = refused
+        .precondition_failed
+        .expect("a lost conditional write is a field, not a sentence");
+    assert_eq!(failure.condition, "If-None-Match: *");
+    assert_eq!(failure.etag.as_deref(), Some(head.sha256.as_str()));
+
+    // And one that holds, quoting the etag the way an HTTP header would.
+    let written = store(
+        blob.clone(),
+        "index.html",
+        b"replaced",
+        Some(Precondition {
+            condition: Some(precondition::Condition::IfMatch(format!(
+                "\"{}\"",
+                head.sha256
+            ))),
+        }),
+    )
+    .await;
+    assert!(written.success, "{:?}", written.error);
+
+    // A conditional Delete against the etag that has just been superseded.
+    let refused = blob
+        .delete(as_tenant(
+            tenant,
+            BlobDeleteRequest {
+                key: "index.html".to_string(),
+                precondition: Some(Precondition {
+                    condition: Some(precondition::Condition::IfMatch(head.sha256.clone())),
+                }),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!refused.success);
+    assert!(refused.precondition_failed.is_some());
+}
+
 #[tokio::test]
 async fn blob_delete_and_missing_keys() {
     let harness = Harness::start().await;
@@ -749,6 +984,7 @@ async fn blob_delete_and_missing_keys() {
         .get(as_tenant(
             "app-one.production",
             deis_store::proto::blob::GetRequest {
+                range: None,
                 key: "absent".to_string(),
             },
         ))
@@ -760,6 +996,7 @@ async fn blob_delete_and_missing_keys() {
         PutRequest {
             payload: Some(put_request::Payload::Header(PutHeader {
                 key: "note.txt".to_string(),
+                precondition: None,
                 content_type: Some("text/plain".to_string()),
             })),
         },
@@ -782,6 +1019,7 @@ async fn blob_delete_and_missing_keys() {
         .get(as_tenant(
             "app-two.production",
             deis_store::proto::blob::GetRequest {
+                range: None,
                 key: "note.txt".to_string(),
             },
         ))
@@ -793,6 +1031,7 @@ async fn blob_delete_and_missing_keys() {
         .delete(as_tenant(
             "app-one.production",
             deis_store::proto::blob::DeleteRequest {
+                precondition: None,
                 key: "note.txt".to_string(),
             },
         ))
@@ -806,6 +1045,7 @@ async fn blob_delete_and_missing_keys() {
         .delete(as_tenant(
             "app-one.production",
             deis_store::proto::blob::DeleteRequest {
+                precondition: None,
                 key: "note.txt".to_string(),
             },
         ))
@@ -840,6 +1080,7 @@ async fn an_oversized_object_is_refused_in_the_response() {
     let mut messages = vec![PutRequest {
         payload: Some(put_request::Payload::Header(PutHeader {
             key: "too-big".to_string(),
+            precondition: None,
             content_type: None,
         })),
     }];
@@ -867,6 +1108,7 @@ async fn an_oversized_object_is_refused_in_the_response() {
         .get(as_tenant(
             "app-one.production",
             deis_store::proto::blob::GetRequest {
+                range: None,
                 key: "too-big".to_string(),
             },
         ))
@@ -978,6 +1220,7 @@ async fn two_environments_of_one_application_share_nothing() {
             PutRequest {
                 payload: Some(put_request::Payload::Header(PutHeader {
                     key: "logo".to_string(),
+                    precondition: None,
                     content_type: None,
                 })),
             },
@@ -1001,6 +1244,7 @@ async fn two_environments_of_one_application_share_nothing() {
                 tenant,
                 deis_store::proto::blob::GetRequest {
                     key: "logo".to_string(),
+                    range: None,
                 },
             ))
             .await
@@ -1118,6 +1362,7 @@ async fn every_service_refuses_a_call_that_carries_no_token() {
         .delete(as_tenant(
             &tenant,
             deis_store::proto::blob::DeleteRequest {
+                precondition: None,
                 key: "an-object".to_string(),
             },
         ))
@@ -1134,6 +1379,7 @@ async fn every_service_refuses_a_call_that_carries_no_token() {
         .get(as_tenant(
             &tenant,
             deis_store::proto::blob::GetRequest {
+                range: None,
                 key: "an-object".to_string(),
             },
         ))

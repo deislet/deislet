@@ -23,10 +23,11 @@
 //! # What is and is not implemented
 //!
 //! Every RPC used here already exists on deis-store - see
-//! `crates/deis-store/proto/storage.proto` and `blob.proto`. Notably absent:
-//! `BlobStore` has no `List` RPC, so there is no `deis blob list`. That is
-//! not an oversight in this module; see `crate::commands::blob` for the full
-//! reasoning.
+//! `crates/deis-store/proto/storage.proto` and `blob.proto`. What is not
+//! wrapped is `BlobStore.Get`'s streaming-to-disk case: an object still
+//! arrives in memory and is written out afterwards, bounded by
+//! [`DEFAULT_MAX_BLOB_BYTES`], and a range is how an operator takes a slice of
+//! something bigger.
 
 use std::time::Duration;
 
@@ -201,6 +202,8 @@ pub struct BlobInfo {
 #[derive(Debug, Clone)]
 pub struct BlobValue {
     pub info: BlobInfo,
+    /// Which bytes `data` holds; `None` for a whole-object read.
+    pub range: Option<BlobRangeAnswer>,
     pub data: Vec<u8>,
 }
 
@@ -208,6 +211,98 @@ pub struct BlobValue {
 pub struct BlobPutResult {
     pub sha256: String,
     pub size: u64,
+}
+
+/// Which bytes of an object to read, in the terms RFC 9110 gives HTTP's
+/// `Range` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobRange {
+    /// From `offset` to the end, or `length` bytes of it.
+    Span { offset: u64, length: Option<u64> },
+    /// The last `n` bytes.
+    Suffix(u64),
+}
+
+/// Which bytes a ranged read actually carried, resolved by deis-store against
+/// the object's real size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobRangeAnswer {
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// What a conditional write requires of the object first.
+///
+/// The etag is the object's `sha256`: the same string `deis blob head` prints
+/// and `deis blob put` answers with, which is what makes a compare-and-set
+/// from the command line possible at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobCondition {
+    /// `--if-match`: the etag must be this one, or `*` for any existing
+    /// object.
+    IfMatch(String),
+    /// `--if-none-match`: the etag must not be this one, or `*` for a key
+    /// that must not exist at all.
+    IfNoneMatch(String),
+}
+
+impl BlobCondition {
+    fn into_proto(self) -> blob_proto::Precondition {
+        blob_proto::Precondition {
+            condition: Some(match self {
+                Self::IfMatch(etag) => blob_proto::precondition::Condition::IfMatch(etag),
+                Self::IfNoneMatch(etag) => blob_proto::precondition::Condition::IfNoneMatch(etag),
+            }),
+        }
+    }
+}
+
+/// How a call that carried a precondition ended.
+///
+/// A refusal is a value rather than an error because it is the one outcome a
+/// script answers by reading the object again and retrying; every error this
+/// module returns means the opposite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Conditional<T> {
+    Done(T),
+    Refused {
+        condition: String,
+        /// The etag the object carries now; `None` when it does not exist.
+        etag: Option<String>,
+    },
+}
+
+/// One page of a blob listing.
+#[derive(Debug, Clone, Default)]
+pub struct BlobListPage {
+    pub objects: Vec<BlobListEntry>,
+    /// Folder names rolled up by the delimiter, each ending with it.
+    pub prefixes: Vec<String>,
+    /// `Some` while there is somewhere to resume from; see `ListResponse` in
+    /// `blob.proto`. A short page is not the end signal - the cursor is.
+    pub next_cursor: Option<String>,
+}
+
+/// One object as a listing reports it: everything `head` says, and no body.
+#[derive(Debug, Clone)]
+pub struct BlobListEntry {
+    pub key: String,
+    pub sha256: String,
+    pub size: u64,
+    pub content_type: Option<String>,
+    pub created_at: i64,
+}
+
+impl From<blob_proto::BlobInfo> for BlobListEntry {
+    fn from(info: blob_proto::BlobInfo) -> Self {
+        Self {
+            key: info.key,
+            sha256: info.sha256,
+            size: info.size,
+            content_type: info.content_type,
+            created_at: info.created_at,
+        }
+    }
 }
 
 /// A connection to deis-store, bound to one tenant.
@@ -435,9 +530,22 @@ impl StorageSession {
     /// memory. `Ok(None)` means no such key - `BlobStore.Get` fails that case
     /// with `NOT_FOUND` before sending anything, per `blob.proto`, which is
     /// what is translated into the ordinary answer here.
-    pub async fn blob_get(&self, key: &str, max_bytes: usize) -> Result<Option<BlobValue>> {
+    pub async fn blob_get(
+        &self,
+        key: &str,
+        range: Option<BlobRange>,
+        max_bytes: usize,
+    ) -> Result<Option<BlobValue>> {
         let request = self.identity.stamp(blob_proto::GetRequest {
             key: key.to_string(),
+            range: range.map(|range| blob_proto::ByteRange {
+                spec: Some(match range {
+                    BlobRange::Span { offset, length } => {
+                        blob_proto::byte_range::Spec::Span(blob_proto::ByteSpan { offset, length })
+                    }
+                    BlobRange::Suffix(n) => blob_proto::byte_range::Spec::Suffix(n),
+                }),
+            }),
         });
         let mut stream = match self.blob.clone().get(request).await {
             Ok(response) => response.into_inner(),
@@ -457,16 +565,26 @@ impl StorageSession {
             _ => bail!("deis-store sent a body chunk before the header for blob key {key:?}"),
         };
 
-        if info.size as usize > max_bytes {
+        // The range deis-store resolved, when one was asked for. What is
+        // measured against the ceiling is what will actually be assembled: a
+        // ranged read of a slice of a huge object is exactly how an operator
+        // takes something bigger than this command holds.
+        let served = first.range.map(|r| BlobRangeAnswer {
+            offset: r.offset,
+            length: r.length,
+        });
+        let expected = served.map_or(info.size, |r| r.length);
+
+        if expected as usize > max_bytes {
             bail!(
-                "blob key {key:?} is {} bytes, over the {max_bytes} byte limit this command holds \
-                 in memory. Raise it with --max-size on `deis blob get` once you are sure that is \
-                 what you want to download.",
-                info.size
+                "reading blob key {key:?} would take {expected} bytes, over the {max_bytes} byte \
+                 limit this command holds in memory. Ask for a byte range with --offset / \
+                 --length / --suffix, or raise the limit with --max-size once you are sure that \
+                 is what you want to download."
             );
         }
 
-        let mut data = Vec::with_capacity((info.size as usize).min(MAX_PREALLOC_BYTES));
+        let mut data = Vec::with_capacity((expected as usize).min(MAX_PREALLOC_BYTES));
         while let Some(message) = stream
             .message()
             .await
@@ -476,8 +594,21 @@ impl StorageSession {
                 Some(blob_proto::get_response::Payload::Chunk(chunk)) => {
                     data.extend_from_slice(&chunk)
                 }
-                _ => bail!("deis-store sent a second header for blob key {key:?}"),
+                Some(_) => bail!("deis-store sent a second header for blob key {key:?}"),
+                // The trailer of a ranged read, carrying the digest of the
+                // slice that was streamed; a message with no payload and no
+                // digest is a kind this build does not know and is skipped.
+                None => {}
             }
+        }
+
+        if data.len() as u64 != expected {
+            bail!(
+                "blob key {key:?} arrived as {} bytes, but deis-store said it was sending \
+                 {expected}. The object is not what this command received; do not trust what was \
+                 written out.",
+                data.len()
+            );
         }
 
         Ok(Some(BlobValue {
@@ -487,8 +618,60 @@ impl StorageSession {
                 content_type: info.content_type,
                 created_at: info.created_at,
             },
+            range: served,
             data,
         }))
+    }
+
+    /// What deis-store knows about one object, without moving its body.
+    /// `Ok(None)` means no such key - `BlobStore.Head` answers that as an
+    /// absent `info` rather than a status, per `blob.proto`.
+    pub async fn blob_head(&self, key: &str) -> Result<Option<BlobListEntry>> {
+        let request = self.identity.stamp(blob_proto::HeadRequest {
+            key: key.to_string(),
+        });
+        let response = self
+            .blob
+            .clone()
+            .head(request)
+            .await
+            .map_err(|status| call_failed("reading the metadata of blob key", key, status))?
+            .into_inner();
+        Ok(response.info.map(BlobListEntry::from))
+    }
+
+    /// One page of this tenant's objects. deis-store clamps `limit` to its own
+    /// ceiling, so this is a request rather than a promise; page until
+    /// `next_cursor` is `None`.
+    pub async fn blob_list(
+        &self,
+        prefix: &str,
+        delimiter: Option<String>,
+        limit: Option<i32>,
+        cursor: Option<String>,
+    ) -> Result<BlobListPage> {
+        let request = self.identity.stamp(blob_proto::ListRequest {
+            prefix: prefix.to_string(),
+            limit,
+            cursor,
+            delimiter,
+        });
+        let response = self
+            .blob
+            .clone()
+            .list(request)
+            .await
+            .map_err(|status| call_failed("listing blob keys under prefix", prefix, status))?
+            .into_inner();
+        Ok(BlobListPage {
+            objects: response
+                .objects
+                .into_iter()
+                .map(BlobListEntry::from)
+                .collect(),
+            prefixes: response.prefixes,
+            next_cursor: response.next_cursor,
+        })
     }
 
     /// Store an object, framed into [`STREAM_CHUNK_BYTES`] slices as
@@ -501,11 +684,12 @@ impl StorageSession {
         &self,
         key: &str,
         content_type: Option<String>,
+        condition: Option<BlobCondition>,
         data: Vec<u8>,
-    ) -> Result<BlobPutResult> {
-        let request = self
-            .identity
-            .stamp(put_messages(key.to_string(), content_type, data));
+    ) -> Result<Conditional<BlobPutResult>> {
+        let request =
+            self.identity
+                .stamp(put_messages(key.to_string(), content_type, condition, data));
         let response = self
             .blob
             .clone()
@@ -513,6 +697,12 @@ impl StorageSession {
             .await
             .map_err(|status| call_failed("uploading blob key", key, status))?
             .into_inner();
+        if let Some(failure) = response.precondition_failed {
+            return Ok(Conditional::Refused {
+                condition: failure.condition,
+                etag: failure.etag,
+            });
+        }
         if !response.success {
             bail!(
                 "blob store rejected key {key:?}: {}",
@@ -521,17 +711,22 @@ impl StorageSession {
                     .unwrap_or_else(|| "no reason given".to_string())
             );
         }
-        Ok(BlobPutResult {
+        Ok(Conditional::Done(BlobPutResult {
             sha256: response.sha256,
             size: response.size,
-        })
+        }))
     }
 
     /// Deleting a key that is already absent succeeds - `BlobStore.Delete`'s
     /// own contract, per `blob.proto`.
-    pub async fn blob_delete(&self, key: &str) -> Result<()> {
+    pub async fn blob_delete(
+        &self,
+        key: &str,
+        condition: Option<BlobCondition>,
+    ) -> Result<Conditional<()>> {
         let request = self.identity.stamp(blob_proto::DeleteRequest {
             key: key.to_string(),
+            precondition: condition.map(BlobCondition::into_proto),
         });
         let response = self
             .blob
@@ -540,6 +735,12 @@ impl StorageSession {
             .await
             .map_err(|status| call_failed("deleting blob key", key, status))?
             .into_inner();
+        if let Some(failure) = response.precondition_failed {
+            return Ok(Conditional::Refused {
+                condition: failure.condition,
+                etag: failure.etag,
+            });
+        }
         if !response.success {
             bail!(
                 "blob store failed to delete key {key:?}: {}",
@@ -548,7 +749,7 @@ impl StorageSession {
                     .unwrap_or_else(|| "no reason given".to_string())
             );
         }
-        Ok(())
+        Ok(Conditional::Done(()))
     }
 }
 
@@ -558,12 +759,17 @@ impl StorageSession {
 fn put_messages(
     key: String,
     content_type: Option<String>,
+    condition: Option<BlobCondition>,
     data: Vec<u8>,
 ) -> impl tokio_stream::Stream<Item = blob_proto::PutRequest> + Send + 'static {
     let mut messages = Vec::with_capacity(1 + data.len().div_ceil(STREAM_CHUNK_BYTES));
     messages.push(blob_proto::PutRequest {
         payload: Some(blob_proto::put_request::Payload::Header(
-            blob_proto::PutHeader { key, content_type },
+            blob_proto::PutHeader {
+                key,
+                content_type,
+                precondition: condition.map(BlobCondition::into_proto),
+            },
         )),
     });
     // Cut eagerly rather than lazily as the stream is polled: the whole body

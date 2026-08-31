@@ -726,12 +726,24 @@ mod tests {
             .unwrap();
 
         let blob = BlobService::open(dir.path(), 4, limits()).await.unwrap();
-        blob.store_object(&one, "photo", None, chunks(vec![b"live bytes".to_vec()]))
-            .await
-            .unwrap();
-        blob.store_object(&two, "photo", None, chunks(vec![b"draft bytes".to_vec()]))
-            .await
-            .unwrap();
+        blob.store_object(
+            &one,
+            "photo",
+            None,
+            None,
+            chunks(vec![b"live bytes".to_vec()]),
+        )
+        .await
+        .unwrap();
+        blob.store_object(
+            &two,
+            "photo",
+            None,
+            None,
+            chunks(vec![b"draft bytes".to_vec()]),
+        )
+        .await
+        .unwrap();
         dir
     }
 
@@ -817,7 +829,12 @@ mod tests {
         )
         .unwrap();
         let blob = BlobService::open(source.path(), 4, limits()).await.unwrap();
-        assert!(blob.remove_object(&one, "photo").await.unwrap());
+        assert!(
+            blob.remove_object(&one, "photo", None)
+                .await
+                .unwrap()
+                .unconditional()
+        );
 
         let copied = copy_content_of(source.path(), &snapshot).unwrap();
         assert_eq!(copied.objects, 1, "the surviving object is still copied");
