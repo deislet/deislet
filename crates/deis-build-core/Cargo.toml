@@ -13,5 +13,21 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "1.0"
-rolldown = { path = "/ext/deislet/resource/rolldown/crates/rolldown", features = ["experimental"] }
-rolldown_common = { path = "/ext/deislet/resource/rolldown/crates/rolldown_common" }
+# The bundler, from its own repository at a pinned tag rather than from a
+# checkout beside this one. Until 2026-08-31 these two were `path =
+# "/ext/deislet/resource/rolldown/..."`, an absolute path outside the
+# workspace: the build worked on the one machine that happened to have that
+# directory and failed on a fresh clone, which makes it a release blocker
+# rather than an inconvenience.
+#
+# rolldown is not published to crates.io, so a git dependency is the only
+# form available. Pinned to a tag, not a branch, because the bundler decides
+# what an application's code becomes: a moving dependency would let the same
+# source compile to different output on two days with nothing in this
+# repository having changed.
+#
+# The lock file additionally holds oxc_resolver at 11.16.3. Later versions do
+# not compile against this rolldown, so `cargo update` on that one crate
+# breaks the build; if the pin has to move, move rolldown first.
+rolldown = { git = "https://github.com/rolldown/rolldown", tag = "v1.0.0-rc.1", features = ["experimental"] }
+rolldown_common = { git = "https://github.com/rolldown/rolldown", tag = "v1.0.0-rc.1" }
