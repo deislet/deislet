@@ -21,8 +21,9 @@
 //!    upstream is picked at all) or from the bytes as they stream past. The
 //!    body is not buffered here, so without this the whole over-large upload
 //!    would be carried across the edge-to-node hop before the node refused it.
-//!    An upgraded connection is exempt: its frames are a conversation with no
-//!    total size, not a body a node will buffer.
+//!    A connection that has *completed* an upgrade is exempt: its frames are a
+//!    conversation with no total size, not a body a node will buffer. Asking
+//!    for an upgrade is not enough; `request_body_filter` says why not.
 //! 4. A backend is picked from the shared upstream pool and the request is
 //!    forwarded. `x-deis-app-id` is set to the id deis-proxy decided on and
 //!    `x-deis-environment` to that app's configured environment (defaulting
@@ -565,7 +566,20 @@ impl ProxyHttp for DeisProxy {
         // more than the ceiling -- mid-sentence, for no fault. The same
         // reasoning takes the upstream read timeout off a tunnel in
         // `upstream_peer`.
-        if session.is_upgrade_req() {
+        //
+        // The question is "has this connection been upgraded", not "did the
+        // client ask for one". `is_upgrade_req` reads the request headers and
+        // nothing else, so `Upgrade: websocket` plus `Transfer-Encoding:
+        // chunked` used to exempt an ordinary upload from the ceiling for as
+        // long as the node was willing to answer such a request normally -
+        // the declared-length check in `request_filter` does not catch a
+        // chunked body, because a chunked body declares no length. Pingora
+        // sets `was_upgraded` only once the node has actually answered 101,
+        // and resets the downstream body reader at that same moment, so every
+        // byte that reaches this filter before the handshake completes is a
+        // request body and is counted, and every byte after it is a frame and
+        // is not.
+        if session.was_upgraded() {
             return Ok(());
         }
 

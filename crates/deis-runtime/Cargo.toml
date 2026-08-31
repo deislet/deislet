@@ -79,8 +79,23 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # it on the one version already in the graph.
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 
-# WebSocket client
-tokio-tungstenite = { version = "0.21", features = ["__rustls-tls"] }
+# WebSocket client, with no TLS backend of its own on purpose.
+#
+# `runtime/ws_client_ops.rs` resolves the destination, asks the outbound fetch
+# policy about the address it is about to dial, opens the socket itself and,
+# for `wss://`, wraps it with a rustls session built by `deno_tls` before
+# handing the finished stream to `client_async_with_config`. Turning on
+# `__rustls-tls` here therefore bought no capability and instead pinned a
+# second rustls (0.22) beside the one deno already links, and with it
+# rustls-webpki 0.102 - RUSTSEC-2026-0049/-0098/-0099/-0104. Dropping the
+# feature removes rustls 0.22 and tokio-rustls 0.25 from the tree, but not
+# those four advisories: the deno fork's workspace also pins
+# `rustls-webpki = "0.102"`, which deno_fetch and deno_tls both take, so they
+# stay until the fork moves.
+#
+# 0.24 is the version axum already brings, so this is also the version that
+# keeps exactly one tokio-tungstenite in the workspace.
+tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
 # Base64 encoding

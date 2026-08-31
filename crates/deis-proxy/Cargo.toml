@@ -27,7 +27,27 @@ futures = "0.3"
 # zero-downtime upgrades. The openssl backend is required for per-SNI
 # certificate selection; the rustls backend does not support handshake
 # callbacks in this release.
-pingora = { version = "0.5", features = ["lb", "openssl"] }
+#
+# 0.8.1 is a security floor rather than a preference. 0.5 is vulnerable to
+# RUSTSEC-2026-0033 and RUSTSEC-2026-0034, two request smuggling flaws at
+# CVSS 9.3: on a multi-tenant edge, smuggling means one tenant's request
+# being delivered to another tenant's application. It is also vulnerable to
+# RUSTSEC-2025-0070 (MadeYouReset HTTP/2) and, if response caching is ever
+# switched on, RUSTSEC-2026-0035. Do not drop below 0.8.0. Two behaviours
+# this crate now relies on arrived with those fixes: a connection is only
+# switched into tunnel mode once the node has answered 101, and
+# `Session::was_upgraded()` reports whether that happened - which is what
+# separates a WebSocket from an upload in
+# `proxy::DeisProxy::request_body_filter`.
+#
+# One advisory rides along and no version choice here can clear it:
+# pingora-core pulls prometheus 0.13, which pulls protobuf 2.28
+# (RUSTSEC-2024-0437, uncontrolled recursion while *parsing* a message).
+# Nothing here parses protobuf through that path - prometheus only encodes
+# metrics with it, this process serves no metrics endpoint at all, and the
+# control-plane gRPC is prost. It is unreachable rather than fixed, and it
+# stays in `cargo audit` until pingora drops the dependency.
+pingora = { version = "0.8.1", features = ["lb", "openssl"] }
 
 # Control (deis-control) client.
 deis-wire = { path = "../deis-wire" }
@@ -41,3 +61,6 @@ openssl = "0.10"
 # (src/control/mock.rs).
 tonic = "0.12"
 tokio-stream = { version = "0.1", features = ["net"] }
+# Somewhere for tests/upgrade_framing_test.rs to put the configuration, the
+# database and the log of the proxy process it starts.
+tempfile = "3"

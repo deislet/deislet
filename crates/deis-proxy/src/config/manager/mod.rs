@@ -62,7 +62,20 @@ impl ConfigManager {
     /// and loads certificates.
     pub fn load_system_config(local_config_path: &Path) -> Result<SystemConfig, ConfigError> {
         let local_config = LocalConfig::from_toml(local_config_path.to_path_buf())?;
-        let mut system_config = SystemConfig::baseline() + local_config.get_system_config();
+        let file_layer = local_config.get_system_config();
+        if file_layer.cache.is_some() {
+            // Read from the file layer rather than the merged result, which
+            // always carries the baseline's cache settings. An operator who
+            // wrote the section is told it does nothing; one who did not is
+            // not warned about a default they never chose.
+            warn!(
+                "a [cache] section is configured but this proxy does not cache: no response is \
+                 stored, no cache key is computed and no X-Cache-Status header is sent, so these \
+                 settings have no effect on traffic. Remove the section, or expect every request \
+                 to reach a node"
+            );
+        }
+        let mut system_config = SystemConfig::baseline() + file_layer;
         system_config.resolve_paths(&std::env::current_dir()?);
         // The file was validated on its own; the merge can still combine a
         // local value with a baseline one into something invalid (a port in

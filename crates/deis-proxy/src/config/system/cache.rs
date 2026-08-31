@@ -1,13 +1,25 @@
-//! Cache System is used to cache the response of the upstream server.
-//! It is only available in http GET and HEAD requests.
-//! It will strictly follow the cache policy of the upstream server.
-//! The following headers are added to the response:
-//!   X-Cache-Status    HIT        Cache hit
-//!   X-Cache-Status    MISS       Cache miss
-//!   X-Cache-Status    EXPIRED    Cache expired
-//!   X-Cache-Status    BYPASS     Cache bypassed
+//! Response cache settings, which nothing in the data plane reads yet.
 //!
-//! Attention: "stale-while-revalidate" is supported as a Application-Level Cache-Control directive.
+//! [`crate::proxy::DeisProxy`] does not implement `request_cache_filter`, and
+//! `pingora` is built without its `cache` feature, so no response is stored,
+//! no cache key is computed and no `X-Cache-Status` is emitted. A `[cache]`
+//! section is parsed and validated and then has no effect on traffic;
+//! `ConfigManager::load_system_config` says so in the log when a
+//! configuration file carries one, rather than letting an operator believe
+//! the edge is caching.
+//!
+//! Whoever wires it up inherits RUSTSEC-2026-0035. Pingora up to 0.7 shipped
+//! a default cache key built from the request path alone. On an edge that
+//! routes several tenants by `Host`, by path prefix, and by an explicit app
+//! id header, that key makes one tenant's response answerable to another
+//! tenant's request - the same URI path under two different hosts is one
+//! entry. Pingora 0.8 deleted the default instead of repairing it, so
+//! `cache_key_callback` now has nothing to fall back on and every factor has
+//! to be named on purpose. For this proxy the key has to carry, at minimum,
+//! the scheme, the host and the whole request URI - which is what
+//! [`CacheConfig::default`] below already spells - *and* the app id and
+//! environment the router settled on, because `x-deis-app-id` can send two
+//! applications to the same host and path.
 
 use std::str::FromStr;
 

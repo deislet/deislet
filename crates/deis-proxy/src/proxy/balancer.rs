@@ -16,7 +16,7 @@ use pingora::lb::selection::{
 };
 use pingora::lb::{Backend, Backends, LoadBalancer};
 use pingora::proxy::Session;
-use pingora::services::Service;
+use pingora::services::ServiceWithDependents;
 use pingora::services::background::background_service;
 use tracing::{debug, warn};
 
@@ -95,7 +95,7 @@ impl Balancer {
     /// Build the balancer for the configured strategy. The returned service
     /// runs discovery and health checks and must be registered with the
     /// server.
-    pub fn build(config: Arc<ConfigManager>) -> (Balancer, Box<dyn Service>) {
+    pub fn build(config: Arc<ConfigManager>) -> (Balancer, Box<dyn ServiceWithDependents>) {
         let system = config.get_system_config();
         let discovery = Box::new(ConfigDiscovery {
             config: Arc::clone(&config),
@@ -170,7 +170,7 @@ impl Balancer {
 fn make<S>(
     discovery: Box<dyn ServiceDiscovery + Send + Sync + 'static>,
     system: &SystemConfig,
-) -> (Arc<LoadBalancer<S>>, Box<dyn Service>)
+) -> (Arc<LoadBalancer<S>>, Box<dyn ServiceWithDependents>)
 where
     S: BackendSelection + Send + Sync + 'static,
     S::Iter: BackendIter,
