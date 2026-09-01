@@ -6447,4 +6447,186 @@ export default function handler(context: any): Response {
             Some("truncated")
         );
     }
+
+    // --- what a Content-Encoding on the way out describes ------------------
+    //
+    // The header names how the bytes in the body are encoded, so it is true
+    // only of the bytes actually being written. Two things can make it a lie,
+    // and they need opposite answers: `fetch` decodes a compressed body before
+    // the handler sees it, which leaves the upstream's `Content-Encoding`
+    // describing bytes that no longer exist; and a handler may compress a body
+    // itself, in which case the header is the only thing telling the client
+    // what to do with it.
+
+    /// One request, with the headers the client would receive.
+    async fn answer_of(app: &str, code: &str, spec: IsolateSpec) -> (u16, Vec<(String, String)>) {
+        let mut runtime = AppRuntime::new(
+            app.to_string(),
+            code.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let (status, headers, _body) = rx.await.unwrap().unwrap();
+        (status, headers)
+    }
+
+    fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// A body the handler compressed itself keeps the header that says so.
+    ///
+    /// Every response used to lose `Content-Encoding` on the way out, because
+    /// the header was in the same list as `Content-Length` and
+    /// `Transfer-Encoding` -- framing the node redoes on its own connection.
+    /// It is not framing: the node writes the handler's bytes unchanged, so a
+    /// handler that gzipped its own body had the one header describing those
+    /// bytes removed and the client was handed a gzip frame labelled as
+    /// whatever the content type said.
+    #[tokio::test]
+    async fn a_body_the_handler_compressed_keeps_the_header_that_says_so() {
+        let (status, headers) = answer_of(
+            "content-encoding-own.production",
+            r#"
+                export default async function handler() {
+                    // Three bytes that are not text: the point is the header
+                    // that tells the client how to read them.
+                    return new Response(new Uint8Array([0x1f, 0x8b, 0x08]), {
+                        headers: {
+                            "content-encoding": "gzip",
+                            "content-type": "application/octet-stream",
+                        },
+                    });
+                }
+            "#,
+            IsolateSpec::default(),
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert_eq!(
+            header_of(&headers, "content-encoding"),
+            Some("gzip"),
+            "the handler compressed the body itself and the client was not told: {headers:?}"
+        );
+        assert_eq!(
+            header_of(&headers, "content-length"),
+            None,
+            "the length is the node's to write, on its own connection"
+        );
+    }
+
+    /// A gzip body on loopback, served with the header that describes it.
+    ///
+    /// Written out as bytes rather than compressed here: the test needs a
+    /// frame `deno_fetch` will decompress, and one fixed frame is enough.
+    const GZIPPED_HELLO: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd, 0xc9, 0xc9,
+        0x57, 0x48, 0x2b, 0xca, 0xcf, 0x55, 0x28, 0x2d, 0x28, 0x2e, 0x29, 0x4a, 0x4d, 0xcc, 0x05,
+        0x00, 0xc2, 0x5d, 0x08, 0x52, 0x13, 0x00, 0x00, 0x00,
+    ];
+
+    async fn a_server_answering_gzip() -> std::net::SocketAddr {
+        use axum::http::header;
+        use axum::routing::get;
+        let router = axum::Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_ENCODING, "gzip"),
+                        (header::CONTENT_TYPE, "text/plain"),
+                    ],
+                    GZIPPED_HELLO,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        addr
+    }
+
+    /// The other half: `fetch` decoded the body, so the header the wire
+    /// carried is not true of what the handler holds -- and must not be true
+    /// of any copy of it either.
+    ///
+    /// Dropped where the decoding happens rather than on the way out of the
+    /// isolate, because a handler copies those headers: `new Response(res.body,
+    /// res)` is how a response is rewritten, and a rule applied only at the
+    /// exit would leave that copy carrying `Content-Encoding: gzip` over bytes
+    /// nothing compressed. The client would then inflate plain text.
+    #[tokio::test]
+    async fn a_body_fetch_decoded_does_not_keep_the_wire_s_content_encoding() {
+        let addr = a_server_answering_gzip().await;
+        let url = format!("http://{addr}/");
+        let policy =
+            crate::runtime::FetchPolicy::new([addr.to_string()], Vec::<String>::new()).unwrap();
+
+        for mode in ["passed-through", "rebuilt", "reported"] {
+            let (status, headers) = answer_of(
+                &format!("content-encoding-fetch-{mode}.production"),
+                r#"
+                    export default async function handler(ctx) {
+                        const upstream = await fetch(ctx.env.PROBE_URL);
+                        if (ctx.env.MODE === "passed-through") return upstream;
+                        if (ctx.env.MODE === "rebuilt") {
+                            return new Response(upstream.body, upstream);
+                        }
+                        return new Response(await upstream.text(), {
+                            headers: {
+                                "x-seen": String(upstream.headers.get("content-encoding")),
+                            },
+                        });
+                    }
+                "#,
+                IsolateSpec {
+                    env: HashMap::from([
+                        ("PROBE_URL".to_string(), url.clone()),
+                        ("MODE".to_string(), mode.to_string()),
+                    ]),
+                    fetch_policy: policy.clone(),
+                    ..IsolateSpec::default()
+                },
+            )
+            .await;
+
+            assert_eq!(status, 200, "mode {mode}");
+            assert_eq!(
+                header_of(&headers, "content-encoding"),
+                None,
+                "mode {mode}: the client was told to inflate a body fetch had already \
+                 inflated: {headers:?}"
+            );
+            if mode == "reported" {
+                assert_eq!(
+                    header_of(&headers, "x-seen"),
+                    Some("null"),
+                    "a handler reading the header off a decoded response must not be told \
+                     the body is still compressed"
+                );
+            }
+        }
+    }
 }

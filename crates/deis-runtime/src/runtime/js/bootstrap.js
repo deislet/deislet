@@ -288,7 +288,22 @@ function nextRequest(current, status, from, to) {
   });
 }
 
-// The response the application is handed, carrying the history of the call.
+// Headers that describe the body as it crossed the wire rather than the body
+// the application is handed.
+//
+// `deno_fetch` asks for `gzip, br` and inflates the answer before any of it
+// reaches JavaScript, and the Fetch specification has it keep the wire's
+// headers anyway. So `response.headers.get("content-encoding")` says gzip over
+// bytes that were inflated, and `content-length` counts the compressed frame
+// rather than what the body now holds.
+const DECODED_BODY_HEADERS = [
+  "content-encoding",
+  "content-length",
+  "transfer-encoding",
+];
+
+// The response the application is handed: the history of the call, and a
+// header list that describes the body it actually carries.
 //
 // `response.url` and `response.redirected` are part of what `fetch` promises,
 // and following redirects here rather than inside `deno_fetch` means nothing
@@ -296,9 +311,40 @@ function nextRequest(current, status, from, to) {
 // URL. Both properties are computed from the same list of URLs -- the last
 // entry is `url`, more than one entry is `redirected` -- so writing the whole
 // chain onto the final response restores both at once.
-function withHistory(hop, urlList) {
+//
+// The three headers above are dropped here, where the decoding happened,
+// rather than anywhere downstream. Every copy of that header list inherits the
+// claim otherwise: the answer the isolate returns, `new Response(res.body,
+// res)` -- which is how a fetched response is rewritten -- and the entry
+// `Cache.put` writes. A client told to inflate bytes nothing compressed gets
+// nothing it can read, and it is told that by a header the application never
+// wrote. Dropping them once, at the source, leaves exactly one meaning for a
+// `Content-Encoding` on the way out of this isolate: a body the application
+// encoded itself, which the node must therefore pass through untouched.
+//
+// deno applies this same rule (`wireHeaderList`) when it re-serialises a
+// response; the only difference here is that it is applied at the point the
+// application receives one, so no copy is made before it takes effect. The
+// cost is the specification's letter on a header no reader in this runtime can
+// act on.
+function asTheApplicationSeesIt(hop, urlList) {
+  const inner = toInnerResponse(hop);
   if (urlList.length > 1) {
-    toInnerResponse(hop).urlList = urlList;
+    inner.urlList = urlList;
+  }
+  if (inner.bodyDecoded) {
+    // Compacted in place rather than replaced: a `Headers` built from this
+    // response would hold the array itself, so swapping the array would leave
+    // the two disagreeing.
+    const list = inner.headerList;
+    let kept = 0;
+    for (let i = 0; i < list.length; i++) {
+      const name = StringPrototypeToLowerCase(list[i][0]);
+      if (!ArrayPrototypeIncludes(DECODED_BODY_HEADERS, name)) {
+        list[kept++] = list[i];
+      }
+    }
+    list.length = kept;
   }
   return hop;
 }
@@ -361,11 +407,11 @@ async function fetch(input, init = undefined) {
     // through this same guard. A status that is not a redirect, and a
     // redirect with no `Location:` to follow, are both simply the answer.
     if (mode === "manual" || !SetPrototypeHas(REDIRECT_STATUSES, inner.status)) {
-      return withHistory(hop, urlList);
+      return asTheApplicationSeesIt(hop, urlList);
     }
     const location = locationOf(inner);
     if (location === null) {
-      return withHistory(hop, urlList);
+      return asTheApplicationSeesIt(hop, urlList);
     }
 
     if (mode === "error") {

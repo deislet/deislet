@@ -13,6 +13,7 @@ use axum::{
     http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
+use deno_core::url::Url;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 
@@ -218,36 +219,46 @@ pub(crate) fn request_url(uri: &Uri, headers: &HeaderMap, key: &AppKey) -> Strin
 
 /// Whether a claimed authority is a host, and only a host.
 ///
-/// Deliberately narrower than the grammar: no userinfo (`@`), because a URL
-/// reader takes everything before it as a user name and the *host* becomes
-/// whatever follows, so `Host: shop.example.com@evil.invalid` would answer
-/// with a URL whose origin is `evil.invalid`. No percent-escapes either --
-/// nothing legitimate needs one in a host, and allowing them would mean this
-/// check and the URL parser inside the isolate had to agree about decoding.
+/// # One parser decides, and it is the one the isolate uses
 ///
-/// What is left is what a real `Host` carries: a registered name, an IPv4
-/// literal, a bracketed IPv6 literal, and an optional `:port`.
+/// This used to answer the question itself: a whitelist of the characters a
+/// registered name, an IPv4 literal, a bracketed IPv6 literal and a port are
+/// spelled with, plus a pass that split those four forms apart. Every version
+/// of that check has had the same shape of hole, because it describes what a
+/// name may *contain* while the URL parser decides what a name *is*. The last
+/// one accepted anything made of letters, digits, `-`, `.` and `_`, which lets
+/// `1.2.3.4.5` through: a URL parser reads a trailing all-digit label as an
+/// IPv4 literal, that is not one, so `new Request(url)` threw inside the
+/// isolate and the client got 500 with this platform's own error text in the
+/// body -- from one header, on a request the proxy had routed correctly.
+/// `999.1.1.1`, `1.2.3.999` and `12345678901` are the same shape.
 ///
-/// # Structure, not a set of characters
+/// So the question is asked of the parser instead. The authority is put where
+/// it will actually be used -- in front of a path, behind this node's scheme --
+/// and parsed with the `url` crate, which is the crate `deno_url` is built on
+/// and therefore the very parser `new URL()` and `new Request()` run inside
+/// the isolate. What it accepts is accepted here by construction, and there is
+/// no second opinion left to drift.
 ///
-/// This used to be a single pass that accepted any string built out of the
-/// characters those four forms are spelled with -- `:`, `[` and `]` among
-/// them, anywhere and any number of times. That admits strings no URL parser
-/// will take: `a:b` has a port that is not a number, `[::1` never closes its
-/// bracket, `a:1:2` has two ports. Each of them was pasted into `request.url`
-/// and `new Request(url)` threw inside the isolate, so the request was
-/// answered 500 with this platform's own error text in the body -- and the
-/// proxy strips the port before it matches a route, so such a request routes
-/// to the right application and only then dies. `Host: a:b` was enough to
-/// make every request to a node fail that way.
+/// # What is asked of the result
 ///
-/// So each of the four forms is recognised as a whole: the host is split from
-/// the port first, the port is a number a URL may carry, and the host is
-/// either a bracketed address the standard library can parse or a name spelled
-/// without any of the three delimiters. The property this check has to have is
-/// that what it accepts, the isolate's URL parser also accepts, and both
-/// halves of that are walked through a real isolate by
-/// `dispatcher::handlers_test`.
+/// Parsing is not enough on its own, because a URL parser is glad to read a
+/// string as something other than a host: `shop.example.com@evil.invalid` is
+/// userinfo and an origin of `evil.invalid`, `shop.example.com/../admin` moves
+/// the path, `a?b` adds a query. Each of those parses. So the parse has to
+/// come back as a *bare* authority: a host, an optional port, no credentials,
+/// and a URL whose path is still the `/` this function supplied and whose
+/// query and fragment are still absent.
+///
+/// # And the characters a parser deletes rather than refuses
+///
+/// Tab, carriage return and newline are removed from the input by the WHATWG
+/// parser before it looks at anything, so `Host: exa<tab>mple.com` parses
+/// happily as `example.com` -- and this node pastes the *original* string into
+/// `request.url`, tab and all. For those the parser did not judge the string
+/// that will be used, which is the one thing that would let the two disagree
+/// again, so the graphic-ASCII test below rules them out first. It rules out
+/// space and the C0 controls with them, none of which belongs in a host.
 fn usable_authority(authority: &str) -> bool {
     // A `Host` longer than this is not a name anybody serves; the ceiling is
     // here so the string cannot become a way to make every log line and every
@@ -258,68 +269,22 @@ fn usable_authority(authority: &str) -> bool {
         return false;
     }
 
-    // The brackets are read before anything else: an IPv6 literal is full of
-    // colons itself, so the `:port` of `[::1]:8080` can only be looked for
-    // after the closing bracket. Everything else has no bracket at all, and
-    // its first colon starts its port.
-    let (name, port) = match authority.strip_prefix('[') {
-        Some(rest) => {
-            let Some((inside, after)) = rest.split_once(']') else {
-                // `[::1` -- an address that never closes. A URL parser refuses
-                // it, so it cannot become the authority of `request.url`.
-                return false;
-            };
-            if inside.parse::<std::net::Ipv6Addr>().is_err() {
-                // Anything inside the brackets that is not an address,
-                // including a zone id (`fe80::1%25eth0`) that this check
-                // refuses along with every other percent-escape.
-                return false;
-            }
-            match after {
-                "" => (None, None),
-                _ => match after.strip_prefix(':') {
-                    Some(port) => (None, Some(port)),
-                    // Something after the literal that is not a port, such as
-                    // `[::1]x`.
-                    None => return false,
-                },
-            }
-        }
-        None => match authority.split_once(':') {
-            Some((name, port)) => (Some(name), Some(port)),
-            None => (Some(authority), None),
-        },
-    };
-
-    // A name, when there is one: `[::1]` has already been parsed as an address
-    // and has nothing left to check. Empty is refused here, which is what
-    // makes `:8080` -- a port with no host -- and `a:b:c`, whose "port" is
-    // `b:c`, both fail.
-    if matches!(name, Some(name) if !usable_host_name(name)) {
+    // See the header: only characters the parser will judge, never ones it
+    // silently drops on its way to a verdict.
+    if !authority.bytes().all(|byte| byte.is_ascii_graphic()) {
         return false;
     }
 
-    // A port, when there is one. `u16` is the range a URL may carry: a WHATWG
-    // URL parser refuses `http://a:70000/` as surely as it refuses
-    // `http://a:b/`, and an empty port is refused here rather than accepted as
-    // "the default", so what reaches an isolate is a port or no port at all.
-    match port {
-        Some(port) => port.parse::<u16>().is_ok(),
-        None => true,
-    }
-}
+    let Ok(parsed) = Url::parse(&format!("{NODE_SCHEME}://{authority}/")) else {
+        return false;
+    };
 
-/// A registered name or an IPv4 literal -- what a `Host` carries when it is
-/// not a bracketed IPv6 address.
-///
-/// The three delimiters are absent by construction, so a name that gets here
-/// cannot reopen the question the split above just answered. IPv4 is not
-/// recognised separately because its spelling is already a subset of this one.
-fn usable_host_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    parsed.host().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
 }
 
 /// Unified request handler - routes to applications via the tenant headers.
@@ -648,6 +613,14 @@ pub async fn handle_request(
         Some(body.to_vec())
     };
 
+    // Whether the client offered an upgrade at all.
+    //
+    // Read before the extractor is consumed by the upgrade below, because the
+    // refusal further down has to be able to say which half of an upgrade was
+    // missing: a handler that attached no socket, or a client that never asked
+    // for one.
+    let upgrade_offered = ws.is_some();
+
     // Execute application
     match state
         .app_manager
@@ -681,15 +654,62 @@ pub async fn handle_request(
                                 handle_websocket_bridged(socket, key_clone, ws_id, app_manager)
                             })
                             .into_response();
-                    } else {
-                        tracing::warn!(
-                            app_id = %key.app_id(),
-                            environment = %key.environment(),
-                            "App {} returned status 101 but no X-Runtime-WebSocket-ID header",
-                            key
-                        );
                     }
                 }
+            }
+
+            // A status this node can actually write on this connection.
+            //
+            // Reaching here with 101 means the upgrade did not happen: either
+            // the client asked for none, or the handler attached no socket. A
+            // 101 written anyway is a promise nothing keeps -- hyper writes
+            // `101 Switching Protocols` and then goes on speaking HTTP, so the
+            // client waits for a protocol that is never coming and the request
+            // hangs until something times it out. One line in a handler,
+            // `new Response(null, { status: 101 })`, did that to every client
+            // that reached it.
+            //
+            // The rest of the range is the same defect one step out. `status`
+            // is read off the object the handler returned, and an own property
+            // shadows `Response.prototype.status`, so the number arriving here
+            // is the handler's to choose: 1000 reached `Response::builder`,
+            // which refuses anything outside 100-999, and the result was
+            // unwrapped -- a panic on this node's thread rather than an answer.
+            // 200-599 is what a response may carry, which is also the range the
+            // `Response` constructor enforces on every handler that does not go
+            // out of its way.
+            if !(200..=599).contains(&status) {
+                let reason = if status == 101 && upgrade_offered {
+                    "the handler answered 101 without attaching a WebSocket, so there is no \
+                     socket for this connection to become"
+                } else if status == 101 {
+                    "the handler answered 101 but this request asked for no upgrade, so \
+                     there is nothing for this connection to switch to"
+                } else {
+                    "a response may only carry a status of 200 through 599"
+                };
+                tracing::error!(
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
+                    status,
+                    method = %method,
+                    path = uri.path(),
+                    "App {} answered with status {}, which this node will not write on a \
+                     client's connection: {}. The request is answered 500 instead; writing \
+                     {} would leave the client waiting for an answer that never completes",
+                    key,
+                    status,
+                    reason,
+                    status
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "The application answered with status {status}, which is not an \
+                         answer this node can send: {reason}"
+                    ),
+                )
+                    .into_response();
             }
 
             // Normal HTTP response
@@ -699,7 +719,33 @@ pub async fn handle_request(
                 response = response.header(key, value);
             }
 
-            response.body(http_body(resp_body)).unwrap().into_response()
+            // Built, not unwrapped. The builder holds the first thing it could
+            // not accept -- a status, a header name, a header value -- and
+            // hands it over here; unwrapping made an unusable answer a panic on
+            // the runtime thread, which the client sees as a dropped connection
+            // and the operator sees as a stack trace with no request in it.
+            match response.body(http_body(resp_body)) {
+                Ok(response) => response.into_response(),
+                Err(e) => {
+                    tracing::error!(
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        status,
+                        method = %method,
+                        path = uri.path(),
+                        "App {} answered with a status and headers this node cannot write: \
+                         {}. The request is answered 500 rather than failing the connection",
+                        key,
+                        e
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "The application's answer could not be written as an HTTP response"
+                            .to_string(),
+                    )
+                        .into_response()
+                }
+            }
         }
         Err(e) => {
             tracing::error!(

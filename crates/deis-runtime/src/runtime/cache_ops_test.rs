@@ -743,6 +743,21 @@ mod what_the_cache_refuses_to_store {
     }
 
     async fn ask(runtime: &mut AppRuntime, headers: &[(&str, &str)]) -> String {
+        ask_with(runtime, "GET", headers, None).await
+    }
+
+    /// One request, with the method and body the caller names.
+    ///
+    /// The method is a parameter because the Cache API is defined over GET
+    /// alone, and every test here used to send GET: a `put` keyed by a POST
+    /// was stored and handed to the next GET of the same URL, and nothing in
+    /// this file could see it.
+    async fn ask_with(
+        runtime: &mut AppRuntime,
+        method: &str,
+        headers: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+    ) -> String {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let headers: Vec<(String, String)> = headers
             .iter()
@@ -751,9 +766,9 @@ mod what_the_cache_refuses_to_store {
         runtime
             .execute_fetch(
                 "http://localhost/account".to_string(),
-                "GET".to_string(),
+                method.to_string(),
                 headers,
-                None,
+                body,
                 tx,
             )
             .await
@@ -907,7 +922,7 @@ mod what_the_cache_refuses_to_store {
         );
         let refused = alice["refused"].as_str().unwrap_or_default();
         assert!(
-            refused.contains("carries none of those headers"),
+            refused.contains("carries no value for authorization"),
             "an authenticated page was stored under a key that had dropped the credential \
              it varies on: {alice}"
         );
@@ -1021,5 +1036,330 @@ mod what_the_cache_refuses_to_store {
                 "a response carrying Cache-Control: {directive} was stored anyway"
             );
         }
+    }
+
+    /// A response answering a POST is not stored, and never becomes the answer
+    /// to a later GET of the same URL.
+    ///
+    /// The Cache API is defined over GET: `Cache.put` refuses any other
+    /// method, and `Cache.match` never answers one. Both halves were missing
+    /// here -- the key was the request's URL and nothing else -- so a handler
+    /// that cached the answer to `POST /account` handed that answer to every
+    /// later `GET /account`, whoever sent it. Every test in this file sent
+    /// GET, which is why the whole dimension was invisible.
+    const BY_METHOD: &str = r#"
+        export default async function handler(context) {
+            const request = context.request;
+            if (request.method !== "GET") {
+                let refused = null;
+                try {
+                    await caches.default.put(
+                        request,
+                        new Response("answer-to:" + request.method),
+                    );
+                } catch (e) {
+                    refused = e.message;
+                }
+                const hit = await caches.default.match(request);
+                // The third verb, and the one whose answer is easiest to
+                // mistake: `false` here means "there was nothing under that
+                // key", which is true and is almost never what a handler
+                // invalidating a page after a write meant to hear.
+                const dropped = await caches.default.delete(request);
+                return new Response(JSON.stringify({
+                    refused,
+                    dropped,
+                    ownMatch: hit === undefined ? null : await hit.text(),
+                }));
+            }
+            const hit = await caches.default.match(request);
+            return new Response(JSON.stringify({
+                served: hit === undefined ? null : await hit.text(),
+            }));
+        }
+    "#;
+
+    #[tokio::test]
+    async fn a_post_is_not_cached_and_its_answer_never_reaches_a_get() {
+        let mut runtime = runtime("cache_method_app.production", BY_METHOD).await;
+
+        let posted: serde_json::Value =
+            serde_json::from_str(&ask_with(&mut runtime, "POST", &[], Some(b"x".to_vec())).await)
+                .expect("json");
+        let refused = posted["refused"].as_str().unwrap_or_default();
+        assert!(
+            refused.contains("POST"),
+            "a POST's answer was stored, and the caller was not told: {posted}"
+        );
+        assert_eq!(
+            posted["ownMatch"],
+            serde_json::Value::Null,
+            "a cache keyed by a POST answered that very POST, so something was stored"
+        );
+        assert_eq!(
+            posted["dropped"], false,
+            "a delete keyed by a POST reported that it had removed something"
+        );
+
+        let got: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[]).await).expect("json");
+        assert_eq!(
+            got["served"],
+            serde_json::Value::Null,
+            "a GET was answered with what a POST to the same URL returned"
+        );
+    }
+
+    /// The same rule for the other methods a handler answers, including the
+    /// ones with a body and the one that looks most like a GET.
+    #[tokio::test]
+    async fn no_method_but_get_may_be_cached() {
+        let mut runtime = runtime("cache_method_all.production", BY_METHOD).await;
+        for method in ["PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+            let body = match method {
+                "PUT" | "PATCH" => Some(b"x".to_vec()),
+                _ => None,
+            };
+            let answered: serde_json::Value =
+                serde_json::from_str(&ask_with(&mut runtime, method, &[], body).await)
+                    .expect("json");
+            assert!(
+                answered["refused"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(method),
+                "a {method} was accepted as a cache key: {answered}"
+            );
+        }
+        let got: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[]).await).expect("json");
+        assert_eq!(
+            got["served"],
+            serde_json::Value::Null,
+            "a GET was answered with what another method returned"
+        );
+    }
+
+    /// A key that carries *some* of the headers the response varies on.
+    ///
+    /// The refusal this replaces fired only when the key carried none of them,
+    /// so one extra name in `Vary` walked straight past it: the entry was
+    /// filed under `accept-language=en, authorization=null` -- the variant for
+    /// a caller who sends a language and no credential -- and the next
+    /// anonymous caller sending that language was handed the authenticated
+    /// page. The property is not "carries at least one"; it is that no value
+    /// in the variant may be one this platform inferred from a key that is not
+    /// the request being answered.
+    #[tokio::test]
+    async fn a_key_missing_one_of_several_varying_headers_is_refused() {
+        let code = r#"
+            const KEY = "https://example.invalid/account";
+            const key = () => new Request(KEY, { headers: { "accept-language": "en" } });
+            export default async function handler(context) {
+                const hit = await caches.default.match(key());
+                if (hit) {
+                    return new Response(JSON.stringify({ served: await hit.text() }));
+                }
+                const who = context.request.headers.get("authorization") ?? "nobody";
+                const fresh = new Response("page-for:" + who, {
+                    headers: { vary: "accept-language, authorization" },
+                });
+                let refused = null;
+                try {
+                    await caches.default.put(key(), fresh.clone());
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, served: null }));
+            }
+        "#;
+        let mut runtime = runtime("cache_vary_partial_key.production", code).await;
+
+        let alice: serde_json::Value = serde_json::from_str(
+            &ask(
+                &mut runtime,
+                &[("authorization", "Bearer alice"), ("accept-language", "en")],
+            )
+            .await,
+        )
+        .expect("json");
+        let anonymous: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[("accept-language", "en")]).await)
+                .expect("json");
+
+        assert_eq!(
+            anonymous["served"],
+            serde_json::Value::Null,
+            "an anonymous caller was served the page stored for an authenticated one, because \
+             the key carried one of the two varying headers and the refusal asked for none"
+        );
+        let refused = alice["refused"].as_str().unwrap_or_default();
+        assert!(
+            refused.contains("authorization"),
+            "the refusal has to name the header whose value the key did not carry: {alice}"
+        );
+    }
+
+    /// A response to a request that carried a credential, with no `Vary` and
+    /// no directive allowing a shared cache to reuse it.
+    ///
+    /// RFC 9111 section 3.5: a shared cache must not use such a response to
+    /// satisfy any later request unless the response says it may. Nothing in
+    /// the entry records *who* it was for -- there is no `Vary` to file it
+    /// under -- so every later caller of that URL matched it, credential or
+    /// none. This is the same disclosure the `Vary` rules exist to prevent,
+    /// reached by a handler that simply did not set `Vary`.
+    #[tokio::test]
+    async fn an_authenticated_answer_with_no_vary_is_not_stored_for_everyone() {
+        let code = r#"
+            export default async function handler(context) {
+                const request = context.request;
+                const hit = await caches.default.match(request);
+                if (hit) {
+                    return new Response(JSON.stringify({ served: await hit.text() }));
+                }
+                const who = request.headers.get("authorization") ?? "nobody";
+                const directive = request.headers.get("x-directive");
+                const headers = directive ? { "cache-control": directive } : {};
+                let refused = null;
+                try {
+                    await caches.default.put(request, new Response("page-for:" + who, { headers }));
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, served: null }));
+            }
+        "#;
+        let mut runtime = runtime("cache_authorization_app.production", code).await;
+
+        let alice: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[("authorization", "Bearer alice")]).await)
+                .expect("json");
+        let anonymous: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[]).await).expect("json");
+
+        assert_eq!(
+            anonymous["served"],
+            serde_json::Value::Null,
+            "an anonymous caller was handed the answer to a request that carried a credential"
+        );
+        let refused = alice["refused"].as_str().unwrap_or_default();
+        assert!(
+            refused.contains("Authorization"),
+            "the refusal has to name the credential that made the answer one caller's: {alice}"
+        );
+
+        // And the two ways out the specification gives, both of which have to
+        // keep working: say the answer is everyone's, or record whose it is.
+        let public: serde_json::Value = serde_json::from_str(
+            &ask(
+                &mut runtime,
+                &[
+                    ("authorization", "Bearer alice"),
+                    ("x-directive", "public, max-age=60"),
+                ],
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(
+            public["refused"],
+            serde_json::Value::Null,
+            "a response that says `public` is one a shared cache may keep: {public}"
+        );
+    }
+
+    /// A 206 is one range of a representation, and this cache can neither
+    /// complete it nor match a `Range` against it.
+    ///
+    /// Stored, it was handed whole to the next request for that URL -- a
+    /// request that sent no `Range` at all and had asked for the entire body.
+    /// The client is told "206 Partial Content" for five bytes of a hundred it
+    /// never asked to be given in pieces.
+    #[tokio::test]
+    async fn a_partial_response_is_not_stored_and_never_answers_a_whole_request() {
+        let code = r#"
+            export default async function handler(context) {
+                const hit = await caches.default.match(context.request);
+                if (hit) {
+                    return new Response(JSON.stringify({
+                        servedStatus: hit.status,
+                        servedBody: await hit.text(),
+                    }));
+                }
+                const status = Number(context.request.headers.get("x-status") ?? "206");
+                const range = context.request.headers.get("x-content-range");
+                const headers = range ? { "content-range": range } : {};
+                // A 304 may not carry a body at all, and the constructor says
+                // so before this cache gets a word in.
+                const body = status === 304 ? null : "01234";
+                let refused = null;
+                try {
+                    await caches.default.put(
+                        context.request,
+                        new Response(body, { status, headers }),
+                    );
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, servedStatus: null }));
+            }
+        "#;
+        let mut runtime = runtime("cache_partial_app.production", code).await;
+
+        let stored: serde_json::Value = serde_json::from_str(
+            &ask(
+                &mut runtime,
+                &[("x-content-range", "bytes 0-4/100"), ("x-status", "206")],
+            )
+            .await,
+        )
+        .expect("json");
+        let next: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[]).await).expect("json");
+        assert_eq!(
+            next["servedStatus"],
+            serde_json::Value::Null,
+            "a request that sent no Range was answered 206 with somebody else's five bytes"
+        );
+        assert!(
+            stored["refused"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("206"),
+            "the refusal has to name the status: {stored}"
+        );
+
+        // The sibling: the same partial body wearing a 200. `Content-Range` is
+        // what makes a body a range, and a status can be written by hand.
+        let mislabelled: serde_json::Value = serde_json::from_str(
+            &ask(
+                &mut runtime,
+                &[("x-content-range", "bytes 0-4/100"), ("x-status", "200")],
+            )
+            .await,
+        )
+        .expect("json");
+        assert!(
+            mislabelled["refused"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Content-Range"),
+            "a body that describes itself as one range of a larger one was stored whole: \
+             {mislabelled}"
+        );
+
+        // And a 304, which answers a conditional request and nothing else:
+        // handed to a request that sent no validator it means "you already
+        // have this", to a client that has never seen it.
+        let not_modified: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[("x-status", "304")]).await).expect("json");
+        assert!(
+            not_modified["refused"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("304"),
+            "a 304 was stored as though it were a representation: {not_modified}"
+        );
     }
 }

@@ -1033,7 +1033,21 @@ mod what_the_handler_is_told_about_the_request {
     /// request to the node could be made to fail that way by one header.
     #[tokio::test]
     async fn a_host_no_url_parser_accepts_does_not_turn_into_a_500() {
-        for fabricated in ["a:b", "shop.example.com:80x", "[::1", "a:1:2", "[::1]x"] {
+        for fabricated in [
+            "a:b",
+            "shop.example.com:80x",
+            "[::1",
+            "a:1:2",
+            "[::1]x",
+            // A name built out of nothing but the characters a host is
+            // spelled with, and still not a host: a URL parser reads a
+            // trailing all-digit label as an IPv4 literal, and none of these
+            // is one.
+            "1.2.3.4.5",
+            "999.1.1.1",
+            "1.2.3.999",
+            "12345678901",
+        ] {
             let router = mirror_router("http-request-bad-host").await;
             let answered = answer(
                 router,
@@ -1109,12 +1123,25 @@ mod what_the_handler_is_told_about_the_request {
     /// agree.
     #[tokio::test]
     async fn the_forms_a_real_host_takes_reach_the_handler_intact() {
-        for real in [
-            "shop.example.com",
-            "shop.example.com:8443",
-            "192.0.2.7:8443",
-            "[2001:db8::1]:8080",
-            "internal_host",
+        // The pair is `Host` sent, URL the handler read. They differ only
+        // where the URL parser normalises -- an empty port is the default
+        // port, a host is case-insensitive -- which is the parser agreeing
+        // with itself rather than a value being changed on the way through.
+        for (real, read_back) in [
+            ("shop.example.com", "http://shop.example.com/checkout"),
+            (
+                "shop.example.com:8443",
+                "http://shop.example.com:8443/checkout",
+            ),
+            ("192.0.2.7:8443", "http://192.0.2.7:8443/checkout"),
+            ("[2001:db8::1]:8080", "http://[2001:db8::1]:8080/checkout"),
+            ("internal_host", "http://internal_host/checkout"),
+            // The two the whitelist refused and the parser does not, walked
+            // through a real isolate: the point of the change is that both
+            // sides read them the same way, and this is where that is checked
+            // rather than argued.
+            ("shop.example.com:", "http://shop.example.com/checkout"),
+            ("SHOP.example.com", "http://shop.example.com/checkout"),
         ] {
             let router = mirror_router("http-request-good-host").await;
             let answered = answer(
@@ -1129,8 +1156,7 @@ mod what_the_handler_is_told_about_the_request {
             )
             .await;
             assert_eq!(
-                answered["url"],
-                format!("http://{real}/checkout"),
+                answered["url"], read_back,
                 "a Host of {real:?} is a host, and the handler has to be given it"
             );
         }
@@ -1281,7 +1307,6 @@ mod the_url_a_handler_is_given {
         for fabricated in [
             "a:b",
             "shop.example.com:80x",
-            "shop.example.com:",
             "shop.example.com:70000",
             "a:1:2",
             "[::1",
@@ -1290,6 +1315,20 @@ mod the_url_a_handler_is_given {
             "[]",
             ":8080",
             "]::1[",
+            // The sibling a whitelist of characters cannot see. Each of these
+            // is spelled with digits and dots alone, so every character check
+            // passes; a URL parser reads a trailing all-digit label as an IPv4
+            // literal and refuses each one, and the isolate answered 500 with
+            // this platform's own error text in the body.
+            "1.2.3.4.5",
+            "999.1.1.1",
+            "1.2.3.999",
+            "12345678901",
+            "0.0.0.0.0:8443",
+            // A tab is not deleted by this node and *is* deleted by a URL
+            // parser, so the string pasted into `request.url` would not be the
+            // string the parser judged.
+            "shop.example\tcom",
         ] {
             let headers = host(fabricated);
             assert_eq!(
@@ -1315,6 +1354,16 @@ mod the_url_a_handler_is_given {
             "[::ffff:192.0.2.1]",
             "internal_host",
             "node-7.internal:65535",
+            // Accepted since the URL parser became the one authority on what
+            // a host is, and refused by the whitelist that came before. A
+            // trailing colon is an empty port, which the parser reads as "the
+            // default", and mixed case is a host spelled in capitals; the
+            // isolate parses each of them to the same host this node does, so
+            // there is nothing left for the two to disagree about. Refusing
+            // them would mean writing a second opinion about hosts, which is
+            // the thing that has produced this defect three times.
+            "shop.example.com:",
+            "SHOP.example.com",
         ] {
             assert_eq!(
                 request_url(&"/".parse::<Uri>().unwrap(), &host(real), &key()),
@@ -1340,5 +1389,160 @@ mod the_url_a_handler_is_given {
             ),
             "http://shop.example.com/pay"
         );
+    }
+}
+
+/// What the node is willing to write on the client's connection.
+///
+/// A handler names a status, and the node writes it. Two of the numbers it can
+/// name are not answers at all, and neither was checked:
+///
+///   * `101 Switching Protocols` means the connection stops being HTTP and
+///     becomes whatever was negotiated. It is only ever true when this node
+///     really did perform the upgrade -- the client asked for one and the
+///     handler attached a socket. Written on any other connection it is a
+///     promise nothing keeps: the client waits for the new protocol and the
+///     request never completes.
+///   * anything outside the range a response may carry. `Response` refuses
+///     those, but `status` is read off the object the handler returns and an
+///     own property shadows the getter, so the number reaching this node is
+///     the handler's to choose.
+mod the_status_the_node_will_write {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::any;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use crate::app::types::AppConfig;
+    use crate::app::{AppKey, ApplicationManager};
+    use crate::config::default_max_request_body_bytes;
+    use crate::dispatcher::handlers::handle_request;
+    use crate::dispatcher::AppState;
+    use crate::APP_ID_HEADER;
+
+    async fn node(app_id: &str, code: &str) -> Router {
+        let manager = Arc::new(ApplicationManager::with_threads(Some(1)));
+        manager
+            .load_app(
+                AppKey::production(app_id),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the app loads");
+
+        Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(manager, default_max_request_body_bytes()))
+    }
+
+    async fn answer(router: Router, app_id: &str) -> (StatusCode, String) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .header("host", "shop.example.com")
+                    .header(APP_ID_HEADER, app_id)
+                    .body(Body::empty())
+                    .expect("buildable"),
+            )
+            .await
+            .expect("the node answers");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// A 101 from a handler that attached no socket, on a request that asked
+    /// for no upgrade.
+    ///
+    /// The node wrote `HTTP/1.1 101 Switching Protocols` and then went on
+    /// serving HTTP, so the client sat waiting for a protocol that was never
+    /// coming: one line in a handler hangs every client that reaches it, and
+    /// nothing in the node's own logs said the answer was impossible.
+    #[tokio::test]
+    async fn a_bare_101_is_not_written_to_a_connection_nothing_upgraded() {
+        let router = node(
+            "status-bare-101",
+            r#"
+                export default async function handler() {
+                    return new Response(null, { status: 101 });
+                }
+            "#,
+        )
+        .await;
+        let (status, body) = answer(router, "status-bare-101").await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the client was told the connection had switched protocols and then left waiting"
+        );
+        assert!(
+            body.contains("101"),
+            "the answer has to name the status the handler asked for: {body}"
+        );
+    }
+
+    /// The sibling: a number no response may carry at all.
+    ///
+    /// `status` is read off the object the handler returns, and an own
+    /// property shadows `Response.prototype.status`, so the handler chooses
+    /// the number. The node built its answer with it and unwrapped the result,
+    /// which is a panic on the runtime thread rather than an answer.
+    #[tokio::test]
+    async fn a_status_outside_the_range_a_response_may_carry_is_refused() {
+        for status in ["1000", "99", "600"] {
+            let router = node(
+                "status-out-of-range",
+                &format!(
+                    r#"
+                        export default async function handler() {{
+                            const answer = new Response("body");
+                            Object.defineProperty(answer, "status", {{ value: {status} }});
+                            return answer;
+                        }}
+                    "#
+                ),
+            )
+            .await;
+            let (seen, body) = answer(router, "status-out-of-range").await;
+            assert_eq!(
+                seen,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a handler answering {status} was not refused: {body}"
+            );
+        }
+    }
+
+    /// And the answers that are ordinary have to stay ordinary.
+    #[tokio::test]
+    async fn every_status_a_response_may_carry_still_reaches_the_client() {
+        for status in ["200", "204", "301", "404", "418", "503", "599"] {
+            let router = node(
+                "status-ordinary",
+                &format!(
+                    r#"
+                        export default async function handler() {{
+                            return new Response({body}, {{ status: {status} }});
+                        }}
+                    "#,
+                    body = if status == "204" { "null" } else { "\"body\"" }
+                ),
+            )
+            .await;
+            let (seen, body) = answer(router, "status-ordinary").await;
+            assert_eq!(
+                seen.as_u16(),
+                status.parse::<u16>().unwrap(),
+                "an ordinary answer of {status} was changed on the way out: {body}"
+            );
+        }
     }
 }

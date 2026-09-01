@@ -61,17 +61,95 @@
 //! served, so it is refused rather than kept for the default lifetime -- which
 //! is what used to happen to every `no-cache` and `max-age=0` response.
 //!
-//! # One variant per key
+//! # The contract
+//!
+//! Three questions, and this is the whole of the answer to each. They are
+//! enforced in one place -- `Cache.put` and `Cache.match` in `js/runtime.js`,
+//! which read the predicates written directly above them -- rather than one
+//! rule per axis somebody happened to look at. Every refusal below names
+//! itself and names the fix, because a `put` that quietly does nothing leaves
+//! the application believing it has a cache.
+//!
+//! ## 1. What an entry is an answer to
+//!
+//! One GET, and nothing else. The Cache API's key is a `Request`, and a
+//! `Request` carries a method: an entry is the answer to *that request*, not
+//! to its URL. The answer to `POST /orders` is the result of an action rather
+//! than a representation of anything, so a `put` keyed by any other method is
+//! refused, and a `match` or a `delete` for one finds nothing. A key given as
+//! a string or a `URL` is the spelling for `new Request(url)`, which is a GET.
+//!
+//! This was missing outright: the store was keyed by the URL alone, so a
+//! handler that cached the answer to a POST handed that answer to every later
+//! GET of the same address, whoever sent it.
+//!
+//! ## 2. What may be stored
+//!
+//! A response that is a whole answer to that GET, that a shared cache is
+//! allowed to keep, and whose variant this platform can vouch for.
+//!
+//! * **A whole answer.** A status of 200-599 -- 101 and the rest of the 1xx
+//!   range are not answers, and a stored 101 would come back out of `match` as
+//!   an upgrade nothing can perform. Not `206 Partial Content` and nothing
+//!   carrying `Content-Range`: those are one range of a body, and there is
+//!   nothing here that can join ranges or match a `Range` header against a
+//!   stored one, so such an entry could only be handed whole to a caller who
+//!   asked for the whole body. Not `304 Not Modified`: it answers a
+//!   conditional request by saying the caller already has the body, and this
+//!   cache has no validator to check.
+//! * **Not one the response itself excludes**: `no-store`, `private`,
+//!   `no-cache`, and a shared lifetime of zero. See the section below on
+//!   freshness for why each of those means what it means to a cache that
+//!   cannot revalidate.
+//! * **Not one whose reader this store cannot tell from another.** The three
+//!   rules for that are question 3.
+//! * **Not one so large that admitting it would empty the store**; see
+//!   [`CacheScope::max_entry_bytes`].
+//!
+//! ## 3. Who may be handed it back
+//!
+//! A later GET of the same key whose values, for every header the entry
+//! varies on, are the values the entry was stored for. Everything else is a
+//! miss, and a miss is a refetch, which is the whole point.
 //!
 //! A response that carries `Vary` says its body depends on named headers of
-//! the request. The values those names had are stored *with* the entry, and
-//! `match` hands the entry back only to a request whose values are the same;
-//! anything else is a miss. So the store holds one variant per key -- a second
-//! `put` replaces the first -- which costs a hit and never costs the wrong
-//! answer. `Vary: *`, and a varying response whose key was a bare URL rather
-//! than a `Request`, are refused at `put`: neither can be told apart from
-//! another caller's copy, and serving one user's page to the next is the
-//! failure this whole arrangement exists to prevent.
+//! the request. The values those names had are stored *with* the entry, so the
+//! store holds one variant per key -- a second `put` replaces the first --
+//! which costs a hit and never costs a wrong answer.
+//!
+//! The property that makes a hit safe is that **the variant an entry is filed
+//! under was stated by somebody, never inferred by this platform**. Three
+//! refusals at `put` are that one property, applied to the three ways a
+//! variant can come out unstated:
+//!
+//! * `Vary: *` says no later request may reuse this response at all.
+//! * A varying response whose key is a bare URL or a string carries no headers
+//!   to read the values off, so the entry would be handed to whoever asked for
+//!   that string next.
+//! * A varying response whose key is a `Request` that carries no value for one
+//!   of those names, and is not the request this invocation is answering. A
+//!   value the key carries is at least the caller's own statement about what
+//!   the response is for; a missing one is this platform inventing "the caller
+//!   sent none of that header", which is precisely the variant every anonymous
+//!   caller matches. The exception is the request being answered, where
+//!   "carries none of them" is not a claim but the truth -- an anonymous
+//!   caller caching its own anonymous page stays ordinary.
+//!
+//! The third refusal used to ask whether the key carried *any* of the varying
+//! headers, and one extra name in `Vary` walked past it: a key carrying
+//! `Accept-Language` and no `Authorization` counted as carrying some, was
+//! filed as the "sent no Authorization" variant, and the authenticated page
+//! went out to the next anonymous caller sending that language. The question
+//! is per name.
+//!
+//! And the same disclosure reached without `Vary` at all: a key carrying
+//! `Authorization` against a response that records nothing about whose answer
+//! it is. RFC 9111 section 3.5 forbids a shared cache to reuse such a
+//! response unless the response says it may, and this is such a cache. The
+//! three ways to say it may are `Vary: Authorization` (file the entry under
+//! the credential), `public`, and `s-maxage`. `must-revalidate`, the fourth
+//! the RFC lists, is not accepted here: it permits storing on the promise that
+//! the entry is revalidated before reuse, and nothing here can revalidate.
 //!
 //! # Why a body is bytes and the rest is a string
 //!

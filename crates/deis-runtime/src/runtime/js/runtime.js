@@ -89,6 +89,7 @@ const ObjectFreeze = Object.freeze;
 const NativeWeakSet = WeakSet;
 const NativeMap = Map;
 const NativeSet = Set;
+const NumberIsInteger = Number.isInteger;
 const hasOwn = typeof Object.hasOwn === "function"
   ? Object.hasOwn
   : (target, key) => Object.prototype.hasOwnProperty.call(target, key);
@@ -702,6 +703,38 @@ function cacheKeyOf(request) {
   );
 }
 
+// One named header of a request or a response: its value, or null when the
+// header is absent and equally when there is nothing to read a header off at
+// all.
+//
+// Written once because four things below ask this question -- the directives,
+// the `Vary` list, the range rule and the credential rule -- and a fourth copy
+// of `headers && typeof headers.get === "function"` is a fourth chance for one
+// of them to answer differently about an object that is not what it looks
+// like.
+function headerValue(source, name) {
+  const headers = readableHeaders(source);
+  return headers === null ? null : headers.get(name);
+}
+
+// The method a cache key names.
+//
+// The Cache API's key is a `Request`, and a `Request` carries a method: an
+// entry is the answer to *that request*, not to its URL. A key given as a
+// string or a `URL` is the spelling for `new Request(url)`, which is a GET, so
+// those answer GET -- as does anything with no readable method, which makes no
+// claim to the contrary.
+//
+// This is the question the whole store used to be missing. It was keyed by the
+// URL alone, so the answer to `POST /orders` -- the result of an action, not a
+// representation of anything -- was stored and then handed to every later
+// `GET /orders`, whoever sent it.
+function cacheKeyMethod(request) {
+  if (typeof request === "string") return "GET";
+  const method = request && request.method;
+  return typeof method === "string" ? method.toUpperCase() : "GET";
+}
+
 // One `Cache-Control` field, taken apart into the directives it carries.
 //
 // Written once and read by everything below, because the field decides two
@@ -717,10 +750,7 @@ function cacheKeyOf(request) {
 // Map, which every reader below treats as "the response said nothing".
 function cacheControlOf(response) {
   const directives = new NativeMap();
-  const headers = response && response.headers;
-  const raw = headers && typeof headers.get === "function"
-    ? headers.get("cache-control")
-    : null;
+  const raw = headerValue(response, "cache-control");
   if (typeof raw !== "string") return directives;
 
   let name = "";
@@ -852,8 +882,7 @@ function refusesToBeStored(directives) {
 // names were written in means nothing, and two entries that differ only by it
 // would otherwise never match each other.
 function varyNames(response) {
-  const headers = response && response.headers;
-  const raw = headers && typeof headers.get === "function" ? headers.get("vary") : null;
+  const raw = headerValue(response, "vary");
   if (typeof raw !== "string" || raw === "") return [];
   const names = [];
   for (const part of raw.split(",")) {
@@ -879,7 +908,9 @@ function varySelector(names, request) {
 
 // The headers of a cache key that is a `Request`, or null for one that is a
 // URL or a string -- both of which the Cache API accepts and neither of which
-// carries any.
+// carries any. Also the way every rule below reads a header off a *response*,
+// through `headerValue`: the question and its one wrong answer are the same
+// on both sides.
 function readableHeaders(request) {
   const headers = request && request.headers;
   return headers && typeof headers.get === "function" ? headers : null;
@@ -896,16 +927,121 @@ function readableHeaders(request) {
 // `Cache.put`.
 let servedRequest = null;
 
-// Whether a key carries a value for any of the headers a response varies on.
+// The headers a response varies on whose value the key does not carry.
 //
-// `[["authorization", null]]` means it carries none of them, which is a
-// perfectly good *variant* -- the one an anonymous caller asks for -- and a
-// perfectly bad *claim* when the key is not the request the response answers.
-function carriesNoVaryingHeader(selector) {
-  for (const [, value] of selector) {
-    if (value !== null) return false;
+// A variant is the list of values the response's `Vary` names had *on the
+// request that produced it*. When the key is that request, every value in the
+// selector is a fact. When it is anything else, a value the key carries is at
+// least the caller's own claim about what this response is for -- but a value
+// the key does *not* carry is nobody's claim at all: it is this platform
+// inferring "the caller sent none of this header" from a key that simply has
+// no headers, and filing the entry under the variant every anonymous caller
+// matches.
+//
+// So the question is not "does the key carry any of them", which is what this
+// used to ask. One extra name in `Vary` walked straight past that: a key
+// carrying `Accept-Language` and no `Authorization` counted as carrying some,
+// was filed as `accept-language=en, authorization=null`, and the next
+// anonymous caller sending that language was handed the authenticated page.
+// The question is which values are missing, and the answer has to be none.
+function varyNamesTheKeyDoesNotCarry(selector) {
+  const missing = [];
+  for (const [name, value] of selector) {
+    if (value === null) missing.push(name);
   }
-  return true;
+  return missing;
+}
+
+// Why this response is not a whole answer that a later request could be given,
+// or null when it is.
+//
+// An entry here is served whole, on its own, to a request that asked for
+// nothing in particular. Three kinds of response cannot survive that, and each
+// of them is an answer to a question the request that gets the entry never
+// asked:
+//
+//   * `206 Partial Content` is one range of a body. This cache cannot join
+//     ranges and cannot match a `Range` header against a stored one, so the
+//     entry could only ever be handed whole to a caller who asked for the
+//     whole body -- and told it is partial.
+//   * a `Content-Range` says the same thing about the body regardless of the
+//     status, and a status is written by hand often enough that the header is
+//     the reliable half.
+//   * `304 Not Modified` answers a conditional request, and means "the copy
+//     you have is still good". Handed to a caller who has no copy it is a
+//     dead end, and this cache has no validator to check and no upstream to
+//     ask.
+//
+// A status outside 200-599 is not a response at all. `Response` refuses those,
+// but `status` is read off the object, an own property shadows the getter, and
+// a 101 built for a WebSocket upgrade is exactly such an object: stored, it
+// would come back out of `match` as a bare 101 and hang whichever client was
+// given it.
+function notACompleteAnswer(response) {
+  const status = response && response.status;
+  if (!NumberIsInteger(status) || status < 200 || status > 599) {
+    return "a status of " + String(status) + ", which is not one a stored " +
+      "answer may carry: a cache entry has to be a complete response, and " +
+      "200 through 599 is what a response may be";
+  }
+  if (status === 206) {
+    return "206 Partial Content, which is one range of a body. This cache " +
+      "cannot complete a range or match a Range header against one, so the " +
+      "entry could only be handed whole to a caller who asked for the whole " +
+      "body";
+  }
+  if (headerValue(response, "content-range") !== null) {
+    return "a Content-Range, which says its body is one range of a larger " +
+      "one. This cache stores whole answers, and a later request would be " +
+      "given those bytes as though they were all of them";
+  }
+  if (status === 304) {
+    return "304 Not Modified, which answers a conditional request by saying " +
+      "the caller already has the body. This cache has no validator to check " +
+      "and nothing to revalidate against, so no request it could be handed to " +
+      "would be able to use it";
+  }
+  return null;
+}
+
+// Why an entry for this key would be one caller's answer sitting in a store
+// every caller reads, or null when it would not.
+//
+// RFC 9111 section 3.5: a shared cache must not use a response to a request
+// that carried `Authorization` to satisfy any later request unless the
+// response says it may. This store is exactly that kind of cache -- one per
+// isolate, read by every later request to this application, from every client
+// -- and the entry records nothing about who it was for unless the response
+// asked it to.
+//
+// This is the same disclosure the `Vary` rules exist to prevent, reached by a
+// handler that simply did not write `Vary`: `cache.put(context.request,
+// answer)` inside a route that reads a bearer token stored the authenticated
+// page under the bare URL, and the next anonymous GET matched it.
+//
+// Three things make it safe again, and every one of them is the *response*
+// saying something rather than this platform guessing:
+//
+//   * `Vary: authorization`, which files the entry under the credential, so
+//     only a caller presenting the same one matches it;
+//   * `public`, the directive whose whole meaning is "this answer is not one
+//     caller's";
+//   * `s-maxage`, which the RFC lists beside `public` because naming a shared
+//     lifetime is naming a shared cache.
+//
+// `must-revalidate`, the fourth on the RFC's list, is deliberately absent: it
+// allows storing on the promise that the entry is revalidated before reuse,
+// and there is nothing here that can revalidate anything.
+function aCredentialTheEntryDoesNotRecord(request, vary, directives) {
+  if (headerValue(request, "authorization") === null) return null;
+  if (vary.indexOf("authorization") !== -1) return null;
+  if (directives.has("public")) return null;
+  if (wholeSeconds(directives.get("s-maxage")) !== null) return null;
+  return "the key carries an Authorization header and the response records " +
+    "nothing about whose answer it is. A cache every later request reads may " +
+    "not hold it: the next caller of this URL would be given this caller's " +
+    "page. Add Vary: Authorization to file it under the credential, or " +
+    "Cache-Control: public (or s-maxage) to say the answer is everyone's";
 }
 
 // Whether a stored entry is the variant this request is asking for.
@@ -944,6 +1080,32 @@ class Cache {
   async put(request, response) {
     const key = cacheKeyOf(request);
 
+    // Question one: what is this an answer *to*. A cache entry is the answer
+    // to the request its key names, and a `Request` names a method. The answer
+    // to a POST is the result of an action rather than a representation of
+    // anything, and it was stored under the URL alone and then handed to every
+    // later GET of it.
+    const method = cacheKeyMethod(request);
+    if (method !== "GET") {
+      throw new TypeError(
+        "cache.put: the key given for " + key + " is a request whose method " +
+          "is " + method + ", and this cache holds answers to GET requests " +
+          "only -- a later GET of the same URL would otherwise be given this " +
+          "response. Key the entry with the GET it answers, or do not cache " +
+          "it. It was not stored"
+      );
+    }
+
+    // Question two, first half: is this a whole answer that a GET could be
+    // given. A range, a "you already have this", or a status no response may
+    // carry is not one; see `notACompleteAnswer`.
+    const incomplete = notACompleteAnswer(response);
+    if (incomplete) {
+      throw new TypeError(
+        "cache.put: this response carries " + incomplete + ". It was not stored"
+      );
+    }
+
     // A response that declares itself unusable by a cache like this one is not
     // stored, and the caller is told rather than left to believe it was.
     // Silently keeping a `private` or `no-cache` response in a store every
@@ -969,7 +1131,8 @@ class Cache {
       );
     }
     // What variant this entry would be filed under, which is the question the
-    // two refusals below are both about.
+    // two refusals below are both about: not what the key is, but what it is
+    // able to say about who this response is for.
     const selector = vary.length > 0 ? varySelector(vary, request) : [];
     if (vary.length > 0 && !readableHeaders(request)) {
       // The key was a URL or a string, so there is nothing to read the varying
@@ -986,33 +1149,53 @@ class Cache {
           "not stored"
       );
     }
-    if (vary.length > 0 && request !== servedRequest && carriesNoVaryingHeader(selector)) {
-      // A `Request` that carries none of them is the same emptiness as a bare
-      // URL wearing a type that passes the test above. `new Request(url)` --
-      // built from the request being served, to normalise a key, to drop a
-      // query string -- is a `Request` and carries no headers at all, so a
-      // page fetched with somebody's `Authorization` was filed as the "carried
-      // no Authorization" variant and handed to every anonymous caller after.
-      // That is the failure this refusal was written for, reached through the
-      // one shape the old test could not see, because the old test asked what
-      // the key *was* rather than what it *carries*.
+    const unvouched =
+      vary.length > 0 && request !== servedRequest
+        ? varyNamesTheKeyDoesNotCarry(selector)
+        : [];
+    if (unvouched.length > 0) {
+      // The variant this entry would be filed under has to be one somebody
+      // actually stated. A value the key carries is at least the caller's own
+      // statement about what this response is for; a value it does not carry
+      // is this platform inventing "the caller sent none of that header",
+      // which is the variant every anonymous caller matches. `new
+      // Request(url)` -- built from the request being served, to normalise a
+      // key, to drop a query string -- is a `Request` and carries no headers
+      // at all, so a page fetched with somebody's `Authorization` was filed as
+      // the "carried no Authorization" variant and handed to every anonymous
+      // caller after.
       //
-      // The exception is the whole reason the two are not one rule: when the
-      // key is the very request this invocation is answering, "carries none of
-      // them" is not a claim, it is the truth. An anonymous caller storing an
-      // anonymous page under `context.request` is the ordinary case and stays
-      // ordinary. Any other key has to bring the values with it -- which
-      // `cache.put(context.request, ...)` does for free, and which caching an
-      // upstream answer under the request that fetched it does too.
+      // The rule this replaces asked whether the key carried *any* of them,
+      // which one extra name in `Vary` walked straight past: a key carrying
+      // `Accept-Language` and nothing else counted as carrying some, and the
+      // authenticated page went out to the next anonymous caller sending that
+      // language. The property is per name, not per key.
+      //
+      // The exception is why this is not one rule with the refusal above: when
+      // the key is the very request this invocation is answering, "carries
+      // none of them" is not a claim, it is the truth. An anonymous caller
+      // storing an anonymous page under `context.request` is the ordinary case
+      // and stays ordinary. Any other key has to bring the values with it --
+      // which `cache.put(context.request, ...)` does for free, and which
+      // caching an upstream answer under the request that fetched it does too.
       throw new TypeError(
         "cache.put: this response varies on " + vary.join(", ") +
-          ", and the key given for " + key + " carries none of those headers " +
-          "while not being the request this handler is answering. Stored, it " +
-          "would be the variant for a caller who carries none of them, and " +
-          "handed to every such caller afterwards. Pass the Request this " +
-          "handler was given, or a key that carries the same values for those " +
-          "headers. It was not stored"
+          ", and the key given for " + key + " carries no value for " +
+          unvouched.join(", ") + " while not being the request this handler " +
+          "is answering. Stored, it would be filed as the variant for a " +
+          "caller who sends none of those, and handed to every such caller " +
+          "afterwards. Pass the Request this handler was given, or a key that " +
+          "carries the same values for those headers. It was not stored"
       );
+    }
+
+    // Question two, last half: does the entry record whose answer it is. A key
+    // carrying a credential and a response that says nothing about one is the
+    // same disclosure as an invented variant, written by a handler that never
+    // reached for `Vary` at all. See `aCredentialTheEntryDoesNotRecord`.
+    const credential = aCredentialTheEntryDoesNotRecord(request, vary, directives);
+    if (credential) {
+      throw new TypeError("cache.put: " + credential + ". It was not stored");
     }
 
     // Clone first: reading the body of the response the handler is about to
@@ -1061,6 +1244,12 @@ class Cache {
   }
   async match(request) {
     const key = cacheKeyOf(request);
+    // Nothing but the answer to a GET is ever stored, so a key naming another
+    // method has no entry here and a miss is the honest answer: the handler
+    // falls through and answers the request properly, which is what a miss is
+    // for. Without this the store was consulted by URL alone, so a POST was
+    // answered with whatever a GET of that URL had left behind.
+    if (cacheKeyMethod(request) !== "GET") return undefined;
     const hit = await DenoCore.ops.op_cache_get(this.name, key);
     if (!hit) return undefined;
     try {
@@ -1086,7 +1275,26 @@ class Cache {
     }
   }
   async delete(request) {
-    return await DenoCore.ops.op_cache_delete(this.name, cacheKeyOf(request));
+    const key = cacheKeyOf(request);
+    const method = cacheKeyMethod(request);
+    if (method !== "GET") {
+      // Nothing was ever stored under a key that is not a GET, so `false` --
+      // the Cache API's word for "there was nothing to delete" -- is the
+      // truth. It is said out loud because it is almost never what the caller
+      // meant: invalidating a page after a write is written as
+      // `cache.delete(context.request)` inside a POST handler, which deletes
+      // nothing, answers as though the cache were already empty, and leaves
+      // the stale page being served with nothing reporting it.
+      platformConsole.warn(
+        "cache.delete: the key given for " + key + " is a request whose " +
+          "method is " + method + ", and this cache holds answers to GET " +
+          "requests only, so there was nothing under that key to delete and " +
+          "this call did nothing. To invalidate the cached GET, pass its URL " +
+          "or a Request for it"
+      );
+      return false;
+    }
+    return await DenoCore.ops.op_cache_delete(this.name, key);
   }
 }
 
@@ -2862,12 +3070,21 @@ globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
 
 // Response headers that belong to the connection a body arrived on rather
 // than to the body itself. See where this is used, in __deis_runtime_invoke.
-// `content-encoding` is in the list because `fetch` already decoded the body
-// before the handler saw it: telling the client it is still gzip would leave
-// it trying to inflate bytes that are no longer compressed.
+//
+// `content-encoding` is deliberately *not* here. It describes the bytes, not
+// the framing: the node writes the handler's bytes through unchanged, so a
+// handler that gzipped its own body -- or built any other encoded one -- is
+// telling the client the one thing it needs in order to read them, and
+// stripping it handed every such client a compressed frame labelled as plain
+// content. It used to be in this list for a real reason: `fetch` inflates a
+// compressed answer and the Fetch specification has the response keep the
+// wire's header anyway, so `return fetch(upstream)` carried a claim about
+// bytes that no longer existed. That is now settled where the inflation
+// happens (`js/bootstrap.js`, `asTheApplicationSeesIt`), which is the only
+// place that can tell the two apart -- so a `Content-Encoding` still here is
+// one the application wrote about a body it produced.
 const REFRAMED_HEADERS = new Set([
   "connection",
-  "content-encoding",
   "content-length",
   "keep-alive",
   "proxy-authenticate",
