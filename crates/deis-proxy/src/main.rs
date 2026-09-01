@@ -24,8 +24,8 @@ use deis_proxy::config::{ConfigManager, SystemConfig};
 use deis_proxy::control::{ControlService, ProxyControlClient};
 use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic};
 use deis_proxy::restart::{
-    ProcessControl, RelaunchArgs, announce_ready, check_upgrade_socket_path,
-    prove_upgrade_socket_bindable,
+    ProcessControl, RelaunchArgs, announce_ready, check_upgrade_socket_path, executable_path,
+    prove_listeners_bindable, prove_pid_file_writable, prove_upgrade_socket_bindable,
 };
 use deis_proxy::tls::SniCertificates;
 
@@ -178,10 +178,17 @@ fn check_daemon_identity(system: &SystemConfig, upgrade: bool) -> Result<()> {
                 user.name
             );
             if upgrade {
-                // Inherited sockets cover the ports the old process bound;
-                // only ports added since then would fail.
+                // Inherited sockets cover the ports the old process bound, so
+                // this cannot be a refusal - it would refuse every upgrade of
+                // an instance that is serving port 80 perfectly well. A port
+                // added since then really would fail, and that is not left to
+                // this warning: `prove_listeners_bindable` binds it for real
+                // before the readiness byte, so the running process is never
+                // asked to leave for a replacement that cannot take over.
                 warn!(
-                    "{message}; inherited sockets cover existing ports, new ones will fail to bind"
+                    "{message}; inherited sockets cover existing ports, and a port added since \
+                     the running process started is proved bindable before the handover is \
+                     requested rather than after"
                 );
             } else {
                 bail!(message);
@@ -237,6 +244,32 @@ fn announce_acme(system: &SystemConfig, settings: &deis_proxy::config::system::A
     }
 }
 
+/// Everything that has to work before this replacement tells the running
+/// process it may leave.
+///
+/// Split out so the failure has one place to be logged from; see the call
+/// site for why logging it matters as much as returning it.
+fn prove_takeover(system: &SystemConfig, inherited: &[String]) -> Result<()> {
+    prove_upgrade_socket_bindable(system.upgrade_sock())?;
+    // Everything this process has to bind for itself: an address the running
+    // process holds arrives as an inherited descriptor and would answer
+    // EADDRINUSE for a reason that is not a failure, so it is the running
+    // process that says which those are.
+    let to_bind: Vec<String> = system
+        .listen_addresses()
+        .into_iter()
+        .filter(|address| !inherited.contains(address))
+        .collect();
+    info!(
+        inherited = ?inherited,
+        binding = ?to_bind,
+        "proving the listening addresses this replacement has to bind for itself before the \
+         running process is asked to hand over; the inherited ones arrive as descriptors and are \
+         not bound here"
+    );
+    prove_listeners_bindable(&to_bind)
+}
+
 fn main() -> Result<()> {
     let cli = CliConfig::parse().context("parsing command line")?;
     cli.execute()?;
@@ -252,6 +285,14 @@ fn main() -> Result<()> {
         .with_context(|| format!("loading {}", cli.config_file.display()))?;
     init_logging(&system)?;
 
+    // Resolved here and nowhere else: asking for it when the upgrade runs
+    // gets `<path> (deleted)`, because every way of installing a new build
+    // unlinks the running one (see deis_proxy::restart). Nothing between the
+    // start of `main` and this line can have replaced the binary, and it is
+    // below `init_logging` so that what it has to say about a binary already
+    // gone reaches the error log rather than a stderr nobody is reading.
+    let executable = executable_path()?;
+
     let daemon = cli.daemon || system.is_daemon();
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -264,6 +305,18 @@ fn main() -> Result<()> {
     );
     if daemon {
         check_daemon_identity(&system, cli.upgrade)?;
+        // Refused here rather than warned about, because in daemon mode there
+        // is no middle ground: pingora writes the pid file inside
+        // `daemonize()` and panics if it cannot, so an unusable path is a
+        // process that serves nothing at all. Refusing while this is still a
+        // foreground process is the only place the reason can be said.
+        //
+        // This is also what protects the upgrade. A replacement runs these
+        // lines long before its readiness byte, so an operator who edits
+        // `pid_file` into a directory that does not exist gets a failed
+        // upgrade instead of a replacement that takes the listening sockets
+        // over and then panics with the old process already gone.
+        prove_pid_file_writable(system.pid_file())?;
         let error_log_path = system
             .log
             .as_ref()
@@ -279,25 +332,37 @@ fn main() -> Result<()> {
 
     // Checked on every start, upgrade or not, because the only process that
     // ever binds this path is the replacement started for an upgrade: an
-    // unusable path is otherwise invisible until the day somebody upgrades,
-    // and by then the running process has already been told to hand over.
-    // Refused rather than warned about: an instance that cannot be replaced
-    // without an outage is not one an operator should discover mid-upgrade.
-    check_upgrade_socket_path(system.upgrade_sock()).with_context(|| {
-        format!(
-            "upgrade_sock {} cannot be used, so no zero-downtime upgrade of this instance could \
-             succeed",
-            system.upgrade_sock()
-        )
-    })?;
-    info!(
-        upgrade_sock = system.upgrade_sock(),
-        bytes = system.upgrade_sock().len(),
-        limit = deis_proxy::config::system::MAX_UPGRADE_SOCK_PATH_LEN,
-        "the upgrade socket path fits a Unix address and its directory exists and is writable; \
-         the replacement started for an upgrade binds it again and only reports ready once it \
-         has"
-    );
+    // unusable path is otherwise invisible until the day somebody upgrades.
+    //
+    // Warned about rather than refused. It used to be a refusal, on the
+    // grounds that the next upgrade would be an outage - and it no longer is:
+    // the replacement binds this path before it reports itself ready, so a
+    // path that cannot be bound costs a failed upgrade and nothing else. What
+    // the refusal did cost was real, and this repo's own demo hit it: a
+    // deployment directory deep enough to push the path past 107 bytes turned
+    // into a proxy that would not start at all. A proxy that serves and warns
+    // is strictly better than one that serves nothing.
+    match check_upgrade_socket_path(system.upgrade_sock()) {
+        Ok(()) => info!(
+            upgrade_sock = system.upgrade_sock(),
+            bytes = system.upgrade_sock().len(),
+            limit = deis_proxy::config::system::MAX_UPGRADE_SOCK_PATH_LEN,
+            "the upgrade socket path fits a Unix address and its directory exists and is \
+             writable; the replacement started for an upgrade binds it again and only reports \
+             ready once it has"
+        ),
+        Err(e) => warn!(
+            upgrade_sock = system.upgrade_sock(),
+            bytes = system.upgrade_sock().len(),
+            limit = deis_proxy::config::system::MAX_UPGRADE_SOCK_PATH_LEN,
+            error = format!("{e:#}"),
+            "this instance serves normally but cannot be replaced without an outage: no \
+             zero-downtime upgrade of it can succeed, because the replacement cannot bind this \
+             path. `-s reload` and the control plane's restart command will fail and leave this \
+             process running, and stopping it to start a new build is a full outage for as long \
+             as that takes"
+        ),
+    }
 
     // Everything async that must happen before pingora takes over runs on a
     // throwaway runtime, which is shut down before the server daemonizes.
@@ -363,45 +428,12 @@ fn main() -> Result<()> {
     };
     let mut server = Server::new_with_opt_and_conf(opt, server_conf(&system, daemon));
 
-    // When this process was spawned for an upgrade, the byte written below is
-    // what makes the running process SIGQUIT itself, and pingora never
-    // reconsiders that. So the last thing that can fail is proved first: bind
-    // the upgrade socket, here, where a failure is still only this process
-    // exiting and the running one keeps every listener. Skipped when nothing
-    // is waiting on a readiness pipe, because then the SIGQUIT may already
-    // have been sent by hand and unlinking the path would take the socket
-    // away from a handover in progress; see deis_proxy::restart.
-    if let Some(fd) = cli.ready_fd {
-        prove_upgrade_socket_bindable(system.upgrade_sock())?;
-        announce_ready(fd)?;
-    }
-    server.bootstrap();
-
-    // Initial discovery runs after bootstrap so a slow resolver cannot delay
-    // taking over the listening sockets, and is bounded so a stall becomes
-    // latency rather than a failed upgrade. The timeout is created inside
-    // the runtime because its timer needs one.
-    let warm_up = init_runtime
-        .block_on(async { tokio::time::timeout(WARM_UP_TIMEOUT, balancer.warm_up()).await });
-    match warm_up {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            warn!(error = %e, "initial upstream discovery failed; retrying in the background")
-        }
-        Err(_) => warn!(
-            timeout_secs = WARM_UP_TIMEOUT.as_secs(),
-            "initial upstream discovery timed out; retrying in the background"
-        ),
-    }
-    // Dropping the runtime would join the blocking threads that DNS lookups
-    // run on, stalling for the full resolver time; shutting it down in the
-    // background does not. It must be gone before run_forever() forks for
-    // daemon mode.
-    init_runtime.shutdown_background();
-
+    // A handle clone: the balancer this keeps and the one `warm_up` runs
+    // against below are the same pool. Built here, above the readiness
+    // byte, because everything in this stretch can fail.
     let proxy = DeisProxy::new(
         Arc::clone(&config),
-        balancer,
+        balancer.clone(),
         access_log,
         acme_runtime
             .as_ref()
@@ -410,20 +442,21 @@ fn main() -> Result<()> {
     let mut service = http_proxy_service_with_name(&server.configuration, proxy, "deis_proxy");
 
     let tls_ports = system.tls_ports();
-    for addr in system.listen_addrs() {
-        for port in system.listen_ports() {
-            let bind = format!("{addr}:{port}");
-            info!(%bind, "listening for HTTP");
-            service.add_tcp(&bind);
-        }
-        for port in &tls_ports {
-            let bind = format!("{addr}:{port}");
+    // Spelled by `listen_addresses_by_kind` so these are character for
+    // character the strings `prove_listeners_bindable` was given and the
+    // strings pingora keys its inherited descriptors by; a second `format!`
+    // here would be a second chance for the three to disagree.
+    for (bind, terminates_tls) in system.listen_addresses_by_kind() {
+        if terminates_tls {
             let mut tls =
                 TlsSettings::with_callbacks(Box::new(SniCertificates::new(Arc::clone(&config))))
                     .map_err(|e| anyhow::anyhow!("creating TLS settings: {e}"))?;
             tls.enable_h2();
             info!(%bind, "listening for HTTPS");
             service.add_tls_with_settings(&bind, None, tls);
+        } else {
+            info!(%bind, "listening for HTTP");
+            service.add_tcp(&bind);
         }
     }
     if !tls_ports.is_empty() && !config.routes().has_certificates() {
@@ -467,6 +500,10 @@ fn main() -> Result<()> {
                 config_file: cli.config_file.clone(),
                 daemon,
                 working_dir,
+                executable,
+                // What this process is listening on, so the replacement can
+                // tell an address it will be handed from one it has to bind.
+                listeners: system.listen_addresses(),
             },
             commands.clone(),
         ),
@@ -540,6 +577,72 @@ fn main() -> Result<()> {
              fetched and only locally configured applications are routed"
         ),
     }
+
+    // When this process was spawned for an upgrade, the byte written below is
+    // what makes the running process SIGQUIT itself, and pingora never
+    // reconsiders that. So everything that can still fail is proved first,
+    // here, where a failure is only this process exiting and the running one
+    // keeps every listener.
+    //
+    // Two proofs, because pingora binds two kinds of socket after this point
+    // and neither failure can be caught where it happens: the upgrade socket
+    // inside `bootstrap()` a few lines below, and the listening sockets
+    // inside `start_service()`, which is later still and is what an added
+    // `listen_ports` entry goes through. Neither can be moved after the byte,
+    // because `bootstrap()` in upgrade mode blocks until the running process
+    // has been signalled - and it is only signalled because of the byte.
+    //
+    // Skipped when nothing is waiting on a readiness pipe: the SIGQUIT may
+    // then already have been sent by hand, and unlinking the upgrade socket
+    // would take it away from a handover in progress. A start that is not a
+    // replacement needs no proof anyway - it binds everything itself and an
+    // error there is a startup failure nobody is depending on.
+    //
+    // Nothing below `announce_ready` may return `Err`. Everything that
+    // can - the TLS settings, the control client, the certificate store -
+    // is built above it for that reason: an exit after the byte is an exit
+    // after the running process has been told it may leave, which is the
+    // outage this whole handshake exists to prevent.
+    if let Some(fd) = cli.ready_fd {
+        // Logged as well as returned. `main` returning `Err` reaches stderr,
+        // and the process that spawned this one is often a daemon whose
+        // stderr went nowhere - so without this the reason an upgrade failed
+        // would exist only in a stream nobody is reading, while the error log
+        // an operator does read said nothing.
+        if let Err(e) = prove_takeover(&system, &cli.inherited_listeners) {
+            error!(
+                error = format!("{e:#}"),
+                "this replacement cannot take the listeners over, so it is exiting before the \
+                 running process is asked to hand them over. That process keeps every listener \
+                 and goes on serving; nothing has been upgraded"
+            );
+            return Err(e);
+        }
+        announce_ready(fd)?;
+    }
+    server.bootstrap();
+
+    // Initial discovery runs after bootstrap so a slow resolver cannot delay
+    // taking over the listening sockets, and is bounded so a stall becomes
+    // latency rather than a failed upgrade. The timeout is created inside
+    // the runtime because its timer needs one.
+    let warm_up = init_runtime
+        .block_on(async { tokio::time::timeout(WARM_UP_TIMEOUT, balancer.warm_up()).await });
+    match warm_up {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(error = %e, "initial upstream discovery failed; retrying in the background")
+        }
+        Err(_) => warn!(
+            timeout_secs = WARM_UP_TIMEOUT.as_secs(),
+            "initial upstream discovery timed out; retrying in the background"
+        ),
+    }
+    // Dropping the runtime would join the blocking threads that DNS lookups
+    // run on, stalling for the full resolver time; shutting it down in the
+    // background does not. It must be gone before run_forever() forks for
+    // daemon mode.
+    init_runtime.shutdown_background();
 
     server.run_forever()
 }

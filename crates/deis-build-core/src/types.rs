@@ -100,6 +100,24 @@ pub struct HandlerInfo {
     pub imports: Vec<String>,
 }
 
+/// One static file the project ships, as an adapter needs to know it.
+///
+/// Path relative to the assets root, no leading slash and `/` separators - the
+/// same spelling `deis_bundle::Asset::path` uses - plus the media type this
+/// platform serves it as. Not the bytes: copying the files is the compiler's
+/// job, and an adapter only has to decide where its host expects them and what
+/// the host has to be told.
+///
+/// The list reaches every adapter because until 2026-09-02 it reached only one.
+/// Three of the four targets built a deployable directory with the project's
+/// `public/` nowhere in it and said nothing, so a site that served its own CSS
+/// on this platform 404ed on the other three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticAsset {
+    pub path: String,
+    pub content_type: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AdapterArtifacts {
     pub router_code: String,

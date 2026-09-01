@@ -13,26 +13,26 @@ use walkdir::WalkDir;
 pub use transformer::Transformer;
 pub use validator::Validator;
 
-/// Compiler configuration options
+/// What a library caller asks a [`Compiler`] for.
+///
+/// Every field here is read. Two used to not be, and both were removed rather
+/// than wired, because each already had a place an author writes it:
+///
+/// * `source_map` - the project's `build.sourcemap` says this, and the two
+///   disagreed on the default (`false` here, `true` there), so whichever
+///   happened to win would have surprised somebody.
+/// * `strict_validation` - [`Compiler::validate`] takes `strict` as an
+///   argument, and strict validation is not implemented at all.
 #[derive(Debug, Clone)]
 pub struct CompilerOptions {
     /// Project directory path
-    #[allow(dead_code)]
     pub project_dir: String,
-    /// Whether to minify the output
-    #[allow(dead_code)]
+    /// Whether to minify the output, unless the project's `build.minify` says
+    /// not to. Either saying no is a no; see `build_for_vendor`.
     pub minify: bool,
-    /// Whether to generate source maps
-    #[allow(dead_code)]
-    pub source_map: bool,
     /// Target platform (None means build all enabled platforms)
-    #[allow(dead_code)]
     pub target_vendor: Option<String>,
-    /// Whether to enable strict validation
-    #[allow(dead_code)]
-    pub strict_validation: bool,
     /// Output mode (Files/Memory/Both)
-    #[allow(dead_code)]
     pub output_mode: OutputMode,
 }
 
@@ -44,9 +44,7 @@ impl Default for CompilerOptions {
         Self {
             project_dir: ".".to_string(),
             minify: true,
-            source_map: false,
             target_vendor: None,
-            strict_validation: false,
             output_mode: OutputMode::Files,
         }
     }
@@ -82,12 +80,29 @@ impl Compiler {
     }
 
     /// Get a reference to the compiler options
-    #[allow(dead_code)]
     pub fn options(&self) -> &CompilerOptions {
         &self.options
     }
 
+    /// Check every handler under the function root against the specification.
+    ///
+    /// `strict` is refused rather than accepted and dropped. It was threaded
+    /// from `--strict` on two command lines into `Validator::validate`, which
+    /// took it as `_strict` and did nothing with it, so anyone who asked for
+    /// stricter checking got the ordinary checks and a passing report - the
+    /// worst possible answer, because the flag exists to be trusted. There is
+    /// nothing behind it to turn on: the validator raises errors and no
+    /// warnings, so "promote warnings to errors" would change nothing either.
+    /// Saying so is what lets someone stop relying on it.
     pub fn validate(&self, project_dir: &Path, strict: bool) -> anyhow::Result<ValidationResult> {
+        if strict {
+            return Err(anyhow::anyhow!(
+                "strict validation is not implemented: no check in this compiler is gated on it, so \
+                 `--strict` would report exactly what an ordinary run reports. Run without it rather \
+                 than trusting a stricter pass that never happened"
+            ));
+        }
+
         // Load project configuration
         let config = self.load_config(project_dir)?;
 
@@ -119,7 +134,6 @@ impl Compiler {
     ///
     /// This is a convenience method that reads options from the compiler
     /// and calls the underlying compile() method.
-    #[allow(dead_code)]
     pub async fn build(&self) -> anyhow::Result<CompilationResult> {
         let project_dir = Path::new(&self.options.project_dir);
         let vendors = if let Some(ref vendor) = self.options.target_vendor {
@@ -439,9 +453,22 @@ impl Compiler {
         project_dir: &Path,
         vendor: &str,
         config: &ProjectConfig,
-        _minify: bool,
+        minify: bool,
     ) -> anyhow::Result<VendorBuild> {
         use deis_build_core::types::BuildArtifacts;
+
+        // What the author asked for, from the two places they can ask.
+        //
+        // Both settings only ever turn minification *off*: `--no-minify` is a
+        // flag with nothing to say when it is absent, and `build.minify`
+        // defaults to true. So either saying no is a no, and a project with no
+        // `build` block gets the same defaults as one that wrote the block and
+        // left the fields out. Neither of these was read by anything until
+        // 2026-09-02: an author who wrote `"minify": false` got a minified
+        // build, and an author who passed `--no-minify` got one too.
+        let build_settings = config.build.as_ref();
+        let minify = minify && build_settings.map(|b| b.minify).unwrap_or(true);
+        let source_map = build_settings.map(|b| b.sourcemap).unwrap_or(true);
 
         // Validate platform capabilities
         let required_features = self.detect_required_features(config);
@@ -557,11 +584,63 @@ impl Compiler {
             if !handler_path.ends_with(".wasm") {
                 let route = Transformer::filename_to_route(relative_path.to_str().unwrap(), "");
                 // Use relative path for import (from _deis_internal/router.ts to src/...)
-                let import_path = format!("../src/{}", relative_path.to_string_lossy());
+                let import_path = format!(
+                    "{}{}",
+                    deis_build_core::routes::STAGED_HANDLER_PREFIX,
+                    relative_path.to_string_lossy()
+                );
                 // Fix Windows paths for JS import
                 let import_path = import_path.replace("\\", "/");
                 routes.push((route, import_path));
             }
+        }
+
+        // The project's static files, read once for whatever this target does
+        // with them.
+        //
+        // Every adapter is handed the list, because until 2026-09-02 only the
+        // deislet one ever saw it: the other three built a deployable
+        // directory with the project's `public/` nowhere in it and said
+        // nothing, so a site that served its own stylesheet here 404ed on all
+        // three of them.
+        let staged_assets =
+            deis_build_adapter_deislet::collect_assets(&Self::assets_dir(project_dir, config))?;
+
+        // `_redirects` and `_headers` describe the site rather than being part
+        // of it, so they are never served - here as in the bundle, where
+        // publishing an author's routing table at /_redirects is the thing the
+        // rule exists to prevent.
+        let (site_files, served_assets): (Vec<_>, Vec<_>) = staged_assets
+            .iter()
+            .partition(|asset| deis_build_adapter_deislet::is_site_file(&asset.path));
+        let adapter_assets: Vec<StaticAsset> = served_assets
+            .iter()
+            .map(|asset| StaticAsset {
+                path: asset.path.clone(),
+                content_type: asset.content_type.to_string(),
+            })
+            .collect();
+
+        // Every host has its own redirect and header configuration and none of
+        // them reads these two files, so the rules in them are simply not in
+        // force on a vendor target. Saying so beats letting an author believe a
+        // redirect table travelled with the build.
+        if vendor != deis_build_adapter_deislet::VENDOR && !site_files.is_empty() {
+            let names: Vec<&str> = site_files.iter().map(|a| a.path.as_str()).collect();
+            let warning =
+                format!(
+                "{} not carried to the {vendor} target: {} configures this platform's own asset \
+                 server, and {vendor} has its own. The rules in {} are not in force there",
+                if names.len() == 1 {
+                    format!("{} is", names[0])
+                } else {
+                    format!("{} are", names.join(" and "))
+                },
+                if names.len() == 1 { "it" } else { "each of them" },
+                if names.len() == 1 { "it" } else { "them" }
+            );
+            println!("{}", format!("  ⚠ {warning}").yellow());
+            warnings.push(warning);
         }
 
         // Call Adapter to get Artifacts (In Memory).
@@ -572,14 +651,16 @@ impl Compiler {
         // compile here instead of silently losing a target.
         let artifacts = match vendor {
             deis_build_adapter_cloudflare::VENDOR => {
-                deis_build_adapter_cloudflare::generate(&routes, config)?
+                deis_build_adapter_cloudflare::generate(&routes, config, &adapter_assets)?
             }
-            deis_build_adapter_deno::VENDOR => deis_build_adapter_deno::generate(&routes, config)?,
+            deis_build_adapter_deno::VENDOR => {
+                deis_build_adapter_deno::generate(&routes, config, &adapter_assets)?
+            }
             deis_build_adapter_tencent::VENDOR => {
-                deis_build_adapter_tencent::generate(&routes, config)?
+                deis_build_adapter_tencent::generate(&routes, config, &adapter_assets)?
             }
             deis_build_adapter_deislet::VENDOR => {
-                deis_build_adapter_deislet::generate(&routes, config)?
+                deis_build_adapter_deislet::generate(&routes, config, &adapter_assets)?
             }
             _ => return Err(anyhow::anyhow!("Unknown vendor: {vendor}")),
         };
@@ -648,7 +729,9 @@ impl Compiler {
             let router_path = system_dir.join("router.ts");
 
             println!("{}", format!("  ⚡ Bundling for {}...", vendor).dimmed());
-            let mut bundler = BuildBundler::new(router_path.to_str().unwrap(), platform);
+            let mut bundler = BuildBundler::new(router_path.to_str().unwrap(), platform)
+                .minified(minify)
+                .with_source_map(source_map);
 
             // A bundle is content-addressed, so its bytes may not depend on
             // where the build was launched from. Pinning the bundler's working
@@ -747,6 +830,55 @@ impl Compiler {
             }
         }
 
+        // Copy the static files where this target's host serves them from.
+        //
+        // Last, and only when there is an output directory to keep: everything
+        // the build generates has been written by now, so a file that would
+        // land on top of one is a real collision and is refused rather than
+        // silently overwriting the deployable. Memory mode has no directory,
+        // and the files it would carry are the project's own, already on the
+        // caller's disk.
+        if keeps_output && vendor != deis_build_adapter_deislet::VENDOR {
+            let destination = build_dir.join(match vendor {
+                deis_build_adapter_cloudflare::VENDOR => deis_build_adapter_cloudflare::ASSETS_DIR,
+                deis_build_adapter_deno::VENDOR => deis_build_adapter_deno::ASSETS_DIR,
+                deis_build_adapter_tencent::VENDOR => deis_build_adapter_tencent::ASSETS_DIR,
+                _ => "assets",
+            });
+
+            for asset in &served_assets {
+                let path = destination.join(&asset.path);
+                if path.exists() {
+                    return Err(anyhow::anyhow!(
+                        "the static file {} would be written over {}, which this build generated for \
+                         the {vendor} target. Rename the file in the assets directory: overwriting \
+                         it would deploy a target that no longer carries its own entry point or \
+                         configuration",
+                        asset.path,
+                        path.display()
+                    ));
+                }
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, &asset.bytes)?;
+                files.push(path.to_string_lossy().to_string());
+                total_size += asset.bytes.len();
+            }
+
+            if !served_assets.is_empty() {
+                println!(
+                    "{}",
+                    format!(
+                        "  ✓ Carried {} static file(s) into {}",
+                        served_assets.len(),
+                        destination.display()
+                    )
+                    .green()
+                );
+            }
+        }
+
         // Pack the deislet target's real artefact.
         if vendor == "deislet" {
             let bundle = self.emit_bundle(project_dir, &build_dir, config, &entry_code, &routes)?;
@@ -782,6 +914,23 @@ impl Compiler {
             warnings,
             artifacts: build_artifacts,
         })
+    }
+
+    /// Where this project's static files live.
+    ///
+    /// A project with no `assets` key still gets the conventional directory:
+    /// shipping static files should not require configuring anything, and an
+    /// absent directory simply means no assets. One function because every
+    /// target reads the same directory - two spellings of the default would
+    /// mean one target carrying a project's files and another not.
+    fn assets_dir(project_dir: &Path, config: &ProjectConfig) -> std::path::PathBuf {
+        project_dir.join(
+            config
+                .assets
+                .as_ref()
+                .map(|a| a.dir.as_str())
+                .unwrap_or("./public"),
+        )
     }
 
     /// Pack a finished deislet build into the application bundle.
@@ -832,17 +981,8 @@ impl Compiler {
             println!("{}", format!("  ⚠ {warning}").yellow());
         }
 
-        // A project with no `assets` key still gets the conventional
-        // directory: shipping static files should not require configuring
-        // anything, and an absent directory simply means no assets.
-        let assets_dir = project_dir.join(
-            config
-                .assets
-                .as_ref()
-                .map(|a| a.dir.as_str())
-                .unwrap_or("./public"),
-        );
-        let assets = deis_build_adapter_deislet::collect_assets(&assets_dir)?;
+        let assets =
+            deis_build_adapter_deislet::collect_assets(&Self::assets_dir(project_dir, config))?;
 
         let manifest = deis_build_adapter_deislet::build_manifest(config, &plan.routes, &assets)?;
         let bytes = deis_build_adapter_deislet::write_bundle(&manifest, worker_js, &assets)?;
@@ -978,11 +1118,16 @@ mod output_mode_tests {
             "export default function handler() {\n  return new Response(\"handler-body-marker\");\n}\n",
         )
         .expect("write the handler");
+        // The compatibility date is not decoration: the cloudflare target
+        // refuses to build without one, because wrangler refuses to deploy a
+        // Worker without one and this build will not choose a day on an
+        // author's behalf.
         fs::write(
             dir.join(".config.json"),
             format!(
                 r#"{{"version":"1.0","name":"memory-mode","runtime":"standard-v1",
-                    "language":"typescript","vendors":{{"{vendor}":{{"enabled":true}}}}}}"#
+                    "language":"typescript","compatibilityDate":"2026-09-01",
+                    "vendors":{{"{vendor}":{{"enabled":true}}}}}}"#
             ),
         )
         .expect("write the project config");

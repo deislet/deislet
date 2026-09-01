@@ -764,7 +764,7 @@ control_url() {
 # `deis`. The key is required now that `start` turns `api_auth_enabled` on, so
 # a caller that forgets it gets 401 rather than an answer.
 control_api() {
-  curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)$1"
+  curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)$1" || true
 }
 
 # Run the developer CLI the way a developer would.
@@ -1575,13 +1575,28 @@ start_demo() {
   # their ports, and the new control plane would either fail to bind or, worse,
   # the probe would find the old one and every later step would address it.
   # Look for the processes themselves rather than trusting the file.
+  #
+  # The two processes that are not components are looked for by the same rule,
+  # and they are the ones this actually caught. `report_service` calls a
+  # service ready when the port answers and the child it started is still
+  # alive, which is the right pair of questions and still loses a race: an
+  # orphaned origin holding the claimed port answers `/payload.txt` with 200
+  # in under a millisecond, while the child that lost the bind takes a few
+  # more to die. The run then said "✓ Origin is serving", and every later
+  # fetch went to a stranger's process running whatever revision of origin.py
+  # was current when it was started - which is how a run reported the outbound
+  # policy broken on an origin that simply did not have the route yet. The
+  # certificate authority is in the same position and leaked the same way.
+  # Both are refused here rather than raced there.
   local orphans
-  orphans=$(pgrep -f "${BIN_DIR}/deis-(control|runtime|proxy|store|queue|telemetry)" 2>/dev/null || true)
+  orphans=$(pgrep -f \
+    "${BIN_DIR}/deis-(control|runtime|proxy|store|queue|telemetry)|${DEMO_DIR}/origin/origin.py|${BIN_DIR}/examples/acme_test_ca" \
+    2>/dev/null || true)
   if [ -n "$orphans" ]; then
-    echo "⚠️  Components from an earlier run are still running (pids: $(echo "$orphans" | tr '\n' ' '))."
+    echo "⚠️  Processes from an earlier run are still running (pids: $(echo "$orphans" | tr '\n' ' '))."
     echo "    They hold their ports and their data. Stop them first:"
     echo "      ./scripts/demo.sh stop      # if .demo/state.env still exists"
-    echo "      pkill -f '${BIN_DIR}/deis-'  # otherwise"
+    echo "      pkill -f '${BIN_DIR}/deis-'; pkill -f '${DEMO_DIR}/origin/origin.py'  # otherwise"
     exit 1
   fi
 
@@ -2015,14 +2030,78 @@ fail_check() {
   return 0
 }
 
+# ----------------------------------------------------------------------
+# A run that stops has to say so
+# ----------------------------------------------------------------------
+#
+# `set -e` ends this script at the first command that fails outside a
+# condition, and the checks are written on the assumption that a component
+# may be down - so one unguarded command reaching a port with nothing on it
+# used to take the whole run with it and print nothing at all: no line for
+# the check it was in, no summary, and an exit status the reader has to know
+# to look at. A run that stopped in the middle then looks exactly like a run
+# that has not finished yet, which is the worse of the two, because the
+# checks that never ran are indistinguishable from checks that passed.
+#
+# Two things keep that from happening. The convention, which applies to every
+# check below: a curl whose answer is read is followed by `|| true`, because
+# what a check does with that answer is judge it, and "nothing answered"
+# is one of the judgements it is written to make. And these two traps, for
+# every other cause including the ones nobody has met yet: whatever kills the
+# run, it names the command and prints the tally, so the last line of a
+# verify run is always either its summary or a sentence saying the summary is
+# missing and why.
+#
+# Measured, with the proxy killed and everything else up: as this file
+# shipped, the run stopped at the first check that addressed the proxy and
+# printed 28 lines ending in a ✓ - which is what a run still in progress
+# looks like. With both of the above, the same conditions print 199 lines,
+# name seven checks as failed, and end "79 passed, 7 failed, and the run did
+# not reach the end of its list".
+VERIFY_REACHED_ITS_SUMMARY=false
+VERIFY_DIED_AT=""
+
+on_verify_error() {
+  # $1 line, $2 the command as bash was about to run it, $3 its status.
+  VERIFY_DIED_AT="demo.sh:$1: \`$2\` exited $3"
+}
+
+on_verify_exit() {
+  local status=$?
+  trap - ERR EXIT
+  [ "$VERIFY_REACHED_ITS_SUMMARY" = "true" ] && return 0
+
+  echo
+  echo "   ✗ the run stopped before it had finished"
+  echo "     ${VERIFY_DIED_AT:-no failing command was recorded}. Everything after this point was never asked, so the checks below the last one printed are neither passed nor failed - they are unknown."
+  echo
+  echo "${CHECKS_PASSED} passed, ${CHECKS_FAILED} failed, and the run did not reach the end of its list"
+  # Never green. A run that stopped short proved nothing about the checks it
+  # never asked, and a zero here would tell a pipeline it had.
+  [ "$status" -eq 0 ] && status=1
+  exit "$status"
+}
+
 # One request to the node, with the tenant header deis-proxy would have
 # stamped. Writes the response headers to $1 and the body to stdout.
+#
+# `|| true` here, and on every other helper below that reaches a component.
+# curl exits 7 when nothing is listening; a check reads the answer with
+# `body=$(app_request ...)`; and an assignment that fails under
+# `set -euo pipefail` is the end of the whole run - no line for the check it
+# was in, no summary, and nothing but an exit status to say the run stopped
+# rather than that it had not finished yet. Measured: with the node's port
+# pointed at nothing, check_static_asset, check_route_parameter and
+# check_app_fetch_allowed each ended the run and printed not one character
+# between them. "The component did not answer" is an outcome every one of
+# these checks is written to report, so it has to reach the check as the
+# empty body it is rather than as a dead script.
 app_request() {
   local header_file=$1
   local path=$2
   shift 2
   curl -s -D "$header_file" -H "x-deis-app-id: ${APP_ID}" "$@" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}"
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}" || true
 }
 
 # The same, addressed to a named environment of the application. No header
@@ -2035,30 +2114,70 @@ env_request() {
   shift 3
   curl -s -D "$header_file" \
     -H "x-deis-app-id: ${APP_ID}" -H "x-deis-environment: ${environment}" "$@" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}"
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}" || true
 }
 
 # Read one header value out of a saved response, lower-casing the name.
+#
+# Nothing at all for a response that never arrived. A curl that could not
+# connect leaves this file empty, or never creates it, and `tr < missing`
+# exits 1 - which in `value=$(header_value ...)` ends the run for the same
+# reason described at `app_request`. An absent header and an absent response
+# both read as empty here; the checks tell them apart by the status, which
+# is empty only in the second case.
 header_value() {
   local file=$1
   local name=$2
+  [ -s "$file" ] || return 0
   tr -d '\r' < "$file" | awk -v want="$(echo "$name" | tr 'A-Z' 'a-z')" '
     { split($0, kv, ":"); k = tolower(kv[1]);
       if (k == want) { sub(/^[^:]*:[ ]*/, ""); print; exit } }'
 }
 
+# The status code of a saved response, or nothing when there was no response
+# to save. `head -n 1` on a file curl never wrote exits 1, `pipefail` makes
+# that the pipeline's status, and `status=$(http_status ...)` then ends the
+# run - see `app_request`. Every caller already prints `${status:-none}` or
+# compares it against the code it wanted, so empty is a value they handle.
 http_status() {
+  [ -s "$1" ] || return 0
   head -n 1 "$1" | tr -d '\r' | awk '{print $2}'
 }
 
-# The node's log with the terminal colouring taken out.
+# The node's log, as text, with the terminal colouring taken out.
 #
-# tracing writes its field names and values wrapped in ANSI escapes when the
-# log is a file as much as when it is a terminal, so `keys=["ASSETS"]` on the
-# page is `keys` ESC [0m ESC [2m = ... in the bytes. A grep for what the line
-# says has to read what a person reads.
+# Two things are removed, for two different reasons.
+#
+# The ANSI escapes, because tracing writes its field names and values wrapped
+# in them when the log is a file as much as when it is a terminal: what reads
+# as `keys=["ASSETS"]` on the page is `keys` ESC [0m ESC [2m = ... in the
+# bytes, and a grep for what the line says has to read what a person reads.
+#
+# The NUL bytes, because this file is not written only by the node. An
+# application's own log line lands here too, and an application's log line
+# carries whatever a request put in it: one unauthenticated
+# `GET /hello/%00` makes the example app write a NUL byte into this file.
+# From that byte on, GNU grep calls the stream binary - it says "binary file
+# matches" on stderr, exits 0 and writes nothing at all on stdout - so every
+# check that reads this log sees an empty log. Thirteen checks read it and
+# twelve of them assert on what they find, so twelve report that the node
+# said nothing while the node's own sentence sits in the file - and the run
+# itself dies at the first of them rather than saying so. One byte from
+# outside, and half the evidence is gone without a word. Deleting it costs
+# nothing:
+# no check reads it, and it is the only byte that can decide binary-or-text
+# here, because everything else in this file came out of a Rust String and is
+# therefore valid UTF-8.
+#
+# What this cannot repair is a line an application *forged*. The same request
+# can put a newline and a complete fabricated `WARN` line into this file, and
+# once it is a line, nothing downstream can tell it from one the node wrote.
+# Closing that belongs where an application's message enters the operator's
+# log - crates/deis-runtime/src/logging - by escaping the control characters
+# out of it there.
 node_log() {
-  sed 's/\x1b\[[0-9;]*m//g' "${LOG_DIR}/deis-runtime.log"
+  LC_ALL=C tr -d '\000' < "${LOG_DIR}/deis-runtime.log" \
+    | sed 's/\x1b\[[0-9;]*m//g'
 }
 
 # What one log line says, without the timestamp, level, thread, tracing span
@@ -2109,11 +2228,11 @@ check_static_asset() {
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' \
     -H "x-deis-app-id: ${APP_ID}" -H "If-None-Match: ${etag}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" || true)
   local length
   length=$(curl -s -o /dev/null -w '%{size_download}' \
     -H "x-deis-app-id: ${APP_ID}" -H "If-None-Match: ${etag}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/" || true)
 
   if [ "$code" = "304" ] && [ "$length" = "0" ]; then
     pass_check "If-None-Match on that ETag answers 304 with no body" \
@@ -2227,7 +2346,7 @@ check_assets_binding() {
   local body
   body=$(app_request "${LOG_DIR}/verify-assets-binding.headers" \
     "/api/asset?path=${SITE_STYLESHEET}")
-  answered_json "$title" assets-binding "$body" || return
+  answered_json "$title" assets-binding "$body" || return 0
 
   local status ctype got reported_bytes
   status=$(echo "$body" | jq -r '.status // empty' 2>/dev/null || true)
@@ -2268,7 +2387,7 @@ check_assets_binding_is_not_shadowable() {
   local title="an application declaring ASSETS in its own env does not get its string"
   local body
   body=$(app_request "${LOG_DIR}/verify-assets-shadow.headers" "/api/asset")
-  answered_json "$title" assets-shadow "$body" || return
+  answered_json "$title" assets-shadow "$body" || return 0
 
   local kind callable leaked
   kind=$(echo "$body" | jq -r '.bindingKind // empty' 2>/dev/null || true)
@@ -2360,7 +2479,7 @@ ensure_catalog_route() {
   curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer ${API_KEY}" -H 'content-type: application/json' \
     -d "{\"host\":\"${host}\",\"path_prefix\":\"${prefix}\",\"priority\":0}" \
-    "$(control_url)/api/apps/${app}/environments/${environment}/routes"
+    "$(control_url)/api/apps/${app}/environments/${environment}/routes" || true
 }
 
 # One request through deis-proxy for a host the catalog claims, with no
@@ -2371,7 +2490,7 @@ routed_request() {
   local path=$2
   local header_file=$3
   curl -s -D "$header_file" -m 10 --noproxy '*' -H "Host: ${host}" \
-    "http://127.0.0.1:${DEIS_PROXY_PORT}${path}"
+    "http://127.0.0.1:${DEIS_PROXY_PORT}${path}" || true
 }
 
 check_the_proxy_routes_by_host_and_path_prefix() {
@@ -2428,7 +2547,7 @@ check_the_proxy_routes_by_host_and_path_prefix() {
   # a proxy that routed on the path alone.
   local stranger_status
   stranger_status=$(curl -s -o /dev/null -w '%{http_code}' -m 10 --noproxy '*' \
-    -H "Host: nothing-claims-this" "http://127.0.0.1:${DEIS_PROXY_PORT}${ROUTED_PREFIX}")
+    -H "Host: nothing-claims-this" "http://127.0.0.1:${DEIS_PROXY_PORT}${ROUTED_PREFIX}" || true)
 
   if [ "$root_label" != "v1" ]; then
     fail_check "$title" \
@@ -3084,9 +3203,18 @@ check_a_stream_past_its_budget_is_closed_by_the_node() {
   # evidence claims. `stream_budget_log_lines` counts at warn, so a line
   # demoted to debug - which is where a message stops being something an
   # operator sees - fails here rather than passing on the wording alone.
+  #
+  # `|| true` on the quotation: a grep that matches nothing exits 1, pipefail
+  # makes that the pipeline's status, and an unguarded assignment under
+  # `set -e` ends the run right here - with no line for this check, no
+  # summary and no clue, which is what a run that had merely not finished
+  # yet looks like. The line being absent is one of the two outcomes this
+  # check exists to tell apart, so it has to reach the `if` below rather
+  # than kill the script on the way; the failure branch already prints
+  # `${said:-<none>}` for it.
   local logged said
   logged=$(( $(stream_budget_log_lines) - logged_before ))
-  said=$(node_log | grep " WARN " | grep "is past stream_timeout_ms" | tail -n 1)
+  said=$(node_log | grep " WARN " | grep "is past stream_timeout_ms" | tail -n 1 || true)
 
   if [ "$timed_out" != "true" ] && [ "$clean" != "true" ] \
     && [ "$last" -ge "$floor" ] && [ "$last" -le "$ceiling" ] && [ "$logged" -ge 1 ]; then
@@ -3220,9 +3348,15 @@ check_no_timer_outlives_the_request_that_armed_it() {
   # read - the old grep took the last line matching the words, which for a
   # message this long is tracing's wrapped continuation and carries no level
   # at all.
+  #
+  # `|| true` for the same reason it is on the quotation in
+  # `check_a_stream_past_its_budget_is_closed_by_the_node`: without it a grep
+  # that matches nothing ends the whole run under `set -euo pipefail`, and
+  # the missing line is exactly what the failure branch below is written to
+  # report.
   local said_after said
   said_after=$(timer_cleared_log_lines)
-  said=$(node_log | grep " WARN " | grep "were still armed when this invocation ended" | tail -n 1)
+  said=$(node_log | grep " WARN " | grep "were still armed when this invocation ended" | tail -n 1 || true)
 
   if [ "$armed_interval" -gt 0 ] && [ "$armed_timeout" -gt 0 ] \
     && [ "$scope" = "undefined" ] && [ "$claim" = "null" ] \
@@ -3287,7 +3421,7 @@ check_kv_roundtrip() {
   local put
   put=$(curl -s -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
     --data-binary "$value" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/${key}")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/${key}" || true)
   if [ "$(http_status "$headers")" != "201" ]; then
     fail_check "$title" "PUT answered $(http_status "$headers"): ${put}"
     return
@@ -3615,7 +3749,7 @@ check_a_service_binding_is_not_a_hole_in_the_outbound_policy() {
   local target="http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/call"
   local body
   body=$(app_fetch service-egress "$target")
-  answered_json "$title" service-egress "$body" || return
+  answered_json "$title" service-egress "$body" || return 0
 
   local available reached error
   available=$(echo "$body" | jq -r '.available // false' 2>/dev/null || true)
@@ -3816,9 +3950,9 @@ check_storage_token_requires_the_api_key() {
   local minted="${LOG_DIR}/verify-storage-token.json"
 
   local anonymous authorised
-  anonymous=$(curl -s -o /dev/null -w '%{http_code}' "$(control_url)${route}")
+  anonymous=$(curl -s -o /dev/null -w '%{http_code}' "$(control_url)${route}" || true)
   authorised=$(curl -s -o "$minted" -w '%{http_code}' \
-    -H "Authorization: Bearer ${API_KEY}" "$(control_url)${route}")
+    -H "Authorization: Bearer ${API_KEY}" "$(control_url)${route}" || true)
 
   local tenant endpoint token_length
   tenant=$(jq -r '.tenant // empty' < "$minted" 2>/dev/null || true)
@@ -4172,7 +4306,7 @@ check_blob_head() {
 
   local missing_status
   missing_status=$(curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?op=head&key=never-written")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?op=head&key=never-written" || true)
 
   # The etag has to be the object's sha256, because that is the value a
   # conditional write compares against; a made-up identity would still look
@@ -4221,11 +4355,11 @@ check_blob_range_read() {
   local unsatisfiable
   unsatisfiable=$(curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
     -H "range: bytes=99-" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=index.html")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=index.html" || true)
   local absent
   absent=$(curl -s -o /dev/null -w '%{http_code}' -H "x-deis-app-id: ${APP_ID}" \
     -H "range: bytes=0-1" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=never-written")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=never-written" || true)
 
   if [ "$status" = "206" ] && [ "$body" = "456789" ] \
     && [ "$range" = "bytes 4-9/16" ] && [ "$suffix" = "cdef" ] \
@@ -4249,10 +4383,10 @@ check_blob_conditional_write() {
   # a transport failure either: the application answers 412 for exactly this.
   local first second
   first=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
-    --data-binary "held by the first writer" "${url}?key=${key}&ifNoneMatch=*")
+    --data-binary "held by the first writer" "${url}?key=${key}&ifNoneMatch=*" || true)
   second=$(curl -s -o "${LOG_DIR}/verify-blob-cas-second.json" -w '%{http_code}' \
     -X PUT -H "x-deis-app-id: ${APP_ID}" \
-    --data-binary "held by the second writer" "${url}?key=${key}&ifNoneMatch=*")
+    --data-binary "held by the second writer" "${url}?key=${key}&ifNoneMatch=*" || true)
 
   local kept
   kept=$(app_request "$headers" "${BLOB_ROUTE}?key=${key}")
@@ -4263,14 +4397,14 @@ check_blob_conditional_write() {
   etag=$(app_request "$headers" "${BLOB_ROUTE}?op=head&key=${key}" | jq -r '.etag // empty' 2>/dev/null || true)
   local updated stale
   updated=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
-    --data-binary "second version" "${url}?key=${key}&ifMatch=${etag}")
+    --data-binary "second version" "${url}?key=${key}&ifMatch=${etag}" || true)
   stale=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "x-deis-app-id: ${APP_ID}" \
-    --data-binary "third version" "${url}?key=${key}&ifMatch=${etag}")
+    --data-binary "third version" "${url}?key=${key}&ifMatch=${etag}" || true)
 
   # And a conditional delete against the etag that is no longer current.
   local stale_delete
   stale_delete=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "x-deis-app-id: ${APP_ID}" \
-    "${url}?key=${key}&ifMatch=${etag}")
+    "${url}?key=${key}&ifMatch=${etag}" || true)
 
   local final
   final=$(app_request "$headers" "${BLOB_ROUTE}?key=${key}")
@@ -4382,7 +4516,7 @@ check_queue_roundtrip() {
   sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
     -H 'content-type: application/json' \
     -d "{\"key\":\"${key}\",\"value\":\"${value}\"}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue" || true)
   if [ "$(http_status "$headers")" != "202" ]; then
     fail_check "a queue message is produced and consumed" \
       "POST /api/enqueue answered $(http_status "$headers"): ${sent}"
@@ -4435,7 +4569,7 @@ check_queue_send_batch() {
   local sent
   sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
     -H 'content-type: application/json' -d "$jobs" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue-batch")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue-batch" || true)
   if [ "$(http_status "$headers")" != "202" ]; then
     fail_check "$title" \
       "POST /api/enqueue-batch answered $(http_status "$headers"): ${sent}"
@@ -4530,7 +4664,7 @@ check_queue_dead_letters() {
   sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
     -H 'content-type: application/json' \
     -d "{\"key\":\"${key}\",\"value\":\"never-stored\"}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue" || true)
   if [ "$(http_status "$headers")" != "202" ]; then
     fail_check "$title" "POST /api/enqueue answered $(http_status "$headers"): ${sent}"
     return
@@ -5225,7 +5359,7 @@ app_fetch() {
   curl -s -G -D "${LOG_DIR}/verify-${label}.headers" \
     -H "x-deis-app-id: ${APP_ID}" \
     --data-urlencode "url=${target}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/fetch"
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/fetch" || true
 }
 
 # Did the handler answer at all?
@@ -5249,6 +5383,13 @@ answered_json() {
   status=$(http_status "${LOG_DIR}/verify-${label}.headers" 2>/dev/null || true)
   fail_check "$title" \
     "the node did not answer with JSON (HTTP ${status:-no response}). Either the request never reached the handler, or the node stopped answering while it ran - check .demo/logs/deis-runtime.log. Body: $(echo "$body" | tr '\n' ' ' | head -c 200)"
+  # Non-zero so the caller can stop, and every caller stops with
+  # `|| return 0` rather than with a bare `|| return`. A bare one hands this
+  # 1 back as the check function's own status, and a check that returns
+  # non-zero under `set -e` ends the whole verify run - so the seven checks
+  # that use this helper each turned "the node did not answer" into "the run
+  # stopped without a summary", which is the one outcome worse than the
+  # failure they had just recorded.
   return 1
 }
 
@@ -5275,7 +5416,7 @@ check_app_fetch_allowed() {
   local target="http://127.0.0.1:${DEIS_ORIGIN_PORT}/payload.txt"
   local body
   body=$(app_fetch fetch-allowed "$target")
-  answered_json "$title" fetch-allowed "$body" || return
+  answered_json "$title" fetch-allowed "$body" || return 0
 
   local available reached status got
   available=$(echo "$body" | jq -r '.available // false' 2>/dev/null || true)
@@ -5333,7 +5474,7 @@ check_app_fetch_refused() {
   local target="http://127.0.0.1:${DEIS_STORE_PORT}/"
   local body
   body=$(app_fetch fetch-refused "$target")
-  answered_json "$title" fetch-refused "$body" || return
+  answered_json "$title" fetch-refused "$body" || return 0
 
   local available reached status error
   available=$(echo "$body" | jq -r '.available // false' 2>/dev/null || true)
@@ -5413,11 +5554,23 @@ check_a_redirect_hop_to_a_refused_host_is_stopped() {
   local allowed_encoded="http%3A%2F%2F127.0.0.1%3A${DEIS_ORIGIN_PORT}%2Fpayload.txt"
   local origin="http://127.0.0.1:${DEIS_ORIGIN_PORT}/redirect-to?url="
 
+  # Read out of the node's configuration rather than asserted. The evidence
+  # this check prints used to say the origin was "the single entry in this
+  # node's [fetch] allow", which nothing here had looked at: an allow list
+  # with the refused address in it would have produced that sentence word for
+  # word. Measured - the control plane's own address added to the list, the
+  # node restarted - the hop was still refused, because it is refused as a
+  # platform service endpoint whatever the allow list says, and the check
+  # went on printing a claim about a file it had never opened. It prints what
+  # the file says now.
+  local allow_list
+  allow_list=$(sed -n 's/^allow = //p' "${DEIS_RUNTIME_CONFIG}" | head -n 1)
+
   local refused_body allowed_body
   refused_body=$(app_fetch redirect-hop-refused "${origin}${refused_encoded}")
-  answered_json "$title" redirect-hop-refused "$refused_body" || return
+  answered_json "$title" redirect-hop-refused "$refused_body" || return 0
   allowed_body=$(app_fetch redirect-hop-allowed "${origin}${allowed_encoded}")
-  answered_json "$title" redirect-hop-allowed "$allowed_body" || return
+  answered_json "$title" redirect-hop-allowed "$allowed_body" || return 0
 
   local refused_reached refused_error allowed_reached allowed_status allowed_text
   refused_reached=$(echo "$refused_body" | jq -r '.reached // false' 2>/dev/null || true)
@@ -5476,7 +5629,7 @@ check_a_redirect_hop_to_a_refused_host_is_stopped() {
   fi
 
   pass_check "$title" \
-    "the handler called one address, ${origin}<...>, which is the single entry in this node's [fetch] allow. Pointed at ${refused_hop} the origin's 302 was refused where it landed - \"$(printf '%s' "$refused_error" | head -c 200)\" - and the node recorded it at warn: \"$(printf '%s' "$logged" | log_message | head -c 160)\". Pointed at /payload.txt instead, the identical call followed the hop and came back with the origin's own body (HTTP ${allowed_status}, \"${ORIGIN_BODY}\"), so it is where the hop went that decided it"
+    "the handler called one address, ${origin}<...>, and this node's [fetch] allow is ${allow_list:-<unreadable>}. Pointed at ${refused_hop} the origin's 302 was refused where it landed - \"$(printf '%s' "$refused_error" | head -c 200)\" - and the node recorded it at warn: \"$(printf '%s' "$logged" | log_message | head -c 160)\". Pointed at /payload.txt instead, the identical call followed the hop and came back with the origin's own body (HTTP ${allowed_status}, \"${ORIGIN_BODY}\"), so it is where the hop went that decided it"
 }
 
 # The Web Crypto globals, judged on their values.
@@ -5490,7 +5643,7 @@ check_web_crypto() {
   local headers="${LOG_DIR}/verify-crypto.headers"
   local body
   body=$(app_request "$headers" "/api/crypto")
-  answered_json "$title" crypto "$body" || return
+  answered_json "$title" crypto "$body" || return 0
 
   local has_crypto uuid differ digest
   has_crypto=$(echo "$body" | jq -r '.present.crypto // false' 2>/dev/null || true)
@@ -5778,7 +5931,7 @@ check_acme_certificate_is_served_over_tls() {
     --noproxy '*' \
     --cacert "${ACME_CA_ROOT}" \
     --resolve "${ACME_PRODUCTION_NAME}:${DEIS_PROXY_TLS_PORT}:127.0.0.1" \
-    "https://${ACME_PRODUCTION_NAME}:${DEIS_PROXY_TLS_PORT}/" 2>"${LOG_DIR}/verify-acme-tls.log")
+    "https://${ACME_PRODUCTION_NAME}:${DEIS_PROXY_TLS_PORT}/" 2>"${LOG_DIR}/verify-acme-tls.log" || true)
 
   status=$(http_status "$headers" 2>/dev/null || echo "")
   if [ -z "$status" ]; then
@@ -5820,7 +5973,7 @@ check_acme_challenge_answers_only_what_was_published() {
 
   unknown=$(curl -s -o /dev/null -w '%{http_code}' -m 5 --noproxy '*' \
     -H "Host: ${ACME_PRODUCTION_NAME}" \
-    "http://127.0.0.1:${DEIS_PROXY_PORT}/.well-known/acme-challenge/never-published-token")
+    "http://127.0.0.1:${DEIS_PROXY_PORT}/.well-known/acme-challenge/never-published-token" || true)
   if [ "$unknown" != "404" ]; then
     fail_check "$claim" \
       "a token nothing published was answered ${unknown} rather than 404; an authority given anything else could believe a validation had succeeded"
@@ -5831,10 +5984,10 @@ check_acme_challenge_answers_only_what_was_published() {
   # is used to name a file. Neither of these may read one.
   traversal=$(curl -s -m 5 --path-as-is --noproxy '*' \
     -H "Host: ${ACME_PRODUCTION_NAME}" \
-    "http://127.0.0.1:${DEIS_PROXY_PORT}/.well-known/acme-challenge/../../../etc/passwd" | head -c 200)
+    "http://127.0.0.1:${DEIS_PROXY_PORT}/.well-known/acme-challenge/../../../etc/passwd" | head -c 200 || true)
   encoded=$(curl -s -m 5 --path-as-is --noproxy '*' \
     -H "Host: ${ACME_PRODUCTION_NAME}" \
-    "http://127.0.0.1:${DEIS_PROXY_PORT}/.well-known/acme-challenge/..%2f..%2f..%2fetc%2fpasswd" | head -c 200)
+    "http://127.0.0.1:${DEIS_PROXY_PORT}/.well-known/acme-challenge/..%2f..%2f..%2fetc%2fpasswd" | head -c 200 || true)
 
   case "${traversal}${encoded}" in
     *root:*)
@@ -6358,7 +6511,10 @@ control_status() {
   if [ -n "$body" ]; then
     args+=(-H "Content-Type: application/json" --data "$body")
   fi
-  curl "${args[@]}"
+  # `%{http_code}` already prints 000 for a request that never got an answer,
+  # so the caller's message reads "answered HTTP 000" instead of the run
+  # ending on curl's exit 7. See `app_request`.
+  curl "${args[@]}" || true
 }
 
 # The same, answering with the body, so a check can assert on what the caller
@@ -6501,7 +6657,7 @@ check_a_credential_cannot_wire_an_app_to_one_it_cannot_see() {
   local refused told
   refused=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer ${token}" -H "Content-Type: application/zip" \
-    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions")
+    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions" || true)
   told=$(curl -s -X POST \
     -H "Authorization: Bearer ${token}" -H "Content-Type: application/zip" \
     --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions" \
@@ -6517,7 +6673,7 @@ check_a_credential_cannot_wire_an_app_to_one_it_cannot_see() {
   widened_token=$(echo "$widened" | jq -r '.secret // empty')
   accepted=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer ${widened_token}" -H "Content-Type: application/zip" \
-    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions")
+    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions" || true)
 
   # And it is written down, like every other refusal on the human API.
   local audited
@@ -6907,7 +7063,7 @@ check_dynamic_node_registration() {
   status=$(curl -s -o /dev/null -w '%{http_code}' \
     -X PUT -H "Authorization: Bearer ${SECRET}" -H 'content-type: application/json' \
     -d "{\"address\":\"http://127.0.0.1:${DEIS_RUNTIME_PORT}\"}" \
-    "$(control_url)/api/nodes/${dynamic_id}/registration")
+    "$(control_url)/api/nodes/${dynamic_id}/registration" || true)
 
   if [ "$status" != "200" ]; then
     fail_check "$title" \
@@ -6923,24 +7079,38 @@ check_dynamic_node_registration() {
   registered_at=$(jq -r --arg id "$dynamic_id" \
     '.nodes[] | select(.id == $id) | .registered_at // empty' < "$fleet" 2>/dev/null || true)
 
-  if [ "$source" = "registered" ] && [ -n "$registered_at" ]; then
+  # Take the invented identity away again, and check that it went.
+  #
+  # Nothing refreshes this registration, and a registration nobody refreshes
+  # is a lease that runs out: the control plane then counts it among the nodes
+  # it has lost and names it in the answer to every later deployment and
+  # application deletion, because a node that stopped talking is normally one
+  # that is still serving what it last received. This one is not - it is a
+  # second name for the process already on the list as ${NODE_ID}.
+  #
+  # The removal is part of the verdict below rather than a swept-up loose end.
+  # It used to be one line with its status thrown away and `|| true` after it,
+  # which is the shape of every unwitnessed cleanup: a control plane that
+  # answered 500 here left the phantom on the fleet, this check went on saying
+  # ✓, and the run after it inherited a node nobody could explain. It is also
+  # the only exercise `DELETE .../registration` gets anywhere in this file, so
+  # discarding the answer left half the endpoint unchecked as well.
+  local removed_status still_listed
+  removed_status=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    -H "Authorization: Bearer ${SECRET}" \
+    "$(control_url)/api/nodes/${dynamic_id}/registration" || true)
+  control_api /api/runtime > "$fleet" 2>/dev/null || true
+  still_listed=$(jq -r --arg id "$dynamic_id" \
+    '[.nodes[] | select(.id == $id)] | length' < "$fleet" 2>/dev/null || echo "?")
+
+  if [ "$source" = "registered" ] && [ -n "$registered_at" ] \
+    && [ "$removed_status" = "200" ] && [ "$still_listed" = "0" ]; then
     pass_check "$title" \
-      "${dynamic_id} is not in deis_runtime_nodes; PUT .../registration alone put it on the fleet, with source=registered since ${registered_at}"
+      "${dynamic_id} is not in deis_runtime_nodes; PUT .../registration alone put it on the fleet, with source=registered since ${registered_at}. DELETE .../registration then answered HTTP ${removed_status} and the fleet no longer lists it, so the run leaves behind exactly the nodes the configuration file names"
   else
     fail_check "$title" \
-      "PUT .../registration for ${dynamic_id} answered HTTP ${status}, but the fleet shows source='${source:-<absent>}' registered_at='${registered_at:-<none>}' instead of a registered entry"
+      "PUT .../registration for ${dynamic_id} answered HTTP ${status} and the fleet showed source='${source:-<absent>}' registered_at='${registered_at:-<none>}'; the DELETE that takes the invented identity away again answered HTTP ${removed_status} and left ${still_listed} entry/entries for it on the fleet"
   fi
-
-  # Take the invented identity away again. Nothing refreshes it, and a
-  # registration nobody refreshes is a lease that runs out: the control plane
-  # then counts it among the nodes it has lost and names it in the answer to
-  # every later deployment and application deletion, because a node that
-  # stopped talking is normally one that is still serving what it last
-  # received. This one is not - it is a second name for the process that is
-  # already on the list as ${NODE_ID} - so the check that invented it removes
-  # it, which is also the only exercise the other half of the endpoint gets.
-  curl -s -o /dev/null -X DELETE -H "Authorization: Bearer ${SECRET}" \
-    "$(control_url)/api/nodes/${dynamic_id}/registration" || true
 }
 
 # ----------------------------------------------------------------------
@@ -7129,7 +7299,7 @@ check_memory_cutoff() {
   local answered status seconds
   answered=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' \
     -H "x-deis-app-id: ${APP_ID}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/heap")
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/heap" || true)
   status=${answered%% *}
   seconds=${answered##* }
 
@@ -7245,6 +7415,13 @@ verify_demo() {
   load_state
   require_command curl
   require_command jq
+
+  # `set -E` is what puts the ERR trap inside the check functions. Without it
+  # bash runs an ERR trap only at the top level, which is the one place none
+  # of this happens.
+  set -E
+  trap 'on_verify_error "$LINENO" "$BASH_COMMAND" "$?"' ERR
+  trap on_verify_exit EXIT
 
   echo "🔎 Verifying the demo end to end"
   echo
@@ -7421,6 +7598,12 @@ verify_demo() {
   check_acme_challenge_answers_only_what_was_published
   check_acme_does_not_reissue_a_current_certificate
   check_acme_restart_reuses_the_account_and_certificates
+
+  # Before the summary, so the traps above stand down only once the whole
+  # list has actually been asked. The line below returns non-zero when a
+  # check failed, and that is a finished run reporting a failure rather than
+  # a run that stopped.
+  VERIFY_REACHED_ITS_SUMMARY=true
 
   echo
   echo "${CHECKS_PASSED} passed, ${CHECKS_FAILED} failed"

@@ -30,6 +30,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -45,7 +47,10 @@ use pingora::services::ServiceWithDependents;
 use pingora::services::background::background_service;
 use tracing::{debug, error, info, warn};
 
-use crate::config::system::{BalancingStrategy, HealthCheckMode};
+use crate::config::system::{
+    BalancingStrategy, HealthCheckMode, NODE_READINESS_HEADER, ReadinessPolicy, ReadinessVerdict,
+    judge_readiness,
+};
 use crate::config::{ConfigManager, SystemConfig};
 use crate::proxy::APP_ID_HEADER;
 
@@ -107,6 +112,14 @@ impl ServiceDiscovery for ConfigDiscovery {
 }
 
 /// The active selection algorithm wrapped around pingora balancers.
+///
+/// `Clone` is a handle clone and nothing more: every variant holds one `Arc`
+/// to the single `LoadBalancer` the background service updates, so two
+/// `Balancer` values are two views of the same pool and the same health
+/// state. `main` keeps one to warm the pool up with after `bootstrap()` and
+/// gives the other to [`crate::proxy::DeisProxy`], which lets every fallible
+/// step of startup finish before the replacement reports itself ready.
+#[derive(Clone)]
 pub enum Balancer {
     RoundRobin(Arc<LoadBalancer<RoundRobin>>),
     Random(Arc<LoadBalancer<Random>>),
@@ -198,14 +211,43 @@ impl Balancer {
         }
     }
 
-    /// Pick a healthy backend, trying up to 256 candidates.
-    pub fn select(&self, key: &[u8]) -> Option<Backend> {
+    /// Pick a healthy backend this request has not already failed to reach,
+    /// trying up to 256 candidates.
+    ///
+    /// `avoid` is what makes a retry worth anything. Pingora calls
+    /// [`ProxyHttp::upstream_peer`] again for every retry, and under a hash
+    /// strategy the same key picks the same backend every time, so without
+    /// the exclusion a refused connection would be retried against the node
+    /// that just refused it until the retry budget ran out and the client got
+    /// its `502` anyway. Under round robin it would have worked by accident,
+    /// which is not the same as working.
+    ///
+    /// The exclusion is per request and never touches the health state: which
+    /// nodes are in rotation is the health check's answer, and one connection
+    /// failure is not enough evidence to take a node away from every other
+    /// request in flight.
+    ///
+    /// [`ProxyHttp::upstream_peer`]: pingora::proxy::ProxyHttp::upstream_peer
+    pub fn select(&self, key: &[u8], avoid: &[String]) -> Option<Backend> {
         const MAX_ITERATIONS: usize = 256;
+        let accept = |backend: &Backend, healthy: bool| {
+            if !healthy {
+                return false;
+            }
+            // The overwhelming majority of requests never fail to connect and
+            // arrive here with nothing to avoid, so that case does exactly
+            // what `select` did before: no formatting, no allocation.
+            if avoid.is_empty() {
+                return true;
+            }
+            let addr = backend.addr.to_string();
+            !avoid.contains(&addr)
+        };
         match self {
-            Balancer::RoundRobin(lb) => lb.select(key, MAX_ITERATIONS),
-            Balancer::Random(lb) => lb.select(key, MAX_ITERATIONS),
-            Balancer::HeaderHash { lb, .. } => lb.select(key, MAX_ITERATIONS),
-            Balancer::IpHash(lb) => lb.select(key, MAX_ITERATIONS),
+            Balancer::RoundRobin(lb) => lb.select_with(key, MAX_ITERATIONS, accept),
+            Balancer::Random(lb) => lb.select_with(key, MAX_ITERATIONS, accept),
+            Balancer::HeaderHash { lb, .. } => lb.select_with(key, MAX_ITERATIONS, accept),
+            Balancer::IpHash(lb) => lb.select_with(key, MAX_ITERATIONS, accept),
         }
     }
 
@@ -300,15 +342,67 @@ impl HealthObserve for RotationLog {
     }
 }
 
+/// How often a fleet that is reporting `degraded` is worth saying so about.
+///
+/// The probe runs every `health_check_interval` (5 seconds by default) per
+/// node, and a degraded node stays in rotation, so there is no transition for
+/// [`RotationLog`] to report and nothing else would ever say it. Logging every
+/// probe would be twelve lines a minute per node for a state that can last
+/// hours; once a minute is enough to be noticed and little enough to live
+/// with.
+const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for the line above.
+///
+/// Pingora's validator is handed the response header and nothing else - not
+/// the backend, not the check - so this cannot be per node and the message
+/// does not pretend to name one. What it can say, and what an operator needs
+/// first, is that some node in this pool is serving from its own disk because
+/// it cannot reach the control plane.
+struct DegradedNotice {
+    started: Instant,
+    /// Seconds since `started` at the last warning, or `u64::MAX` for none.
+    last: AtomicU64,
+}
+
+impl DegradedNotice {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// Whether this observation should be logged now.
+    fn due(&self) -> bool {
+        let now = self.started.elapsed().as_secs();
+        let last = self.last.load(Ordering::Relaxed);
+        if last != u64::MAX && now.saturating_sub(last) < DEGRADED_LOG_INTERVAL.as_secs() {
+            return false;
+        }
+        self.last.store(now, Ordering::Relaxed);
+        true
+    }
+}
+
 /// Build the check that decides whether a node may be given traffic.
 ///
 /// See [`crate::config::system::health`] for why the default asks the node
-/// rather than its kernel.
+/// rather than its kernel, and for what the node has to say for the answer to
+/// mean anything.
 fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Sync + 'static> {
     let settings = system.health_check();
     let timeout = settings.timeout();
     match settings.mode() {
         HealthCheckMode::Tcp => {
+            if matches!(settings.readiness, Some(policy) if policy != ReadinessPolicy::Ignored) {
+                warn!(
+                    readiness = %settings.readiness(),
+                    "health_check.readiness is set but health_check.mode is tcp, so nothing is \
+                     ever asked and the setting does nothing. Leave the mode unset to have the \
+                     node asked"
+                );
+            }
             let asked = "mode=tcp (connect only; a node that is listening and not ready passes)"
                 .to_string();
             let mut check = TcpHealthCheck::new();
@@ -374,6 +468,42 @@ fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Syn
                     "health_check.path is not a usable request target; probing / instead"
                 ),
             }
+            let policy = settings.readiness();
+            asked = format!("{asked} readiness={policy}");
+            // A 200 from `_system`'s `/health` is a constant: it proves the
+            // dispatcher ran an isolate and says nothing about whether this
+            // node is running what the control plane assigned it. The
+            // readiness the node states on the answer is what turns this into
+            // a question that can be answered no; `judge_readiness` holds the
+            // rule and is tested on its own.
+            let degraded = DegradedNotice::new();
+            check.validator = Some(Box::new(move |resp| {
+                let status = resp.status.as_u16();
+                let reported = resp
+                    .headers
+                    .get(NODE_READINESS_HEADER)
+                    .and_then(|value| value.to_str().ok());
+                match judge_readiness(status, reported, policy) {
+                    ReadinessVerdict::InRotation => Ok(()),
+                    ReadinessVerdict::InRotationWithWarning(why) => {
+                        if degraded.due() {
+                            warn!(
+                                status,
+                                reported = ?reported,
+                                readiness = %policy,
+                                interval_secs = DEGRADED_LOG_INTERVAL.as_secs(),
+                                "{why}. Repeated at most once every {} seconds while it lasts",
+                                DEGRADED_LOG_INTERVAL.as_secs()
+                            );
+                        }
+                        Ok(())
+                    }
+                    ReadinessVerdict::OutOfRotation(why) => pingora::Error::e_explain(
+                        pingora::ErrorType::CustomCode("upstream is not ready", status),
+                        why,
+                    ),
+                }
+            }));
             check.consecutive_success = settings.healthy_after();
             check.consecutive_failure = settings.unhealthy_after();
             check.peer_template.options.connection_timeout = Some(timeout);
@@ -389,9 +519,33 @@ fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Syn
                 interval_secs = system.health_check_interval().as_secs(),
                 healthy_after = settings.healthy_after(),
                 unhealthy_after = settings.unhealthy_after(),
+                readiness_header = NODE_READINESS_HEADER,
                 "an upstream is given traffic only while it answers 200 to this, so an upstream \
                  whose port is open but which is not serving takes none of it"
             );
+            match policy {
+                ReadinessPolicy::Reported => info!(
+                    readiness_header = NODE_READINESS_HEADER,
+                    "a node that states its own readiness is believed: `starting` takes it out \
+                     of rotation, `degraded` keeps its share because every node goes degraded at \
+                     once when the control plane does. A node that states nothing is judged on \
+                     the 200 alone, which only proves it ran an isolate - so until deis-runtime \
+                     sends this header, a node whose assignments failed to load still counts as \
+                     healthy here"
+                ),
+                ReadinessPolicy::Required => warn!(
+                    readiness_header = NODE_READINESS_HEADER,
+                    "health_check.readiness is \"required\": an upstream that does not state \
+                     `ready` in this header is given no traffic, a node that states nothing \
+                     included. If any node in this pool is older than that contract the pool \
+                     empties and every request is answered 503"
+                ),
+                ReadinessPolicy::Ignored => warn!(
+                    "health_check.readiness is \"ignored\": the status code alone decides, so a \
+                     deis-runtime node that reports `starting` keeps its full share of the \
+                     traffic and fails it. Only right for an upstream that is not a node"
+                ),
+            }
             Box::new(check)
         }
     }

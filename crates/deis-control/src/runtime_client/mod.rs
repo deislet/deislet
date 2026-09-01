@@ -72,9 +72,16 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Deadline for a scheduled trigger.
 ///
 /// Deliberately longer than the node's own execution ceiling (30s by
-/// default). A shorter deadline would report a slow-but-successful cron
-/// run as a failure, and the scheduler would hand the same fire to another
-/// node - running the job twice, which is worse than reporting it late.
+/// default), so that a slow-but-successful cron run answers inside it rather
+/// than being cut off at 60s while the handler is still going.
+///
+/// What happens when it expires anyway is not this constant's job to prevent:
+/// tonic turns the elapsed deadline into a `Cancelled` status,
+/// [`NodeError::left_the_outcome_unknown`] reads that as "the node was given
+/// this and never answered", and `crate::scheduler` stops the fleet walk there
+/// instead of handing the occurrence to the next node. Widening this number
+/// makes the case rarer; it is the reading that makes a job charge a card
+/// once instead of once per node.
 const TRIGGER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many lost nodes are remembered at once. See [`DepartedNode`].
@@ -269,6 +276,92 @@ impl DepartedNode {
     }
 }
 
+/// Who answers at one address, as that node describes itself.
+///
+/// Read from `GetStatus`, which is the only RPC that carries a node's own id
+/// back. It is what lets a registration tell "this machine moved" from "a
+/// second machine is claiming the first one's name".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentity {
+    /// The id the node calls itself. Empty when the node did not say.
+    pub node_id: String,
+    /// Hostname the node reports, so the refusal names a machine an operator
+    /// can go and look at rather than only an address.
+    pub hostname: String,
+    /// Seconds that node's process has been up.
+    pub uptime_seconds: i64,
+}
+
+/// A node id that two live machines are claiming at the same time.
+///
+/// The damage this records is quiet and total. A node id is the whole of a
+/// node's identity here: it keys the fleet list, the health cache, the
+/// delivery fan-out and the cron rotation. When a second machine registers the
+/// id a first machine is still answering for, everything this control plane
+/// sends goes to exactly one of them - and the report for a deployment, or for
+/// an application deletion, counts one node and says every node took it, while
+/// the other machine keeps serving the previous version with the previous
+/// secrets and is never told anything again.
+///
+/// So the claim is refused, the machine already answering keeps the id, and
+/// this record exists to make the machine that was refused visible: every
+/// fan-out names it as unreached, exactly as a [`DepartedNode`] is named.
+///
+/// The probe cannot tell two machines from one machine that has started
+/// reporting a second address while the first still reaches it, and it does
+/// not pretend to: both are answered the same way, because in both the address
+/// that was proven live keeps the id and nothing moves silently. The message
+/// names both readings and the operator action for each.
+///
+/// It is cleared when the refusals stop for a whole registration lifetime -
+/// which is what happens when whichever machine was wrong is corrected or shut
+/// down - or when an operator says the machine is gone with
+/// `DELETE /api/nodes/{id}/registration`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContestedNodeId {
+    pub id: String,
+    /// The address that holds the id, and the only one anything is sent to.
+    pub holder_addr: String,
+    /// Hostname of the machine holding the id, when it said one.
+    pub holder_hostname: String,
+    /// The address that was refused the id. Nothing is ever sent here, and
+    /// this machine is still running whatever it last had.
+    pub claimant_addr: String,
+    /// First time this claim was refused.
+    pub first_refused_at: DateTime<Utc>,
+    /// Most recent time it was refused. The claimant keeps registering every
+    /// `registration_refresh_interval`, so this is how the record stays alive
+    /// and how it expires once the claim stops coming.
+    pub last_refused_at: DateTime<Utc>,
+}
+
+impl ContestedNodeId {
+    /// Why a fleet-wide operation could not include this machine, in the words
+    /// the answer to a deploy or a delete carries back to whoever ran it.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} registered this node id while a live node at {}{} was still answering for it, so \
+             the claim was refused and nothing is ever sent to {}: whatever is there is still \
+             running what it last received, including the previous version of this application. \
+             Either two machines were given one node id, in which case change one of them; or \
+             this is one machine that now reports a different address from the one that already \
+             reaches it, in which case DELETE /api/nodes/{}/registration and let it register \
+             again at the address you want used. First refused at {}, last at {}",
+            self.claimant_addr,
+            self.holder_addr,
+            if self.holder_hostname.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", self.holder_hostname)
+            },
+            self.claimant_addr,
+            self.id,
+            self.first_refused_at.to_rfc3339(),
+            self.last_refused_at.to_rfc3339(),
+        )
+    }
+}
+
 /// What a deregistration did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deregistered {
@@ -339,6 +432,16 @@ pub enum RegistrationError {
     InvalidId,
     #[error("address {addr:?} is not a usable gRPC endpoint: {reason}")]
     InvalidAddress { addr: String, reason: String },
+    /// A live node at another address already answers for this id. See
+    /// [`ContestedNodeId`] for what accepting it silently used to cost.
+    #[error(
+        "node id is already held by a live node at {holder_addr}{}, which answered for it just now; give this machine a different node id, or - if this is the same machine reporting a new address - deregister it first so the new address can be taken",
+        if holder_hostname.is_empty() { String::new() } else { format!(" ({holder_hostname})") }
+    )]
+    IdHeldByAnotherMachine {
+        holder_addr: String,
+        holder_hostname: String,
+    },
 }
 
 /// A node id has to survive being put in a URL path and in a log line, and it
@@ -412,6 +515,13 @@ pub struct RuntimeNodeManager {
     /// Registered nodes whose lease ran out, kept so that a fleet-wide
     /// operation can say it did not reach them. See [`DepartedNode`].
     departed: std::sync::RwLock<std::collections::BTreeMap<String, DepartedNode>>,
+    /// Machines that were refused a node id another machine is still
+    /// answering for, kept for the same reason `departed` is: a fan-out that
+    /// named only the machines it can reach reports a deploy as complete while
+    /// one of them serves the previous version. Keyed by
+    /// `(node id, claimant address)`, because one id can be claimed by more
+    /// than one machine. See [`ContestedNodeId`].
+    contested: std::sync::RwLock<std::collections::BTreeMap<(String, String), ContestedNodeId>>,
     health: DashMap<String, NodeHealth>,
     poll_interval: Duration,
     registration_ttl: Duration,
@@ -463,6 +573,7 @@ impl RuntimeNodeManager {
         Self {
             nodes: std::sync::RwLock::new(entries),
             departed: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            contested: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             health,
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             registration_ttl: Duration::from_secs(registration_ttl_secs.max(1)),
@@ -525,6 +636,35 @@ impl RuntimeNodeManager {
         &self,
     ) -> std::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<String, DepartedNode>> {
         self.departed.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn contested_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<
+        '_,
+        std::collections::BTreeMap<(String, String), ContestedNodeId>,
+    > {
+        self.contested.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Machines refused a node id another machine is still answering for,
+    /// oldest refusal first.
+    ///
+    /// Read by every fan-out beside [`Self::departed`]: both answer the same
+    /// question - which machines are running this platform's code and cannot
+    /// be told anything - and a report that left either of them out is the
+    /// report that says a deploy succeeded when a live node still serves the
+    /// version before it.
+    pub fn contested(&self) -> Vec<ContestedNodeId> {
+        let mut contested: Vec<ContestedNodeId> = self
+            .contested
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        contested.sort_by_key(|node| node.first_refused_at);
+        contested
     }
 
     /// Nodes this control plane has lost and has not been told about since,
@@ -669,6 +809,235 @@ impl RuntimeNodeManager {
         }
     }
 
+    /// Accept a node's registration, refusing a machine that claims an id
+    /// another live machine is still answering for.
+    ///
+    /// This is what `PUT /api/nodes/{id}/registration` calls. [`Self::register`]
+    /// underneath it is pure bookkeeping and cannot tell the two ways an
+    /// address changes apart:
+    ///
+    /// * one machine moved - it has a new address and nothing answers at the
+    ///   old one, so taking the new address is right; and
+    /// * a second machine was given the same node id by mistake - a cloned
+    ///   image, a copied configuration file, a scale-out that reused a name -
+    ///   in which case both machines are alive and each registration hands the
+    ///   id to whichever one called last.
+    ///
+    /// The second case used to be indistinguishable from the first, and it is
+    /// silent: the fleet list still holds one entry, so a deployment is pushed
+    /// to one machine, counted against one node and reported as delivered to
+    /// the whole fleet, while the other machine goes on serving the previous
+    /// version with the previous secrets. So before an address is moved the
+    /// address on file is asked who is there. A node that answers and gives
+    /// this same id is a machine that has not moved anywhere, and the claim is
+    /// refused rather than granted - see [`ContestedNodeId`].
+    pub async fn register_claim(
+        &self,
+        id: &str,
+        addr: &str,
+        version: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<Registered, RegistrationError> {
+        self.register_claim_with(id, addr, version, now, |holder_addr| async move {
+            self.identify_at(&holder_addr).await
+        })
+        .await
+    }
+
+    /// [`Self::register_claim`] with the "who is at this address?" call as a
+    /// parameter.
+    ///
+    /// Split out for the same reason `crate::scheduler`'s fleet walk is: the
+    /// decision being tested here is which of two live machines keeps a name,
+    /// and getting it wrong is not a failure anything would notice - it is a
+    /// deploy that reports success while half the fleet serves the old code.
+    /// That has to be testable without two live nodes.
+    pub(crate) async fn register_claim_with<F, Fut>(
+        &self,
+        id: &str,
+        addr: &str,
+        version: Option<String>,
+        now: DateTime<Utc>,
+        probe: F,
+    ) -> Result<Registered, RegistrationError>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Option<NodeIdentity>>,
+    {
+        let trimmed = id.trim();
+        let claimed = addr.trim().to_string();
+
+        // Refuse what [`Self::register`] would refuse, before anything is
+        // dialled. Without this a node reporting an address nothing can parse
+        // would be told its id is held by another machine, which is a true
+        // sentence about a request whose real fault is somewhere else.
+        if trimmed.is_empty() {
+            return Err(RegistrationError::EmptyId);
+        }
+        if !valid_node_id(trimmed) {
+            return Err(RegistrationError::InvalidId);
+        }
+        check_node_address(&claimed)?;
+
+        // Only an address change on a self-registered node can hand an id
+        // from one machine to another. A new id takes nothing from anybody, a
+        // refresh at the same address is the same machine, and a configured
+        // node keeps the file's address whatever it reports - so none of those
+        // is worth a network call.
+        let holder = self
+            .read()
+            .get(trimmed)
+            .filter(|entry| entry.source == NodeSource::Registered)
+            .map(|entry| entry.config.addr.clone())
+            .filter(|held| *held != claimed);
+
+        if let Some(holder_addr) = holder
+            && let Some(identity) = probe(holder_addr.clone()).await
+        {
+            // Something answered `GetStatus` at the address on file, which
+            // means a live node holding this control plane's node credential
+            // is there. Whether it names this id or another one decides
+            // everything: the same id is two machines with one name, and a
+            // different id is an address that was reused after the first
+            // machine really did move away.
+            if identity.node_id.is_empty() || identity.node_id == trimmed {
+                let mut contested = self.contested_write();
+                let key = (trimmed.to_string(), claimed.clone());
+                let first_refused_at = contested
+                    .get(&key)
+                    .map(|record| record.first_refused_at)
+                    .unwrap_or(now);
+                let record = ContestedNodeId {
+                    id: trimmed.to_string(),
+                    holder_addr: holder_addr.clone(),
+                    holder_hostname: identity.hostname.clone(),
+                    claimant_addr: claimed.clone(),
+                    first_refused_at,
+                    last_refused_at: now,
+                };
+                let first_time = first_refused_at == now;
+                contested.insert(key, record);
+                Self::trim_contested(&mut contested);
+                drop(contested);
+
+                if first_time {
+                    error!(
+                        node = %trimmed,
+                        holder_addr = %holder_addr,
+                        holder_hostname = %identity.hostname,
+                        holder_uptime_seconds = identity.uptime_seconds,
+                        claimant_addr = %claimed,
+                        "A node id was claimed from a second address while a live node at the address on file was still answering for it. The machine already answering keeps the id and this registration is refused, so nothing is sent to the claimant and it keeps serving whatever it last received - which from the next deployment onwards is the previous version, with the previous secrets. Every deploy and every application deletion now reports it as unreached. Either two machines were given one node id, in which case change one of them; or this is one machine reporting a new address while its old one still reaches it, in which case deregister it and let it register again"
+                    );
+                } else {
+                    warn!(
+                        node = %trimmed,
+                        holder_addr = %holder_addr,
+                        claimant_addr = %claimed,
+                        refused_since = %first_refused_at.to_rfc3339(),
+                        "The refused machine is still claiming a node id another machine answers for; the claim is refused again and it remains unreachable for deployments and cron"
+                    );
+                }
+
+                return Err(RegistrationError::IdHeldByAnotherMachine {
+                    holder_addr,
+                    holder_hostname: identity.hostname,
+                });
+            }
+
+            warn!(
+                node = %trimmed,
+                previous_addr = %holder_addr,
+                previous_node_id = %identity.node_id,
+                new_addr = %claimed,
+                "This node's previous address is now answering as a different node, so the address was reused after this one moved; the registration is accepted and every management call goes to the new address"
+            );
+        }
+
+        let outcome = self.register(trimmed, &claimed, version, now)?;
+        // The claim was granted, so this machine is not being refused
+        // anything and there is nothing left to report as unreached for it.
+        self.contested_write()
+            .remove(&(trimmed.to_string(), claimed));
+        Ok(outcome)
+    }
+
+    /// Ask whichever node is at `addr` who it thinks it is.
+    ///
+    /// `None` covers everything that is not a live deis-runtime answering with
+    /// this control plane's node credential: nothing listening, a connection
+    /// refused, a node that refuses the credential, a timeout. All of those
+    /// read the same way at the one call site - the machine that held this id
+    /// is not there any more - and a registration must not be refused because
+    /// a probe was slow.
+    async fn identify_at(&self, addr: &str) -> Option<NodeIdentity> {
+        let channel = Endpoint::from_shared(addr.to_string())
+            .ok()?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(RPC_TIMEOUT)
+            .connect()
+            .await
+            .map_err(|e| {
+                debug!(address = %addr, error = %e, "Nothing answers at this address");
+            })
+            .ok()?;
+        let info = with_message_limits(RuntimeManagementClient::new(self.authorized(channel)))
+            .get_status(proto::GetStatusRequest {
+                include_apps: false,
+            })
+            .await
+            .map_err(|e| {
+                debug!(address = %addr, error = %e, "A node at this address would not say who it is");
+            })
+            .ok()?
+            .into_inner()
+            .node_info?;
+        Some(NodeIdentity {
+            node_id: info.node_id,
+            hostname: info.hostname,
+            uptime_seconds: info.uptime_seconds,
+        })
+    }
+
+    /// Keep the contested list bounded, for the reason the departed list is
+    /// bounded: the ids and addresses in it come from whoever holds a node
+    /// key.
+    fn trim_contested(
+        contested: &mut std::collections::BTreeMap<(String, String), ContestedNodeId>,
+    ) {
+        while contested.len() > MAX_DEPARTED_NODES {
+            let Some(oldest) = contested
+                .values()
+                .min_by_key(|node| node.last_refused_at)
+                .map(|node| (node.id.clone(), node.claimant_addr.clone()))
+            else {
+                break;
+            };
+            contested.remove(&oldest);
+            warn!(
+                node = %oldest.0,
+                claimant_addr = %oldest.1,
+                kept = MAX_DEPARTED_NODES,
+                "More than {MAX_DEPARTED_NODES} machines have been refused a node id at once, so the oldest refusal is being forgotten; if that machine is still running it will no longer be reported as unreached by a deployment or a deletion"
+            );
+        }
+    }
+
+    /// Drop every refused claim on one node id. Returns whether there was
+    /// one, so a deregistration can say it removed something.
+    fn forget_contested(&self, id: &str) -> bool {
+        let mut contested = self.contested_write();
+        let keys: Vec<(String, String)> = contested
+            .keys()
+            .filter(|(node, _)| node == id)
+            .cloned()
+            .collect();
+        for key in &keys {
+            contested.remove(key);
+        }
+        !keys.is_empty()
+    }
+
     /// Take a node off the list because it said it is going away.
     ///
     /// Returns what was done, or `None` when this control plane has never
@@ -684,10 +1053,14 @@ impl RuntimeNodeManager {
         let mut nodes = self.write();
         let Some(entry) = nodes.get(id) else {
             drop(nodes);
-            return self
-                .departed_write()
-                .remove(id)
-                .map(|_| Deregistered::Forgotten);
+            // `DELETE /api/nodes/{id}/registration` is the one lever an
+            // operator has for "that machine is really gone", so it clears
+            // both records this control plane keeps about machines it cannot
+            // reach - the lost one and the refused one - and not only the
+            // first.
+            let forgotten = self.departed_write().remove(id).is_some();
+            let uncontested = self.forget_contested(id);
+            return (forgotten || uncontested).then_some(Deregistered::Forgotten);
         };
         if entry.source == NodeSource::Configured {
             return Some(Deregistered::Configured);
@@ -698,6 +1071,7 @@ impl RuntimeNodeManager {
         // A node that says it is stopping is not a node this control plane
         // lost track of, so it leaves no record behind.
         self.departed_write().remove(id);
+        self.forget_contested(id);
         Some(Deregistered::FromFleet)
     }
 
@@ -765,6 +1139,32 @@ impl RuntimeNodeManager {
         for entry in &stale {
             self.health.remove(&entry.config.id);
         }
+
+        // A refused machine keeps registering every
+        // `registration_refresh_interval`, so a record that has gone a whole
+        // registration lifetime without another refusal is a contest that
+        // ended: one of the two machines was given a different id, or was shut
+        // down. Keeping it would name a machine that is no longer there in
+        // every deployment report, which is the same untruth in the other
+        // direction.
+        let mut contested = self.contested_write();
+        let ended: Vec<(String, String)> = contested
+            .values()
+            .filter(|record| now - record.last_refused_at > ttl)
+            .map(|record| (record.id.clone(), record.claimant_addr.clone()))
+            .collect();
+        for key in &ended {
+            contested.remove(key);
+            info!(
+                node = %key.0,
+                claimant_addr = %key.1,
+                ttl_seconds = self.registration_ttl.as_secs(),
+                "A machine has stopped claiming a node id another machine holds; after {} seconds without another attempt the contest is treated as over and deployments stop reporting it as unreached",
+                self.registration_ttl.as_secs()
+            );
+        }
+        drop(contested);
+
         stale.into_iter().map(|entry| entry.config.id).collect()
     }
 
@@ -1131,13 +1531,71 @@ pub enum NodeError {
     UnknownNode,
     #[error("transport error: {0}")]
     Transport(String),
-    #[error("rpc error: {0}")]
-    Rpc(String),
+    /// The call went out over an established connection and came back as a
+    /// status instead of an answer.
+    ///
+    /// The code is kept as a [`tonic::Code`] rather than folded into the
+    /// message: [`Self::left_the_outcome_unknown`] has to branch on it, and a
+    /// caller that had to parse it back out of a string would get it wrong the
+    /// first time the formatting changed.
+    #[error("rpc error: {code}: {message}")]
+    Rpc { code: tonic::Code, message: String },
 }
 
 impl NodeError {
     fn from_status(status: tonic::Status) -> Self {
-        NodeError::Rpc(format!("{}: {}", status.code(), status.message()))
+        NodeError::Rpc {
+            code: status.code(),
+            message: status.message().to_string(),
+        }
+    }
+
+    /// Whether this failure leaves it unknown what the node did with the call.
+    ///
+    /// The distinction only matters for a call that is **not** safe to
+    /// repeat: a cron occurrence, which charges a card or sends an email once.
+    /// For those, "the call failed" is two different events:
+    ///
+    /// * the request never reached the node, so nothing happened and another
+    ///   node may be asked; or
+    /// * the request reached the node and this process stopped listening
+    ///   before the node answered, so the handler may be running right now,
+    ///   may have finished, and asking a second node would run it again.
+    ///
+    /// `RuntimeNodeManager::channel` connects before any RPC is sent, so
+    /// [`NodeError::Transport`] is always the first case: the connection was
+    /// never established, and nothing was sent over it.
+    /// [`NodeError::UnknownNode`] never left this process at all.
+    ///
+    /// For a status the list runs the other way round - the codes named below
+    /// are the ones a node produces *before* it runs anything, and everything
+    /// else counts as unknown. That direction is deliberate: the cost of
+    /// reading "unknown" as "did not run" is a duplicated side effect, and the
+    /// cost of reading "did not run" as "unknown" is one occurrence skipped
+    /// and said out loud. A status that is not in the list, including one
+    /// invented by a future node, therefore stops the fleet walk.
+    ///
+    /// `Cancelled` is left out of the list on purpose: tonic maps the
+    /// client-side `Endpoint::timeout` elapsing to `Cancelled`, not to
+    /// `DeadlineExceeded`, so a trigger that outlived `TRIGGER_TIMEOUT`
+    /// arrives here as `Cancelled` and is exactly the case this method exists
+    /// for.
+    pub fn left_the_outcome_unknown(&self) -> bool {
+        use tonic::Code;
+        match self {
+            NodeError::UnknownNode | NodeError::Transport(_) => false,
+            NodeError::Rpc { code, .. } => !matches!(
+                code,
+                Code::Unauthenticated
+                    | Code::PermissionDenied
+                    | Code::Unimplemented
+                    | Code::InvalidArgument
+                    | Code::NotFound
+                    | Code::AlreadyExists
+                    | Code::FailedPrecondition
+                    | Code::OutOfRange
+            ),
+        }
     }
 }
 
@@ -1155,6 +1613,16 @@ mod tests {
                 .collect(),
             15,
         )
+    }
+
+    /// A live node that answers `GetStatus` at the address on file and calls
+    /// itself `node_id`.
+    fn answering_as(node_id: &str, hostname: &str) -> Option<NodeIdentity> {
+        Some(NodeIdentity {
+            node_id: node_id.to_string(),
+            hostname: hostname.to_string(),
+            uptime_seconds: 4_212,
+        })
     }
 
     fn mark_healthy(manager: &RuntimeNodeManager, id: &str, healthy: bool) {
@@ -1460,5 +1928,201 @@ mod tests {
         );
         assert_eq!(manager.ids(), vec!["from-file".to_string()]);
         assert_eq!(manager.deregister("never-seen"), None);
+    }
+
+    /// Two machines, one node id, and a fleet list with room for one entry.
+    ///
+    /// A node id is the whole of a node's identity here: the fleet list, the
+    /// health cache, the delivery fan-out and the cron rotation are all keyed
+    /// by it. A second machine registering an id the first is still answering
+    /// for used to simply move the address, after which every push went to one
+    /// of the two, was counted against one node, and came back reported as
+    /// delivered to the whole fleet - while the other machine kept serving the
+    /// previous version with the previous secrets and was never told anything
+    /// again.
+    #[tokio::test]
+    async fn a_second_machine_cannot_take_a_node_id_the_first_still_answers_for() {
+        let manager = manager(&[]);
+        let now = Utc::now();
+
+        // The first machine. Nothing holds the id, so nothing is probed.
+        let probed = std::sync::Mutex::new(Vec::<String>::new());
+        manager
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |addr| {
+                probed.lock().unwrap().push(addr);
+                async { None }
+            })
+            .await
+            .unwrap();
+        assert!(
+            probed.lock().unwrap().is_empty(),
+            "a new id takes nothing from anybody"
+        );
+
+        // The second machine, while the first is up and answering for the id.
+        let error = manager
+            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, |addr| {
+                probed.lock().unwrap().push(addr);
+                async { answering_as("node-a", "box-one") }
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            probed.into_inner().unwrap(),
+            ["http://10.0.0.7:8086"],
+            "the address on file is what gets asked who is there"
+        );
+        assert!(
+            matches!(
+                &error,
+                RegistrationError::IdHeldByAnotherMachine { holder_addr, holder_hostname }
+                    if holder_addr == "http://10.0.0.7:8086" && holder_hostname == "box-one"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            manager.node("node-a").unwrap().addr,
+            "http://10.0.0.7:8086",
+            "the machine that was answering keeps the id; nothing silently moves"
+        );
+        assert_eq!(manager.len(), 1);
+
+        // And the refused machine is on the record, so a fan-out can say it
+        // was not reached.
+        let contested = manager.contested();
+        assert_eq!(contested.len(), 1);
+        assert_eq!(contested[0].id, "node-a");
+        assert_eq!(contested[0].claimant_addr, "http://10.0.0.9:8086");
+        assert_eq!(contested[0].holder_addr, "http://10.0.0.7:8086");
+        assert!(contested[0].describe().contains("http://10.0.0.9:8086"));
+    }
+
+    /// The other side of the same check, and the one that must not regress: a
+    /// machine that really moved has to be able to take its new address, or a
+    /// node whose IP changed would never be a delivery target again.
+    #[tokio::test]
+    async fn a_node_that_really_moved_takes_its_new_address() {
+        let now = Utc::now();
+
+        // Nothing answers at the old address any more.
+        let manager = manager(&[]);
+        manager
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| async {
+                None
+            })
+            .await
+            .unwrap();
+        let outcome = manager
+            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, |_| async {
+                None
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, Registered::AddressChanged);
+        assert_eq!(manager.node("node-a").unwrap().addr, "http://10.0.0.9:8086");
+        assert!(manager.contested().is_empty());
+
+        // Something does answer at the old address, but it is a different
+        // node: the address was reused after this one moved away.
+        let manager = RuntimeNodeManager::new(Vec::new(), 15);
+        manager
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| async {
+                None
+            })
+            .await
+            .unwrap();
+        let outcome = manager
+            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, |_| async {
+                answering_as("node-b", "box-two")
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, Registered::AddressChanged);
+        assert_eq!(manager.node("node-a").unwrap().addr, "http://10.0.0.9:8086");
+        assert!(manager.contested().is_empty());
+    }
+
+    /// A refresh at the address already on file is the same machine saying it
+    /// is still there, so it must never cost a probe or be refused.
+    #[tokio::test]
+    async fn refreshing_at_the_same_address_is_never_contested() {
+        let manager = manager(&[]);
+        let now = Utc::now();
+        manager
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| async {
+                None
+            })
+            .await
+            .unwrap();
+
+        let probed = std::sync::Mutex::new(0usize);
+        let outcome = manager
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| {
+                *probed.lock().unwrap() += 1;
+                async { answering_as("node-a", "box-one") }
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, Registered::Refreshed);
+        assert_eq!(probed.into_inner().unwrap(), 0);
+        assert!(manager.contested().is_empty());
+    }
+
+    /// The record has to end when the contest does, or a machine that was
+    /// corrected months ago would be named as unreached by every deploy for
+    /// ever - the same untruth in the other direction.
+    #[tokio::test]
+    async fn a_claim_that_stops_coming_stops_being_reported() {
+        let manager = RuntimeNodeManager::new_with_ttl(Vec::new(), 15, 90);
+        let start = Utc::now();
+        manager
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, start, |_| async {
+                None
+            })
+            .await
+            .unwrap();
+        manager
+            .register_claim_with("node-a", "http://10.0.0.9:8086", None, start, |_| async {
+                answering_as("node-a", "box-one")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(manager.contested().len(), 1);
+
+        // Still inside the registration lifetime: the claimant may simply not
+        // have come back round yet.
+        manager.expire_stale_registrations(start + chrono::Duration::seconds(89));
+        assert_eq!(manager.contested().len(), 1);
+
+        manager.expire_stale_registrations(start + chrono::Duration::seconds(91));
+        assert!(manager.contested().is_empty());
+    }
+
+    /// `DELETE /api/nodes/{id}/registration` is the one lever an operator has
+    /// for "that machine is really gone", and it has to clear both records
+    /// this control plane keeps about machines it cannot reach.
+    #[tokio::test]
+    async fn clearing_a_registration_also_clears_a_refused_claim() {
+        let manager = manager(&[]);
+        let now = Utc::now();
+        manager
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| async {
+                None
+            })
+            .await
+            .unwrap();
+        manager
+            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, |_| async {
+                answering_as("node-a", "box-one")
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(manager.deregister("node-a"), Some(Deregistered::FromFleet));
+        assert!(
+            manager.contested().is_empty(),
+            "the holder was taken off the fleet, so the refusal it caused is over too"
+        );
     }
 }

@@ -156,11 +156,19 @@ pub struct VendorsConfig {
     pub deislet: Option<VendorConfig>,
 }
 
+/// Whether a project builds for one of the vendor targets.
+///
+/// One field, for the reason [`ServiceConfig`] has one: this used to carry a
+/// free-form `options` map as well, and nothing in the workspace ever looked at
+/// it. An adapter reads the project configuration directly - the Cloudflare one
+/// reads `name`, `services` and `compatibilityDate` - so an `options` bag was a
+/// place to write settings that reached no adapter and changed no output. A
+/// knob an author can turn that moves nothing is worse than no knob. Unknown
+/// keys in the project file are still accepted, so a config that carries the
+/// old map does not fail to parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VendorConfig {
     pub enabled: bool,
-    #[serde(default)]
-    pub options: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Where the project's static files live, and what happens to a path none of
@@ -219,16 +227,32 @@ pub struct QueueConsumerConfig {
     pub max_concurrency: Option<u32>,
 }
 
+/// What the build does with the code, as the project asks for it.
+///
+/// Each field is also askable from the command line where a command line makes
+/// sense, and the two combine by "either one saying no is a no": `--no-minify`
+/// is a flag with nothing to say when it is absent, and [`Self::minify`]
+/// defaults to on, so neither can force minification on against the other.
+///
+/// This block used to carry a `target` string - an ECMAScript level - and
+/// nothing read it: the bundler is handed a platform, not a language level, and
+/// every target this compiler builds for runs a current V8. An author who wrote
+/// `"target": "es2015"` got exactly the output of one who wrote nothing.
+/// Unknown keys are still accepted, so a config that carries it still parses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildConfig {
     #[serde(rename = "outDir", default = "default_out_dir")]
     pub out_dir: String,
+    /// Whether to minify the bundled entry module. Read in
+    /// `deis_build::compiler`, which passes it to `BuildBundler::minified`.
     #[serde(default = "default_true")]
     pub minify: bool,
+    /// Whether the bundled entry module carries a source map. The map goes
+    /// inside the module as a data URL rather than beside it as a `.map` file:
+    /// every target here deploys a single module, so a second file would be
+    /// left behind and the module would point at nothing.
     #[serde(default = "default_true")]
     pub sourcemap: bool,
-    #[serde(default)]
-    pub target: Option<String>,
 }
 
 fn default_out_dir() -> String {
@@ -351,6 +375,31 @@ mod tests {
         assert!(config.queues.is_empty());
         assert!(config.compatibility_date.is_none());
         assert!(config.compatibility_flags.is_empty());
+    }
+
+    #[test]
+    fn a_config_with_the_removed_build_target_still_parses() {
+        // The key named an ECMAScript level and reached no bundler: an author
+        // who set it got the same output as one who did not. Dropping it from
+        // the struct must not be a parse error, or a project that wrote it
+        // stops building.
+        let mut json = minimal();
+        json["build"] = serde_json::json!({ "outDir": "./out", "target": "es2015" });
+        let config = parse(json);
+        let build = config.build.expect("the build block parses");
+        assert_eq!(build.out_dir, "./out");
+        assert!(build.minify, "the defaults are unchanged");
+        assert!(build.sourcemap);
+    }
+
+    #[test]
+    fn a_config_with_the_removed_vendor_options_still_parses() {
+        let mut json = minimal();
+        json["vendors"] = serde_json::json!({
+            "cloudflare": { "enabled": true, "options": { "anything": 1 } }
+        });
+        let config = parse(json);
+        assert!(config.vendors.unwrap().cloudflare.unwrap().enabled);
     }
 
     #[test]

@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
-use rolldown::{Bundler, BundlerOptions, InputItem, OutputFormat, Platform};
+use anyhow::{bail, Result};
+use rolldown::{
+    Bundler, BundlerOptions, CodeSplittingMode, InputItem, OutputFormat, Platform,
+    RawMinifyOptions, SourceMapType,
+};
 use rolldown_common::Output;
 
 pub enum TargetPlatform {
@@ -36,6 +39,19 @@ impl BuildBundler {
             }]),
             platform: platform_opt,
             format,
+            // Every target this compiler serves takes exactly one module: the
+            // deislet bundle names a single `worker/index.js` in its manifest,
+            // a Worker names one `main`, an EdgeOne function is one file. There
+            // is nowhere for a second chunk to live, and nothing that would
+            // upload it.
+            //
+            // Left on its default, rolldown splits a `import()` out into its
+            // own chunk and hoists a module two chunks share into a third, and
+            // the entry then names them - `import { x } from "./m-C9Nc6.js"`.
+            // Only the entry was ever carried, so the application shipped,
+            // deployed, and answered nothing. Inlining is what makes "one
+            // chunk" true rather than merely asserted below.
+            code_splitting: Some(CodeSplittingMode::Bool(false)),
             ..Default::default()
         };
 
@@ -55,43 +71,136 @@ impl BuildBundler {
         self
     }
 
+    /// Whether to minify the bundled module.
+    ///
+    /// The project's `build.minify` and the CLI's `--no-minify`; see
+    /// `deis_build_core::config::BuildConfig`.
+    pub fn minified(mut self, minify: bool) -> Self {
+        self.options.minify = Some(RawMinifyOptions::Bool(minify));
+        self
+    }
+
+    /// Whether to carry a source map for the bundled module.
+    ///
+    /// The map goes *inside* the module, as a `sourceMappingURL` data URL,
+    /// rather than beside it as `index.js.map`. A separate file is a second
+    /// output, and a second output is precisely what none of these targets can
+    /// carry: the deislet manifest names one entry, so a `.map` written next to
+    /// it would be left out of the archive and the module would point at a file
+    /// nobody shipped - the same failure the chunk splitting above used to
+    /// cause. Inline, the map travels with the code it describes or not at all.
+    pub fn with_source_map(mut self, source_map: bool) -> Self {
+        self.options.sourcemap = source_map.then_some(SourceMapType::Inline);
+        self
+    }
+
     /// Bundle without touching the filesystem.
     ///
-    /// [`Self::bundle`] writes the chunks to the output directory as a side
-    /// effect of asking for them. A target that packs the result into an
-    /// archive does not want those loose files: they would be left behind
-    /// next to the archive, stale from the moment the next build ran.
+    /// Rolldown's own `write()` puts the chunks in `dist/` relative to the
+    /// *process's* working directory rather than the project's output
+    /// directory, so asking it to write dropped a stray `dist/index.js`
+    /// wherever the build was launched from. Taking the string and letting the
+    /// caller do the writing is the same output with nothing left behind, and
+    /// it is what lets Memory mode keep its promise.
     pub async fn generate(&self) -> Result<String> {
         let mut bundler = Bundler::new(self.options.clone())?;
         let result = bundler.generate().await?;
-        Ok(Self::join_js_chunks(result.assets))
+        Self::single_js_chunk(result.assets)
     }
 
-    pub async fn bundle(&self) -> Result<String> {
-        let mut bundler = Bundler::new(self.options.clone())?;
-        let result = bundler.write().await?;
-        Ok(Self::join_js_chunks(result.assets))
-    }
-
-    fn join_js_chunks(assets: Vec<Output>) -> String {
-        let mut code = String::new();
+    /// The one module the bundler was asked for, or an explanation of what else
+    /// it produced.
+    ///
+    /// This used to concatenate every chunk into one string, which was worse
+    /// than dropping them. The entry's `import { n } from "./report-C9Nc6.js"`
+    /// survived the concatenation, so the file that shipped both imported a
+    /// chunk no archive carried *and* redeclared every binding that chunk
+    /// defined - a module that fails to parse, inside an application the build
+    /// called successful.
+    ///
+    /// Splitting is off (see [`Self::new`]), so reaching the `bail!`s below
+    /// means the bundler found some other reason to emit a second file - an
+    /// asset a module referenced, a chunk a future option asked for. Refusing
+    /// names the file and stops the build; the alternative is shipping an
+    /// application whose only symptom is that it serves nothing.
+    fn single_js_chunk(assets: Vec<Output>) -> Result<String> {
+        let mut entry: Option<(String, Vec<String>)> = None;
+        let mut extra_chunks: Vec<String> = Vec::new();
+        let mut emitted_assets: Vec<String> = Vec::new();
 
         for asset in assets {
             match asset {
                 Output::Chunk(chunk) => {
-                    if chunk.filename.as_str().ends_with(".js")
-                        || chunk.filename.as_str().ends_with(".mjs")
-                    {
-                        code.push_str(&chunk.code);
-                        code.push('\n');
+                    let filename = chunk.filename.as_str().to_string();
+                    if chunk.is_entry && entry.is_none() {
+                        // A dynamic import that was inlined leaves the chunk
+                        // naming *itself*, which is resolved by definition. Only
+                        // the specifiers pointing somewhere else are unfinished
+                        // business.
+                        let mut outstanding: Vec<String> = chunk
+                            .imports
+                            .iter()
+                            .chain(chunk.dynamic_imports.iter())
+                            .map(|specifier| specifier.as_str().to_string())
+                            .filter(|specifier| *specifier != filename)
+                            .collect();
+                        outstanding.sort();
+                        outstanding.dedup();
+                        entry = Some((chunk.code.clone(), outstanding));
+                    } else {
+                        extra_chunks.push(filename);
                     }
                 }
-                Output::Asset(_) => {
-                    // Ignore assets for code bundle
-                }
+                Output::Asset(asset) => emitted_assets.push(asset.filename.as_str().to_string()),
             }
         }
 
-        code
+        if !extra_chunks.is_empty() {
+            extra_chunks.sort();
+            bail!(
+                "the bundler split this application into {} module(s) besides the entry ({}); the \
+                 entry imports them by name and no target this compiler builds for can carry a \
+                 second file, so the application would deploy and answer nothing",
+                extra_chunks.len(),
+                extra_chunks.join(", ")
+            );
+        }
+
+        if !emitted_assets.is_empty() {
+            emitted_assets.sort();
+            bail!(
+                "the bundler emitted {} file(s) beside the entry module ({}); the entry references \
+                 them by name and no target this compiler builds for can carry them, so the \
+                 application would deploy with those references pointing at nothing",
+                emitted_assets.len(),
+                emitted_assets.join(", ")
+            );
+        }
+
+        let Some((code, outstanding)) = entry else {
+            bail!(
+                "the bundler produced no entry module; there is nothing to deploy and nothing to \
+                 report about why"
+            )
+        };
+
+        // Anything the entry still imports is a module the bundler could not
+        // resolve and left as an external. Nothing carries it: deis-runtime
+        // loads `worker/index.js` on its own with no resolver, and the Worker
+        // and EdgeOne targets are handed one pre-bundled file too. A handler
+        // that wrote `import { v4 } from "uuid"` therefore built, packed,
+        // uploaded and deployed, and then failed to load - the same failure as
+        // a dropped chunk, reached through a missing dependency instead.
+        if !outstanding.is_empty() {
+            bail!(
+                "the bundled entry still imports {} module(s) it could not resolve ({}); nothing \
+                 carries them to the target, so the application would deploy and fail to load. \
+                 Vendor the dependency into the project, or drop the import",
+                outstanding.len(),
+                outstanding.join(", ")
+            );
+        }
+
+        Ok(code)
     }
 }

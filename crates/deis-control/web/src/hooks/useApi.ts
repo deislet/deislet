@@ -5,9 +5,14 @@ import type { Command } from '@/lib/api'
 // Every request below goes through `api.request` rather than a bare `fetch`.
 // These hooks used to call `fetch` directly, which meant they sent no
 // `X-API-Key`: with `api_auth_enabled = true` the whole dashboard answered 401
-// on every poll, and lib/api.ts's 401 handler bounced the user back to a login
-// page that was itself polling. One request layer, one place that carries the
-// key and handles a 401.
+// on every poll. One request layer, one place that carries the key and handles
+// a 401.
+//
+// These hooks never mount without a credential the control plane has already
+// accepted: App.tsx asks one question before it renders them and shows the key
+// screen instead when the answer is 401 (see `Access` there). That is what
+// stops the five intervals below from polling a control plane that is refusing
+// all of them.
 
 /**
  * Read a list out of a response that may be either `{ <key>: [...] }` or a

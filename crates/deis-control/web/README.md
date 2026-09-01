@@ -20,6 +20,36 @@ answers normally and the dashboard pages return 404, and the build prints a
 warning saying so. To get the dashboard, run `npm run build` here and rebuild
 the crate.
 
+## Getting in: the credential
+
+The console has no session of its own. Every call it makes carries the API key
+as `X-API-Key`, kept in this browser's `localStorage` and nowhere else.
+
+Which screen you land on is decided by one question the app asks before it
+renders anything: `GET /api/metrics/summary`.
+
+- **401** — the control plane has `api_auth_enabled = true` and wants a
+  credential, so `src/pages/SignIn.tsx` asks for one. The key is spent on a
+  real call before it is committed, so a wrong paste is reported as a refused
+  key rather than as a dashboard that will not load.
+- **anything else** — straight in. With `api_auth_enabled` off, a caller on
+  the machine the control plane runs on is admitted with no credential at all,
+  and there is no token to ask anyone for; a key screen there would be a
+  locked door with no key cut for it. A 403 or an unreachable control plane
+  also goes straight in, because those are conditions the pages themselves
+  report.
+
+A 401 arriving later — a revoked key, or one dropped from `api_keys` and the
+control plane restarted — drops the stored key and shows the key screen again.
+It does **not** navigate. It used to: `lib/api.ts` answered every 401 with
+`window.location.href = "/"`, which reloads the console, which starts polling
+five endpoints, which answer 401. With `api_auth_enabled = true` and no key
+stored, one tab left open on the console reloaded itself continuously and put
+1273 refused calls into a control plane in 105 seconds while rendering nothing
+a person could type a key into. The 401 is an event now
+(`api.onUnauthorized`), and the sign-out button in the sidebar goes through
+the same path so there is one way out of a session rather than two.
+
 ## Working on it
 
 ```bash
@@ -35,12 +65,15 @@ part of it on purpose, so a type error stops the build rather than shipping.
 ## Where things live
 
 - `src/pages/` — one file per route: Dashboard, Nodes, Commands, Configs,
-  Events.
+  Events, plus `SignIn.tsx`, which is not a route: `App.tsx` renders it
+  *instead of* the router, so the polling hooks never mount without a
+  credential the control plane has already accepted.
 - `src/hooks/useApi.ts` — the polling hooks the pages read from. The dashboard
   polls; there is no server push, and there is no WebSocket endpoint to
   subscribe to.
-- `src/lib/api.ts` — the typed request layer, including the `X-API-Key` header
-  and the 401 handling.
+- `src/lib/api.ts` — the typed request layer: the `X-API-Key` header, the
+  401 handling, and `onUnauthorized` / `signOut`, which are how a refusal
+  reaches `App.tsx` without a page load.
 - `src/components/ui/` — shadcn/ui components, generated and then owned here.
 
 ## Two names that are not interchangeable

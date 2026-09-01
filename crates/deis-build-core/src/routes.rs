@@ -17,6 +17,35 @@
 //! `deis_bundle::Route::pattern` and in `RouteRule.pattern` on the wire, so a
 //! pattern derived here can go straight into a bundle manifest.
 
+/// Where the compiler stages a handler, as the generated entry module reaches
+/// it.
+///
+/// Every handler under the function root is copied into `src/` of the build
+/// directory and the generated entry module is written into `_deis_internal/`,
+/// so the entry imports a handler as `../src/<path under the function root>`.
+/// The constant lives here rather than in either half because both halves read
+/// it: the compiler builds the specifier, and the deislet route planner takes
+/// it apart again to find out whether a file sits *at* the function root.
+pub const STAGED_HANDLER_PREFIX: &str = "../src/";
+
+/// The handler's path under the function root, recovered from the specifier the
+/// compiler built with [`STAGED_HANDLER_PREFIX`].
+///
+/// `strip_prefix`, once, and deliberately not `trim_start_matches`: that strips
+/// the prefix as many times as it appears, so `../src/src/_queue.ts` - an
+/// ordinary file in an ordinary directory called `src` - came back as
+/// `_queue.ts` and was read as a file at the function root. The platform
+/// handlers are named by position, so that quietly turned an author's page into
+/// the whole application's queue consumer and dropped its route.
+///
+/// A specifier that does not carry the prefix is returned unchanged: it did not
+/// come from the staging convention, so there is nothing to take off it.
+pub fn staged_handler_path(import_path: &str) -> &str {
+    import_path
+        .strip_prefix(STAGED_HANDLER_PREFIX)
+        .unwrap_or(import_path)
+}
+
 /// Extensions a handler file may carry. Anything else keeps its suffix, since
 /// stripping an unknown one would silently route `report.tar.gz` as `report`.
 const HANDLER_EXTENSIONS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
@@ -186,6 +215,24 @@ mod tests {
             vec!["org".to_string(), "repo".to_string(), "*".to_string()]
         );
         assert!(placeholder_names("/api/hello").is_empty());
+    }
+
+    #[test]
+    fn a_directory_called_src_is_an_ordinary_directory() {
+        // The staging prefix is taken off once. Stripped repeatedly,
+        // `functions/src/_queue.ts` came back as `_queue.ts`, which is the
+        // spelling reserved for the application's own queue consumer.
+        assert_eq!(staged_handler_path("../src/_queue.ts"), "_queue.ts");
+        assert_eq!(staged_handler_path("../src/src/_queue.ts"), "src/_queue.ts");
+        assert_eq!(
+            staged_handler_path("../src/src/src/index.ts"),
+            "src/src/index.ts"
+        );
+    }
+
+    #[test]
+    fn a_specifier_without_the_staging_prefix_is_left_alone() {
+        assert_eq!(staged_handler_path("./index.ts"), "./index.ts");
     }
 
     #[test]

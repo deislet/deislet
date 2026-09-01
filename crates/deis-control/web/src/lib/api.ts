@@ -2,8 +2,8 @@
  * Control API Client
  *
  * Single entry point for every dashboard API call. It provides:
- * - bearer token authentication
- * - automatic handling of a 401 by clearing the key and returning to login
+ * - API-key authentication
+ * - one place that reacts to a 401, by dropping the key and telling the app
  * - uniform error handling
  */
 
@@ -16,6 +16,33 @@ export class ApiError extends Error {
     super(message);
     this.status = status;
     this.name = "ApiError";
+  }
+}
+
+/**
+ * Whoever wants to know that the control plane refused the stored key.
+ *
+ * A 401 used to be answered with `window.location.href = "/"`. That is a full
+ * page load of the console itself, and the console starts polling five
+ * endpoints the moment it mounts - so with `api_auth_enabled = true`, which is
+ * the posture an operator is told to run, the first poll answered 401, the tab
+ * reloaded, the poll ran again, and the console reloaded itself for as long as
+ * it was open. Nothing was ever rendered that a person could put a key into,
+ * and the control plane took a fresh round of requests every reload for as
+ * long as the tab was left there.
+ *
+ * So a 401 is an event now. The key is dropped, the listeners are told, and
+ * nothing navigates: the app decides what to show, which is the one screen
+ * that can get the console out of this state.
+ */
+type UnauthorizedListener = () => void;
+
+const unauthorizedListeners = new Set<UnauthorizedListener>();
+
+function announceUnauthorized(): void {
+  // A copy, because a listener may unsubscribe itself while being told.
+  for (const listener of [...unauthorizedListeners]) {
+    listener();
   }
 }
 
@@ -39,6 +66,27 @@ export const api = {
    */
   removeToken: (): void => {
     localStorage.removeItem("apiKey");
+  },
+
+  /**
+   * Listen for the control plane refusing the stored key. Returns the
+   * function that stops listening, so a React effect can return it directly.
+   */
+  onUnauthorized: (listener: UnauthorizedListener): (() => void) => {
+    unauthorizedListeners.add(listener);
+    return () => {
+      unauthorizedListeners.delete(listener);
+    };
+  },
+
+  /**
+   * Put the key down deliberately, and take the console back to the key
+   * screen. The same path a refusal takes, so there is one way out of an
+   * authenticated session rather than two that can drift apart.
+   */
+  signOut: (): void => {
+    api.removeToken();
+    announceUnauthorized();
   },
 
   /**
@@ -68,10 +116,12 @@ export const api = {
         headers,
       });
 
-      // Unauthenticated: drop the stale key and send the user back to login
+      // Unauthenticated: drop the stale key and tell the app, which shows the
+      // screen that can replace it. Deliberately no navigation - see
+      // `unauthorizedListeners` above for the reload loop that was.
       if (res.status === 401) {
         api.removeToken();
-        window.location.href = "/";
+        announceUnauthorized();
         throw new ApiError(401, "Unauthorized");
       }
 

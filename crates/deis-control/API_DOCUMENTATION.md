@@ -1187,6 +1187,27 @@ curl -H "Authorization: Bearer $DEIS_TOKEN" http://localhost:8080/api/metrics
   node kept serving the old version. A node clears itself by registering
   again; `DELETE /api/nodes/{id}/registration` clears one whose machine is
   really gone, and now answers `200` for such an id instead of `404`
+- `GET /api/runtime` answers with a third array, `contested`: machines that
+  registered a node id another machine was still answering for. Two machines
+  under one id used to be one node here - the fleet list moved to whichever
+  address had registered last, so a deploy went to one of them, was counted
+  against one entry and came back reporting the whole fleet as delivered while
+  the other machine went on serving the previous version. `PUT
+  /api/nodes/{id}/registration` now asks the address already on file who is
+  there, and answers `409` to a claim on an id a live node still holds. Those
+  machines are named in the `failed` array of every deployment answer and of
+  `DELETE /api/apps/{app_id}`, beside the lost ones. A record clears itself
+  when the claim stops coming for a whole `node_registration_ttl_secs`, or with
+  `DELETE /api/nodes/{id}/registration`
+- `DELETE /api/runtime/{node}/apps/{app_id}` answers `409` while the catalog
+  still deploys that application, and sends nothing to the node. The unload is
+  node-local and writes nothing to the catalog, so the node's next assignment
+  reconcile loaded the application straight back - the call reported `200
+  {"success": true}` for a change that undid itself within one refresh
+  interval. The answer names what is still deployed and points at `DELETE
+  /api/apps/{app_id}`, which does take the application off the fleet. The
+  endpoint still works for an application the catalog no longer names and a
+  node is still running, which is the case it is for
 
 ### v0.1.0 (2026-01-11)
 - Initial release

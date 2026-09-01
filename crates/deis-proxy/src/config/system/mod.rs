@@ -20,7 +20,10 @@ pub use acme::AcmeConfig;
 pub use balancing::BalancingStrategy;
 pub use cache::CacheConfig;
 pub use compression::{CompressionAlgo, CompressionConfig};
-pub use health::{HealthCheckConfig, HealthCheckMode};
+pub use health::{
+    HealthCheckConfig, HealthCheckMode, NODE_READINESS_HEADER, READINESS_DEGRADED, READINESS_READY,
+    READINESS_STARTING, ReadinessPolicy, ReadinessVerdict, judge_readiness,
+};
 pub use https::HttpsConfig;
 pub use log::*;
 pub use routing::RoutingConfig;
@@ -37,16 +40,24 @@ pub const DEFAULT_UPGRADE_SOCK: &str = "/tmp/deis_proxy_upgrade.sock";
 ///
 /// `struct sockaddr_un` on Linux holds the path in a fixed `char sun_path[108]`
 /// that has to end in a NUL, so 107 bytes is the whole address space a Unix
-/// socket has. It is checked here rather than left to `bind()` because the
-/// only process that binds this path is the replacement started for an
-/// upgrade: pingora's `get_fds_from` calls `UnixAddr::new(path).unwrap()`, so
-/// a path one byte too long is a panic in the one process the running one is
-/// about to hand its listeners to. Refusing the configuration at startup
-/// turns "the next upgrade is an outage" into "this instance does not start".
+/// socket has. A path one byte longer is `ENAMETOOLONG`, and pingora reaches
+/// it through `UnixAddr::new(path).unwrap()` inside `get_fds_from`, so for the
+/// replacement started by an upgrade it is a panic rather than an error.
+///
+/// The rule is enforced by [`check_upgrade_socket_path`], not here, and it is
+/// deliberately not a reason to refuse the configuration. An over-long path
+/// costs this instance nothing but the ability to be replaced without an
+/// outage, and it can no longer cost even that: the replacement proves the
+/// path bindable *before* it reports itself ready, so the running process is
+/// never signalled for a replacement that would panic. What is left is a
+/// failed upgrade, which is a warning; a proxy that refuses to serve because
+/// its deployment directory has a long name is not.
 ///
 /// [`SystemConfig::resolve_paths`] makes relative paths absolute, so the
-/// length that matters is the resolved one; this is checked after that step,
-/// on the merged configuration.
+/// length that matters is the resolved one, which is what
+/// [`check_upgrade_socket_path`] is given at startup.
+///
+/// [`check_upgrade_socket_path`]: crate::restart::check_upgrade_socket_path
 pub const MAX_UPGRADE_SOCK_PATH_LEN: usize = 107;
 /// SQLite database holding application configurations.
 pub const DEFAULT_DATABASE: &str = "sites.db";
@@ -242,6 +253,44 @@ impl SystemConfig {
             .unwrap_or_default()
     }
 
+    /// Every address this instance listens on, spelled exactly as it is
+    /// handed to pingora.
+    ///
+    /// One function rather than the same `format!` at each call site, because
+    /// the spelling is load-bearing twice over. Pingora keys its table of
+    /// inherited descriptors by this string, so a replacement only takes over
+    /// a listener whose address it spells the same way the old process did;
+    /// and [`crate::restart::prove_listeners_bindable`] proves these addresses
+    /// bindable before an upgrade commits, which is only a proof of the right
+    /// thing if it is proving the addresses that will actually be bound.
+    ///
+    /// Plain HTTP first, then TLS, in the order they are added as services.
+    pub fn listen_addresses(&self) -> Vec<String> {
+        self.listen_addresses_by_kind()
+            .into_iter()
+            .map(|(address, _)| address)
+            .collect()
+    }
+
+    /// As [`Self::listen_addresses`], paired with whether the listener
+    /// terminates TLS.
+    ///
+    /// The flag travels with the address rather than being worked out from it
+    /// again at the call site: reading `:443` back out of the string to decide
+    /// would be a second, weaker copy of a fact this function already knows.
+    pub fn listen_addresses_by_kind(&self) -> Vec<(String, bool)> {
+        let mut addresses = Vec::new();
+        for addr in self.listen_addrs() {
+            for port in self.listen_ports() {
+                addresses.push((format!("{addr}:{port}"), false));
+            }
+            for port in self.tls_ports() {
+                addresses.push((format!("{addr}:{port}"), true));
+            }
+        }
+        addresses
+    }
+
     /// The ACME settings if automatic certificates are switched on.
     ///
     /// One accessor rather than three `and_then` chains at the call sites:
@@ -363,26 +412,6 @@ impl Validatable for SystemConfig {
         {
             return Err(ConfigError::ValidationError {
                 message: "worker_threads must be at least 1".to_string(),
-            });
-        }
-        // Checked on every layer, but the one that decides is the merged and
-        // resolved configuration: `resolve_paths` turns a relative
-        // `upgrade_sock` into an absolute one, which only ever makes it
-        // longer.
-        if let Some(sock) = &self.upgrade_sock
-            && sock.len() > MAX_UPGRADE_SOCK_PATH_LEN
-        {
-            return Err(ConfigError::ValidationError {
-                message: format!(
-                    "upgrade_sock is {} bytes ({sock}) but a Unix socket address holds at most \
-                     {MAX_UPGRADE_SOCK_PATH_LEN}. A relative path is resolved against the \
-                     working directory before this is measured, so shorten the path or \
-                     move it under a shorter directory. Left as it is, this instance \
-                     starts and serves, and the next zero-downtime upgrade is a full \
-                     outage: the replacement panics on the over-long address after the \
-                     running process has already been told to hand over its listeners",
-                    sock.len()
-                ),
             });
         }
         if let Some(tls) = &self.tls {
@@ -586,18 +615,23 @@ ports = [443]
     }
 
     #[test]
-    fn an_upgrade_socket_longer_than_an_address_is_refused() {
+    fn an_upgrade_socket_longer_than_an_address_does_not_refuse_the_configuration() {
+        // It used to. An over-long path stops this instance being replaced
+        // without an outage; it does not stop it serving, and since the
+        // replacement proves the path bindable before it reports ready, it no
+        // longer costs even the outage. Refusing here made the length of a
+        // deployment directory a reason not to start at all - which is how
+        // `demo.sh start` began producing a proxy that exited. The rule lives
+        // in `restart::check_upgrade_socket_path`, which the startup path
+        // warns on and the replacement refuses on.
         let sock = format!("/tmp/{}.sock", "x".repeat(MAX_UPGRADE_SOCK_PATH_LEN));
         let config = SystemConfig {
             upgrade_sock: Some(sock),
             ..Default::default()
         };
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("upgrade_sock"), "{err}");
-        assert!(
-            err.contains(&MAX_UPGRADE_SOCK_PATH_LEN.to_string()),
-            "the refusal has to name the limit so an operator knows how much to cut: {err}"
-        );
+        config
+            .validate()
+            .expect("a long upgrade_sock is a warning at startup, not a refusal");
     }
 
     #[test]
@@ -605,12 +639,10 @@ ports = [443]
         // The shape that got past every earlier check: short in the file,
         // over the limit once `resolve_paths` has made it absolute. Which is
         // the only length that matters, because it is the one that reaches
-        // `bind()`.
+        // `bind()`, so it is the resolved value that has to be handed to the
+        // check.
         let base = PathBuf::from(format!("/srv/{}", "d".repeat(90)));
         let local: SystemConfig = toml::from_str("upgrade_sock = \"run/upgrade.sock\"\n").unwrap();
-        local
-            .validate()
-            .expect("the relative path on its own is well under the limit");
 
         let mut merged = SystemConfig::baseline() + local;
         merged.resolve_paths(&base);
@@ -618,8 +650,14 @@ ports = [443]
             merged.upgrade_sock().len() > MAX_UPGRADE_SOCK_PATH_LEN,
             "the fixture is not long enough to exercise anything"
         );
-        let err = merged.validate().unwrap_err().to_string();
-        assert!(err.contains("upgrade_sock"), "{err}");
+        let said = crate::restart::check_upgrade_socket_path(merged.upgrade_sock())
+            .expect_err("the resolved path is over the limit")
+            .to_string();
+        assert!(said.contains("upgrade_sock"), "{said}");
+        assert!(
+            said.contains(&MAX_UPGRADE_SOCK_PATH_LEN.to_string()),
+            "the message has to name the limit so an operator knows how much to cut: {said}"
+        );
     }
 
     #[test]

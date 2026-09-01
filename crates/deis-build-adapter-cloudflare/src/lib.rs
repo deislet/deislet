@@ -13,11 +13,20 @@
 /// if they ever stop agreeing.
 pub const VENDOR: &str = "cloudflare";
 
-use deis_build_core::{AdapterArtifacts, ProjectConfig};
+use deis_build_core::{AdapterArtifacts, ProjectConfig, StaticAsset};
+
+/// Where the compiler stages this project's static files inside the Cloudflare
+/// output directory, and what `wrangler.toml` points at.
+///
+/// One constant, because the two have to be the same directory: wrangler serves
+/// whatever `[assets] directory` names and nothing else, so a copy that landed
+/// anywhere else would be uploaded as inert weight.
+pub const ASSETS_DIR: &str = "assets";
 
 pub fn generate(
     routes: &[(String, String)],
     config: &ProjectConfig,
+    assets: &[StaticAsset],
 ) -> anyhow::Result<AdapterArtifacts> {
     let has_kv = config
         .services
@@ -50,22 +59,65 @@ pub fn generate(
     let mut config_files = Vec::new();
 
     // wrangler.toml
+    //
+    // Everything in it comes from the project file. Three things used to be
+    // invented here instead, and all three were wrong in the same way - the
+    // author read them back as their own:
+    //
+    //   * `compatibility_date = "2024-09-23"`, a fixed day, whatever date the
+    //     project pinned. A compatibility date is the whole mechanism for
+    //     deciding which of a runtime's behaviours an application gets, so an
+    //     author who pinned 2026-09-01 and deployed to Cloudflare was running
+    //     under semantics two years older than the ones they tested against.
+    //   * `compatibility_flags = ["nodejs_compat"]`, which nobody wrote. It
+    //     turns on Node built-ins in the Worker; the bundler here targets the
+    //     browser platform and emits no Node imports, so it bought nothing and
+    //     was never asked for.
+    //   * `[env.staging]` and `[env.production]` with `route =
+    //     "<name>.workers.dev"`. `route` binds a Worker to a hostname on a zone
+    //     the account controls, and `workers.dev` is not one of those, so the
+    //     two blocks named deployment environments the author never declared
+    //     and pointed them at routes that cannot be taken.
+    let compatibility_date = config.compatibility_date.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the cloudflare target needs a compatibility date and this project pins none. wrangler \
+             requires `compatibility_date` to deploy a Worker, and this build will not choose one on \
+             your behalf: a date filled in by the build would move on its own, so the same unchanged \
+             source would run under different semantics the next time it was built. Add \
+             \"compatibilityDate\": \"YYYY-MM-DD\" to .config.json"
+        )
+    })?;
+    if !config.compatibility_flags.is_empty() {
+        return Err(anyhow::anyhow!(
+            "this project declares the compatibility flag(s) {:?}, which name behaviours of this \
+             platform (`deis_bundle::compatibility::FLAGS`) and mean nothing to Cloudflare Workers, \
+             whose flags are its own. Carrying them over would produce a wrangler.toml wrangler \
+             refuses, and dropping them would build a Worker that behaves differently from the one \
+             you pinned. Remove the flags, or drop `cloudflare` from `vendors`",
+            config.compatibility_flags
+        ));
+    }
+
     let wrangler_toml = format!(
         r#"name = "{}"
 main = "index.js"
-compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
-
-[env.staging]
-route = "staging.{}.workers.dev"
-
-[env.production]
-route = "{}.workers.dev"
-{}{}
-"#,
+compatibility_date = "{compatibility_date}"
+{}{}{}"#,
         config.name,
-        config.name,
-        config.name,
+        if assets.is_empty() {
+            String::new()
+        } else {
+            // What makes wrangler upload and serve the project's static files.
+            // Without it the directory is deployed and never looked at, which
+            // is what happened to every Cloudflare build before this: the files
+            // were not even copied.
+            format!(
+                r#"
+[assets]
+directory = "./{ASSETS_DIR}"
+"#
+            )
+        },
         if has_kv {
             r#"
 [[kv_namespaces]]

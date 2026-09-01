@@ -96,12 +96,16 @@ pub async fn register(
     Path(node_id): Path<String>,
     Json(request): Json<RegisterRequest>,
 ) -> impl IntoResponse {
-    let outcome = match state.nodes.register(
-        &node_id,
-        &request.address,
-        request.version.clone(),
-        Utc::now(),
-    ) {
+    let outcome = match state
+        .nodes
+        .register_claim(
+            &node_id,
+            &request.address,
+            request.version.clone(),
+            Utc::now(),
+        )
+        .await
+    {
         Ok(outcome) => outcome,
         Err(e) => {
             warn!(
@@ -115,6 +119,11 @@ pub async fn register(
                     StatusCode::BAD_REQUEST
                 }
                 RegistrationError::InvalidAddress { .. } => StatusCode::BAD_REQUEST,
+                // Not the caller's request being malformed: the request is
+                // fine and the name in it belongs to somebody else. 409 is
+                // what a node's own log needs to show, because the operator
+                // reading it has to change a node id on one of two machines.
+                RegistrationError::IdHeldByAnotherMachine { .. } => StatusCode::CONFLICT,
             };
             return (status, Json(json!({ "error": e.to_string() }))).into_response();
         }
@@ -141,7 +150,7 @@ pub async fn register(
         Registered::AddressChanged => warn!(
             node = %node_id,
             address = %request.address,
-            "A known node registered at a different address; every management call now goes to the new one, and anything still listening at the old address receives nothing"
+            "A known node registered at a different address and the address it had was asked first: nothing answers there for this node any more, so the move is real. Every management call now goes to the new address"
         ),
         Registered::Refreshed => tracing::debug!(
             node = %node_id,

@@ -13,11 +13,21 @@
 /// if they ever stop agreeing.
 pub const VENDOR: &str = "deno";
 
-use deis_build_core::{AdapterArtifacts, ProjectConfig};
+use deis_build_core::{AdapterArtifacts, ProjectConfig, StaticAsset};
+
+/// Where the compiler stages this project's static files inside the Deno
+/// output directory.
+///
+/// Deno Deploy has no static layer of its own - nothing serves a file unless
+/// the program reads it - so the generated router serves them from here. The
+/// router reaches them as `../assets/<path>` because it lives one level down in
+/// `_deis_internal/`.
+pub const ASSETS_DIR: &str = "assets";
 
 pub fn generate(
     routes: &[(String, String)],
     config: &ProjectConfig,
+    assets: &[StaticAsset],
 ) -> anyhow::Result<AdapterArtifacts> {
     let has_kv = config
         .services
@@ -37,7 +47,7 @@ pub fn generate(
     };
 
     // 3. Generate Router Code
-    let router_code = generate_router_code(routes, has_kv);
+    let router_code = generate_router_code(routes, has_kv, assets);
 
     // 4. Generate Config Files
     let mut config_files = Vec::new();
@@ -83,7 +93,11 @@ pub fn generate(
     })
 }
 
-fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
+fn generate_router_code(
+    routes: &[(String, String)],
+    has_kv: bool,
+    assets: &[StaticAsset],
+) -> String {
     let mut imports = String::new();
     let mut route_handlers = String::new();
 
@@ -109,6 +123,28 @@ fn generate_router_code(routes: &[(String, String)], has_kv: bool) -> String {
         "import { createContextBuilder } from './adapters/context-builder.ts';\n";
     let kv_comment = if has_kv { "" } else { "undefined; // " };
 
+    // The static files, as a table rather than as a directory listing at
+    // request time.
+    //
+    // Deno Deploy has no asset layer: a file is served only if the program
+    // reads it, which is why every Deno build used to leave the project's
+    // `public/` unserved and unmentioned. The table is written by the build
+    // because only the build knows which files there are and what media type
+    // each one gets - the type comes from `deis_bundle::guess_content_type`,
+    // the same table the bundle manifest and deis-runtime use, so one file is
+    // not served as two different types depending on which target ran.
+    //
+    // It also bounds what can be read: a path that is not a key is a 404, so no
+    // request can walk out of the assets directory and no generated file
+    // beside it (`deno.json`, `src/`) is reachable.
+    let asset_types: std::collections::BTreeMap<&str, &str> = assets
+        .iter()
+        .map(|asset| (asset.path.as_str(), asset.content_type.as_str()))
+        .collect();
+    let asset_table =
+        serde_json::to_string_pretty(&asset_types).unwrap_or_else(|_| "{}".to_string());
+
+    let assets_dir = ASSETS_DIR;
     format!(
         r#"/**
  * Deno Deploy Entry Point
@@ -133,13 +169,21 @@ Deno.serve(async (request: Request): Promise<Response> => {{
   try {{
     const url = new URL(request.url);
 
+    // Asset-first, the way this platform answers: a path that names a file in
+    // the bundle is answered from the file and no handler runs.
+    const asset = await serveAsset(url.pathname);
+    if (asset !== null) return asset;
+
 {route_handlers}
     // 404 Not Found
     return new Response('Not Found', {{ status: 404 }});
   }} catch (error) {{
     console.error('Deno Deploy Error:', error);
     return new Response(
-      JSON.stringify({{ error: error.message || String(error) }}),
+      // `error` is `unknown` in a catch clause, so reaching for `.message`
+      // without narrowing first is a type error: `deno check` refused this
+      // module, which is exactly the smoke test the build runs on it.
+      JSON.stringify({{ error: error instanceof Error ? error.message : String(error) }}),
       {{
         status: 500,
         headers: {{ 'content-type': 'application/json' }}
@@ -162,6 +206,32 @@ function matchRoute(pathname: string, route: string): boolean {{
     if (part.startsWith(':')) return true;
     return part === pathParts[i];
   }});
+}}
+
+// The static files this build carried, and the media type each one is served
+// as. Written by the compiler from the project's assets directory.
+const ASSETS: Record<string, string> = {asset_table};
+
+async function serveAsset(pathname: string): Promise<Response | null> {{
+  let key = pathname.replace(/^\/+/, '');
+  // A directory names its index, so `/` is `index.html` and `/docs/` is
+  // `docs/index.html` - the same rule the bundle's asset index applies.
+  if (key === '' || key.endsWith('/')) key = key + 'index.html';
+
+  const contentType = ASSETS[key];
+  if (contentType === undefined) return null;
+
+  try {{
+    const bytes = await Deno.readFile(new URL('../{assets_dir}/' + key, import.meta.url));
+    return new Response(bytes, {{ headers: {{ 'content-type': contentType }} }});
+  }} catch (error) {{
+    // The table said the file was carried and it could not be read, so the
+    // deployment is not what the build produced. A 404 here would read as "no
+    // such page" and hide that, so say which file and let the route table have
+    // its turn.
+    console.error('asset ' + key + ' is in the manifest and could not be read:', error);
+    return null;
+  }}
 }}
 
 console.log('🚀 Deno Deploy server running...');
@@ -362,7 +432,7 @@ mod generated_config {
         )
         .expect("a minimal config");
 
-        let artifacts = super::generate(&[("/".to_string(), "index.ts".to_string())], &config)
+        let artifacts = super::generate(&[("/".to_string(), "index.ts".to_string())], &config, &[])
             .expect("the adapter generates");
 
         let (_, deno_json) = artifacts

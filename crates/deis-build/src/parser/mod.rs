@@ -52,14 +52,27 @@ impl TypeScriptParser {
         })
     }
 
+    /// A rough route for the handler being parsed, used only in diagnostics.
+    ///
+    /// Each affix comes off once. `trim_start_matches` / `trim_end_matches`
+    /// take theirs off as many times as they appear, so
+    /// `functions/functions/x.ts` lost both directories and `report.ts.ts` lost
+    /// both suffixes - the same repeated-prefix mistake that made a file under
+    /// a directory called `src` into the application's queue consumer.
+    ///
+    /// The route the build actually uses is `deis_build_core::routes`, which
+    /// this deliberately does not try to reproduce: it knows nothing about
+    /// `[id]` or `[[catch]]`, and a second definition of the routing rule is
+    /// how an app ends up answering on one target and 404ing on another.
     fn path_to_route(path: &str) -> String {
         // Simple route extraction
         // functions/api/users.ts -> /api/users
         // functions/index.ts -> /
-        let route = path
-            .trim_start_matches("functions/")
-            .trim_end_matches(".ts")
-            .trim_end_matches(".js");
+        let route = path.strip_prefix("functions/").unwrap_or(path);
+        let route = route
+            .strip_suffix(".ts")
+            .or_else(|| route.strip_suffix(".js"))
+            .unwrap_or(route);
 
         if route == "index" || route.is_empty() {
             "/".to_string()

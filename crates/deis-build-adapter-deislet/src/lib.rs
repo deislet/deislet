@@ -45,7 +45,7 @@ pub use manifest::{build_manifest, RUNTIME_PROFILE, WORKER_ENTRY};
 pub use routing::{plan_routes, RouteEntry, RoutePlan, QUEUE_HANDLER_STEM, SCHEDULED_HANDLER_STEM};
 pub use site::{build_site_config, is_site_file};
 
-use deis_build_core::{AdapterArtifacts, ProjectConfig};
+use deis_build_core::{AdapterArtifacts, ProjectConfig, StaticAsset};
 
 /// Generate the entry module for a set of handlers.
 ///
@@ -61,11 +61,18 @@ use deis_build_core::{AdapterArtifacts, ProjectConfig};
 ///   rather than in a module the entry imports.
 /// * `config_files` - a bundle has no per-vendor configuration file. Everything
 ///   a node needs is in `manifest.json`, which is built separately because it
-///   has to describe the *bundled* output, including assets the compiler has
-///   not collected yet at this point.
+///   has to describe the *bundled* output - every asset with its digest, its
+///   length and its media type, which is more than the list handed here.
+///
+/// The static file list is taken and not used for the same reason: this
+/// target's entry module never mentions the assets. deis-runtime answers a
+/// request that names one from the manifest's index before any isolate starts,
+/// which is what asset-first means. The other three adapters do need the list,
+/// so it is on the signature every adapter shares.
 pub fn generate(
     routes: &[(String, String)],
     _config: &ProjectConfig,
+    _assets: &[StaticAsset],
 ) -> anyhow::Result<AdapterArtifacts> {
     let plan = plan_routes(routes);
 
@@ -94,7 +101,7 @@ mod tests {
     #[test]
     fn generate_returns_an_entry_module_and_nothing_else() {
         let routes = vec![("/".to_string(), "../src/index.ts".to_string())];
-        let artifacts = generate(&routes, &config()).unwrap();
+        let artifacts = generate(&routes, &config(), &[]).unwrap();
 
         assert!(artifacts.router_code.contains("export default"));
         assert!(

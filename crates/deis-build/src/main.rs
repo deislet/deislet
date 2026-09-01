@@ -1,9 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-mod commands;
-mod compiler;
-mod parser;
+// The binary drives the library rather than declaring `mod compiler;` and
+// friends of its own. Doing both compiled the whole compiler twice - once into
+// `deis_build` and once into this binary - so anything the CLI happened not to
+// call was dead code in one of the two copies and live in the other. That is
+// what the `#[allow(dead_code)]` scattered over `CompilerOptions` was hiding,
+// and hiding it is how two fields nobody read survived.
+use deis_build::commands;
 
 #[derive(Parser)]
 #[command(name = "deis-build")]

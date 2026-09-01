@@ -4,6 +4,7 @@
   "runtime": "standard-v1",
   "language": "typescript",
   "functionRoot": "src",
+  "compatibilityDate": "2026-09-01",
   "entry_point": "src/index.ts",
   "vendors": {
     "cloudflare": {

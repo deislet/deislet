@@ -29,7 +29,7 @@ use dashmap::DashMap;
 use saffron::Cron;
 use serde::Serialize;
 use tokio::time::{Duration, interval};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::catalog::CatalogStore;
 use crate::runtime_client::{NodeError, RuntimeNodeManager, trigger::TriggerResponse};
@@ -116,35 +116,51 @@ struct Due {
 /// What one node's answer to a scheduled trigger means for the rest of the
 /// walk over the fleet.
 ///
-/// The two failures are not interchangeable, and the node is the only thing
-/// that can tell them apart, which is why it says so on the wire.
+/// The three failures are not interchangeable, and only two of them are
+/// answers at all: the node says which of those two it is, and the third is
+/// this control plane admitting it never heard back.
 #[derive(Debug, PartialEq, Eq)]
 enum NodeAnswer {
     /// The handler ran here and finished.
     Ran,
     /// Nothing of the occurrence happened on this node: it does not have the
-    /// application loaded, it is shutting down, it could not be reached at
-    /// all. Another node may still run it.
+    /// application loaded, it is shutting down, the connection to it was never
+    /// established. Another node may still run it.
     NotRunnableHere(String),
     /// The application's own handler ran here and threw. The occurrence has
     /// already had whatever effect the handler managed before it failed - a
     /// charge, an email, a write - so handing it to a second node would
     /// replay that effect rather than retry it.
     HandlerFailed(String),
+    /// The call reached the node and this control plane stopped listening
+    /// before the node answered: the deadline expired, or the connection
+    /// broke with the request already on it. The handler may be running on
+    /// that node right now, or may have finished; nothing here can tell.
+    /// Handing the occurrence on would risk replaying it, exactly as
+    /// [`NodeAnswer::HandlerFailed`] would.
+    Unknown(String),
 }
 
 /// Read one node's answer to `OnScheduled`.
 ///
-/// A transport or RPC error is this control plane's own view of the node and
-/// not an answer from it, so it is read as "not runnable here": at the point
-/// the call failed the node had, as far as anything here knows, not started
-/// the handler. The one case that reading gets wrong is a deadline that
-/// expires while a handler is still running, which is why the deadline in
-/// `runtime_client` is deliberately twice the node's own execution ceiling.
+/// A failed call is not one event but two, and
+/// [`NodeError::left_the_outcome_unknown`] is what tells them apart. A
+/// connection that was never established means the node never saw the
+/// request, so nothing of the occurrence happened there and the next node may
+/// be asked. A call that went out and came back without an answer - the
+/// deadline in `runtime_client` expiring is the ordinary way - means the node
+/// may be running the handler at this moment, and reading that as "nothing
+/// happened on this node" is what used to run one occurrence once per node in
+/// the fleet.
+///
+/// The trigger deadline being twice the node's own execution ceiling makes
+/// that second case rare. It does not make it impossible, which is why it has
+/// an answer of its own rather than a comment.
 fn read_answer(result: Result<TriggerResponse, NodeError>) -> NodeAnswer {
     let error = match result {
         Ok(resp) if resp.success => return NodeAnswer::Ran,
         Ok(resp) => resp.error,
+        Err(e) if e.left_the_outcome_unknown() => return NodeAnswer::Unknown(e.to_string()),
         Err(e) => return NodeAnswer::NotRunnableHere(e.to_string()),
     };
 
@@ -172,6 +188,13 @@ pub enum RunOutcome {
     /// A node ran the handler and the handler itself failed. The occurrence
     /// is over: it is not handed to another node, and it is not made up later.
     HandlerFailed { node: String, error: String },
+    /// A node was given the occurrence and never said what became of it. The
+    /// walk stops here for the same reason [`RunOutcome::HandlerFailed`] stops
+    /// it, but the record is different on purpose: after a handler failure the
+    /// occurrence certainly ran, and after this one nobody knows whether it
+    /// ran, half ran or never started. That is the state an operator has to go
+    /// and look at the node for.
+    Unknown { node: String, error: String },
     /// No node ran it at all. Every node that was tried said it could not,
     /// or could not be reached.
     NoNodeRan,
@@ -181,7 +204,9 @@ impl RunOutcome {
     /// The node the occurrence was handed to, if any.
     fn node(&self) -> Option<&str> {
         match self {
-            RunOutcome::Ran { node } | RunOutcome::HandlerFailed { node, .. } => Some(node),
+            RunOutcome::Ran { node }
+            | RunOutcome::HandlerFailed { node, .. }
+            | RunOutcome::Unknown { node, .. } => Some(node),
             RunOutcome::NoNodeRan => None,
         }
     }
@@ -512,12 +537,15 @@ impl CronScheduler {
     /// Walk the fleet for one occurrence, stopping at the first node that
     /// answers something final.
     ///
-    /// Two of the three answers end the walk. A node that ran the handler
+    /// Three of the four answers end the walk. A node that ran the handler
     /// ends it because the occurrence happened; a node whose *handler* failed
     /// ends it because the occurrence also happened - the handler had
     /// whatever effect it managed before it threw, and asking a second node
-    /// would replay that effect, not retry it. Only "this node cannot run it"
-    /// moves on, because then nothing of the occurrence has happened yet.
+    /// would replay that effect, not retry it; and a node that was given the
+    /// occurrence and never answered ends it because nothing here can rule out
+    /// that the handler is running there right now. Only "this node cannot run
+    /// it" moves on, because that is the one answer which says nothing of the
+    /// occurrence has happened yet.
     ///
     /// The call is a parameter so the decision above can be tested without a
     /// fleet of live nodes: getting it wrong is not a failure anything would
@@ -597,6 +625,30 @@ impl CronScheduler {
                         candidates.len() - tried - 1
                     );
                     return RunOutcome::HandlerFailed {
+                        node: node.clone(),
+                        error,
+                    };
+                }
+                NodeAnswer::Unknown(error) => {
+                    // Also not "try the next node", and for a worse reason
+                    // than a handler failure: the node was handed the
+                    // occurrence and this control plane stopped listening
+                    // before it answered, so the handler may be running there
+                    // at this moment. Every remaining node would start a
+                    // second copy of it.
+                    error!(
+                        app_id = %key.app_id,
+                        environment = %key.environment,
+                        cron = %cron_expr,
+                        node = %node,
+                        error = %error,
+                        due = %scheduled,
+                        nodes_tried = tried + 1,
+                        nodes_not_tried = candidates.len() - tried - 1,
+                        "This node was given the scheduled occurrence and never answered, so it is not known whether the handler ran, ran half way or never started. The remaining {} node(s) of the fleet are deliberately not asked, because a handler that is still running there would then be running twice; and the occurrence is not made up later. Check that node's log for this occurrence before assuming it was missed",
+                        candidates.len() - tried - 1
+                    );
+                    return RunOutcome::Unknown {
                         node: node.clone(),
                         error,
                     };
@@ -1158,5 +1210,171 @@ mod tests {
         for task in scheduler.tasks_for("demo", "production") {
             assert_eq!(task.last_run, Some(was_due));
         }
+    }
+
+    /// The status tonic actually produces when the trigger deadline expires.
+    ///
+    /// `Endpoint::timeout` elapsing becomes `Cancelled`, not
+    /// `DeadlineExceeded`; a fix that only looked for the latter would leave
+    /// the ordinary case - a cron handler that outran the 60 second deadline -
+    /// reading exactly as it did before.
+    fn timed_out() -> NodeError {
+        NodeError::Rpc {
+            code: tonic::Code::Cancelled,
+            message: "Timeout expired".to_string(),
+        }
+    }
+
+    /// A trigger that came back without an answer must not be handed on.
+    ///
+    /// The walk used to read every failed call as "nothing happened on this
+    /// node" and carry on down the fleet. A handler still running on node-a
+    /// when the deadline expired was therefore started again on node-b and
+    /// again on node-c: one due occurrence, three charges. Nothing here can
+    /// tell a node that never got the request from a node that got it and is
+    /// still working, so the only safe reading of "no answer" is the one that
+    /// does not start a second copy.
+    #[tokio::test]
+    async fn a_trigger_that_came_back_without_an_answer_stops_the_walk() {
+        let (scheduler, store) = scheduler_with_nodes(&["node-a", "node-b", "node-c"]).await;
+        deploy(&store, None, &["*/5 * * * *"]).await;
+        scheduler.refresh().await;
+
+        let now = Utc::now();
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let outcome = scheduler
+            .fire_on_fleet(&due_now(now), now, |node| {
+                asked.lock().unwrap().push(node.clone());
+                async move { Err(timed_out()) }
+            })
+            .await;
+
+        assert_eq!(
+            asked.into_inner().unwrap(),
+            ["node-a"],
+            "the handler may still be running on node-a; every further node starts a second copy"
+        );
+        assert!(
+            matches!(outcome, RunOutcome::Unknown { ref node, .. } if node == "node-a"),
+            "the occurrence has to be recorded as unknown on node-a, not as one nobody ran: {outcome:?}"
+        );
+    }
+
+    /// The other half of the same distinction, and the half that must not
+    /// regress: a connection that was never established means the node never
+    /// saw the request, so the fleet walk carries on and the occurrence still
+    /// runs.
+    #[tokio::test]
+    async fn a_node_that_was_never_reached_still_hands_the_occurrence_on() {
+        let (scheduler, store) = scheduler_with_nodes(&["node-a", "node-b"]).await;
+        deploy(&store, None, &["*/5 * * * *"]).await;
+        scheduler.refresh().await;
+
+        let now = Utc::now();
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let outcome = scheduler
+            .fire_on_fleet(&due_now(now), now, |node| {
+                asked.lock().unwrap().push(node.clone());
+                let unreachable = node == "node-a";
+                async move {
+                    if unreachable {
+                        Err(NodeError::Transport(
+                            "connect http://10.0.0.7:8086: connection refused".to_string(),
+                        ))
+                    } else {
+                        Ok(answer(true, ""))
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(asked.into_inner().unwrap(), ["node-a", "node-b"]);
+        assert_eq!(
+            outcome,
+            RunOutcome::Ran {
+                node: "node-b".to_string()
+            }
+        );
+    }
+
+    /// Which gRPC statuses mean "the node decided not to run this" and which
+    /// mean "nobody knows".
+    ///
+    /// The list runs the safe way round: a status that is not one of the
+    /// node's own pre-execution refusals counts as unknown, so a code this
+    /// control plane has never seen stops the walk rather than replaying the
+    /// occurrence somewhere else.
+    #[test]
+    fn only_a_refusal_the_node_made_before_running_anything_hands_the_occurrence_on() {
+        for code in [
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unimplemented,
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::FailedPrecondition,
+        ] {
+            let answer = read_answer(Err(NodeError::Rpc {
+                code,
+                message: "refused".to_string(),
+            }));
+            assert!(
+                matches!(answer, NodeAnswer::NotRunnableHere(_)),
+                "{code} is the node refusing before it ran anything: {answer:?}"
+            );
+        }
+
+        for code in [
+            tonic::Code::Cancelled,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Unavailable,
+            tonic::Code::Internal,
+            tonic::Code::Unknown,
+            tonic::Code::Aborted,
+        ] {
+            let answer = read_answer(Err(NodeError::Rpc {
+                code,
+                message: "no answer".to_string(),
+            }));
+            assert!(
+                matches!(answer, NodeAnswer::Unknown(_)),
+                "{code} leaves it unknown whether the handler ran: {answer:?}"
+            );
+        }
+    }
+
+    /// The record has to keep "nobody knows" apart from "nobody ran it": one
+    /// is an occurrence to go and look at on a named node, the other is an
+    /// occurrence that certainly did not happen.
+    #[tokio::test]
+    async fn an_unknown_outcome_names_the_node_it_was_handed_to() {
+        let (scheduler, store) = scheduler_with_nodes(&["node-a"]).await;
+        deploy(&store, None, &["*/5 * * * *"]).await;
+        scheduler.refresh().await;
+
+        let now = Utc::now();
+        let was_due = now - chrono::Duration::minutes(1);
+        make_due(&scheduler, was_due);
+        let due = due_now(was_due);
+
+        scheduler.record_run(
+            &due,
+            now,
+            RunOutcome::Unknown {
+                node: "node-a".to_string(),
+                error: "rpc error: Cancelled: Timeout expired".to_string(),
+            },
+        );
+
+        let task = &scheduler.tasks_for("demo", "production")[0];
+        assert_eq!(task.last_node.as_deref(), Some("node-a"));
+        assert!(matches!(
+            task.last_outcome,
+            Some(RunOutcome::Unknown { .. })
+        ));
+        assert!(
+            task.next_run.is_some_and(|next| next > now),
+            "an unknown outcome still advances the schedule, or the occurrence re-fires every tick"
+        );
     }
 }

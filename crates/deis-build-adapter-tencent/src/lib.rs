@@ -13,11 +13,22 @@
 /// if they ever stop agreeing.
 pub const VENDOR: &str = "tencent";
 
-use deis_build_core::{AdapterArtifacts, ProjectConfig};
+use deis_build_core::{AdapterArtifacts, ProjectConfig, StaticAsset};
+
+/// Where the compiler stages this project's static files inside the EdgeOne
+/// output directory: the deployment root itself.
+///
+/// EdgeOne Pages serves the build output directory as the site and reserves
+/// `edge-functions/` for the functions, so `public/css/app.css` has to land at
+/// `css/app.css` to be served at `/css/app.css`. An `assets/` subdirectory
+/// would have served it at `/assets/css/app.css`, which is not the path the
+/// same file answers on any other target.
+pub const ASSETS_DIR: &str = "";
 
 pub fn generate(
     routes: &[(String, String)],
     config: &ProjectConfig,
+    _assets: &[StaticAsset],
 ) -> anyhow::Result<AdapterArtifacts> {
     let has_kv = config
         .services
@@ -42,7 +53,12 @@ pub fn generate(
     // 4. Generate Config Files
     let mut config_files = Vec::new();
 
-    // Minimal configuration based on EdgeOne Pages spec
+    // Minimal configuration based on EdgeOne Pages spec.
+    //
+    // The static files need no entry here: EdgeOne Pages serves whatever is in
+    // the deployment root, which is where the compiler stages them (see
+    // [`ASSETS_DIR`]). Naming them a second time in this file would be a list
+    // that could disagree with the directory.
     let edgeone_json = serde_json::json!({
         "name": config.name,
     });

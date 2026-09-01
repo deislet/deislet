@@ -25,7 +25,7 @@ fn test_entry_point_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify onRequest entry point (per spec.mdc line 847)
     assert!(result.router_code.contains("export function onRequest"));
@@ -40,7 +40,7 @@ fn test_context_parameter() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify context parameter usage (per spec.mdc line 819-822)
     assert!(result.router_code.contains("context"));
@@ -52,7 +52,7 @@ fn test_no_modern_syntax() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify NO Object.fromEntries (not in spec.mdc Web APIs list)
     // Match the call form so the explanatory comment in the generated
@@ -68,7 +68,7 @@ fn test_web_apis_compliance() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify only approved Web APIs are used (per spec.mdc line 899-928)
 
@@ -89,7 +89,7 @@ fn test_context_structure() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify EdgeOne context structure (per spec.mdc line 819-822)
     // The builder aliases `const request = context.request` and then
@@ -107,7 +107,7 @@ fn test_cookie_parsing_compatibility() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify cookie parsing uses indexOf/slice (not destructuring)
     assert!(result.context_builder_code.contains("indexOf('=')"));
@@ -122,7 +122,7 @@ fn test_error_handling() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify comprehensive error handling
     assert!(result.router_code.contains("try"));
@@ -136,7 +136,7 @@ fn test_edgeone_json_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Find edgeone.json in config files
     let edgeone_json = result
@@ -158,7 +158,7 @@ fn test_spec_reference_in_comments() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify spec compliance is documented (references pages-llms.mdc)
     assert!(
@@ -175,7 +175,7 @@ fn test_traditional_loops_only() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", false);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     // Verify traditional for loops are used (maximum compatibility)
     assert!(result.context_builder_code.contains("for (let i"));
@@ -187,7 +187,7 @@ fn test_kv_adapter_compatibility() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("test-app", true);
 
-    let result = generate(&routes, &config).unwrap();
+    let result = generate(&routes, &config, &[]).unwrap();
 
     assert!(result.kv_adapter_code.is_some());
 

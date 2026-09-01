@@ -9,9 +9,11 @@ import {
   ScrollText,
   ChevronLeft,
   ChevronRight,
+  LogOut,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import { api } from '@/lib/api'
 
 interface NavItem {
   title: string
@@ -80,7 +82,26 @@ export function Sidebar() {
         </nav>
       </ScrollArea>
 
-      <div className="border-t p-4">
+      <div className="flex flex-col gap-2 border-t p-4">
+        {/*
+          Only when a key is actually held. A control plane with
+          `api_auth_enabled` off admits a caller on its own machine with no
+          credential at all, and there is nothing to sign out of there - a
+          button that cleared nothing and then demanded a key that does not
+          exist would be a way to lock yourself out of an open console.
+        */}
+        {api.getToken() !== null && (
+          <Button
+            variant="ghost"
+            size={collapsed ? 'icon' : 'sm'}
+            className={cn('text-muted-foreground', collapsed ? 'mx-auto' : 'justify-start')}
+            title="Forget this API key"
+            onClick={() => api.signOut()}
+          >
+            <LogOut className="h-4 w-4 shrink-0" />
+            {!collapsed && <span className="ml-2">Forget this key</span>}
+          </Button>
+        )}
         {!collapsed && (
           <p className="text-xs text-muted-foreground">Control v0.1.0</p>
         )}

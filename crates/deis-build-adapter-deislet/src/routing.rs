@@ -22,7 +22,7 @@
 //! of the rule, which is what deis-runtime ranks the manifest's patterns by
 //! too.
 
-use deis_build_core::routes::{wildcard_is_reachable, wildcard_name};
+use deis_build_core::routes::{staged_handler_path, wildcard_is_reachable, wildcard_name};
 use deis_bundle::sort_by_specificity;
 
 /// Handler file, at the function root, holding this app's queue consumer.
@@ -131,20 +131,23 @@ pub fn plan_routes(routes: &[(String, String)]) -> RoutePlan {
 /// Only the function root counts: `functions/admin/_queue.ts` is a nested file
 /// with no special meaning, and treating it as this app's queue consumer would
 /// silently pick the wrong one in a project that has both.
+///
+/// "At the function root" is decided by [`staged_handler_path`], which takes
+/// the compiler's staging prefix off exactly once. Taking it off repeatedly -
+/// which is what `trim_start_matches` does - read `functions/src/_queue.ts` as
+/// if it were `functions/_queue.ts`, so an ordinary page in an ordinary
+/// directory called `src` became the whole application's queue consumer, lost
+/// its own route, and started receiving batches its author never wrote it to
+/// handle. Nothing in the build said so.
 fn reserved_stem(import_path: &str) -> Option<&str> {
-    let normalised = import_path.rsplit('/').next()?;
-    let depth = import_path
-        .trim_start_matches("../")
-        .trim_start_matches("src/")
-        .matches('/')
-        .count();
-    if depth > 0 {
+    let relative = staged_handler_path(import_path);
+    if relative.contains('/') {
         return None;
     }
-    let stem = normalised
+    let stem = relative
         .rsplit_once('.')
         .map(|(stem, _)| stem)
-        .unwrap_or(normalised);
+        .unwrap_or(relative);
     stem.starts_with('_').then_some(stem)
 }
 
@@ -279,6 +282,30 @@ mod tests {
         let plan = plan_routes(&[route("/admin/_queue", "../src/admin/_queue.ts")]);
         assert_eq!(patterns(&plan), vec!["/admin/_queue"]);
         assert!(plan.queue.is_none());
+    }
+
+    #[test]
+    fn a_directory_called_src_does_not_name_the_platform_handlers() {
+        // `functions/src/_queue.ts` is a page under a directory an author
+        // called `src`. It used to be promoted to the application's queue
+        // consumer - the staging prefix `../src/` was stripped as many times
+        // as it appeared - so the file stopped answering `/src/_queue` and
+        // started being handed every batch off the queue instead.
+        let plan = plan_routes(&[
+            route("/", "../src/index.ts"),
+            route("/src/_queue", "../src/src/_queue.ts"),
+            route("/src/_scheduled", "../src/src/_scheduled.ts"),
+        ]);
+        assert_eq!(patterns(&plan), vec!["/src/_queue", "/src/_scheduled", "/"]);
+        assert!(
+            plan.queue.is_none(),
+            "a nested file must not become the queue consumer"
+        );
+        assert!(
+            plan.scheduled.is_none(),
+            "a nested file must not become the cron handler"
+        );
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]

@@ -33,13 +33,19 @@ fn copy_tree(from: &Path, to: &Path) {
 
 /// Build the fixture for the deislet vendor and return the archive's bytes.
 async fn build_bundle(project: &Path) -> Vec<u8> {
+    build_bundle_with(project, true).await
+}
+
+/// The same, with the answer `--no-minify` would give: `false` here is the
+/// flag being passed, `true` is it being left off.
+async fn build_bundle_with(project: &Path, minify: bool) -> Vec<u8> {
     let compiler = Compiler::with_options(CompilerOptions {
         project_dir: project.to_string_lossy().to_string(),
         ..Default::default()
     });
 
     let result = compiler
-        .compile(project, vec!["deislet".to_string()], true)
+        .compile(project, vec!["deislet".to_string()], minify)
         .await
         .expect("the fixture builds for deislet");
 
@@ -57,6 +63,23 @@ fn archive_names(bytes: &[u8]) -> Vec<String> {
     (0..archive.len())
         .map(|i| archive.by_index(i).expect("an entry").name().to_string())
         .collect()
+}
+
+/// The bundled module's export clause.
+///
+/// Found by scanning rather than by looking at the last line: minification is
+/// on by default, and a minified module is a single line whose export clause is
+/// spelled `export{a as default}` with no space. A test that looked for a line
+/// starting with `export {` passed only because nothing minified anything.
+fn export_clause(worker: &str) -> String {
+    for opener in ["export{", "export {"] {
+        if let Some(start) = worker.rfind(opener) {
+            let rest = &worker[start + opener.len()..];
+            let end = rest.find('}').unwrap_or(rest.len());
+            return rest[..end].to_string();
+        }
+    }
+    panic!("the bundled module carries no export clause");
 }
 
 fn entry_text(bytes: &[u8], name: &str) -> String {
@@ -316,11 +339,7 @@ async fn the_platform_handlers_become_exports_and_never_routes() {
     // Named exports, because that is what deis-runtime reads off the module:
     // `mod.queue` and `mod.scheduled`.
     let worker = entry_text(&bytes, "worker/index.js");
-    let exports = worker
-        .lines()
-        .rev()
-        .find(|line| line.starts_with("export {"))
-        .expect("the bundled module ends with its export list");
+    let exports = export_clause(&worker);
     assert!(
         exports.contains("queue") && exports.contains("scheduled"),
         "the entry module has to export both platform handlers: {exports}"
@@ -347,5 +366,208 @@ async fn a_site_with_only_static_files_still_builds() {
     assert!(
         worker.contains("export default") || worker.contains("as default"),
         "an app with no handlers must still expose the export the runtime imports"
+    );
+}
+
+/// Every relative module specifier the bundled entry still reaches for.
+///
+/// A bundler that splits an application names the pieces `<name>-<hash>.js` and
+/// has the entry reach for them by relative specifier - statically as
+/// `from "./report-C9Nc6-Y9.js"`, or lazily as `import("./report-CwIiHk-J.js")`.
+/// deis-runtime loads `worker/index.js` on its own, with no resolver and
+/// nothing else out of the archive, so either spelling names a file the
+/// application asks for at load time and the bundle does not carry.
+fn relative_module_references(worker: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let bytes = worker.as_bytes();
+    for quote in ['"', '\''] {
+        let opener = format!("{quote}./");
+        for (start, _) in worker.match_indices(&opener) {
+            let rest = &worker[start + 1..];
+            let Some(end) = rest.find(quote) else {
+                continue;
+            };
+            let specifier = &rest[..end];
+            if specifier.ends_with(".js") || specifier.ends_with(".mjs") {
+                found.push(specifier.to_string());
+            }
+        }
+    }
+    let _ = bytes;
+    found.sort();
+    found.dedup();
+    found
+}
+
+#[tokio::test]
+async fn an_application_the_bundler_would_split_is_carried_whole() {
+    // The critical one. A handler with a lazy `import()` used to make rolldown
+    // emit three chunks; the build concatenated them into one string and packed
+    // only that. What shipped named `./report-C9Nc6-Y9.js` in an `import`
+    // statement no archive carried, and redeclared every binding that chunk
+    // defined, so the module did not even parse. The build reported success,
+    // the manifest verified, the upload was accepted, and the application
+    // answered nothing.
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage_fixture(project.path());
+    let functions = project.path().join("functions");
+    std::fs::write(
+        functions.join("report.ts"),
+        "export function render(path: string): string {\n  return 'lazy-chunk-marker:' + path;\n}\n\
+         export default function report(context: any) {\n  return new Response(render(context.path));\n}\n",
+    )
+    .expect("write the lazily imported handler");
+    std::fs::write(
+        functions.join("index.ts"),
+        "export default async function root(context: any): Promise<Response> {\n  \
+           const lazy = await import('./report.ts');\n  \
+           return new Response(lazy.render(context.path));\n}\n",
+    )
+    .expect("write the handler that splits the bundle");
+
+    let bytes = build_bundle(project.path()).await;
+
+    // Nothing beside the entry: the format has one worker module and no place
+    // to put a second one.
+    let names = archive_names(&bytes);
+    let stray: Vec<&String> = names
+        .iter()
+        .filter(|name| name.starts_with("worker/") && *name != "worker/index.js")
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the archive carries {stray:?} beside the entry"
+    );
+
+    let worker = entry_text(&bytes, "worker/index.js");
+    assert!(
+        relative_module_references(&worker).is_empty(),
+        "the worker asks for {:?}, and the archive carries {names:?}",
+        relative_module_references(&worker)
+    );
+
+    // And the lazily imported code is actually in there, so "no references"
+    // was not bought by dropping the module.
+    assert!(
+        worker.contains("lazy-chunk-marker:"),
+        "inlining the lazy import has to keep the code it pointed at"
+    );
+}
+
+#[tokio::test]
+async fn minification_is_on_by_default_and_both_settings_can_turn_it_off() {
+    // Neither `--no-minify` nor `build.minify` was read by anything, so an
+    // author who wrote either got exactly the same output as one who wrote
+    // neither: unminified, whatever they asked for.
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage_fixture(project.path());
+
+    let default_build = entry_text(&build_bundle(project.path()).await, "worker/index.js");
+    let no_minify_flag = entry_text(
+        &build_bundle_with(project.path(), false).await,
+        "worker/index.js",
+    );
+
+    // The generated router declares `function matchRoute(`, and minification
+    // renames it. The handler bodies are string literals and survive either
+    // way, so this is the part that tells the two apart.
+    assert!(
+        !default_build.contains("function matchRoute("),
+        "the default build minifies"
+    );
+    assert!(
+        no_minify_flag.contains("function matchRoute("),
+        "`--no-minify` has to reach the bundler"
+    );
+
+    // The project file says it the other way round: the flag is absent and
+    // `build.minify` is false.
+    let config_path = project.path().join(".config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read the config"))
+            .expect("the config parses");
+    config["build"]["minify"] = serde_json::json!(false);
+    std::fs::write(&config_path, config.to_string()).expect("write the config back");
+
+    let opted_out = entry_text(&build_bundle(project.path()).await, "worker/index.js");
+    assert!(
+        opted_out.contains("function matchRoute("),
+        "`build.minify: false` has to reach the bundler"
+    );
+}
+
+#[tokio::test]
+async fn the_source_map_travels_inside_the_module_or_not_at_all() {
+    // `build.sourcemap` was read by nobody. It is wired to an *inline* map:
+    // a `worker/index.js.map` beside the entry would be a second file, and the
+    // manifest names exactly one, so it would be left out of the archive and
+    // the module would point at something nobody shipped.
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage_fixture(project.path());
+
+    let bytes = build_bundle(project.path()).await;
+    let worker = entry_text(&bytes, "worker/index.js");
+    assert!(
+        worker.contains("sourceMappingURL=data:application/json"),
+        "the default carries its map inline"
+    );
+    assert!(
+        !archive_names(&bytes)
+            .iter()
+            .any(|name| name.ends_with(".map")),
+        "a map file beside the entry is a file the manifest cannot name"
+    );
+
+    let config_path = project.path().join(".config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read the config"))
+            .expect("the config parses");
+    config["build"]["sourcemap"] = serde_json::json!(false);
+    std::fs::write(&config_path, config.to_string()).expect("write the config back");
+
+    let worker = entry_text(&build_bundle(project.path()).await, "worker/index.js");
+    assert!(
+        !worker.contains("sourceMappingURL"),
+        "`build.sourcemap: false` has to reach the bundler"
+    );
+}
+
+#[tokio::test]
+async fn a_handler_importing_a_module_nothing_carries_fails_the_build() {
+    // The same failure as a dropped chunk, reached through a missing
+    // dependency. `import { v4 } from "uuid"` used to survive the bundler as an
+    // external and go straight into `worker/index.js`; deis-runtime loads that
+    // file on its own with no resolver, so the application built, packed,
+    // uploaded, deployed - and then failed to load.
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage_fixture(project.path());
+    std::fs::write(
+        project.path().join("functions/index.ts"),
+        "import { v4 } from 'uuid';\n\
+         export default function root(): Response {\n  return new Response(v4());\n}\n",
+    )
+    .expect("write a handler with an unvendored dependency");
+
+    let compiler = Compiler::with_options(CompilerOptions {
+        project_dir: project.path().to_string_lossy().to_string(),
+        ..Default::default()
+    });
+    let error = compiler
+        .compile(project.path(), vec!["deislet".to_string()], true)
+        .await
+        .expect_err("a bundle that cannot load must not be produced")
+        .to_string();
+
+    assert!(
+        error.contains("uuid"),
+        "the message names the module: {error}"
+    );
+    assert!(
+        error.contains("fail to load"),
+        "the message says what would happen: {error}"
+    );
+    assert!(
+        !Path::new(&project.path().join("dist/deislet/bundle.zip")).exists(),
+        "no archive may be written for an application that cannot load"
     );
 }

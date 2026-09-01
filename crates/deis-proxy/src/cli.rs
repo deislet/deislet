@@ -24,6 +24,15 @@ pub struct CliConfig {
     /// the upgrade socket is about to be opened. Set by the process that
     /// spawned this one for an upgrade; see [`crate::restart`].
     pub ready_fd: Option<RawFd>,
+    /// Listening addresses the process that spawned this one is going to hand
+    /// over, so this one knows which of its own it has to bind for itself.
+    ///
+    /// Only the rest are worth proving bindable before the readiness byte:
+    /// an address the running process still holds answers `EADDRINUSE` for a
+    /// reason that is not a failure. Empty for any start that is not a
+    /// replacement, which is right - such a start binds everything and finds
+    /// out immediately.
+    pub inherited_listeners: Vec<String>,
     pub action: CliAction,
 }
 
@@ -55,6 +64,7 @@ impl Default for CliConfig {
             daemon: false,
             upgrade: false,
             ready_fd: None,
+            inherited_listeners: Vec::new(),
             action: CliAction::Start,
         }
     }
@@ -96,6 +106,14 @@ impl CliConfig {
                         .next()
                         .ok_or_else(|| anyhow!("option -s requires a signal name"))?;
                     config.action = CliAction::Signal(Self::parse_signal(name.as_ref())?);
+                }
+                "--inherited-listener" => {
+                    let address = args.next().ok_or_else(|| {
+                        anyhow!("option --inherited-listener requires an address")
+                    })?;
+                    config
+                        .inherited_listeners
+                        .push(address.as_ref().to_string());
                 }
                 "--ready-fd" => {
                     let fd = args
@@ -149,8 +167,19 @@ impl CliConfig {
                 process::exit(0);
             }
             CliAction::TestConfig => {
-                self.load_config()?;
+                let config = self.load_config()?;
                 println!("Configuration file syntax is OK");
+                // Not part of "syntax", and not a reason to fail: an
+                // unusable `upgrade_sock` costs this configuration only the
+                // ability to be replaced without an outage. But `-t` is where
+                // an operator looks before a deployment, so it is where the
+                // one thing that will not work has to be said.
+                if let Err(e) = crate::restart::check_upgrade_socket_path(config.upgrade_sock()) {
+                    println!(
+                        "warning: no zero-downtime upgrade of this configuration can succeed. \
+                         {e:#}"
+                    );
+                }
                 process::exit(0);
             }
             CliAction::Signal(signal) => {
@@ -195,6 +224,24 @@ impl CliConfig {
         println!("Sending {unix_signal} to process {pid}");
         kill(Pid::from_raw(pid), unix_signal)
             .with_context(|| format!("sending {unix_signal} to process {pid}"))?;
+        if signal == SignalType::Reload {
+            // A signal carries no answer back, so a zero exit here only means
+            // the signal was delivered. Saying so is the difference between
+            // an operator who checks and one who believes a new build is
+            // running because the command succeeded.
+            let error_log = config
+                .log
+                .as_ref()
+                .and_then(|log| log.error_log.as_ref())
+                .and_then(|error_log| error_log.path.as_deref())
+                .unwrap_or("the error log");
+            println!(
+                "The upgrade runs in process {pid} and a signal carries no answer back, so this \
+                 exit code only means the signal was delivered. Whether a replacement took the \
+                 listeners over is in {error_log}: it says either 'replacement process is ready; \
+                 handing over listening sockets' or 'keeping the current process' and why."
+            );
+        }
         Ok(())
     }
 
@@ -255,6 +302,29 @@ mod tests {
         assert!(config.daemon);
         assert!(config.ready_fd.is_none());
         assert!(matches!(config.action, CliAction::Start));
+    }
+
+    #[test]
+    fn collects_every_inherited_listener() {
+        // Repeated rather than comma-separated: an address is allowed to
+        // contain a colon and there is no separator a listening address
+        // cannot also contain, so one flag per address is the only spelling
+        // that cannot be misparsed.
+        let config = CliConfig::parse_from([
+            "--inherited-listener",
+            "0.0.0.0:80",
+            "--inherited-listener",
+            "[::]:443",
+        ])
+        .unwrap();
+        assert_eq!(config.inherited_listeners, ["0.0.0.0:80", "[::]:443"]);
+        assert!(CliConfig::parse_from(["--inherited-listener"]).is_err());
+
+        let config = CliConfig::parse_from(Vec::<&str>::new()).unwrap();
+        assert!(
+            config.inherited_listeners.is_empty(),
+            "a start that is not a replacement inherits nothing and must prove every address"
+        );
     }
 
     #[test]

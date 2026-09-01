@@ -58,6 +58,20 @@
 // way; see deis_wire::conventions for why they live in one place.
 pub use deis_wire::conventions::{APP_ID_HEADER, ENVIRONMENT_HEADER};
 
+/// How many upstreams one request may be handed to before it is answered
+/// `502`.
+///
+/// Three, counting the first: enough to ride out one or two nodes going away
+/// at once, which is what a rolling restart or a lost machine looks like, and
+/// small enough that the worst case is bounded. Each attempt can cost a whole
+/// `upstream_connect_timeout` - 5 seconds by default - when a node is
+/// dropping packets rather than refusing them, so this is 15 seconds of
+/// patience at the outside and nothing at all in the ordinary case, where a
+/// refused connection comes back at once.
+///
+/// See [`DeisProxy::fail_to_connect`].
+const MAX_UPSTREAM_ATTEMPTS: usize = 3;
+
 /// The prefix the platform reserves for headers it writes about itself.
 ///
 /// Everything under it is one component of this platform telling another
@@ -96,7 +110,7 @@ use pingora::protocols::http::compression::Algorithm;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::acme::{CHALLENGE_PREFIX, ChallengeResponder};
 use crate::catalog::table::{CatalogRoutes, MatchSource};
@@ -128,8 +142,17 @@ pub struct RequestCtx {
     /// Set together with `app_id`; `None` only in plain reverse proxy mode
     /// where no application was resolved at all.
     pub environment: Option<String>,
-    /// Backend address the request was sent to, once selected.
+    /// Backend address the request was sent to, once selected. The most
+    /// recent one when the request went round the retry loop.
     pub upstream: Option<String>,
+    /// Backends this request has already been handed to, in the order they
+    /// were picked.
+    ///
+    /// Read on two paths that both need it: the selector skips them, so a
+    /// retry reaches a different node instead of the one that just refused;
+    /// and the 502 and 503 say how many were tried, which is the difference
+    /// between "one node is down" and "the fleet is down".
+    pub tried_upstreams: Vec<String>,
     /// Whether the client connection is TLS.
     pub tls: bool,
     /// Ceiling on this request's body, taken from the configuration once when
@@ -152,6 +175,7 @@ impl Default for RequestCtx {
             app_id: None,
             environment: None,
             upstream: None,
+            tried_upstreams: Vec::new(),
             tls: false,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             body_bytes: 0,
@@ -904,21 +928,36 @@ impl ProxyHttp for DeisProxy {
         ctx: &mut RequestCtx,
     ) -> pingora::Result<Box<HttpPeer>> {
         let key = self.balancer.key(session);
-        let Some(backend) = self.balancer.select(&key) else {
-            // The counts separate the three ways to get here, which want
-            // three different things done about them: nothing configured or
-            // nothing resolving, every node refusing the health check, or
-            // healthy nodes present that this key could not reach.
+        let Some(backend) = self.balancer.select(&key, &ctx.tried_upstreams) else {
+            // The counts separate the ways to get here, which want different
+            // things done about them: nothing configured or nothing
+            // resolving, every node refusing the health check, healthy nodes
+            // present that this key could not reach, or - on a retry - every
+            // node this request could have used having already refused it.
             let (ready, upstreams) = self.balancer.rotation();
-            warn!(
-                host = %ctx.host,
-                app_id = ?ctx.app_id,
-                ready,
-                upstreams,
-                "no upstream is in rotation for this request; answering 503. An upstream is in \
-                 rotation only while it answers the configured health check, so an upstream whose \
-                 port is open but which is not serving is deliberately not counted here"
-            );
+            if ctx.tried_upstreams.is_empty() {
+                warn!(
+                    host = %ctx.host,
+                    app_id = ?ctx.app_id,
+                    ready,
+                    upstreams,
+                    "no upstream is in rotation for this request; answering 503. An upstream is \
+                     in rotation only while it answers the configured health check, so an \
+                     upstream whose port is open but which is not serving is deliberately not \
+                     counted here"
+                );
+            } else {
+                warn!(
+                    host = %ctx.host,
+                    app_id = ?ctx.app_id,
+                    ready,
+                    upstreams,
+                    tried = ?ctx.tried_upstreams,
+                    "every upstream this request could be sent to refused the connection; \
+                     answering 503. The health check has not evicted them yet, so this is a \
+                     failure the whole pool is having at once rather than one node dying"
+                );
+            }
             return Err(Error::explain(
                 ErrorType::HTTPStatus(503),
                 "no healthy upstream",
@@ -931,6 +970,11 @@ impl ProxyHttp for DeisProxy {
             ));
         };
         ctx.upstream = Some(addr.to_string());
+        // Recorded before the connection is attempted, not after it fails:
+        // pingora calls this method again for each retry and the record is
+        // the only thing that stops the next call handing the request back to
+        // the node that just refused it.
+        ctx.tried_upstreams.push(addr.to_string());
 
         let system = self.config.get_system_config();
         // Offloading means the upstream leg is plain even when the client
@@ -987,6 +1031,87 @@ impl ProxyHttp for DeisProxy {
         ctx: &mut RequestCtx,
     ) -> pingora::Result<()> {
         stamp_platform_headers(upstream_request, ctx)
+    }
+
+    /// Send the request to another node when one refuses the connection.
+    ///
+    /// Without this the default applies, which is "do not retry": one node
+    /// refusing a connection was answered `502` even with the rest of the
+    /// fleet healthy and idle. A node that dies between two health checks
+    /// therefore failed its whole share of the traffic - about half of it on
+    /// a two-node edge - for up to `unhealthy_after` (2) intervals, five
+    /// seconds each, before the check took it out of rotation. That is ten
+    /// seconds of errors for a failure the edge could see immediately.
+    ///
+    /// This hook is only reached when the *connection* could not be
+    /// established, which is what makes retrying safe for any method. Nothing
+    /// has been written to any node, so nothing has been done once and might
+    /// be done twice; a `POST` is as retryable here as a `GET`. An error
+    /// after the connection succeeded arrives at `error_while_proxy`
+    /// instead, and pingora's own default there only retries a reused
+    /// connection whose retry buffer is intact - which is the right rule and
+    /// is left alone.
+    ///
+    /// The budget is [`MAX_UPSTREAM_ATTEMPTS`], not the pool size. Each
+    /// attempt can cost a full `upstream_connect_timeout` (5 seconds by
+    /// default) when a node is black-holing packets rather than refusing, so
+    /// trying every node in a large pool would turn one dead node into a
+    /// request that hangs for a minute. Three attempts bound the worst case
+    /// at fifteen seconds and cover the case this exists for, which is one or
+    /// two nodes gone at once; when more than that are gone the honest answer
+    /// is the `503` the selector produces when it runs out of untried
+    /// backends.
+    fn fail_to_connect(
+        &self,
+        session: &mut Session,
+        peer: &HttpPeer,
+        ctx: &mut RequestCtx,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        let attempts = ctx.tried_upstreams.len();
+        // Asked before the retry is announced rather than discovered by
+        // taking one. Retrying with nothing left to reach would turn the
+        // `502` this request has honestly earned into the `503`
+        // `upstream_peer` answers when it runs out of candidates - a
+        // different diagnosis for the same event, and the wrong one: `502`
+        // says a node refused, `503` says the edge had nowhere to send it.
+        // On a single-upstream deployment that is every connection failure.
+        let key = self.balancer.key(session);
+        let another_is_waiting = self.balancer.select(&key, &ctx.tried_upstreams).is_some();
+
+        if attempts < MAX_UPSTREAM_ATTEMPTS && another_is_waiting {
+            // `upstream_peer` runs again and skips everything in
+            // `tried_upstreams`, so this reaches a different node.
+            e.set_retry(true);
+            info!(
+                host = %ctx.host,
+                app_id = ?ctx.app_id,
+                upstream = %peer._address,
+                attempts,
+                max_attempts = MAX_UPSTREAM_ATTEMPTS,
+                error = %e,
+                "could not connect to an upstream; nothing was sent to it, so the request goes \
+                 to another one. The health check decides whether this node stays in rotation, \
+                 not this failure"
+            );
+        } else {
+            e.set_retry(false);
+            warn!(
+                host = %ctx.host,
+                app_id = ?ctx.app_id,
+                upstream = %peer._address,
+                attempts,
+                max_attempts = MAX_UPSTREAM_ATTEMPTS,
+                another_is_waiting,
+                tried = ?ctx.tried_upstreams,
+                error = %e,
+                "could not connect to an upstream and there is no other one left to try; \
+                 answering 502. Either every upstream in rotation has refused this request or \
+                 the attempt budget is spent, so this is the pool failing rather than one node \
+                 dying"
+            );
+        }
+        e
     }
 
     /// Take compression off a response the node is still producing.

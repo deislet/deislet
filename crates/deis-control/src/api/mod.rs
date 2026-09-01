@@ -100,10 +100,6 @@ pub fn build_api_router(
         metrics_collector: Arc::clone(&metrics_collector),
     };
 
-    let apps_state = apps::AppsState {
-        deis_runtime: Arc::clone(&deis_runtime_manager),
-    };
-
     // One credential object for the whole node channel: the assignment
     // list, the bundle download and the registration endpoint must accept
     // exactly the same keys, and building it three times would let them
@@ -116,6 +112,15 @@ pub fn build_api_router(
         node_auth.clone(),
         &config,
     );
+
+    // Built after the catalog and sharing its store, not beside it with a
+    // second one: `apps::unload_app` refuses an unload the catalog would undo,
+    // and that check has to read the same rows the assignment list is built
+    // from.
+    let apps_state = apps::AppsState {
+        deis_runtime: Arc::clone(&deis_runtime_manager),
+        catalog: Arc::clone(&catalog_state.store),
+    };
 
     let auth_config = middleware::AuthConfig::from_control_config(&config);
 

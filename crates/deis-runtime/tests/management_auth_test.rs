@@ -16,6 +16,7 @@ use deis_runtime::config::RuntimeConfig;
 use deis_runtime::deployment::DeploymentManager;
 use deis_runtime::dispatcher::{self, ServerOptions};
 use deis_runtime::health::NodeHealth;
+use reqwest::StatusCode;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -241,9 +242,27 @@ async fn the_control_plane_is_still_served() {
         .await
         .expect("the data path must still answer");
     assert!(
-        public.status().is_success(),
+        public.status() != StatusCode::UNAUTHORIZED && public.status() != StatusCode::FORBIDDEN,
         "public traffic must not need a node key: {}",
         public.status()
+    );
+    // 503 and not 200, and that is the answer being asserted: this node has no
+    // control plane to ask, so it never left `Readiness::Starting`, and
+    // `_system`'s `/health` reports what the node is rather than that it is
+    // listening. A 200 here would mean the probe had gone back to answering
+    // from a constant - see `deis_runtime::health`.
+    assert_eq!(
+        public.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a node that has not been told what to run must not pass the edge's probe"
+    );
+    assert_eq!(
+        public
+            .headers()
+            .get(deis_runtime::health::READINESS_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("starting"),
+        "the edge reads its rotation decision off this header"
     );
 
     node.abort();

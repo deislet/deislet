@@ -226,6 +226,14 @@ On a fresh clone, build the web console first. Its output is gitignored and
 cd crates/deis-control/web && npm ci && npm run build
 ```
 
+The console is then served from the control plane's own port —
+`http://127.0.0.1:8085` for the demo. The demo runs with
+`api_auth_enabled = true`, which is the posture a real installation should be
+in, so the console asks for a key before it shows anything: paste the
+`API_KEY` line from `.demo/state.env`. A control plane with authentication off
+opens straight to the dashboard, because a caller on its own machine needs no
+credential there and there is none to ask for.
+
 [DEMO.md](DEMO.md) walks through what `start` does step by step, what each
 check proves, and what lands in the `.demo/` run directory.
 

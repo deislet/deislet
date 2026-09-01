@@ -19,8 +19,10 @@
 
 - Rust 1.85+ (the workspace is edition 2024; 1.70 cannot build it)
 - Node.js 18+ (for the console build, which the binary embeds at compile time)
-- `sqlite3` (the backup and restore procedure below uses `.backup`; a `cp` of a
-  WAL-mode database can copy a corrupt one without saying so)
+- `sqlite3`, 3.8.2 or newer for its `-readonly` flag (the backup and
+  troubleshooting procedures below use `.backup`, and every one of them opens
+  the live database read-only; a `cp` of a database that is being written can
+  copy a torn one without saying so)
 - `openssl` (generates the secret master key)
 - `curl` and `jq` (the readiness check below)
 - (Optional) Nginx/Caddy (reverse proxy)
@@ -517,15 +519,36 @@ descriptor it was started with, has no reload that reopens a log file, and
 
 `/api/metrics` is behind the same credential as the rest of the human API, so
 with `api_auth_enabled = true` - which the minimal configuration above sets -
-an unauthenticated scrape gets **401**, not a page of numbers. Mint a token
-that can do nothing else and give it to the scraper:
+an unauthenticated scrape gets **401**, not a page of numbers.
+
+**Two commands, in this order.** A fresh control plane has exactly one
+account, `config-key`, created for the `api_keys` in its configuration file;
+there is no `ops`, no `prometheus` and nothing else until somebody makes one.
+`deis token create --account <name>` against a name that does not exist
+answers `404 Not Found: account <name> not found` and mints nothing - while
+the redirection below has already created the file, so a scraper set up from
+the second command alone starts with a zero-byte token and every scrape
+answering 401. The account name here is the one
+[`API_DOCUMENTATION.md`](API_DOCUMENTATION.md#get-prometheus-format-metrics)
+uses, so the two procedures are the same procedure.
 
 ```bash
-# A read-only token. Do not point a scraper at an api_keys entry: those are
-# unscoped and can deploy, rotate secrets and mint any tenant's storage
-# token. The secret is printed once and never again, so it goes straight
-# into the file the scraper reads.
-deis token create --account ops --scope 'read:*/*' --json prometheus \
+# 1. The account. `viewer` is the narrowest role, and the role only bounds
+#    what tokens may be minted for it.
+deis account create prometheus --role viewer
+
+# 2. Its credential. `read:*/*` is the narrowest scope that works: the
+#    exposition names no application but counts all of them, so the gate asks
+#    for every application rather than any one, and a token scoped to a single
+#    app is refused with 403 and told exactly which scope it lacks.
+#
+#    Do not point a scraper at an api_keys entry instead: those are unscoped
+#    and can deploy, rotate secrets and mint any tenant's storage token. This
+#    token can read everything and change nothing - the catalog, the routes
+#    and the audit log are readable with it, which is worth knowing before the
+#    file lands on a monitoring host. The secret is printed once and never
+#    again, so it goes straight into the file the scraper reads.
+deis token create --account prometheus --scope 'read:*/*' --json scrape \
   | jq -r .secret > /etc/prometheus/deis-control.token
 chmod 600 /etc/prometheus/deis-control.token
 ```
@@ -542,8 +565,15 @@ scrape_configs:
       credentials_file: /etc/prometheus/deis-control.token
 ```
 
-`deis-telemetry` exports on a port of its own and is scraped the same way,
-with its own token; see `crates/deis-telemetry/deis-telemetry.example.toml`.
+`deis-telemetry` exports on a port of its own, and its credential is not one
+of these: it has no accounts and no scopes. Its scrape carries
+`base64(HMAC-SHA256(auth_secret, "deis-telemetry"))`, the same one string
+every producer and every `deis logs` / `deis tail` / `deis trace` presents,
+and it is required only once `auth_secret` is set - which is required as soon
+as either of that service's addresses is not a loopback address. See
+`crates/deis-telemetry/deis-telemetry.example.toml`; `deis token create`
+mints nothing that service will accept.
+
 Two series there are worth an alert on any installation:
 `deis_telemetry_store_writable` going to 0 means the collector is refusing
 every log line and trace it is handed, and `deis_telemetry_storage_failures_total`
@@ -650,16 +680,48 @@ RUST_LOG=debug deis-control -c /etc/deis-control/config.toml
 
 #### 3. Database locked
 
-```bash
-# Check database file permissions
-ls -l /var/lib/deis-control/deis-control.db
+A lock is contention, not damage: some other process is holding the write lock
+on a file this one wants. The catalog runs on SQLite's default rollback
+journal rather than WAL - nothing here sets `journal_mode`, and
+`PRAGMA journal_mode` on a live catalog answers `delete` - so one writer
+excludes every reader for as long as it is writing. That makes the question
+"who else has this file open", and nothing else.
 
-# Check processes
+`-readonly` on each command below is the load-bearing part, and it is why
+this section no longer opens a plain `sqlite3` prompt. Without the flag the
+shell opens the database **read-write**: a second writer attached to the live
+catalog, which is the exact condition being diagnosed. It queues for the same
+lock; interrupted mid-statement it leaves a hot journal the service has to
+roll back before it can serve; and run under `sudo` beside a service running
+as `deis-control` it creates that journal owned by root, after which the
+service cannot write at all and a lock that would have cleared on its own has
+become an outage. With `-readonly`, SQLite refuses every write before it
+reaches the file.
+
+```bash
+# Who has the file open. This is the answer most of the time.
 sudo lsof /var/lib/deis-control/deis-control.db
 
-# If recovery is needed
-sqlite3 /var/lib/deis-control/deis-control.db ".backup /tmp/deis-control-backup.db"
+# Permissions - the directory as well as the file. SQLite writes its journal
+# beside the database, so a writable file in a directory the service cannot
+# write to is a database it cannot write either.
+ls -ld /var/lib/deis-control
+ls -l /var/lib/deis-control/deis-control.db
+
+# Is the file itself damaged? Asked without becoming a writer.
+sqlite3 -readonly /var/lib/deis-control/deis-control.db 'PRAGMA integrity_check;'
+
+# A copy to work on, through SQLite's own backup API so it is consistent even
+# while the service is running. Poke at the copy; leave the live file alone.
+sqlite3 -readonly /var/lib/deis-control/deis-control.db \
+  ".backup /tmp/deis-control-copy.db"
 ```
+
+Stop the service before running anything that writes. A `sqlite3` prompt on
+the live catalog reaches applications, versions, accounts, scoped tokens and
+the audit log with no authorization gate in front of it and no audit line
+behind it - the audit log has no delete anywhere in this process, and that
+prompt is the one way around it.
 
 #### 4. TLS certificate issues
 
@@ -704,15 +766,18 @@ document's script. In the order it matters:
   a running service takes the same snapshots on a timer once `snapshot_dir` is
   set.
 * **deis-queue** - `<data_dir>/queue.sqlite`, also WAL, and with no snapshot
-  subcommand of its own. Copy it with `sqlite3 queue.sqlite ".backup out.db"`
-  or `VACUUM INTO`, never with `cp`. In-flight messages are the loss.
+  subcommand of its own. Copy it with
+  `sqlite3 -readonly queue.sqlite ".backup out.db"` or `VACUUM INTO`, never
+  with `cp`, and never without `-readonly`: the queue is being written while
+  you copy it. In-flight messages are the loss.
 * **deis-proxy** - the ACME storage directory (`tls.acme.storage_dir`, default
   `acme`). It holds the account key and the issued certificates. Losing it is
   recoverable but not free: the account is registered again and every
   certificate re-issued, against the issuing authority's rate limits.
 * **deis-telemetry** - `<data_dir>/telemetry.sqlite`. Logs, traces and metric
   samples; losing them loses history, not the ability to serve. Back it up if
-  the history is worth something, with `.backup` for the same WAL reason.
+  the history is worth something, with `sqlite3 -readonly ... ".backup ..."`
+  for the same two reasons: WAL, and never a second writer.
 * **deis-runtime** - nothing. A node's data directory is derived state: its
   assignment list and the bundles it has fetched. It rebuilds both from the
   control plane on its next poll, which is exactly why the control plane's
@@ -737,10 +802,20 @@ trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$BACKUP_DIR"
 
-# The database, through SQLite's own backup API. It runs in WAL mode, so a
-# plain cp can produce a file that is missing the last commits or is corrupt,
-# and neither shows up until the day it is restored.
-sqlite3 "$DB" ".backup '$STAGE/deis-control.db'"
+# The database, through SQLite's own backup API rather than cp: this runs on a
+# timer against a control plane that is serving, and a copy taken part-way
+# through a transaction is missing the journal that would complete it. Such a
+# file opens perfectly the day it is made and is short of its last commits, or
+# corrupt, on the day it is restored. (The catalog is on the default rollback
+# journal, not WAL - `PRAGMA journal_mode` answers `delete` - which changes
+# how a torn copy goes wrong and not that it does.)
+#
+# -readonly for the same reason the troubleshooting section uses it: a backup
+# must never be the second writer on the live catalog. Without the flag this
+# line opens the database read-write, queues behind the service for the write
+# lock, and - run from root's cron beside a service running as deis-control -
+# can leave a journal file the service is not allowed to write.
+sqlite3 -readonly "$DB" ".backup '$STAGE/deis-control.db'"
 
 # The bundle store: the only copy of every version's code.
 cp -a "$BUNDLES" "$STAGE/bundles"

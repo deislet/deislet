@@ -136,18 +136,14 @@ mod tests {
         let options = CompilerOptions {
             project_dir: "./test".to_string(),
             minify: true,
-            source_map: false,
             target_vendor: Some("cloudflare".to_string()),
-            strict_validation: false,
             output_mode: OutputMode::Memory,
         };
 
         // Verify the fields are accessible
         assert_eq!(options.project_dir, "./test");
         assert!(options.minify);
-        assert!(!options.source_map);
         assert_eq!(options.target_vendor, Some("cloudflare".to_string()));
-        assert!(!options.strict_validation);
         assert_eq!(options.output_mode, OutputMode::Memory);
     }
 
@@ -179,7 +175,6 @@ mod tests {
 
         assert_eq!(options.project_dir, ".");
         assert!(options.minify);
-        assert!(!options.source_map);
         assert_eq!(options.target_vendor, None);
     }
 }

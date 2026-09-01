@@ -551,6 +551,42 @@ pub async fn handle_request(
         key.environment().to_string(),
     );
 
+    // This node's own readiness, for the one application that answers the
+    // edge's health probe.
+    //
+    // deis-proxy asks `GET /health` with `x-deis-app-id: _system`, evicts an
+    // upstream that does not answer 200, and reads the readiness the answer
+    // states to judge a node that is up but not running what it was told to.
+    // The system application used to answer 200 from a literal that consulted
+    // nothing, so a node that could not reach its control plane and had
+    // nothing loaded passed the probe for ever while answering 500 to every
+    // real request.
+    //
+    // It cannot read `crate::health` itself - `js/runtime.js` deletes
+    // `globalThis.Deno` before any application code runs - and the sweep above
+    // is what makes these two headers trustworthy: the client's copy of
+    // anything under `x-deis-` has already been dropped, so what the isolate
+    // reads here is this node's word and nobody else's. See `crate::health`
+    // for which answer each state gets and why the count travels with it.
+    //
+    // Stamped for `_system` alone. Every other application gets a smaller
+    // request, and none of them has any business branching on the health of
+    // the node it happens to be running on.
+    if key.app_id() == crate::health::SYSTEM_APP_ID {
+        if let Some(readiness) = crate::health::serving_readiness() {
+            header_list::set_unique(
+                &mut request_headers,
+                crate::health::READINESS_HEADER,
+                readiness.state_name().to_string(),
+            );
+            header_list::set_unique(
+                &mut request_headers,
+                crate::health::SERVING_APPS_HEADER,
+                readiness.serving_apps().to_string(),
+            );
+        }
+    }
+
     // Add WebSocket upgrade flag.
     //
     // Lower-cased deliberately, because the loop above spells every name the

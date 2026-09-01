@@ -768,7 +768,12 @@ impl DeploymentDeliverer {
         // reach - and came back green while a live node kept serving the old
         // version. See `RuntimeNodeManager::departed`.
         let departed = self.nodes.departed();
-        if node_ids.is_empty() && departed.is_empty() {
+        // The second way a live machine is missing from `ids()`: it registered
+        // a node id another machine already answers for and was refused, so it
+        // has no entry of its own and everything sent to that id goes to the
+        // other machine. See `RuntimeNodeManager::contested`.
+        let contested = self.nodes.contested();
+        if node_ids.is_empty() && departed.is_empty() && contested.is_empty() {
             let reason_text = "no runtime nodes are configured on this control plane; \
                  the deployment is recorded and any node that starts later picks it up \
                  from its assignment list"
@@ -830,6 +835,12 @@ impl DeploymentDeliverer {
                 error: node.describe(),
             });
         }
+        for node in &contested {
+            report.failed.push(NodeFailure {
+                node: node.id.clone(),
+                error: node.describe(),
+            });
+        }
 
         let failed_nodes: Vec<&str> = report.failed.iter().map(|f| f.node.as_str()).collect();
         if report.failed.is_empty() {
@@ -849,6 +860,7 @@ impl DeploymentDeliverer {
                 reason = reason.as_str(),
                 nodes = ?failed_nodes,
                 lost_nodes = departed.len(),
+                contested_ids = contested.len(),
                 errors = ?report.failed.iter().map(|f| f.error.as_str()).collect::<Vec<_>>(),
                 "No runtime node took this version; the whole fleet still serves the previous one until a node refetches its assignments"
             );
@@ -861,6 +873,7 @@ impl DeploymentDeliverer {
                 delivered = report.delivered.len(),
                 failed = ?failed_nodes,
                 lost_nodes = departed.len(),
+                contested_ids = contested.len(),
                 "{} of the fleet took this version and {} did not; the listed nodes still serve the previous one, so requests hit two different versions until they catch up",
                 report.delivered.len(),
                 failed_nodes.len()
@@ -904,7 +917,12 @@ impl DeploymentDeliverer {
         // it. A node that stopped refreshing its registration is by definition
         // not reconciling either.
         let departed = self.nodes.departed();
-        if node_ids.is_empty() && departed.is_empty() {
+        // And the machine that was refused a node id another machine holds is
+        // exactly as unreachable, with the same consequence one step worse:
+        // after this call it goes on serving the deleted application, its code
+        // and its decrypted secrets.
+        let contested = self.nodes.contested();
+        if node_ids.is_empty() && departed.is_empty() && contested.is_empty() {
             let reason = "no runtime nodes are configured on this control plane, so there is \
                  nothing serving the deleted application here"
                 .to_string();
@@ -944,6 +962,12 @@ impl DeploymentDeliverer {
                 error: node.describe(),
             });
         }
+        for node in &contested {
+            report.failed.push(NodeFailure {
+                node: node.id.clone(),
+                error: node.describe(),
+            });
+        }
 
         if report.failed.is_empty() {
             info!(
@@ -956,6 +980,7 @@ impl DeploymentDeliverer {
                 app_id = %app_id,
                 unloaded = report.unloaded.len(),
                 lost_nodes = departed.len(),
+                contested_ids = contested.len(),
                 nodes = ?report.failed.iter().map(|f| f.node.as_str()).collect::<Vec<_>>(),
                 errors = ?report.failed.iter().map(|f| f.error.as_str()).collect::<Vec<_>>(),
                 "These runtime nodes were not told to drop the deleted application and are still serving it, with its secrets still in memory; one that can still reach this control plane stops on its own the next time it reconciles against its assignment list, which no longer names the application, so the exposure lasts until that reconcile - while one counted in lost_nodes stopped talking to this control plane altogether and is not reconciling either, so it serves the deleted application until it is restarted or comes back"
@@ -1806,6 +1831,71 @@ mod tests {
         assert_eq!(nodes.expire_stale_registrations(Utc::now()), ["node-b"]);
         assert!(nodes.ids().is_empty(), "it has left the fleet list");
         nodes
+    }
+
+    /// A fleet where one machine was refused a node id another machine is
+    /// still answering for. The refused machine has no entry of its own, so
+    /// `ids()` shows one node where two are running.
+    async fn fleet_with_one_refused_machine() -> Arc<RuntimeNodeManager> {
+        let nodes = Arc::new(RuntimeNodeManager::new_with_ttl(Vec::new(), 15, 60));
+        let now = Utc::now();
+        nodes
+            .register_claim_with("node-a", "http://127.0.0.1:1", None, now, |_| async {
+                None
+            })
+            .await
+            .unwrap();
+        nodes
+            .register_claim_with("node-a", "http://127.0.0.2:1", None, now, |_| async {
+                Some(crate::runtime_client::NodeIdentity {
+                    node_id: "node-a".to_string(),
+                    hostname: "box-one".to_string(),
+                    uptime_seconds: 4_212,
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(nodes.ids(), ["node-a".to_string()], "one id, two machines");
+        nodes
+    }
+
+    /// Two machines sharing a node id used to be one node to this control
+    /// plane: the push went to whichever address had registered last, was
+    /// counted against the single entry, and the deploy came back reporting
+    /// the whole fleet as delivered while the other machine went on serving
+    /// the previous version.
+    #[tokio::test]
+    async fn a_deploy_reports_the_machine_that_was_refused_the_node_id() {
+        let (ready, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let deliverer = DeploymentDeliverer::new(
+            Arc::clone(&store),
+            Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
+            fleet_with_one_refused_machine().await,
+            Arc::clone(&ready.address),
+            StorageWiring::default(),
+        );
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+        let report = deliverer.push(&payload, DeliveryReason::Deployment).await;
+
+        // Two entries for one id, which is the truth: one machine was asked
+        // and one was never reachable at all.
+        assert_eq!(report.failed.len(), 2, "got {:?}", report.failed);
+        let refused = report
+            .failed
+            .iter()
+            .find(|failure| failure.error.contains("registered this node id"))
+            .expect("the refused machine has to be named");
+        assert!(
+            refused.error.contains("http://127.0.0.2:1"),
+            "the answer has to name the machine nothing was sent to: {}",
+            refused.error
+        );
+        assert!(!report.fully_delivered());
     }
 
     /// A node that fell off the fleet list used to appear in neither

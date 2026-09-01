@@ -2,6 +2,13 @@
 #
 # Layering: baseline defaults + this file + control overlay. Every key is
 # optional; an unset key keeps the baseline value shown here.
+# Order matters, and TOML is the reason: once a table header like
+# `[[upstreams]]` or `[health_check]` appears, every bare key after it belongs
+# to *that* table, and this proxy refuses unknown fields. So every top-level
+# key is written first and the tables come afterwards. Moving one of the keys
+# below down past a table turns it into an unknown field of that table and the
+# configuration stops loading, which is why
+# `config::tests::the_shipped_example_configuration_loads` reads this file.
 
 # Relative paths anywhere in this file (database, pid_file, upgrade_sock,
 # log paths, certificate files) are resolved against the directory deis-proxy was
@@ -31,6 +38,23 @@ database = "sites.db"
 # Plain HTTP listeners: every address combined with every port.
 listen_addr = ["0.0.0.0"]
 listen_ports = [80]
+
+# round_robin | random | ip_hash | header_hash(<Header-Name>)
+# Fixed for the lifetime of the process; the upstream list is not.
+balancing_strategy = "round_robin"
+# Seconds between health checks and upstream list refreshes.
+health_check_interval_secs = 5
+# Seconds to wait for one upstream connection. A request whose connection is
+# refused or times out is retried on another upstream, up to three upstreams,
+# so this is also the worst-case cost of each of those attempts.
+upstream_connect_timeout_secs = 5
+upstream_read_timeout_secs = 30
+
+# On shutdown or upgrade: seconds to keep serving in-flight requests after new
+# connections are no longer accepted, then seconds allowed for the workers to
+# wind down. Together they bound how long the old process lingers.
+grace_period_secs = 10
+graceful_shutdown_timeout_secs = 5
 
 # TLS listeners. The baseline has none; enable this table to terminate TLS.
 # Certificates belong to applications and are chosen by the SNI name the
@@ -122,19 +146,31 @@ host = "127.0.0.1"
 port = 8002
 weight = 2
 
-# round_robin | random | ip_hash | header_hash(<Header-Name>)
-# Fixed for the lifetime of the process; the upstream list is not.
-balancing_strategy = "round_robin"
-# Seconds between TCP health checks and upstream list refreshes.
-health_check_interval_secs = 5
-upstream_connect_timeout_secs = 5
-upstream_read_timeout_secs = 30
-
-# On shutdown or upgrade: seconds to keep serving in-flight requests after new
-# connections are no longer accepted, then seconds allowed for the workers to
-# wind down. Together they bound how long the old process lingers.
-grace_period_secs = 10
-graceful_shutdown_timeout_secs = 5
+# What the edge asks an upstream before giving it traffic.
+[health_check]
+# http (default) asks the node; tcp only opens a connection, which a
+# deis-runtime node accepts long before it can serve anything.
+mode = "http"
+path = "/health"
+app_id = "_system"
+timeout_secs = 2
+healthy_after = 1
+unhealthy_after = 2
+# How much the node's own `x-deis-node-readiness` answer is believed.
+#
+#   reported (default) - `starting` is out of rotation; `degraded` keeps its
+#                        share, because every node reports degraded at once
+#                        when the control plane goes down and evicting them
+#                        all would answer 503 to traffic they can still
+#                        serve; a node that states nothing is judged on the
+#                        200 alone.
+#   required           - only a node stating `ready` is given traffic. A node
+#                        that states nothing is out of rotation, so this
+#                        empties the pool against a fleet that predates the
+#                        header.
+#   ignored            - the status code alone decides. For an upstream that
+#                        is not a deis-runtime node.
+readiness = "reported"
 
 [compression]
 enabled = true

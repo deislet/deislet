@@ -1,10 +1,22 @@
 use crate::compiler::Compiler;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use colored::Colorize;
 use std::env;
 use std::time::Instant;
 
-pub async fn execute(vendors: Vec<String>, _watch: bool, minify: bool) -> Result<()> {
+pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<()> {
+    // Refused rather than ignored, the same way `deis build --watch` refuses
+    // it. This binary took the flag as `_watch`, built once and exited, which
+    // looks exactly like a watcher that is running and seeing no changes - the
+    // slowest possible way to discover that nothing is rebuilding.
+    if watch {
+        bail!(
+            "`deis-build build --watch` is not implemented. `deis dev` rebuilds and reloads on every \
+             change for this platform; for a vendor target, run `deis-build build --vendor <name>` \
+             from your own file watcher."
+        );
+    }
+
     println!("{}", "Building project...".yellow());
 
     let start = Instant::now();

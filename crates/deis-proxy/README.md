@@ -202,17 +202,38 @@ the control pushes. Notable behaviour:
   upstream is in rotation the edge answers `503` and logs how many upstreams
   there are and how many passed.
 
-  What that probe is worth today has a limit worth knowing. A node's real
-  readiness — `starting`, `ready`, `degraded` — is reported by its
-  *management* `HealthCheck` RPC, on an address this proxy is never given;
-  the `/health` on the data port is the `_system` application's own and
-  answers `200` whenever the node is serving at all. So the check closes the
-  states a TCP connect cannot see (a port in the kernel's backlog with
-  nothing serving it, a dispatcher that has stopped answering, a node too
-  loaded to answer inside `timeout_secs`) and not yet the two only the node
-  can name. Closing those is one change on the node: the moment `_system`'s
-  `/health` answers a non-200 while the node is not `ready`, this proxy
-  already asks, already believes it and already stops routing there.
+  A `200` on its own is still thin: `_system`'s `/health` is a handler that
+  returns a constant, so it proves the dispatcher ran an isolate and says
+  nothing about whether the node is running what the control plane assigned
+  it. So the probe also reads `x-deis-node-readiness` off the answer, where a
+  node states its own `starting` / `ready` / `degraded`, and
+  `health_check.readiness` decides what to do with it:
+
+  | `readiness` | Effect |
+  |---|---|
+  | `reported` (default) | `starting` is out of rotation; `degraded` keeps its share and is logged; a node that states nothing is judged on the `200` alone. |
+  | `required` | Only a node stating `ready` is given traffic. A node that states nothing is out of rotation, so this empties the pool against a fleet older than the contract. |
+  | `ignored` | The status code alone decides. For an upstream that is not a deis-runtime node. |
+
+  `degraded` keeping its share is deliberate: a node is degraded because it
+  cannot reach the *control plane*, and when a control plane goes down every
+  node reports it at once. Evicting them all would answer `503` to traffic
+  that every node was still able to serve — this edge inventing a larger
+  outage than the one it was reacting to.
+
+  The header is under `x-deis-`, which deis-bundle refuses to let a deployed
+  application set on a response, so it is a statement by the node and not a
+  claim by whatever code the node is running.
+- A **connection** that cannot be established is retried on another upstream,
+  up to three upstreams for one request. Nothing has been written to a node
+  when a connect fails, so there is nothing that could be done twice and a
+  `POST` is as retryable as a `GET`; an error *after* the connection
+  succeeded is not retried except on a reused connection, which is pingora's
+  own rule. Three, not the whole pool: a node dropping packets rather than
+  refusing them costs a full `upstream_connect_timeout_secs` (5) per attempt.
+  Without this a node that died between two health checks failed its whole
+  share of the traffic — half of it on a two-node edge — until the check
+  evicted it, up to `unhealthy_after` intervals later.
 - `listen_ports` are plain HTTP, `tls.ports` terminate TLS; a port may not
   appear in both. `[tls.acme]` is refused with an empty `tls.ports`: a
   certificate nothing can present is a rate limit spent for nothing.
@@ -302,25 +323,64 @@ daemon running without one.
 
 `reload` (or the control's `restart`) starts a second `deis-proxy --upgrade`
 process with the same configuration and from the same working directory,
-waits for it to report that its startup succeeded (configuration, database,
-logs and certificates loaded, and the `upgrade_sock` path bound once to
-prove it can be), then sends `SIGQUIT` to the running one. Pingora hands the
-listening sockets over that Unix socket; the new process starts accepting on
-them while the old one finishes its in-flight requests and exits. No
-connection is refused in between. If the replacement exits before it is
-ready, the running process logs the exit status and keeps serving.
+waits for it to report that its startup succeeded, then sends `SIGQUIT` to
+the running one. Pingora hands the listening sockets over that Unix socket;
+the new process starts accepting on them while the old one finishes its
+in-flight requests and exits. No connection is refused in between. If the
+replacement exits before it is ready, the running process logs why and keeps
+serving.
 
-`SIGQUIT` is a one-way door -- pingora commits to shutting down whether or
-not the transfer that follows works -- so the readiness byte has to come
-after everything that can fail, and binding the upgrade socket is both the
-last of those and a `.unwrap()` inside pingora. Two things follow. A
-`upgrade_sock` longer than the 107 bytes a Unix address holds, or one whose
-directory does not exist, is refused at **startup**, not left to be
-discovered by the first operator who runs `reload`; remember that a relative
-path is made absolute first, so the length that counts is the resolved one.
-And the replacement binds the path itself, releases it, and only then says it
-is ready, so a path that has become unusable since startup fails the upgrade
-instead of taking the listeners down with it.
+**It runs the build that is on disk now.** The path to execute is captured
+when the process starts, not when the upgrade runs: every way of installing a
+new binary on Linux unlinks the running one (`cp` onto a running executable
+is refused with `ETXTBSY`, and `install`, `mv`, `dpkg` and `rpm` all rename),
+so `/proc/self/exe` asked at upgrade time reads `… (deleted)` and names
+nothing. Put the new build at the same path and run `reload`.
+
+`SIGQUIT` is a one-way door — pingora commits to shutting down whether or not
+the transfer that follows works — so the readiness byte has to come after
+everything that can fail, and it cannot come after `bootstrap()`, which in
+upgrade mode blocks until the running process has been signalled. Two things
+are therefore bound for real, by the replacement, before it says it is ready:
+
+- the **upgrade socket**, which pingora binds inside `bootstrap()` with an
+  `.unwrap()`, so an over-long or missing path would be a panic;
+- every **listening address the replacement has to bind for itself**. The
+  running process tells the replacement which addresses it is handing over
+  (they arrive as descriptors and answer `EADDRINUSE` for a reason that is
+  not a failure); anything else in `listen_ports` and `tls.ports` is new, and
+  pingora binds those in `start_service`, after the handover. Adding a port
+  that cannot be bound used to be a permanent outage — the old process left,
+  the replacement retried the bind for thirty seconds and exited, and nothing
+  was listening. Now the upgrade fails and the running process keeps every
+  listener.
+
+In daemon mode a third thing is proved, with the rest of the daemon checks and
+for the same reason one step further out: the **pid file**. Pingora writes it
+inside `daemonize()`, which runs after the listening sockets have already been
+taken over, and creates it with an `unwrap()`. A `pid_file` in a directory that
+does not exist is therefore an upgrade that hands over and then panics — and on
+an ordinary `deis-proxy -d` it is worse than that, because the daemonize crate
+forks before it creates the file: the parent exits `0`, the child panics, the
+command reports success and no port is ever bound. It is refused in the
+foreground now, naming the directory to create; a service manager usually
+creates it (systemd's `RuntimeDirectory=`).
+
+An `upgrade_sock` longer than the 107 bytes a Unix address holds, or one
+whose directory does not exist, is a **warning** at startup and in
+`deis-proxy -t`. Not a refusal: it costs this instance nothing but the
+ability to be replaced without an outage, and since the replacement proves
+the path before the running process is signalled, it no longer costs even
+that. Refusing to start would make the length of a deployment directory a
+reason to serve nothing. Remember that a relative path is made absolute
+first, so the length that counts is the resolved one, and that `upgrade_sock`
+does not have to sit beside the database and the pid file — `/run/…` or
+`/tmp/…` is fine.
+
+`-s reload` exits `0` once the signal is delivered, and a signal carries no
+answer back: whether a replacement took the listeners over is in the error
+log, as either `replacement process is ready; handing over listening sockets`
+or `keeping the current process` and why.
 
 `scripts/test_graceful_restart.sh` at the repository root exercises this
 end to end against a local backend while keeping requests flowing, in the
