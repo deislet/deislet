@@ -110,10 +110,15 @@ const {
   ArrayPrototypePush,
   DateNow,
   FunctionPrototypeCall,
+  MapPrototypeDelete,
+  MapPrototypeGet,
+  MapPrototypeSet,
   MathFloor,
   ObjectDefineProperties,
   ObjectFreeze,
   ObjectGetOwnPropertyDescriptor,
+  ReflectApply,
+  SafeMap,
   SafeSet,
   SafeSetIterator,
   SetPrototypeAdd,
@@ -432,6 +437,116 @@ async function fetch(input, init = undefined) {
 }
 
 // ---------------------------------------------------------------------------
+// What owns a timer, and what owns an outbound call
+// ---------------------------------------------------------------------------
+//
+// An isolate outlives the request that ran in it: deis-runtime keeps one per
+// (application, environment) on each node and hands it every later request. So
+// anything an application leaves armed goes on running inside somebody else's
+// request, charged to somebody else's budget. Every timer this runtime arms and
+// every outbound call it bounds is therefore filed against the stretch of
+// application code that armed it, and ended when that stretch ends.
+//
+// There are exactly two kinds of stretch, and deliberately no third:
+//
+//   * an invocation -- a request, a queue batch, a cron tick, or the module's
+//     own top-level code -- together with its `waitUntil` tail. `js/runtime.js`
+//     sweeps `invocationOwner` at the end of it, and `runtime/isolate.rs`
+//     sweeps it again on the paths that never reach that tail, which is what a
+//     handler that overruns its budget takes.
+//   * one step of a response stream's producer. A stream is the one thing that
+//     outlives the invocation that created it: its head has gone to the client
+//     and its body is still being written, by code that legitimately holds the
+//     `fetch` it is copying from and the timer that paces it. Sweeping those
+//     when the handler returned would cut the stream's own source out from
+//     under it; leaving them in the invocation's sets would mean the *next*
+//     request to this application swept them, which is worse -- the failure
+//     would then depend on somebody else's traffic. So a stream is given an
+//     owner of its own when it begins, and it is released when the stream ends,
+//     on every path that ends one.
+//
+// # Which stretch is running is this runtime's answer, not the application's
+//
+// `entryOwner` is written only by `streamScope` further down, and `streamScope`
+// never reaches application code: `js/runtime.js` claims it once while the
+// isolate is being built, and the claim answers null to every caller after
+// that. That is the whole of the guarantee, and it is worth writing down why it
+// has to be. The scope used to sit on `globalThis` sealed and callable, and
+// sealed is not unreachable: a handler that called
+// `enter({ intervals: new Set() })`, armed an interval and called `leave()` had
+// filed that interval in a set no sweep looks in. Measured before this was
+// closed: 4, 9, 14 and 23 ticks of one request's interval firing inside
+// separate later ones, with nothing in the log to say so. `adopt()` was the
+// same hole without even an invented object -- it minted an owner the runtime
+// would only release when a stream that was never opened ended.
+//
+// `streamOwners` is the second half of the same answer, and it is what makes
+// the model hold even if that object ever leaks again. `enter` accepts only an
+// owner this module minted and has not yet released; anything else -- an
+// invented object, an owner already given back -- files against the invocation,
+// which is the set that is always swept. The set of owners is therefore closed:
+// every one of them is something this runtime ends, and a caller can at most
+// choose among owners that already exist.
+
+function newOwner() {
+  return {
+    guards: new SafeSet(),
+    intervals: new SafeSet(),
+    timeouts: new SafeSet(),
+  };
+}
+
+// The invocation running now. One object for the life of the isolate: an
+// invocation is swept rather than replaced, so there is nothing to hand over
+// between one request and the next.
+const invocationOwner = newOwner();
+
+// The owners response streams hold right now, and the only owners `enter` will
+// accept. More than one at a time is ordinary: an application serving
+// server-sent events has one per connected browser.
+const streamOwners = new SafeSet();
+
+// Where whatever is armed now gets filed. Never null -- the invocation owns
+// everything no stream step armed, which is every path that existed before
+// streams did.
+let entryOwner = invocationOwner;
+
+function ownedGuards() {
+  return entryOwner.guards;
+}
+
+function ownedIntervals() {
+  return entryOwner.intervals;
+}
+
+function ownedTimeouts() {
+  return entryOwner.timeouts;
+}
+
+// Which set each live timer is filed in.
+//
+// A timer id is a number, so unlike a budget guard it cannot carry its own set
+// around, and there is more than one set it could be in: a timer armed by a
+// stream's producer is in that stream's, not the invocation's. Clearing it out
+// of a guess would leave the id behind in the set it really is in -- harmless
+// once, and unbounded for a producer that sleeps between chunks for the whole
+// of `stream_timeout_ms`.
+const timerHome = new SafeMap();
+
+function fileTimer(set, id) {
+  SetPrototypeAdd(set, id);
+  MapPrototypeSet(timerHome, id, set);
+}
+
+// Take one timer off the books. Says nothing about the timer itself: whoever
+// calls this has either cleared it or just watched it fire.
+function dropTimer(id) {
+  const set = MapPrototypeGet(timerHome, id);
+  if (set !== undefined) SetPrototypeDelete(set, id);
+  MapPrototypeDelete(timerHome, id);
+}
+
+// ---------------------------------------------------------------------------
 // The execution budget an outbound call has to fit inside
 // ---------------------------------------------------------------------------
 //
@@ -474,8 +589,8 @@ const nativeClearTimeout = timers.clearTimeout;
 // Each entry is `{ controller, id, set }`: the `AbortController` bounding one
 // outbound call, the timeout that trips it when the budget runs out, and the
 // set the entry is filed in so the timeout can take itself out of the right
-// one. See `entryOwner` below for why there is more than one set.
-const budgetGuards = new SafeSet();
+// one. The set it starts in is the one the ownership section above chose; see
+// there for why there is more than one.
 
 // What an application is told when the budget ran out under it. A
 // `TimeoutError` is what an `AbortSignal` deadline produces everywhere else,
@@ -531,21 +646,13 @@ function armGuard(set, controller, remaining) {
   return guard;
 }
 
-// End every outbound call still bounded by the budget when the invocation
-// ends, and say how many there were. `js/runtime.js` calls this after
-// `waitUntil` work has been awaited, next to the interval sweep.
+// End every outbound call filed in one set, and say how many there were.
 //
 // Each guard's timer is stopped so it cannot fire inside a later request, and
 // its controller is aborted. Aborting the controller of a call that already
 // finished is a no-op; aborting one that is still open -- a detached `fetch`
 // the handler never awaited -- closes its socket, so no outbound call outlives
-// the request that made it.
-function sweepBudgetTimers() {
-  return sweepGuardSet(budgetGuards);
-}
-
-// End every outbound call filed in one set. Written apart from the sweep above
-// because a response stream owns a set of its own and is released the same way.
+// the stretch that made it.
 function sweepGuardSet(set) {
   let swept = 0;
   for (const guard of new SafeSetIterator(set)) {
@@ -566,28 +673,31 @@ function sweepGuardSet(set) {
 // Timers
 // ---------------------------------------------------------------------------
 //
-// An isolate outlives the request that ran in it: deis-runtime keeps one per
-// (application, environment) on each node and hands it every later request.
-// That makes a timer left running a leak, and the two kinds of timer are not
-// equally bad:
+// Both kinds are tracked, and for one reason each. Neither kind stops on its
+// own when the stretch that armed it ends, and an isolate is reused, so what is
+// left armed fires inside somebody else's request.
 //
-//   * a `setTimeout` fires once and is gone. A pending one costs one callback
-//     on some later request's event loop and then nothing. `waitUntil` work
-//     depends on being able to schedule one, so they are left alone.
-//   * a `setInterval` never stops on its own. One created per request
-//     accumulates without bound: every one of them keeps firing on every
-//     later request in that isolate, burning CPU that the request being served
-//     is charged for, and each op the callback dispatches counts against the
-//     isolate's rate limit -- so a handler that sets an interval and returns
-//     eventually gets its own isolate terminated for a reason nothing in its
-//     code explains.
+//   * a `setInterval` never stops at all. One created per request accumulates
+//     without bound: every one of them keeps firing on every later request in
+//     that isolate, burning CPU that the request being served is charged for,
+//     and each op the callback dispatches counts against the isolate's rate
+//     limit -- so a handler that sets an interval and returns eventually gets
+//     its own isolate terminated for a reason nothing in its code explains.
+//   * a `setTimeout` fires once, and this file used to take that for harmless:
+//     "a setTimeout fires once and is gone ... so they are left alone", it
+//     said, and timeouts were bound straight to the raw timer and tracked
+//     nowhere. That is true of the timer and false of the callback. A callback
+//     that arms the next one before it returns is an interval written in two
+//     lines; it needs no API this runtime does not already publish, it produced
+//     no warning, and it ran for the life of the isolate. Measured: a chain
+//     armed by one request was still firing about twenty times per request
+//     inside every later one.
 //
-// So intervals are tracked, and `__deis_runtime_sweep_intervals` clears
-// whatever is still running. `js/runtime.js` calls it at the end of every
-// invocation, after `waitUntil` work has been awaited, so an interval lives
-// exactly as long as the request that created it.
-
-const liveIntervals = new SafeSet();
+// What tracking costs an application is a timer that was meant to outlive its
+// request, and there is no such thing here -- there never was, for intervals.
+// Work that has to finish after the response has gone out belongs in
+// `context.waitUntil`: the sweep is the last thing the tail does, so a timer
+// awaited inside it has already fired by then.
 
 // Lifted out of the module namespace before they are called. deno's timers
 // check their receiver -- `this` has to be undefined or globalThis -- and
@@ -598,80 +708,124 @@ const nativeClearInterval = timers.clearInterval;
 
 function setInterval(callback, delay, ...args) {
   const id = nativeSetInterval(callback, delay, ...args);
-  SetPrototypeAdd(ownedIntervals(), id);
+  fileTimer(ownedIntervals(), id);
   return id;
 }
 
 function clearInterval(id) {
   nativeClearInterval(id);
-  SetPrototypeDelete(liveIntervals, id);
-  if (entryOwner !== null) SetPrototypeDelete(entryOwner.intervals, id);
+  dropTimer(id);
 }
 
-// Stop every interval still running and say how many there were, so the
-// caller can tell the application it left something behind.
-function sweepIntervals() {
-  return sweepIntervalSet(liveIntervals);
+function setTimeout(callback, delay, ...args) {
+  const set = ownedTimeouts();
+
+  // The callback is wrapped so a timeout takes itself off the books when it
+  // fires. Without that, a producer sleeping between chunks would leave one
+  // dead id per sleep in its stream's set, and a stream may run for the whole
+  // of `stream_timeout_ms`. `id` is read inside the wrapper rather than passed
+  // in because the wrapper has to exist before there is an id to name.
+  //
+  // Only a function can be wrapped. `setTimeout` also accepts a string to be
+  // evaluated, and that form is handed to deno untouched: its id is still
+  // filed, so it is still cleared when the stretch ends -- just not the moment
+  // it fires, which is untidy rather than wrong.
+  let id = 0;
+  const tracked =
+    typeof callback === "function"
+      ? function (...called) {
+          dropTimer(id);
+          return ReflectApply(callback, this, called);
+        }
+      : callback;
+
+  id = nativeSetTimeout(tracked, delay, ...args);
+  fileTimer(set, id);
+  return id;
 }
 
-function sweepIntervalSet(set) {
+function clearTimeout(id) {
+  nativeClearTimeout(id);
+  dropTimer(id);
+}
+
+// Everything one invocation was allowed to hold, given back, with a count of
+// each kind.
+//
+// The counts are returned rather than logged here: `js/runtime.js` owns the
+// console bridge, and it is the caller that knows which of these an application
+// should be told about. Called at the end of `__deis_runtime_wait_until_all`,
+// after `waitUntil` work has been awaited, and again from
+// `runtime/isolate.rs::sweep_invocation_timers` on the paths that never reach
+// that tail.
+function sweepInvocation() {
+  return sweepOwner(invocationOwner);
+}
+
+function sweepOwner(owner) {
+  return {
+    calls: sweepGuardSet(owner.guards),
+    intervals: sweepTimerSet(owner.intervals),
+    timeouts: sweepTimerSet(owner.timeouts),
+  };
+}
+
+// Clear every timer filed in one set, and say how many there were.
+//
+// One function ends either kind: `clearTimeout` and `clearInterval` are the
+// same operation in deno_web's `02_timers.js` -- both cancel whatever timer the
+// id names -- and keeping two would only invite the sets and the clears to
+// drift apart.
+function sweepTimerSet(set) {
   let swept = 0;
   for (const id of new SafeSetIterator(set)) {
-    nativeClearInterval(id);
+    nativeClearTimeout(id);
+    MapPrototypeDelete(timerHome, id);
     swept++;
   }
   SetPrototypeClear(set);
   return swept;
 }
 
+// Hand every timer in one set to another, keeping `timerHome` honest about
+// where each of them now lives. Used once, when a response stream takes over
+// what the handler that created it left running.
+function moveTimers(from, to) {
+  for (const id of new SafeSetIterator(from)) {
+    SetPrototypeAdd(to, id);
+    MapPrototypeSet(timerHome, id, to);
+  }
+  SetPrototypeClear(from);
+}
+
 // ---------------------------------------------------------------------------
-// Who owns an outbound call or an interval
+// Handing what is open to a response stream
 // ---------------------------------------------------------------------------
 //
-// Everywhere else in this runtime, "as long as the request" is the answer, and
-// the two sweeps above are how it is kept: whatever a stretch of application
-// code left running is ended when that stretch ends.
-//
-// A response stream is the one thing that outlives the stretch that created it.
-// Its head has already gone to the client and its body is still being produced,
-// by code that legitimately holds the `fetch` it is copying from and the
-// interval that paces it. Sweeping those when the handler returned would cut
-// the stream's own source out from under it; leaving them in the shared sets
-// would mean the *next* request to this application sweeps them instead, which
-// is worse -- the failure would then depend on somebody else's traffic.
-//
-// So a stream takes ownership. `adopt` moves everything the handler still has
-// open into sets of the stream's own; `enter` points new entries at those sets;
-// `release` ends all of it when the stream does. `entryOwner` is `null` --
-// "the stretch running now owns it" -- on every path that existed before
-// streams did.
+// The ownership section near the top says who owns what and why the answer
+// cannot be the application's to give. This is the handover itself: `adopt`
+// moves everything the stretch that just ran still has open into sets of the
+// stream's own and puts its outbound calls on the stream's clock; `enter`
+// points new entries at those sets; `release` ends all of it when the stream
+// does.
 //
 // `enter` is sticky, and that is the part worth reading twice. `js/runtime.js`
 // calls it immediately before each step of a stream's producer, and *nothing*
 // clears it except the start of the next armed stretch (`leave`, called at the
-// top of an invocation and of its `waitUntil` tail). It has to be sticky: a
+// top of every invocation and of its `waitUntil` tail). It has to be sticky: a
 // producer's own code runs inside the `await` that follows `enter`, and its
 // continuations run in microtasks after that await has returned, so an owner
 // cleared on the way out of one step would leave the `fetch` a producer starts
-// in the next one filed in the shared set -- where the next request to this
-// application would sweep it.
+// in the next one filed against the invocation -- where the next request to
+// this application would sweep it.
 //
 // The cost of sticky is an attribution that can be off by one *stream*: while
 // two streams of the same application are producing at once, work one of them
 // starts outside its own step is filed against whichever stream stepped last.
 // Both are streams of this application and both are bounded by their own
 // budgets, so the entry is still swept, just possibly a little early or a
-// little late. What cannot happen -- and is the thing this whole section is
+// little late. What cannot happen -- and is the thing this whole arrangement is
 // for -- is a producer's outbound call being swept by somebody else's request.
-let entryOwner = null;
-
-function ownedGuards() {
-  return entryOwner === null ? budgetGuards : entryOwner.guards;
-}
-
-function ownedIntervals() {
-  return entryOwner === null ? liveIntervals : entryOwner.intervals;
-}
 
 // Re-arm one owner's outbound calls against the budget now in force.
 //
@@ -703,37 +857,73 @@ function rearmGuards(owner) {
 
 const streamScope = ObjectFreeze({
   // Hand everything the stretch that just ran still has open to a new owner,
-  // and put its outbound calls on the stream's clock.
+  // and put its outbound calls on the stream's clock. The counts come back with
+  // the owner so the caller can say in the log what this stream took over.
   adopt() {
-    const owner = { guards: new SafeSet(), intervals: new SafeSet() };
-    for (const guard of new SafeSetIterator(budgetGuards)) {
+    const owner = newOwner();
+    let calls = 0;
+    for (const guard of new SafeSetIterator(invocationOwner.guards)) {
       guard.set = owner.guards;
       SetPrototypeAdd(owner.guards, guard);
+      calls++;
     }
-    SetPrototypeClear(budgetGuards);
-    for (const id of new SafeSetIterator(liveIntervals)) {
-      SetPrototypeAdd(owner.intervals, id);
-    }
-    SetPrototypeClear(liveIntervals);
+    SetPrototypeClear(invocationOwner.guards);
+
+    const intervals = invocationOwner.intervals.size;
+    const timeouts = invocationOwner.timeouts.size;
+    moveTimers(invocationOwner.intervals, owner.intervals);
+    moveTimers(invocationOwner.timeouts, owner.timeouts);
+
+    SetPrototypeAdd(streamOwners, owner);
     rearmGuards(owner);
-    return owner;
+    return { owner, held: { calls, intervals, timeouts } };
   },
+  // Point what is armed next at one stream's sets.
+  //
+  // Only at an owner this module minted and has not released yet. Anything else
+  // -- an object a caller built, an owner already given back -- is the
+  // invocation's, which is the set that is always swept. That check is why a
+  // caller who got hold of this object could not file a timer somewhere nothing
+  // looks; see the ownership section for the shape of the attack it answers.
   enter(owner) {
-    entryOwner = owner;
+    entryOwner = SetPrototypeHas(streamOwners, owner) ? owner : invocationOwner;
   },
   leave() {
-    entryOwner = null;
+    entryOwner = invocationOwner;
   },
   // End everything this stream held, and say how much there was.
   //
-  // The owner is cleared if it is still the one in force: filing anything into
-  // a released set would leave it with nothing to sweep it, which is the leak
-  // this whole section exists to prevent.
+  // The owner is taken out of `streamOwners` and stops being the one in force
+  // if it was: filing anything into a released set would leave it with nothing
+  // to sweep it, which is the leak this whole arrangement exists to prevent.
   release(owner) {
-    if (entryOwner === owner) entryOwner = null;
-    return sweepGuardSet(owner.guards) + sweepIntervalSet(owner.intervals);
+    if (entryOwner === owner) entryOwner = invocationOwner;
+    SetPrototypeDelete(streamOwners, owner);
+    return sweepOwner(owner);
   },
 });
+
+// The one-shot handover of the scope above to `js/runtime.js`.
+//
+// This is what keeps ownership out of an application's hands. `js/runtime.js`
+// runs through `execute_script` while the isolate is being built -- before the
+// application's module is loaded, so before a line of its code has run -- and
+// takes the scope into a closure of its own. Every later caller gets null, so
+// the four verbs above are not reachable from application code at all. Sealing
+// the name was not enough on its own: a sealed function is still a callable
+// one, and calling `enter` was all the bypass ever needed.
+//
+// Once, rather than "a fresh one per caller": `js/runtime.js` cannot run twice
+// in one isolate anyway. It reads `Deno.core` on one line and deletes
+// `globalThis.Deno` on the next, so a second execution fails there long before
+// it reaches this.
+let streamScopeClaimed = false;
+
+function claimStreamScope() {
+  if (streamScopeClaimed) return null;
+  streamScopeClaimed = true;
+  return streamScope;
+}
 
 // ---------------------------------------------------------------------------
 // The clock, and what this platform calls itself
@@ -840,11 +1030,16 @@ const navigator = ObjectFreeze({
 // looking like platform surface to code that had never touched them.
 //
 // So the names that describe the platform rather than serve the application
-// are sealed: no write, no redefinition, no delete. The two internal hooks are
-// sealed for a harder reason -- `__deis_runtime_sweep_intervals` is what ends
-// an application's `setInterval` when its request does, and an application
-// that could replace it with a no-op would leave callbacks running on a
-// runtime thread its request no longer owns.
+// are sealed: no write, no redefinition, no delete. The internal hooks are
+// sealed for a harder reason -- `__deis_runtime_sweep_invocation` is what ends
+// an application's timers and outbound calls when its request ends, and an
+// application that could replace it with a no-op would leave callbacks running
+// on a runtime thread its request no longer owns.
+//
+// Sealing is a floor, not a ceiling. It protects a name and a value; it says
+// nothing about what calling the value does. `__deis_runtime_stream_scope` was
+// sealed and reachable, and reaching it was the whole of the bypass -- so the
+// stream scope is now handed over once and not published at all.
 
 function propSealed(value) {
   return { value, writable: false, enumerable: true, configurable: false };
@@ -889,10 +1084,13 @@ ObjectDefineProperties(globalThis, {
   WritableStream: core.propNonEnumerable(streams.WritableStream),
   TransformStream: core.propNonEnumerable(streams.TransformStream),
 
-  // Section 8.1: timers. `setInterval` and `clearInterval` are the wrappers
-  // above, so an interval cannot outlive the request that created it.
-  setTimeout: core.propWritable(timers.setTimeout),
-  clearTimeout: core.propWritable(timers.clearTimeout),
+  // Section 8.1: timers. All four are the wrappers above, so no timer can
+  // outlive the stretch of application code that armed it -- an interval, and
+  // equally a `setTimeout` whose callback arms the next one before it returns,
+  // which is what the raw `timers.setTimeout` that used to be bound here let
+  // run for the life of the isolate.
+  setTimeout: core.propWritable(setTimeout),
+  clearTimeout: core.propWritable(clearTimeout),
   setInterval: core.propWritable(setInterval),
   clearInterval: core.propWritable(clearInterval),
 
@@ -974,19 +1172,25 @@ ObjectDefineProperties(globalThis, {
   navigator: propSealed(navigator),
 
   // Internal, not part of the platform's promise to applications: see the
-  // timers section above and the execution-budget section further up. Both
-  // are called by `js/runtime.js` at the end of every invocation, so both are
-  // sealed -- a no-op in place of either is an application keeping work
-  // running past the request that started it.
-  __deis_runtime_sweep_intervals: propSealedNonEnumerable(sweepIntervals),
-  __deis_runtime_sweep_fetch_budgets: propSealedNonEnumerable(sweepBudgetTimers),
+  // timers section above and the execution-budget section further up. This is
+  // what ends an invocation's timers and its outbound calls, and it is called
+  // by `js/runtime.js` at the end of every invocation and by
+  // `runtime/isolate.rs` on the paths that never reach that end. Sealed: a
+  // no-op in its place is an application keeping work running past the request
+  // that started it.
+  __deis_runtime_sweep_invocation: propSealedNonEnumerable(sweepInvocation),
 
-  // How a response stream keeps hold of the outbound call and the interval
-  // that feed it for as long as its body is being written, instead of losing
-  // them to the sweep that ends the request. Sealed for the same reason the
-  // sweeps are: an application that could replace it would keep work running
-  // on a runtime thread no request of its own still owns.
-  __deis_runtime_stream_scope: propSealedNonEnumerable(streamScope),
+  // How a response stream keeps hold of the outbound calls and timers that
+  // feed it for as long as its body is being written, instead of losing them
+  // to the sweep that ends the request.
+  //
+  // A claim, not the object: `js/runtime.js` takes it while the isolate is
+  // being built and every later caller gets null, so an application cannot
+  // reach `enter` or `adopt` at all. Sealing the object here was what this
+  // used to do, and a sealed function is still a callable one -- calling
+  // `enter` with a set of its own was all it took to file a timer where no
+  // sweep looks.
+  __deis_runtime_claim_stream_scope: propSealedNonEnumerable(claimStreamScope),
 
   // The event classes `js/runtime.js` builds its WebSocket events out of.
   // That file runs through `execute_script`, so it cannot import from

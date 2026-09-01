@@ -332,6 +332,39 @@ impl Drop for Proxy {
     }
 }
 
+/// Write one application into a fresh deis-proxy database, in the shape the
+/// control plane pushes.
+///
+/// Straight SQL against the schema `deis_proxy::config::ConfigDatabase`
+/// creates (`app_configs(app_id, config, version_timestamp)`), because
+/// deis-runtime does not depend on deis-proxy and should not start to for a
+/// single row. The proxy's own `CREATE TABLE IF NOT EXISTS` runs over this
+/// happily. The domain is there because the proxy refuses an application
+/// that claims none; nothing in this file is addressed by host, so which
+/// name it is does not matter.
+fn seed_app(database: &std::path::Path, app_id: &str) {
+    let connection = rusqlite::Connection::open(database).expect("the proxy database opens");
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS app_configs (
+                app_id TEXT PRIMARY KEY,
+                config TEXT NOT NULL,
+                version_timestamp TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("the app table exists");
+    let config = format!(
+        r#"{{"id":"{app_id}","description":"","domains":["ws-proxy-app.test"],"certificates":[],"enabled":true,"cache":[]}}"#
+    );
+    connection
+        .execute(
+            "INSERT INTO app_configs (app_id, config, version_timestamp) VALUES (?1, ?2, ?3)",
+            rusqlite::params![app_id, config, "1970-01-01T00:00:00+00:00"],
+        )
+        .expect("the application is written");
+}
+
 impl Proxy {
     /// Where `cargo build` leaves the proxy: this test binary lives in
     /// `target/<profile>/deps`, and the binary is its grandparent's child.
@@ -372,10 +405,20 @@ impl Proxy {
         let port = Proxy::free_port();
         let config = dir.path().join("deis-proxy.toml");
         let log = dir.path().join("deis-proxy-error.log");
-        // No [control] section: standalone. No applications are configured
-        // either, which puts the proxy in plain reverse proxy mode, so it
-        // forwards the routing headers this test sends instead of replacing
-        // them - the same headers deis-proxy would have stamped itself.
+        let database = dir.path().join("deis-proxy.db");
+        // The application this test addresses, written into the proxy's own
+        // database the way the control plane would have pushed it.
+        //
+        // It is not decoration. deis-proxy stamps `x-deis-app-id` from what
+        // it resolved and strips it when it resolved nothing, so a proxy that
+        // had never heard of this application would hand the node a request
+        // with no application id at all - and the node answers 400 to that,
+        // as it should. Seeding the row is what makes the hop under test the
+        // real one: the header the node reads is the proxy's decision, not a
+        // value this test smuggled past it.
+        seed_app(&database, APP);
+        // No [control] section: standalone, so nothing is polled and the
+        // application list written above is the whole routing table.
         std::fs::write(
             &config,
             format!(
@@ -393,7 +436,7 @@ impl Proxy {
                  [log.error_log]\n\
                  level = \"debug\"\n\
                  path = \"{log}\"\n",
-                db = dir.path().join("deis-proxy.db").display(),
+                db = database.display(),
                 pid = dir.path().join("deis-proxy.pid").display(),
                 sock = dir.path().join("upgrade.sock").display(),
                 host = upstream.ip(),

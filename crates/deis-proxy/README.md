@@ -34,24 +34,46 @@ socket handling or process model.
    candidates are ordered by `priority` and then by prefix length, so
    `/api/v2` beats `/api` beats `/` and an operator can still override
    that. If the catalog claims nothing, the local list is matched on host.
-   When neither the local list nor the catalog claims any host, every
-   request is forwarded unchanged, so a bare instance is a plain reverse
-   proxy; once either holds something, an unmatched request is a `404`.
+
+   What a request that matches nothing means depends on where this
+   instance's routing comes from, which is a different question in each of
+   three states:
+
+   * **No `[control]` section and no applications of its own** — a plain
+     reverse proxy. The request is forwarded unchanged, with both routing
+     headers **stripped** from it first: deis-proxy decided neither, so
+     neither may reach a node as though it had.
+   * **A control plane configured and a table fetched from it** — `404`,
+     including when that table turned out to be empty. The control plane is
+     the authority on what is routed here, and "nothing" is an answer.
+   * **A control plane configured and no table ever fetched** — `503`. This
+     instance has been told where its routing comes from and has not got
+     it, so it cannot place the request; forwarding it would route it by
+     the client's own `x-deis-app-id`. A poll that fails *after* one
+     succeeded is a different thing entirely — the last table stays in
+     force and traffic is unaffected. Only a proxy that has never once
+     heard from its control plane refuses.
 2. **Apply policy.** Disabled applications get a `403`. Plain HTTP requests
    for an application whose certificate is loaded (or that has a
    certificate configured and `tls.default_certificate` to fall back on)
-   are redirected to HTTPS when `https.auto_redirect_to_https` is set. An
-   application whose certificate failed to load stays reachable over plain
-   HTTP instead of being redirected to a handshake that cannot succeed.
+   are redirected to HTTPS when `https.auto_redirect_to_https` is set —
+   and only to a name this instance actually holds a certificate for,
+   because the `Location` is built from the request's own `Host` and a
+   request that named its application by header never had that `Host`
+   checked against anything. An application whose certificate failed to
+   load stays reachable over plain HTTP instead of being redirected to a
+   handshake that cannot succeed.
 3. **Pick a backend** from the upstream pool using the configured strategy
    and forward the request. `x-deis-app-id` is set to the id deis-proxy decided
-   on, replacing whatever the client sent, so deis-runtime only sees ids that
-   passed the checks above. With `https.auto_offload_https = false` the
-   upstream leg keeps TLS.
+   on and `x-deis-environment` to that application's environment, replacing
+   whatever the client sent, so deis-runtime only sees values that passed the
+   checks above. With `https.auto_offload_https = false` the upstream leg
+   keeps TLS.
 
-Because the header is validated, deis-runtime's own targets such as
-`_inspect:<app>` and `_system` cannot be reached through deis-proxy; the
-inspector is meant to be used on deis-runtime's own port.
+Because the header is validated — and removed outright when nothing was
+resolved — deis-runtime's own targets such as `_inspect:<app>` and `_system`
+cannot be reached through deis-proxy in any of its modes; the inspector is
+meant to be used on deis-runtime's own port.
 
 A request body larger than `max_request_body_bytes` is refused rather than
 carried. A connection that has **completed** an upgrade is exempt, because

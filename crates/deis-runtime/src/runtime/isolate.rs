@@ -1704,12 +1704,15 @@ impl AppRuntime {
     /// observed firing inside the next one, on that request's budget. So the
     /// sweep is done from here as well, on every path.
     ///
-    /// Both swept functions are this runtime's own bookkeeping, defined in
-    /// `js/bootstrap.js`; neither runs a line of the application's code. A
-    /// module that never finished loading has neither, which is what the
+    /// The sweep is this runtime's own bookkeeping, defined in
+    /// `js/bootstrap.js`; it does not run a line of the application's code, and
+    /// it ends the invocation's timers and its outbound calls only -- what a
+    /// response stream owns is released when that stream ends instead, which is
+    /// the one thing on this platform allowed to outlive its invocation. A
+    /// module that never finished loading has no sweep at all, which is what the
     /// `typeof` guard is for.
     ///
-    /// Silent: the count is reported by `js/runtime.js` on the path that
+    /// Silent: the counts are reported by `js/runtime.js` on the path that
     /// reaches it, and the paths that reach this one instead have already
     /// logged, at warn, why the invocation ended where it did.
     fn sweep_invocation_timers(&mut self) {
@@ -1720,9 +1723,8 @@ impl AppRuntime {
 
         const SOURCE: &str = r#"
             (() => {
-                if (typeof globalThis.__deis_runtime_sweep_intervals !== "function") return;
-                globalThis.__deis_runtime_sweep_fetch_budgets();
-                globalThis.__deis_runtime_sweep_intervals();
+                if (typeof globalThis.__deis_runtime_sweep_invocation !== "function") return;
+                globalThis.__deis_runtime_sweep_invocation();
             })()
         "#;
 
@@ -1738,7 +1740,7 @@ impl AppRuntime {
                 target: "app",
                 app_id = %self.app_id,
                 error = %e,
-                "The end-of-invocation timer sweep of app {} did not run: {}. An interval this \
+                "The end-of-invocation timer sweep of app {} did not run: {}. A timer this \
                  invocation left armed will keep firing inside later requests to this application",
                 self.app_id,
                 e
@@ -2820,6 +2822,17 @@ impl AppRuntime {
     /// End every open stream as a failure, because the isolate can no longer
     /// produce any of them.
     fn fail_open_response_streams(&mut self, reason: &str) {
+        self.fail_open_response_streams_for_client(reason);
+        self.release_stream_producers();
+    }
+
+    /// End the client's half of every open stream, and nothing else.
+    ///
+    /// Split out for the one caller that must not run script: `Drop`. Releasing
+    /// the isolate's half there would buy nothing -- the isolate and every timer
+    /// in it are about to be freed together -- and running a script inside a
+    /// destructor is a risk taken for no gain.
+    fn fail_open_response_streams_for_client(&mut self, reason: &str) {
         // The ids are taken out of the borrow before anything is closed:
         // holding the registry's borrow across the loop would panic on the
         // first close, which is a `borrow_mut` of the same cell.
@@ -2828,6 +2841,50 @@ impl AppRuntime {
             self.response_streams()
                 .borrow_mut()
                 .close_with_failure(id, reason.to_string());
+        }
+    }
+
+    /// Give back what the isolate's own copy of each stream is still holding.
+    ///
+    /// [`Self::fail_open_response_streams`] ends the client's half of every
+    /// body. This ends the isolate's half, and they are not the same thing:
+    /// every path that reaches it does so because no producer can go on, and on
+    /// two of them -- the watchdog cut-off and the op rate limiter -- the
+    /// producers were stopped by terminating V8, inside an `await` that never
+    /// resumes. Nothing in `js/runtime.js` would ever learn that those streams
+    /// are over.
+    ///
+    /// What that costs is not a stale map entry. A response stream owns the
+    /// timers and outbound calls its producer armed, and a stream's owner is the
+    /// one set the end-of-invocation sweep must not touch -- so an interval
+    /// pacing a body that nobody is reading any more would go on firing inside
+    /// every later request to this application, for the life of the isolate.
+    /// That is reachable without any internal call: answer with a streaming body
+    /// whose producer will not yield, and the cut-off does the rest.
+    ///
+    /// Runs after [`Self::clear_termination`] on every path that terminated,
+    /// because this is script and a termination flag left set is what it would
+    /// kill.
+    fn release_stream_producers(&mut self) {
+        match self
+            .runtime
+            .execute_script("<stream_release>", "__deis_runtime_stream_release_all()")
+        {
+            // Silent on success: the count, and what each stream was holding,
+            // are said by `js/runtime.js` itself, which is the side that knows
+            // both numbers.
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                error = %e,
+                "The response-stream producers of app {} could not be released: {}. Whatever \
+                 those producers left armed -- an interval pacing the body, an outbound call \
+                 feeding it -- stays armed, and will fire inside later requests to this \
+                 application",
+                self.app_id,
+                e
+            ),
         }
     }
 
@@ -3339,7 +3396,7 @@ impl Drop for AppRuntime {
                 self.app_id,
                 open.len()
             );
-            self.fail_open_response_streams(
+            self.fail_open_response_streams_for_client(
                 "the application's isolate was taken off this node while the body was still \
                  being produced",
             );

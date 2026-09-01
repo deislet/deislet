@@ -223,12 +223,41 @@ bsQYFKFc9dTQfotPIKmUq1inaC4klQ7RQQ==\n\
         // OpenSSL hands back a DER SEQUENCE; JWS wants r and s concatenated.
         // Passing the DER through is the classic mistake here, and it fails
         // only at the authority.
+        //
+        // The check is that the halves are the scalars, verified against the
+        // key that produced them, not that the first byte is not the DER
+        // SEQUENCE tag: a raw signature legitimately begins with 0x30 about
+        // one time in 256, and this test used to fail that often for a
+        // correct implementation. A flaky test that guards a security
+        // property is worse than none, because the next person reads a red
+        // run as noise.
         let key = AccountKey::generate().unwrap();
+        let public = EcKey::from_public_key(
+            &EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap(),
+            key.key.public_key(),
+        )
+        .unwrap();
+
+        // Every signature is fixed width. DER is variable and, for P-256,
+        // longer than this - so the length alone already rules it out, for
+        // every key rather than for most of them.
+        for _ in 0..64 {
+            let signature = key.sign(b"anything").unwrap();
+            assert_eq!(signature.len(), P256_COORDINATE_BYTES * 2);
+        }
+
         let signature = key.sign(b"anything").unwrap();
-        assert_eq!(signature.len(), 64);
-        assert_ne!(
-            signature[0], 0x30,
-            "a signature starting with the DER SEQUENCE tag means the raw form was never taken"
+        let (r, s) = signature.split_at(P256_COORDINATE_BYTES);
+        let rebuilt = EcdsaSig::from_private_components(
+            openssl::bn::BigNum::from_slice(r).unwrap(),
+            openssl::bn::BigNum::from_slice(s).unwrap(),
+        )
+        .unwrap();
+        let digest = hash(MessageDigest::sha256(), b"anything").unwrap();
+        assert!(
+            rebuilt.verify(&digest, &public).unwrap(),
+            "the two halves are not the r and s the key signed with, so what is on the wire is \
+             not an ES256 signature"
         );
     }
 }

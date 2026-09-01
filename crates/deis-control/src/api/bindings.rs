@@ -96,7 +96,23 @@ pub fn check_service_bindings(
         if binding.kind != BindingKind::Service {
             continue;
         }
-        let Some(callee) = binding.app.as_deref() else {
+        // Trimmed, and empty means unnamed, because that is the spelling
+        // every other reader of this field uses: `DeclaredBindings::validate`
+        // checks `binding.app.as_deref().map(str::trim)`, so a padded name is
+        // a manifest this platform accepts, and the node rebuilds its binding
+        // table from the environment line with `str::trim` on every field, so
+        // the padded name is *not* what the call is dispatched to. Judging
+        // the raw spelling meant checking one name and running another: no
+        // scope can contain a space (`identity::scope::Component`), so a
+        // credential holding exactly `read:auth-api/*` was refused a binding
+        // to `" auth-api "` and told to obtain `read: auth-api /*`, which is
+        // not a scope anybody can be granted.
+        let Some(callee) = binding
+            .app
+            .as_deref()
+            .map(str::trim)
+            .filter(|callee| !callee.is_empty())
+        else {
             // `Manifest::validate` has already refused this; nothing to judge.
             continue;
         };
@@ -217,6 +233,47 @@ mod tests {
         assert_eq!(
             check_service_bindings(&scoped(&["read:auth-api/production"]), &pinned),
             Ok(())
+        );
+    }
+
+    /// The name in the manifest and the name the platform acts on have to be
+    /// the same one.
+    ///
+    /// `DeclaredBindings::validate` trims `app` before it checks it, so a
+    /// padded spelling is a manifest this platform accepts; the node rebuilds
+    /// its binding table from the deployment's environment line and trims
+    /// every field, so the call is dispatched to the trimmed name. Judging
+    /// the raw spelling therefore checked a name nothing would ever call -
+    /// and, because no scope can contain a space, it refused the credential
+    /// that holds exactly the right authority and told it to go and ask for a
+    /// scope the parser rejects.
+    #[test]
+    fn a_padded_callee_is_judged_as_the_name_the_node_will_call() {
+        let manifest = manifest_with(r#"{"AUTH":{"kind":"service","app":"  auth-api\n"}}"#);
+        assert_eq!(
+            manifest.bindings.get("AUTH").and_then(|b| b.app.as_deref()),
+            Some("  auth-api\n"),
+            "the manifest keeps what the author wrote; this test is about how it is read"
+        );
+
+        assert_eq!(
+            check_service_bindings(
+                &scoped(&["deploy:frontend/*", "read:auth-api/*"]),
+                &manifest
+            ),
+            Ok(()),
+            "the credential holds authority over the application the node will call"
+        );
+
+        // And the padding buys nothing: the callee is still judged, and the
+        // refusal still names a scope somebody could actually be granted.
+        let refusal = check_service_bindings(&scoped(&["deploy:frontend/*"]), &manifest)
+            .expect_err("this credential has never heard of the callee");
+        assert_eq!(refusal.callee, "auth-api");
+        assert_eq!(refusal.required_scope, "read:auth-api/*");
+        assert!(
+            Scope::parse(&refusal.required_scope).is_ok(),
+            "a refusal that names an unparseable scope leaves the caller with nothing to ask for"
         );
     }
 

@@ -102,6 +102,48 @@
 //! keyword check carries that one, which is why it has to see the same first
 //! word SQLite does.
 //!
+//! # What a statement may touch, and what it may cost
+//!
+//! Everything above decides *what* a tenant's SQL may reach. None of it
+//! decides how much that may cost, and the two are not the same boundary. A
+//! `WITH RECURSIVE` counting to a hundred million is ordinary, allowed SQL
+//! against the tenant's own file, and it ran 95.7 seconds on one core;
+//! killing the client changed nothing, because a statement runs inside
+//! `spawn_blocking` and dropping the future awaiting it does not stop it.
+//! `SELECT randomblob(20000000)` took the process from 18 MB resident to
+//! 1476 MB, because a blob comes back as a JSON array of byte values and the
+//! whole result set was built in memory before anything checked its size.
+//! One process holds every tenant's KV, SQL and blob data, so either of
+//! those denies the node to everybody.
+//!
+//! So every request carries a budget, and it is the same budget whichever
+//! RPC sent it - `Query`, `Execute`, `Batch`, `Prepare` and the four
+//! transaction RPCs all go through it:
+//!
+//! * **[`DEFAULT_STATEMENT_DEADLINE`]** of wall clock, enforced from inside
+//!   SQLite by [`crate::sqlite::within_budget`], which also stops a request
+//!   whose caller has gone away. Inside a transaction the budget is the
+//!   smaller of this and the time the transaction itself has left, because
+//!   otherwise a statement outlives the deadline that is supposed to bound
+//!   it - a 19.4 second statement ran inside a 5 second transaction.
+//! * **[`DEFAULT_MAX_RESULT_ROWS`]** and **[`DEFAULT_MAX_RESULT_BYTES`]**,
+//!   charged as the rows are read rather than after they are all in hand, so
+//!   a result set that will not fit is refused before the memory for it is
+//!   spent.
+//!
+//! A ceiling nobody can read is not much better than no ceiling, so each one
+//! comes back as a sentence naming the number that was crossed and what to
+//! change - a `LIMIT`, a narrower `WHERE`, the blob service instead of a
+//! column - and rides inside the response like a SQL typo rather than
+//! arriving as a transport failure. Two more ceilings sit on the connection
+//! itself, on the size of one value and of one statement; they belong to
+//! [`crate::sqlite`] because SQLite is the only thing that can enforce them.
+//!
+//! What this does not do is bound how *often* a tenant may spend a budget.
+//! The pool does that instead, and only per tenant: a tenant's SQL cannot
+//! occupy more than its own `tenant_connections` blocking threads, however
+//! many requests it sends.
+//!
 //! # Interactive transactions
 //!
 //! `Batch` runs several statements atomically, but the caller has to know all
@@ -148,6 +190,7 @@
 //! busy timeout. That is inherent, and it is why the per-tenant bound is
 //! small: queueing writers behind a writer does not make them any faster.
 
+use crate::MAX_GRPC_MESSAGE_BYTES;
 use crate::error::{StoreError, StoreResult};
 use crate::proto::storage::{
     BatchRequest, BatchResponse, BeginTransactionRequest, BeginTransactionResponse,
@@ -165,7 +208,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
@@ -322,6 +365,33 @@ fn note_refusal(tenant: &TenantId, error: &StoreError) {
     }
 }
 
+/// Log a request stopped at one of its cost ceilings, against the tenant that
+/// sent it.
+///
+/// `warn`, and for the same reason [`note_refusal`] is: the store had to stop
+/// work a tenant asked for, which is either an application that has outgrown
+/// what one request may do or one query away from denying this node to
+/// everybody on it, and an operator wants the line either way. Refusals still
+/// go through `note_refusal`, which this calls, so one `inspect_err` on a
+/// path covers both.
+fn note_cost(tenant: &TenantId, error: &StoreError) {
+    match error {
+        StoreError::Expired(what) => tracing::warn!(
+            tenant = %tenant,
+            reason = %what,
+            "stopped a request from this tenant part-way; nothing it had written was kept, and \
+             the connection and blocking thread it held are back"
+        ),
+        StoreError::TooLarge(what) => tracing::warn!(
+            tenant = %tenant,
+            reason = %what,
+            "stopped building a result set for this tenant; the rows already read are discarded \
+             rather than sent, so no memory is held for an answer that could not be delivered"
+        ),
+        other => note_refusal(tenant, other),
+    }
+}
+
 /// Refuse an `ATTACH`, whether or not SQLite could say what it named.
 ///
 /// `None` is the expression spelling: SQLite only passes the filename to the
@@ -453,6 +523,159 @@ impl StatementRegistry {
     }
 }
 
+/// How long one request may spend running SQL before the store stops it.
+///
+/// Five seconds, and the number is taken from three places that already
+/// agree. It is the pool's `BUSY_TIMEOUT`, so a statement that has run
+/// longer than SQLite is willing to *wait* for a lock is past the point
+/// where the rest of the tenant's traffic is being served normally. It is
+/// [`DEFAULT_TRANSACTION_DEADLINE`], so a statement can no longer outlive
+/// the transaction that is meant to bound it. And it is well inside the
+/// thirty seconds the runtime gives a gRPC call, so the store answers with a
+/// sentence the application can read instead of the caller's transport
+/// giving up on a connection that is still busy.
+///
+/// It is a ceiling on the request, not on one statement inside it: a batch
+/// holds the same connection and the same blocking thread for its twentieth
+/// `INSERT` that it held for its first, and that is the resource being
+/// bounded.
+pub const DEFAULT_STATEMENT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How many rows one request may return.
+///
+/// Ten thousand, which is exactly the page ceiling [`crate::kv`] already
+/// puts on a listing: it is this store's existing idea of how much one
+/// request carries, and a SQL result has no claim to be larger than a KV
+/// page.
+///
+/// This is the cap that actually bounds memory, which is why it exists
+/// beside the byte cap rather than being folded into it. A row is held as a
+/// `serde_json` object before it is rendered, and measured, a hundred
+/// thousand single-column rows cost 67 MB resident while rendering to 1.5 MB
+/// of JSON - a forty-six-fold amplification that a byte count taken on the
+/// data itself cannot see.
+pub const DEFAULT_MAX_RESULT_ROWS: usize = 10_000;
+
+/// How many bytes of column data one request may return.
+///
+/// A quarter of [`MAX_GRPC_MESSAGE_BYTES`], so four megabytes. The rows go
+/// back as one JSON string in one gRPC message capped at sixteen, and a blob
+/// column renders as a JSON array of byte values - up to four characters per
+/// byte. A quarter is therefore the largest figure at which a result made
+/// entirely of blobs still fits in the message that has to carry it.
+///
+/// It counts the bytes SQLite hands over, before any of them are turned into
+/// JSON: charged that way the ceiling means the same thing whatever the rows
+/// contain, and it is charged before the memory is spent rather than after.
+pub const DEFAULT_MAX_RESULT_BYTES: usize = MAX_GRPC_MESSAGE_BYTES / 4;
+
+/// What one request is allowed to cost, whatever SQL it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlLimits {
+    /// Wall clock for the whole request; see [`DEFAULT_STATEMENT_DEADLINE`].
+    pub statement_deadline: Duration,
+    /// Rows one request may return; see [`DEFAULT_MAX_RESULT_ROWS`].
+    pub max_result_rows: usize,
+    /// Bytes of column data one request may return; see
+    /// [`DEFAULT_MAX_RESULT_BYTES`].
+    pub max_result_bytes: usize,
+}
+
+impl Default for SqlLimits {
+    fn default() -> Self {
+        Self {
+            statement_deadline: DEFAULT_STATEMENT_DEADLINE,
+            max_result_rows: DEFAULT_MAX_RESULT_ROWS,
+            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
+        }
+    }
+}
+
+impl SqlLimits {
+    /// The refusal a caller gets for asking for more rows than it may have.
+    fn too_many_rows(&self) -> StoreError {
+        StoreError::TooLarge(format!(
+            "this query returned more than the {} rows one request may carry, so it was stopped \
+             before the rest were read; add a LIMIT and page through with OFFSET, or narrow the \
+             WHERE clause",
+            self.max_result_rows
+        ))
+    }
+
+    /// The refusal for asking for more data than one response may carry.
+    fn too_many_bytes(&self) -> StoreError {
+        StoreError::TooLarge(format!(
+            "this query returned more than the {} bytes of column data one request may carry, so \
+             it was stopped before the rest were read; select fewer columns or fewer rows, and \
+             keep payloads this size in the blob service rather than in a column",
+            self.max_result_bytes
+        ))
+    }
+}
+
+/// How much of a result set's byte budget one cell costs: the bytes SQLite
+/// hands over, before any of them are turned into JSON.
+///
+/// Counting the source rather than the rendering is deliberate. It is the
+/// same number whatever formatter the response ends up going through, it is
+/// known before the memory is spent rather than after, and it does not
+/// depend on how `serde_json` spells a float or which characters it escapes.
+/// What it does not do is promise the rendered response fits in one gRPC
+/// message, which is why [`DEFAULT_MAX_RESULT_BYTES`] is a quarter of that
+/// message rather than all of it.
+fn column_bytes(value: ValueRef<'_>) -> usize {
+    match value {
+        ValueRef::Null => 0,
+        // The widest either can render to, near enough: what this is
+        // bounding is the data, and a number is not where a result set gets
+        // large.
+        ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
+    }
+}
+
+/// Read every row a prepared statement returns into JSON, refusing to build
+/// a result set larger than one request may carry.
+///
+/// Both ceilings are checked before the row or the cell is added, so the
+/// memory for the one that crossed them is never spent. The one place this
+/// lives is shared by the plain and the in-transaction query paths: two
+/// copies of a loop like this would be two chances for one of them to have
+/// no ceiling at all.
+fn collect_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: Vec<SqlValue>,
+    limits: SqlLimits,
+) -> StoreResult<ResultSet> {
+    let columns: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        if out.len() >= limits.max_result_rows {
+            return Err(limits.too_many_rows());
+        }
+        let mut object = JsonMap::with_capacity(columns.len());
+        for (index, name) in columns.iter().enumerate() {
+            let value = row.get_ref(index)?;
+            bytes = bytes.saturating_add(column_bytes(value));
+            if bytes > limits.max_result_bytes {
+                return Err(limits.too_many_bytes());
+            }
+            object.insert(name.clone(), sql_to_json(value));
+        }
+        out.push(JsonValue::Object(object));
+    }
+    Ok(ResultSet {
+        columns,
+        rows: JsonValue::Array(out),
+    })
+}
+
 /// How long an interactive transaction may stay open before the server rolls
 /// it back on its own.
 ///
@@ -569,9 +792,38 @@ struct TransactionEntry {
     deadline_task: Mutex<Option<JoinHandle<()>>>,
     /// What the caller was granted, quoted back when the deadline fires.
     granted: Duration,
+    /// The instant the deadline task will roll this back. Every statement on
+    /// the connection is held to what is left of it, so a statement cannot
+    /// outlive the transaction it is running in: before this existed a 19.4
+    /// second statement ran inside a 5 second transaction, because the
+    /// deadline task could not preempt work already under way.
+    ///
+    /// Behind a mutex because the instant that counts is only known once
+    /// `BEGIN IMMEDIATE` has returned - time spent waiting for the write
+    /// lock is not the caller's - and by then the entry is already shared.
+    expires_at: Mutex<Instant>,
 }
 
 impl TransactionEntry {
+    /// Start the clock the statements on this connection are held to.
+    fn deadline_starts_now(&self, granted: Duration) {
+        *self.expires_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now() + granted;
+    }
+
+    /// How long a statement on this connection may run: what the request
+    /// budget allows, or what the transaction has left, whichever is less.
+    ///
+    /// `None` means the transaction is already past its deadline and the task
+    /// that reaps it has simply not got there yet - there is no time to give.
+    fn budget_for(&self, request: Duration) -> Option<Duration> {
+        let expires_at = *self.expires_at.lock().unwrap_or_else(|e| e.into_inner());
+        let left = expires_at.checked_duration_since(Instant::now())?;
+        if left.is_zero() {
+            return None;
+        }
+        Some(left.min(request))
+    }
+
     /// Stop the deadline task; the transaction has ended some other way.
     fn cancel_deadline(&self) {
         if let Some(task) = self
@@ -591,6 +843,10 @@ enum Ended {
     Committed,
     RolledBack,
     DeadlineExceeded,
+    /// A statement inside it was stopped part-way - at the request budget,
+    /// or because the caller went away. The transaction goes with it; see
+    /// [`DatabaseService::end_after_a_stopped_statement`].
+    StatementStopped,
 }
 
 /// The tombstone left behind by a finished transaction.
@@ -613,6 +869,15 @@ impl EndedTransaction {
                  it wrote was applied. Keep the work between BeginTransaction and \
                  CommitTransaction short, or ask for a longer timeout when opening it",
                 self.granted.as_millis()
+            )),
+            // Also specific, and for the same reason: the caller was told
+            // its statement was stopped, and it needs to know that took the
+            // transaction with it rather than leaving it open to retry in.
+            Ended::StatementStopped => StoreError::Expired(format!(
+                "transaction {id} was rolled back because a statement inside it had to be \
+                 stopped part-way; nothing it wrote was applied. SQLite rolls an explicit \
+                 transaction back when it stops a write inside one, so the handle is closed \
+                 rather than left half-open. Open a new transaction and send cheaper statements"
             )),
             Ended::Committed => {
                 StoreError::NotFound(format!("transaction {id} was already committed"))
@@ -708,6 +973,10 @@ impl TransactionRegistry {
             conn: Mutex::new(None),
             deadline_task: Mutex::new(None),
             granted,
+            // Provisional; `open_transaction` restarts it once `BEGIN
+            // IMMEDIATE` has returned. This value only covers the window
+            // before that, where nothing runs statements on the entry anyway.
+            expires_at: Mutex::new(Instant::now() + granted),
         });
         state.open.insert(id.clone(), Arc::clone(&entry));
         Ok((id, entry))
@@ -883,18 +1152,27 @@ async fn end_transaction(entry: Arc<TransactionEntry>, sql: &'static str) -> Sto
     .await?
 }
 
-/// Run one statement on a transaction's pinned connection.
-async fn on_transaction<F, T>(entry: Arc<TransactionEntry>, id: String, f: F) -> StoreResult<T>
+/// Run one statement on a transaction's pinned connection, held to `granted`.
+async fn on_transaction<F, T>(
+    entry: Arc<TransactionEntry>,
+    id: String,
+    granted: Duration,
+    f: F,
+) -> StoreResult<T>
 where
     F: FnOnce(&mut rusqlite::Connection) -> StoreResult<T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    let (presence, abandoned) = sqlite::CallerPresence::new();
+    let task = tokio::task::spawn_blocking(move || {
         let mut guard = entry.conn.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
-            // Wrapped here as well as in `SqlitePool::with_conn`, because a
-            // pinned connection runs its statements without going through it.
-            Some(pinned) => sqlite::explaining_refusals(|| f(pinned)),
+            // Budgeted and translated here as well as in
+            // `SqlitePool::with_conn_within`, because a pinned connection
+            // runs its statements without going through the pool at all -
+            // and a transaction is the one place a statement can hold a
+            // tenant's write lock while it overruns.
+            Some(pinned) => sqlite::tenant_statement(granted, abandoned, || f(pinned)),
             // Only reachable by racing a commit, a rollback or the deadline:
             // the handle was still open when it was looked up and had ended by
             // the time this statement got the connection.
@@ -902,8 +1180,10 @@ where
                 "transaction {id} ended while this statement was waiting for it"
             ))),
         }
-    })
-    .await?
+    });
+    let outcome = task.await;
+    drop(presence);
+    outcome?
 }
 
 /// Open the transaction on a freshly pinned connection.
@@ -931,6 +1211,7 @@ pub struct DatabaseService {
     statements: Arc<StatementRegistry>,
     transactions: Arc<TransactionRegistry>,
     limits: TransactionLimits,
+    sql: SqlLimits,
 }
 
 impl DatabaseService {
@@ -967,6 +1248,7 @@ impl DatabaseService {
             statements: Arc::new(StatementRegistry::default()),
             transactions: Arc::new(TransactionRegistry::default()),
             limits: clamp_to_pool(TransactionLimits::default(), connections_per_tenant),
+            sql: SqlLimits::default(),
         })
     }
 
@@ -980,11 +1262,24 @@ impl DatabaseService {
         self
     }
 
+    /// Replace what one request is allowed to cost.
+    pub fn with_sql_limits(mut self, limits: SqlLimits) -> Self {
+        self.sql = limits;
+        self
+    }
+
     /// The ceilings actually in force, after clamping. Logged at startup so
     /// an operator reading about a refused `BeginTransaction` can see what it
     /// was refused against.
     pub fn transaction_limits(&self) -> TransactionLimits {
         self.limits
+    }
+
+    /// What one request may cost. Logged at startup for the same reason: an
+    /// operator reading that a tenant's query was stopped needs the number it
+    /// was stopped against in front of them.
+    pub fn sql_limits(&self) -> SqlLimits {
+        self.sql
     }
 
     /// The pool for one tenant, opened on first use.
@@ -1024,7 +1319,7 @@ impl DatabaseService {
         let sql = check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let params = params.to_vec();
         self.pool(tenant)
-            .with_conn(move |conn| {
+            .with_conn_within(self.sql.statement_deadline, move |conn| {
                 let rows_affected = conn.execute(&sql, rusqlite::params_from_iter(params))?;
                 Ok(ExecOutcome {
                     rows_affected: rows_affected as i64,
@@ -1032,7 +1327,7 @@ impl DatabaseService {
                 })
             })
             .await
-            .inspect_err(|e| note_refusal(tenant, e))
+            .inspect_err(|e| note_cost(tenant, e))
     }
 
     /// Run one statement and collect its rows.
@@ -1044,30 +1339,14 @@ impl DatabaseService {
     ) -> StoreResult<ResultSet> {
         let sql = check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let params = params.to_vec();
+        let limits = self.sql;
         self.pool(tenant)
-            .with_conn(move |conn| {
+            .with_conn_within(limits.statement_deadline, move |conn| {
                 let mut stmt = conn.prepare(&sql)?;
-                let columns: Vec<String> = stmt
-                    .column_names()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect();
-                let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next()? {
-                    let mut object = JsonMap::with_capacity(columns.len());
-                    for (index, name) in columns.iter().enumerate() {
-                        object.insert(name.clone(), sql_to_json(row.get_ref(index)?));
-                    }
-                    out.push(JsonValue::Object(object));
-                }
-                Ok(ResultSet {
-                    columns,
-                    rows: JsonValue::Array(out),
-                })
+                collect_rows(&mut stmt, params, limits)
             })
             .await
-            .inspect_err(|e| note_refusal(tenant, e))
+            .inspect_err(|e| note_cost(tenant, e))
     }
 
     /// Run several statements inside one transaction: either all of them
@@ -1081,7 +1360,7 @@ impl DatabaseService {
             check_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         }
         self.pool(tenant)
-            .with_conn(move |conn| {
+            .with_conn_within(self.sql.statement_deadline, move |conn| {
                 // Deferred is enough here: `tx.execute` refuses a statement
                 // that returns rows, so a batch never reads before it writes
                 // and never has to upgrade a read snapshot to a write lock -
@@ -1095,13 +1374,27 @@ impl DatabaseService {
                             rows_affected: rows_affected as i64,
                             last_insert_id: tx.last_insert_rowid(),
                         }),
+                        Err(e) if sqlite::was_interrupted(&e) => {
+                            // The budget stopped the batch. This one does
+                            // *not* become a named statement failure: a
+                            // `BatchFailure` is an `Ok` at this level, which
+                            // would slip past the wrapper that turns SQLite's
+                            // bare "interrupted" into which ceiling was
+                            // crossed, and the caller would be told its
+                            // seventh statement failed for no stated reason.
+                            return Err(StoreError::from(e));
+                        }
                         Err(e) => {
                             // A batch names the statement that failed rather
                             // than failing outright, so the refusal is
                             // collected here instead of by the pool's
                             // `explaining_refusals`, which only rewrites an
-                            // error that came all the way out.
-                            let message = sqlite::take_refusal().unwrap_or_else(|| e.to_string());
+                            // error that came all the way out. Size ceilings
+                            // are explained the same way and for the same
+                            // reason.
+                            let message = sqlite::take_refusal()
+                                .or_else(|| sqlite::size_limit_message(&e))
+                                .unwrap_or_else(|| e.to_string());
                             // Dropping the transaction rolls it back.
                             return Ok(Err(BatchFailure {
                                 index,
@@ -1115,6 +1408,7 @@ impl DatabaseService {
                 Ok(Ok(done))
             })
             .await
+            .inspect_err(|e| note_cost(tenant, e))
     }
 
     /// Validate `sql` and remember it under a handle.
@@ -1126,12 +1420,12 @@ impl DatabaseService {
         // statement the authorizer refuses is refused here too, for the same
         // reason and at the same call.
         self.pool(tenant)
-            .with_conn(move |conn| {
+            .with_conn_within(self.sql.statement_deadline, move |conn| {
                 conn.prepare(&owned)?;
                 Ok(())
             })
             .await
-            .inspect_err(|e| note_refusal(tenant, e))?;
+            .inspect_err(|e| note_cost(tenant, e))?;
         let id = self.statements.insert(tenant.clone(), sql);
         tracing::debug!(tenant = %tenant, statement = %id, "prepared statement registered");
         Ok(id)
@@ -1178,6 +1472,9 @@ impl DatabaseService {
         let id = slot.keep();
         // The clock starts now, not before BEGIN: a transaction that spent
         // time waiting for the write lock has not spent any of the caller's.
+        // Both readings of it start together - the task that reaps the
+        // transaction, and the instant every statement on it is held to.
+        entry.deadline_starts_now(granted);
         let task = self.spawn_deadline(id.clone(), granted);
         *entry
             .deadline_task
@@ -1239,8 +1536,9 @@ impl DatabaseService {
     ) -> StoreResult<ExecOutcome> {
         let sql = check_transaction_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let entry = self.transactions.resolve(tenant, id)?;
+        let granted = self.statement_budget(tenant, id, &entry)?;
         let params = params.to_vec();
-        on_transaction(entry, id.to_string(), move |conn| {
+        let outcome = on_transaction(entry, id.to_string(), granted, move |conn| {
             let rows_affected = conn.execute(&sql, rusqlite::params_from_iter(params))?;
             Ok(ExecOutcome {
                 rows_affected: rows_affected as i64,
@@ -1248,7 +1546,10 @@ impl DatabaseService {
             })
         })
         .await
-        .inspect_err(|e| note_refusal(tenant, e))
+        .inspect_err(|e| note_cost(tenant, e));
+        self.end_after_a_stopped_statement(tenant, id, &outcome)
+            .await;
+        outcome
     }
 
     /// Run a query inside an open transaction. It sees that transaction's own
@@ -1263,30 +1564,78 @@ impl DatabaseService {
     ) -> StoreResult<ResultSet> {
         let sql = check_transaction_sql(sql).inspect_err(|e| note_refusal(tenant, e))?;
         let entry = self.transactions.resolve(tenant, id)?;
+        let granted = self.statement_budget(tenant, id, &entry)?;
         let params = params.to_vec();
-        on_transaction(entry, id.to_string(), move |conn| {
+        let limits = self.sql;
+        let outcome = on_transaction(entry, id.to_string(), granted, move |conn| {
             let mut stmt = conn.prepare(&sql)?;
-            let columns: Vec<String> = stmt
-                .column_names()
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-            let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? {
-                let mut object = JsonMap::with_capacity(columns.len());
-                for (index, name) in columns.iter().enumerate() {
-                    object.insert(name.clone(), sql_to_json(row.get_ref(index)?));
-                }
-                out.push(JsonValue::Object(object));
-            }
-            Ok(ResultSet {
-                columns,
-                rows: JsonValue::Array(out),
-            })
+            collect_rows(&mut stmt, params, limits)
         })
         .await
-        .inspect_err(|e| note_refusal(tenant, e))
+        .inspect_err(|e| note_cost(tenant, e));
+        self.end_after_a_stopped_statement(tenant, id, &outcome)
+            .await;
+        outcome
+    }
+
+    /// How long a statement inside this transaction may run.
+    ///
+    /// The smaller of the request budget and what the transaction has left,
+    /// which is the whole of what makes the transaction deadline enforceable:
+    /// the deadline task cannot preempt a statement already running, so a
+    /// statement given more time than the transaction has is a statement that
+    /// outlives it.
+    fn statement_budget(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        entry: &TransactionEntry,
+    ) -> StoreResult<Duration> {
+        entry.budget_for(self.sql.statement_deadline).ok_or_else(|| {
+            tracing::debug!(
+                tenant = %tenant,
+                transaction = %id,
+                "refused a statement on a transaction that is already past its deadline; the task \
+                 that rolls it back has not run yet"
+            );
+            StoreError::Expired(format!(
+                "transaction {id} is past its deadline and is being rolled back; nothing it wrote \
+                 will be applied"
+            ))
+        })
+    }
+
+    /// End a transaction whose statement had to be stopped part-way.
+    ///
+    /// Not tidiness. SQLite rolls an explicit transaction back by itself when
+    /// it stops a write inside one, which leaves the connection in autocommit
+    /// while the handle still says a transaction is open - and the next
+    /// statement sent on that handle would then run outside any transaction
+    /// and be kept. Ending it here means the handle answers for itself
+    /// instead, and the tenant gets its pinned connection back now rather
+    /// than at the transaction's deadline.
+    async fn end_after_a_stopped_statement<T>(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        outcome: &StoreResult<T>,
+    ) {
+        if !matches!(outcome, Err(StoreError::Expired(_))) {
+            return;
+        }
+        tracing::warn!(
+            tenant = %tenant,
+            transaction = %id,
+            "rolling this transaction back: a statement inside it was stopped part-way, so \
+             SQLite may already have discarded its writes and the handle cannot be trusted to \
+             still be inside a transaction"
+        );
+        // A losing race with the deadline task or with an explicit rollback is
+        // ordinary: whoever got there first ended it, which is the outcome
+        // wanted here.
+        let _ = self
+            .finish(tenant, id, Ended::StatementStopped, "ROLLBACK")
+            .await;
     }
 
     /// Apply everything the transaction did and release its connection.
@@ -1586,6 +1935,10 @@ fn is_caller_visible(error: &StoreError) -> bool {
             | StoreError::NotFound(_)
             | StoreError::Expired(_)
             | StoreError::Exhausted(_)
+            // A result set the caller asked for and may not have. Same
+            // reasoning as the ceilings above it: the answer is in the
+            // message, and the store is not down.
+            | StoreError::TooLarge(_)
             // The application is the only one who can act on this: it sent
             // SQL a tenant may not run, and the message names which part.
             | StoreError::Refused(_)
@@ -1631,9 +1984,11 @@ impl DatabaseService {
                 tracing::debug!(tenant = %tenant, error = %e, "sql execute rejected by sqlite");
                 Ok(failed_execute(e.to_string()))
             }
-            Err(e @ (StoreError::InvalidArgument(_) | StoreError::Refused(_))) => {
-                Ok(failed_execute(e.to_string()))
-            }
+            // Everything the caller is owed as text rides inside the
+            // response, exactly as a SQL typo does: a ceiling it crossed and
+            // what to change are the answer, and a gRPC status would leave
+            // the sentence in a place a handler reads as "the store is down".
+            Err(e) if is_caller_visible(&e) => Ok(failed_execute(caller_visible_text(&e))),
             Err(other) => {
                 tracing::error!(
                     tenant = %tenant,
@@ -1670,9 +2025,7 @@ impl DatabaseService {
                 tracing::debug!(tenant = %tenant, error = %e, "sql query rejected by sqlite");
                 Ok(failed_query(e.to_string()))
             }
-            Err(e @ (StoreError::InvalidArgument(_) | StoreError::Refused(_))) => {
-                Ok(failed_query(e.to_string()))
-            }
+            Err(e) if is_caller_visible(&e) => Ok(failed_query(caller_visible_text(&e))),
             Err(other) => {
                 tracing::error!(
                     tenant = %tenant,
@@ -1774,7 +2127,16 @@ impl Database for DatabaseService {
                     )),
                 }))
             }
-            Err(e @ StoreError::InvalidArgument(_)) => Ok(Response::new(BatchResponse {
+            // The two cost ceilings join `InvalidArgument` inside the
+            // response: a batch stopped at its deadline is the tenant's own
+            // statement to fix, not the store failing. A SQLite error at this
+            // level is left where it was - it is the commit itself failing,
+            // which is the store's problem and wants the `error` line below.
+            Err(
+                e @ (StoreError::InvalidArgument(_)
+                | StoreError::Expired(_)
+                | StoreError::TooLarge(_)),
+            ) => Ok(Response::new(BatchResponse {
                 success: false,
                 results: Vec::new(),
                 error: Some(e.to_string()),
@@ -1810,10 +2172,10 @@ impl Database for DatabaseService {
                     error: Some(e.to_string()),
                 }))
             }
-            Err(e @ StoreError::InvalidArgument(_)) => Ok(Response::new(PrepareResponse {
+            Err(e) if is_caller_visible(&e) => Ok(Response::new(PrepareResponse {
                 success: false,
                 statement_id: String::new(),
-                error: Some(e.to_string()),
+                error: Some(caller_visible_text(&e)),
             })),
             Err(other) => {
                 tracing::error!(
@@ -2012,6 +2374,14 @@ mod tests {
     fn service() -> (TempDir, DatabaseService) {
         let dir = TempDir::new().unwrap();
         let svc = DatabaseService::open(dir.path(), 4).unwrap();
+        (dir, svc)
+    }
+
+    fn service_with_sql(limits: SqlLimits) -> (TempDir, DatabaseService) {
+        let dir = TempDir::new().unwrap();
+        let svc = DatabaseService::open(dir.path(), 4)
+            .unwrap()
+            .with_sql_limits(limits);
         (dir, svc)
     }
 
@@ -3415,6 +3785,330 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows, serde_json::json!([{ "n": 0 }]));
         svc.roll_back(&app, &abandoned.id).await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // What a statement may cost
+    // ------------------------------------------------------------------
+    //
+    // The authorizer above decides what a tenant's SQL may touch. These
+    // decide how much it may spend doing it, which is the other half and was
+    // for a while missing entirely: one `WITH RECURSIVE` counting to a
+    // hundred million pegged a core for 95.7 seconds, one
+    // `SELECT randomblob(20000000)` took the process from 18 MB resident to
+    // 1476 MB, and killing the client stopped neither.
+
+    /// Ordinary, allowed SQL with no answer worth having, that counts far
+    /// enough that only a ceiling ends it.
+    const COUNTS_FOREVER: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c \
+                                  WHERE x < 2000000000) SELECT count(*) FROM c";
+
+    #[tokio::test]
+    async fn a_query_that_runs_too_long_is_stopped_and_told_what_to_change() {
+        let (_dir, svc) = service_with_sql(SqlLimits {
+            statement_deadline: Duration::from_millis(300),
+            ..SqlLimits::default()
+        });
+        let app = tenant("app-one.production");
+        let started = std::time::Instant::now();
+        let err = svc
+            .fetch_rows(&app, COUNTS_FOREVER, &[])
+            .await
+            .expect_err("a query with no end must not run to one");
+        assert!(matches!(err, StoreError::Expired(_)), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("300 ms") && message.contains("LIMIT"),
+            "the refusal has to name the ceiling and what to change: {message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it ran {:?}, so it was not stopped anywhere near its deadline",
+            started.elapsed()
+        );
+        // And the tenant's database is still perfectly usable afterwards.
+        let one = svc.fetch_rows(&app, "SELECT 1 AS n", &[]).await.unwrap();
+        assert_eq!(one.rows, serde_json::json!([{ "n": 1 }]));
+    }
+
+    /// `Execute` and `Batch` are held to the same ceiling as `Query`. A batch
+    /// stopped part-way must not come back as "statement 0 failed:
+    /// interrupted", which names the wrong thing and explains nothing.
+    #[tokio::test]
+    async fn execute_and_batch_are_held_to_the_same_ceiling_as_query() {
+        let (_dir, svc) = service_with_sql(SqlLimits {
+            statement_deadline: Duration::from_millis(300),
+            ..SqlLimits::default()
+        });
+        let app = tenant("app-one.production");
+        svc.exec_statement(&app, "CREATE TABLE t(a INTEGER)", &[])
+            .await
+            .unwrap();
+        let counting_insert = format!("INSERT INTO t(a) {COUNTS_FOREVER}");
+
+        let err = svc
+            .exec_statement(&app, &counting_insert, &[])
+            .await
+            .expect_err("Execute must be bounded too");
+        assert!(matches!(err, StoreError::Expired(_)), "{err}");
+
+        let err = svc
+            .exec_batch(&app, vec![(counting_insert, Vec::new())])
+            .await
+            .expect_err("a batch stopped at its ceiling is not a named statement failure");
+        assert!(matches!(err, StoreError::Expired(_)), "{err}");
+        assert!(err.to_string().contains("300 ms"), "{err}");
+
+        let rows = svc
+            .fetch_rows(&app, "SELECT count(*) AS n FROM t", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.rows,
+            serde_json::json!([{ "n": 0 }]),
+            "a stopped statement must leave nothing behind"
+        );
+    }
+
+    /// The row ceiling, which is the one that actually bounds memory: a
+    /// hundred thousand single-column rows cost 67 MB resident while
+    /// rendering to 1.5 MB of JSON, so counting the data alone would not see
+    /// them.
+    #[tokio::test]
+    async fn a_result_set_with_too_many_rows_is_refused_before_they_are_all_read() {
+        let (_dir, svc) = service_with_sql(SqlLimits {
+            max_result_rows: 5,
+            ..SqlLimits::default()
+        });
+        let app = tenant("app-one.production");
+        let err = svc
+            .fetch_rows(
+                &app,
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 100) \
+                 SELECT x FROM c",
+                &[],
+            )
+            .await
+            .expect_err("a hundred rows against a ceiling of five");
+        assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains('5') && message.contains("LIMIT"),
+            "the refusal has to name the ceiling and what to change: {message}"
+        );
+        // Exactly the ceiling is fine; it is one past it that is refused.
+        let full = svc
+            .fetch_rows(
+                &app,
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5) \
+                 SELECT x FROM c",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.rows.as_array().map(Vec::len), Some(5));
+    }
+
+    /// The byte ceiling, charged as the cells are read so the memory for a
+    /// result set that cannot be delivered is never spent.
+    #[tokio::test]
+    async fn a_result_set_with_too_much_data_is_refused_before_the_memory_is_spent() {
+        let (_dir, svc) = service_with_sql(SqlLimits {
+            max_result_bytes: 1_000,
+            ..SqlLimits::default()
+        });
+        let app = tenant("app-one.production");
+        let err = svc
+            .fetch_rows(&app, "SELECT randomblob(4000) AS b", &[])
+            .await
+            .expect_err("four kilobytes against a ceiling of one");
+        assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("1000") && message.contains("blob service"),
+            "the refusal has to name the ceiling and where large payloads belong: {message}"
+        );
+        let small = svc
+            .fetch_rows(&app, "SELECT length(randomblob(100)) AS n", &[])
+            .await
+            .unwrap();
+        assert_eq!(small.rows, serde_json::json!([{ "n": 100 }]));
+    }
+
+    /// The ceiling the progress callback cannot reach: `randomblob` is one
+    /// virtual-machine instruction, so the memory is already gone by the time
+    /// anything watching between instructions gets a turn. Only SQLite can
+    /// refuse this one, and only because it is told to.
+    #[tokio::test]
+    async fn a_value_bigger_than_a_row_may_be_is_refused_inside_sqlite() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        let err = svc
+            .fetch_rows(&app, "SELECT randomblob(20000000) AS b", &[])
+            .await
+            .expect_err("twenty megabytes in one cell took the store to 1476 MB resident");
+        assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("8388608") && message.contains("blob service"),
+            "the refusal has to name the ceiling and where such a payload belongs: {message}"
+        );
+    }
+
+    /// The same shape one layer over: `Prepare` remembers statement text
+    /// under a handle, and until the statement ceiling existed the size of
+    /// each was bounded only by the gRPC message that carried it - a table of
+    /// 4096 handles could hold 64 GB.
+    #[tokio::test]
+    async fn a_statement_too_long_to_remember_is_refused_at_the_call_that_sent_it() {
+        let (_dir, svc) = service();
+        let app = tenant("app-one.production");
+        // The padding is a comment, so this is one ordinary `SELECT 1` that
+        // happens to weigh 70 KB - the ceiling is on the bytes, not on what
+        // they say.
+        let padded = format!("/*{}*/ SELECT 1 AS n", "x".repeat(70_000));
+
+        let err = svc
+            .register_statement(&app, &padded)
+            .await
+            .expect_err("Prepare must not remember a statement this size");
+        assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
+        assert!(err.to_string().contains("65536"), "{err}");
+        assert_eq!(
+            svc.statements.len(),
+            0,
+            "a refused Prepare must leave nothing in the table it would have grown"
+        );
+
+        // The same ceiling on the paths that do not remember anything.
+        let err = svc.fetch_rows(&app, &padded, &[]).await.unwrap_err();
+        assert!(matches!(err, StoreError::TooLarge(_)), "{err}");
+    }
+
+    /// The transaction deadline was unenforceable while a statement inside it
+    /// could not be preempted: a 19.4 second statement ran inside a 5 second
+    /// transaction. A statement now gets the smaller of its own budget and
+    /// what the transaction has left.
+    #[tokio::test]
+    async fn a_statement_cannot_outlive_the_transaction_it_runs_in() {
+        let (_dir, svc) = service_with(TransactionLimits {
+            deadline: Duration::from_millis(400),
+            ..TransactionLimits::default()
+        });
+        let app = tenant("app-one.production");
+        let handle = svc.open_transaction(&app, None).await.unwrap();
+        assert_eq!(handle.expires_in, Duration::from_millis(400));
+
+        let started = std::time::Instant::now();
+        let err = svc
+            .fetch_rows_in_transaction(&app, &handle.id, COUNTS_FOREVER, &[])
+            .await
+            .expect_err("a statement must not outlive the transaction holding the write lock");
+        assert!(matches!(err, StoreError::Expired(_)), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it ran {:?} inside a 400 ms transaction",
+            started.elapsed()
+        );
+        // The connection it pinned is back: the tenant can open another.
+        let next = svc.open_transaction(&app, None).await.unwrap();
+        svc.roll_back(&app, &next.id).await.unwrap();
+    }
+
+    /// SQLite rolls an explicit transaction back by itself when it stops a
+    /// write inside one, which would otherwise leave the handle naming a
+    /// transaction that no longer exists - and the next statement sent on it
+    /// running outside any transaction and being kept.
+    #[tokio::test]
+    async fn a_transaction_whose_statement_was_stopped_is_closed_and_says_so() {
+        let (_dir, svc) = service_with_sql(SqlLimits {
+            statement_deadline: Duration::from_millis(300),
+            ..SqlLimits::default()
+        });
+        let app = tenant("app-one.production");
+        make_table(&svc, &app).await;
+        // A transaction with far more time than the statement gets, so it is
+        // the request budget that ends the statement and not the deadline.
+        let handle = svc
+            .open_transaction(&app, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let err = svc
+            .exec_in_transaction(
+                &app,
+                &handle.id,
+                &format!("INSERT INTO users(name) {COUNTS_FOREVER}"),
+                &[],
+            )
+            .await
+            .expect_err("a statement with no end must be stopped inside a transaction too");
+        assert!(matches!(err, StoreError::Expired(_)), "{err}");
+
+        // The handle answers for itself rather than looking unknown, and it
+        // will not run anything else.
+        let after = svc
+            .fetch_rows_in_transaction(&app, &handle.id, "SELECT 1 AS n", &[])
+            .await
+            .expect_err("the handle must be closed, not reusable");
+        let message = after.to_string();
+        assert!(
+            message.contains("stopped part-way") && message.contains("rolled back"),
+            "the caller has to be told what happened to its transaction: {message}"
+        );
+        let rows = svc
+            .fetch_rows(&app, "SELECT count(*) AS n FROM users", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.rows, serde_json::json!([{ "n": 0 }]));
+    }
+
+    /// Every one of these is the answer to the caller's own request, so it
+    /// belongs in the response body next to a SQL typo rather than arriving
+    /// as a transport failure a handler reads as "the store is down".
+    #[tokio::test]
+    async fn a_crossed_ceiling_reaches_the_application_in_the_response() {
+        let (_dir, svc) = service_with_sql(SqlLimits {
+            statement_deadline: Duration::from_millis(300),
+            max_result_rows: 5,
+            ..SqlLimits::default()
+        });
+        let app = tenant("app-one.production");
+
+        let stopped = svc
+            .query(tagged(
+                &app,
+                QueryRequest {
+                    sql: COUNTS_FOREVER.to_string(),
+                    params: None,
+                },
+            ))
+            .await
+            .expect("a stopped query is not a transport failure")
+            .into_inner();
+        assert!(!stopped.success);
+        let message = stopped.error.expect("a failed query carries its reason");
+        assert!(message.contains("300 ms"), "{message}");
+
+        let too_many = svc
+            .query(tagged(
+                &app,
+                QueryRequest {
+                    sql: "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c \
+                          WHERE x < 100) SELECT x FROM c"
+                        .to_string(),
+                    params: None,
+                },
+            ))
+            .await
+            .expect("a result set over the ceiling is not a transport failure")
+            .into_inner();
+        assert!(!too_many.success);
+        assert!(
+            too_many
+                .error
+                .expect("a failed query carries its reason")
+                .contains("LIMIT")
+        );
     }
 
     #[tokio::test]

@@ -38,15 +38,50 @@
 //! only makes sure it is installed on every connection, that it is installed
 //! *after* the pool's own settings, and that a refusal comes back as
 //! something the caller can read.
+//!
+//! # Deciding what a statement may touch is only half of it
+//!
+//! An authorizer answers *what*. Nothing in it answers *how much*, and a
+//! statement that is allowed to run is otherwise allowed to run for as long
+//! as it likes on as much memory as it likes: one `WITH RECURSIVE` counting
+//! to a hundred million pegs a core for a minute and a half, and one
+//! `SELECT randomblob(20000000)` takes the process from 18 MB resident to
+//! 1476 MB - on a process that holds every tenant's data. So a guarded
+//! connection carries two more settings, and every connection carries a
+//! third:
+//!
+//! * **`SQLITE_LIMIT_LENGTH`** at [`TENANT_MAX_VALUE_BYTES`] and
+//!   **`SQLITE_LIMIT_SQL_LENGTH`** at [`TENANT_MAX_SQL_BYTES`], on guarded
+//!   connections only - the KV and blob pools store values a caller sent in
+//!   one gRPC message and must keep taking them. These are the ceilings
+//!   SQLite enforces for itself, inside the allocation, which is the only
+//!   place `randomblob(1000000000)` can be stopped: it is one virtual
+//!   machine instruction, so nothing that watches a statement *between*
+//!   instructions ever gets a turn.
+//! * **A cost budget**, consulted between instructions by a progress
+//!   callback installed on every connection this module opens. It stops a
+//!   statement that has run past its deadline, and one whose caller has gone
+//!   away - a `spawn_blocking` closure is not cancelled when the future
+//!   awaiting it is dropped, so without this an abandoned query runs to
+//!   completion with nobody left to take the answer. See [`within_budget`],
+//!   which is also where SQLite's bare "interrupted" is turned back into
+//!   which ceiling stopped the statement.
+//!
+//! The budget belongs to the request rather than to the connection:
+//! [`crate::database`] decides the number and passes it in, because only
+//! that layer knows whether a statement is a plain query or one inside a
+//! transaction with its own, shorter, time left.
 
 use crate::error::{StoreError, StoreResult};
 use rusqlite::Connection;
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::limits::Limit;
 use std::cell::RefCell;
+use std::ffi::c_int;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// How long a connection waits for a competing writer before giving up.
@@ -55,6 +90,60 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// checkpoint and short enough that a wedged writer surfaces as an error
 /// instead of a hung request.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The largest single string, blob or table row a tenant's SQL may produce
+/// or store, in bytes. SQLite's own default is a gigabyte.
+///
+/// Eight megabytes, derived from the wire rather than from taste. A value a
+/// caller wrote arrived in one gRPC message, and a value it reads leaves in
+/// one, and that message is capped at
+/// [`crate::MAX_GRPC_MESSAGE_BYTES`] - sixteen megabytes. Half of it is the
+/// largest single value that still leaves room in the message for the row it
+/// sits in and the columns beside it. Anything larger is either unreachable
+/// from outside or was built inside SQLite by a function like `randomblob`,
+/// where the only thing it can do is cost memory: `SELECT
+/// randomblob(20000000)` took the store from 18 MB resident to 1476 MB,
+/// because a blob comes back as a JSON array of byte values, and SQLite's
+/// default would have allowed fifty times that in one call.
+///
+/// This also caps the total width of a row, which is what it should do: a
+/// row wider than one message can never be read back whole either.
+const TENANT_MAX_VALUE_BYTES: i32 = 8 * 1024 * 1024;
+
+/// The longest single statement a tenant may send, in bytes. SQLite's own
+/// default is again a gigabyte.
+///
+/// Sixty-four kilobytes is around fifteen hundred lines of SQL, and it is
+/// also roughly where SQLite's own `SQLITE_LIMIT_VARIABLE_NUMBER` of 32766
+/// already stops an `INSERT ... VALUES (?),(?),...`: two characters a
+/// placeholder puts that statement at 64 KB give or take. So the two
+/// ceilings meet, and nothing that fits under the existing one is refused by
+/// this one.
+///
+/// It is here rather than in [`crate::database`] because the memory it
+/// bounds is not the statement's own. `Prepare` remembers statement text
+/// under a handle, up to `MAX_PREPARED_STATEMENTS` of them at once, and
+/// until this limit existed the size of each was bounded only by the gRPC
+/// message that carried it - 4096 handles of 16 MB is 64 GB of remembered
+/// SQL. With it the same table cannot exceed 256 MB.
+const TENANT_MAX_SQL_BYTES: i32 = 64 * 1024;
+
+/// How many SQLite virtual-machine instructions run between two consultations
+/// of the cost budget.
+///
+/// A thousand is what SQLite's own documentation suggests for a progress
+/// callback used to keep a UI responsive, and it is the right order here for
+/// the same reason: the check is one thread-local read and at most one clock
+/// read, which is nothing against a thousand instructions, while a statement
+/// still notices its deadline within well under a millisecond of it passing.
+const BUDGET_CHECK_EVERY_OPS: c_int = 1000;
+
+/// The budget is still running.
+const RUNNING: u8 = 0;
+/// The statement ran past the time it was given.
+const STOPPED_AT_DEADLINE: u8 = 1;
+/// Whoever asked for the statement is no longer waiting for the answer.
+const STOPPED_CALLER_GONE: u8 = 2;
 
 /// The policy a guarded pool applies to every statement prepared on it.
 ///
@@ -75,6 +164,220 @@ thread_local! {
     /// thread-local rather than something threaded through the callback,
     /// which SQLite gives no room for.
     static LAST_REFUSAL: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// The ceiling the statement running on this thread is being held to.
+    ///
+    /// The same shape as [`LAST_REFUSAL`] above and for the same reason:
+    /// SQLite's progress callback has no room for an argument Rust can own,
+    /// it runs synchronously on the thread executing the statement, and every
+    /// statement in this crate runs inside `spawn_blocking` - one statement
+    /// to a thread at a time. So [`within_budget`] leaves the budget here and
+    /// [`budget_is_spent`] reads it back from inside the callback.
+    static BUDGET: RefCell<Option<ActiveBudget>> = const { RefCell::new(None) };
+}
+
+/// What the statement running on this thread may spend, while it spends it.
+struct ActiveBudget {
+    /// The instant past which the statement must be stopped, whatever it is
+    /// in the middle of.
+    until: Instant,
+    /// Set by the async half when its future is dropped. That is the only
+    /// signal a `spawn_blocking` closure gets that nobody is waiting for its
+    /// answer: dropping the future awaiting a blocking task does not cancel
+    /// the task.
+    abandoned: Arc<AtomicBool>,
+    /// Which ceiling stopped the statement, written by the callback and read
+    /// back after it returns - SQLite reports both as a bare "interrupted".
+    stopped: Arc<AtomicU8>,
+}
+
+/// SQLite's progress callback: stop the statement, or let it carry on.
+///
+/// Installed on every connection this module opens, so no call site has to
+/// remember it exists; on a connection running a statement with no budget it
+/// reads one empty thread-local and returns.
+///
+/// `try_with` rather than `with`: a connection can be closed while its
+/// thread's locals are already being destroyed, and a panic raised from
+/// inside a C callback is worth avoiding for a check whose answer would be
+/// "no budget" anyway.
+fn budget_is_spent() -> bool {
+    BUDGET
+        .try_with(|slot| {
+            let borrowed = slot.borrow();
+            let Some(budget) = borrowed.as_ref() else {
+                return false;
+            };
+            if budget.abandoned.load(Ordering::Relaxed) {
+                budget.stopped.store(STOPPED_CALLER_GONE, Ordering::Relaxed);
+                return true;
+            }
+            if Instant::now() >= budget.until {
+                budget.stopped.store(STOPPED_AT_DEADLINE, Ordering::Relaxed);
+                return true;
+            }
+            false
+        })
+        .unwrap_or(false)
+}
+
+/// Clears the thread's budget however the statement ended, panic included.
+///
+/// Without this a statement that panicked would leave an expired budget on a
+/// blocking thread that the pool hands to unrelated requests, and every one
+/// of them would be stopped the moment it started.
+struct BudgetScope;
+
+impl Drop for BudgetScope {
+    fn drop(&mut self) {
+        let _ = BUDGET.try_with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// The async half of a budget: flips the flag when the caller goes away.
+///
+/// Held in the frame of the `async fn` that is awaiting the blocking task, so
+/// it is dropped both when that future completes and when it is cancelled -
+/// a tonic handler future is dropped when the client resets the stream. On
+/// the completing path the closure has already finished and the flag is read
+/// by nobody, which is why this does not need to know which happened.
+pub struct CallerPresence(Arc<AtomicBool>);
+
+impl Drop for CallerPresence {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+impl CallerPresence {
+    /// A fresh flag and the guard that sets it.
+    pub fn new() -> (Self, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        (Self(Arc::clone(&flag)), flag)
+    }
+}
+
+/// Whether SQLite stopped this statement because the progress callback told
+/// it to. Any caller that has to decide something before
+/// [`within_budget`] gets its turn needs this - see the batch path in
+/// [`crate::database`].
+pub fn was_interrupted(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::OperationInterrupted
+    )
+}
+
+/// The sentence for a statement or a value that crossed one of the two size
+/// ceilings a guarded connection carries, or `None` for anything else.
+///
+/// SQLite reports both as `SQLITE_TOOBIG` with a phrase that says which
+/// ("statement too long", "string or blob too big") but no number and no
+/// suggestion, and the numbers are this module's, not SQLite's - a caller
+/// reading "string or blob too big" has no way to find out how big is too
+/// big.
+pub fn size_limit_message(error: &rusqlite::Error) -> Option<String> {
+    let rusqlite::Error::SqliteFailure(e, said) = error else {
+        return None;
+    };
+    if e.code != rusqlite::ErrorCode::TooBig {
+        return None;
+    }
+    Some(format!(
+        "{}: this store holds a tenant's SQL to {TENANT_MAX_VALUE_BYTES} bytes for any single \
+         string, blob or row, and {TENANT_MAX_SQL_BYTES} bytes for any single statement. Keep \
+         payloads that size in the blob service, which stores whole objects, rather than in a \
+         column",
+        said.as_deref().unwrap_or("too big")
+    ))
+}
+
+/// Run `f` and turn a crossed size ceiling into a sentence naming it.
+///
+/// The same shape as [`explaining_refusals`], and applied in the same places
+/// and for the same reason: SQLite's own report names neither the number nor
+/// what to do instead.
+pub fn explaining_size_limits<T>(f: impl FnOnce() -> StoreResult<T>) -> StoreResult<T> {
+    match f() {
+        Err(StoreError::Sqlite(e)) => match size_limit_message(&e) {
+            Some(message) => Err(StoreError::TooLarge(message)),
+            None => Err(StoreError::Sqlite(e)),
+        },
+        other => other,
+    }
+}
+
+/// One request's worth of tenant SQL, held to `granted`, with every way
+/// SQLite has of saying no turned into a sentence an application can act on.
+///
+/// The one place the three translations are composed, so a call site cannot
+/// pick up two of them and miss the third. The budget goes outermost because
+/// it is the only one that has to see the error whatever the other two made
+/// of it: a statement that was stopped must say which ceiling stopped it even
+/// if an inner layer had already given the failure a name of its own.
+pub fn tenant_statement<T>(
+    granted: Duration,
+    abandoned: Arc<AtomicBool>,
+    f: impl FnOnce() -> StoreResult<T>,
+) -> StoreResult<T> {
+    within_budget(granted, abandoned, || {
+        explaining_size_limits(|| explaining_refusals(f))
+    })
+}
+
+/// Run `f` under a ceiling on how long it may take, and turn SQLite's bare
+/// "interrupted" back into which ceiling stopped it.
+///
+/// The ceiling is enforced from inside SQLite, by the progress callback every
+/// connection here carries; this function only says what the callback should
+/// hold this statement to. Two things make that the mechanism rather than
+/// `sqlite3_interrupt` from a timer task. An interrupt raced against the end
+/// of one statement lands on whichever statement starts next on that
+/// connection, and there is no way to join a timer task from inside the
+/// blocking closure to rule that out. And a callback needs no second task per
+/// statement at all.
+///
+/// `f` is everything the request does on the connection, not one statement:
+/// what a batch is holding while it runs its twentieth `INSERT` is the same
+/// connection and the same blocking thread it held for its first.
+pub fn within_budget<T>(
+    granted: Duration,
+    abandoned: Arc<AtomicBool>,
+    f: impl FnOnce() -> StoreResult<T>,
+) -> StoreResult<T> {
+    let stopped = Arc::new(AtomicU8::new(RUNNING));
+    BUDGET.with(|slot| {
+        *slot.borrow_mut() = Some(ActiveBudget {
+            until: Instant::now() + granted,
+            abandoned,
+            stopped: Arc::clone(&stopped),
+        });
+    });
+    let scope = BudgetScope;
+    let outcome = f();
+    drop(scope);
+
+    // Only an error is rewritten. A statement stopped one instruction before
+    // it would have finished anyway is a statement that finished, and the
+    // rows it produced are as good as any others.
+    match (outcome, stopped.load(Ordering::Relaxed)) {
+        (Err(_), STOPPED_AT_DEADLINE) => Err(StoreError::Expired(format!(
+            "this statement ran longer than the {} ms the store gives one request and was \
+             stopped; nothing it had written was kept. Narrow it - add a WHERE clause, an index \
+             or a LIMIT - or split it into several requests",
+            granted.as_millis()
+        ))),
+        // Nobody is left to read this, which is exactly what it says. It is
+        // still an error rather than a success so that no caller further up
+        // mistakes a half-built answer for a whole one, and so the layer that
+        // knows the tenant can log it.
+        (Err(_), STOPPED_CALLER_GONE) => Err(StoreError::Expired(
+            "this statement was stopped because whoever asked for it stopped waiting; nothing it \
+             had written was kept"
+                .to_string(),
+        )),
+        (outcome, _) => outcome,
+    }
 }
 
 /// Refuse the action, and leave behind the sentence the caller should see.
@@ -215,6 +518,38 @@ impl SqlitePool {
             explaining_refusals(|| f(&mut conn))
         })
         .await?
+    }
+
+    /// The same as [`Self::with_conn`], under a ceiling on what the request
+    /// may spend.
+    ///
+    /// `granted` is the wall clock the whole closure gets, not one statement
+    /// inside it: what a request holds is one connection and one blocking
+    /// thread, and it holds them from its first statement to its last.
+    ///
+    /// The closure is also stopped early if the caller goes away. That is not
+    /// free anywhere else: `spawn_blocking` cannot be cancelled, so dropping
+    /// the future returned here leaves the closure running to completion with
+    /// nobody to give the answer to, which is how one abandoned query used to
+    /// keep a core busy for a minute and a half.
+    pub async fn with_conn_within<F, T>(&self, granted: Duration, f: F) -> StoreResult<T>
+    where
+        F: FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        let permit = self.permit().await?;
+        let (presence, abandoned) = CallerPresence::new();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut conn = PooledConnection::take(inner, permit)?;
+            tenant_statement(granted, abandoned, || f(&mut conn))
+        });
+        // Dropped after the await either way, which is the point: if this
+        // future is cancelled instead of completing, the drop is what tells
+        // the closure that nobody is waiting for it.
+        let outcome = task.await;
+        drop(presence);
+        outcome?
     }
 
     /// Take a connection out of the pool and keep it until the guard drops.
@@ -395,6 +730,14 @@ fn open(path: &Path, label: &str, authorizer: Option<SqlAuthorizer>) -> StoreRes
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
 
+    // On every connection, guarded or not, for the same reason
+    // `explaining_refusals` wraps every pooled statement: a connection whose
+    // statement carries no budget reads one empty thread-local and carries
+    // on, and no call site added later has to remember this exists. The
+    // result is not discardable - a connection that silently kept no budget
+    // would run a tenant's `WITH RECURSIVE` until it finished.
+    conn.progress_handler(BUDGET_CHECK_EVERY_OPS, Some(budget_is_spent))?;
+
     // Last, and deliberately so: the settings above are the pool's own and
     // several of them are PRAGMAs the authorizer refuses a tenant. Installing
     // it here means the connection arrives configured and then locked down,
@@ -405,6 +748,12 @@ fn open(path: &Path, label: &str, authorizer: Option<SqlAuthorizer>) -> StoreRes
         // open a second file - and it catches `VACUUM`, which attaches its
         // destination without the parser ever spelling the word.
         conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
+        // The two ceilings the progress callback above cannot reach. It runs
+        // between virtual-machine instructions; `randomblob(1000000000)` is
+        // one instruction, and the memory is gone before the next one comes
+        // round. Only SQLite can refuse those, and only if it is told to.
+        conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, TENANT_MAX_VALUE_BYTES)?;
+        conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, TENANT_MAX_SQL_BYTES)?;
         // The result is not discardable. This call is the tenant SQL sandbox:
         // if it fails and the connection is handed out anyway, every statement
         // the authorizer exists to refuse - ATTACH to another tenant's file,
@@ -415,7 +764,10 @@ fn open(path: &Path, label: &str, authorizer: Option<SqlAuthorizer>) -> StoreRes
         tracing::debug!(
             pool = %label,
             path = %path.display(),
-            "opened a guarded sqlite connection: authorizer installed, no database may be attached"
+            max_value_bytes = TENANT_MAX_VALUE_BYTES,
+            max_sql_bytes = TENANT_MAX_SQL_BYTES,
+            "opened a guarded sqlite connection: authorizer installed, no database may be \
+             attached, and one value or one statement is bounded"
         );
         return Ok(conn);
     }
@@ -552,6 +904,128 @@ mod tests {
             .unwrap();
         }
         assert_eq!(pool.inner.idle.lock().unwrap().len(), 2);
+    }
+
+    /// The SQL a cost test needs: an ordinary, allowed statement with no
+    /// answer worth having, that counts far enough that nothing but a
+    /// ceiling will end it. This is the shape that ran 95.7 seconds on one
+    /// core against a store with no ceiling at all.
+    const COUNTS_FOREVER: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c \
+                                  WHERE x < 2000000000) SELECT count(*) FROM c";
+
+    /// A statement that runs past its budget has to be stopped by something,
+    /// and the caller has to be told which something.
+    #[tokio::test]
+    async fn a_statement_past_its_deadline_is_stopped_and_says_which_ceiling_it_crossed() {
+        let dir = TempDir::new().unwrap();
+        let pool = pool(&dir);
+        let started = Instant::now();
+        let err = pool
+            .with_conn_within(Duration::from_millis(300), |c| {
+                Ok(c.query_row(COUNTS_FOREVER, [], |r| r.get::<_, i64>(0))?)
+            })
+            .await
+            .expect_err("a statement with no end must not be allowed to run to one");
+        assert!(matches!(err, StoreError::Expired(_)), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("300 ms") && message.contains("LIMIT"),
+            "a refusal has to name the number and what to change: {message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it took {:?}, so nothing stopped it near its deadline",
+            started.elapsed()
+        );
+    }
+
+    /// A statement that finishes inside its budget is untouched, including
+    /// one that returns nothing.
+    #[tokio::test]
+    async fn a_statement_inside_its_budget_is_left_alone() {
+        let dir = TempDir::new().unwrap();
+        let pool = pool(&dir);
+        let n: i64 = pool
+            .with_conn_within(Duration::from_secs(5), |c| {
+                Ok(c.query_row(
+                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 1000) \
+                     SELECT count(*) FROM c",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1000);
+    }
+
+    /// `spawn_blocking` cannot be cancelled, so dropping the future awaiting
+    /// one leaves the closure running with nobody to give the answer to. The
+    /// pool permit is the observable: a pool of one admits nobody else until
+    /// the closure returns, so a second caller getting served is proof the
+    /// first statement actually stopped.
+    #[tokio::test]
+    async fn an_abandoned_statement_gives_its_connection_back_instead_of_finishing() {
+        let dir = TempDir::new().unwrap();
+        let pool = SqlitePool::new(dir.path().join("t.sqlite"), "test", PoolSize::new(1));
+        // A minute of budget, so the deadline is not what ends this one.
+        let running = pool.with_conn_within(Duration::from_secs(60), |c| {
+            Ok(c.query_row(COUNTS_FOREVER, [], |r| r.get::<_, i64>(0))?)
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), running)
+                .await
+                .is_err(),
+            "the statement was supposed to still be running when its caller left"
+        );
+        let one: i64 = tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.with_conn(|c| Ok(c.query_row("SELECT 1", [], |r| r.get(0))?)),
+        )
+        .await
+        .expect("the abandoned statement never gave its connection back")
+        .unwrap();
+        assert_eq!(one, 1);
+    }
+
+    /// The two ceilings only SQLite can enforce, and the pools that must not
+    /// carry them: KV and blob store whatever a caller sent in one gRPC
+    /// message, which is twice the value ceiling a tenant's SQL gets.
+    #[tokio::test]
+    async fn a_guarded_connection_bounds_one_value_and_one_statement() {
+        let dir = TempDir::new().unwrap();
+        let guarded = SqlitePool::new_guarded(
+            dir.path().join("g.sqlite"),
+            "guarded",
+            PoolSize::new(2),
+            |_| Authorization::Allow,
+        );
+        let (value, sql) = guarded
+            .with_conn(|c| {
+                Ok((
+                    c.limit(Limit::SQLITE_LIMIT_LENGTH)?,
+                    c.limit(Limit::SQLITE_LIMIT_SQL_LENGTH)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, TENANT_MAX_VALUE_BYTES);
+        assert_eq!(sql, TENANT_MAX_SQL_BYTES);
+
+        let plain = pool(&dir);
+        let (value, sql) = plain
+            .with_conn(|c| {
+                Ok((
+                    c.limit(Limit::SQLITE_LIMIT_LENGTH)?,
+                    c.limit(Limit::SQLITE_LIMIT_SQL_LENGTH)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(
+            value > TENANT_MAX_VALUE_BYTES && sql > TENANT_MAX_SQL_BYTES,
+            "an unguarded pool must keep SQLite's own ceilings; it got {value} and {sql}"
+        );
     }
 
     /// The case that would poison the pool: a holder that left `BEGIN`

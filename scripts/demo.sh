@@ -286,6 +286,29 @@ wait_for_tcp() {
   [ "$rc" -ne 7 ]
 }
 
+# Wait until deis-proxy can actually route to the deployed application.
+#
+# Answering the port is not enough, and since the edge was made to fail closed
+# it is not even close: a proxy that has never managed to fetch its routing
+# table refuses every request with 503 rather than forwarding it blind, and it
+# is listening the whole time it does so. So `start` used to return while the
+# front door was still turning traffic away, and the checks that go through it
+# - the WebSocket hop, every streaming check - failed on a demo that was
+# perfectly healthy a second later.
+#
+# The probe is therefore a real request for the application that was just
+# deployed, retried until the proxy answers it. curl paces its own retries and
+# `--retry-all-errors` covers the 503, so there is no shell-level sleeping and
+# nothing here waits for a guessed duration.
+wait_for_proxy_routing() {
+  local attempts=$1
+  curl -sf -o /dev/null -m 2 \
+    --retry "$attempts" --retry-delay 1 --retry-max-time $((attempts * 2)) \
+    --retry-connrefused --retry-all-errors \
+    -H "x-deis-app-id: ${APP_ID}" \
+    "http://127.0.0.1:${DEIS_PROXY_PORT}/" >/dev/null 2>&1
+}
+
 # Wait for one service to start serving, giving up early if it dies.
 #
 # Each round hands the pacing to curl, which spaces its own retries a second
@@ -802,6 +825,7 @@ prepare_app_source() {
   add_websocket_route "$dest"
   add_blob_route "$dest"
   add_stream_route "$dest"
+  add_timers_route "$dest"
   add_cookie_route "$dest"
 
   echo "$dest"
@@ -1000,6 +1024,111 @@ export default async function handler(context: any): Promise<Response> {
       "cache-control": "no-cache",
     },
   });
+}
+TS
+}
+
+# The route the timer-ownership check talks to.
+TIMER_ROUTE="/api/timers"
+
+# Give the staged copy a handler that deliberately leaves timers behind.
+#
+# Written here for the same reason the streaming handler is: the check below
+# needs an application that actually tries to keep work running past its own
+# request, and the interesting part is what the node does about it. The moment
+# `functions/api/timers.ts` appears in the example app's own sources this stops
+# writing anything.
+add_timers_route() {
+  local dest=$1
+  local handler="${dest}/functions${TIMER_ROUTE}.ts"
+
+  if [ -f "$handler" ]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$handler")"
+  cat > "$handler" <<'TS'
+// Everything an application can do to keep a timer running past its request.
+//
+// An isolate is reused for every request to this application on a node, so a
+// timer left armed does not stop when the request that armed it does: it fires
+// inside later requests, on their CPU and against their rate limit. `?mode=arm`
+// tries every way there is to leave one behind, and `?mode=report` -- a
+// separate request, in the same isolate -- says whether any of them is still
+// ticking.
+//
+// The counters are module-level on purpose: that is what makes "still ticking"
+// a fact a later request can read.
+let intervalTicks = 0;
+let timeoutTicks = 0;
+let ownerTicks = 0;
+let doors: Record<string, string> = {};
+
+function json(payload: unknown): Response {
+  return new Response(JSON.stringify(payload), {
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+export default async function handler(context: any): Promise<Response> {
+  const url = new URL(context.request.url);
+
+  if (url.searchParams.get("mode") !== "arm") {
+    // Long enough that a survivor ticking every 5ms would be seen many times
+    // over, and short enough not to be a wait.
+    const before = { intervalTicks, timeoutTicks, ownerTicks };
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    return json({ doors, before, after: { intervalTicks, timeoutTicks, ownerTicks } });
+  }
+
+  doors = {};
+
+  // The plain one. Never stops on its own.
+  setInterval(() => { intervalTicks += 1; }, 5);
+
+  // The one that used to go untracked, on the reasoning that a setTimeout
+  // fires once and is gone. This callback arms the next one before it returns,
+  // which is an interval written in two lines.
+  const again = () => { timeoutTicks += 1; setTimeout(again, 5); };
+  setTimeout(again, 5);
+
+  // The two doors that used to let a handler choose what owns a timer, and so
+  // file one in a set the end-of-invocation sweep never looks in.
+  const runtime = globalThis as any;
+  doors.scope = typeof runtime.__deis_runtime_stream_scope;
+  try {
+    doors.claim = runtime.__deis_runtime_claim_stream_scope() === null
+      ? "null"
+      : "handed over";
+  } catch (e: any) {
+    doors.claim = "threw:" + (e && e.name ? e.name : String(e));
+  }
+  try {
+    const scope = runtime.__deis_runtime_stream_scope;
+    scope.enter({ guards: new Set(), intervals: new Set(), timeouts: new Set() });
+    setInterval(() => { ownerTicks += 1; }, 5);
+    scope.leave();
+    doors.invented = "entered";
+  } catch (e: any) {
+    doors.invented = "threw:" + (e && e.name ? e.name : String(e));
+  }
+  try {
+    const scope = runtime.__deis_runtime_stream_scope;
+    const owner = scope.adopt();
+    scope.enter(owner);
+    setInterval(() => { ownerTicks += 1; }, 5);
+    scope.leave();
+    doors.adopted = "entered";
+  } catch (e: any) {
+    doors.adopted = "threw:" + (e && e.name ? e.name : String(e));
+  }
+
+  // Held open long enough for the timers above to fire while their own request
+  // is still running. Without this the check could not tell "swept" from "never
+  // ran at all".
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  return json({ doors, intervalTicks, timeoutTicks, ownerTicks });
 }
 TS
 }
@@ -1696,6 +1825,15 @@ EOF
     "the demo entry point is unreachable"
 
   deploy_example_app
+
+  # Only now can the front door answer for this application: the routing table
+  # it needs did not exist until the deploy above created it. Everything the
+  # verification drives through the proxy depends on this having happened.
+  if ! wait_for_proxy_routing 60; then
+    echo "⚠️  deis-proxy is listening but still cannot route to ${APP_ID}."
+    echo "    Its log is ${LOG_DIR}/deis-proxy.log; the checks that go through"
+    echo "    the proxy will fail until it has fetched the routing table."
+  fi
 
   write_state
 
@@ -2818,6 +2956,58 @@ check_a_request_is_served_while_a_stream_is_open() {
   fi
 }
 
+check_no_timer_outlives_the_request_that_armed_it() {
+  local title="no timer outlives the request that armed it, however the handler files it"
+  local headers="${LOG_DIR}/verify-timers.headers"
+
+  # One request arms everything it can; a second, in the same isolate, reads
+  # whether any of it is still ticking. Two requests is the whole point: a timer
+  # that fires inside the request that armed it is ordinary, and a timer that
+  # fires inside the next one is somebody else's CPU and somebody else's rate
+  # limit being spent.
+  local armed
+  armed=$(app_request "$headers" "${TIMER_ROUTE}?mode=arm")
+  if [ "$(http_status "$headers")" != "200" ]; then
+    fail_check "$title" "GET ${TIMER_ROUTE}?mode=arm answered $(http_status "$headers"): $(printf '%s' "$armed" | head -c 200)"
+    return
+  fi
+
+  local armed_interval armed_timeout scope claim invented adopted
+  armed_interval=$(printf '%s' "$armed" | jq -r '.intervalTicks // 0')
+  armed_timeout=$(printf '%s' "$armed" | jq -r '.timeoutTicks // 0')
+  scope=$(printf '%s' "$armed" | jq -r '.doors.scope // "?"')
+  claim=$(printf '%s' "$armed" | jq -r '.doors.claim // "?"')
+  invented=$(printf '%s' "$armed" | jq -r '.doors.invented // "?"')
+  adopted=$(printf '%s' "$armed" | jq -r '.doors.adopted // "?"')
+
+  local report before_i after_i before_t after_t before_o after_o
+  report=$(app_request "$headers" "${TIMER_ROUTE}?mode=report")
+  before_i=$(printf '%s' "$report" | jq -r '.before.intervalTicks // -1')
+  after_i=$(printf '%s' "$report" | jq -r '.after.intervalTicks // -2')
+  before_t=$(printf '%s' "$report" | jq -r '.before.timeoutTicks // -1')
+  after_t=$(printf '%s' "$report" | jq -r '.after.timeoutTicks // -2')
+  before_o=$(printf '%s' "$report" | jq -r '.before.ownerTicks // -1')
+  after_o=$(printf '%s' "$report" | jq -r '.after.ownerTicks // -2')
+
+  # The node has to say what it cleared, with the numbers: an operator whose
+  # application is slower than it should be needs this line to be findable.
+  local said
+  said=$(grep -h "were still armed when this invocation ended" \
+    "${LOG_DIR}/deis-runtime.log" 2>/dev/null | tail -1 || true)
+
+  if [ "$armed_interval" -gt 0 ] && [ "$armed_timeout" -gt 0 ] \
+    && [ "$scope" = "undefined" ] && [ "$claim" = "null" ] \
+    && [ "${invented#threw:}" != "$invented" ] && [ "${adopted#threw:}" != "$adopted" ] \
+    && [ "$after_i" = "$before_i" ] && [ "$after_t" = "$before_t" ] \
+    && [ "$after_o" = "$before_o" ] && [ -n "$said" ]; then
+    pass_check "$title" \
+      "the arming request watched its own timers fire (${armed_interval} interval tick(s), ${armed_timeout} tick(s) of a setTimeout that rearms itself) and could reach neither door to the runtime's ownership of them: __deis_runtime_stream_scope is ${scope} and the claim answers ${claim}, so enter() ${invented} and adopt() ${adopted}. A later request through the same isolate then sat for 250ms and none of the three counters moved (${before_i}/${before_t}/${before_o}). The node said so at warn: \"$(printf '%s' "$said" | sed 's/.*: //' | head -c 160)\""
+  else
+    fail_check "$title" \
+      "arming request: intervalTicks=${armed_interval} timeoutTicks=${armed_timeout} scope=${scope} claim=${claim} invented=${invented} adopted=${adopted}; later request: intervals ${before_i}->${after_i}, timeouts ${before_t}->${after_t}, redirected ${before_o}->${after_o}; node log line: \"${said}\""
+  fi
+}
+
 check_secret_delivery() {
   local headers="${LOG_DIR}/verify-secret.headers"
   local body
@@ -3376,6 +3566,67 @@ check_storage_token_requires_the_api_key() {
   fi
 }
 
+# The SQL sandbox decides what a tenant's statement may touch. On its own that
+# leaves how much it may cost decided by nobody, and one tenant is one query
+# away from denying deis-store to every tenant on the node: a `WITH RECURSIVE`
+# counting to a hundred million ran 95.7 seconds on one core, and killing the
+# client changed nothing, because the statement runs inside a blocking task
+# that dropping the caller's future does not cancel.
+#
+# This is that query, sent the way an application or an operator sends one. It
+# has to come back refused, quickly, saying which ceiling it crossed - a query
+# killed with "database error" teaches nobody anything.
+check_a_runaway_query_is_stopped_and_names_its_ceiling() {
+  local title="a query with no end is stopped, and says which ceiling stopped it"
+  local out="${LOG_DIR}/cli-db-runaway.log"
+  local sql="WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 2000000000) SELECT count(*) FROM c"
+
+  local started elapsed rc
+  started=$(date +%s)
+  deis_cli db query "$sql" --json > "$out" 2>&1 && rc=0 || rc=$?
+  elapsed=$(( $(date +%s) - started ))
+
+  local message
+  message=$(tr '\n' ' ' < "$out" | sed 's/  */ /g')
+
+  # Under twenty seconds: the store's own ceiling is five, and anything near
+  # the ninety-six this used to take means nothing stopped it.
+  if [ "$rc" -ne 0 ] && [ "$elapsed" -lt 20 ] \
+    && echo "$message" | grep -q 'ms the store gives one request'; then
+    pass_check "$title" \
+      "\`deis db query\` sent a recursive count to two billion and deis-store stopped it after ${elapsed}s rather than running it to the end, answering: $(echo "$message" | head -c 240). The refusal rides inside the response, like a SQL typo, and names both the ceiling and what to change"
+  else
+    fail_check "$title" \
+      "expected a refusal naming the statement ceiling within 20s; the call exited ${rc} after ${elapsed}s saying: $(echo "$message" | head -c 300)"
+  fi
+}
+
+# The other half of the same gap, and the one that takes the process down
+# rather than merely busy: `SELECT randomblob(20000000)` took deis-store from
+# 18 MB resident to 1476 MB, because a blob comes back as a JSON array of byte
+# values and the whole result set was built before anything looked at its size.
+# SQLite is the only thing that can refuse this one - the blob is a single
+# instruction, so nothing watching between instructions ever gets a turn.
+check_a_single_value_cannot_be_bigger_than_a_row_may_be() {
+  local title="one cell cannot be made larger than a row is allowed to be"
+  local out="${LOG_DIR}/cli-db-huge-value.log"
+
+  local rc
+  deis_cli db query "SELECT randomblob(20000000) AS b" --json > "$out" 2>&1 && rc=0 || rc=$?
+
+  local message
+  message=$(tr '\n' ' ' < "$out" | sed 's/  */ /g')
+
+  if [ "$rc" -ne 0 ] && echo "$message" | grep -q '8388608' \
+    && echo "$message" | grep -q 'blob service'; then
+    pass_check "$title" \
+      "deis-store refused a twenty-megabyte cell before allocating it, naming its 8388608-byte ceiling on any single string, blob or row and pointing at the blob service for payloads that size: $(echo "$message" | head -c 240)"
+  else
+    fail_check "$title" \
+      "expected a refusal naming the 8388608-byte value ceiling; the call exited ${rc} saying: $(echo "$message" | head -c 300)"
+  fi
+}
+
 # ----------------------------------------------------------------------
 # Object storage beyond put / get / delete
 # ----------------------------------------------------------------------
@@ -3415,10 +3666,30 @@ check_blob_listing() {
     return
   fi
 
-  # A delimiter at the top level: `index.html` is a key here, and everything
-  # under `img/` is one folder rather than three keys.
+  # Everything this check asserts on lives under one prefix it owns.
+  #
+  # It used to list the tenant's root and expect to find exactly
+  # `index.html` there, which held only on a store nothing else had written
+  # to - so a second `verify` against the same running demo failed it, the
+  # conditional-write checks having left their own keys at the root by then.
+  # A check that passes only on a fresh instance reads as a real defect to
+  # whoever runs it twice, so the listing is scoped instead.
+  local scope="listing/"
+  local seeded
+  for seeded in "index.html" "img/logo.png" "img/hero.png" "img/icons/star.svg"; do
+    curl -s -o /dev/null -D "$headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+      --data-binary "0123456789abcdef" \
+      "http://127.0.0.1:${DEIS_RUNTIME_PORT}${BLOB_ROUTE}?key=${scope}${seeded}&contentType=text/plain"
+    if [ "$(http_status "$headers")" != "201" ]; then
+      fail_check "$title" "the application could not store ${scope}${seeded}"
+      return
+    fi
+  done
+
+  # A delimiter one level in: `listing/index.html` is a key here, and
+  # everything under `listing/img/` is one folder rather than three keys.
   local top
-  top=$(app_request "$headers" "${BLOB_ROUTE}?op=list&delimiter=%2F")
+  top=$(app_request "$headers" "${BLOB_ROUTE}?op=list&prefix=${scope}&delimiter=%2F")
   local keys prefixes
   keys=$(echo "$top" | jq -r '[.objects[].key] | join(",")' 2>/dev/null || true)
   prefixes=$(echo "$top" | jq -r '.prefixes | join(",")' 2>/dev/null || true)
@@ -3428,7 +3699,7 @@ check_blob_listing() {
   local cursor="" walked="" pages=0 complete="false"
   while [ "$complete" != "true" ] && [ "$pages" -lt 10 ]; do
     local page
-    page=$(app_request "$headers" "${BLOB_ROUTE}?op=list&prefix=img/&limit=1&cursor=${cursor}")
+    page=$(app_request "$headers" "${BLOB_ROUTE}?op=list&prefix=${scope}img/&limit=1&cursor=${cursor}")
     walked="${walked}$(echo "$page" | jq -r '[.objects[].key] | join(",")' 2>/dev/null || true),"
     complete=$(echo "$page" | jq -r '.list_complete' 2>/dev/null || echo false)
     cursor=$(echo "$page" | jq -r '.cursor // ""' 2>/dev/null || true)
@@ -3436,13 +3707,16 @@ check_blob_listing() {
   done
   walked=$(echo "$walked" | tr -s ',' ',' | sed 's/,$//')
 
-  if [ "$keys" = "index.html" ] && [ "$prefixes" = "img/" ] \
-    && [ "$walked" = "img/hero.png,img/icons/star.svg,img/logo.png" ]; then
+  local want_keys="${scope}index.html"
+  local want_prefixes="${scope}img/"
+  local want_walk="${scope}img/hero.png,${scope}img/icons/star.svg,${scope}img/logo.png"
+  if [ "$keys" = "$want_keys" ] && [ "$prefixes" = "$want_prefixes" ] \
+    && [ "$walked" = "$want_walk" ]; then
     pass_check "$title" \
-      "list({ delimiter: \"/\" }) answered objects [${keys}] and prefixes [${prefixes}] - the three files under img/ cost one entry, not three; paging img/ one object at a time took ${pages} pages and visited ${walked} in key order, each key exactly once"
+      "list({ prefix: \"${scope}\", delimiter: \"/\" }) answered objects [${keys}] and prefixes [${prefixes}] - the three files under ${scope}img/ cost one entry, not three; paging that folder one object at a time took ${pages} pages and visited ${walked} in key order, each key exactly once"
   else
     fail_check "$title" \
-      "expected objects [index.html], prefixes [img/] and a walk of img/hero.png,img/icons/star.svg,img/logo.png; got objects [${keys:-<none>}], prefixes [${prefixes:-<none>}], walk [${walked:-<none>}] over ${pages} pages"
+      "expected objects [${want_keys}], prefixes [${want_prefixes}] and a walk of ${want_walk}; got objects [${keys:-<none>}], prefixes [${prefixes:-<none>}], walk [${walked:-<none>}] over ${pages} pages"
   fi
 }
 
@@ -5406,6 +5680,61 @@ check_a_credential_cannot_wire_an_app_to_one_it_cannot_see() {
   fi
 }
 
+check_a_scoped_token_cannot_unload_an_application_from_a_node() {
+  local title="a token for one environment cannot take the application off a node"
+  ensure_account ci deployer
+
+  # Exactly the credential a preview pipeline holds, and the same one the
+  # scoped-token check proves can deploy to ${PREVIEW_ENV_NAME} and nowhere
+  # else. `DELETE /api/runtime/<node>/apps/<app>` stops the application on the
+  # node; without ?environment= it stops every environment of it, so it is a
+  # real outage of ${ENV_NAME} made with a credential that may not deploy
+  # there. It used to be allowed, because the route named no environment in
+  # its path and the authorisation table asked for "any environment the caller
+  # holds" - which one preview scope answers.
+  #
+  # Every call below is one that has to be refused, so nothing on the node is
+  # actually unloaded and the checks after this one still have an application
+  # to look at.
+  local minted token
+  minted=$(deis_cli token create --account ci \
+    --scope "deploy:${APP_ID}/${PREVIEW_ENV_NAME}" unload-attempt --json 2>/dev/null || echo '{}')
+  token=$(echo "$minted" | jq -r '.secret // empty')
+  if [ -z "$token" ]; then
+    fail_check "$title" "could not mint a scoped token: ${minted}"
+    return
+  fi
+
+  local whole named other told
+  whole=$(control_status DELETE "/api/runtime/${NODE_ID}/apps/${APP_ID}" "$token")
+  named=$(control_status DELETE \
+    "/api/runtime/${NODE_ID}/apps/${APP_ID}?environment=${ENV_NAME}" "$token")
+  other=$(control_status DELETE "/api/runtime/${NODE_ID}/apps/${CALLEE_APP_ID}" "$token")
+  told=$(control_answer DELETE "/api/runtime/${NODE_ID}/apps/${APP_ID}" "$token" \
+    | jq -r '.details // .error // empty')
+
+  # The application is still being served, which is the claim that matters:
+  # a refusal that had nonetheless unloaded something would be no refusal.
+  local headers="${LOG_DIR}/verify-unload-refused.headers"
+  app_request "$headers" "/" > /dev/null
+  local still_serving
+  still_serving=$(http_status "$headers")
+
+  local audited
+  audited=$(deis_cli audit --outcome refused --json 2>/dev/null \
+    | jq -r '[.entries[] | select(.action == "node.app.unload")] | length' 2>/dev/null || echo 0)
+
+  if [ "$whole" = "403" ] && [ "$named" = "403" ] && [ "$other" = "403" ] \
+    && [ "$still_serving" = "200" ] && [ "${audited:-0}" -ge 3 ] \
+    && echo "$told" | grep -q "deploy:${APP_ID}/\*"; then
+    pass_check "$title" \
+      "carrying only deploy:${APP_ID}/${PREVIEW_ENV_NAME}, the token was refused DELETE /api/runtime/${NODE_ID}/apps/${APP_ID} (HTTP ${whole}), the same call naming ${ENV_NAME} (${named}) and the one against ${CALLEE_APP_ID} (${other}). The refusal asks for the whole application - \"$(printf '%s' "$told" | head -c 120)\" - because a call that names no environment stops every one of them. ${APP_ID} is still served (HTTP ${still_serving}) and ${audited} refused node.app.unload row(s) are on the record"
+  else
+    fail_check "$title" \
+      "expected 403 for the whole application (got ${whole}), for ${ENV_NAME} (got ${named}) and for ${CALLEE_APP_ID} (got ${other}), naming deploy:${APP_ID}/* -- it said \"$(printf '%s' "${told:-nothing}" | head -c 160)\". ${APP_ID} answered ${still_serving} (expected 200) and the audit log holds ${audited:-0} refused node.app.unload row(s)"
+  fi
+}
+
 check_a_wide_credential_cannot_mint_a_storage_token() {
   local title="minting a storage token needs that exact tenant written down"
   ensure_account data-team maintainer
@@ -5953,6 +6282,9 @@ verify_demo() {
   # thing being watched is a ceiling running out.
   check_a_stream_past_its_budget_is_closed_by_the_node
   echo "-- the web platform --"
+  # First of these, because it is about the one piece of `globalThis` an
+  # application is not meant to be able to use at all: what owns its timers.
+  check_no_timer_outlives_the_request_that_armed_it
   # Here rather than at the end: these are about what a handler finds on
   # `globalThis`, which is the same subject as the check above, and they run
   # before the rollback moves production around underneath them.
@@ -5976,6 +6308,11 @@ verify_demo() {
   check_storage_capability_token
   check_storage_token_requires_the_api_key
   check_data_cli_reads_the_apps_write
+  # What a tenant's SQL may cost, as opposed to what it may touch. Both go
+  # through `deis db query`, which is the same Database service the
+  # `context.services.database` binding reaches.
+  check_a_runaway_query_is_stopped_and_names_its_ceiling
+  check_a_single_value_cannot_be_bigger_than_a_row_may_be
   # Object storage past put / get / delete. The listing check seeds the
   # objects the four after it read, so it runs first.
   check_blob_listing
@@ -6041,6 +6378,7 @@ verify_demo() {
   check_the_configured_api_key_is_listed_as_unscoped
   check_a_scoped_token_reaches_one_environment_and_no_other
   check_a_credential_cannot_wire_an_app_to_one_it_cannot_see
+  check_a_scoped_token_cannot_unload_an_application_from_a_node
   check_a_wide_credential_cannot_mint_a_storage_token
   check_a_revoked_token_stops_at_its_next_call
   check_the_audit_log_names_who_changed_what

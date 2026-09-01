@@ -41,10 +41,12 @@ pub enum StoreError {
     /// the same request may well succeed later, which is what separates this
     /// from [`StoreError::InvalidArgument`].
     Exhausted(String),
-    /// A handle the caller still holds was closed by the server because it
-    /// outlived its deadline. Deliberately not [`StoreError::NotFound`]: the
-    /// caller is owed the difference between "that never existed" and "your
-    /// work was rolled back and here is why".
+    /// A deadline the server set has passed: a handle the caller still holds
+    /// was closed because it outlived its own, or a statement was stopped
+    /// part-way because the request had spent the time it was given - or
+    /// because whoever asked for it stopped waiting. Deliberately not
+    /// [`StoreError::NotFound`]: the caller is owed the difference between
+    /// "that never existed" and "your work was rolled back and here is why".
     Expired(String),
     /// The caller sent SQL that the store will not run against a tenant's
     /// file at all - `ATTACH`, `VACUUM`, a PRAGMA outside the allowlist. Not

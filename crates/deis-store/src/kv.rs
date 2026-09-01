@@ -29,9 +29,30 @@ const MAX_KEY_LEN: usize = 1024;
 /// Keys returned by `List` when the caller does not ask for a limit.
 const DEFAULT_LIST_LIMIT: i32 = 1000;
 
-/// Hard ceiling on one `List` page, whatever the caller asks for. Keeps a
-/// single request from pulling an entire namespace into one gRPC message.
+/// Hard ceiling on how many entries one `List` page holds, whatever the
+/// caller asks for. Keeps a single request from pulling an entire namespace
+/// into one gRPC message.
 const MAX_LIST_LIMIT: i32 = 10_000;
+
+/// Hard ceiling on how much one `List` page weighs.
+///
+/// Both ceilings are needed, and for the same reason a SQL result set needs
+/// both: a count says how many entries a page holds and says nothing about
+/// how large they are. A listed entry carries its key, up to [`MAX_KEY_LEN`]
+/// bytes, and the metadata its writer attached - which nothing bounds, so ten
+/// thousand entries is ten thousand times whatever a caller chose to store.
+/// The gRPC encoder was the only thing that ever noticed, and only after the
+/// whole page was already built in memory.
+///
+/// Eight megabytes, half of [`crate::MAX_GRPC_MESSAGE_BYTES`]. It counts the
+/// stored bytes rather than the encoded ones, and protobuf carries a string
+/// as its bytes plus a few of framing, so half the message is ample room for
+/// everything else in the response.
+///
+/// Crossing it is not a refusal: the page simply stops where it is and hands
+/// back the cursor it already has for a full page, so a caller pages sooner
+/// and nothing it stored becomes unreadable.
+const MAX_LIST_PAGE_BYTES: usize = crate::MAX_GRPC_MESSAGE_BYTES / 2;
 
 /// One key's value and everything stored beside it.
 ///
@@ -244,7 +265,7 @@ impl KvService {
         let upper = prefix_upper_bound(prefix);
         let now = unix_seconds();
 
-        let entries: Vec<KvListing> = self
+        let (entries, page_bytes, cut_short) = self
             .pool
             .with_conn(move |conn| {
                 let sql = format!(
@@ -266,20 +287,46 @@ impl KvService {
                     None => stmt.query(rusqlite::params![tenant_id, lower, now, limit])?,
                 };
                 let mut entries = Vec::new();
+                let mut page_bytes = 0usize;
+                let mut cut_short = false;
                 while let Some(row) = rows.next()? {
-                    entries.push(KvListing {
+                    let entry = KvListing {
                         key: row.get(0)?,
                         metadata: row.get(1)?,
                         expires_at: row.get(2)?,
-                    });
+                    };
+                    let cost = entry.key.len() + entry.metadata.as_deref().map_or(0, str::len);
+                    // The first entry always goes in, whatever it weighs.
+                    // Refusing it would leave a caller that stored one large
+                    // entry paging forever over a page that never advances,
+                    // and what it weighs is already bounded by the one
+                    // message that carried it in.
+                    if !entries.is_empty() && page_bytes + cost > MAX_LIST_PAGE_BYTES {
+                        cut_short = true;
+                        break;
+                    }
+                    page_bytes += cost;
+                    entries.push(entry);
                 }
-                Ok(entries)
+                Ok((entries, page_bytes, cut_short))
             })
             .await?;
 
-        // A full page means there may be more; a short page means there is
-        // definitely nothing left.
-        let next_cursor = if entries.len() as i32 == limit {
+        if cut_short {
+            tracing::debug!(
+                tenant = %tenant,
+                entries = entries.len(),
+                asked_for = limit,
+                bytes = page_bytes,
+                ceiling = MAX_LIST_PAGE_BYTES,
+                "kv list page stopped on its byte ceiling before its entry ceiling; the caller \
+                 gets a cursor and the rest on its next call"
+            );
+        }
+
+        // A page that filled either ceiling means there may be more; a page
+        // that filled neither means there is definitely nothing left.
+        let next_cursor = if cut_short || entries.len() as i32 == limit {
             entries.last().map(|entry| entry.key.clone())
         } else {
             None
@@ -953,6 +1000,62 @@ mod tests {
             prefix_upper_bound(&before_surrogates).unwrap(),
             char::from_u32(0xE000).unwrap().to_string()
         );
+    }
+
+    /// The same shape as the SQL result-set ceilings: a page ceiling counted
+    /// in entries says nothing about how much each entry weighs, and the
+    /// metadata a caller attaches is bounded by nothing at all. Ten thousand
+    /// entries carrying a megabyte each is a ten-gigabyte response that the
+    /// encoder only ever refused after it existed.
+    #[tokio::test]
+    async fn a_listing_page_stops_on_its_byte_ceiling_and_hands_back_a_cursor() {
+        let (_dir, kv) = service().await;
+        let tenant = tenant("demo.production");
+        // Eight entries of just over a megabyte of metadata each: well inside
+        // the entry ceiling, well past the byte one.
+        let metadata = "m".repeat(1024 * 1024 + 1);
+        for i in 0..8 {
+            kv.set(
+                &tenant,
+                &format!("weighty:{i}"),
+                b"v".to_vec(),
+                Some(metadata.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let (page, cursor) = kv.list(&tenant, "weighty:", None, None).await.unwrap();
+        assert!(
+            page.len() < 8,
+            "the page took all {} entries, so nothing bounded its size",
+            page.len()
+        );
+        let carried: usize = page
+            .iter()
+            .map(|e| e.key.len() + e.metadata.as_deref().map_or(0, str::len))
+            .sum();
+        assert!(
+            carried <= MAX_LIST_PAGE_BYTES,
+            "the page carries {carried} bytes against a ceiling of {MAX_LIST_PAGE_BYTES}"
+        );
+
+        // Cut short is not lost: the cursor walks the rest of them.
+        let mut seen = page.len();
+        let mut cursor = cursor.expect("a page stopped early has to say there is more");
+        loop {
+            let (page, next) = kv
+                .list(&tenant, "weighty:", None, Some(cursor))
+                .await
+                .unwrap();
+            seen += page.len();
+            match next {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen, 8, "paging has to reach every entry exactly once");
     }
 
     #[test]

@@ -2,6 +2,17 @@ use deis_control::*;
 use std::sync::Arc;
 use tokio::time::Duration;
 
+/// The caller address the real server puts on every request it accepts, and
+/// which a `oneshot` against a bare router has to supply for itself.
+///
+/// It is not decoration. `api_auth_enabled` defaults to off, and a control
+/// plane that requires no credential serves the human API only to callers on
+/// its own machine, so a request that carries no address is refused with 401
+/// rather than admitted as anonymous.
+fn local_peer() -> axum::extract::ConnectInfo<std::net::SocketAddr> {
+    axum::extract::ConnectInfo("127.0.0.1:54321".parse().expect("a peer address"))
+}
+
 /// Poll the given TCP port until the API server accepts connections,
 /// so tests do not rely on fixed delays for startup synchronization.
 /// Panics if the server is not ready within the attempt limit.
@@ -558,12 +569,18 @@ async fn the_dashboards_restart_body_is_the_one_the_control_plane_accepts() {
 
     let post = |body: &'static str| {
         let router = api.router.clone();
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri("/api/commands/execute/deis-proxy-1")
             .header("content-type", "application/json")
             .body(Body::from(body))
             .unwrap();
+        // The address the real server always attaches
+        // (`into_make_service_with_connect_info`). This control plane demands
+        // no credential, and a control plane that demands none serves the
+        // human API only to its own machine - so a request with no address on
+        // it at all is one the gate has no reason to trust.
+        request.extensions_mut().insert(local_peer());
         async move {
             let response = router.oneshot(request).await.unwrap();
             let status = response.status();
@@ -902,11 +919,12 @@ async fn pushing_config_to_an_unconnected_node_is_a_404_not_a_500() {
 
     let post = |uri: &'static str| {
         let router = api.router.clone();
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri(uri)
             .body(Body::empty())
             .unwrap();
+        request.extensions_mut().insert(local_peer());
         async move {
             let response = router.oneshot(request).await.unwrap();
             let status = response.status();

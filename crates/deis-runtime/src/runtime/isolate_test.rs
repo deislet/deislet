@@ -4071,6 +4071,405 @@ export default function handler(context: any): Response {
         );
     }
 
+    /// Two requests through one isolate, where the first one tries to arm a
+    /// timer the end-of-invocation sweep will not find.
+    ///
+    /// Returns what the second request saw: `before`/`after` counters that must
+    /// be equal, plus whatever the first request reported about the doors it
+    /// found open.
+    async fn ticks_after_a_second_request(app: &str, code: &str) -> serde_json::Value {
+        let mut runtime = AppRuntime::new(
+            app.to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let mut seen = Vec::new();
+        for path in ["/arm", "/check"] {
+            let (tx, rx) = oneshot::channel();
+            runtime
+                .execute_fetch(
+                    format!("http://localhost{path}"),
+                    "GET".to_string(),
+                    HashMap::new(),
+                    None,
+                    tx,
+                )
+                .await
+                .unwrap();
+            let (status, _headers, body) = rx.await.unwrap().unwrap();
+            let body = text(body).unwrap_or_default();
+            assert_eq!(status, 200, "{body}");
+            seen.push(serde_json::from_str::<serde_json::Value>(&body).unwrap());
+        }
+        serde_json::json!({ "armed": seen[0], "checked": seen[1] })
+    }
+
+    #[tokio::test]
+    async fn an_application_cannot_choose_what_owns_its_timers() {
+        // The end-of-invocation sweep clears the sets the runtime files timers
+        // in, and which set that is used to be decided by an object on
+        // `globalThis`: `__deis_runtime_stream_scope`, sealed, present and
+        // callable. A handler that called `enter({ intervals: new Set() })`,
+        // armed an interval and called `leave()` filed that interval in a set
+        // no sweep looks in -- measured at 4, 9, 14 and 23 ticks across
+        // separate later requests, with nothing in the log. `adopt()` was the
+        // same hole without even an invented object.
+        //
+        // Two things are asserted, because either one alone would leave the
+        // door ajar: the scope is not reachable from application code at all
+        // (`js/runtime.js` claims it once while the isolate is built), and an
+        // owner that is not one this runtime minted is refused even if it were.
+        let code = r#"
+            globalThis.__ticks = 0;
+
+            // Every door an application has to the ownership of a timer.
+            function reach() {
+                const out = {};
+                out.scope = typeof globalThis.__deis_runtime_stream_scope;
+                try {
+                    out.claimed = globalThis.__deis_runtime_claim_stream_scope();
+                    out.claim = out.claimed === null ? "null" : typeof out.claimed;
+                } catch (e) {
+                    out.claim = "threw:" + e.name;
+                }
+                delete out.claimed;
+                return out;
+            }
+
+            export default async function handler(ctx) {
+                const out = reach();
+                out.before = globalThis.__ticks;
+                if (new URL(ctx.request.url).pathname === "/arm") {
+                    const scope = globalThis.__deis_runtime_stream_scope;
+                    for (const [name, make] of [
+                        ["invented", () => ({
+                            guards: new Set(), intervals: new Set(), timeouts: new Set(),
+                        })],
+                        ["adopted", () => scope.adopt()],
+                    ]) {
+                        try {
+                            scope.enter(make());
+                            setInterval(() => { globalThis.__ticks++; }, 1);
+                            scope.leave();
+                            out[name] = "entered";
+                        } catch (e) {
+                            out[name] = "threw:" + e.name;
+                        }
+                    }
+                }
+                await new Promise((resolve) => setTimeout(resolve, 40));
+                out.after = globalThis.__ticks;
+                return new Response(JSON.stringify(out));
+            }
+        "#;
+
+        let seen = ticks_after_a_second_request("timer-owner.production", code).await;
+
+        // The object itself is gone from the global surface, and the claim that
+        // replaced it has already been spent by `js/runtime.js`.
+        assert_eq!(
+            seen["armed"]["scope"], "undefined",
+            "the stream scope is still on globalThis, where an application can call it: {seen}"
+        );
+        assert_eq!(
+            seen["armed"]["claim"], "null",
+            "the stream scope can still be claimed after the isolate was built: {seen}"
+        );
+        // Which is why both attempts above got no further than a TypeError on
+        // an object that is not there.
+        assert_eq!(seen["armed"]["invented"], "threw:TypeError", "{seen}");
+        assert_eq!(seen["armed"]["adopted"], "threw:TypeError", "{seen}");
+        // And nothing ticked during the second request, which armed nothing.
+        assert_eq!(
+            seen["checked"]["after"], seen["checked"]["before"],
+            "an interval the first request filed against an owner of its own choosing was still \
+             firing inside the second request: {seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_stream_owns_its_timer_and_gives_it_back_when_it_ends() {
+        // The other half of the guarantee, and the reason "sweep everything at
+        // the end of the invocation" is not the answer either. A response stream
+        // outlives the invocation that created it on purpose -- its head has
+        // gone to the client and its body is still being written -- and the code
+        // writing it legitimately paces itself with a timer. So the stream takes
+        // ownership of what the handler left armed, keeps it for as long as it
+        // is producing, and gives it back when it ends.
+        let code = r#"
+            globalThis.__ticks = 0;
+            export default async function handler(context) {
+                if (new URL(context.request.url).pathname === "/check") {
+                    const before = globalThis.__ticks;
+                    await new Promise((resolve) => setTimeout(resolve, 60));
+                    return new Response(JSON.stringify({ before, after: globalThis.__ticks }));
+                }
+
+                // Armed by the handler, so it is the adoption that carries it
+                // over rather than the producer arming it inside a step.
+                setInterval(() => { globalThis.__ticks++; }, 1);
+
+                let sent = 0;
+                const stream = new ReadableStream({
+                    async pull(controller) {
+                        if (sent === 3) { controller.close(); return; }
+                        sent++;
+                        await new Promise((resolve) => setTimeout(resolve, 20));
+                        controller.enqueue("tick " + globalThis.__ticks + " ");
+                    },
+                });
+                return new Response(stream);
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "stream-owns-timer.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (_, _, body) = answer_to(&mut runtime, "/stream").await;
+        let (bytes, failure) = drain_stream(&mut runtime, body).await;
+        assert!(failure.is_none(), "the stream did not finish: {failure:?}");
+        let sent = String::from_utf8(bytes).unwrap();
+
+        // The interval was still firing while the body was being produced,
+        // which is the whole point: the counter it prints has moved by the last
+        // chunk. Sweeping it with the invocation would have cut the producer's
+        // own pacing out from under it.
+        let counts: Vec<i64> = sent
+            .split_whitespace()
+            .filter(|word| *word != "tick")
+            .map(|word| word.parse().expect("the producer prints the tick count"))
+            .collect();
+        assert_eq!(counts.len(), 3, "the producer sent {sent:?}");
+        assert!(
+            counts[2] > counts[0],
+            "the stream's own interval stopped firing while it was still producing: {sent:?}"
+        );
+
+        // ... and it ended with the stream, not with some later request.
+        let (status, _, body) = answer_to(&mut runtime, "/check").await;
+        let body = text(body).unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            seen["after"], seen["before"],
+            "the interval a finished response stream owned was still firing in a later \
+             request: {seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_node_had_to_terminate_gives_its_timer_back_too() {
+        // The same leak as the two above, reached through the one owner the
+        // end-of-invocation sweep is not allowed to touch, and with no internal
+        // call at all: answer with a streaming body whose producer stops
+        // yielding.
+        //
+        // The node can only end that by terminating the isolate, which leaves
+        // the producer inside an `await` that never resumes -- so
+        // `js/runtime.js` never learns its stream is over. The entry stayed in
+        // `openStreams` holding the stream's owner, and the interval pacing a
+        // body nobody can read any more went on firing inside every later
+        // request this application served. The node's half of the body was
+        // always ended; `runtime/isolate.rs::release_stream_producers` is the
+        // isolate's half.
+        //
+        // The two timings this depends on, so that a later reader can see the
+        // test is not a race. `QUEUED_CHUNKS` is 2, so the invocation that
+        // answers produces three chunks and then parks with the node's queue
+        // full: the pulls that spin are reached only once the client below
+        // starts draining, which is what keeps the spin out of the request's own
+        // `waitUntil` tail. And the spin lasts far longer than
+        // `stream_timeout_ms` plus the stream watchdog's grace, so the ending is
+        // always the cut-off and never the node reaping a stream that overran.
+        let code = r#"
+            globalThis.__ticks = 0;
+            export default async function handler(context) {
+                if (new URL(context.request.url).pathname === "/check") {
+                    const before = globalThis.__ticks;
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                    return new Response(JSON.stringify({ before, after: globalThis.__ticks }));
+                }
+
+                // Armed by the handler, so the stream adopts it and it is the
+                // stream, not the invocation, that has to give it back.
+                setInterval(() => { globalThis.__ticks++; }, 1);
+
+                let pulls = 0;
+                const stream = new ReadableStream({
+                    pull(controller) {
+                        controller.enqueue("x");
+                        if (pulls++ < 5) return;
+                        // Computes rather than awaits, so nothing short of
+                        // terminating the isolate stops it.
+                        const until = Date.now() + 10_000;
+                        while (Date.now() < until) {}
+                    },
+                });
+                return new Response(stream);
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "stream-cutoff-timer.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec {
+                limits: ExecutionLimits {
+                    stream_timeout_ms: 300,
+                    ..ExecutionLimits::default()
+                },
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (_, _, body) = answer_to(&mut runtime, "/endless").await;
+        let (_, failure) = drain_stream(&mut runtime, body).await;
+        let failure = failure.expect("a producer that will not yield does not end cleanly");
+        // The test only means anything if the stream ended on the path that
+        // terminates the isolate. The other ending -- the node reaping a stream
+        // that ran past `stream_timeout_ms` -- cancels the producer, which
+        // reaches `retireStream` through `js/runtime.js` and released the owner
+        // even before this was fixed.
+        assert!(
+            failure.contains("was cut off"),
+            "the stream was reaped rather than terminated, so this proves nothing: {failure}"
+        );
+
+        let (status, _, body) = answer_to(&mut runtime, "/check").await;
+        let body = text(body).unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+        let seen: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            seen["after"], seen["before"],
+            "the interval owned by a response stream the node had to terminate was still firing \
+             inside a later request: {seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_the_node_says_about_a_swept_timer_is_not_the_applications_to_silence() {
+        // The sweep's warning is the only account an operator gets of an
+        // application that leaves work running past its requests, and it went
+        // out through `globalThis.console` -- a name this platform lets an
+        // application replace, as a browser and Deno do, and one that survives
+        // into every later request because the isolate is reused. One line of
+        // `globalThis.console = { warn() {} }` and the timers were still swept
+        // and nobody was told, which is half the guarantee gone.
+        //
+        // `js/runtime.js` logs through a console of its own now, held in the
+        // closure and not reachable by any name.
+        use tracing_subscriber::prelude::*;
+        let buffer = std::sync::Arc::new(crate::logging::LogBuffer::new(64));
+        let subscriber = tracing_subscriber::registry().with(crate::logging::RuntimeLayer::new(
+            buffer.clone(),
+            "node-under-test".to_string(),
+        ));
+        // A thread-local dispatcher, and `#[tokio::test]` polls this future on
+        // the thread that set it.
+        let _collecting = tracing::subscriber::set_default(subscriber);
+
+        let code = r#"
+            export default async function handler(ctx) {
+                // Ordinary instrumentation, and this platform allows it: what
+                // the application logs from here on is the application's
+                // business.
+                globalThis.console = {
+                    log() {}, info() {}, debug() {}, warn() {}, error() {}, trace() {},
+                };
+                setInterval(() => {}, 1000);
+                return new Response("quiet");
+            }
+        "#;
+
+        let mut runtime = AppRuntime::new(
+            "quiet-sweep.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (status, _, body) = answer_to(&mut runtime, "/").await;
+        assert_eq!(status, 200, "{:?}", text(body));
+
+        let lines: Vec<String> = buffer
+            .drain(64)
+            .into_iter()
+            .map(|entry| entry.message)
+            .collect();
+        assert!(
+            lines.iter().any(
+                |line| line.contains("were still armed when this invocation ended")
+                    && line.contains("1 interval(s)")
+            ),
+            "the node said nothing about the interval it cleared, because the application had \
+             replaced the console the warning went through: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_self_rescheduling_timeout_does_not_outlive_the_request_that_started_it() {
+        // `setTimeout` was bound straight to the raw timer and tracked nowhere,
+        // on the reasoning that "a setTimeout fires once and is gone". A
+        // callback that arms the next one before it returns is never gone: it
+        // needs no internal API, produces no warning, and keeps firing inside
+        // every later request this isolate serves, exactly as an interval does.
+        let code = r#"
+            globalThis.__ticks = 0;
+            export default async function handler(ctx) {
+                const before = globalThis.__ticks;
+                if (new URL(ctx.request.url).pathname === "/arm") {
+                    const again = () => { globalThis.__ticks++; setTimeout(again, 1); };
+                    setTimeout(again, 1);
+                }
+                await new Promise((resolve) => setTimeout(resolve, 40));
+                return new Response(JSON.stringify({ before, after: globalThis.__ticks }));
+            }
+        "#;
+
+        let seen = ticks_after_a_second_request("timeout-chain.production", code).await;
+        // The chain did run while its own request was running: the sweep is the
+        // end of an invocation, not a ban on timers.
+        assert!(
+            seen["armed"]["after"].as_i64().unwrap() > seen["armed"]["before"].as_i64().unwrap(),
+            "the timeout chain never fired at all: {seen}"
+        );
+        assert_eq!(
+            seen["checked"]["after"], seen["checked"]["before"],
+            "a self-rescheduling setTimeout from the first request was still firing inside the \
+             second: {seen}"
+        );
+    }
+
     #[tokio::test]
     async fn utf8_round_trips_through_the_encoding_globals() {
         // Not a formality: `request.arrayBuffer()`, `blob.put` with a string,

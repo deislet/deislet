@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use deis_wire::conventions::DEFAULT_ENVIRONMENT;
+use deis_wire::conventions::{APP_ID_HEADER, DEFAULT_ENVIRONMENT};
 use tracing::warn;
 
 use crate::catalog::wire::RoutingTableDocument;
@@ -290,11 +290,23 @@ impl CatalogRoutes {
     }
 
     /// Whether this table can answer anything at all.
+    ///
+    /// Every lookup this type offers has to be covered here,
+    /// `apps_with_default_env` included:
+    /// [`CatalogRoutes::target_by_app_id`] answers the `x-deis-app-id` path
+    /// out of that set, and it is filled from the document's environments
+    /// rather than from its routes. A catalog that genuinely knows three
+    /// applications but claims no hostname - a platform before anyone
+    /// creates a route, with the preview zone off - therefore used to report
+    /// itself empty while it was still resolving names, and the caller that
+    /// reads this to decide "nothing is routed here" (`proxy::resolve_app`)
+    /// concluded the request could be forwarded untouched.
     pub fn is_empty(&self) -> bool {
         self.by_host.is_empty()
             && self.wildcards.is_empty()
             && self.any_host.is_empty()
             && self.preview.is_empty()
+            && self.apps_with_default_env.is_empty()
     }
 
     pub fn route_count(&self) -> usize {
@@ -408,6 +420,14 @@ impl CatalogRoutes {
             lines.insert(format!(
                 "{host}/ -> {}/{} (automatic)",
                 target.app_id, target.environment
+            ));
+        }
+        // The header path is a rule too, and for a platform with no routes
+        // yet it is the only one. Leaving it out described a table that had
+        // just made three applications reachable by name as "0 added".
+        for app_id in &self.apps_with_default_env {
+            lines.insert(format!(
+                "{APP_ID_HEADER}: {app_id} -> {app_id}/{DEFAULT_ENVIRONMENT}"
             ));
         }
         lines
@@ -604,6 +624,60 @@ mod tests {
         assert!(table.is_empty());
         assert_eq!(table.version(), "v");
         assert!(CatalogRoutes::default().version().is_empty());
+    }
+
+    #[test]
+    fn a_table_that_knows_applications_is_not_empty() {
+        // No route claims a hostname and the preview zone is off, so the
+        // four maps a request is matched against are all empty - and the
+        // table still answers `x-deis-app-id: shop` with shop/production.
+        // Calling that empty told the caller nothing was routed here, and
+        // the caller forwards a request nothing routes carrying whatever
+        // the client asked for.
+        let table = table(
+            r#"{"version":"v","routes":[],"environments":[
+                {"app_id":"shop","environment":"production"},
+                {"app_id":"blog","environment":"production"},
+                {"app_id":"api","environment":"pr-7"}
+            ]}"#,
+            None,
+        );
+        assert!(table.match_request("anything.test", "/").is_none());
+        assert!(
+            table.target_by_app_id("shop").is_some(),
+            "the header path resolves out of this table"
+        );
+        assert!(
+            !table.is_empty(),
+            "a table that resolves an application by header is not empty, whatever its host \
+             maps hold"
+        );
+    }
+
+    #[test]
+    fn describe_names_the_applications_reachable_by_header() {
+        // The change log is diffed on describe(), so a fetch that made two
+        // applications reachable by name and claimed no host used to be
+        // logged as "0 added".
+        let before = table(r#"{"version":"v0","routes":[],"environments":[]}"#, None);
+        let after = table(
+            r#"{"version":"v1","routes":[],"environments":[
+                {"app_id":"shop","environment":"production"},
+                {"app_id":"api","environment":"pr-7"}
+            ]}"#,
+            None,
+        );
+        let added: Vec<_> = after
+            .describe()
+            .difference(&before.describe())
+            .cloned()
+            .collect();
+        assert_eq!(
+            added,
+            vec!["x-deis-app-id: shop -> shop/production".to_string()],
+            "pr-7 is not a default environment, so the header cannot reach it and no line \
+             claims it can"
+        );
     }
 
     #[test]

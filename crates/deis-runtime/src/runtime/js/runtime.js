@@ -39,6 +39,24 @@ const DenoCore = Deno.core;
 delete globalThis.Deno;
 delete globalThis.__bootstrap;
 
+// The console this file logs through, which is deliberately not the one an
+// application sees.
+//
+// `globalThis.console` is writable, as it is in a browser and in Deno, and an
+// application that assigns over it to install its own formatting is doing
+// something ordinary. But every `console` call in *this* file is the platform
+// speaking, and most of them are addressed to an operator rather than to the
+// application: what an invocation left armed and had cleared, a `waitUntil`
+// that failed, a queue batch dropped for want of a handler. Read off the global
+// name, one line of `globalThis.console = { warn() {} }` in a handler's
+// top-level code would silence all of it for the life of the isolate -- and the
+// timer sweep's warning is the only account an operator gets of an application
+// that leaves work running past its requests. Filled in by the console-bridge
+// block at the end of this file, which is also what puts the application's copy
+// on `globalThis`; the value here is the raw console until then, and nothing
+// below runs before the bridge is built.
+let platformConsole = globalThis.console;
+
 // ---------------------------------------------------------
 // Reading an options object the application handed in
 // ---------------------------------------------------------
@@ -495,7 +513,7 @@ class BridgeWebSocket extends PlatformEventTarget {
     this.readyState = 1; // OPEN (Simulated)
   }
   
-  send(data) { console.warn("BridgeWebSocket.send ignored"); }
+  send(data) { platformConsole.warn("BridgeWebSocket.send ignored"); }
   close() { this.readyState = 3; }
   accept() {} 
 }
@@ -1432,7 +1450,7 @@ class NativeDB {
         // exactly the case when its deadline is what made the callback throw
         // -- and putting it in front of the original would hide the bug the
         // application is actually looking for.
-        console.warn(
+        platformConsole.warn(
           "database.transaction: the rollback after the callback threw did not succeed: " +
             rollbackError.message +
             ". The transaction ends either way; the error the callback raised is the one " +
@@ -2206,7 +2224,7 @@ function createBindings() {
         table[entry.name] = new ServiceBinding(entry.name, entry.app, entry.environment);
         break;
       default:
-        console.warn(
+        platformConsole.warn(
           "binding " + JSON.stringify(entry.name) + " is of kind " +
             JSON.stringify(entry.kind) + ", which this node has no binding for; " +
             "it is not published on context.bindings or on env"
@@ -2279,10 +2297,10 @@ function createServiceContext() {
       cache: defaultCache,
     },
     log: {
-      debug: (...args) => console.debug(...args),
-      info: (...args) => console.info(...args),
-      warn: (...args) => console.warn(...args),
-      error: (...args) => console.error(...args),
+      debug: (...args) => platformConsole.debug(...args),
+      info: (...args) => platformConsole.info(...args),
+      warn: (...args) => platformConsole.warn(...args),
+      error: (...args) => platformConsole.error(...args),
     },
     waitUntil: (promise) => {
       if (!globalThis.__pending_wait_until) globalThis.__pending_wait_until = [];
@@ -2327,7 +2345,7 @@ globalThis.__deis_runtime_wait_until_all = async function() {
     try {
         await Promise.all(promises);
     } catch (e) {
-        console.error("Error in waitUntil promise:", e);
+        platformConsole.error("Error in waitUntil promise:", e);
     }
     if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
       await globalThis.__deis_runtime_wait_until_all();
@@ -2340,24 +2358,27 @@ globalThis.__deis_runtime_wait_until_all = async function() {
   // Last thing on every path the Rust side runs -- request, queue batch and
   // cron tick all end here, after waitUntil work has been awaited.
   //
-  // The deadline timers go first and silently: they are this runtime's own
-  // bookkeeping, one per outbound fetch, and an invocation that ends with one
-  // still armed has done nothing wrong. Leaving them would mean a later
-  // request in this same isolate carried an abort timer belonging to an
-  // invocation that is already over.
-  globalThis.__deis_runtime_sweep_fetch_budgets();
-
-  // An interval still running at this point would keep firing inside every
-  // later request this isolate serves; see the timers section of
-  // js/bootstrap.js for why that is unbounded and why timeouts are left
-  // alone.
-  const swept = globalThis.__deis_runtime_sweep_intervals();
-  if (swept > 0) {
-    console.warn(
-      swept + " interval(s) were still running when this invocation ended and have been " +
-      "cleared. An isolate is reused across requests, so an interval that outlives the " +
-      "request that created it keeps firing inside later ones; clear it before returning, " +
-      "or do the work in the request itself"
+  // Three kinds of thing come back at once, and only two of them are worth
+  // telling the application about. The outbound-call deadlines are this
+  // runtime's own bookkeeping, one per fetch, and an invocation that ends with
+  // one still armed has done nothing wrong -- so they are ended silently.
+  //
+  // A timer still armed at this point is different: it would keep firing inside
+  // every later request this isolate serves, which is why it is named with its
+  // count. See the timers section of js/bootstrap.js for why that is unbounded
+  // for both kinds of timer, the self-rescheduling `setTimeout` included.
+  const swept = globalThis.__deis_runtime_sweep_invocation();
+  const left = [];
+  if (swept.intervals > 0) left.push(swept.intervals + " interval(s)");
+  if (swept.timeouts > 0) left.push(swept.timeouts + " timeout(s)");
+  if (left.length > 0) {
+    platformConsole.warn(
+      left.join(" and ") + " were still armed when this invocation ended, and have been " +
+      "cleared. An isolate is reused across requests, so a timer that outlives the request " +
+      "that created it keeps firing inside later ones -- a setTimeout whose callback arms " +
+      "the next one before it returns is an interval written in two lines. Clear it before " +
+      "returning, do the work in the request itself, or hand the promise to " +
+      "context.waitUntil, which is awaited before this sweep runs"
     );
   }
 };
@@ -2399,6 +2420,14 @@ globalThis.__deis_runtime_wait_until_all = async function() {
 // what the node hands back to deis-queue; everything else is acknowledged and
 // never delivered again.
 globalThis.__deis_runtime_invoke_queue = async function(payload) {
+  // Ownership goes back to the invocation before a line of the handler runs.
+  // A response stream's producer parks inside an `await` with its own owner in
+  // force, and the runtime thread comes back here to serve the next thing while
+  // it is parked -- so without this, a timer this handler armed would be filed
+  // against whichever stream stepped last, and would end when that stream did.
+  // `__deis_runtime_invoke` has always done this; the queue and cron paths are
+  // invocations in exactly the same sense and had been left out of it.
+  StreamScope.leave();
   const messages = (payload && payload.messages) || [];
   const allIds = messages.map((m) => m.id);
 
@@ -2409,7 +2438,7 @@ globalThis.__deis_runtime_invoke_queue = async function(payload) {
   }
 
   if (typeof handler !== "function") {
-    console.error(
+    platformConsole.error(
       "Queue batch for '" + payload.queue + "' dropped: this app declares a queue consumer " +
       "but exports no `queue` handler, so its messages cannot be processed"
     );
@@ -2466,7 +2495,7 @@ globalThis.__deis_runtime_invoke_queue = async function(payload) {
     await handler(batch, context.env, context);
   } catch (e) {
     const errorText = e && e.stack ? e.stack : String(e);
-    console.error("Queue handler error on '" + payload.queue + "':", errorText);
+    platformConsole.error("Queue handler error on '" + payload.queue + "':", errorText);
     return { failed: allIds, error: errorText };
   }
 
@@ -2493,6 +2522,14 @@ globalThis.__deis_runtime_invoke_queue = async function(payload) {
 // not retried and it is not made up later if it fails, so anything that must
 // not be missed belongs on a queue that the handler fills.
 globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
+  // Ownership goes back to the invocation before a line of the handler runs.
+  // A response stream's producer parks inside an `await` with its own owner in
+  // force, and the runtime thread comes back here to serve the next thing while
+  // it is parked -- so without this, a timer this handler armed would be filed
+  // against whichever stream stepped last, and would end when that stream did.
+  // `__deis_runtime_invoke` has always done this; the queue and cron paths are
+  // invocations in exactly the same sense and had been left out of it.
+  StreamScope.leave();
   let handler = globalThis.user_module && globalThis.user_module.scheduled;
   if (typeof handler !== "function") {
     const dflt = globalThis.user_module && globalThis.user_module.default;
@@ -2500,7 +2537,7 @@ globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
   }
 
   if (typeof handler !== "function") {
-    console.error(
+    platformConsole.error(
       "Scheduled trigger for '" + payload.cron + "' did nothing: this app declares a cron " +
       "expression but exports no `scheduled` handler"
     );
@@ -2519,7 +2556,7 @@ globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
     await handler(event, context.env, context);
   } catch (e) {
     const errorText = e && e.stack ? e.stack : String(e);
-    console.error("Scheduled handler error on '" + payload.cron + "':", errorText);
+    platformConsole.error("Scheduled handler error on '" + payload.cron + "':", errorText);
     return { ok: false, error: errorText };
   }
 
@@ -2614,14 +2651,29 @@ function headerPairs(headers) {
 // # Why the producer's fetch and interval have to be handed over
 //
 // Everything else this runtime does is swept when the stretch that started it
-// ends: an outbound `fetch` left in flight is aborted, an interval left armed
-// is cleared. A stream is the one thing that outlives its stretch on purpose,
-// and the call feeding it is usually the very `fetch` the handler made. So the
+// ends: an outbound `fetch` left in flight is aborted, a timer left armed is
+// cleared. A stream is the one thing that outlives its stretch on purpose, and
+// the call feeding it is usually the very `fetch` the handler made. So the
 // stream takes ownership of what the handler left open (`StreamScope.adopt`),
 // files what its producer opens afterwards in the same place
 // (`StreamScope.enter`), and gives all of it back when the stream ends
 // (`StreamScope.release`). See the ownership section in `js/bootstrap.js`.
-const StreamScope = globalThis.__deis_runtime_stream_scope;
+//
+// Claimed, not read: the claim answers once and then answers null for good, so
+// after this line nothing outside this closure can name the four verbs above.
+// That is what stops a handler from choosing its own owner for a timer, which
+// is a set no sweep looks in.
+const StreamScope = globalThis.__deis_runtime_claim_stream_scope();
+if (StreamScope === null) {
+  // Only reachable if this file were executed twice in one isolate, which is
+  // already impossible -- it reads `Deno.core` and then deletes `globalThis.Deno`
+  // at the top. Said out loud rather than left to fail later as "cannot read
+  // property adopt of null" the first time an application streams a response.
+  throw new TypeError(
+    "the response-stream scope was already claimed: js/runtime.js has run twice in this " +
+      "isolate, and this isolate cannot serve a streaming response",
+  );
+}
 
 // Captured for the reason `ObjectAssign` above is: chunks are inspected on
 // every write, after the application has had every chance to replace a global.
@@ -2665,11 +2717,25 @@ function chunkBytes(value) {
 
 // Take a stream out of the isolate's books and give back everything it held.
 // Every ending goes through here, so none of them can forget the release.
+//
+// What it held is said out loud when there was anything, at debug: a stream is
+// the one thing on this platform allowed to keep an outbound call or a timer
+// past the invocation that made it, and this line is where an operator can see
+// how much of that there was and that it ended with the stream. Debug rather
+// than warn because a producer pacing itself with one interval is doing exactly
+// what streams are for -- the number is worth having, the alarm is not.
 function retireStream(id, entry) {
   if (entry.closed) return false;
   entry.closed = true;
   openStreams.delete(id);
-  StreamScope.release(entry.owner);
+  const held = StreamScope.release(entry.owner);
+  if (held.calls > 0 || held.intervals > 0 || held.timeouts > 0) {
+    platformConsole.debug(
+      "Response stream " + id + " ended holding " + held.calls + " outbound call(s), " +
+      held.intervals + " interval(s) and " + held.timeouts + " timeout(s); all of them ended " +
+      "with it, so none outlives the stream that owned them"
+    );
+  }
   return true;
 }
 
@@ -2765,6 +2831,21 @@ async function pumpStream(id, entry) {
 // `waitUntil` tail -- and the runtime thread goes back to serving other
 // requests for this application between chunks.
 globalThis.__deis_runtime_stream_begin = function(id) {
+  // An id this isolate is already producing is not something the node ever
+  // asks for twice -- it opens each stream once and calls this once. Refused
+  // rather than trusted, because overwriting the entry would take the running
+  // stream off the books while leaving it open: its owner would never be
+  // released, and the timers and outbound calls that owner holds would go on
+  // firing inside every later request. This name is sealed but callable, and a
+  // small integer is not hard to guess.
+  if (openStreams.has(id)) {
+    DenoCore.ops.op_deis_stream_fail(
+      id,
+      "this response stream is already being produced; it was asked to start a second time",
+    );
+    return;
+  }
+
   const source = pendingStreamBody;
   pendingStreamBody = null;
 
@@ -2780,7 +2861,21 @@ globalThis.__deis_runtime_stream_begin = function(id) {
   // Adopted before the reader is taken: whatever the handler still has open
   // belongs to this stream from here on, and its outbound calls are put on the
   // stream's clock rather than on the request's, which is already spent.
-  const owner = StreamScope.adopt();
+  //
+  // The handover is logged when there was anything to hand over, so the one
+  // exception to "nothing outlives its invocation" is visible at the moment it
+  // is made rather than only when the stream ends. The stream's own budget is
+  // logged beside this by `runtime/isolate.rs`, which is what bounds all of it.
+  const adopted = StreamScope.adopt();
+  const owner = adopted.owner;
+  const held = adopted.held;
+  if (held.calls > 0 || held.intervals > 0 || held.timeouts > 0) {
+    platformConsole.debug(
+      "Response stream " + id + " took over " + held.calls + " outbound call(s), " +
+      held.intervals + " interval(s) and " + held.timeouts + " timeout(s) that the handler " +
+      "left open; they now end with the stream instead of with the request"
+    );
+  }
 
   let reader;
   try {
@@ -2820,6 +2915,53 @@ globalThis.__deis_runtime_stream_cancel = function(id, reason) {
   if (entry === undefined) return false;
   abandonStream(id, entry, reason);
   return true;
+};
+
+// Give back what every open stream is still holding, because this isolate can
+// no longer produce any of them.
+//
+// `runtime/isolate.rs::fail_open_response_streams` ends the client's half of
+// each body. This is the isolate's half, and it is not the same thing: the
+// paths that get there by terminating the isolate leave every producer stopped
+// mid-step, inside an `await` that will never resume, so nothing on this side
+// would ever notice its stream is over. The entry would stay in `openStreams`
+// holding that producer's owner -- and a stream's owner is the one set the
+// end-of-invocation sweep is not allowed to touch, so the interval pacing a
+// body nobody is reading any more would go on firing inside every later request
+// this application serves. That is the leak the whole ownership arrangement
+// exists to prevent, reached without any internal call: return a streaming
+// response whose producer will not yield, and the cut-off does the rest.
+//
+// The producers are not cancelled, and the node's half is not touched: on every
+// path that calls this the node has already ended each body, and
+// `reader.cancel()` runs the application's own `cancel` hook, whose code has
+// either just been terminated or has nothing left that can wake it. The reap in
+// `runtime/isolate.rs` is where a stream that ends in the ordinary way gets its
+// cancel.
+//
+// The name is sealed but callable, so an application can release its own
+// producers out of turn. What that costs it is its own bodies: the node still
+// holds those streams open with nobody writing to them, which
+// `pump_response_streams` notices as "no operation or timer outstanding" and
+// ends as failures rather than making each client wait out `stream_timeout_ms`.
+//
+// Answers with how many were released, for the caller's log.
+globalThis.__deis_runtime_stream_release_all = function() {
+  const ids = [];
+  openStreams.forEach((_entry, id) => { ids.push(id); });
+  let released = 0;
+  for (const id of ids) {
+    const entry = openStreams.get(id);
+    if (entry !== undefined && retireStream(id, entry)) released++;
+  }
+  if (released > 0) {
+    platformConsole.debug(
+      released + " response stream producer(s) were released because this isolate can no longer " +
+      "produce any of them; each one's outbound calls and timers ended with it, and the line " +
+      "above says how much each was holding"
+    );
+  }
+  return released;
 };
 
 globalThis.__deis_runtime_invoke = async function(requestPayload) {
@@ -2901,7 +3043,7 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     return respond(resp.status, headers, body);
   } catch (e) {
     const errorText = e && e.stack ? e.stack : String(e);
-    console.error("Runtime invoke error:", errorText);
+    platformConsole.error("Runtime invoke error:", errorText);
     return respond(500, {}, `Runtime Error: ${errorText}`);
   }
 };
@@ -2964,7 +3106,11 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
       }
     };
 
-  globalThis.console = Object.assign(Object.create(native ?? null), native, {
+  // One object, reached by two names. `globalThis.console` is the
+  // application's and stays replaceable; `platformConsole` is this file's and
+  // is not reachable from outside this closure, so what the platform says about
+  // an application cannot be turned off by that application.
+  platformConsole = Object.assign(Object.create(native ?? null), native, {
     log: bridged("info", "log"),
     info: bridged("info", "info"),
     debug: bridged("debug", "debug"),
@@ -2972,6 +3118,7 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     error: bridged("error", "error"),
     trace: bridged("debug", "trace"),
   });
+  globalThis.console = platformConsole;
 }
 
 globalThis.user_module = {}; globalThis.__deis_runtime_set_response = (json) => DenoCore.ops.op_set_response(json);
@@ -2981,14 +3128,14 @@ globalThis.user_module = {}; globalThis.__deis_runtime_set_response = (json) => 
 //
 // These are not the application's surface, and an application that could put
 // its own function under one of them would not merely be lying to itself.
-// `__deis_runtime_invoke` is what runs an invocation *and what sweeps up
-// after one*: it calls `__deis_runtime_sweep_intervals` and
-// `__deis_runtime_sweep_fetch_budgets` at the end, which is where an
-// application's `setInterval` callbacks and outbound-fetch deadlines stop.
-// `js/bootstrap.js` seals those two, and that is not enough on its own while
-// the function that calls them can be replaced with one that does not --
-// timers would then go on firing on a runtime thread shared with every other
-// application on it, long after the request that created them.
+// `__deis_runtime_invoke` is what runs an invocation *and what sweeps up after
+// one*: `__deis_runtime_wait_until_all` calls
+// `__deis_runtime_sweep_invocation` at the end, which is where an application's
+// timers and its outbound-fetch deadlines stop. `js/bootstrap.js` seals that
+// sweep, and that is not enough on its own while the function that calls it can
+// be replaced with one that does not -- timers would then go on firing on a
+// runtime thread shared with every other application on it, long after the
+// request that created them.
 //
 // `user_module` is deliberately not in this list: `runtime/isolate.rs` writes
 // the application's exports there once the module has evaluated.
@@ -2996,6 +3143,7 @@ for (const name of [
   "__deis_runtime_invoke",
   "__deis_runtime_stream_begin",
   "__deis_runtime_stream_cancel",
+  "__deis_runtime_stream_release_all",
   "__deis_runtime_invoke_queue",
   "__deis_runtime_invoke_scheduled",
   "__deis_runtime_wait_until_all",

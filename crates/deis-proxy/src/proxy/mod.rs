@@ -9,10 +9,17 @@
 //!    ([`crate::catalog`]) first and the locally configured application
 //!    list second - the catalog is the table an operator can change without
 //!    touching this machine, and it is the only one that knows path
-//!    prefixes and per-environment addresses. Unknown hosts get a 404 once
-//!    either table has anything in it; with both empty every request is
-//!    forwarded unchanged so a bare instance still works as a plain reverse
-//!    proxy.
+//!    prefixes and per-environment addresses.
+//!
+//!    What a request that matches nothing means depends on where this
+//!    instance's routing comes from ([`RoutingSource`]). With a control
+//!    plane configured and a table fetched from it, it is a 404. With a
+//!    control plane configured and *no* table ever fetched, it is a 503:
+//!    the instance has been told where its routing comes from and has not
+//!    got it, and forwarding would route the request by the client's own
+//!    header. Only an instance with no control plane at all and no
+//!    applications of its own forwards the request unchanged, which is the
+//!    plain reverse proxy deployment `config.toml.example` describes.
 //! 2. Disabled applications get a 403. Plain HTTP requests for an application
 //!    whose certificate is actually loaded are redirected to HTTPS when the
 //!    policy says so.
@@ -35,8 +42,10 @@
 //!    forwarded. `x-deis-app-id` is set to the id deis-proxy decided on and
 //!    `x-deis-environment` to that app's configured environment (defaulting
 //!    to production when the route names none), replacing whatever the
-//!    client sent for either header, so deis-runtime only ever sees values
-//!    that passed the checks above.
+//!    client sent for either header; in plain reverse proxy mode, where no
+//!    application was resolved, both are removed. Either way deis-runtime
+//!    only ever sees values that passed the checks above, and never a value
+//!    the client chose.
 //! 6. A request the upstream upgrades (a WebSocket handshake) becomes a
 //!    tunnel: everything after the 101 is relayed in both directions until
 //!    one end closes. The upstream read timeout is a bound on how long a
@@ -69,7 +78,7 @@ use crate::acme::{CHALLENGE_PREFIX, ChallengeResponder};
 use crate::catalog::table::{CatalogRoutes, MatchSource};
 use crate::config::routes::{RouteTable, normalize_host};
 use crate::config::system::{CompressionAlgo, DEFAULT_MAX_REQUEST_BODY_BYTES};
-use crate::config::{AppConfig, ConfigManager};
+use crate::config::{AppConfig, ConfigManager, SystemConfig};
 
 pub use access_log::AccessLog;
 pub use balancer::Balancer;
@@ -315,7 +324,53 @@ enum Resolution {
     Passthrough,
     /// Something is configured but none of it matches: 404.
     NotFound,
+    /// A control plane is configured and has never answered, so this instance
+    /// does not know what it is meant to route: 503.
+    Unavailable,
     Found(Resolved),
+}
+
+/// Where this instance's routing comes from, which is what a request that
+/// matches nothing means.
+///
+/// The two situations the code could not tell apart before. A proxy with no
+/// `[control]` section and no applications of its own is a plain reverse
+/// proxy, which is a supported deployment - `config.toml.example` and the
+/// integration tests use it - and forwarding an unmatched request is the
+/// whole job. A proxy that *has* been pointed at a control plane and has
+/// never heard back is a different machine in a bad state: it has been told
+/// where its routing comes from and does not have it, so a request it cannot
+/// place must be refused rather than forwarded on the strength of the
+/// client's own `x-deis-app-id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingSource {
+    /// No control plane is configured. This machine's own application list
+    /// is the whole truth about routing.
+    ThisMachine,
+    /// A control plane is configured and a catalog has been fetched from it
+    /// at least once. That table is the answer, including when the answer is
+    /// "this host is routed nowhere".
+    Catalog,
+    /// A control plane is configured and no catalog has ever arrived.
+    CatalogMissing,
+}
+
+impl RoutingSource {
+    /// Read from the running configuration and the table in force.
+    ///
+    /// `control` says an operator pointed this instance at a control plane;
+    /// an empty catalog version says no answer from it has ever been applied
+    /// ([`CatalogRoutes::version`]). A poll that fails *after* one succeeded
+    /// leaves the last table in force and stays [`RoutingSource::Catalog`],
+    /// which is the whole contract of [`crate::catalog`]: a management
+    /// outage must not become a traffic outage.
+    fn of(system: &SystemConfig, catalog: &CatalogRoutes) -> Self {
+        match (system.control.is_some(), catalog.version().is_empty()) {
+            (false, _) => RoutingSource::ThisMachine,
+            (true, true) => RoutingSource::CatalogMissing,
+            (true, false) => RoutingSource::Catalog,
+        }
+    }
 }
 
 /// The routing rule.
@@ -337,19 +392,33 @@ enum Resolution {
 fn resolve_app(
     routes: &RouteTable,
     catalog: &CatalogRoutes,
+    source: RoutingSource,
     requested_id: Option<&str>,
     host: &str,
     path: &str,
 ) -> Resolution {
-    // Nothing here claims any host: forward the request untouched. Checked
-    // last of all, after every lookup has failed, so an app the catalog
-    // knows by id is still reachable by header on an instance whose routing
-    // table happens to hold no rule.
-    let nothing_claims_a_host = || {
-        if routes.is_empty() && catalog.is_empty() {
-            Resolution::Passthrough
-        } else {
-            Resolution::NotFound
+    // What it means that every lookup above failed. Checked last of all, so
+    // an app the catalog knows by id is still reachable by header on an
+    // instance whose routing table happens to hold no rule.
+    let nothing_claims_a_host = || match source {
+        // Told where its routing comes from, and never told what it is. The
+        // `x-deis-app-id` the client sent is not an answer to that - it is
+        // the question - so this request cannot be placed and is refused.
+        RoutingSource::CatalogMissing => Resolution::Unavailable,
+        // The control plane answered, and its table is the whole truth about
+        // what is routed here. A request outside it is a 404 even when that
+        // table turned out to be empty.
+        RoutingSource::Catalog => Resolution::NotFound,
+        // Nobody drives this instance. With nothing configured either it is
+        // a plain reverse proxy and forwards the request untouched; with an
+        // application list that simply does not claim this host, it is a 404
+        // exactly as before.
+        RoutingSource::ThisMachine => {
+            if routes.is_empty() && catalog.is_empty() {
+                Resolution::Passthrough
+            } else {
+                Resolution::NotFound
+            }
         }
     };
 
@@ -403,24 +472,73 @@ fn resolve_app(
 /// Set `x-deis-app-id` and `x-deis-environment` on the upstream request from
 /// what deis-proxy resolved, replacing whatever the client sent under either
 /// name (`insert_header` replaces rather than appends, and normalizes header
-/// case). With no application resolved (plain reverse proxy mode) both
-/// fields are `None` and both headers are left exactly as the client sent
-/// them, since pingora already copied the downstream headers over.
+/// case).
+///
+/// With no application resolved - plain reverse proxy mode, the only state
+/// that reaches here with both fields `None` - both headers are *removed*
+/// instead. Leaving the client's values in place was the same hole from the
+/// other side: pingora has already copied the downstream headers over, a
+/// node trusts these two completely and picks its storage tenant from them,
+/// and nothing downstream can tell a header the client wrote from one the
+/// edge stamped. So a request deis-proxy made no routing decision about used
+/// to arrive at the node as whichever application and environment the client
+/// asked for. An upstream that is not a deis-runtime never reads them; a
+/// deis-runtime answers 400 when they are absent, which is the honest
+/// outcome for a request nothing here routed.
 fn stamp_routing_headers(
     upstream_request: &mut RequestHeader,
     ctx: &RequestCtx,
 ) -> pingora::Result<()> {
-    if let Some(app_id) = &ctx.app_id {
-        upstream_request.insert_header(APP_ID_HEADER, app_id.as_str())?;
+    match &ctx.app_id {
+        Some(app_id) => {
+            upstream_request.insert_header(APP_ID_HEADER, app_id.as_str())?;
+        }
+        None => {
+            upstream_request.remove_header(APP_ID_HEADER);
+        }
     }
     // An app that names no environment still carries one here: see
     // AppConfig::environment's default, which guarantees this is never
     // empty once an app has been resolved, so the header on the wire is
     // never ambiguous.
-    if let Some(environment) = &ctx.environment {
-        upstream_request.insert_header(ENVIRONMENT_HEADER, environment.as_str())?;
+    match &ctx.environment {
+        Some(environment) => {
+            upstream_request.insert_header(ENVIRONMENT_HEADER, environment.as_str())?;
+        }
+        None => {
+            upstream_request.remove_header(ENVIRONMENT_HEADER);
+        }
     }
     Ok(())
+}
+
+/// Whether a plain HTTP request for `host` may be answered with a redirect to
+/// HTTPS, given the local configuration of the application it resolved to
+/// (`None` for one only the catalog knows).
+///
+/// Two questions, and both have to be yes.
+///
+/// [`RouteTable::https_available`] asks whether this application terminates
+/// TLS at all - one of its own certificates loaded, or it named certificates
+/// and the default one stands in for them.
+///
+/// [`RouteTable::https_available_for_host`] asks whether this edge holds a
+/// certificate that attests to the name the `Location` will carry, and that
+/// is the load-bearing half: the `Location` is built from the client's own
+/// `Host` header, which took no part in resolving the application whenever
+/// `x-deis-app-id` did. Without this test, a client naming any known
+/// application by header and any `Host` it liked was answered `301` to that
+/// host - a redirect off the edge's own domain, signed by the edge's own
+/// domain, which is what makes an open redirect worth having for a phishing
+/// link. `auto_redirect_to_https` defaults to on, so no configuration had to
+/// be wrong for it.
+fn https_redirect_allowed(routes: &RouteTable, config: Option<&AppConfig>, host: &str) -> bool {
+    if let Some(config) = config
+        && !routes.https_available(config)
+    {
+        return false;
+    }
+    routes.https_available_for_host(host)
 }
 
 #[async_trait]
@@ -510,8 +628,10 @@ impl ProxyHttp for DeisProxy {
             return self.answer_acme_challenge(session, &responder, &host).await;
         }
 
+        let system = self.config.get_system_config();
         let routes = self.config.routes();
         let catalog = self.config.catalog_routes();
+        let source = RoutingSource::of(&system, &catalog);
         let requested_id = session
             .get_header(APP_ID_HEADER)
             .and_then(|value| value.to_str().ok())
@@ -523,6 +643,7 @@ impl ProxyHttp for DeisProxy {
         let resolution = resolve_app(
             &routes,
             &catalog,
+            source,
             requested_id.as_deref(),
             &ctx.host,
             session.req_header().uri.path(),
@@ -532,9 +653,38 @@ impl ProxyHttp for DeisProxy {
             Resolution::Passthrough => {
                 debug!(
                     host = %ctx.host,
-                    "no applications configured and no routing table fetched; forwarding unchanged"
+                    "no control plane, no applications and no routing table: plain reverse proxy \
+                     mode, forwarding this request with its routing headers stripped"
                 );
                 return Ok(false);
+            }
+            Resolution::Unavailable => {
+                // Not a 404: the application may well exist and be perfectly
+                // healthy. What is missing is this edge's knowledge of where
+                // to send it, so the honest answer is "this instance cannot
+                // serve you yet" and the honest action is to refuse rather
+                // than route on a header the client wrote. The routing table
+                // poller logs at error, every
+                // routing.control_poll_interval_secs seconds (5 by default),
+                // why the fetch is failing.
+                warn!(
+                    host = %ctx.host,
+                    path = %session.req_header().uri.path(),
+                    app_id = ?requested_id,
+                    "a control plane is configured and no routing table has ever been fetched \
+                     from it, so this instance cannot say which application this request belongs \
+                     to; refusing it with 503. Forwarding it would route it by the client's own \
+                     x-deis-app-id, which the node trusts and picks its storage tenant from"
+                );
+                session
+                    .respond_error_with_body(
+                        503,
+                        Bytes::from_static(
+                            b"the routing table has not been fetched from the control plane yet\n",
+                        ),
+                    )
+                    .await?;
+                return Ok(true);
             }
             Resolution::NotFound => {
                 debug!(
@@ -582,17 +732,8 @@ impl ProxyHttp for DeisProxy {
         ctx.app_id = Some(resolved.app_id.clone());
         ctx.environment = Some(resolved.environment.clone());
 
-        let system = self.config.get_system_config();
         let tls_ports = system.tls_ports();
-        // Whether a handshake for this request would actually succeed. An
-        // application configured here answers on the certificates it names;
-        // one only the catalog knows has none of its own, so the question is
-        // whether any certificate would be served for this host - which is
-        // how a wildcard certificate covers a whole preview zone.
-        let https_ready = match &resolved.config {
-            Some(config) => routes.https_available(config),
-            None => routes.https_available_for_host(&ctx.host),
-        };
+        let https_ready = https_redirect_allowed(&routes, resolved.config.as_deref(), &ctx.host);
         if !ctx.tls
             && system.https().auto_redirect_to_https
             && https_ready
@@ -897,6 +1038,45 @@ mod tests {
         CatalogRoutes::default()
     }
 
+    /// [`resolve_app`] on an instance nobody drives: no `[control]` section,
+    /// so this machine's own application list is the whole truth about
+    /// routing and an empty one is a plain reverse proxy.
+    fn standalone(
+        routes: &RouteTable,
+        catalog: &CatalogRoutes,
+        requested_id: Option<&str>,
+        host: &str,
+        path: &str,
+    ) -> Resolution {
+        resolve_app(
+            routes,
+            catalog,
+            RoutingSource::ThisMachine,
+            requested_id,
+            host,
+            path,
+        )
+    }
+
+    /// [`resolve_app`] on an instance a control plane drives and whose
+    /// catalog has been fetched at least once.
+    fn driven(
+        routes: &RouteTable,
+        catalog: &CatalogRoutes,
+        requested_id: Option<&str>,
+        host: &str,
+        path: &str,
+    ) -> Resolution {
+        resolve_app(
+            routes,
+            catalog,
+            RoutingSource::Catalog,
+            requested_id,
+            host,
+            path,
+        )
+    }
+
     fn resolved(resolution: Resolution) -> Option<Resolved> {
         match resolution {
             Resolution::Found(found) => Some(found),
@@ -915,7 +1095,7 @@ mod tests {
     #[test]
     fn header_wins_when_it_names_a_known_app() {
         let routes = table(&[("shop", "shop.example.com"), ("blog", "blog.example.com")]);
-        let resolution = resolve_app(
+        let resolution = standalone(
             &routes,
             &no_catalog(),
             Some("blog"),
@@ -929,7 +1109,7 @@ mod tests {
     fn unknown_header_is_rejected_even_for_a_known_host() {
         let routes = table(&[("shop", "shop.example.com")]);
         assert!(matches!(
-            resolve_app(
+            standalone(
                 &routes,
                 &no_catalog(),
                 Some("Shop"),
@@ -939,7 +1119,7 @@ mod tests {
             Resolution::NotFound
         ));
         assert!(matches!(
-            resolve_app(
+            standalone(
                 &routes,
                 &no_catalog(),
                 Some("other"),
@@ -953,12 +1133,12 @@ mod tests {
     #[test]
     fn empty_header_falls_back_to_the_host() {
         let routes = table(&[("shop", "shop.example.com")]);
-        let resolution = resolve_app(&routes, &no_catalog(), Some(""), "shop.example.com", "/");
+        let resolution = standalone(&routes, &no_catalog(), Some(""), "shop.example.com", "/");
         assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
-        let resolution = resolve_app(&routes, &no_catalog(), None, "shop.example.com", "/");
+        let resolution = standalone(&routes, &no_catalog(), None, "shop.example.com", "/");
         assert_eq!(resolved_id(resolution).as_deref(), Some("shop"));
         assert!(matches!(
-            resolve_app(&routes, &no_catalog(), None, "other.example.com", "/"),
+            standalone(&routes, &no_catalog(), None, "other.example.com", "/"),
             Resolution::NotFound
         ));
     }
@@ -967,7 +1147,7 @@ mod tests {
     fn no_apps_and_no_routing_table_means_passthrough() {
         let routes = table(&[]);
         assert!(matches!(
-            resolve_app(
+            standalone(
                 &routes,
                 &no_catalog(),
                 Some("anything"),
@@ -989,18 +1169,11 @@ mod tests {
         );
         let routes = table(&[]);
         assert_eq!(
-            resolved_id(resolve_app(
-                &routes,
-                &catalog,
-                None,
-                "shop.example.com",
-                "/"
-            ))
-            .as_deref(),
+            resolved_id(driven(&routes, &catalog, None, "shop.example.com", "/")).as_deref(),
             Some("shop")
         );
         assert!(matches!(
-            resolve_app(&routes, &catalog, None, "other.example.com", "/"),
+            driven(&routes, &catalog, None, "other.example.com", "/"),
             Resolution::NotFound
         ));
     }
@@ -1017,19 +1190,12 @@ mod tests {
             None,
         );
         let routes = table(&[]);
-        let found = resolved(resolve_app(
-            &routes,
-            &catalog,
-            None,
-            "example.com",
-            "/api/users",
-        ))
-        .unwrap();
+        let found = resolved(driven(&routes, &catalog, None, "example.com", "/api/users")).unwrap();
         assert_eq!(found.app_id, "api");
         assert_eq!(found.environment, "pr-42");
         assert_eq!(found.from, ResolvedFrom::Catalog);
         assert_eq!(
-            resolved_id(resolve_app(&routes, &catalog, None, "example.com", "/")).as_deref(),
+            resolved_id(driven(&routes, &catalog, None, "example.com", "/")).as_deref(),
             Some("site")
         );
     }
@@ -1045,14 +1211,7 @@ mod tests {
             r#"{"version":"v1","routes":[{"app_id":"shop","environment":"pr-9","host":"shop.example.com","path_prefix":"/"}],"environments":[]}"#,
             None,
         );
-        let found = resolved(resolve_app(
-            &routes,
-            &catalog,
-            None,
-            "shop.example.com",
-            "/",
-        ))
-        .unwrap();
+        let found = resolved(driven(&routes, &catalog, None, "shop.example.com", "/")).unwrap();
         assert_eq!(found.app_id, "shop");
         assert_eq!(found.environment, "pr-9");
         assert_eq!(found.from, ResolvedFrom::Catalog);
@@ -1069,14 +1228,7 @@ mod tests {
             r#"{"version":"v1","routes":[{"app_id":"other","environment":"production","host":"other.example.com","path_prefix":"/"}],"environments":[]}"#,
             None,
         );
-        let found = resolved(resolve_app(
-            &routes,
-            &catalog,
-            None,
-            "shop.example.com",
-            "/",
-        ))
-        .unwrap();
+        let found = resolved(driven(&routes, &catalog, None, "shop.example.com", "/")).unwrap();
         assert_eq!(found.app_id, "shop");
         assert_eq!(found.from, ResolvedFrom::Local);
     }
@@ -1088,7 +1240,7 @@ mod tests {
             Some("preview.example.com"),
         );
         let routes = table(&[]);
-        let found = resolved(resolve_app(
+        let found = resolved(driven(
             &routes,
             &catalog,
             None,
@@ -1109,7 +1261,7 @@ mod tests {
             None,
         );
         let routes = table(&[]);
-        let found = resolved(resolve_app(
+        let found = resolved(driven(
             &routes,
             &catalog,
             Some("shop"),
@@ -1124,37 +1276,109 @@ mod tests {
             "the header names an application, so the only honest environment is the default one"
         );
         assert!(matches!(
-            resolve_app(&routes, &catalog, Some("nothing"), "anything.test", "/"),
+            driven(&routes, &catalog, Some("nothing"), "anything.test", "/"),
             Resolution::NotFound
         ));
     }
 
     #[test]
-    fn a_catalog_with_apps_but_no_route_still_forwards_unmatched_traffic() {
-        // The shape a platform has before anyone creates a route, and the
-        // shape the bundled demo runs in: applications and environments
-        // exist, nothing claims a hostname. A bare instance must still be a
-        // plain reverse proxy, and an app named outright by header must
-        // still resolve.
+    fn a_catalog_with_apps_but_no_route_does_not_forward_unmatched_traffic() {
+        // The shape a platform has before anyone creates a route:
+        // applications and environments exist, nothing claims a hostname.
+        // The catalog reports itself empty on the four maps a host is
+        // matched against, and this used to be read as "nothing routes here,
+        // forward it" - so a request naming any application at all reached
+        // the node carrying the client's own x-deis-app-id, which is the
+        // header the node picks its storage tenant from. An instance a
+        // control plane drives must answer 404 here, and an application the
+        // catalog does know by name must still resolve by header.
         let catalog = catalog(
             r#"{"version":"v1","routes":[],"environments":[{"app_id":"demo","environment":"production"}]}"#,
             None,
         );
         let routes = table(&[]);
         assert!(matches!(
-            resolve_app(&routes, &catalog, None, "127.0.0.1", "/"),
-            Resolution::Passthrough
+            driven(&routes, &catalog, None, "127.0.0.1", "/"),
+            Resolution::NotFound
+        ));
+        assert!(matches!(
+            driven(&routes, &catalog, Some("_system"), "victim.example", "/"),
+            Resolution::NotFound
         ));
         assert_eq!(
-            resolved_id(resolve_app(
-                &routes,
-                &catalog,
-                Some("demo"),
-                "127.0.0.1",
-                "/"
-            ))
-            .as_deref(),
+            resolved_id(driven(&routes, &catalog, Some("demo"), "127.0.0.1", "/")).as_deref(),
             Some("demo")
+        );
+    }
+
+    #[test]
+    fn a_control_plane_that_has_never_answered_fails_closed() {
+        // Reproduced against a running proxy: with [control] pointing at a
+        // port nothing listens on, `curl -H 'Host: victim.example'
+        // -H 'x-deis-app-id: demo' -H 'x-deis-environment: preview'` reached
+        // the node as demo/preview - a different storage tenant - and
+        // `-H 'x-deis-app-id: _system'` reached the node's internal system
+        // application. Every one of those is a request this instance made no
+        // routing decision about.
+        //
+        // 503 rather than 404: the application may exist and be healthy.
+        // What is missing is this edge's knowledge of where to send it.
+        let routes = table(&[]);
+        let catalog = no_catalog();
+        for requested_id in [None, Some("demo"), Some("_system")] {
+            assert!(
+                matches!(
+                    resolve_app(
+                        &routes,
+                        &catalog,
+                        RoutingSource::CatalogMissing,
+                        requested_id,
+                        "victim.example",
+                        "/",
+                    ),
+                    Resolution::Unavailable
+                ),
+                "a request naming {requested_id:?} must not be routed by an instance that has \
+                 never been told what it routes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_application_list_still_answers_while_the_control_plane_is_silent() {
+        // Failing closed is about requests this instance cannot place, not
+        // about refusing everything: an application configured on this
+        // machine is a routing decision this machine made, and it keeps
+        // working while the catalog is missing.
+        let routes = table(&[("shop", "shop.example.com")]);
+        let found = resolved(resolve_app(
+            &routes,
+            &no_catalog(),
+            RoutingSource::CatalogMissing,
+            None,
+            "shop.example.com",
+            "/",
+        ))
+        .unwrap();
+        assert_eq!(found.app_id, "shop");
+        assert_eq!(found.from, ResolvedFrom::Local);
+    }
+
+    #[test]
+    fn a_control_plane_that_answered_once_keeps_serving_its_last_table() {
+        // The other half of the same rule, and the reason the state is read
+        // from the catalog's version rather than from whether the last poll
+        // worked: a poll that fails after one succeeded leaves the last
+        // table in force, so a control plane restarted for an upgrade must
+        // not take traffic down with it.
+        let catalog = catalog(
+            r#"{"version":"v1","routes":[{"app_id":"shop","environment":"production","host":"shop.example.com","path_prefix":"/"}],"environments":[]}"#,
+            None,
+        );
+        let routes = table(&[]);
+        assert_eq!(
+            resolved_id(driven(&routes, &catalog, None, "shop.example.com", "/")).as_deref(),
+            Some("shop")
         );
     }
 
@@ -1164,7 +1388,7 @@ mod tests {
         // pushed without one must still resolve to a concrete value rather
         // than leave it unset.
         let routes = table(&[("shop", "shop.example.com")]);
-        let resolution = resolve_app(&routes, &no_catalog(), None, "shop.example.com", "/");
+        let resolution = standalone(&routes, &no_catalog(), None, "shop.example.com", "/");
         assert_eq!(
             resolved_environment(resolution).as_deref(),
             Some(deis_wire::conventions::DEFAULT_ENVIRONMENT)
@@ -1211,10 +1435,12 @@ mod tests {
     }
 
     #[test]
-    fn stamp_leaves_headers_untouched_in_passthrough_mode() {
+    fn stamp_strips_the_client_values_when_no_application_was_resolved() {
         // No application was resolved (RequestCtx::default has both fields
-        // as None), so whatever pingora already copied from the client must
-        // survive unchanged: deis-proxy has no opinion to stamp.
+        // as None), so deis-proxy has no opinion to stamp - and leaving the
+        // client's own values in place is not "no opinion", it is the
+        // client's opinion arriving at a node that cannot tell it from the
+        // edge's. Both go.
         let mut upstream_request = empty_upstream_request();
         upstream_request
             .insert_header(APP_ID_HEADER, "client-value")
@@ -1225,14 +1451,8 @@ mod tests {
 
         stamp_routing_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
 
-        assert_eq!(
-            header_str(&upstream_request, APP_ID_HEADER).as_deref(),
-            Some("client-value")
-        );
-        assert_eq!(
-            header_str(&upstream_request, ENVIRONMENT_HEADER).as_deref(),
-            Some("client-env")
-        );
+        assert_eq!(header_str(&upstream_request, APP_ID_HEADER), None);
+        assert_eq!(header_str(&upstream_request, ENVIRONMENT_HEADER), None);
     }
 
     #[test]
@@ -1293,6 +1513,141 @@ mod tests {
             text.contains("33554432"),
             "a refusal has to say what the limit is; it said {text:?}"
         );
+    }
+
+    /// A route table holding one application with a certificate of its own,
+    /// plus a `tls.default_certificate` for an unrelated name.
+    ///
+    /// Both halves matter. The application's own certificate is what entitles
+    /// it to an HTTPS redirect at all; the default certificate is the piece
+    /// that used to widen "is HTTPS available for this host" to every host
+    /// there is, because it is what the handshake falls back to for a name
+    /// nothing matches.
+    fn table_with_certificate(id: &str, domain: &str) -> (RouteTable, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_file, key_file) = self_signed(dir.path(), domain);
+        let (default_cert, default_key) = self_signed(dir.path(), "default.example");
+        let apps: HashMap<String, serde_json::Value> = HashMap::from([(
+            id.to_string(),
+            json!({
+                "id": id,
+                "description": "",
+                "domains": [domain],
+                "certificates": [{"cert_file": cert_file, "key_file": key_file}],
+                "enabled": true,
+                "cache": [],
+            }),
+        )]);
+        let default_certificate = crate::config::CertificateConfig {
+            cert_file: default_cert,
+            key_file: default_key,
+        };
+        (
+            RouteTable::build(&apps, Some(&default_certificate), &[]),
+            dir,
+        )
+    }
+
+    /// A throwaway certificate on disk, so the route table loads it the way
+    /// it loads a real one.
+    fn self_signed(dir: &std::path::Path, name: &str) -> (String, String) {
+        use openssl::asn1::Asn1Time;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::x509::extension::SubjectAlternativeName;
+        use openssl::x509::{X509, X509NameBuilder};
+
+        let key = PKey::generate_ed25519().unwrap();
+        let mut subject = X509NameBuilder::new().unwrap();
+        subject.append_entry_by_text("CN", name).unwrap();
+        let subject = subject.build();
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&subject).unwrap();
+        builder.set_issuer_name(&subject).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        let alt = SubjectAlternativeName::new()
+            .dns(name)
+            .build(&builder.x509v3_context(None, None))
+            .unwrap();
+        builder.append_extension(alt).unwrap();
+        // Ed25519 signatures embed their own digest.
+        builder.sign(&key, MessageDigest::null()).unwrap();
+        let certificate = builder.build();
+
+        let cert_file = dir.join(format!("{}.pem", name.replace('*', "wildcard")));
+        let key_file = dir.join(format!("{}.key", name.replace('*', "wildcard")));
+        std::fs::write(&cert_file, certificate.to_pem().unwrap()).unwrap();
+        std::fs::write(&key_file, key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+        (
+            cert_file.to_string_lossy().into_owned(),
+            key_file.to_string_lossy().into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_redirect_is_not_built_from_a_host_the_client_chose() {
+        // Reproduced against a running proxy: with a default certificate
+        // loaded and auto_redirect_to_https on (its default),
+        // `curl -H 'Host: evil.example' -H 'x-deis-app-id: demo'` was
+        // answered `301 Location: https://evil.example:<tls port>/login`.
+        // The Location is built from the client's own Host, and the header
+        // path never looked at that Host at all - so the redirect has to be
+        // refused unless this edge holds a certificate for the name it would
+        // send the client to.
+        let (routes, _dir) = table_with_certificate("shop", "shop.example.com");
+        let shop = routes.app_by_id("shop").cloned().unwrap();
+
+        assert!(
+            https_redirect_allowed(&routes, Some(&shop), "shop.example.com"),
+            "the application's own name still redirects; that is what the feature is for"
+        );
+        assert!(
+            routes.certificate_for(Some("evil.example")).is_some(),
+            "the handshake would still present the default certificate for that name; the \
+             redirect decision is a different question and this is the one that used to be \
+             answered with it"
+        );
+        assert!(
+            !https_redirect_allowed(&routes, Some(&shop), "evil.example"),
+            "an application named by header does not make the client's Host a redirect target"
+        );
+        assert!(
+            !https_redirect_allowed(&routes, None, "evil.example"),
+            "and neither does an application only the catalog knows"
+        );
+        assert!(
+            https_redirect_allowed(&routes, None, "default.example"),
+            "a name the default certificate does attest to is still an HTTPS name of this edge"
+        );
+    }
+
+    #[test]
+    fn an_application_that_terminates_no_tls_is_not_redirected() {
+        // The other half of the pair, unchanged by the fix: a certificate
+        // covering the name is not on its own a reason to redirect an
+        // application that has none.
+        let (routes, _dir) = table_with_certificate("shop", "shop.example.com");
+        let plain = serde_json::from_value::<AppConfig>(json!({
+            "id": "plain",
+            "description": "",
+            "domains": ["shop.example.com"],
+            "certificates": [],
+            "enabled": true,
+            "cache": [],
+        }))
+        .unwrap();
+        assert!(!https_redirect_allowed(
+            &routes,
+            Some(&plain),
+            "shop.example.com"
+        ));
     }
 
     #[test]

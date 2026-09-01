@@ -16,7 +16,7 @@ use crate::auth::StorageAuth;
 use crate::backup;
 use crate::blob::BlobService;
 use crate::config::Config;
-use crate::database::{DatabaseService, TransactionLimits};
+use crate::database::{DatabaseService, SqlLimits, TransactionLimits};
 use crate::kv::KvService;
 use crate::proto::blob::blob_store_server::BlobStoreServer;
 use crate::proto::storage::{database_server::DatabaseServer, kv_store_server::KvStoreServer};
@@ -183,7 +183,13 @@ pub async fn serve(
         .set_serving::<BlobStoreServer<BlobService>>()
         .await;
 
-    info_ready(&config, addr, &auth, stores.database.transaction_limits());
+    info_ready(
+        &config,
+        addr,
+        &auth,
+        stores.database.transaction_limits(),
+        stores.database.sql_limits(),
+    );
 
     let result = Server::builder()
         .add_service(health_service)
@@ -259,6 +265,7 @@ fn info_ready(
     addr: std::net::SocketAddr,
     auth: &StorageAuth,
     transactions: TransactionLimits,
+    sql: SqlLimits,
 ) {
     tracing::info!(
         %addr,
@@ -276,6 +283,12 @@ fn info_ready(
         transaction_deadline_ms = transactions.deadline.as_millis(),
         max_open_transactions_per_tenant = transactions.max_open_per_tenant,
         max_open_transactions = transactions.max_open_total,
+        // What one SQL request may cost. An operator reading that a tenant's
+        // query was stopped part-way needs the number it was stopped against
+        // on the same line an operator greps for, not in the source.
+        statement_deadline_ms = sql.statement_deadline.as_millis(),
+        max_result_rows = sql.max_result_rows,
+        max_result_bytes = sql.max_result_bytes,
         // Whether callers are authenticated belongs on the line an operator
         // greps for first; the detail of what that means is logged by
         // `StorageAuth::for_listener` just above it.

@@ -532,7 +532,7 @@ pub fn log_api_ready(
         );
     } else {
         info!(
-            "⚠️  Human API: OPEN (api_auth_enabled is off, so the dashboard and every catalog route are public; accounts and scopes are recorded and not enforced)"
+            "⚠️  Human API: NO CREDENTIAL REQUIRED (api_auth_enabled is off, so the dashboard and every catalog route are served to anyone on this machine as \"anonymous\"; a caller from another host gets 401, and a credential that is presented is still held to its scopes)"
         );
     }
     // Said separately because it is a separate credential: this one is not

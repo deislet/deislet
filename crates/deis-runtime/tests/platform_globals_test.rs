@@ -99,16 +99,17 @@ const ATTACK_THEN_READ: &str = r#"
         }
 
         // The internal hooks that end an application's timers and outbound
-        // budgets when its request ends, and the entry point that calls them.
-        // A no-op in place of any of the three is work that outlives the
-        // request that started it, on a runtime thread shared with every other
-        // application on it.
+        // calls when its request ends, and the entry points that call them. A
+        // no-op in place of any of these is work that outlives the request that
+        // started it, on a runtime thread shared with every other application
+        // on it.
         for (const name of [
-            "__deis_runtime_sweep_intervals",
-            "__deis_runtime_sweep_fetch_budgets",
+            "__deis_runtime_sweep_invocation",
+            "__deis_runtime_claim_stream_scope",
             "__deis_runtime_invoke",
             "__deis_runtime_wait_until_all",
             "__deis_runtime_set_response",
+            "__deis_runtime_stream_release_all",
         ]) {
             try {
                 Object.defineProperty(globalThis, name, {
@@ -133,8 +134,16 @@ const ATTACK_THEN_READ: &str = r#"
             navigatorFrozen: Object.isFrozen(navigator),
             hasGetRandomValues: typeof crypto.getRandomValues === "function",
             sweepIsPlatforms:
-                typeof globalThis.__deis_runtime_sweep_intervals === "function" &&
-                globalThis.__deis_runtime_sweep_intervals.name === "sweepIntervals",
+                typeof globalThis.__deis_runtime_sweep_invocation === "function" &&
+                globalThis.__deis_runtime_sweep_invocation.name === "sweepInvocation",
+            // The scope that decides what owns a timer is not on the global
+            // object at all any more, and the claim that replaced it was spent
+            // by `js/runtime.js` before this application existed. Both halves
+            // are read, because either one alone would leave the door ajar.
+            streamScope: typeof globalThis.__deis_runtime_stream_scope,
+            scopeClaim: globalThis.__deis_runtime_claim_stream_scope() === null
+                ? "null"
+                : "handed over",
             // Proof that both requests ran in one isolate: an ordinary global
             // an application writes does survive, and is meant to.
             stash: globalThis.__stash ?? "none",
@@ -169,11 +178,12 @@ async fn a_platform_global_cannot_be_redefined_or_deleted() {
         );
     }
     for name in [
-        "__deis_runtime_sweep_intervals",
-        "__deis_runtime_sweep_fetch_budgets",
+        "__deis_runtime_sweep_invocation",
+        "__deis_runtime_claim_stream_scope",
         "__deis_runtime_invoke",
         "__deis_runtime_wait_until_all",
         "__deis_runtime_set_response",
+        "__deis_runtime_stream_release_all",
     ] {
         assert_eq!(
             attacked[format!("define_{name}")],
@@ -216,7 +226,21 @@ async fn a_second_request_sees_the_platforms_objects_and_not_the_previous_reques
     assert_eq!(seen["hasGetRandomValues"], true);
     assert_eq!(
         seen["sweepIsPlatforms"], true,
-        "the interval sweep is not the platform's function any more"
+        "the invocation sweep is not the platform's function any more"
+    );
+
+    // Sealed is not unreachable, and this is the difference. The stream scope
+    // was sealed and present, and calling `enter` with a set of the caller's own
+    // was the whole of a bypass that left an interval running for the life of
+    // the isolate. It is handed to `js/runtime.js` once and published nowhere.
+    assert_eq!(
+        seen["streamScope"], "undefined",
+        "the stream scope is on the global object, where an application can call it"
+    );
+    assert_eq!(
+        seen["scopeClaim"], "null",
+        "the stream scope can still be claimed after the isolate was built, which hands an \
+         application the choice of what owns its timers"
     );
 }
 

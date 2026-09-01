@@ -4,9 +4,10 @@
 //!
 //! * The human API - dashboard and CLI - is guarded by
 //!   [`crate::api::authz::authorize`], which resolves an account, checks the
-//!   scope the route needs and writes the audit line. Whether it enforces
-//!   anything is still `api_auth_enabled`, which defaults to off;
-//!   [`AuthConfig`] is what the startup banner prints about it.
+//!   scope the route needs and writes the audit line. `api_auth_enabled`
+//!   decides one thing about it - whether a caller has to present a
+//!   credential at all - and it still defaults to off; [`AuthConfig`] is what
+//!   the startup banner prints about it.
 //! * [`NodeAuthConfig`] is the credential a runtime node already shares with
 //!   the control plane to register (`node_preshared_keys`). It guards the
 //!   endpoints that exist for nodes, and `api_auth_enabled` has no say over
@@ -14,11 +15,23 @@
 //!   purpose is to make a dashboard convenient must not be able to switch
 //!   authentication off on that channel.
 //!
-//! Neither credential has an "unconfigured means open" state. For the node
-//! channel that is the whole point: an empty key list refuses every caller,
-//! and [`crate::config::ControlConfig::ensure_node_credential`] mints a key
-//! before the server starts so the refusal is not what an operator meets on
-//! a first run.
+//! Neither credential has an "unconfigured means open" state, and each
+//! reaches that by the means its channel allows.
+//!
+//! For the node channel it is the whole point: an empty key list refuses
+//! every caller, and [`crate::config::ControlConfig::ensure_node_credential`]
+//! mints a key before the server starts so the refusal is not what an
+//! operator meets on a first run.
+//!
+//! For the human API, `api_auth_enabled = false` means no credential is
+//! required - not that the surface is published. A caller who presents
+//! nothing is admitted only from the machine the control plane runs on, and
+//! one from any other host is refused; a credential that *is* presented is
+//! held to its scopes whatever the flag says. The default `bind_addr` is
+//! `0.0.0.0` and cannot be narrowed the way deis-queue narrows its own - this
+//! listener is where every node fetches its assignments and its bundles - so
+//! the peer, not the bind address, is what carries the rule. See
+//! [`crate::api::authz::authorize`].
 
 use axum::{
     Json,

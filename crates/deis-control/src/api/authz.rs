@@ -5,9 +5,9 @@
 //! [`authorize`]. That is deliberate. Spreading the check across handlers is
 //! how a route ends up shipped with no check at all - this repository has
 //! produced that defect before - so the requirement for every route lives in
-//! one table ([`classify`]) which is a pure function of the method and the
-//! path, and the middleware that applies it is layered where no route can be
-//! mounted around it.
+//! one table ([`classify`]) which is a pure function of the method, the path
+//! and the query, and the middleware that applies it is layered where no
+//! route can be mounted around it.
 //!
 //! # Fail closed
 //!
@@ -15,6 +15,34 @@
 //! not recognise. A route added without a line in the table therefore becomes
 //! reachable only by an administrator, and is visible as such the first time
 //! a scoped token is refused - rather than becoming an unguarded hole.
+//!
+//! The same rule governs the two [`Resource`] cases that are not a name.
+//! [`Resource::Any`] is answered by *any one* scope the caller holds, so it
+//! belongs only on a call whose effect is confined to one of the things the
+//! caller can already reach - reading the application record, uploading a
+//! bundle that is stored and put nowhere. A call that acts on all of them at
+//! once is [`Resource::Every`], which only a `*` answers. Writing `Any` where
+//! the effect is `Every` does not look like a hole in the table; it looks
+//! like a line that is present. `DELETE /api/runtime/:node/apps/:app` was
+//! exactly that, and one environment's deploy credential could stop every
+//! environment of the application on a node with it.
+//!
+//! # What `api_auth_enabled = false` means, and what it does not
+//!
+//! It means no credential is *required*. It has never been allowed to mean
+//! that a credential which *is* presented goes unchecked, and it must not
+//! mean that the whole human API is published to whatever can route to this
+//! port. With it off, [`resolve`] admits an unauthenticated caller only from
+//! the machine this control plane runs on, and a credential that resolves is
+//! held to its own scopes exactly as it would be with the flag on.
+//!
+//! # The query string is read for exactly one route
+//!
+//! `DELETE /api/runtime/:node/apps/:app` takes one environment of an
+//! application off a node with `?environment=<name>`, and *every* environment
+//! of it without. The path is identical either way, so the table reads that
+//! one parameter; see [`narrowing_query_value`] for why it narrows the demand
+//! only for a spelling that can mean one environment and nothing else.
 //!
 //! # The body is read for exactly two routes
 //!
@@ -58,6 +86,19 @@ const UNAUTHENTICATED_DETAIL: &str = "A valid credential is required. Present it
                                       'Authorization: Bearer <token>' or 'X-API-Key: <token>'. \
                                       Mint one with `deis token create`.";
 
+/// What a caller off the box is told when this control plane demands no
+/// credential at all. It names the setting rather than repeating
+/// [`UNAUTHENTICATED_DETAIL`], because there is no token to ask anyone for:
+/// nothing has been minted, and an operator sent looking for one would find
+/// nothing. Nothing is given away by saying so - a caller who cannot present
+/// a credential learns only that there is none to steal.
+const UNCONFIGURED_OFF_BOX_DETAIL: &str = "This control plane requires no credential \
+                                          (api_auth_enabled is off), so it serves the human API \
+                                          only to callers on the machine it runs on. Set \
+                                          api_auth_enabled = true in its configuration and \
+                                          restart: it prints one owner token at startup, and \
+                                          every caller - on this machine or not - presents that.";
+
 /// Which component of the resource a route names in its body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyComponent {
@@ -71,7 +112,9 @@ pub enum Resource {
     /// All of them at once. Only a `*` in a scope answers this.
     Every,
     /// Not about one of them - a version upload names no environment. Any
-    /// the caller holds is enough.
+    /// one the caller holds is enough, which is why this belongs only where
+    /// the call cannot reach past what that one already gives them. When the
+    /// call acts on all of them, the answer is [`Resource::Every`].
     Any,
     /// This one, by name, out of the path.
     Named(String),
@@ -157,10 +200,59 @@ fn named(value: &str) -> Resource {
     Resource::Named(value.to_string())
 }
 
-/// What this method and path need. A pure function, so the whole
+/// The one value in a query string that may narrow what a route is about, or
+/// `None` if the query does not narrow it at all.
+///
+/// This deliberately does no percent-decoding and no `+` unescaping, and it
+/// answers `None` the moment the query is anything but one plain occurrence
+/// of `key=<name>`. The gate and the handler must agree on which environment
+/// a call is about, and the handler reads its query through `serde_urlencoded`,
+/// so any decoder written here would be a second implementation that could
+/// disagree with it; a disagreement is a demand naming one environment while
+/// the node is told to unload another. Answering `None` instead costs a caller
+/// who wrote `%70roduction` nothing but a wildcard scope, and it makes every
+/// case this cannot read exactly (an encoded spelling, an empty value, the key
+/// given twice with different values) fall to the wider demand rather than the
+/// narrower one.
+///
+/// A name that needs no encoding is what this platform's names are: an
+/// environment is 1 to 64 characters of lowercase letters, digits, `-` and
+/// `_` (`identity::scope::Component`), none of which a query string escapes.
+fn narrowing_query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    let mut found: Option<&str> = None;
+    for pair in query?.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name != key {
+            continue;
+        }
+        let plain = !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        if !plain {
+            return None;
+        }
+        match found {
+            // The same value twice is the same request; two different ones
+            // are a request this cannot read as being about one environment.
+            Some(first) if first == value => {}
+            Some(_) => return None,
+            None => found = Some(value),
+        }
+    }
+    found
+}
+
+/// What this method, path and query need. A pure function, so the whole
 /// authorisation surface of this control plane can be read - and tested -
 /// without starting one.
-pub fn classify(method: &Method, path: &str) -> Requirement {
+///
+/// `query` is the raw query string, without the `?`, exactly as
+/// [`axum::http::Uri::query`] hands it over. One route reads it; see the
+/// module header.
+pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let writing = method != Method::GET && method != Method::HEAD;
 
@@ -383,8 +475,20 @@ pub fn classify(method: &Method, path: &str) -> Requirement {
         ["api", "runtime", _node, "status"] => {
             Requirement::new("node.status", Verb::Read, Resource::Every, Resource::Every)
         }
+        // Stopping an application on a node. `?environment=<name>` takes
+        // that one off; with nothing named the node takes off *every*
+        // environment of the application it is running, so the demand is the
+        // whole application and only a `*` answers it. `Resource::Any` was
+        // what stood here, and any single environment scope answered it - so
+        // a preview pipeline's credential could stop production, repeatedly,
+        // because the node re-adds the application on its next reconcile and
+        // the call can simply be made again.
         ["api", "runtime", _node, "apps", app] => {
-            Requirement::new("node.app.unload", Verb::Deploy, named(app), Resource::Any)
+            let environment = match narrowing_query_value(query, "environment") {
+                Some(name) => named(name),
+                None => Resource::Every,
+            };
+            Requirement::new("node.app.unload", Verb::Deploy, named(app), environment)
                 .changes_state()
         }
 
@@ -403,9 +507,11 @@ pub fn classify(method: &Method, path: &str) -> Requirement {
 /// What the gate needs in order to answer a request.
 #[derive(Clone)]
 pub struct AuthzState {
-    /// `api_auth_enabled`. When it is off the human API is open exactly as it
-    /// always was, and this gate records rather than refuses - see
-    /// [`authorize`].
+    /// `api_auth_enabled`. It decides one thing only: whether a caller has to
+    /// present a credential at all. It has never decided whether a credential
+    /// that *is* presented is checked - see [`authorize`] - and with it off
+    /// the caller who presents nothing is admitted only from this machine,
+    /// see [`resolve`].
     pub enforced: bool,
     /// The `api_keys` entries from the configuration file. Still checked
     /// here, against the file, and never against the database.
@@ -425,12 +531,14 @@ pub struct AuthzState {
 /// 4. run the request;
 /// 5. write the audit line, with the outcome the response actually had.
 ///
-/// With `api_auth_enabled` off, step 1 admits everybody as anonymous and
-/// step 3 is skipped - the human API stays exactly as open as it was before
-/// accounts existed, because an upgrade must not brick a control plane whose
-/// operator never turned authentication on. Step 5 still runs, so even an
-/// unauthenticated platform gets a record of every deploy, rollback and
-/// secret change.
+/// With `api_auth_enabled` off, step 1 admits a caller who presented nothing
+/// as anonymous - but only from a loopback peer, because a control plane
+/// listening on 0.0.0.0 with nothing required is otherwise handing the whole
+/// human API to anything that can route to the port. Step 3 runs whatever the
+/// flag says: not requiring a credential cannot mean that a `deploy:app/preview`
+/// token which is presented may mint a storage capability for another tenant.
+/// Step 5 runs on every path, so even an unauthenticated platform gets a
+/// record of every deploy, rollback and secret change.
 pub async fn authorize(State(state): State<AuthzState>, request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     // Unchanged from the flat-key days: the health probe has no caller, and
@@ -441,22 +549,26 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
 
     let method = request.method().clone();
     let headers = request.headers().clone();
-    let peer = request
+    let query = request.uri().query().map(str::to_string);
+    // Kept as an address and not only as text: with nothing enforced it is
+    // what decides whether an unauthenticated caller is admitted at all.
+    let peer_addr = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.to_string());
+        .map(|ConnectInfo(addr)| *addr);
+    let peer = peer_addr.map(|addr| addr.to_string());
 
-    let principal = match resolve(&state, &headers).await {
+    let principal = match resolve(&state, &headers, peer_addr).await {
         Ok(principal) => principal,
         Err(refusal) => {
-            let requirement = classify(&method, &path);
+            let requirement = classify(&method, &path, query.as_deref());
             warn!(
                 %method,
                 path = %path,
                 peer = peer.as_deref().unwrap_or("an unknown address"),
                 reason = refusal.log_reason,
                 credential = refusal.credential.as_deref().unwrap_or("none"),
-                "Refused a call to the human API because the credential presented cannot be used; the caller is told only that a valid credential is required, so a stolen token learns nothing about why it stopped working"
+                "Refused a call to the human API because nothing it presented is a credential this control plane will act on; what the caller is told carries no clue why, so a stolen token does not learn from it that it was withdrawn"
             );
             state
                 .audit
@@ -477,11 +589,11 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
                         .build(),
                 )
                 .await;
-            return unauthenticated();
+            return unauthenticated(refusal.caller_detail);
         }
     };
 
-    let mut requirement = classify(&method, &path);
+    let mut requirement = classify(&method, &path, query.as_deref());
 
     // The two routes that name their resource in the body. Everything else
     // keeps its body untouched and unread.
@@ -509,9 +621,14 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
         environment: requirement.environment.selector(),
     };
 
-    if state.enforced
-        && let Err(denial) = principal.permits(&demand)
-    {
+    // Unconditionally, whatever `api_auth_enabled` says. That flag decides
+    // whether a credential is *required*; a credential that was presented and
+    // resolved carries scopes its holder was given on the understanding that
+    // they are the limit, and skipping this handed a token scoped to one
+    // preview environment the whole platform on every install that had not
+    // turned the flag on. The anonymous caller of such an install is
+    // `Authority::Unscoped` and still passes here, exactly as it always did.
+    if let Err(denial) = principal.permits(&demand) {
         warn!(
             %method,
             path = %path,
@@ -575,12 +692,71 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
     response
 }
 
-/// Why a presented credential could not be used. Kept out of the answer to
+/// Why a call could not be admitted. The reason is kept out of the answer to
 /// the caller on purpose; it exists for the control plane's own log.
 struct Refusal {
     log_reason: &'static str,
+    /// What the caller is told. Every unusable *credential* gets
+    /// [`UNAUTHENTICATED_DETAIL`] and nothing else, because telling them
+    /// apart is a free oracle. The one refusal that says something different
+    /// is the caller who presented nothing to a control plane that demands
+    /// nothing: there is no credential there to keep anything from, and an
+    /// operator whose CLI has just started answering 401 has to be able to
+    /// tell "you need a token" from "this port answers only its own machine".
+    caller_detail: &'static str,
     /// The public half of whatever was presented, when there was one to name.
     credential: Option<String>,
+}
+
+/// Whether a peer is on the machine this control plane runs on.
+///
+/// A caller that reached a dual-stack socket over IPv4 arrives as
+/// `::ffff:127.0.0.1`, and `Ipv6Addr::is_loopback` is false for that address -
+/// the loopback it names is the IPv4 one. Unmapping first is what stops a
+/// local `deis` from being refused as remote on a control plane bound to
+/// `::`.
+///
+/// `None` - no `ConnectInfo` on the request - is not local. The binary always
+/// serves with one (`api::serve`), so an address this cannot see means the
+/// router was mounted by something other than the server, and "we cannot tell
+/// where this came from" must not be the single case that gets in.
+fn is_local_peer(peer: Option<SocketAddr>) -> bool {
+    match peer.map(|addr| addr.ip()) {
+        Some(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Some(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => v6.is_loopback(),
+        },
+        None => false,
+    }
+}
+
+/// The caller nobody authenticated, on a control plane that requires nobody
+/// to be - admitted from this machine, refused from anywhere else.
+///
+/// This is the whole of the "unconfigured is not unguarded" rule for the
+/// human API, and it is the one shape that fits. deis-queue answers the same
+/// question by refusing to start on a non-loopback bind, and that remedy is
+/// not available here: this listener also carries the node gRPC channel, the
+/// assignment fetch and the bundle download, so every node in the fleet needs
+/// the port reachable and moving it to loopback would leave a one-machine
+/// platform. The address therefore stays open and the peer decides. Turning
+/// `api_auth_enabled` on by default was the other candidate and is worse: it
+/// stops an existing installation's dashboard, CLI and deploy pipeline the
+/// moment the binary is replaced. This leaves every one of those working on
+/// the machine the control plane runs on, and refuses only the callers who
+/// are somewhere else - which is exactly the set that was never meant to be
+/// served without a credential.
+fn anonymous_from(peer: Option<SocketAddr>) -> Result<Principal, Refusal> {
+    if is_local_peer(peer) {
+        return Ok(Principal::anonymous());
+    }
+    Err(Refusal {
+        log_reason: "this control plane requires no credential, so it admits an unauthenticated \
+                     caller only from its own machine, and this one is not on it",
+        caller_detail: UNCONFIGURED_OFF_BOX_DETAIL,
+        credential: None,
+    })
 }
 
 /// Turn what a request carries into the caller it belongs to.
@@ -590,7 +766,11 @@ struct Refusal {
 /// holds no copy of it and cannot admit anyone. Anything shaped like a minted
 /// token is looked up by its public id and its secret compared against a
 /// stored digest.
-async fn resolve(state: &AuthzState, headers: &HeaderMap) -> Result<Principal, Refusal> {
+async fn resolve(
+    state: &AuthzState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<Principal, Refusal> {
     let presented: Vec<String> = presented_credentials(headers)
         .into_iter()
         .map(|c| c.to_string())
@@ -598,16 +778,18 @@ async fn resolve(state: &AuthzState, headers: &HeaderMap) -> Result<Principal, R
 
     if presented.is_empty() {
         if !state.enforced {
-            return Ok(Principal::anonymous());
+            return anonymous_from(peer);
         }
         return Err(Refusal {
             log_reason: "no credential was presented",
+            caller_detail: UNAUTHENTICATED_DETAIL,
             credential: None,
         });
     }
 
     let mut refusal = Refusal {
         log_reason: "the credential presented matches no token this control plane knows",
+        caller_detail: UNAUTHENTICATED_DETAIL,
         credential: None,
     };
 
@@ -646,12 +828,14 @@ async fn resolve(state: &AuthzState, headers: &HeaderMap) -> Result<Principal, R
                 refusal = Refusal {
                     log_reason: "the token presented was revoked, so something out there is still \
                                  configured with a credential that has been withdrawn",
+                    caller_detail: UNAUTHENTICATED_DETAIL,
                     credential: Some(token),
                 };
             }
             Ok(Resolution::AccountDisabled { token, .. }) => {
                 refusal = Refusal {
                     log_reason: "the token presented is valid and its account is switched off",
+                    caller_detail: UNAUTHENTICATED_DETAIL,
                     credential: Some(token),
                 };
             }
@@ -667,9 +851,10 @@ async fn resolve(state: &AuthzState, headers: &HeaderMap) -> Result<Principal, R
 
     if !state.enforced {
         // Nothing was required, and what was offered did not resolve. The
-        // call goes through as it always did, and the audit line says
-        // anonymous rather than inventing an account.
-        return Ok(Principal::anonymous());
+        // call is treated as the one that offered nothing at all - admitted
+        // from this machine, refused from anywhere else - and the audit line
+        // says anonymous rather than inventing an account.
+        return anonymous_from(peer);
     }
     Err(refusal)
 }
@@ -704,30 +889,41 @@ async fn peek_body_field(
         }
     };
 
+    // Trimmed, because the handler trims: `catalog::apps::create_app` stores
+    // `request.id.trim()` and `catalog::environments::create_environment`
+    // stores `request.name.trim()`. Judging the untrimmed spelling would mean
+    // checking one name and creating another - and since no scope can spell a
+    // name with a space in it (`identity::scope::Component`), a credential
+    // that holds exactly `deploy:myapp/*` would be refused its own
+    // application over a stray newline, and told to go and ask for
+    // `deploy: myapp\n/*`, which is not a scope anyone can be granted.
     let value = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|body| {
             body.get(field)
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
                 .map(|s| s.to_string())
         });
 
     // A body that is not JSON, or names nothing, is not this gate's problem:
-    // the handler answers 400 for it. What matters here is that the resource
-    // stays unnamed, which leaves the requirement at "any", and the handler
-    // then refuses the request on its own terms.
+    // the handler answers 400 for it - `CatalogStore::create_app` and
+    // `create_environment` both refuse an empty name. What matters here is
+    // that the resource stays unnamed, which leaves the requirement at "any",
+    // and the handler then refuses the request on its own terms.
     Ok((
         Request::from_parts(parts, axum::body::Body::from(bytes)),
         value,
     ))
 }
 
-fn unauthenticated() -> Response {
+fn unauthenticated(detail: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({
             "error": "Unauthorized",
-            "details": UNAUTHENTICATED_DETAIL,
+            "details": detail,
         })),
     )
         .into_response()
@@ -756,11 +952,13 @@ pub fn log_authorization_ready(enforced: bool, config_keys: usize, unscoped: usi
     if !enforced {
         warn!(
             unscoped,
-            "api_auth_enabled is off: the dashboard and the human API are OPEN, so anyone who can \
-             reach this port can deploy, rotate a secret and mint a storage token. Accounts, \
-             scopes and tokens are recorded and NOT enforced while it is off; the audit log still \
-             records every change, attributed to \"anonymous\". Set api_auth_enabled = true to \
-             turn the scope checks on"
+            "api_auth_enabled is off, so no caller has to present a credential: anyone on THIS \
+             machine can deploy, rotate a secret and mint a storage token as \"anonymous\", and \
+             every change of theirs is in the audit log under that name. A caller from any other \
+             host is refused with 401 rather than served, because a port bound off loopback with \
+             nothing required would otherwise be the whole platform published to the network. A \
+             credential that IS presented is held to its scopes either way. Set \
+             api_auth_enabled = true to require one from everybody"
         );
         return;
     }
@@ -786,7 +984,11 @@ mod tests {
     use super::*;
 
     fn requirement(method: &str, path: &str) -> Requirement {
-        classify(&Method::from_bytes(method.as_bytes()).unwrap(), path)
+        let (path, query) = match path.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (path, None),
+        };
+        classify(&Method::from_bytes(method.as_bytes()).unwrap(), path, query)
     }
 
     /// The route table, spelled out. Every route the human router mounts has
@@ -1131,6 +1333,122 @@ mod tests {
         }
     }
 
+    /// Unloading an application from a node stops every environment of it
+    /// unless the query names one, so that is what the table has to demand.
+    ///
+    /// The defect: this line said `Resource::Any` for the environment, which
+    /// *any single* environment scope answers. A pipeline holding
+    /// `deploy:myapp/preview` - correctly refused a deploy to production -
+    /// could take production off a node, and take it off again after every
+    /// reconcile put it back.
+    #[test]
+    fn unloading_an_application_from_a_node_is_about_every_environment_of_it() {
+        let whole = requirement("DELETE", "/api/runtime/node-1/apps/myapp");
+        assert_eq!(whole.app, Resource::Named("myapp".to_string()));
+        assert_eq!(
+            whole.environment,
+            Resource::Every,
+            "with nothing named the node takes off every environment of the application"
+        );
+
+        let one = requirement(
+            "DELETE",
+            "/api/runtime/node-1/apps/myapp?environment=production",
+        );
+        assert_eq!(one.environment, Resource::Named("production".to_string()));
+
+        // Anything this cannot read as exactly one environment falls to the
+        // wider demand rather than the narrower one.
+        for query in [
+            "environment=",
+            "environment=pro%64uction",
+            "environment=preview&environment=production",
+            "environment=Production",
+            "other=production",
+        ] {
+            assert_eq!(
+                requirement("DELETE", &format!("/api/runtime/n/apps/myapp?{query}")).environment,
+                Resource::Every,
+                "?{query} must not narrow what this call is judged against"
+            );
+        }
+        // The same value twice is still one environment.
+        assert_eq!(
+            requirement(
+                "DELETE",
+                "/api/runtime/n/apps/myapp?environment=preview&environment=preview"
+            )
+            .environment,
+            Resource::Named("preview".to_string())
+        );
+
+        // And the pipeline credential, against the table, in both spellings.
+        let ci = Principal {
+            kind: crate::identity::PrincipalKind::Account,
+            account: Some("ci".to_string()),
+            role: Some(crate::identity::Role::Deployer),
+            credential_id: Some("0011223344556677".to_string()),
+            authority: crate::identity::Authority::Scoped(
+                crate::identity::Scope::parse_list("deploy:myapp/preview").unwrap(),
+            ),
+        };
+        fn demand(requirement: &Requirement) -> Demand<'_> {
+            Demand {
+                verb: requirement.verb,
+                app: requirement.app.selector(),
+                environment: requirement.environment.selector(),
+            }
+        }
+        assert!(
+            ci.permits(&demand(&whole)).is_err(),
+            "one environment's credential must not stop the whole application"
+        );
+        assert!(ci.permits(&demand(&one)).is_err());
+        assert!(
+            ci.permits(&demand(&requirement(
+                "DELETE",
+                "/api/runtime/node-1/apps/myapp?environment=preview"
+            )))
+            .is_ok(),
+            "the environment it does hold stays reachable, or the route is unusable to a \
+             scoped credential"
+        );
+    }
+
+    /// A peer this cannot place is not on this machine. The mapped-IPv4 case
+    /// is the one that bites: a local `deis` reaching a control plane bound
+    /// to `::` arrives as ::ffff:127.0.0.1, whose `Ipv6Addr::is_loopback` is
+    /// false.
+    #[test]
+    fn only_an_address_on_this_machine_counts_as_local() {
+        for local in [
+            "127.0.0.1:1",
+            "127.0.0.53:1",
+            "[::1]:1",
+            "[::ffff:127.0.0.1]:1",
+        ] {
+            assert!(
+                is_local_peer(Some(local.parse().unwrap())),
+                "{local} is on this machine"
+            );
+        }
+        for remote in [
+            "10.0.0.7:1",
+            "192.168.1.4:1",
+            "[2001:db8::1]:1",
+            "[::ffff:10.0.0.7]:1",
+        ] {
+            assert!(
+                !is_local_peer(Some(remote.parse().unwrap())),
+                "{remote} is not on this machine"
+            );
+        }
+        assert!(
+            !is_local_peer(None),
+            "an address this cannot see must not be the one case that gets in"
+        );
+    }
+
     /// The storage-token route asks for a verb nothing else implies, over
     /// this exact application and environment.
     #[test]
@@ -1180,7 +1498,7 @@ mod gate_tests {
 
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use axum::routing::{get, post, put};
+    use axum::routing::{delete, get, post, put};
     use axum::{Json, Router};
     use tower::ServiceExt;
 
@@ -1226,6 +1544,7 @@ mod gate_tests {
                 put(created),
             )
             .route("/api/apps/:app/environments/:env/storage-token", get(ok))
+            .route("/api/runtime/:node/apps/:app", delete(ok))
             .route("/api/audit", get(ok))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -1234,6 +1553,16 @@ mod gate_tests {
 
         Gate { router, state }
     }
+
+    /// The peer every call below comes from unless it says otherwise: the
+    /// machine the control plane runs on, which is what `deis` on the box and
+    /// the dashboard in a browser on the box are. The real server always puts
+    /// an address on the request (`api::serve` uses
+    /// `into_make_service_with_connect_info`), so a test that left it off
+    /// would be asserting about a request shape that never reaches this gate.
+    const ON_THE_BOX: &str = "127.0.0.1:54321";
+    /// Any other machine that can route to the port.
+    const OFF_THE_BOX: &str = "10.0.0.7:54321";
 
     async fn call(gate: &Gate, method: &str, path: &str, credential: Option<&str>) -> StatusCode {
         call_with_body(gate, method, path, credential, "{}").await.0
@@ -1246,6 +1575,17 @@ mod gate_tests {
         credential: Option<&str>,
         body: &str,
     ) -> (StatusCode, String) {
+        call_from(gate, ON_THE_BOX, method, path, credential, body).await
+    }
+
+    async fn call_from(
+        gate: &Gate,
+        peer: &str,
+        method: &str,
+        path: &str,
+        credential: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
         let mut builder = HttpRequest::builder()
             .method(method)
             .uri(path)
@@ -1253,12 +1593,11 @@ mod gate_tests {
         if let Some(credential) = credential {
             builder = builder.header("Authorization", format!("Bearer {credential}"));
         }
-        let response = gate
-            .router
-            .clone()
-            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
-            .await
-            .unwrap();
+        let mut request = builder.body(Body::from(body.to_string())).unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            peer.parse::<SocketAddr>().expect("a peer address"),
+        ));
+        let response = gate.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -1658,5 +1997,246 @@ mod gate_tests {
         let gate = gate(true, vec![]).await;
         assert_eq!(call(&gate, "GET", "/health", None).await, StatusCode::OK);
         assert!(lines(&gate).await.is_empty());
+    }
+
+    /// Unloading an application from a node is a real outage: the node stops
+    /// serving it, and it stays stopped until the next reconcile - which the
+    /// same call can undo again. A credential that may deploy to one preview
+    /// environment must not be able to make it.
+    #[tokio::test]
+    async fn a_credential_for_one_environment_cannot_unload_the_application_from_a_node() {
+        let gate = gate(true, vec![]).await;
+        gate.state
+            .identity
+            .create_account("ci", Role::Deployer)
+            .await
+            .unwrap();
+        let (_, secret) = gate
+            .state
+            .identity
+            .create_token(
+                "ci",
+                "preview-pipeline",
+                Authority::Scoped(Scope::parse_list("deploy:myapp/preview").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        // The whole application, and one environment of it that this
+        // credential has no business touching.
+        for path in [
+            "/api/runtime/node-1/apps/myapp",
+            "/api/runtime/node-1/apps/myapp?environment=production",
+            "/api/runtime/node-1/apps/otherapp",
+        ] {
+            assert_eq!(
+                call(&gate, "DELETE", path, Some(&secret)).await,
+                StatusCode::FORBIDDEN,
+                "DELETE {path} was allowed to a token scoped to deploy:myapp/preview"
+            );
+        }
+
+        // And the environment it does hold is still reachable, or the route
+        // would be unusable to every scoped credential there is.
+        assert_eq!(
+            call(
+                &gate,
+                "DELETE",
+                "/api/runtime/node-1/apps/myapp?environment=preview",
+                Some(&secret)
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // The refusal names the scope that would have worked, and it is the
+        // wildcard rather than one environment.
+        let (_, body) = call_with_body(
+            &gate,
+            "DELETE",
+            "/api/runtime/node-1/apps/myapp",
+            Some(&secret),
+            "{}",
+        )
+        .await;
+        assert!(body.contains("deploy:myapp/*"), "{body}");
+
+        // Every one of those is on the record: an unload changes state, so
+        // it is audited whatever its outcome.
+        let refused: Vec<_> = lines(&gate)
+            .await
+            .into_iter()
+            .filter(|line| line.action == "node.app.unload" && line.outcome == Outcome::Refused)
+            .collect();
+        assert_eq!(refused.len(), 4, "{refused:?}");
+    }
+
+    /// `api_auth_enabled = false` means no credential is required. It does
+    /// not mean the human API is published: an operator who never turned it
+    /// on used to be handing every application, the audit log, the account
+    /// list and the storage-token mint to anything that could route to the
+    /// port.
+    #[tokio::test]
+    async fn a_control_plane_that_requires_no_credential_answers_only_its_own_machine() {
+        let gate = gate(false, vec![]).await;
+
+        // On the box: exactly as open as it always was. This is the demo,
+        // the single-host install and the operator who is mid-upgrade with a
+        // dashboard on localhost.
+        assert_eq!(
+            call(
+                &gate,
+                "POST",
+                "/api/apps/demo/environments/production/deployments",
+                None
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // From anywhere else: nothing at all, including the two calls that
+        // hurt most - the audit log, which names every application and
+        // everybody who touched one, and the storage-token mint, which hands
+        // back a credential that never expires.
+        for (method, path) in [
+            ("POST", "/api/apps/demo/environments/production/deployments"),
+            ("GET", "/api/audit"),
+            (
+                "GET",
+                "/api/apps/demo/environments/production/storage-token",
+            ),
+        ] {
+            let (status, body) = call_from(&gate, OFF_THE_BOX, method, path, None, "{}").await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} was served to a caller off the box"
+            );
+            assert!(
+                body.contains("api_auth_enabled"),
+                "the answer has to name the one setting that fixes this: {body}"
+            );
+        }
+
+        // And the refusals are in the log, with the address, which is how an
+        // operator sees that something off the box was reaching for this.
+        let refusals: Vec<_> = lines(&gate)
+            .await
+            .into_iter()
+            .filter(|line| line.outcome == Outcome::Refused)
+            .collect();
+        assert_eq!(refusals.len(), 3, "{refusals:?}");
+        assert!(
+            refusals
+                .iter()
+                .all(|line| line.peer.as_deref() == Some(OFF_THE_BOX)),
+            "{refusals:?}"
+        );
+    }
+
+    /// The other half of the same flag. Not requiring a credential cannot
+    /// mean that one which is presented goes unchecked: the scopes on it were
+    /// written down as its limit, and a control plane that ignores them hands
+    /// a preview pipeline the storage credential of any tenant it names.
+    #[tokio::test]
+    async fn a_credential_that_is_presented_is_held_to_its_scopes_even_when_none_is_required() {
+        let gate = gate(false, vec![]).await;
+        gate.state
+            .identity
+            .create_account("ci", Role::Deployer)
+            .await
+            .unwrap();
+        let (_, secret) = gate
+            .state
+            .identity
+            .create_token(
+                "ci",
+                "preview-pipeline",
+                Authority::Scoped(Scope::parse_list("deploy:myapp/preview").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call(
+                &gate,
+                "POST",
+                "/api/apps/myapp/environments/preview/deployments",
+                Some(&secret)
+            )
+            .await,
+            StatusCode::OK,
+            "what the token says it may do, it may still do"
+        );
+        for (method, path) in [
+            (
+                "POST",
+                "/api/apps/myapp/environments/production/deployments",
+            ),
+            (
+                "GET",
+                "/api/apps/other/environments/production/storage-token",
+            ),
+            ("GET", "/api/audit"),
+        ] {
+            assert_eq!(
+                call(&gate, method, path, Some(&secret)).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path} was allowed to deploy:myapp/preview because nothing was enforced"
+            );
+        }
+    }
+
+    /// The gate reads the name a create route puts in its body, and the
+    /// handler trims that name before it stores it. Reading the two
+    /// differently means judging one application and creating another - and
+    /// since no scope can contain a space, the credential that owns the
+    /// application is the one that gets refused.
+    #[tokio::test]
+    async fn a_padded_name_in_the_body_is_judged_as_the_name_that_gets_created() {
+        let gate = gate(true, vec![]).await;
+        gate.state
+            .identity
+            .create_account("ci", Role::Deployer)
+            .await
+            .unwrap();
+        let (_, secret) = gate
+            .state
+            .identity
+            .create_token(
+                "ci",
+                "pipeline",
+                Authority::Scoped(Scope::parse_list("deploy:myapp/preview").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call_with_body(
+                &gate,
+                "POST",
+                "/api/apps",
+                Some(&secret),
+                "{\"id\":\"  myapp\\n\"}"
+            )
+            .await
+            .0,
+            StatusCode::OK,
+            "the handler would have created \"myapp\", which this credential owns"
+        );
+        // Padding is not a way past the check either: the name still has to
+        // be one the credential holds.
+        assert_eq!(
+            call_with_body(
+                &gate,
+                "POST",
+                "/api/apps",
+                Some(&secret),
+                "{\"id\":\"  someone-elses \"}"
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
     }
 }

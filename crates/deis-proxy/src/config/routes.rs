@@ -360,18 +360,58 @@ impl RouteTable {
             || (!app.certificates.is_empty() && self.default_cert.is_some())
     }
 
-    /// Whether a TLS handshake for this host name can succeed, without an
-    /// application configuration to ask about.
+    /// Whether a certificate that *attests to this name* would be served for
+    /// it.
     ///
     /// This is the question for an application only the control plane's
     /// catalog knows: it has no entry here and therefore no certificates of
-    /// its own, so what decides is whether *some* certificate would be
-    /// served for the name - a wildcard covering a whole preview zone, or
-    /// `tls.default_certificate`. The test is exactly what the SNI callback
-    /// will do at handshake time, so the redirect cannot point at a port
-    /// that would then reject the client.
+    /// its own, so what decides is whether some certificate covers the name -
+    /// a wildcard covering a whole preview zone, or a
+    /// `tls.default_certificate` whose subject names include it.
+    ///
+    /// Deliberately not `certificate_for(Some(host)).is_some()`, which is the
+    /// handshake's question and a different one. `certificate_for` falls back
+    /// to the default certificate for *any* name, because something has to be
+    /// presented or the connection cannot be completed at all; so once a
+    /// default certificate existed this answered yes for every host on earth.
+    /// The caller uses the answer to build a `Location` out of the client's
+    /// own `Host` header, which turned the edge into an open redirect - and
+    /// even for an honest client the redirect led to a certificate the name
+    /// does not match, which is a browser warning rather than a page.
     pub fn https_available_for_host(&self, host: &str) -> bool {
-        self.certificate_for(Some(host)).is_some()
+        let host = normalize_host(host);
+        if self.certs_by_name.contains_key(&host) {
+            return true;
+        }
+        if self
+            .wildcard_certs
+            .iter()
+            .any(|(suffix, _)| host.len() > suffix.len() && host.ends_with(suffix.as_str()))
+        {
+            return true;
+        }
+        self.default_cert.as_ref().is_some_and(|cert| {
+            cert.names
+                .iter()
+                .any(|name| certificate_name_covers(name, &host))
+        })
+    }
+}
+
+/// Whether one subject name out of a certificate covers `host`.
+///
+/// The same suffix rule the rest of this file matches wildcards with, applied
+/// to the names inside a certificate rather than to the keys it is filed
+/// under - which is what the default certificate needs, since it is filed
+/// under no name at all.
+fn certificate_name_covers(subject: &str, host: &str) -> bool {
+    let subject = normalize_host(subject);
+    match subject.strip_prefix("*.") {
+        Some(zone) => {
+            let suffix = format!(".{zone}");
+            host.len() > suffix.len() && host.ends_with(&suffix)
+        }
+        None => subject == host,
     }
 }
 
@@ -648,6 +688,42 @@ mod tests {
         assert!(table.has_configured_certificate_for("pr-1--shop.preview.example.com"));
         assert!(!table.has_configured_certificate_for("shop.example.com"));
         assert!(table.https_available_for_host("pr-1--shop.preview.example.com"));
+    }
+
+    #[test]
+    fn a_default_certificate_does_not_make_https_available_for_every_name() {
+        // What the handshake does and what a redirect may claim are two
+        // questions. The default certificate is served for any unmatched
+        // name, because something has to be, and it attests to
+        // default.example.com and nothing else. Answering "yes, HTTPS is
+        // available" for evil.example let the caller build a 301 to a host
+        // the client had named itself.
+        let mut table = RouteTable::build(&HashMap::new(), None, &[]);
+        table.default_cert = Some(Arc::new(test_certificate()));
+
+        assert!(
+            table.certificate_for(Some("evil.example")).is_some(),
+            "the handshake still presents the default certificate; that is not the question here"
+        );
+        assert!(
+            !table.https_available_for_host("evil.example"),
+            "a name the default certificate does not attest to is not an HTTPS name of this edge"
+        );
+        assert!(
+            table.https_available_for_host("default.example.com"),
+            "the names inside the default certificate are still served over HTTPS"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_default_certificate_covers_one_zone_and_not_the_world() {
+        let dir = tempfile::tempdir().unwrap();
+        let wildcard = write_certificate(dir.path(), "*.preview.example.com");
+        let table = RouteTable::build(&HashMap::new(), Some(&wildcard), &[]);
+
+        assert!(table.https_available_for_host("pr-1--shop.preview.example.com"));
+        assert!(!table.https_available_for_host("preview.example.com"));
+        assert!(!table.https_available_for_host("evil.example"));
     }
 
     /// A throwaway self-signed certificate, generated in memory.

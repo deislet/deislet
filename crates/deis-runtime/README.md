@@ -407,13 +407,27 @@ The reasoning and the address classification are in
 ### Timers do not outlive the request
 
 An isolate is reused: one per (application, environment) on each node, handed
-every later request. A `setTimeout` left pending is bounded — it fires once and
-is gone — so it is left alone, which is also what makes `waitUntil` usable. A
-`setInterval` never stops on its own, so one created per request would
-accumulate without bound, firing inside every later request in that isolate and
-spending its rate-limit budget. Intervals are therefore tracked and cleared at
-the end of each invocation, after `waitUntil` work has been awaited; the
-application is told at `warn` when one had to be swept.
+every later request. A `setInterval` never stops on its own, so one created per
+request would accumulate without bound, firing inside every later request in
+that isolate and spending its rate-limit budget. A `setTimeout` fires once, and
+this used to be treated as harmless — it was bound to the raw timer and tracked
+nowhere. That is true of the timer and false of the callback: one that arms the
+next timeout before it returns is an interval written in two lines, and it ran
+for the life of the isolate with nothing in the log to say so.
+
+Both kinds are therefore tracked and cleared at the end of each invocation,
+after `waitUntil` work has been awaited; the application is told at `warn`, with
+the count of each kind, when anything had to be swept. Work that has to finish
+after the response has gone out belongs in `context.waitUntil`, which is awaited
+before the sweep runs.
+
+Which timers an invocation owns is not the application's to choose. A response
+stream is the one thing allowed to outlive the invocation that created it — it
+adopts what the handler left armed, keeps it while its body is being written,
+and gives it back when it ends, bounded by `stream_timeout_ms`. The object that
+performs that handover is claimed once by `js/runtime.js` while the isolate is
+being built and is reachable from nowhere else, so a handler cannot file a timer
+against an owner nothing sweeps.
 
 ## Remote debugging
 

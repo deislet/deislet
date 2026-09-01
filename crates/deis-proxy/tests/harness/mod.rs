@@ -16,8 +16,8 @@ use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,6 +57,13 @@ pub struct Backend {
     pub addr: SocketAddr,
     server: tokio::task::JoinHandle<()>,
     completed_uploads: Arc<AtomicUsize>,
+    /// Every request head that reached this side of the hop, in order.
+    ///
+    /// What a node was actually handed, which is the only place a test can
+    /// see the headers deis-proxy decided on rather than the ones the client
+    /// sent. A request the proxy refused leaves nothing here at all, which is
+    /// how "it was not forwarded" is asserted.
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl Backend {
@@ -67,19 +74,41 @@ impl Backend {
         let addr = listener.local_addr().expect("the backend address");
         let completed_uploads = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&completed_uploads);
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heads);
         let server = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                tokio::spawn(serve_one(stream, Arc::clone(&counter)));
+                tokio::spawn(serve_one(stream, Arc::clone(&counter), Arc::clone(&seen)));
             }
         });
         Backend {
             addr,
             server,
             completed_uploads,
+            heads,
         }
+    }
+
+    /// The request heads this backend has been handed, newest last.
+    pub fn heads(&self) -> Vec<String> {
+        self.heads
+            .lock()
+            .expect("the head log is not poisoned")
+            .clone()
+    }
+
+    /// One header value out of the last request head, lower-cased name, or
+    /// `None` when the head does not carry it.
+    pub fn last_header(&self, name: &str) -> Option<String> {
+        let heads = self.heads();
+        let head = heads.last()?;
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
     }
 
     /// How many uploads arrived here complete, terminating chunk and all.
@@ -98,10 +127,18 @@ impl Backend {
     }
 }
 
-async fn serve_one(mut stream: TcpStream, completed_uploads: Arc<AtomicUsize>) {
+async fn serve_one(
+    mut stream: TcpStream,
+    completed_uploads: Arc<AtomicUsize>,
+    heads: Arc<Mutex<Vec<String>>>,
+) {
     let Some(head) = read_head(&mut stream).await else {
         return;
     };
+    heads
+        .lock()
+        .expect("the head log is not poisoned")
+        .push(head.clone());
     let path = head
         .lines()
         .next()
@@ -530,6 +567,36 @@ impl Proxy {
             self.addr,
             self.log_tail()
         );
+    }
+
+    /// One plain HTTP request through the proxy carrying extra headers, head
+    /// and body together.
+    ///
+    /// `headers` are written verbatim as `name: value` lines, so a test can
+    /// send exactly what a client would - `x-deis-app-id` included, which is
+    /// the whole point: it is a header the edge is supposed to decide and a
+    /// client is free to guess at.
+    pub async fn request_with_headers(
+        &self,
+        path: &str,
+        host: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
+        let mut stream = TcpStream::connect(self.addr)
+            .await
+            .expect("the proxy accepts a connection");
+        let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer).await;
+        answer
     }
 
     /// One plain HTTP request through the proxy, head and body together.

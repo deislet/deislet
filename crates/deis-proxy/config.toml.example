@@ -159,6 +159,14 @@ level = "info"  # trace | debug | info | warn | error; RUST_LOG overrides
 # `secret` is one of the control plane's node_preshared_keys. It is the
 # credential for both directions of the relationship: the gRPC channel this
 # instance registers on, and the HTTP read of the routing table below.
+# Configuring this changes what an unroutable request means. Left commented
+# out, this instance is standalone: with no applications of its own it is a
+# plain reverse proxy and forwards everything, having stripped x-deis-app-id
+# and x-deis-environment from it first, since it decided neither. Set, it is
+# driven from the control plane - and until a routing table has been fetched
+# even once it answers 503 rather than forwarding a request it cannot place.
+# A poll that fails after one succeeded is not that case: the last table
+# stays in force and traffic is unaffected.
 # [control]
 # addr = "http://127.0.0.1:8085"
 # associated_id = "deis-proxy-01"
