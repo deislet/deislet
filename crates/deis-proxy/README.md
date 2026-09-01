@@ -187,6 +187,32 @@ the control pushes. Notable behaviour:
   `header_hash(<Header>)`) is fixed for the lifetime of the process. The
   `upstreams` list is re-read on every `health_check_interval_secs` tick,
   so backends can be added and removed without a restart.
+- `[health_check]` decides which of those upstreams gets a request. By
+  default the proxy asks the node rather than its kernel: `GET /health` with
+  `x-deis-app-id: _system`, and only a `200` counts. A deis-runtime node
+  binds its data port before it has asked the control plane what to run, and
+  keeps it bound if the dispatcher behind it stops answering, so a TCP
+  connect proves nothing — which is why `mode = "tcp"` is the opt-in for an
+  upstream that is not a node and has no health endpoint to ask, and not the
+  default. `path`, `app_id`, `timeout_secs` (2), `healthy_after` (1) and
+  `unhealthy_after` (2) are the rest of it; `health_check_interval_secs` (5)
+  is how often the question is asked. One check pass runs before the process
+  serves its first request, so a node that is up and not answering is out of
+  rotation from the first request rather than for the first interval. When no
+  upstream is in rotation the edge answers `503` and logs how many upstreams
+  there are and how many passed.
+
+  What that probe is worth today has a limit worth knowing. A node's real
+  readiness — `starting`, `ready`, `degraded` — is reported by its
+  *management* `HealthCheck` RPC, on an address this proxy is never given;
+  the `/health` on the data port is the `_system` application's own and
+  answers `200` whenever the node is serving at all. So the check closes the
+  states a TCP connect cannot see (a port in the kernel's backlog with
+  nothing serving it, a dispatcher that has stopped answering, a node too
+  loaded to answer inside `timeout_secs`) and not yet the two only the node
+  can name. Closing those is one change on the node: the moment `_system`'s
+  `/health` answers a non-200 while the node is not `ready`, this proxy
+  already asks, already believes it and already stops routing there.
 - `listen_ports` are plain HTTP, `tls.ports` terminate TLS; a port may not
   appear in both. `[tls.acme]` is refused with an empty `tls.ports`: a
   certificate nothing can present is a rate limit spent for nothing.
@@ -277,12 +303,24 @@ daemon running without one.
 `reload` (or the control's `restart`) starts a second `deis-proxy --upgrade`
 process with the same configuration and from the same working directory,
 waits for it to report that its startup succeeded (configuration, database,
-logs and certificates loaded), then sends `SIGQUIT` to the running one.
-Pingora hands the listening sockets over the `upgrade_sock` Unix socket; the
-new process starts accepting on them while the old one finishes its
-in-flight requests and exits. No connection is refused in between. If the
-replacement exits before it is ready, the running process logs the exit
-status and keeps serving.
+logs and certificates loaded, and the `upgrade_sock` path bound once to
+prove it can be), then sends `SIGQUIT` to the running one. Pingora hands the
+listening sockets over that Unix socket; the new process starts accepting on
+them while the old one finishes its in-flight requests and exits. No
+connection is refused in between. If the replacement exits before it is
+ready, the running process logs the exit status and keeps serving.
+
+`SIGQUIT` is a one-way door -- pingora commits to shutting down whether or
+not the transfer that follows works -- so the readiness byte has to come
+after everything that can fail, and binding the upgrade socket is both the
+last of those and a `.unwrap()` inside pingora. Two things follow. A
+`upgrade_sock` longer than the 107 bytes a Unix address holds, or one whose
+directory does not exist, is refused at **startup**, not left to be
+discovered by the first operator who runs `reload`; remember that a relative
+path is made absolute first, so the length that counts is the resolved one.
+And the replacement binds the path itself, releases it, and only then says it
+is ready, so a path that has become unusable since startup fails the upgrade
+instead of taking the listeners down with it.
 
 `scripts/test_graceful_restart.sh` at the repository root exercises this
 end to end against a local backend while keeping requests flowing, in the

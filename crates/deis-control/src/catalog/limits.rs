@@ -32,10 +32,13 @@ use deis_bundle::Manifest;
 /// uploaded the bundle: it is returned at upload time so a version that no
 /// node could honour never becomes deployable.
 ///
-/// Spelling is already settled by the time this runs -
-/// [`deis_bundle::DeclaredLimits`] denies unknown fields, so a misspelled
-/// limit fails the manifest parse rather than being dropped in silence. What
-/// is left for here is meaning: a budget of zero, a rate that is not a
+/// Spelling is not this gate's business and no longer anybody's refusal here:
+/// a key [`deis_bundle::DeclaredLimits`] does not read is ignored and named at
+/// `warn` when the bundle is read, because refusing one refuses the whole
+/// manifest and therefore every bundle a newer builder wrote - see
+/// `deis_bundle::forward`. A ceiling misspelled in a project file is still
+/// refused where it was typed, by `deis_build_core::config::LimitsConfig`.
+/// What is left for here is meaning: a budget of zero, a rate that is not a
 /// number. Those parse perfectly and are the ones a node would have to
 /// discard on every load.
 pub fn declared_limits(manifest: &Manifest) -> Result<Option<DeclaredLimits>, String> {
@@ -88,16 +91,26 @@ mod tests {
         assert_eq!(limits.resource_table_max, Some(16));
     }
 
-    /// The failure this whole module exists to make impossible: a limit that
-    /// looks set, is not, and is discovered only when the ceiling an operator
-    /// thought was in force turns out never to have been. The manifest parse
-    /// is what refuses it now, which means a bundle carrying one never even
-    /// reaches an upload handler.
+    /// A limit that looks set and is not used to be a manifest parse failure.
+    /// It is not any more, and the reason is the version id: the manifest sits
+    /// inside the archive whose sha256 *is* the version, so a per-document
+    /// refusal meant that one key an older build had never heard of made every
+    /// version deployed since unloadable on that build, with no re-upload able
+    /// to repair it. The key is now named instead of fatal, and this control
+    /// plane's upload path is where an operator sees it.
     #[test]
-    fn a_misspelled_limit_is_refused_rather_than_dropped() {
-        let err = read(r#"{"timeout_millis":1500}"#)
-            .expect_err("a key nobody reads must not be accepted");
-        assert!(err.contains("timeout_millis"), "{err}");
+    fn a_limit_nobody_reads_is_named_rather_than_costing_the_manifest() {
+        let limits = read(r#"{"timeout_ms":1500,"timeout_millis":1500}"#)
+            .expect("an unrecognised key must not refuse the bundle that carries it")
+            .expect("declared");
+        assert_eq!(limits.timeout_ms, Some(1500));
+
+        let json = r#"{"schema":1,"app":"demo","entry":"worker/index.js","limits":{"timeout_millis":1500}}"#;
+        assert_eq!(
+            deis_bundle::unknown_fields(json),
+            vec!["limits.timeout_millis".to_string()],
+            "the key has to be named somewhere, or a misspelling is silent"
+        );
     }
 
     #[test]

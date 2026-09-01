@@ -905,7 +905,20 @@ impl ProxyHttp for DeisProxy {
     ) -> pingora::Result<Box<HttpPeer>> {
         let key = self.balancer.key(session);
         let Some(backend) = self.balancer.select(&key) else {
-            warn!(host = %ctx.host, app_id = ?ctx.app_id, "no healthy upstream available");
+            // The counts separate the three ways to get here, which want
+            // three different things done about them: nothing configured or
+            // nothing resolving, every node refusing the health check, or
+            // healthy nodes present that this key could not reach.
+            let (ready, upstreams) = self.balancer.rotation();
+            warn!(
+                host = %ctx.host,
+                app_id = ?ctx.app_id,
+                ready,
+                upstreams,
+                "no upstream is in rotation for this request; answering 503. An upstream is in \
+                 rotation only while it answers the configured health check, so an upstream whose \
+                 port is open but which is not serving is deliberately not counted here"
+            );
             return Err(Error::explain(
                 ErrorType::HTTPStatus(503),
                 "no healthy upstream",

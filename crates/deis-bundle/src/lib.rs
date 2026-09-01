@@ -24,6 +24,7 @@ pub mod archive;
 pub mod assets;
 pub mod bindings;
 pub mod compatibility;
+pub mod forward;
 pub mod headers;
 pub mod limits;
 pub mod path;
@@ -44,6 +45,9 @@ pub use compatibility::{
     CompatibilityDate, CompatibilityProfile, DeclaredCompatibility, FLAGS, Flag, FlagSpec,
     PLATFORM_KNOWN_THROUGH, flag_spec, known_flag_names,
 };
+pub use forward::{
+    BINDING_FIELDS, COMPATIBILITY_FIELDS, LIMITS_FIELDS, MANIFEST_FIELDS, unknown_fields,
+};
 pub use headers::{HeaderField, HeaderNamesWritten, HeaderRule, HeaderTable, parse_headers};
 pub use limits::DeclaredLimits;
 pub use path::{percent_decode, percent_encode_uri};
@@ -59,6 +63,13 @@ pub use site::{
 };
 
 /// Manifest schema this version of the platform understands.
+///
+/// **The manifest's only forward-compatibility gate.** Within one schema the
+/// format is additive and a build ignores keys it does not know; a change an
+/// older build could not safely ignore takes a new number here, and an older
+/// build then refuses the whole manifest by name rather than acting on half
+/// of it. See [`forward`] for the rule and what it costs an operator rolling
+/// back.
 pub const SUPPORTED_SCHEMA: u32 = 1;
 
 /// Name of the manifest at the root of the archive.
@@ -115,7 +126,11 @@ impl std::fmt::Display for BundleError {
             Self::InvalidManifest(m) => write!(f, "bundle {MANIFEST_ENTRY} is invalid: {m}"),
             Self::UnsupportedSchema { found, supported } => write!(
                 f,
-                "bundle manifest schema {found} is not supported; this build understands schema {supported}"
+                "bundle manifest schema {found} is not supported; this build understands schema \
+                 {supported}. A schema number changes only for something an older build cannot \
+                 safely ignore, so this bundle is refused whole rather than acted on in part: \
+                 upgrade this component to schema {found}, or deploy a version built against \
+                 schema {supported}"
             ),
             Self::TooLarge {
                 limit,
@@ -153,9 +168,12 @@ pub type Result<T> = std::result::Result<T, BundleError>;
 
 /// `manifest.json`.
 ///
-/// Unknown fields are accepted on purpose: a newer builder may add keys, and
-/// the raw text is stored verbatim alongside the parsed form, so nothing is
-/// lost by a component that does not understand a field yet.
+/// Unknown fields are accepted on purpose, at every level of the document -
+/// see [`forward`] for the rule and why one unknown key must never cost the
+/// whole bundle. The raw text is stored verbatim alongside the parsed form
+/// (see [`ParsedManifest::json`]), so a key this build drops is still carried
+/// to every component and still there when the fleet is upgraded; nothing but
+/// this process's own view of the manifest loses it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema: u32,
@@ -491,6 +509,12 @@ pub fn read_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
         })?;
 
     let manifest = Manifest::parse(&json)?;
+    // Here rather than in `Manifest::parse`, because this is the path a whole
+    // archive comes in on - once at the build, once at the upload, once per
+    // node that installs the version. `parse` is also what the control plane's
+    // scheduler calls for every deployed environment on every tick, and a line
+    // per application per minute would bury the one an operator needs.
+    forward::report(&json, manifest.schema);
 
     let entry_module = archive
         .read_text(&manifest.entry, Limit::EntryBytes)?

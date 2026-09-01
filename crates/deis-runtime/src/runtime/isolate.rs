@@ -3,7 +3,7 @@
 use super::bindings::{AppServices, ServiceWiring};
 use super::cache_ops::{create_cache_store, CacheStore};
 use super::fetch_policy::FetchPolicy;
-use super::header_list::{count_of, fold_duplicate_names, HeaderPairs};
+use super::header_list::{combine_cookie_fields, count_of, fold_duplicate_names, HeaderPairs};
 use super::loader::DbModuleLoader;
 use super::metrics::{
     now_us, recorder, InvocationKind, InvocationOutcome, InvocationTrace, MetricsRegistry,
@@ -2366,10 +2366,19 @@ impl AppRuntime {
         started: Instant,
         url: String,
         method: String,
-        headers: HeaderPairs,
+        mut headers: HeaderPairs,
         body: Option<Vec<u8>>,
         response_tx: oneshot::Sender<Result<FetchResult>>,
     ) -> Result<()> {
+        // The one header whose repeats are not joined with a comma. Done here
+        // rather than at either caller because this is the single place a
+        // request becomes a `Request` inside an isolate: a client splitting
+        // its cookies across two fields -- which HTTP/2 invites and browsers
+        // do -- would otherwise reach a handler as one comma-joined value,
+        // and the router deis-build generates splits that on `;` and keeps
+        // one cookie. See `super::header_list::combine_cookie_fields`.
+        combine_cookie_fields(&mut headers);
+
         let pathname = path_from_url(&url);
         let params = match_routes(&self.route_patterns, &pathname);
         if !params.is_empty() {

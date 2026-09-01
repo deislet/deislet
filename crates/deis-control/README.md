@@ -132,7 +132,7 @@ from "changed" without diffing).
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/runtime` | GET | The fleet: each node, and whether it is `configured` or `registered` |
+| `/api/runtime` | GET | The fleet: each node, and whether it is `configured` or `registered`; plus `lost`, the nodes that stopped refreshing their registration and are presumed to be still serving what they last received |
 | `/api/runtime/:node/status` | GET | Asked of the node itself: what it is really serving |
 | `/api/runtime/:node/apps/:app_id` | DELETE | Unload an application from one node |
 | `/api/sessions` | GET | Control channels currently open to this process |
@@ -179,7 +179,9 @@ on it: authenticate, register, heartbeat, receive configuration and commands.
 For runtime nodes the direction is the other way round — deis-control is the
 *client*, calling `ApplyDeployment`, `UnloadApp`, `GetStatus`, `HealthCheck`,
 `StartInspect` and `Trigger.OnScheduled` on the node's own management service
-(`crates/deis-runtime/proto/management.proto`).
+(`crates/deis-runtime/proto/management.proto`). The node's other trigger RPC,
+`Trigger.OnQueue`, is deliberately not called from here — nodes lease their
+messages from deis-queue directly.
 
 `ApplyDeployment` carries a **pointer** — app, version, environment,
 `bundle_url`, `bundle_sha`, and the environment map with secrets decrypted at

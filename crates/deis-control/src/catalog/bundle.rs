@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
 use deis_bundle::MANIFEST_ENTRY;
@@ -50,12 +50,50 @@ pub struct StoredBundle {
 
 /// Content-addressed bundle directory: `<root>/<app_id>/<sha256>.zip`.
 pub struct BundleStore {
+    /// Always absolute. See [`BundleStore::new`].
     root: PathBuf,
 }
 
 impl BundleStore {
+    /// Open the store at `root`, anchoring a relative path to the directory
+    /// this process was started in.
+    ///
+    /// `bundle_dir` defaults to the relative `data/bundles`, and every path
+    /// derived from the root is written into `versions.bundle_path` exactly as
+    /// it comes out - so an installation on the default was storing, for every
+    /// version it ever accepted, a path that only means anything from one
+    /// particular working directory. Start the control plane from anywhere
+    /// else - a systemd unit, a shell in another directory, a container with a
+    /// different WORKDIR - and every version at once became "recorded but
+    /// missing on disk": the zips are still there, and no node can load any of
+    /// them.
+    ///
+    /// Anchoring here rather than at each use is what makes that impossible to
+    /// reintroduce: there is no other way to build one of these, so no path
+    /// this store hands out can be relative.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        if root.is_absolute() {
+            return Self { root };
+        }
+        match std::path::absolute(&root) {
+            // Said once at startup by the caller that knows what was
+            // configured, not here: a store is opened more than once in a
+            // process and the same sentence twice in a log reads as two
+            // different directories.
+            Ok(absolute) => Self { root: absolute },
+            Err(e) => {
+                // Only an unreadable working directory reaches this. The
+                // relative path is kept because it is still the operator's
+                // instruction, and it still works as long as nothing moves.
+                error!(
+                    bundle_dir = %root.display(),
+                    error = %e,
+                    "bundle_dir is relative and this process cannot read its own working directory, so bundle paths stay relative; a restart from another directory will lose every uploaded version until bundle_dir is made absolute"
+                );
+                Self { root }
+            }
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -280,6 +318,22 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> CatalogResult<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Every path this store hands out has to mean the same thing from any
+    /// working directory, because it is written into `versions.bundle_path`
+    /// and read back by a later process that may have been started elsewhere.
+    #[test]
+    fn a_relative_bundle_dir_is_anchored_once_when_the_store_is_opened() {
+        let store = BundleStore::new("data/bundles");
+        assert!(store.root().is_absolute(), "got {}", store.root().display());
+        let path = store.path_for("demo", "abc");
+        assert!(path.is_absolute(), "got {}", path.display());
+        assert!(path.ends_with("data/bundles/demo/abc.zip"), "{path:?}");
+
+        // An absolute one is the operator's own words and is left alone.
+        let store = BundleStore::new("/srv/deis/bundles");
+        assert_eq!(store.root(), Path::new("/srv/deis/bundles"));
+    }
 
     /// Build a minimal but valid bundle in memory.
     pub(crate) fn sample_bundle(app: &str) -> Vec<u8> {

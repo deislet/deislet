@@ -887,36 +887,58 @@ impl Default for LoggingConfig {
 impl RuntimeConfig {
     /// Read the TOML file (if any), apply environment overrides, and reject
     /// values the node cannot run on.
-    pub fn load() -> Result<Self> {
+    ///
+    /// Answers with the file it read as well as what it read, because the node
+    /// says so in its startup log: "which file is this node actually running
+    /// on" is the question an operator gets wrong most often and sees least,
+    /// and `None` there means default ports, no control plane and no outbound
+    /// allowlist.
+    pub fn load(named: Option<&Path>) -> Result<(Self, Option<PathBuf>)> {
         reject_removed_env_vars()?;
 
-        let mut config = Self::default();
+        let source = Self::source(named)?;
+        let mut config = match &source {
+            Some(path) => Self::load_from(path)?,
+            None => Self::default(),
+        };
 
-        if let Some(path) = Self::config_path()? {
-            if path.exists() {
-                config = Self::load_from(&path)?;
-            } else if env::var("DEIS_RUNTIME_CONFIG").is_ok() {
+        config.apply_env_overrides()?;
+        config.validate()?;
+        Ok((config, source))
+    }
+
+    /// Which file this node reads its configuration from, if any.
+    ///
+    /// Three answers, in the order of how explicitly each was asked for: the
+    /// path given on the command line, then `DEIS_RUNTIME_CONFIG`, then
+    /// `./deis-runtime.toml` if it happens to be there.
+    ///
+    /// The first two were *named* by an operator, so a file that is not there
+    /// stops the node rather than being quietly replaced by the defaults: a
+    /// node that came up on default ports with no control plane, no allowlist
+    /// and no application -- and a `/health` saying it was fine -- is the
+    /// failure this refusal exists to prevent. The third is the convenience of
+    /// running from the source tree and is allowed to be absent.
+    pub fn source(named: Option<&Path>) -> Result<Option<PathBuf>> {
+        if let Some(path) = named {
+            if !path.exists() {
+                return Err(anyhow!(
+                    "the configuration file named with --config does not exist: {}",
+                    path.display()
+                ));
+            }
+            return Ok(Some(path.to_path_buf()));
+        }
+
+        if let Ok(named) = env::var("DEIS_RUNTIME_CONFIG") {
+            let path = PathBuf::from(named);
+            if !path.exists() {
                 return Err(anyhow!(
                     "DEIS_RUNTIME_CONFIG specified file does not exist: {}",
                     path.display()
                 ));
             }
-        }
-
-        config.apply_env_overrides()?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// How long in-flight requests get to finish once a shutdown signal
-    /// arrives.
-    pub fn shutdown_grace_period(&self) -> Duration {
-        Duration::from_secs(self.shutdown_grace_period_secs)
-    }
-
-    fn config_path() -> Result<Option<PathBuf>> {
-        if let Ok(path) = env::var("DEIS_RUNTIME_CONFIG") {
-            return Ok(Some(PathBuf::from(path)));
+            return Ok(Some(path));
         }
 
         let default_path = PathBuf::from("deis-runtime.toml");
@@ -925,6 +947,12 @@ impl RuntimeConfig {
         } else {
             Ok(None)
         }
+    }
+
+    /// How long in-flight requests get to finish once a shutdown signal
+    /// arrives.
+    pub fn shutdown_grace_period(&self) -> Duration {
+        Duration::from_secs(self.shutdown_grace_period_secs)
     }
 
     fn load_from(path: &Path) -> Result<Self> {
@@ -1893,6 +1921,63 @@ mod tests {
     // would observe each other's values mid-test); this lock is the only thing
     // serializing them.
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The defect, stated as a test: a node that was told which file to run
+    /// on and did not read it.
+    ///
+    /// Nothing read this binary's command line at all, so
+    /// `deis-runtime -c /etc/deis-runtime.toml` started a node on default
+    /// ports with no control plane and no outbound allowlist, and reported
+    /// itself ready. Every other component of this platform takes `-c`.
+    #[test]
+    fn the_file_named_on_the_command_line_is_the_one_read() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let named = dir.path().join("named.toml");
+        std::fs::write(&named, "http_port = 9101\n").expect("the file is written");
+        let by_variable = dir.path().join("by-variable.toml");
+        std::fs::write(&by_variable, "http_port = 9102\n").expect("the file is written");
+
+        // With nothing named, the variable still decides, which is what every
+        // installation that predates the flag depends on.
+        env::set_var("DEIS_RUNTIME_CONFIG", &by_variable);
+        let (config, source) = RuntimeConfig::load(None).expect("the variable's file is read");
+        assert_eq!(config.http_port, 9102);
+        assert_eq!(source.as_deref(), Some(by_variable.as_path()));
+
+        // And a file named on the command line wins over it: the flag is the
+        // more explicit of the two, and an operator running two nodes on one
+        // host says so there.
+        let (config, source) = RuntimeConfig::load(Some(&named)).expect("the named file is read");
+        assert_eq!(
+            config.http_port, 9101,
+            "the file named on the command line was not the one read"
+        );
+        assert_eq!(source.as_deref(), Some(named.as_path()));
+
+        env::remove_var("DEIS_RUNTIME_CONFIG");
+    }
+
+    /// A named file that is not there stops the node.
+    ///
+    /// The alternative is the failure this whole finding is about: falling
+    /// back to the built-in defaults means default ports, no control plane and
+    /// no allowlist, on a node whose `/health` says it is fine.
+    #[test]
+    fn a_named_configuration_file_that_is_missing_is_refused() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        env::remove_var("DEIS_RUNTIME_CONFIG");
+
+        let missing = Path::new("/nonexistent/deis-runtime.toml");
+        let err = RuntimeConfig::load(Some(missing))
+            .expect_err("a node told to run on a file that is not there must not start")
+            .to_string();
+        assert!(
+            err.contains("/nonexistent/deis-runtime.toml"),
+            "the refusal has to name the file: {err}"
+        );
+    }
 
     #[test]
     fn test_env_overrides_limits() {

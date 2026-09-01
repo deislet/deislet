@@ -336,6 +336,28 @@ pub async fn announce_authorization(authz: &authz::AuthzState) {
     authz.audit.announce().await;
 }
 
+/// Repair `versions.bundle_path` rows that were stored relative, and say what
+/// happened either way.
+///
+/// A startup step, called before anything can serve a bundle, by both entry
+/// points: the binary in `main.rs` and [`start_api_server`]. Public for the
+/// first of those, which builds its router itself.
+///
+/// Never fatal: a control plane that cannot repair the rows still serves every
+/// version whose path is already absolute, and refusing to start would take a
+/// working platform down over rows it could read perfectly well.
+pub async fn anchor_bundle_paths(database: &Arc<Database>, config: &ControlConfig) {
+    let bundles = BundleStore::new(config.bundle_dir.clone());
+    let store = crate::CatalogStore::new(Arc::clone(database));
+    if let Err(e) = store.anchor_bundle_paths(&bundles).await {
+        error!(
+            bundle_dir = %bundles.root().display(),
+            error = %e,
+            "Could not anchor the recorded bundle paths to the bundle directory; any version whose path was stored relative to another working directory stays unreachable, and every node that tries to fetch one gets \"recorded but missing on disk\""
+        );
+    }
+}
+
 /// Assemble the state every catalog endpoint shares.
 ///
 /// Both fallible pieces - the bundle directory and the secret master key -
@@ -348,13 +370,18 @@ fn build_catalog_state(
     config: &ControlConfig,
 ) -> catalog::CatalogState {
     let bundles = BundleStore::new(config.bundle_dir.clone());
+    // Both paths, because they differ exactly when `bundle_dir` is relative -
+    // and then the resolved one is the whole answer to "where did my versions
+    // go?" after this process is next started somewhere else.
     match bundles.ensure_root() {
         Ok(()) => info!(
-            bundle_dir = %config.bundle_dir.display(),
-            "Bundle directory ready; uploaded versions are stored here and served to nodes from here"
+            configured = %config.bundle_dir.display(),
+            bundle_dir = %bundles.root().display(),
+            "Bundle directory ready; uploaded versions are stored here and served to nodes from here. A relative configured path is anchored to this process's working directory, so make it absolute if this control plane may ever be started from elsewhere"
         ),
         Err(e) => error!(
-            bundle_dir = %config.bundle_dir.display(),
+            configured = %config.bundle_dir.display(),
+            bundle_dir = %bundles.root().display(),
             error = %e,
             "Bundle directory is not usable; every bundle upload will fail and nodes cannot fetch any version until this path is writable"
         ),
@@ -635,6 +662,13 @@ pub async fn start_api_server(
     // than being cut off mid-probe by an abort.
     let shutdown = crate::shutdown::on_signal();
     tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop(shutdown.clone()));
+    // Before anything can be served: version rows written by an earlier run
+    // may name their bundle relative to the directory *that* run was started
+    // in, which is nothing this process can resolve. Anchoring them to the
+    // configured bundle root is a one-off repair that costs one query on a
+    // control plane which has none. See `CatalogStore::anchor_bundle_paths`.
+    anchor_bundle_paths(&database, &config).await;
+
     let api = build_api_router(
         sessions,
         database,

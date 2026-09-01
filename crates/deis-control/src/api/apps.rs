@@ -46,8 +46,19 @@ fn node_error_response(e: &NodeError) -> (StatusCode, Json<serde_json::Value>) {
 /// names it or because it registered itself; holding a gRPC control channel
 /// open has nothing to do with it, and the nodes that do that are a
 /// different list at `GET /api/sessions` ([`crate::api::nodes`]).
+///
+/// `lost` is the other half of the same question, and the reason it is served
+/// here rather than only appearing inside a deployment's answer: these are
+/// nodes that were on the list, stopped refreshing their registration and are
+/// presumed to be still running what they last received. Every deploy and
+/// every application deletion names them as unreached, so an operator has to
+/// be able to see which ones they are and clear the ones whose machine is
+/// really gone with `DELETE /api/nodes/{id}/registration`.
 pub async fn list_fleet(State(state): State<AppsState>) -> impl IntoResponse {
-    Json(json!({ "nodes": state.deis_runtime.list() }))
+    Json(json!({
+        "nodes": state.deis_runtime.list(),
+        "lost": state.deis_runtime.departed(),
+    }))
 }
 
 #[derive(Deserialize)]

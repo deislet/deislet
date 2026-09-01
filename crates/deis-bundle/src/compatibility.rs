@@ -235,11 +235,13 @@ pub fn flag_spec(flag: Flag) -> &'static FlagSpec {
 /// people - an operator asks what an application *declared*, and the runtime
 /// asks what is *on*.
 ///
-/// `deny_unknown_fields` for the reason [`crate::limits::DeclaredLimits`] has
-/// it: a misspelled key that parsed and was dropped would leave an author
-/// reading their own manifest and believing in a pin that was never in force.
+/// A key this build does not know is ignored and named at `warn`, for the
+/// reason [`crate::limits::DeclaredLimits`] no longer refuses one either: see
+/// [`crate::forward`]. Refusing here would have been a refusal of the whole
+/// manifest, which is the one thing a compatibility mechanism must never do -
+/// this block exists so that a fleet can be half upgraded, and it would have
+/// been the field that made half an upgrade impossible.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct DeclaredCompatibility {
     /// The day this application was written against. Absent means it predates
     /// the mechanism; see [`CompatibilityProfile::resolve`] for what that
@@ -695,11 +697,28 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_block_refuses_a_key_nobody_reads() {
-        let err =
-            serde_json::from_str::<DeclaredCompatibility>(r#"{"compatibilityDate":"2026-09-01"}"#)
-                .expect_err("a key nobody reads must not be accepted");
-        assert!(err.to_string().contains("compatibilityDate"), "{err}");
+    fn a_manifest_block_ignores_a_key_this_build_does_not_read_and_names_it() {
+        // This block used to refuse one. That refusal was per document, so a
+        // node one release behind threw away every manifest a newer builder
+        // had added a key to - the whole bundle, not the key - which is the
+        // fleet-wide breaking change the compatibility date exists to
+        // prevent, delivered by the compatibility block itself.
+        let block: DeclaredCompatibility =
+            serde_json::from_str(r#"{"date":"2026-09-01","profile":"strict"}"#)
+                .expect("a key this build does not read must not cost the block");
+        assert_eq!(
+            block.date.map(|d| d.to_string()).as_deref(),
+            Some("2026-09-01")
+        );
+
+        // A misspelling reaches the author the same way a newer key reaches
+        // an operator: named, at `warn`, when the bundle is read.
+        assert_eq!(
+            crate::forward::unknown_fields(
+                r#"{"schema":1,"app":"d","entry":"e.js","compatibility":{"compatibilityDate":"2026-09-01"}}"#
+            ),
+            vec!["compatibility.compatibilityDate".to_string()]
+        );
     }
 
     #[test]

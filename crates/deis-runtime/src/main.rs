@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use clap::Parser;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
@@ -15,6 +17,41 @@ use deis_runtime::health::NodeHealth;
 use deis_runtime::logging::{LogBuffer, LogShipper, RuntimeLayer, ShipperConfig};
 use deis_runtime::runtime::{FetchPolicy, MetricShipper, MetricShipperConfig};
 
+// What this node accepts on its command line.
+//
+// Doc comments on this struct and its fields are what `--help` prints, so the
+// reasoning is here, in ordinary comments, and only what an operator needs is
+// down there.
+//
+// This binary used to accept nothing at all -- not because the arguments were
+// refused, but because nothing read them. `deis-runtime -c
+// /etc/deis-runtime.toml` started a node that had never opened that file:
+// default ports, no control plane, no outbound allowlist, no application, and
+// a `/health` that said it was fine. `--help` did the same. Every other
+// component of this platform takes `-c`, so an operator following the
+// documents got a node serving nothing and no sign anywhere that it had been
+// asked to do otherwise.
+//
+// Reading the command line is therefore the fix, and refusing what it does not
+// understand is the other half: clap answers an unknown flag with usage and a
+// non-zero exit, which is the difference between a typo an operator sees and a
+// typo that becomes an outage.
+#[derive(Parser)]
+#[command(name = "deis-runtime", about = "Deislet node: runs applications")]
+struct Cli {
+    // No default value, which is where this differs from the other components:
+    // with the flag absent this node keeps the answer it has always given, so
+    // every installation that sets `DEIS_RUNTIME_CONFIG` is unaffected. A file
+    // named here and missing is an error rather than a fall back to the
+    // defaults, because an operator who names one is saying what the node is
+    // to run as.
+    /// Path to the TOML configuration file. Without it, the file
+    /// DEIS_RUNTIME_CONFIG names, or ./deis-runtime.toml if it is there, or
+    /// the built-in defaults.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+}
+
 /// Everything that has to happen while this process is still single-threaded.
 ///
 /// Removing a variable from the process environment mutates a table the whole
@@ -23,10 +60,17 @@ use deis_runtime::runtime::{FetchPolicy, MetricShipper, MetricShipperConfig};
 /// matter. So the configuration is read and the proxy question is settled
 /// here, on the main thread, and only then is the tokio runtime built.
 fn main() -> Result<()> {
+    // Before anything else, including logging: an argument this binary does
+    // not understand ends the process here with usage on stderr, rather than
+    // being ignored by a node that then goes on to report itself ready.
+    let cli = Cli::parse();
+
     // Configuration is read before logging is set up because it sizes the log
     // buffer. A bad value stops the node here, with the reason on stderr,
     // instead of turning into failing requests later.
-    let config = RuntimeConfig::load().context("loading the deis-runtime configuration")?;
+
+    let (config, config_source) = RuntimeConfig::load(cli.config.as_deref())
+        .context("loading the deis-runtime configuration")?;
 
     // Whether an HTTP proxy named in this node's environment gets to carry
     // applications' outbound calls. `deno_fetch` reads those variables
@@ -40,10 +84,14 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building the tokio runtime")?
-        .block_on(run(config, proxy))
+        .block_on(run(config, config_source, proxy))
 }
 
-async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
+async fn run(
+    config: RuntimeConfig,
+    config_source: Option<PathBuf>,
+    proxy: ProxyDecision,
+) -> Result<()> {
     // Taken first, so the uptime this node reports to the control plane is the
     // process's own and not the moment some later component happened to be
     // built.
@@ -72,6 +120,17 @@ async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
 
     info!("Node ID: {}", node_id);
     info!("HTTP Port: {}", port);
+    // Named out loud because it is the one thing an operator most often gets
+    // wrong and least often sees: two nodes on one host, a unit file with a
+    // stale path, a container whose file was never mounted. "Defaults" here
+    // means no control plane and no outbound allowlist.
+    match &config_source {
+        Some(path) => info!(config = %path.display(), "Configuration read from {}", path.display()),
+        None => info!(
+            "No configuration file was read; this node is running on the built-in defaults \
+             with whatever DEIS_RUNTIME_* variables are set"
+        ),
+    }
 
     // Held back until now because it happens before logging exists: what
     // became of this node's proxy variables, and what that costs.

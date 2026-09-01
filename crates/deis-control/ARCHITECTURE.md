@@ -190,11 +190,15 @@ pub struct CronScheduler {
    `manifest.cron` of each environment's currently deployed version declares,
    so they follow deploys and rollbacks and are never persisted separately.
 2. Fire everything due, one occurrence to exactly one node, trying the next
-   node when one refuses; an occurrence nobody takes is skipped, not retried.
+   node when one says it *cannot* run it; an occurrence nobody takes is
+   skipped, not retried.
 3. Advance to the next occurrence.
 
 A handler that throws is *not* retried on another node: the same code would
-fail the same way elsewhere, and it may already have had side effects.
+fail the same way elsewhere, and it may already have had side effects. The
+node says which of the two happened — it prefixes the error with
+`handler-failed: ` when the application's own handler ran and threw — and the
+walk over the fleet stops there.
 
 ### 7. Runtime client (`src/runtime_client/`)
 
@@ -202,6 +206,18 @@ The client half of a node's management service: `ApplyDeployment`,
 `UnloadApp`, `GetStatus`, `HealthCheck`, `StartInspect`, and
 `Trigger.OnScheduled`. Also the fleet list — configured entries plus
 self-registrations, with health polled on a timer.
+
+`Trigger.OnQueue` is the one RPC of a node that this control plane does not
+call and will not: nodes lease their messages straight from deis-queue, and
+this process holds no queue client and no lease it could hand on. See the
+`trigger` module's own note for what it *is* for.
+
+A self-registration that runs out is remembered, not forgotten. A node that
+stopped refreshing is exactly a node that is still serving what it last
+received and is not reconciling either, so every fleet-wide answer — a deploy,
+an application deletion — names it as unreached instead of describing only the
+half of the fleet that still answers. It clears itself when the node registers
+again, or with `DELETE /api/nodes/{id}/registration` when the machine is gone.
 
 ### 8. Configuration management (`src/config_manager/`)
 

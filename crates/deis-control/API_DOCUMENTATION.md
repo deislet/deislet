@@ -1178,6 +1178,15 @@ curl -H "Authorization: Bearer $DEIS_TOKEN" http://localhost:8080/api/metrics
   ever measured it
 - The `/api/ws` WebSocket endpoint documented below never existed and its
   description is gone with the broadcaster behind it
+- `GET /api/runtime` answers with a second array, `lost`: nodes that were on
+  the fleet list, stopped refreshing their registration and are presumed to be
+  still serving what they last received. They are also named in the `failed`
+  array of every deployment answer and of `DELETE /api/apps/{app_id}`, which
+  used to describe only the half of the fleet this control plane could still
+  reach and so reported a deploy - and a deletion - as complete while a live
+  node kept serving the old version. A node clears itself by registering
+  again; `DELETE /api/nodes/{id}/registration` clears one whose machine is
+  really gone, and now answers `200` for such an id instead of `404`
 
 ### v0.1.0 (2026-01-11)
 - Initial release

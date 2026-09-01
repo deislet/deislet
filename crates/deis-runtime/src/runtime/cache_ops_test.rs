@@ -855,6 +855,90 @@ mod what_the_cache_refuses_to_store {
         );
     }
 
+    /// A varying response stored under a `Request` that carries none of the
+    /// headers it varies on.
+    ///
+    /// `new Request(url)` is a `Request`, so the refusal above -- which asked
+    /// what the key *was* -- let it through, and it carries no headers at all,
+    /// so the entry was filed as the "carried no Authorization" variant. Every
+    /// later caller who also carried none was handed it: one user's
+    /// authenticated page served to anonymous clients, which is the exact
+    /// failure the refusal was written to prevent, reached through the one
+    /// shape a test of the key's type cannot see.
+    ///
+    /// Rebuilding a key with `new Request(request.url)` is an ordinary thing
+    /// to write -- to normalise a URL, to drop a query string, to cache under
+    /// a canonical form -- so this is not an exotic path.
+    #[tokio::test]
+    async fn a_varying_response_stored_under_a_key_that_dropped_the_headers_is_refused() {
+        let code = r#"
+            const KEY = "https://example.invalid/account";
+            export default async function handler(context) {
+                const hit = await caches.default.match(new Request(KEY));
+                if (hit) {
+                    return new Response(JSON.stringify({ served: await hit.text() }));
+                }
+                const who = context.request.headers.get("authorization") ?? "nobody";
+                const fresh = new Response("page-for:" + who, {
+                    headers: { vary: "authorization" },
+                });
+                let refused = null;
+                try {
+                    await caches.default.put(new Request(KEY), fresh.clone());
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, served: null }));
+            }
+        "#;
+        let mut runtime = runtime("cache_vary_stripped_key.production", code).await;
+
+        let alice: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[("authorization", "Bearer alice")]).await)
+                .expect("json");
+        let anonymous: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[]).await).expect("json");
+
+        // The consequence first, because it is the whole reason for the rule.
+        assert_eq!(
+            anonymous["served"],
+            serde_json::Value::Null,
+            "an anonymous caller was served the page the cache stored for an authenticated one"
+        );
+        let refused = alice["refused"].as_str().unwrap_or_default();
+        assert!(
+            refused.contains("carries none of those headers"),
+            "an authenticated page was stored under a key that had dropped the credential \
+             it varies on: {alice}"
+        );
+    }
+
+    /// And the case the refusal must not swallow: a caller who genuinely
+    /// carries none of the varying headers, storing their own page under the
+    /// request being answered.
+    ///
+    /// The key is the request itself, so "carries none of them" is the truth
+    /// about the response rather than a claim about a stand-in. Refusing this
+    /// would mean no anonymous answer to a credential-varying route could ever
+    /// be cached, which is most of what a cache in front of such a route is
+    /// for.
+    #[tokio::test]
+    async fn an_anonymous_caller_may_still_cache_the_page_it_was_given() {
+        let mut runtime = runtime("cache_vary_anonymous.production", VARYING).await;
+
+        assert_eq!(ask(&mut runtime, &[]).await, "MISS:page-for:nobody");
+        assert_eq!(
+            ask(&mut runtime, &[]).await,
+            "HIT:page-for:nobody",
+            "the anonymous variant was refused rather than stored"
+        );
+        assert_eq!(
+            ask(&mut runtime, &[("authorization", "Bearer alice")]).await,
+            "MISS:page-for:Bearer alice",
+            "the anonymous entry was handed to a caller who carried a credential"
+        );
+    }
+
     /// `Vary: *` is the response saying no later request may reuse it.
     #[tokio::test]
     async fn a_response_that_varies_on_everything_is_refused() {

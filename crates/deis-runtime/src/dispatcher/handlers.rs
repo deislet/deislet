@@ -227,6 +227,27 @@ pub(crate) fn request_url(uri: &Uri, headers: &HeaderMap, key: &AppKey) -> Strin
 ///
 /// What is left is what a real `Host` carries: a registered name, an IPv4
 /// literal, a bracketed IPv6 literal, and an optional `:port`.
+///
+/// # Structure, not a set of characters
+///
+/// This used to be a single pass that accepted any string built out of the
+/// characters those four forms are spelled with -- `:`, `[` and `]` among
+/// them, anywhere and any number of times. That admits strings no URL parser
+/// will take: `a:b` has a port that is not a number, `[::1` never closes its
+/// bracket, `a:1:2` has two ports. Each of them was pasted into `request.url`
+/// and `new Request(url)` threw inside the isolate, so the request was
+/// answered 500 with this platform's own error text in the body -- and the
+/// proxy strips the port before it matches a route, so such a request routes
+/// to the right application and only then dies. `Host: a:b` was enough to
+/// make every request to a node fail that way.
+///
+/// So each of the four forms is recognised as a whole: the host is split from
+/// the port first, the port is a number a URL may carry, and the host is
+/// either a bracketed address the standard library can parse or a name spelled
+/// without any of the three delimiters. The property this check has to have is
+/// that what it accepts, the isolate's URL parser also accepts, and both
+/// halves of that are walked through a real isolate by
+/// `dispatcher::handlers_test`.
 fn usable_authority(authority: &str) -> bool {
     // A `Host` longer than this is not a name anybody serves; the ceiling is
     // here so the string cannot become a way to make every log line and every
@@ -236,14 +257,69 @@ fn usable_authority(authority: &str) -> bool {
     if authority.is_empty() || authority.len() > LONGEST {
         return false;
     }
-    // A leading `:` is a port with no host; a leading `[` is an IPv6 literal,
-    // which is the one legal use of the brackets.
-    if authority.starts_with(':') {
+
+    // The brackets are read before anything else: an IPv6 literal is full of
+    // colons itself, so the `:port` of `[::1]:8080` can only be looked for
+    // after the closing bracket. Everything else has no bracket at all, and
+    // its first colon starts its port.
+    let (name, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let Some((inside, after)) = rest.split_once(']') else {
+                // `[::1` -- an address that never closes. A URL parser refuses
+                // it, so it cannot become the authority of `request.url`.
+                return false;
+            };
+            if inside.parse::<std::net::Ipv6Addr>().is_err() {
+                // Anything inside the brackets that is not an address,
+                // including a zone id (`fe80::1%25eth0`) that this check
+                // refuses along with every other percent-escape.
+                return false;
+            }
+            match after {
+                "" => (None, None),
+                _ => match after.strip_prefix(':') {
+                    Some(port) => (None, Some(port)),
+                    // Something after the literal that is not a port, such as
+                    // `[::1]x`.
+                    None => return false,
+                },
+            }
+        }
+        None => match authority.split_once(':') {
+            Some((name, port)) => (Some(name), Some(port)),
+            None => (Some(authority), None),
+        },
+    };
+
+    // A name, when there is one: `[::1]` has already been parsed as an address
+    // and has nothing left to check. Empty is refused here, which is what
+    // makes `:8080` -- a port with no host -- and `a:b:c`, whose "port" is
+    // `b:c`, both fail.
+    if matches!(name, Some(name) if !usable_host_name(name)) {
         return false;
     }
-    authority.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'[' | b']' | b'_')
-    })
+
+    // A port, when there is one. `u16` is the range a URL may carry: a WHATWG
+    // URL parser refuses `http://a:70000/` as surely as it refuses
+    // `http://a:b/`, and an empty port is refused here rather than accepted as
+    // "the default", so what reaches an isolate is a port or no port at all.
+    match port {
+        Some(port) => port.parse::<u16>().is_ok(),
+        None => true,
+    }
+}
+
+/// A registered name or an IPv4 literal -- what a `Host` carries when it is
+/// not a bracketed IPv6 address.
+///
+/// The three delimiters are absent by construction, so a name that gets here
+/// cannot reopen the question the split above just answered. IPv4 is not
+/// recognised separately because its spelling is already a subset of this one.
+fn usable_host_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
 }
 
 /// Unified request handler - routes to applications via the tenant headers.

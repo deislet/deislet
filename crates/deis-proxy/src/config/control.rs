@@ -28,8 +28,13 @@ impl ControlSystemConfig {
         config.grace_period_secs = None;
         config.graceful_shutdown_timeout_secs = None;
         // The balancer's schedule is fixed when the process starts; an
-        // overlay value would be stored but never applied.
+        // overlay value would be stored but never applied. The same is true
+        // of what a health check asks: the checker object is built once, in
+        // `Balancer::build`, from the configuration this process started
+        // with, so an overlay here would read back as if it had taken effect
+        // while every probe still asked the old question.
         config.health_check_interval_secs = None;
+        config.health_check = None;
         config.listen_addr = None;
         config.listen_ports = None;
         config.tls = None;

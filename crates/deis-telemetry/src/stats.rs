@@ -13,6 +13,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use tokio::sync::watch;
+use tracing::{error, info};
+
 /// Relaxed ordering is right for every counter here: they are read for
 /// reporting, never to establish happens-before between threads.
 const ORD: Ordering = Ordering::Relaxed;
@@ -56,6 +59,168 @@ pub const OVERFLOW_APP: &str = "(other)";
 /// the page. Past the cap the counting continues under [`OVERFLOW_APP`], so
 /// the sum still adds up and only the attribution is lost.
 pub const MAX_TRACKED_APPS: usize = 64;
+
+/// Which direction a storage call went, so that a success in one direction
+/// cannot vouch for the other.
+///
+/// The distinction is the whole point. The commonest way for this service to
+/// break is a disk with no space left, and on that disk every read still
+/// works: a scrape reads the metric table happily while every log write is
+/// refused. A single "the store is fine" flag would be set back to fine by
+/// the next scrape, once a second, and the failure would be invisible again
+/// between one push and the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// An insert, a delete, or a retention sweep.
+    Write,
+    /// A query, or the read behind the Prometheus export.
+    Read,
+}
+
+impl Access {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+        }
+    }
+}
+
+/// What the last storage call in each direction did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreState {
+    /// `true` while the last write succeeded.
+    pub writable: bool,
+    /// `true` while the last read succeeded.
+    pub readable: bool,
+}
+
+impl StoreState {
+    /// Whether this service can do its job at all. Ingest is the job, so a
+    /// store that cannot be written to is not serving whatever its reads do.
+    pub fn is_serving(self) -> bool {
+        self.writable && self.readable
+    }
+}
+
+/// Whether the database underneath this service is answering, in each
+/// direction.
+///
+/// Every storage call reports its outcome here, and the answer drives two
+/// things: the `store_writable` and `store_readable` gauges on `/metrics`,
+/// and the standard `grpc.health.v1` status of all three services (see
+/// [`crate::server::start`]). Before this existed, the health service was set
+/// to `SERVING` once at startup and never touched again, so a process whose
+/// disk had filled or whose database had been restored unwritable went on
+/// answering every probe with `SERVING` while dropping every log line, trace
+/// and sample it was handed. A collector that reports healthy while
+/// collecting nothing is worse than one that reports broken: nothing
+/// downstream has any other way to find out.
+///
+/// One failure is enough to say so, and one success **in the same direction**
+/// is enough to take it back. That can flap, and flapping is the honest
+/// answer while a disk is hovering at full - the alternative, a threshold, is
+/// a window during which the service is known to be losing data and still
+/// saying `SERVING`.
+///
+/// The three services share one database, so there is one state and not three.
+#[derive(Debug)]
+pub struct StoreHealth {
+    /// A `watch` rather than two `AtomicBool`s because the health task has to
+    /// be woken by a change; a poll loop would put a delay between the failure
+    /// and the probe telling the truth about it.
+    state: watch::Sender<StoreState>,
+}
+
+impl Default for StoreHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StoreHealth {
+    /// Starts able to do both: nothing has failed yet, and the store was
+    /// opened successfully or the process would not be running.
+    pub fn new() -> Self {
+        Self {
+            state: watch::channel(StoreState {
+                writable: true,
+                readable: true,
+            })
+            .0,
+        }
+    }
+
+    /// A storage call in `access` succeeded.
+    pub fn record_success(&self, access: Access) {
+        let changed = self.state.send_if_modified(|state| match access {
+            Access::Write if !state.writable => {
+                state.writable = true;
+                true
+            }
+            Access::Read if !state.readable => {
+                state.readable = true;
+                true
+            }
+            _ => false,
+        });
+        if changed {
+            info!(
+                direction = access.as_str(),
+                "the telemetry database is taking {}s again; whatever was refused while it was \
+                 not is not recoverable",
+                access.as_str()
+            );
+        }
+    }
+
+    /// A storage call in `access` failed, or did not complete.
+    ///
+    /// `operation` is the caller's own name for what it was doing, so the line
+    /// says which surface noticed first.
+    pub fn record_failure(&self, access: Access, operation: &str) {
+        let changed = self.state.send_if_modified(|state| match access {
+            Access::Write if state.writable => {
+                state.writable = false;
+                true
+            }
+            Access::Read if state.readable => {
+                state.readable = false;
+                true
+            }
+            _ => false,
+        });
+        if !changed {
+            return;
+        }
+        match access {
+            Access::Write => error!(
+                operation,
+                "the telemetry database stopped accepting writes; every push is refused from \
+                 here on, so the logs, traces and metric samples produced meanwhile are lost for \
+                 good. This process now reports NOT_SERVING on grpc.health.v1 and \
+                 deis_telemetry_store_writable reads 0"
+            ),
+            Access::Read => error!(
+                operation,
+                "the telemetry database stopped answering reads; queries and the Prometheus \
+                 export fail from here on, so stored data is still there but nothing can get at \
+                 it. This process now reports NOT_SERVING on grpc.health.v1 and \
+                 deis_telemetry_store_readable reads 0"
+            ),
+        }
+    }
+
+    /// What the last call in each direction did. `1` or `0` on `/metrics`.
+    pub fn state(&self) -> StoreState {
+        *self.state.borrow()
+    }
+
+    /// A receiver that is woken whenever either direction changes.
+    pub fn subscribe(&self) -> watch::Receiver<StoreState> {
+        self.state.subscribe()
+    }
+}
 
 /// Losses broken down by the application whose records were thrown away.
 ///
@@ -168,6 +333,10 @@ macro_rules! service_stats {
                 pub $field: AtomicU64,
             )+
             started_at: Instant,
+            /// Whether the database is answering. Not a counter: it is the
+            /// one number here that goes back down, and it is what the
+            /// gRPC health status follows.
+            pub store_health: StoreHealth,
             /// Live log entries thrown away, by the application that owned
             /// them. Exported alongside the plain total by
             /// [`ServiceStats::labelled_snapshot`].
@@ -181,6 +350,7 @@ macro_rules! service_stats {
                 Self {
                     $( $field: AtomicU64::new(0), )+
                     started_at: Instant::now(),
+                    store_health: StoreHealth::new(),
                     tail_entries_dropped_by_app: AppDrops::default(),
                     trace_tail_entries_dropped_by_app: AppDrops::default(),
                 }
@@ -200,6 +370,28 @@ macro_rules! service_stats {
                         help: "Seconds since this deis-telemetry process started",
                         value: self.uptime_seconds(),
                     },
+                    // Read off `StoreHealth` rather than counted, like
+                    // uptime above. These are the two series that answer "is
+                    // the pipeline up right now" instead of "how much has
+                    // happened since start", which is the question an operator
+                    // has first. Two, not one, because a full disk refuses
+                    // every write while answering every read.
+                    SelfMetric {
+                        name: "store_writable",
+                        kind: MetricKind::Gauge,
+                        help: "1 while the last write to the telemetry database succeeded, 0 \
+                               after one failed; while this reads 0 every push is refused and \
+                               every log line, trace and sample produced is lost for good",
+                        value: u64::from(self.store_health.state().writable),
+                    },
+                    SelfMetric {
+                        name: "store_readable",
+                        kind: MetricKind::Gauge,
+                        help: "1 while the last read of the telemetry database succeeded, 0 \
+                               after one failed; while this reads 0 queries and this very page \
+                               fail, and stored data cannot be got at",
+                        value: u64::from(self.store_health.state().readable),
+                    },
                     $(
                         SelfMetric {
                             name: $name,
@@ -215,6 +407,46 @@ macro_rules! service_stats {
 }
 
 service_stats! {
+    storage_failures: Counter =
+        "storage_failures_total",
+        "Storage calls that failed or did not complete, over ingest, queries, the retention \
+         sweep and the Prometheus export. The single number that moves whatever is wrong \
+         underneath: every path into the database is counted here, so a full disk or an \
+         unwritable file shows up even on a surface nobody happened to be watching";
+    logs_lost: Counter =
+        "logs_lost_total",
+        "Well-formed log entries this service accepted from a producer and then failed to \
+         write; unlike logs_rejected_total there was nothing wrong with them, and they will \
+         never appear in Query or Tail";
+    traces_lost: Counter =
+        "traces_lost_total",
+        "Well-formed trace records this service accepted and then failed to write; those \
+         invocations happened and will never appear in QueryTraces or TailTraces";
+    metric_samples_lost: Counter =
+        "metric_samples_lost_total",
+        "Well-formed metric samples this service accepted and then failed to write; the series \
+         they belonged to shows a gap in QueryMetrics and on /metrics";
+    retention_sweeps_failed: Counter =
+        "retention_sweeps_failed_total",
+        "Retention sweeps that failed or did not complete; expired logs, traces and samples \
+         stay on disk and the database keeps growing until a sweep succeeds";
+    metric_scrapes: Counter = "metric_scrapes_total", "Prometheus scrapes served on /metrics";
+    metric_samples_dropped_from_export: Counter =
+        "metric_samples_dropped_from_export_total",
+        "Stored metric samples left out of a /metrics page because they could not be rendered: \
+         a name with no character legal in the exposition format, or a histogram bucket whose \
+         `le` label names no bound. They are still in storage and still come back from \
+         QueryMetrics; it is the scraped series that has the gap";
+    metric_labels_dropped_from_export: Counter =
+        "metric_labels_dropped_from_export_total",
+        "Labels left off a line on a /metrics page: a name with no legal character, or one that \
+         collides with an earlier label after sanitising. The sample is exported without that \
+         label, because repeating a label name makes a scraper reject the whole page rather \
+         than the one series";
+    metric_scrapes_failed: Counter =
+        "metric_scrapes_failed_total",
+        "Prometheus scrapes answered with 500 because the stored samples could not be read; \
+         the scraper records those as a failed scrape and every stored series shows a gap";
     log_pushes: Counter = "log_pushes_total", "PushLogs calls served";
     logs_accepted: Counter = "logs_accepted_total", "Log entries written to storage";
     logs_rejected: Counter =

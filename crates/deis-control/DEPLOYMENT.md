@@ -1,7 +1,7 @@
 # Control Deployment Guide
 
 **Version**: v0.1.0
-**Last Updated**: 2026-01-11
+**Last Updated**: 2026-09-02
 
 ---
 
@@ -17,9 +17,12 @@
 
 ### Software Dependencies
 
-- Rust 1.70+ (for compilation)
-- Node.js 18+ (for frontend build)
-- SQLite 3.x
+- Rust 1.85+ (the workspace is edition 2024; 1.70 cannot build it)
+- Node.js 18+ (for the console build, which the binary embeds at compile time)
+- `sqlite3` (the backup and restore procedure below uses `.backup`; a `cp` of a
+  WAL-mode database can copy a corrupt one without saying so)
+- `openssl` (generates the secret master key)
+- `curl` and `jq` (the readiness check below)
 - (Optional) Nginx/Caddy (reverse proxy)
 - (Optional) Certbot (Let's Encrypt certificates)
 
@@ -29,36 +32,54 @@
 
 ### 1. Compile Project
 
+`deis-control` is one crate of the `deislet` workspace, not a repository of
+its own, and it embeds the web console into the binary at compile time. So the
+console is built **first**: with `crates/deis-control/web/dist` missing,
+`cargo build` fails outright rather than producing a binary without a console.
+
 ```bash
-# Clone project
-git clone https://github.com/your-org/deis-control.git
-cd deis-control
+# Clone the workspace this crate lives in
+git clone https://github.com/deislet/deislet.git
+cd deislet
 
-# Compile Release version
-cargo build --release
+# The console, first. Its output is gitignored, and the compile below
+# embeds it, so a fresh clone has to do this before anything else.
+cd crates/deis-control/web && npm ci && npm run build && cd ../../..
 
-# Compile frontend
-cd web
-npm install
-npm run build
-cd ..
+# Then the binary. Lands in target/release/deis-control.
+cargo build --release -p deis-control
 ```
 
 ### 2. Prepare Configuration File
 
 ```bash
+sudo mkdir -p /etc/deis-control
+
 # Copy the example configuration (deis-control.example.toml is the only
 # one; the file it is copied to can be named anything -c is given)
-cp deis-control.example.toml config.toml
+sudo cp crates/deis-control/deis-control.example.toml /etc/deis-control/config.toml
 
 # Edit configuration
-vi config.toml
+sudo vi /etc/deis-control/config.toml
 ```
 
-**Minimal Configuration** (`config.toml`):
+**Minimal Configuration** (`config.toml`) - this is the whole file, and it
+starts:
+
 ```toml
+# Every key below is required: the four without a default are refused at
+# parse time by name, and the fifth is what makes secrets work at all. A
+# file missing `heartbeat_interval` does not start with a warning, it does
+# not start at all: "TOML parse error ... missing field heartbeat_interval".
 bind_addr = "0.0.0.0"
 port = 8080
+
+# How often this control plane polls each node it knows about, in seconds,
+# and how long a node may be silent before it is reported unresponsive.
+# There is no default for either: they decide how quickly a dead node is
+# noticed, and a number nobody chose is the wrong number to inherit.
+heartbeat_interval = 15
+heartbeat_timeout = 90
 
 # The credential every runtime node presents: on the gRPC handshake, and
 # on the two HTTP endpoints that serve nodes. Required in practice - with
@@ -74,13 +95,40 @@ api_auth_enabled = true
 api_keys = [
     "your-api-key-change-me"
 ]
+
+# The 32-byte key every environment secret is encrypted with. Without it
+# this control plane starts, answers /health with OK, and refuses every
+# secret endpoint with 503 - and serves each node an assignment list with
+# every application that has a secret withheld from it. Create it before
+# the first start (see below), and back it up: the encrypted values in the
+# database are worth nothing without this file.
+secret_key_file = "/etc/deis-control/secret.key"
+
+# Where uploaded bundles are kept - the only copy of every version's code.
+# Absolute on purpose; see the comment in the example configuration.
+bundle_dir = "/var/lib/deis-control/bundles"
 ```
 
 ### 3. Initialize Database
 
+The database is created on first start. The two things that are *not*
+created for you are the directory it lives in and the secret master key -
+and a control plane started without the key runs, and is unusable for every
+application that has a secret.
+
 ```bash
-# The database will be created automatically upon first startup
-mkdir -p /var/lib/deis-control
+# Database and bundle store. bundle_dir is under this path, and it is the
+# only copy of every version's code, so it belongs on storage that survives
+# a restart and is in the backup.
+sudo mkdir -p /var/lib/deis-control/bundles
+
+# The secret master key: 32 bytes, as 64 hex characters. Generate it once,
+# per installation, and never regenerate it - the values already in the
+# database decrypt with this key and no other. Losing it loses every
+# secret; a copy of it that other local users can read is not a secret at
+# all, which is why deis-control complains about the mode.
+sudo openssl rand -hex 32 | sudo tee /etc/deis-control/secret.key > /dev/null
+sudo chmod 600 /etc/deis-control/secret.key
 ```
 
 ### 4. Start Service
@@ -88,13 +136,32 @@ mkdir -p /var/lib/deis-control
 ```bash
 # Test startup
 ./target/release/deis-control \
-  -c config.toml \
+  -c /etc/deis-control/config.toml \
   --database /var/lib/deis-control/deis-control.db
-
-# Verify service
-curl http://localhost:8080/health
-# Should return: OK
 ```
+
+**`/health` is a liveness probe, and only that.** It answers the constant
+`OK` for as long as the process is running and accepting connections. It is
+deliberately that dumb - an unauthenticated prober must not be able to read
+the state of the platform off it - so it says nothing about whether the
+bundle store is present, whether the master key is readable, or whether any
+application can run. A control plane that has lost both still answers `OK`.
+
+So `curl /health` proves the process is up, and the startup log is what says
+whether it can do anything:
+
+```bash
+curl http://localhost:8080/health          # expect: OK - the process is alive
+
+# The three lines that decide whether this installation works at all.
+# Each of them is an ERROR or a WARN, and each names what stops working.
+journalctl -u deis-control -n 200 | grep -E 'Master key unusable|Bundle directory is not usable|No node credential'
+# Expect no output. Any hit here is an installation that answers OK and
+# cannot serve.
+```
+
+The readiness check that answers "can it serve" is in **Monitoring and
+Operations** below; it is also the one to run after a restore.
 
 ---
 
@@ -102,22 +169,38 @@ curl http://localhost:8080/health
 
 ### Dockerfile
 
+Build it from the root of the `deislet` workspace, not from this crate's
+directory: the binary is one crate of that workspace. Two things the obvious
+Dockerfile gets wrong and this one does not - the toolchain has to be new
+enough for edition 2024, and the console has to be built before `cargo`
+runs, because `deis-control` embeds `crates/deis-control/web/dist` at compile
+time and the build fails outright without it.
+
 ```dockerfile
-FROM rust:1.70 as builder
+FROM rust:1.85 AS builder
+
+# Node, for the console the binary embeds.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends nodejs npm && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . .
-RUN cargo build --release
+
+# The console first; cargo fails without its output.
+RUN cd crates/deis-control/web && npm ci && npm run build
+RUN cargo build --release -p deis-control
 
 FROM ubuntu:22.04
 
 RUN apt-get update && \
-    apt-get install -y ca-certificates && \
+    apt-get install -y ca-certificates sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/deis-control /usr/local/bin/
-COPY config.toml /etc/deis-control/
 
+# The configuration and the master key are mounted at run time, not baked in:
+# a key in an image layer is a key in every registry that image reaches.
 VOLUME ["/var/lib/deis-control"]
 EXPOSE 8080
 
@@ -127,16 +210,22 @@ CMD ["deis-control", "-c", "/etc/deis-control/config.toml", "--database", "/var/
 ### docker-compose.yml
 
 ```yaml
-version: '3.8'
-
 services:
   deis-control:
     build: .
     ports:
       - "8080:8080"  # HTTP API + the node gRPC channel, one port
     volumes:
+      # Database and bundle store. The bundle store has to be on this volume:
+      # it is the only copy of every version's code, and a container that
+      # keeps it in the writable layer loses every version on the next
+      # `docker compose up --build`.
       - deis-control-data:/var/lib/deis-control
       - ./config.toml:/etc/deis-control/config.toml:ro
+      # The secret master key. Without this mount the container starts,
+      # answers /health with OK, and withholds every application that has a
+      # secret from every node.
+      - ./secret.key:/etc/deis-control/secret.key:ro
     restart: unless-stopped
     environment:
       - RUST_LOG=info
@@ -145,16 +234,30 @@ volumes:
   deis-control-data:
 ```
 
+The `config.toml` beside the compose file is the minimal configuration from
+above, with the two paths pointing inside the container:
+
+```toml
+secret_key_file = "/etc/deis-control/secret.key"
+bundle_dir = "/var/lib/deis-control/bundles"
+```
+
+`docker compose down -v` deletes that volume, and with it the database **and**
+the bundle store. Take a backup first; see **Backup and Recovery** below.
+
 ### Start
 
 ```bash
-docker-compose up -d
+# Create the master key once, beside the compose file, before the first start.
+openssl rand -hex 32 > secret.key && chmod 600 secret.key
+
+docker compose up -d
 
 # View logs
-docker-compose logs -f
+docker compose logs -f
 
-# Stop
-docker-compose down
+# Stop. Without -v the data volume survives, which is what you want.
+docker compose down
 ```
 
 ---
@@ -233,10 +336,15 @@ server {
         grpc_pass grpc://localhost:8080;
     }
 
-    # Frontend static files
+    # The console. It is compiled into the binary and served from the same
+    # port as the API, so there is no static directory to point at: proxy it
+    # like everything else. A `root` here would serve an empty directory and
+    # a 404 for the dashboard.
     location / {
-        root /var/www/deis-control;
-        try_files $uri $uri/ /index.html;
+        proxy_pass http://localhost:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 
@@ -268,7 +376,11 @@ After=network.target
 Type=simple
 User=deis-control
 Group=deis-control
-WorkingDirectory=/opt/deis-control
+# A directory the service user owns and that the steps below actually
+# create. systemd refuses to start the unit when this path does not exist,
+# and the paths in the configuration are absolute anyway, so there is
+# nothing to gain from pointing it somewhere else.
+WorkingDirectory=/var/lib/deis-control
 ExecStart=/usr/local/bin/deis-control \
   -c /etc/deis-control/config.toml \
   --database /var/lib/deis-control/deis-control.db
@@ -303,18 +415,26 @@ WantedBy=multi-user.target
 # Create user
 sudo useradd -r -s /bin/false deis-control
 
-# Create directories and set permissions
-sudo mkdir -p /var/lib/deis-control /etc/deis-control
-sudo chown deis-control:deis-control /var/lib/deis-control
+# Create directories and set permissions. The bundle store is under the
+# data directory and has to exist before the first upload; the service
+# creates it if it can write there, which is what the chown below is for.
+sudo mkdir -p /var/lib/deis-control/bundles /etc/deis-control
+sudo chown -R deis-control:deis-control /var/lib/deis-control
 sudo chmod 700 /var/lib/deis-control
+
+# The secret master key, once per installation. See "Initialize Database"
+# above for what happens without it.
+sudo openssl rand -hex 32 | sudo tee /etc/deis-control/secret.key > /dev/null
+sudo chown deis-control:deis-control /etc/deis-control/secret.key
+sudo chmod 600 /etc/deis-control/secret.key
 
 # Install binary file
 sudo cp target/release/deis-control /usr/local/bin/
 sudo chown root:root /usr/local/bin/deis-control
 sudo chmod 755 /usr/local/bin/deis-control
 
-# Copy configuration
-sudo cp config.toml /etc/deis-control/
+# The configuration written in "Prepare Configuration File" above. It holds
+# the node credential and the API keys, so it is readable by this user only.
 sudo chown deis-control:deis-control /etc/deis-control/config.toml
 sudo chmod 600 /etc/deis-control/config.toml
 
@@ -340,7 +460,6 @@ sudo ufw enable
 
 # firewalld (CentOS)
 sudo firewall-cmd --permanent --add-port=8080/tcp
-sudo firewall-cmd --permanent --add-port=8080/tcp
 sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --reload
 ```
@@ -351,16 +470,37 @@ sudo firewall-cmd --reload
 
 ### 1. Log Management
 
-**Configure log level:**
-```bash
-# Environment variable method
-export RUST_LOG=deis-control=info,warn
+**Configure log level.** The filter names a *module path*, and a module path
+uses underscores: `deis_control`, never `deis-control`. The hyphenated
+spelling is not an error and is not warned about - it simply matches nothing,
+and because it is the only directive it also turns off the default, so the
+service runs completely silent. That includes the startup ERROR lines that
+say the master key is unreadable or the bundle directory is not writable.
 
-# In systemd service
-Environment="RUST_LOG=deis-control=info"
+```bash
+# Everything this crate logs at info, everything else at warn.
+export RUST_LOG=deis_control=info,warn
+
+# In the systemd service
+Environment="RUST_LOG=deis_control=info,warn"
 ```
 
-**Log rotation** (`/etc/logrotate.d/deis-control`):
+**Log rotation.** Under the systemd unit above, output goes to the journal
+(`StandardOutput=journal`), so rotation is `journalctl`'s and there is nothing
+to configure here:
+
+```bash
+# How much the journal keeps
+sudo journalctl --vacuum-time=30d
+# Or permanently, in /etc/systemd/journald.conf: MaxRetentionSec=30day
+```
+
+Only if you redirect the service's output to a file of your own does logrotate
+come into it, and then it has to be `copytruncate`: the process writes to the
+descriptor it was started with, has no reload that reopens a log file, and
+`systemctl reload` on this unit fails outright because it declares no
+`ExecReload`.
+
 ```
 /var/log/deis-control/*.log {
     daily
@@ -369,15 +509,26 @@ Environment="RUST_LOG=deis-control=info"
     delaycompress
     missingok
     notifempty
-    create 0640 deis-control deis-control
-    sharedscripts
-    postrotate
-        systemctl reload deis-control
-    endscript
+    copytruncate
 }
 ```
 
 ### 2. Prometheus Monitoring
+
+`/api/metrics` is behind the same credential as the rest of the human API, so
+with `api_auth_enabled = true` - which the minimal configuration above sets -
+an unauthenticated scrape gets **401**, not a page of numbers. Mint a token
+that can do nothing else and give it to the scraper:
+
+```bash
+# A read-only token. Do not point a scraper at an api_keys entry: those are
+# unscoped and can deploy, rotate secrets and mint any tenant's storage
+# token. The secret is printed once and never again, so it goes straight
+# into the file the scraper reads.
+deis token create --account ops --scope 'read:*/*' --json prometheus \
+  | jq -r .secret > /etc/prometheus/deis-control.token
+chmod 600 /etc/prometheus/deis-control.token
+```
 
 **Prometheus configuration** (`prometheus.yml`):
 ```yaml
@@ -386,22 +537,84 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:8080']
     metrics_path: '/api/metrics'
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/deis-control.token
 ```
+
+`deis-telemetry` exports on a port of its own and is scraped the same way,
+with its own token; see `crates/deis-telemetry/deis-telemetry.example.toml`.
+Two series there are worth an alert on any installation:
+`deis_telemetry_store_writable` going to 0 means the collector is refusing
+every log line and trace it is handed, and `deis_telemetry_storage_failures_total`
+climbing means something underneath it is failing whatever surface noticed.
 
 ### 3. Health Check
 
-**Script example** (`healthcheck.sh`):
+`/health` answers a constant `OK` while the process is alive, so a probe on
+it is a liveness probe and belongs in a supervisor's restart policy. It is
+not a readiness check and must not be used as one: the failure it cannot see
+is exactly the one that follows a bad restore, where the process is perfectly
+alive and every application is missing its code, its secrets, or both.
+
+**Liveness** (`healthcheck.sh`) - restart the process when this fails:
+
 ```bash
 #!/bin/bash
 response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
 
 if [ "$response" -eq 200 ]; then
-    echo "Control is healthy"
+    echo "Control is alive"
     exit 0
 else
-    echo "Control is unhealthy (HTTP $response)"
+    echo "Control is not answering (HTTP $response)"
     exit 1
 fi
+```
+
+**Readiness** - whether it can actually serve. Restarting does not fix any of
+these, so this belongs in an alert, not in a restart policy:
+
+```bash
+#!/bin/bash
+# readiness.sh <api-key> <node-key>
+set -u
+API=$1; NODE=$2; BASE=http://localhost:8080
+fail=0
+
+# 1. Every version's bundle is on disk. A version whose file is missing
+#    answers 500 here, and no node can ever load it.
+for row in $(curl -sf -H "Authorization: Bearer $API" "$BASE/api/apps" \
+             | jq -r '.apps[].id'); do
+  for vid in $(curl -sf -H "Authorization: Bearer $API" "$BASE/api/apps/$row/versions" \
+               | jq -r '.versions[].id'); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $NODE" \
+           "$BASE/api/apps/$row/versions/$vid/bundle")
+    [ "$code" = 200 ] || { echo "bundle missing: $row $vid (HTTP $code)"; fail=1; }
+  done
+done
+
+# 2. The master key decrypts what is in the database. Listing names needs no
+#    key; writing one needs the key and the existing rows to agree with it.
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+       -H "Authorization: Bearer $API" -H 'content-type: application/json' \
+       -d '{"value":"readiness-probe"}' \
+       "$BASE/api/apps/<app>/environments/<env>/secrets/DEIS_READINESS")
+# 503 here is a missing or unreadable secret_key_file; 500 is a master key
+# that does not decrypt what is already in the database, which is the shape
+# of a restore that took the database from one host and the key from another.
+[ "$code" = 200 ] || { echo "secret storage unusable (HTTP $code)"; fail=1; }
+
+exit $fail
+```
+
+Point 1 is the check that would have caught the restore this document used to
+describe. Point 2 needs an application and environment to write into; use a
+throwaway one, and delete the probe secret afterwards:
+
+```bash
+curl -s -X DELETE -H "Authorization: Bearer $API" \
+  "$BASE/api/apps/<app>/environments/<env>/secrets/DEIS_READINESS"
 ```
 
 ---
@@ -415,13 +628,17 @@ fi
 ```bash
 # Check port occupation
 sudo lsof -i :8080
-sudo lsof -i :8080
 
-# Check configuration file
-deis-control -c /etc/deis-control/config.toml --check-config
+# Check the configuration file. There is no --check-config flag: the parse
+# happens at startup, so a start is the check. `-p 0` takes an ephemeral
+# port and a throwaway database, so this can be run beside a live instance;
+# Ctrl-C it once it says "Listening". A file missing one of the required
+# keys never gets that far - it fails with "missing field <key>", naming
+# the key, before anything is bound or written.
+deis-control -c /etc/deis-control/config.toml --database /tmp/probe.db -p 0
 
 # View detailed logs
-RUST_LOG=debug deis-control -c config.toml
+RUST_LOG=debug deis-control -c /etc/deis-control/config.toml
 ```
 
 #### 2. Node cannot connect
@@ -461,66 +678,174 @@ openssl s_client -connect deis-control.yourdomain.com:8080
 
 ## 📦 Backup and Recovery
 
+### What has to be in the backup
+
+Four things, and the database is only one of them. The procedure in this
+document used to be the database and the configuration file; a restore from
+that answers `/health` with `OK`, lists every application and every version in
+the console, and cannot run a single one of them.
+
+| What | Where | What is lost without it |
+|---|---|---|
+| The catalog database | `--database`, e.g. `/var/lib/deis-control/deis-control.db` | Applications, versions, environments, deployment pointers, routes, accounts, scoped tokens, the encrypted secrets and the audit log. |
+| **The bundle store** | `bundle_dir`, e.g. `/var/lib/deis-control/bundles` | Every version's code. The database keeps a *path*, not the bytes. A node fetching a version whose file is gone gets `500 bundle ... is recorded but missing on disk`, and re-uploading cannot repair it: the manifest is inside the archive whose sha256 **is** the version id, so an upload of the same source produces a different version. Rollback to any earlier version becomes impossible. |
+| **The secret master key** | `secret_key_file`, e.g. `/etc/deis-control/secret.key` | Every environment secret. The values in the database are encrypted with this key and decrypt with no other. Without the file, secret endpoints answer 503 and **every application that has a secret is withheld from each node's assignment list** - the list comes back marked incomplete, so a node reconciling against it keeps whatever it is already running and starts none of them. On a node that was rebuilt with the platform, that is nothing at all. |
+| The configuration file | `-c`, e.g. `/etc/deis-control/config.toml` | `node_preshared_keys`, `api_keys` and `storage_auth_secret` are shared with the rest of the fleet. A restored control plane with new values is one no node and no CLI can talk to. |
+
+The other components hold state of their own and are not covered by this
+document's script. In the order it matters:
+
+* **deis-store** - `deis-store snapshot --out DIR` and
+  `deis-store restore --from DIR`. Use them. Every database there runs in WAL
+  mode, so `cp -r` or `rsync` of the data directory can copy a tree that is
+  missing the most recent commits or is simply corrupt, and it does not fail
+  when you take it - only when you restore it. The snapshot covers the SQLite
+  databases *and* the objects, and writes a `snapshot.json` naming both counts;
+  a running service takes the same snapshots on a timer once `snapshot_dir` is
+  set.
+* **deis-queue** - `<data_dir>/queue.sqlite`, also WAL, and with no snapshot
+  subcommand of its own. Copy it with `sqlite3 queue.sqlite ".backup out.db"`
+  or `VACUUM INTO`, never with `cp`. In-flight messages are the loss.
+* **deis-proxy** - the ACME storage directory (`tls.acme.storage_dir`, default
+  `acme`). It holds the account key and the issued certificates. Losing it is
+  recoverable but not free: the account is registered again and every
+  certificate re-issued, against the issuing authority's rate limits.
+* **deis-telemetry** - `<data_dir>/telemetry.sqlite`. Logs, traces and metric
+  samples; losing them loses history, not the ability to serve. Back it up if
+  the history is worth something, with `.backup` for the same WAL reason.
+* **deis-runtime** - nothing. A node's data directory is derived state: its
+  assignment list and the bundles it has fetched. It rebuilds both from the
+  control plane on its next poll, which is exactly why the control plane's
+  bundle store has to be in the backup.
+
 ### Backup
 
 ```bash
 #!/bin/bash
-# backup.sh
+# backup.sh - the four things a control plane cannot be rebuilt without.
+set -euo pipefail
 
-BACKUP_DIR="/var/backups/deis-control"
+DB=/var/lib/deis-control/deis-control.db
+BUNDLES=/var/lib/deis-control/bundles
+KEY=/etc/deis-control/secret.key
+CONF=/etc/deis-control/config.toml
+
+BACKUP_DIR=/var/backups/deis-control
 DATE=$(date +%Y%m%d_%H%M%S)
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
 
-mkdir -p $BACKUP_DIR
+mkdir -p "$BACKUP_DIR"
 
-# Backup database
-sqlite3 /var/lib/deis-control/deis-control.db ".backup $BACKUP_DIR/deis-control-$DATE.db"
+# The database, through SQLite's own backup API. It runs in WAL mode, so a
+# plain cp can produce a file that is missing the last commits or is corrupt,
+# and neither shows up until the day it is restored.
+sqlite3 "$DB" ".backup '$STAGE/deis-control.db'"
 
-# Backup configuration
-cp /etc/deis-control/config.toml $BACKUP_DIR/config-$DATE.toml
+# The bundle store: the only copy of every version's code.
+cp -a "$BUNDLES" "$STAGE/bundles"
 
-# Compress
-tar czf $BACKUP_DIR/deis-control-backup-$DATE.tar.gz \
-    $BACKUP_DIR/deis-control-$DATE.db \
-    $BACKUP_DIR/config-$DATE.toml
+# The master key, and the configuration that has to match the rest of the
+# fleet. Both hold credentials, so the archive is written 0600.
+cp -a "$KEY" "$STAGE/secret.key"
+cp -a "$CONF" "$STAGE/config.toml"
 
-# Clean up temporary files
-rm $BACKUP_DIR/deis-control-$DATE.db
-rm $BACKUP_DIR/config-$DATE.toml
+# The absolute path the bundle store lived at. The restore needs it; see
+# below for why.
+echo "$BUNDLES" > "$STAGE/bundle_dir.path"
 
-# Retain backups from the last 30 days
-find $BACKUP_DIR -name "*.tar.gz" -mtime +30 -delete
+umask 077
+tar czf "$BACKUP_DIR/deis-control-$DATE.tar.gz" -C "$STAGE" .
+
+find "$BACKUP_DIR" -name '*.tar.gz' -mtime +30 -delete
 ```
 
 ### Recovery
 
+**Copying the bundle files back is not enough if the path changed.** Each
+version row holds an absolute `bundle_path`, and only a path stored *relative*
+is re-anchored at startup - an absolute one from a host that no longer exists
+is left exactly as it was. Bundle files restored to a different absolute path
+are therefore restored to somewhere nothing will look, and the symptom is
+identical to not having copied them at all: `500 recorded but missing on disk`
+on every node's fetch, while `/health` goes on answering `OK`.
+
+That is what `bundle_dir.path` in the archive is for. The script below reads
+it, and when the store has moved it rewrites both the recorded paths and
+`bundle_dir` in the restored configuration.
+
 ```bash
 #!/bin/bash
-# restore.sh
+# restore.sh <backup_file.tar.gz>
+set -euo pipefail
 
-BACKUP_FILE=$1
+BACKUP_FILE=${1:?Usage: $0 <backup_file.tar.gz>}
+DB=/var/lib/deis-control/deis-control.db
+BUNDLES=/var/lib/deis-control/bundles
+KEY=/etc/deis-control/secret.key
+CONF=/etc/deis-control/config.toml
 
-if [ -z "$BACKUP_FILE" ]; then
-    echo "Usage: $0 <backup_file.tar.gz>"
-    exit 1
-fi
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+tar xzf "$BACKUP_FILE" -C "$STAGE"
 
-# Stop service
 sudo systemctl stop deis-control
 
-# Extract backup
-tar xzf $BACKUP_FILE -C /tmp
+install -o deis-control -g deis-control -m 600 "$STAGE/deis-control.db" "$DB"
+install -o deis-control -g deis-control -m 600 "$STAGE/secret.key"       "$KEY"
+install -o deis-control -g deis-control -m 600 "$STAGE/config.toml"      "$CONF"
 
-# Restore database
-cp /tmp/deis-control-*.db /var/lib/deis-control/deis-control.db
-chown deis-control:deis-control /var/lib/deis-control/deis-control.db
+rm -rf "$BUNDLES"
+cp -a "$STAGE/bundles" "$BUNDLES"
+chown -R deis-control:deis-control "$BUNDLES"
 
-# Restore configuration
-cp /tmp/config-*.toml /etc/deis-control/config.toml
-chown deis-control:deis-control /etc/deis-control/config.toml
+# If the bundle store is not at the path it had on the source host, two
+# things still name a machine that no longer exists: the path recorded with
+# each version, and bundle_dir in the configuration that came out of the
+# archive. Both are rewritten to $BUNDLES, which is where the operator
+# running this script has already said the store now lives.
+#
+# Doing only the first is the trap: the restored versions would serve
+# perfectly while every new upload was written to the old path, and nobody
+# would find out until the next restore.
+WAS=$(cat "$STAGE/bundle_dir.path")
+if [ "$WAS" != "$BUNDLES" ]; then
+    echo "bundle store moved from $WAS to $BUNDLES; rewriting the recorded paths"
+    sqlite3 "$DB" \
+      "UPDATE versions SET bundle_path = '$BUNDLES' || '/' || app_id || '/' || bundle_sha || '.zip';"
 
-# Start service
+    if grep -qE '^[[:space:]]*bundle_dir[[:space:]]*=' "$CONF"; then
+        sed -i -E "s|^[[:space:]]*bundle_dir[[:space:]]*=.*|bundle_dir = \"$BUNDLES\"|" "$CONF"
+    else
+        # It was commented out, so the old host was running on the default.
+        printf '\nbundle_dir = "%s"\n' "$BUNDLES" >> "$CONF"
+    fi
+    grep -n '^bundle_dir' "$CONF"
+fi
+
 sudo systemctl start deis-control
 ```
+
+### Verifying a restore
+
+Run the readiness script from **Monitoring and Operations** above. `/health`
+answering `OK` is not a verification of anything, and neither is the console
+listing the applications: both look exactly the same on a restore that has
+lost the bundle store and the master key.
+
+This procedure was checked by restoring, on a control plane holding one
+application, one version, one deployment and one secret. What each restore
+produced:
+
+| Restore | `/health` | Versions listed | Node fetches the bundle | Node's assignment list |
+|---|---|---|---|---|
+| Database + configuration only (what this document used to say) | `200 OK` | yes | `500 recorded but missing on disk` | `[]` - the application is withheld, because the master key is gone and its environment cannot be built |
+| All four, bundle store at a new path, paths not rewritten | `200 OK` | yes | `500 recorded but missing on disk` | complete, with the secret decrypted - so a node accepts the assignment and then fails to fetch the code |
+| All four, bundle store back at its original path | `200 OK` | yes | `200`, the bundle | complete, with the secret decrypted |
+
+The middle row is the one worth reading twice: every file was in the backup and
+the restore still did not work, because a path in the database outlived the
+machine it named.
 
 ---
 
@@ -529,7 +854,9 @@ sudo systemctl start deis-control
 ### Upgrade Steps
 
 ```bash
-# 1. Backup
+# 1. Backup - all four things, not just the database. An upgrade that has to
+#    be rolled back needs the bundle store and the master key as much as a
+#    restore from a lost machine does.
 ./backup.sh
 
 # 2. Download new version
@@ -543,15 +870,15 @@ sudo systemctl stop deis-control
 sudo cp deis-control-v0.2.0/deis-control /usr/local/bin/
 sudo chmod 755 /usr/local/bin/deis-control
 
-# 5. Check configuration compatibility
-deis-control -c /etc/deis-control/config.toml --check-config
-
-# 6. Start service
+# 5. Start service
 sudo systemctl start deis-control
 
-# 7. Verify
+# 6. Verify. /health only says the process is alive; the log is where a
+#    configuration key the new version stopped accepting shows up, and the
+#    readiness script is what says it can serve.
 curl http://localhost:8080/health
 sudo journalctl -u deis-control -n 50
+./readiness.sh "$API_KEY" "$NODE_KEY"
 ```
 
 ---

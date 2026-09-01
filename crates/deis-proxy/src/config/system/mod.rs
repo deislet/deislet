@@ -2,6 +2,7 @@ pub mod acme;
 pub mod balancing;
 pub mod cache;
 pub mod compression;
+pub mod health;
 pub mod https;
 pub mod log;
 pub mod routing;
@@ -19,6 +20,7 @@ pub use acme::AcmeConfig;
 pub use balancing::BalancingStrategy;
 pub use cache::CacheConfig;
 pub use compression::{CompressionAlgo, CompressionConfig};
+pub use health::{HealthCheckConfig, HealthCheckMode};
 pub use https::HttpsConfig;
 pub use log::*;
 pub use routing::RoutingConfig;
@@ -31,9 +33,32 @@ use crate::config::{ConfigError, Validatable};
 pub const DEFAULT_PID_FILE: &str = "/tmp/deis-proxy.pid";
 /// Unix socket used to hand listening sockets to an upgraded process.
 pub const DEFAULT_UPGRADE_SOCK: &str = "/tmp/deis_proxy_upgrade.sock";
+/// Longest `upgrade_sock` path a Unix socket can carry.
+///
+/// `struct sockaddr_un` on Linux holds the path in a fixed `char sun_path[108]`
+/// that has to end in a NUL, so 107 bytes is the whole address space a Unix
+/// socket has. It is checked here rather than left to `bind()` because the
+/// only process that binds this path is the replacement started for an
+/// upgrade: pingora's `get_fds_from` calls `UnixAddr::new(path).unwrap()`, so
+/// a path one byte too long is a panic in the one process the running one is
+/// about to hand its listeners to. Refusing the configuration at startup
+/// turns "the next upgrade is an outage" into "this instance does not start".
+///
+/// [`SystemConfig::resolve_paths`] makes relative paths absolute, so the
+/// length that matters is the resolved one; this is checked after that step,
+/// on the merged configuration.
+pub const MAX_UPGRADE_SOCK_PATH_LEN: usize = 107;
 /// SQLite database holding application configurations.
 pub const DEFAULT_DATABASE: &str = "sites.db";
-/// Seconds between TCP health checks of each upstream.
+/// Seconds between health checks of each upstream.
+///
+/// What one check asks is [`health::HealthCheckConfig`]; this is only how
+/// often it is asked. Five seconds against the two-second probe timeout
+/// leaves three seconds of slack, so a probe can never still be running when
+/// the next one is due. With [`health::DEFAULT_UNHEALTHY_AFTER`] set to two,
+/// a node that stops answering leaves rotation one interval after its first
+/// failed probe -- five seconds of failing, plus however long each of the two
+/// probes took to give up.
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 /// Seconds to wait for an upstream TCP connection.
 pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 5;
@@ -95,8 +120,12 @@ pub struct SystemConfig {
     pub upstreams: Option<Vec<UpstreamServer>>,
     /// How requests are spread across upstreams. Fixed for the process lifetime.
     pub balancing_strategy: Option<BalancingStrategy>,
-    /// Seconds between TCP health checks of each upstream.
+    /// Seconds between health checks of each upstream.
     pub health_check_interval_secs: Option<u64>,
+    /// What one of those checks asks, and how many answers move a node in or
+    /// out of rotation. Fixed for the process lifetime, like the interval
+    /// above and the balancing strategy.
+    pub health_check: Option<HealthCheckConfig>,
     /// Seconds to wait for an upstream TCP connection.
     pub upstream_connect_timeout_secs: Option<u64>,
     /// Seconds to wait for an upstream response.
@@ -148,6 +177,7 @@ impl SystemConfig {
             upstreams: None,
             balancing_strategy: Some(BalancingStrategy::RoundRobin),
             health_check_interval_secs: Some(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
+            health_check: Some(HealthCheckConfig::default()),
             upstream_connect_timeout_secs: Some(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS),
             upstream_read_timeout_secs: Some(DEFAULT_UPSTREAM_READ_TIMEOUT_SECS),
             grace_period_secs: Some(DEFAULT_GRACE_PERIOD_SECS),
@@ -237,6 +267,11 @@ impl SystemConfig {
             self.health_check_interval_secs
                 .unwrap_or(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
         )
+    }
+
+    /// Health check settings, or the defaults when the section is absent.
+    pub fn health_check(&self) -> HealthCheckConfig {
+        self.health_check.clone().unwrap_or_default()
     }
 
     pub fn upstream_connect_timeout(&self) -> Duration {
@@ -330,6 +365,26 @@ impl Validatable for SystemConfig {
                 message: "worker_threads must be at least 1".to_string(),
             });
         }
+        // Checked on every layer, but the one that decides is the merged and
+        // resolved configuration: `resolve_paths` turns a relative
+        // `upgrade_sock` into an absolute one, which only ever makes it
+        // longer.
+        if let Some(sock) = &self.upgrade_sock
+            && sock.len() > MAX_UPGRADE_SOCK_PATH_LEN
+        {
+            return Err(ConfigError::ValidationError {
+                message: format!(
+                    "upgrade_sock is {} bytes ({sock}) but a Unix socket address holds at most \
+                     {MAX_UPGRADE_SOCK_PATH_LEN}. A relative path is resolved against the \
+                     working directory before this is measured, so shorten the path or \
+                     move it under a shorter directory. Left as it is, this instance \
+                     starts and serves, and the next zero-downtime upgrade is a full \
+                     outage: the replacement panics on the over-long address after the \
+                     running process has already been told to hand over its listeners",
+                    sock.len()
+                ),
+            });
+        }
         if let Some(tls) = &self.tls {
             tls.validate()?;
             if let Some(ports) = &self.listen_ports
@@ -376,6 +431,9 @@ impl Validatable for SystemConfig {
                     .to_string(),
             });
         }
+        if let Some(health_check) = &self.health_check {
+            health_check.validate()?;
+        }
         if let Some(cache) = &self.cache {
             cache.validate()?;
         }
@@ -421,6 +479,7 @@ impl Add<SystemConfig> for SystemConfig {
             health_check_interval_secs: other
                 .health_check_interval_secs
                 .or(self.health_check_interval_secs),
+            health_check: other.health_check.or(self.health_check),
             upstream_connect_timeout_secs: other
                 .upstream_connect_timeout_secs
                 .or(self.upstream_connect_timeout_secs),
@@ -443,6 +502,8 @@ impl Add<SystemConfig> for SystemConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -522,6 +583,43 @@ ports = [443]
         };
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("max_request_body_bytes"), "{err}");
+    }
+
+    #[test]
+    fn an_upgrade_socket_longer_than_an_address_is_refused() {
+        let sock = format!("/tmp/{}.sock", "x".repeat(MAX_UPGRADE_SOCK_PATH_LEN));
+        let config = SystemConfig {
+            upgrade_sock: Some(sock),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("upgrade_sock"), "{err}");
+        assert!(
+            err.contains(&MAX_UPGRADE_SOCK_PATH_LEN.to_string()),
+            "the refusal has to name the limit so an operator knows how much to cut: {err}"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_socket_is_measured_after_it_has_been_resolved() {
+        // The shape that got past every earlier check: short in the file,
+        // over the limit once `resolve_paths` has made it absolute. Which is
+        // the only length that matters, because it is the one that reaches
+        // `bind()`.
+        let base = PathBuf::from(format!("/srv/{}", "d".repeat(90)));
+        let local: SystemConfig = toml::from_str("upgrade_sock = \"run/upgrade.sock\"\n").unwrap();
+        local
+            .validate()
+            .expect("the relative path on its own is well under the limit");
+
+        let mut merged = SystemConfig::baseline() + local;
+        merged.resolve_paths(&base);
+        assert!(
+            merged.upgrade_sock().len() > MAX_UPGRADE_SOCK_PATH_LEN,
+            "the fixture is not long enough to exercise anything"
+        );
+        let err = merged.validate().unwrap_err().to_string();
+        assert!(err.contains("upgrade_sock"), "{err}");
     }
 
     #[test]

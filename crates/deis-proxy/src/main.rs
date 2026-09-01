@@ -23,14 +23,25 @@ use deis_proxy::config::system::acme::{LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STA
 use deis_proxy::config::{ConfigManager, SystemConfig};
 use deis_proxy::control::{ControlService, ProxyControlClient};
 use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic};
-use deis_proxy::restart::{ProcessControl, RelaunchArgs, announce_ready};
+use deis_proxy::restart::{
+    ProcessControl, RelaunchArgs, announce_ready, check_upgrade_socket_path,
+    prove_upgrade_socket_bindable,
+};
 use deis_proxy::tls::SniCertificates;
 
-/// Upper bound on the initial upstream discovery. It runs after the listening
-/// sockets have been taken over, so a stall here delays queued connections
-/// rather than refusing them; anything slower is left to the background
-/// refresh. Well under the five seconds pingora keeps the old process
-/// accepting after the handover.
+/// Upper bound on the initial upstream discovery and the health check pass
+/// that follows it. Both run after the listening sockets have been taken
+/// over, so a stall here delays queued connections rather than refusing
+/// them; anything slower is left to the background refresh.
+///
+/// Three seconds is chosen against two numbers. Below it: one probe costs at
+/// most `health_check.timeout_secs` (2 by default) and every upstream is
+/// probed at once, so a resolver that answers promptly leaves a second of
+/// slack. Above it: pingora keeps the old process accepting for five seconds
+/// after the handover, and running past that would mean refusing connections
+/// rather than queueing them. Timing out is not a failure - it only means
+/// the pool is believed as discovered until the first background pass, which
+/// is where it was before this ran at all.
 const WARM_UP_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn init_logging(system: &SystemConfig) -> Result<()> {
@@ -266,6 +277,28 @@ fn main() -> Result<()> {
         }
     }
 
+    // Checked on every start, upgrade or not, because the only process that
+    // ever binds this path is the replacement started for an upgrade: an
+    // unusable path is otherwise invisible until the day somebody upgrades,
+    // and by then the running process has already been told to hand over.
+    // Refused rather than warned about: an instance that cannot be replaced
+    // without an outage is not one an operator should discover mid-upgrade.
+    check_upgrade_socket_path(system.upgrade_sock()).with_context(|| {
+        format!(
+            "upgrade_sock {} cannot be used, so no zero-downtime upgrade of this instance could \
+             succeed",
+            system.upgrade_sock()
+        )
+    })?;
+    info!(
+        upgrade_sock = system.upgrade_sock(),
+        bytes = system.upgrade_sock().len(),
+        limit = deis_proxy::config::system::MAX_UPGRADE_SOCK_PATH_LEN,
+        "the upgrade socket path fits a Unix address and its directory exists and is writable; \
+         the replacement started for an upgrade binds it again and only reports ready once it \
+         has"
+    );
+
     // Everything async that must happen before pingora takes over runs on a
     // throwaway runtime, which is shut down before the server daemonizes.
     let init_runtime = tokio::runtime::Builder::new_current_thread()
@@ -330,10 +363,16 @@ fn main() -> Result<()> {
     };
     let mut server = Server::new_with_opt_and_conf(opt, server_conf(&system, daemon));
 
-    // Everything that can fail at startup has succeeded. When this process
-    // was spawned for an upgrade, tell the old process so now, right before
-    // the upgrade socket is bound; it sends SIGQUIT to itself on this byte.
+    // When this process was spawned for an upgrade, the byte written below is
+    // what makes the running process SIGQUIT itself, and pingora never
+    // reconsiders that. So the last thing that can fail is proved first: bind
+    // the upgrade socket, here, where a failure is still only this process
+    // exiting and the running one keeps every listener. Skipped when nothing
+    // is waiting on a readiness pipe, because then the SIGQUIT may already
+    // have been sent by hand and unlinking the path would take the socket
+    // away from a handover in progress; see deis_proxy::restart.
     if let Some(fd) = cli.ready_fd {
+        prove_upgrade_socket_bindable(system.upgrade_sock())?;
         announce_ready(fd)?;
     }
     server.bootstrap();

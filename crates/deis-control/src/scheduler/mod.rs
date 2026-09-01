@@ -32,7 +32,21 @@ use tokio::time::{Duration, interval};
 use tracing::{debug, info, warn};
 
 use crate::catalog::CatalogStore;
-use crate::runtime_client::RuntimeNodeManager;
+use crate::runtime_client::{NodeError, RuntimeNodeManager, trigger::TriggerResponse};
+
+/// Marker the node stamps on the front of `TriggerResponse.error` when the
+/// application's own handler ran and failed, as opposed to this node being
+/// unable to run the occurrence at all.
+///
+/// The other half of the pair is `deis_runtime::trigger::HANDLER_FAILED_PREFIX`.
+/// The literal is spelled out again here instead of imported because this
+/// crate cannot depend on deis-runtime - that is the process this one drives,
+/// and it carries a whole JavaScript engine - and because the marker belongs
+/// to trigger.proto rather than to either side of it. The pair is only as good
+/// as the two spellings agreeing, so [`tests::a_handler_failure_is_recognised_by_its_marker`]
+/// pins this one; if they ever drift, the control plane stops recognising a
+/// failed handler and goes back to replaying it on every node in the fleet.
+const HANDLER_FAILED_PREFIX: &str = "handler-failed: ";
 
 /// What a task is keyed by. An application in two environments keeps two
 /// independent schedules, because they run different versions.
@@ -63,9 +77,16 @@ pub struct CronTask {
     /// When this task was last due, whether or not a node took it. The
     /// time the occurrence was due, not the time the tick fired it.
     pub last_run: Option<DateTime<Utc>>,
-    /// Node that ran the last occurrence. `None` after an occurrence that
-    /// no node accepted.
+    /// Node the last occurrence was handed to, whether or not the handler
+    /// on it succeeded. `None` after an occurrence no node accepted.
     pub last_node: Option<String>,
+    /// What became of the last occurrence.
+    ///
+    /// Separate from `last_node` because "no node would take it" and "a node
+    /// ran it and the application's handler threw" are different events with
+    /// different consequences, and a single `Option<String>` said the same
+    /// thing about both.
+    pub last_outcome: Option<RunOutcome>,
 }
 
 impl CronTask {
@@ -90,6 +111,80 @@ struct Due {
     index: usize,
     cron_expr: String,
     scheduled: DateTime<Utc>,
+}
+
+/// What one node's answer to a scheduled trigger means for the rest of the
+/// walk over the fleet.
+///
+/// The two failures are not interchangeable, and the node is the only thing
+/// that can tell them apart, which is why it says so on the wire.
+#[derive(Debug, PartialEq, Eq)]
+enum NodeAnswer {
+    /// The handler ran here and finished.
+    Ran,
+    /// Nothing of the occurrence happened on this node: it does not have the
+    /// application loaded, it is shutting down, it could not be reached at
+    /// all. Another node may still run it.
+    NotRunnableHere(String),
+    /// The application's own handler ran here and threw. The occurrence has
+    /// already had whatever effect the handler managed before it failed - a
+    /// charge, an email, a write - so handing it to a second node would
+    /// replay that effect rather than retry it.
+    HandlerFailed(String),
+}
+
+/// Read one node's answer to `OnScheduled`.
+///
+/// A transport or RPC error is this control plane's own view of the node and
+/// not an answer from it, so it is read as "not runnable here": at the point
+/// the call failed the node had, as far as anything here knows, not started
+/// the handler. The one case that reading gets wrong is a deadline that
+/// expires while a handler is still running, which is why the deadline in
+/// `runtime_client` is deliberately twice the node's own execution ceiling.
+fn read_answer(result: Result<TriggerResponse, NodeError>) -> NodeAnswer {
+    let error = match result {
+        Ok(resp) if resp.success => return NodeAnswer::Ran,
+        Ok(resp) => resp.error,
+        Err(e) => return NodeAnswer::NotRunnableHere(e.to_string()),
+    };
+
+    match error.strip_prefix(HANDLER_FAILED_PREFIX) {
+        Some(reason) if !reason.trim().is_empty() => NodeAnswer::HandlerFailed(reason.to_string()),
+        // The marker with nothing behind it still means the handler ran: what
+        // is missing is only the reason, and treating that as "try elsewhere"
+        // would replay the effect the marker exists to prevent.
+        Some(_) => {
+            NodeAnswer::HandlerFailed("the node did not say why the handler failed".to_string())
+        }
+        None if error.is_empty() => NodeAnswer::NotRunnableHere(
+            "node reported the scheduled run as failed without saying why".to_string(),
+        ),
+        None => NodeAnswer::NotRunnableHere(error),
+    }
+}
+
+/// What became of one occurrence once the walk over the fleet stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum RunOutcome {
+    /// A node ran the handler and it finished.
+    Ran { node: String },
+    /// A node ran the handler and the handler itself failed. The occurrence
+    /// is over: it is not handed to another node, and it is not made up later.
+    HandlerFailed { node: String, error: String },
+    /// No node ran it at all. Every node that was tried said it could not,
+    /// or could not be reached.
+    NoNodeRan,
+}
+
+impl RunOutcome {
+    /// The node the occurrence was handed to, if any.
+    fn node(&self) -> Option<&str> {
+        match self {
+            RunOutcome::Ran { node } | RunOutcome::HandlerFailed { node, .. } => Some(node),
+            RunOutcome::NoNodeRan => None,
+        }
+    }
 }
 
 /// Outcome of one reconciliation against the catalog, for logging.
@@ -393,16 +488,45 @@ impl CronScheduler {
                 );
                 return;
             }
-            let node = self.trigger_once(&item, now).await;
-            self.record_run(&item, now, node);
+            let outcome = self.trigger_once(&item, now).await;
+            self.record_run(&item, now, outcome);
         }
     }
 
-    /// Hand one occurrence to a single node, trying the next one when a
-    /// node refuses or is unreachable.
+    /// Hand one occurrence to the fleet, over this control plane's own
+    /// transport.
+    async fn trigger_once(&self, due: &Due, now: DateTime<Utc>) -> RunOutcome {
+        self.fire_on_fleet(due, now, |node| {
+            let key = due.key.clone();
+            let cron = due.cron_expr.clone();
+            let scheduled = due.scheduled;
+            async move {
+                self.nodes
+                    .trigger_scheduled(&node, &key.app_id, &key.environment, &cron, scheduled)
+                    .await
+            }
+        })
+        .await
+    }
+
+    /// Walk the fleet for one occurrence, stopping at the first node that
+    /// answers something final.
     ///
-    /// Returns the node that ran it, or `None` when nobody did.
-    async fn trigger_once(&self, due: &Due, now: DateTime<Utc>) -> Option<String> {
+    /// Two of the three answers end the walk. A node that ran the handler
+    /// ends it because the occurrence happened; a node whose *handler* failed
+    /// ends it because the occurrence also happened - the handler had
+    /// whatever effect it managed before it threw, and asking a second node
+    /// would replay that effect, not retry it. Only "this node cannot run it"
+    /// moves on, because then nothing of the occurrence has happened yet.
+    ///
+    /// The call is a parameter so the decision above can be tested without a
+    /// fleet of live nodes: getting it wrong is not a failure anything would
+    /// notice, it is one due occurrence charging a card once per node.
+    async fn fire_on_fleet<F, Fut>(&self, due: &Due, now: DateTime<Utc>, mut call: F) -> RunOutcome
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<TriggerResponse, NodeError>>,
+    {
         let Due {
             key,
             cron_expr,
@@ -436,32 +560,48 @@ impl CronScheduler {
                 cron = %cron_expr,
                 "No runtime node is configured, so this scheduled run does not happen at all; the occurrence is skipped, not queued"
             );
-            return None;
+            return RunOutcome::NoNodeRan;
         }
 
         let mut failures: Vec<String> = Vec::new();
-        for node in &candidates {
-            let error = match self
-                .nodes
-                .trigger_scheduled(node, &key.app_id, &key.environment, cron_expr, *scheduled)
-                .await
-            {
-                Ok(resp) if resp.success => {
+        for (tried, node) in candidates.iter().enumerate() {
+            let error = match read_answer(call(node.clone()).await) {
+                NodeAnswer::Ran => {
                     info!(
                         app_id = %key.app_id,
                         environment = %key.environment,
                         cron = %cron_expr,
                         node = %node,
                         healthy = self.nodes.is_healthy(node),
+                        nodes_tried = tried + 1,
                         "Scheduled run executed on one node"
                     );
-                    return Some(node.clone());
+                    return RunOutcome::Ran { node: node.clone() };
                 }
-                Ok(resp) if resp.error.is_empty() => {
-                    "node reported the scheduled run as failed without saying why".to_string()
+                NodeAnswer::HandlerFailed(error) => {
+                    // Not "try the next node". The handler ran on this one and
+                    // threw part-way through, so whatever it had already done -
+                    // a charge, an email, a write - is done. Every remaining
+                    // node would repeat that, once each, for a single due
+                    // occurrence.
+                    warn!(
+                        app_id = %key.app_id,
+                        environment = %key.environment,
+                        cron = %cron_expr,
+                        node = %node,
+                        error = %error,
+                        due = %scheduled,
+                        nodes_tried = tried + 1,
+                        nodes_not_tried = candidates.len() - tried - 1,
+                        "The application's own scheduled handler ran on this node and failed. The occurrence is over: the remaining {} node(s) of the fleet are deliberately not asked, because they would replay whatever the handler managed before it threw rather than retry it. It is not made up later either; the next occurrence fires on schedule",
+                        candidates.len() - tried - 1
+                    );
+                    return RunOutcome::HandlerFailed {
+                        node: node.clone(),
+                        error,
+                    };
                 }
-                Ok(resp) => resp.error,
-                Err(e) => e.to_string(),
+                NodeAnswer::NotRunnableHere(error) => error,
             };
             warn!(
                 app_id = %key.app_id,
@@ -469,7 +609,7 @@ impl CronScheduler {
                 cron = %cron_expr,
                 node = %node,
                 error = %error,
-                "Node did not run this scheduled occurrence; trying the next node"
+                "Node could not run this scheduled occurrence, so nothing of it happened there; trying the next node"
             );
             failures.push(format!("{node}: {error}"));
         }
@@ -480,9 +620,10 @@ impl CronScheduler {
             cron = %cron_expr,
             nodes_tried = candidates.len(),
             failures = ?failures,
-            "Scheduled run skipped: no node accepted it. This occurrence does not run and is not retried; the next one fires on schedule"
+            "Scheduled run skipped: none of the {} node(s) tried could run it. This occurrence does not run and is not retried; the next one fires on schedule",
+            candidates.len()
         );
-        None
+        RunOutcome::NoNodeRan
     }
 
     /// Record an occurrence and compute the next one.
@@ -500,7 +641,7 @@ impl CronScheduler {
     /// The next occurrence is computed from `now` rather than from the time
     /// the fire was due, so a tick that ran late does not immediately find
     /// the same task due again.
-    fn record_run(&self, due: &Due, now: DateTime<Utc>, node: Option<String>) {
+    fn record_run(&self, due: &Due, now: DateTime<Utc>, outcome: RunOutcome) {
         let Some(mut entry) = self.tasks.get_mut(&due.key) else {
             return;
         };
@@ -521,13 +662,15 @@ impl CronScheduler {
             return;
         };
         task.last_run = Some(due.scheduled);
-        task.last_node = node;
+        task.last_node = outcome.node().map(str::to_string);
+        task.last_outcome = Some(outcome);
         task.next_run = task.schedule.as_ref().and_then(|cron| cron.next_after(now));
         debug!(
             app_id = %due.key.app_id,
             environment = %due.key.environment,
             cron = %due.cron_expr,
             was_due = %due.scheduled,
+            outcome = ?task.last_outcome,
             next_run = ?task.next_run,
             "Scheduled the next occurrence"
         );
@@ -551,6 +694,7 @@ fn new_task(
         next_run: None,
         last_run: None,
         last_node: None,
+        last_outcome: None,
     };
 
     match task.cron_expr.parse::<Cron>() {
@@ -608,15 +752,51 @@ mod tests {
     use crate::database::Database;
 
     async fn scheduler() -> (Arc<CronScheduler>, Arc<CatalogStore>) {
+        scheduler_with_nodes(&[]).await
+    }
+
+    /// A scheduler over a named fleet. The node entries are never dialled by
+    /// these tests - [`CronScheduler::fire_on_fleet`] takes the call as a
+    /// parameter - they only have to exist so that `call_order` returns them.
+    async fn scheduler_with_nodes(ids: &[&str]) -> (Arc<CronScheduler>, Arc<CatalogStore>) {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
         let store = Arc::new(CatalogStore::new(database));
-        // No nodes configured: these tests are about which tasks exist and
-        // how they advance, not about what a node does with a trigger.
-        let nodes = Arc::new(RuntimeNodeManager::new(Vec::new(), 15));
+        let nodes = Arc::new(RuntimeNodeManager::new(
+            ids.iter()
+                .map(|id| crate::config::RuntimeNodeConfig {
+                    id: (*id).to_string(),
+                    // Nothing is ever sent here; see above.
+                    addr: "http://127.0.0.1:1".to_string(),
+                })
+                .collect(),
+            15,
+        ));
         (
             Arc::new(CronScheduler::new(Arc::clone(&store), nodes, 60)),
             store,
         )
+    }
+
+    /// The occurrence `fire_due` would have collected for the first task of
+    /// `demo`'s production environment.
+    fn due_now(scheduled: DateTime<Utc>) -> Due {
+        Due {
+            key: CronKey {
+                app_id: "demo".to_string(),
+                environment: "production".to_string(),
+            },
+            index: 0,
+            cron_expr: "*/5 * * * *".to_string(),
+            scheduled,
+        }
+    }
+
+    fn answer(success: bool, error: &str) -> TriggerResponse {
+        TriggerResponse {
+            success,
+            failed_message_ids: Vec::new(),
+            error: error.to_string(),
+        }
     }
 
     fn manifest(cron: &[&str]) -> String {
@@ -775,6 +955,152 @@ mod tests {
             task.next_run.is_some_and(|next| next > now),
             "the next occurrence must be in the future, or the fire repeats every tick"
         );
+    }
+
+    /// The marker the node stamps on a failed handler, spelled exactly as
+    /// `deis_runtime::trigger::HANDLER_FAILED_PREFIX` spells it.
+    ///
+    /// The two crates cannot share the constant, so this test is the joint.
+    /// If it ever has to be changed to make the suite pass, the wire contract
+    /// has moved and the change belongs in trigger.proto, on both sides at
+    /// once - not here alone, because a control plane that stops recognising
+    /// the marker silently goes back to replaying failed handlers across the
+    /// whole fleet.
+    #[test]
+    fn a_handler_failure_is_recognised_by_its_marker() {
+        assert_eq!(HANDLER_FAILED_PREFIX, "handler-failed: ");
+
+        assert_eq!(
+            read_answer(Ok(answer(
+                false,
+                "handler-failed: TypeError: x is not a function"
+            ))),
+            NodeAnswer::HandlerFailed("TypeError: x is not a function".to_string())
+        );
+        // The marker with nothing behind it is still a handler that ran.
+        assert!(matches!(
+            read_answer(Ok(answer(false, "handler-failed: "))),
+            NodeAnswer::HandlerFailed(_)
+        ));
+        assert_eq!(read_answer(Ok(answer(true, ""))), NodeAnswer::Ran);
+        assert_eq!(
+            read_answer(Ok(answer(false, "app demo is not loaded here"))),
+            NodeAnswer::NotRunnableHere("app demo is not loaded here".to_string())
+        );
+        // A node that answers "failed" and says nothing must not be read as a
+        // failed handler, or an occurrence that never ran anywhere would stop
+        // being tried elsewhere.
+        assert!(matches!(
+            read_answer(Ok(answer(false, ""))),
+            NodeAnswer::NotRunnableHere(_)
+        ));
+        assert!(matches!(
+            read_answer(Err(NodeError::Transport("connect refused".to_string()))),
+            NodeAnswer::NotRunnableHere(_)
+        ));
+    }
+
+    /// One due occurrence whose handler throws must run on **one** node.
+    ///
+    /// The walk used to treat "the application's handler threw" exactly like
+    /// "this node cannot run it", so it carried on down the fleet: a single
+    /// occurrence executed the handler on every node in turn, replaying
+    /// whatever it had already done - a charge, an email, a write - once per
+    /// node.
+    #[tokio::test]
+    async fn a_handler_that_throws_is_not_replayed_on_the_rest_of_the_fleet() {
+        let (scheduler, store) = scheduler_with_nodes(&["node-a", "node-b", "node-c"]).await;
+        deploy(&store, None, &["*/5 * * * *"]).await;
+        scheduler.refresh().await;
+
+        let now = Utc::now();
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let outcome = scheduler
+            .fire_on_fleet(&due_now(now), now, |node| {
+                asked.lock().unwrap().push(node.clone());
+                async move { Ok(answer(false, "handler-failed: charge already attempted")) }
+            })
+            .await;
+
+        assert_eq!(
+            asked.into_inner().unwrap(),
+            ["node-a"],
+            "the occurrence had already had its effect on node-a; every further node replays it"
+        );
+        assert_eq!(
+            outcome,
+            RunOutcome::HandlerFailed {
+                node: "node-a".to_string(),
+                error: "charge already attempted".to_string(),
+            }
+        );
+    }
+
+    /// The other half of the same distinction: a node that could not run it
+    /// at all has had no effect, so the fleet walk must carry on.
+    #[tokio::test]
+    async fn a_node_that_cannot_run_it_hands_the_occurrence_on() {
+        let (scheduler, store) = scheduler_with_nodes(&["node-a", "node-b", "node-c"]).await;
+        deploy(&store, None, &["*/5 * * * *"]).await;
+        scheduler.refresh().await;
+
+        let now = Utc::now();
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let outcome = scheduler
+            .fire_on_fleet(&due_now(now), now, |node| {
+                asked.lock().unwrap().push(node.clone());
+                let refuse = node != "node-b";
+                async move {
+                    if refuse {
+                        Ok(answer(false, "app demo is not loaded here"))
+                    } else {
+                        Ok(answer(true, ""))
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(asked.into_inner().unwrap(), ["node-a", "node-b"]);
+        assert_eq!(
+            outcome,
+            RunOutcome::Ran {
+                node: "node-b".to_string()
+            }
+        );
+    }
+
+    /// What is recorded against the task has to keep the two apart as well:
+    /// "a node ran it and the handler threw" is not "nobody would take it".
+    #[tokio::test]
+    async fn the_task_records_which_of_the_two_failures_happened() {
+        let (scheduler, store) = scheduler_with_nodes(&["node-a"]).await;
+        deploy(&store, None, &["*/5 * * * *"]).await;
+        scheduler.refresh().await;
+
+        let now = Utc::now();
+        let was_due = now - chrono::Duration::minutes(1);
+        make_due(&scheduler, was_due);
+        let due = due_now(was_due);
+
+        scheduler.record_run(
+            &due,
+            now,
+            RunOutcome::HandlerFailed {
+                node: "node-a".to_string(),
+                error: "boom".to_string(),
+            },
+        );
+        let task = &scheduler.tasks_for("demo", "production")[0];
+        assert_eq!(task.last_node.as_deref(), Some("node-a"));
+        assert!(matches!(
+            task.last_outcome,
+            Some(RunOutcome::HandlerFailed { .. })
+        ));
+
+        scheduler.record_run(&due, now, RunOutcome::NoNodeRan);
+        let task = &scheduler.tasks_for("demo", "production")[0];
+        assert!(task.last_node.is_none());
+        assert_eq!(task.last_outcome, Some(RunOutcome::NoNodeRan));
     }
 
     /// A manifest that repeats a cron line - one copy-paste - used to

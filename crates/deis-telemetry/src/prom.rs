@@ -22,10 +22,19 @@ const SELF_PREFIX: &str = "deis_telemetry";
 /// same series are collapsed keeping the newest, because Prometheus rejects a
 /// scrape that repeats a series.
 pub fn render(samples: &[MetricRecord], stats: &ServiceStats) -> String {
-    let mut out = String::with_capacity(1024 + samples.len() * 96);
+    // The stored series are rendered first and written second, which looks
+    // backwards and is not: rendering them is where a series with a name this
+    // format cannot carry gets thrown out of the export, and the counter that
+    // says so has to be on the page it happened on. Written the other way
+    // round, every export drop showed up one scrape late - and the last one
+    // before a restart never showed up at all.
+    let mut body = String::with_capacity(samples.len() * 96);
+    render_samples(&mut body, samples, stats);
+
+    let mut out = String::with_capacity(1024 + body.len());
     render_self(&mut out, stats);
     render_self_by_app(&mut out, stats);
-    render_samples(&mut out, samples);
+    out.push_str(&body);
     out
 }
 
@@ -124,7 +133,7 @@ fn bucket_bound(sample: &MetricRecord) -> Option<f64> {
     raw.parse::<f64>().ok().filter(|v| !v.is_nan())
 }
 
-fn render_samples(out: &mut String, samples: &[MetricRecord]) {
+fn render_samples(out: &mut String, samples: &[MetricRecord], stats: &ServiceStats) {
     // A histogram arrives as three ordinary series - `_bucket`, `_sum` and
     // `_count` - and is only a histogram if they are exported together under
     // one `# TYPE ... histogram` header. The `_bucket` series is what proves
@@ -150,6 +159,7 @@ fn render_samples(out: &mut String, samples: &[MetricRecord]) {
     let mut grouped: BTreeMap<String, Family> = BTreeMap::new();
     for sample in samples {
         let Some(name) = sanitize_name(&sample.name) else {
+            ServiceStats::incr(&stats.metric_samples_dropped_from_export);
             warn!(
                 metric = %sample.name,
                 "metric name has no character usable in Prometheus format, \
@@ -166,7 +176,7 @@ fn render_samples(out: &mut String, samples: &[MetricRecord]) {
         });
 
         let Some((base, suffix)) = part else {
-            let labels = render_pairs(&label_pairs(sample, ""));
+            let labels = render_pairs(&label_pairs(sample, "", stats));
             let gauges = &mut grouped.entry(name).or_default().gauges;
             match gauges.get(&labels) {
                 Some((_, seen)) if *seen >= sample.timestamp_us => {}
@@ -180,7 +190,7 @@ fn render_samples(out: &mut String, samples: &[MetricRecord]) {
         // `le` is not part of a series' identity: every bucket of one series
         // carries the same other labels and differs only in its bound, so it
         // is left out of the key here and put back, last, on the line.
-        let pairs = label_pairs(sample, "le");
+        let pairs = label_pairs(sample, "le", stats);
         let labels = render_pairs(&pairs);
         let series = grouped
             .entry(base)
@@ -192,6 +202,7 @@ fn render_samples(out: &mut String, samples: &[MetricRecord]) {
         match suffix {
             "_bucket" => {
                 let Some(bound) = bucket_bound(sample) else {
+                    ServiceStats::incr(&stats.metric_samples_dropped_from_export);
                     warn!(
                         metric = %sample.name,
                         "a bucket sample carries no usable `le` label, so it names no upper \
@@ -307,7 +318,7 @@ fn render_histogram(out: &mut String, name: &str, series: BTreeMap<String, Histo
 /// `http.status` and `http-status` are two different names to a producer and
 /// the same name here. The first one wins, which also settles `app_id`: the
 /// dedicated field is placed first, so a label of that name loses to it.
-fn label_pairs(sample: &MetricRecord, skip: &str) -> Vec<(String, String)> {
+fn label_pairs(sample: &MetricRecord, skip: &str, stats: &ServiceStats) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut taken: BTreeSet<String> = BTreeSet::new();
     if !sample.app_id.is_empty() {
@@ -319,6 +330,7 @@ fn label_pairs(sample: &MetricRecord, skip: &str) -> Vec<(String, String)> {
             continue;
         }
         let Some(sanitized) = sanitize_name(key) else {
+            ServiceStats::incr(&stats.metric_labels_dropped_from_export);
             warn!(
                 label = %key,
                 metric = %sample.name,
@@ -328,6 +340,7 @@ fn label_pairs(sample: &MetricRecord, skip: &str) -> Vec<(String, String)> {
             continue;
         };
         if !taken.insert(sanitized.clone()) {
+            ServiceStats::incr(&stats.metric_labels_dropped_from_export);
             warn!(
                 label = %key,
                 exported_as = %sanitized,
@@ -710,6 +723,55 @@ mod tests {
     }
 
     #[test]
+    fn a_series_this_format_cannot_carry_is_counted_on_the_page_it_vanished_from() {
+        // Both of these used to be a log line and nothing else. An operator
+        // watching /metrics for an application's series saw it simply not
+        // there, which looks exactly like an application that stopped
+        // reporting - and this page, the one they were looking at, said
+        // nothing about having dropped it.
+        let stats = ServiceStats::new();
+        let text = render(
+            &[
+                // A name with no character the exposition format accepts.
+                sample("...", "shop", &[], 1.0, 10),
+                // Two label names that are one name after sanitising, which
+                // must not both be written: a repeated label name makes a
+                // scraper reject the whole page rather than the one series.
+                sample(
+                    "orders_total",
+                    "shop",
+                    &[("http.status", "200"), ("http-status", "201")],
+                    7.0,
+                    10,
+                ),
+            ],
+            &stats,
+        );
+
+        assert_eq!(
+            ServiceStats::get(&stats.metric_samples_dropped_from_export),
+            1
+        );
+        assert_eq!(
+            ServiceStats::get(&stats.metric_labels_dropped_from_export),
+            1
+        );
+
+        // On this page, not the next one: the counters are rendered from the
+        // same pass that did the dropping.
+        assert!(
+            text.contains("deis_telemetry_metric_samples_dropped_from_export_total 1"),
+            "unexpected export:\n{text}"
+        );
+        assert!(
+            text.contains("deis_telemetry_metric_labels_dropped_from_export_total 1"),
+            "unexpected export:\n{text}"
+        );
+        // And what survived is still there, with one of the two labels.
+        assert!(text.contains("orders_total{"), "unexpected export:\n{text}");
+    }
+
+    #[test]
     fn a_sum_without_buckets_is_still_a_plain_gauge() {
         // The existing counters end in `_sum` and `_count` and nothing else;
         // making them part of a histogram nobody pushed would break every
@@ -735,7 +797,15 @@ mod tests {
         );
         assert!(text.contains("# TYPE deis_runtime_isolate_execution_ms_sum gauge"));
         assert!(text.contains("# TYPE deis_runtime_isolate_execution_ms_count gauge"));
-        assert!(!text.contains("histogram"));
+        // The claim is about the family, so it is spelled as the line that
+        // would have to appear. A bare search for the word matched the help
+        // text of this process's own counters as soon as one of them said
+        // "histogram" - a way for this test to fail without the export having
+        // changed at all.
+        assert!(
+            !text.contains("# TYPE deis_runtime_isolate_execution_ms histogram"),
+            "unexpected export:\n{text}"
+        );
     }
 
     #[test]

@@ -54,9 +54,21 @@
 //! that judgement through here would mean an outage of the observability
 //! component looked like an outage of everything it observes.
 //!
-//! Its own liveness is answered by the standard `grpc.health.v1` service and
+//! Its own health is answered by the standard `grpc.health.v1` service and
 //! nothing else, the same probe deis-store and deis-queue answer. A second,
 //! home-grown health RPC would only add an answer that could disagree.
+//!
+//! That answer follows the database rather than the process. All three
+//! services report `NOT_SERVING` from the moment a storage call fails and
+//! `SERVING` again from the moment one works, because a collector that
+//! reports healthy while refusing every push is worse than one that reports
+//! broken - nothing downstream has another way to find out. Writes and reads
+//! are tracked apart, since the commonest failure of all, a disk with no
+//! space left, refuses every write while answering every read. Both show up
+//! on `/metrics` as `deis_telemetry_store_writable` and
+//! `deis_telemetry_store_readable`, beside `deis_telemetry_storage_failures_total`
+//! and the `*_lost_total` counters saying how much went missing. See
+//! [`stats::StoreHealth`].
 //!
 //! Layout:
 //! - [`auth`]    the capability token, and the refusal to serve unguarded

@@ -4,15 +4,46 @@
 # gRPC endpoint. Four services share it: LogService (PushLogs / Query /
 # Tail), TraceService (PushTraces / QueryTraces / TailTraces), MetricService
 # (PushMetrics / QueryMetrics) and the standard grpc.health.v1 service, which
-# is the only liveness surface this process offers.
+# is the only health surface this process offers. That one answers NOT_SERVING
+# whenever the database underneath has stopped taking writes or reads, so a
+# probe on it is worth having: a collector that reports healthy while
+# refusing every log line is worse than one that reports broken.
+#
+# Loopback on purpose, because the auth_secret line below is commented out.
+# With no auth_secret, anything that can reach these two ports may read every
+# application's logs, traces and metric series and may push entries carrying
+# any app_id it likes, so what protects the data is only that the ports are
+# unreachable from another host. Binding either of them anywhere else in that
+# state is refused at startup rather than warned about.
 listen = "127.0.0.1:8092"
 
 # Prometheus scrape endpoint (HTTP GET /metrics). A separate port so a
 # scraper can read the exported numbers without reaching the ingest and
-# query RPCs.
+# query RPCs. Both ports count for the rule above: this one serves every
+# application's metric series.
 metrics_listen = "127.0.0.1:8093"
 
-# Directory holding telemetry.sqlite.
+# Shared secret this service's capability token is derived from. Commented
+# out by default, which is the single-box install described above.
+#
+# Set it, and every gRPC call and every scrape must carry
+# base64(HMAC-SHA256(auth_secret, "deis-telemetry")) - the producers on each
+# node, `deis logs` / `deis tail` / `deis trace`, and the Prometheus scraper.
+# The token names this service rather than a tenant, so it is one credential
+# for the channel and not one per application; anything holding it may name
+# any app_id. The health service is exempt: it names no application and reads
+# no data, so a liveness probe needs no credential.
+#
+# Required as soon as either address above is not a loopback address.
+# auth_secret = "put a long random string here"
+
+# Directory holding telemetry.sqlite: the logs, the traces and the metric
+# series. It runs in WAL mode, so back it up with
+# `sqlite3 telemetry.sqlite ".backup out.db"` rather than `cp` - a copy of a
+# WAL-mode database can be missing the last commits, or simply corrupt, and
+# neither shows up until the day it is restored. Losing it loses history, not
+# the ability to serve; see crates/deis-control/DEPLOYMENT.md for what the
+# rest of the platform needs backed up.
 data_dir = "./data"
 
 # Days of logs to keep. Logs live in one table per UTC day and the sweeper

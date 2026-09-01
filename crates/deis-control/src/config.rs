@@ -91,6 +91,11 @@ pub struct ControlConfig {
     ///
     /// This is the only copy of a version's code the platform keeps, so it
     /// belongs on persistent storage that survives a restart.
+    ///
+    /// Should be absolute. A relative value - and the default is one - is
+    /// anchored to this process's working directory by
+    /// [`crate::catalog::BundleStore::new`], which is right for the run that
+    /// wrote it and wrong for the next one started from somewhere else.
     #[serde(default = "default_bundle_dir")]
     pub bundle_dir: PathBuf,
     /// Absolute base URL nodes use to reach this control plane, for
@@ -372,6 +377,15 @@ mod tests {
             "the example must show a node key: without one the assignment list serves no secret to any node"
         );
         assert!(config.api_auth_enabled);
+        // The file people copy has to show the shape that survives being
+        // started from another directory; a relative example is the reason
+        // every uploaded version went missing on the first restart from
+        // somewhere else.
+        assert!(
+            config.bundle_dir.is_absolute(),
+            "the example must show an absolute bundle_dir, got {}",
+            config.bundle_dir.display()
+        );
     }
 
     /// The defect this exists to prevent: a control plane started with no

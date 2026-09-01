@@ -30,12 +30,28 @@ fn a_declaration_round_trips_through_the_manifest() {
 }
 
 #[test]
-fn a_misspelled_key_is_refused_rather_than_dropped() {
-    // The whole reason for deny_unknown_fields: an author who wrote "App"
-    // instead of "app" would otherwise get a service binding with nothing to
-    // call, and a manifest that reads as though it had one.
-    let err = parse(r#"{"AUTH":{"kind":"service","App":"auth-api"}}"#).unwrap_err();
-    assert!(err.to_string().contains("App"), "{err}");
+fn a_misspelled_key_is_still_refused_once_the_binding_is_judged() {
+    // An author who wrote "App" instead of "app" gets a service binding with
+    // nothing to call. This used to be a serde refusal, from
+    // `deny_unknown_fields`; it is now `validate`'s, because a parser that
+    // refuses an unrecognised key refuses the whole manifest and therefore
+    // every bundle a newer builder wrote (see `crate::forward`). The refusal
+    // survived the move and says more than it did: serde could only name the
+    // key it did not want, while this names what is missing and what to add.
+    let declared = parse(r#"{"AUTH":{"kind":"service","App":"auth-api"}}"#)
+        .expect("an unrecognised key must not cost the manifest that carries it");
+    let err = declared
+        .validate("demo")
+        .expect_err("must still be refused");
+    assert!(err.contains("names no application to call"), "{err}");
+
+    // And the key itself is named, so the author sees the spelling too.
+    assert_eq!(
+        crate::forward::unknown_fields(
+            r#"{"schema":1,"app":"d","entry":"e.js","bindings":{"AUTH":{"kind":"service","App":"a"}}}"#
+        ),
+        vec!["bindings.AUTH.App".to_string()]
+    );
 }
 
 #[test]

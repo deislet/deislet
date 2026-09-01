@@ -7,7 +7,11 @@
 //! What this layer refuses to do is as important as what it does:
 //!
 //! * no `update_version` / `delete_version` exists — a version row is
-//!   written once and read forever;
+//!   written once and read forever. The single exception is
+//!   [`CatalogStore::anchor_bundle_paths`], which rewrites `bundle_path` and
+//!   nothing else: that column is not part of what a version *is*, it is where
+//!   this installation put the file, and it used to be recorded relative to
+//!   whatever directory the process was started in;
 //! * no `update_deployment` exists — moving an environment to another
 //!   version, including backwards, always inserts a new pointer row.
 
@@ -39,6 +43,18 @@ const RETIRED_NAME_COLUMNS: &str = "app_id, retired_at, environments, released_a
 /// `rowid` is monotonic per insert, so it breaks the tie in true insertion
 /// order and keeps the pointer semantics correct under rapid changes.
 const DEPLOYMENT_ORDER: &str = "created_at DESC, rowid DESC";
+
+/// What [`CatalogStore::anchor_bundle_paths`] found and did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BundlePathRepair {
+    /// Rows whose `bundle_path` was relative and has been rewritten.
+    pub anchored: usize,
+    /// Of those, how many name a file that is not under the bundle root. Each
+    /// one is a version no node can fetch.
+    pub missing: usize,
+    /// Rows that already named an absolute path and were left alone.
+    pub already_absolute: usize,
+}
 
 /// The answer to "what should be running?", and what could not be answered.
 ///
@@ -380,6 +396,108 @@ impl CatalogStore {
     // ----------------------------------------------------------------
     // Versions (append-only)
     // ----------------------------------------------------------------
+
+    /// Re-anchor every relative `bundle_path` to the configured bundle root.
+    ///
+    /// The one place a version row is ever rewritten, and it does not touch
+    /// what a version *is*: not its number, not its digest, not its manifest.
+    /// It repairs where this installation says the file is, which was recorded
+    /// as it was written - and `bundle_dir` defaults to the relative
+    /// `data/bundles`, so on most installations it was recorded relative to
+    /// whatever directory the control plane happened to be started in. The
+    /// first restart from another directory made every version ever uploaded
+    /// unreachable at once, with the zips still sitting on the disk.
+    ///
+    /// The new value is computed from the version's own identity -
+    /// `<bundle_root>/<app_id>/<bundle_sha>.zip`, the layout
+    /// [`super::bundle::BundleStore`] has always written - and not from the old
+    /// string, so it does not depend
+    /// on guessing which directory the row was written from.
+    ///
+    /// Idempotent: a second run finds every row absolute and writes nothing.
+    pub async fn anchor_bundle_paths(
+        &self,
+        bundles: &super::bundle::BundleStore,
+    ) -> CatalogResult<BundlePathRepair> {
+        let rows: Vec<(String, String, String, String)> = self
+            .with_conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT id, app_id, bundle_sha, bundle_path FROM versions")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        let mut repair = BundlePathRepair {
+            already_absolute: rows
+                .iter()
+                .filter(|(_, _, _, path)| std::path::Path::new(path).is_absolute())
+                .count(),
+            ..BundlePathRepair::default()
+        };
+
+        let updates: Vec<(String, String)> = rows
+            .iter()
+            .filter(|(_, _, _, path)| !std::path::Path::new(path).is_absolute())
+            .map(|(id, app_id, sha, _)| {
+                let anchored = bundles.path_for(app_id, sha);
+                if !anchored.exists() {
+                    repair.missing += 1;
+                }
+                (id.clone(), anchored.to_string_lossy().into_owned())
+            })
+            .collect();
+
+        repair.anchored = updates.len();
+        if updates.is_empty() {
+            debug!(
+                versions = repair.already_absolute,
+                "Every recorded bundle path is absolute; nothing to anchor"
+            );
+            return Ok(repair);
+        }
+
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            for (id, path) in &updates {
+                tx.execute(
+                    "UPDATE versions SET bundle_path = ?1 WHERE id = ?2",
+                    params![path, id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+
+        if repair.missing == 0 {
+            info!(
+                anchored = repair.anchored,
+                already_absolute = repair.already_absolute,
+                bundle_dir = %bundles.root().display(),
+                "Anchored {} version(s) whose bundle path was stored relative to whatever directory this control plane was started in; every one of them now names a file that is there, so a restart from another directory no longer loses them",
+                repair.anchored
+            );
+        } else {
+            // The number an operator has to act on: these versions cannot be
+            // fetched by any node, and no deployment of them will ever load.
+            warn!(
+                anchored = repair.anchored,
+                missing = repair.missing,
+                already_absolute = repair.already_absolute,
+                bundle_dir = %bundles.root().display(),
+                "Anchored {} version(s) whose bundle path was stored relative, and {} of them have no file under {}. Those versions cannot be fetched by any node. Their zips are wherever this control plane was standing when they were uploaded: move them under this bundle_dir, keeping the <app_id>/<sha256>.zip layout, or upload those versions again",
+                repair.anchored,
+                repair.missing,
+                bundles.root().display()
+            );
+        }
+        Ok(repair)
+    }
 
     /// Record an uploaded bundle as a new version.
     ///
@@ -1285,6 +1403,84 @@ mod tests {
             .unwrap();
         assert!(created);
         version
+    }
+
+    /// Version rows written by an earlier run name their bundle relative to
+    /// the directory *that* run was started in, which is nothing a later
+    /// process can resolve: every version at once answers "recorded but
+    /// missing on disk" while the zips are still there. The repair anchors
+    /// them to the configured root, computed from the version's own identity
+    /// rather than from a guess about the old working directory.
+    #[tokio::test]
+    async fn bundle_paths_stored_relative_are_anchored_to_the_bundle_root() {
+        let store = store().await;
+        store.create_app("demo").await.unwrap();
+        // Exactly what the default `bundle_dir` used to write.
+        store
+            .create_version("demo", "sha-1", "data/bundles/demo/sha-1.zip", "{}")
+            .await
+            .unwrap();
+        store
+            .create_version("demo", "sha-2", "/srv/deis/bundles/demo/sha-2.zip", "{}")
+            .await
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("demo")).unwrap();
+        std::fs::write(root.path().join("demo/sha-1.zip"), b"zip").unwrap();
+        let bundles = super::super::bundle::BundleStore::new(root.path());
+
+        let repair = store.anchor_bundle_paths(&bundles).await.unwrap();
+        assert_eq!(
+            repair,
+            BundlePathRepair {
+                anchored: 1,
+                missing: 0,
+                already_absolute: 1,
+            }
+        );
+
+        let versions = store.list_versions("demo").await.unwrap();
+        for version in &versions {
+            assert!(
+                std::path::Path::new(&version.bundle_path).is_absolute(),
+                "{} is still only meaningful from one directory",
+                version.bundle_path
+            );
+        }
+        let anchored = versions.iter().find(|v| v.bundle_sha == "sha-1").unwrap();
+        assert_eq!(
+            std::path::Path::new(&anchored.bundle_path),
+            root.path().join("demo/sha-1.zip")
+        );
+        // An absolute path is the operator's own words and is left alone.
+        let untouched = versions.iter().find(|v| v.bundle_sha == "sha-2").unwrap();
+        assert_eq!(untouched.bundle_path, "/srv/deis/bundles/demo/sha-2.zip");
+
+        // Idempotent: a second run has nothing left to rewrite.
+        let again = store.anchor_bundle_paths(&bundles).await.unwrap();
+        assert_eq!(again.anchored, 0);
+        assert_eq!(again.already_absolute, 2);
+    }
+
+    /// A version anchored to a path with no file there is the number an
+    /// operator has to act on: no node can fetch it.
+    #[tokio::test]
+    async fn a_version_whose_bundle_is_not_under_the_root_is_counted() {
+        let store = store().await;
+        store.create_app("demo").await.unwrap();
+        store
+            .create_version("demo", "sha-1", "data/bundles/demo/sha-1.zip", "{}")
+            .await
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let repair = store
+            .anchor_bundle_paths(&super::super::bundle::BundleStore::new(root.path()))
+            .await
+            .unwrap();
+        assert_eq!(repair.anchored, 1);
+        assert_eq!(repair.missing, 1);
     }
 
     #[tokio::test]

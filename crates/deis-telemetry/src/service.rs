@@ -32,7 +32,7 @@ use crate::proto::{
     QueryMetricsResponse, QueryRequest, QueryResponse, QueryTracesRequest, QueryTracesResponse,
     TailRequest, TailTracesRequest, TraceRecord as ProtoTraceRecord,
 };
-use crate::stats::ServiceStats;
+use crate::stats::{Access, ServiceStats};
 use crate::store::{
     LogCursor, LogFilter, LogRecord, MetricCursor, MetricFilter, MetricRecord, TelemetryStore,
     TraceCursor, TraceFilter, TraceRecord,
@@ -175,23 +175,45 @@ impl TraceService {
     }
 }
 
-/// Run a blocking storage call off the reactor.
+/// Run a blocking storage call off the reactor, and account for how it went.
 ///
 /// `op` names the operation so a failure says which one failed; the caller
 /// gets a generic `internal` status because the detail belongs in our log,
 /// not in a client's error string.
-async fn blocking<T, F>(op: &'static str, f: F) -> Result<T, Status>
+///
+/// **Every storage call in this file comes through here, and that is what
+/// makes the accounting trustworthy.** Each of these failures used to produce
+/// a line in this process's own log and move no counter at all, so an
+/// operator watching `/metrics` while the database was refusing every write
+/// saw `log_pushes_total` climbing, `logs_accepted_total` flat, and every
+/// counter with "failed" or "rejected" in its name reading zero - the shape
+/// of an idle service, not a broken one. Counting here rather than at each
+/// call site also means a storage call added later cannot forget to be
+/// counted.
+async fn blocking<T, F>(
+    stats: &ServiceStats,
+    access: Access,
+    op: &'static str,
+    f: F,
+) -> Result<T, Status>
 where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
     match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(value)) => Ok(value),
+        Ok(Ok(value)) => {
+            stats.store_health.record_success(access);
+            Ok(value)
+        }
         Ok(Err(e)) => {
+            ServiceStats::incr(&stats.storage_failures);
+            stats.store_health.record_failure(access, op);
             error!(operation = op, error = ?e, "storage call failed, the request is answered with an error");
             Err(Status::internal(format!("{op} failed")))
         }
         Err(e) => {
+            ServiceStats::incr(&stats.storage_failures);
+            stats.store_health.record_failure(access, op);
             error!(operation = op, error = %e, "storage worker panicked or was cancelled, the request is answered with an error");
             Err(Status::internal(format!("{op} did not complete")))
         }
@@ -418,11 +440,29 @@ impl LogServiceRpc for LogService {
             let store = self.store.clone();
             // The records come back out of the blocking task so they can be
             // fanned out without a second copy.
-            let stored = blocking("store log batch", move || {
+            let stored = match blocking(&self.stats, Access::Write, "store log batch", move || {
                 store.insert_logs(&records)?;
                 Ok(records)
             })
-            .await?;
+            .await
+            {
+                Ok(stored) => stored,
+                Err(status) => {
+                    // How many were lost, not just that something failed.
+                    // These entries were well formed and accepted; nothing but
+                    // this counter says they existed at all, because the write
+                    // that would have made them queryable is the one that
+                    // failed.
+                    ServiceStats::add(&self.stats.logs_lost, accepted as u64);
+                    error!(
+                        lost = accepted,
+                        received,
+                        "a log batch could not be written; those entries are gone and will never \
+                         appear in Query or Tail"
+                    );
+                    return Err(status);
+                }
+            };
             ServiceStats::add(&self.stats.logs_accepted, accepted as u64);
             // Fan out only after the write committed, so a tail consumer can
             // never see an entry that a later Query would not find.
@@ -473,7 +513,7 @@ impl LogServiceRpc for LogService {
 
         let store = self.store.clone();
         let describe = format!("{filter:?}");
-        let page = blocking("query logs", move || {
+        let page = blocking(&self.stats, Access::Read, "query logs", move || {
             store.query_logs(&filter, limit, cursor)
         })
         .await?;
@@ -715,11 +755,29 @@ impl TraceServiceRpc for TraceService {
         let accepted = records.len();
         if accepted > 0 {
             let store = self.store.clone();
-            let stored = blocking("store trace batch", move || {
-                store.insert_traces(&records)?;
-                Ok(records)
-            })
-            .await?;
+            let stored = match blocking(
+                &self.stats,
+                Access::Write,
+                "store trace batch",
+                move || {
+                    store.insert_traces(&records)?;
+                    Ok(records)
+                },
+            )
+            .await
+            {
+                Ok(stored) => stored,
+                Err(status) => {
+                    ServiceStats::add(&self.stats.traces_lost, accepted as u64);
+                    error!(
+                        lost = accepted,
+                        received,
+                        "a trace batch could not be written; those invocations happened and will \
+                         never appear in QueryTraces or TailTraces"
+                    );
+                    return Err(status);
+                }
+            };
             ServiceStats::add(&self.stats.traces_accepted, accepted as u64);
             // Fan out only after the write committed, so a follower can never
             // see a record a later QueryTraces would not find.
@@ -779,7 +837,7 @@ impl TraceServiceRpc for TraceService {
 
         let store = self.store.clone();
         let describe = format!("{filter:?}");
-        let page = blocking("query traces", move || {
+        let page = blocking(&self.stats, Access::Read, "query traces", move || {
             store.query_traces(&filter, limit, cursor)
         })
         .await?;
@@ -870,7 +928,23 @@ impl MetricServiceRpc for MetricService {
         let accepted = records.len();
         if accepted > 0 {
             let store = self.store.clone();
-            blocking("store metric batch", move || store.insert_metrics(&records)).await?;
+            if let Err(status) = blocking(
+                &self.stats,
+                Access::Write,
+                "store metric batch",
+                move || store.insert_metrics(&records),
+            )
+            .await
+            {
+                ServiceStats::add(&self.stats.metric_samples_lost, accepted as u64);
+                error!(
+                    lost = accepted,
+                    received,
+                    "a metric batch could not be written; those series show a gap in \
+                     QueryMetrics and on /metrics"
+                );
+                return Err(status);
+            }
             ServiceStats::add(&self.stats.metric_samples_accepted, accepted as u64);
             debug!(accepted, rejected, "stored a metric batch");
         }
@@ -914,7 +988,7 @@ impl MetricServiceRpc for MetricService {
 
         let store = self.store.clone();
         let describe = format!("{filter:?}");
-        let page = blocking("query metrics", move || {
+        let page = blocking(&self.stats, Access::Read, "query metrics", move || {
             store.query_metrics(&filter, limit, cursor)
         })
         .await?;

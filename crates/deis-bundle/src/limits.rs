@@ -30,11 +30,20 @@ use serde::{Deserialize, Serialize};
 /// would silently get the node default instead of the refusal it deserves for
 /// asking for a budget nothing can run in.
 ///
-/// `deny_unknown_fields` is the point of the whole struct. A misspelled limit
-/// that parsed and was dropped would leave an operator reading their own
-/// manifest and believing in a ceiling that was never in force.
+/// A key this build does not know is **ignored**, not refused, and named at
+/// `warn` when the bundle is read - see [`crate::forward`] for the rule. This
+/// struct used to be `deny_unknown_fields`, so that a misspelled limit could
+/// not parse and be silently dropped; the protection was real but it was
+/// bought in the wrong currency. Serde's refusal is per document, so one key
+/// an older build had never heard of threw away the whole manifest, and with
+/// it the application's code, routes and bindings - on every node still on
+/// the older build, with no re-upload able to repair it, because the manifest
+/// is inside the archive whose digest is the version id. The misspelling is
+/// still caught, closer to the author than a node ever was:
+/// `deis_build_core::config::LimitsConfig` keeps `deny_unknown_fields`, so a
+/// ceiling typed wrong in the project file is refused there, with the file
+/// still on screen.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct DeclaredLimits {
     /// V8 heap ceiling for this application's isolates, in MB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,9 +217,23 @@ mod tests {
     }
 
     #[test]
-    fn a_misspelled_limit_is_refused_rather_than_dropped() {
-        let err = serde_json::from_str::<DeclaredLimits>(r#"{"timeout_millis":1500}"#)
-            .expect_err("a key nobody reads must not be accepted");
-        assert!(err.to_string().contains("timeout_millis"), "{err}");
+    fn a_limit_this_build_does_not_know_is_ignored_and_named() {
+        // The rollback case, at this struct's own level: a ceiling a newer
+        // builder wrote must cost this build that one declaration and nothing
+        // else. Refusing it here would have refused the manifest that carried
+        // it, and with it the application.
+        let limits: DeclaredLimits =
+            serde_json::from_str(r#"{"timeout_ms":1500,"max_open_sockets":8}"#)
+                .expect("a key this build does not read must not cost the block that carries it");
+        assert_eq!(limits.timeout_ms, Some(1500));
+
+        // Ignored is not unsaid. `crate::forward` is what names it, and a
+        // misspelling reaches an author through the same line.
+        assert_eq!(
+            crate::forward::unknown_fields(
+                r#"{"schema":1,"app":"d","entry":"e.js","limits":{"timeout_millis":1500}}"#
+            ),
+            vec!["limits.timeout_millis".to_string()]
+        );
     }
 }

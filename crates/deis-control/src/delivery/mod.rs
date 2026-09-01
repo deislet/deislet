@@ -762,7 +762,13 @@ impl DeploymentDeliverer {
         };
 
         let node_ids = self.nodes.ids();
-        if node_ids.is_empty() {
+        // Read before anything is sent. A node that dropped off the fleet list
+        // is not on `ids()` at all, so a report built from that list alone
+        // described only the half of the fleet this control plane can still
+        // reach - and came back green while a live node kept serving the old
+        // version. See `RuntimeNodeManager::departed`.
+        let departed = self.nodes.departed();
+        if node_ids.is_empty() && departed.is_empty() {
             let reason_text = "no runtime nodes are configured on this control plane; \
                  the deployment is recorded and any node that starts later picks it up \
                  from its assignment list"
@@ -818,6 +824,13 @@ impl DeploymentDeliverer {
             }
         }
 
+        for node in &departed {
+            report.failed.push(NodeFailure {
+                node: node.id.clone(),
+                error: node.describe(),
+            });
+        }
+
         let failed_nodes: Vec<&str> = report.failed.iter().map(|f| f.node.as_str()).collect();
         if report.failed.is_empty() {
             info!(
@@ -835,6 +848,7 @@ impl DeploymentDeliverer {
                 version_id = %payload.version_id,
                 reason = reason.as_str(),
                 nodes = ?failed_nodes,
+                lost_nodes = departed.len(),
                 errors = ?report.failed.iter().map(|f| f.error.as_str()).collect::<Vec<_>>(),
                 "No runtime node took this version; the whole fleet still serves the previous one until a node refetches its assignments"
             );
@@ -846,7 +860,10 @@ impl DeploymentDeliverer {
                 reason = reason.as_str(),
                 delivered = report.delivered.len(),
                 failed = ?failed_nodes,
-                "Part of the fleet took this version; the listed nodes still serve the previous one, so requests hit two different versions until they catch up"
+                lost_nodes = departed.len(),
+                "{} of the fleet took this version and {} did not; the listed nodes still serve the previous one, so requests hit two different versions until they catch up",
+                report.delivered.len(),
+                failed_nodes.len()
             );
         }
 
@@ -879,7 +896,15 @@ impl DeploymentDeliverer {
         };
 
         let node_ids = self.nodes.ids();
-        if node_ids.is_empty() {
+        // The same read as in `push`, and it matters more here: a deployment
+        // that misses a node is corrected by that node's next assignment
+        // reconcile, while a *deletion* that misses one leaves it running the
+        // application - its code, its decrypted secrets, its queue consumers -
+        // until it manages to reconcile against a catalog that no longer names
+        // it. A node that stopped refreshing its registration is by definition
+        // not reconciling either.
+        let departed = self.nodes.departed();
+        if node_ids.is_empty() && departed.is_empty() {
             let reason = "no runtime nodes are configured on this control plane, so there is \
                  nothing serving the deleted application here"
                 .to_string();
@@ -913,6 +938,13 @@ impl DeploymentDeliverer {
             }
         }
 
+        for node in &departed {
+            report.failed.push(NodeFailure {
+                node: node.id.clone(),
+                error: node.describe(),
+            });
+        }
+
         if report.failed.is_empty() {
             info!(
                 app_id = %app_id,
@@ -923,9 +955,10 @@ impl DeploymentDeliverer {
             error!(
                 app_id = %app_id,
                 unloaded = report.unloaded.len(),
+                lost_nodes = departed.len(),
                 nodes = ?report.failed.iter().map(|f| f.node.as_str()).collect::<Vec<_>>(),
                 errors = ?report.failed.iter().map(|f| f.error.as_str()).collect::<Vec<_>>(),
-                "These runtime nodes were not told to drop the deleted application and are still serving it, with its secrets still in memory; each one stops on its own the next time it reconciles against its assignment list, which no longer names the application, so the exposure lasts until that node's next reconcile - and until a restart for a node that does not reconcile at all"
+                "These runtime nodes were not told to drop the deleted application and are still serving it, with its secrets still in memory; one that can still reach this control plane stops on its own the next time it reconciles against its assignment list, which no longer names the application, so the exposure lasts until that reconcile - while one counted in lost_nodes stopped talking to this control plane altogether and is not reconciling either, so it serves the deleted application until it is restarted or comes back"
             );
         }
 
@@ -1026,6 +1059,7 @@ mod tests {
     use crate::catalog::SecretCipher;
     use crate::catalog::secrets::MASTER_KEY_LEN;
     use crate::database::Database;
+    use chrono::Utc;
 
     const MANIFEST: &str = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
         "env":{"LOG_LEVEL":"info","API_KEY":"placeholder-from-manifest"},
@@ -1753,6 +1787,128 @@ mod tests {
         // environment it was built from.
         let rendered = serde_json::to_string(&report).unwrap();
         assert!(!rendered.contains("s3cr3t"));
+    }
+
+    /// A fleet with one node whose registration has already run out. The
+    /// node is not on `ids()` any more, which is the whole point: this
+    /// control plane cannot reach it and it is not asking for its
+    /// assignments either, so nothing corrects it.
+    fn fleet_with_one_lost_node() -> Arc<RuntimeNodeManager> {
+        let nodes = Arc::new(RuntimeNodeManager::new_with_ttl(Vec::new(), 15, 60));
+        nodes
+            .register(
+                "node-b",
+                "http://127.0.0.1:1",
+                None,
+                Utc::now() - chrono::Duration::hours(1),
+            )
+            .unwrap();
+        assert_eq!(nodes.expire_stale_registrations(Utc::now()), ["node-b"]);
+        assert!(nodes.ids().is_empty(), "it has left the fleet list");
+        nodes
+    }
+
+    /// A node that fell off the fleet list used to appear in neither
+    /// `delivered` nor `failed`, so a deploy that reached nothing at all
+    /// came back describing an empty, entirely successful fleet.
+    #[tokio::test]
+    async fn a_deploy_reports_the_node_that_fell_off_the_fleet_list() {
+        let (ready, store) = deliverer(true).await;
+        let env = environment(&store).await;
+        let deliverer = DeploymentDeliverer::new(
+            Arc::clone(&store),
+            Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
+            fleet_with_one_lost_node(),
+            Arc::clone(&ready.address),
+            StorageWiring::default(),
+        );
+
+        let payload = deliverer
+            .payload(&env, &version(MANIFEST), "http://control.test")
+            .await
+            .unwrap();
+        let report = deliverer.push(&payload, DeliveryReason::Deployment).await;
+
+        assert!(report.delivered.is_empty());
+        assert_eq!(report.failed.len(), 1, "got {:?}", report.failed);
+        assert_eq!(report.failed[0].node, "node-b");
+        assert!(
+            report.failed[0].error.contains("stopped refreshing"),
+            "the answer has to say why: {}",
+            report.failed[0].error
+        );
+        assert!(
+            report.skipped.is_none(),
+            "an empty list is not an empty fleet when a node was lost from it"
+        );
+        assert!(!report.fully_delivered());
+    }
+
+    /// The same hole, on the operation that cannot be repaired afterwards:
+    /// a node that never hears the unload keeps running the deleted
+    /// application, its decrypted secrets and its queue consumers.
+    #[tokio::test]
+    async fn deleting_an_app_reports_the_node_that_fell_off_the_fleet_list() {
+        let (ready, store) = deliverer(true).await;
+        let deliverer = DeploymentDeliverer::new(
+            Arc::clone(&store),
+            Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
+            fleet_with_one_lost_node(),
+            Arc::clone(&ready.address),
+            StorageWiring::default(),
+        );
+
+        let report = deliverer
+            .remove_app("demo", vec!["production".to_string()])
+            .await;
+        assert!(report.unloaded.is_empty());
+        assert_eq!(report.failed.len(), 1, "got {:?}", report.failed);
+        assert_eq!(report.failed[0].node, "node-b");
+        assert!(report.skipped.is_none());
+        assert!(
+            !report.fully_removed(),
+            "this node is still serving the deleted application"
+        );
+    }
+
+    /// A node coming back clears the record, so the fleet stops being
+    /// reported as incomplete once it really is complete again.
+    #[tokio::test]
+    async fn a_node_that_registers_again_is_no_longer_reported_as_lost() {
+        let (ready, store) = deliverer(true).await;
+        let nodes = fleet_with_one_lost_node();
+        let deliverer = DeploymentDeliverer::new(
+            Arc::clone(&store),
+            Arc::new(SecretsBackend::Unavailable("not needed here".to_string())),
+            Arc::clone(&nodes),
+            Arc::clone(&ready.address),
+            StorageWiring::default(),
+        );
+
+        nodes
+            .register("node-b", "http://127.0.0.1:1", None, Utc::now())
+            .unwrap();
+        assert!(nodes.departed().is_empty());
+
+        let report = deliverer.remove_app("demo", Vec::new()).await;
+        // Back on the list, so it is dialled and fails as an unreachable
+        // node rather than as a node nobody can account for.
+        assert_eq!(report.failed.len(), 1);
+        assert!(!report.failed[0].error.contains("stopped refreshing"));
+    }
+
+    /// An operator whose machine is really gone has to be able to say so,
+    /// or every deploy from now on names a node that no longer exists.
+    #[test]
+    fn deregistering_a_lost_node_clears_the_record() {
+        let nodes = fleet_with_one_lost_node();
+        assert_eq!(nodes.departed().len(), 1);
+        assert_eq!(
+            nodes.deregister("node-b"),
+            Some(crate::runtime_client::Deregistered::Forgotten)
+        );
+        assert!(nodes.departed().is_empty());
+        assert_eq!(nodes.deregister("node-b"), None);
     }
 
     #[tokio::test]

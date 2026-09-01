@@ -2192,6 +2192,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "clap 4.6.6",
  "dashmap 5.5.3",
  "deis-bundle",
  "deis-store",

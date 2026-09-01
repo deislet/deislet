@@ -1024,6 +1024,36 @@ mod what_the_handler_is_told_about_the_request {
         );
     }
 
+    /// A `Host` the edge is happy to route on must not kill the request here.
+    ///
+    /// deis-proxy matches on the host with the port stripped, so `a:b` reaches
+    /// the right application; the node then pasted it into `request.url`
+    /// unchanged, `new Request(url)` threw on a port that is not a number, and
+    /// the client got 500 with this platform's error text in the body. Every
+    /// request to the node could be made to fail that way by one header.
+    #[tokio::test]
+    async fn a_host_no_url_parser_accepts_does_not_turn_into_a_500() {
+        for fabricated in ["a:b", "shop.example.com:80x", "[::1", "a:1:2", "[::1]x"] {
+            let router = mirror_router("http-request-bad-host").await;
+            let answered = answer(
+                router,
+                Request::builder()
+                    .method("GET")
+                    .uri("/checkout")
+                    .header("host", fabricated)
+                    .header(APP_ID_HEADER, "http-request-bad-host")
+                    .body(Body::empty())
+                    .expect("buildable"),
+            )
+            .await;
+            assert_eq!(
+                answered["url"], "http://localhost/checkout",
+                "a Host of {fabricated:?} reached the isolate and the request was answered from \
+                 a URL the isolate could not parse"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn every_value_of_a_repeated_header_reaches_the_handler() {
         let router = mirror_router("http-request-headers").await;
@@ -1056,6 +1086,75 @@ mod what_the_handler_is_told_about_the_request {
                 .unwrap()
                 .contains("203.0.113.7"),
             "the whole X-Forwarded-For chain has to reach the handler: {answered}"
+        );
+    }
+
+    /// Two `Cookie` fields are one cookie list, joined the way a cookie list
+    /// is joined.
+    ///
+    /// HTTP/2 lets a client split its cookies across fields and browsers do
+    /// it. The `Headers` rule joins repeats with `", "`, which is right for
+    /// every other name; for this one the generated router splits the value on
+    /// `;`, so `"session=abc, csrf=xyz"` became the single cookie `session`
+    /// with the value `abc, csrf=xyz` and the second cookie was gone. A
+    /// session cookie sent second could not be read at all.
+    /// And the other half of the same claim: what the check accepts, the
+    /// isolate's URL parser accepts too.
+    ///
+    /// A refusal tightened until nothing got through would cost every
+    /// application the URL of the request it is serving, which is what
+    /// `request_url` exists to give it. Each of these goes through a real
+    /// isolate and comes back as the URL the handler read off its own
+    /// `Request`, so the two parsers are compared rather than assumed to
+    /// agree.
+    #[tokio::test]
+    async fn the_forms_a_real_host_takes_reach_the_handler_intact() {
+        for real in [
+            "shop.example.com",
+            "shop.example.com:8443",
+            "192.0.2.7:8443",
+            "[2001:db8::1]:8080",
+            "internal_host",
+        ] {
+            let router = mirror_router("http-request-good-host").await;
+            let answered = answer(
+                router,
+                Request::builder()
+                    .method("GET")
+                    .uri("/checkout")
+                    .header("host", real)
+                    .header(APP_ID_HEADER, "http-request-good-host")
+                    .body(Body::empty())
+                    .expect("buildable"),
+            )
+            .await;
+            assert_eq!(
+                answered["url"],
+                format!("http://{real}/checkout"),
+                "a Host of {real:?} is a host, and the handler has to be given it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cookies_split_across_fields_arrive_as_one_cookie_list() {
+        let router = mirror_router("http-request-cookies").await;
+        let answered = answer(
+            router,
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("host", "shop.example.com")
+                .header(APP_ID_HEADER, "http-request-cookies")
+                .header("cookie", "session=abc")
+                .header("cookie", "csrf=xyz")
+                .body(Body::empty())
+                .expect("buildable"),
+        )
+        .await;
+        assert_eq!(
+            answered["cookie"], "session=abc; csrf=xyz",
+            "the handler has to be able to split this on `;` and find both cookies"
         );
     }
 }
@@ -1165,6 +1264,62 @@ mod the_url_a_handler_is_given {
                 request_url(&"/orders/17".parse::<Uri>().unwrap(), &headers, &key()),
                 "http://localhost/orders/17",
                 "a Host of {fabricated:?} was pasted into the URL a handler reads"
+            );
+        }
+    }
+
+    /// The shapes a whitelist of *characters* let through.
+    ///
+    /// Every one of these is built out of nothing but the characters a host,
+    /// an IPv6 literal and a port are spelled with, and not one of them is an
+    /// authority: the port is not a number, the bracket never closes, there
+    /// are two ports, or there is no host at all. Pasted into the URL they
+    /// made `new Request(url)` throw inside the isolate, which the client saw
+    /// as 500 on a request the edge had routed correctly.
+    #[test]
+    fn a_host_whose_parts_are_not_a_host_and_a_port_is_refused() {
+        for fabricated in [
+            "a:b",
+            "shop.example.com:80x",
+            "shop.example.com:",
+            "shop.example.com:70000",
+            "a:1:2",
+            "[::1",
+            "[::1]x",
+            "[not-an-address]",
+            "[]",
+            ":8080",
+            "]::1[",
+        ] {
+            let headers = host(fabricated);
+            assert_eq!(
+                request_url(&"/orders/17".parse::<Uri>().unwrap(), &headers, &key()),
+                "http://localhost/orders/17",
+                "a Host of {fabricated:?} was pasted into the URL a handler reads"
+            );
+        }
+    }
+
+    /// And the four forms a real `Host` takes still get through, ports and
+    /// all: a refusal that swallowed those would cost every application its
+    /// canonical URL to buy the fix above.
+    #[test]
+    fn the_forms_a_real_host_takes_are_still_accepted() {
+        for real in [
+            "shop.example.com",
+            "shop.example.com:8443",
+            "192.0.2.7",
+            "192.0.2.7:8443",
+            "[2001:db8::1]",
+            "[2001:db8::1]:8080",
+            "[::ffff:192.0.2.1]",
+            "internal_host",
+            "node-7.internal:65535",
+        ] {
+            assert_eq!(
+                request_url(&"/".parse::<Uri>().unwrap(), &host(real), &key()),
+                format!("http://{real}/"),
+                "a Host of {real:?} is a host, and the URL a handler reads has to say so"
             );
         }
     }

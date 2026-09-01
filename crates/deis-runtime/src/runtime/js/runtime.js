@@ -885,6 +885,29 @@ function readableHeaders(request) {
   return headers && typeof headers.get === "function" ? headers : null;
 }
 
+// The `Request` this invocation is answering, or null when it is not answering
+// one -- a queue batch, a cron tick, or a `Cache.put` from the module's own
+// top-level code.
+//
+// Written by `createContext` and cleared at the top of every invocation, so it
+// is never the previous request's. Nothing else reads it: it exists for the
+// one question `Cache.put` cannot otherwise answer, which is whether a key
+// carrying none of a response's varying headers is telling the truth. See
+// `Cache.put`.
+let servedRequest = null;
+
+// Whether a key carries a value for any of the headers a response varies on.
+//
+// `[["authorization", null]]` means it carries none of them, which is a
+// perfectly good *variant* -- the one an anonymous caller asks for -- and a
+// perfectly bad *claim* when the key is not the request the response answers.
+function carriesNoVaryingHeader(selector) {
+  for (const [, value] of selector) {
+    if (value !== null) return false;
+  }
+  return true;
+}
+
 // Whether a stored entry is the variant this request is asking for.
 //
 // An entry stored with no selector is the ordinary case -- the response named
@@ -945,6 +968,9 @@ class Cache {
           "request may reuse it. It was not stored"
       );
     }
+    // What variant this entry would be filed under, which is the question the
+    // two refusals below are both about.
+    const selector = vary.length > 0 ? varySelector(vary, request) : [];
     if (vary.length > 0 && !readableHeaders(request)) {
       // The key was a URL or a string, so there is nothing to read the varying
       // headers off, and an entry whose selector is unknown is exactly the one
@@ -958,6 +984,34 @@ class Cache {
           "nothing to read those headers from and no way to tell one caller's " +
           "copy from another's. Pass the Request itself as the key. It was " +
           "not stored"
+      );
+    }
+    if (vary.length > 0 && request !== servedRequest && carriesNoVaryingHeader(selector)) {
+      // A `Request` that carries none of them is the same emptiness as a bare
+      // URL wearing a type that passes the test above. `new Request(url)` --
+      // built from the request being served, to normalise a key, to drop a
+      // query string -- is a `Request` and carries no headers at all, so a
+      // page fetched with somebody's `Authorization` was filed as the "carried
+      // no Authorization" variant and handed to every anonymous caller after.
+      // That is the failure this refusal was written for, reached through the
+      // one shape the old test could not see, because the old test asked what
+      // the key *was* rather than what it *carries*.
+      //
+      // The exception is the whole reason the two are not one rule: when the
+      // key is the very request this invocation is answering, "carries none of
+      // them" is not a claim, it is the truth. An anonymous caller storing an
+      // anonymous page under `context.request` is the ordinary case and stays
+      // ordinary. Any other key has to bring the values with it -- which
+      // `cache.put(context.request, ...)` does for free, and which caching an
+      // upstream answer under the request that fetched it does too.
+      throw new TypeError(
+        "cache.put: this response varies on " + vary.join(", ") +
+          ", and the key given for " + key + " carries none of those headers " +
+          "while not being the request this handler is answering. Stored, it " +
+          "would be the variant for a caller who carries none of them, and " +
+          "handed to every such caller afterwards. Pass the Request this " +
+          "handler was given, or a key that carries the same values for those " +
+          "headers. It was not stored"
       );
     }
 
@@ -996,7 +1050,7 @@ class Cache {
     // knows a response varied until the entry it varied on has been read. One
     // variant per key, therefore -- a second `put` for the same URL replaces
     // it -- which costs a hit and never costs a wrong answer.
-    if (vary.length > 0) meta.vary = varySelector(vary, request);
+    if (vary.length > 0) meta.vary = selector;
     await DenoCore.ops.op_cache_set(
       this.name,
       key,
@@ -2557,12 +2611,15 @@ function createServiceContext() {
 // looks like and what `new Request` wants to be told.
 function createContext(requestData) {
   const body = DenoCore.ops.op_deis_take_request_body();
+  // Kept as well as handed over: `Cache.put` has to be able to tell the
+  // request this handler is answering from a stand-in built to look like it.
+  servedRequest = new Request(requestData.url, {
+    method: requestData.method,
+    headers: requestData.headers,
+    body: body ?? null
+  });
   return Object.assign(createServiceContext(), {
-    request: new Request(requestData.url, {
-      method: requestData.method,
-      headers: requestData.headers,
-      body: body ?? null
-    }),
+    request: servedRequest,
     // Own members only: a `params` an application had planted on
     // `Object.prototype` would otherwise be handed to the next request as if
     // the router had captured it. The object itself is an ordinary one --
@@ -2664,6 +2721,8 @@ globalThis.__deis_runtime_invoke_queue = async function(payload) {
   // `__deis_runtime_invoke` has always done this; the queue and cron paths are
   // invocations in exactly the same sense and had been left out of it.
   StreamScope.leave();
+  // A queue batch answers no request, so nothing here may be mistaken for one.
+  servedRequest = null;
   const messages = (payload && payload.messages) || [];
   const allIds = messages.map((m) => m.id);
 
@@ -2766,6 +2825,8 @@ globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
   // `__deis_runtime_invoke` has always done this; the queue and cron paths are
   // invocations in exactly the same sense and had been left out of it.
   StreamScope.leave();
+  // A cron tick answers no request, so nothing here may be mistaken for one.
+  servedRequest = null;
   let handler = globalThis.user_module && globalThis.user_module.scheduled;
   if (typeof handler !== "function") {
     const dflt = globalThis.user_module && globalThis.user_module.default;
@@ -3220,8 +3281,11 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
   // A stream the previous invocation stashed and never began would otherwise
   // become this request's body. Ownership goes back to the invocation for the
   // same reason: what this handler opens is this handler's, and is swept when
-  // it ends.
+  // it ends. The request being answered is cleared here and set again by
+  // `createContext`, so that a `Cache.put` made before there is one cannot be
+  // credited with the last one.
   pendingStreamBody = null;
+  servedRequest = null;
   StreamScope.leave();
   try {
     let handler;

@@ -48,8 +48,8 @@ pub use message::{
 };
 pub use metrics::{MetricsCollector, MetricsSummary, NodesMetrics, SystemMetrics};
 pub use reaper::Reaper;
-pub use runtime_client::RuntimeNodeManager;
-pub use scheduler::{CronKey, CronScheduler, CronTask};
+pub use runtime_client::{DepartedNode, Deregistered, RuntimeNodeManager};
+pub use scheduler::{CronKey, CronScheduler, CronTask, RunOutcome};
 pub use server::ControlServer;
 pub use session::{NodeEvent, NodeFSM, NodeSession, NodeState, SendError, SessionManager};
 

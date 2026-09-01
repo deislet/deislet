@@ -546,35 +546,60 @@ function ownedGuards() {
   return entryOwner.guards;
 }
 
-function ownedIntervals() {
-  return entryOwner.intervals;
-}
-
-function ownedTimeouts() {
-  return entryOwner.timeouts;
-}
-
-// Which set each live timer is filed in.
+// Put one stretch back in force. Together with `leave`, which always answers
+// the invocation, this is the whole of how `entryOwner` is ever written.
 //
-// A timer id is a number, so unlike a budget guard it cannot carry its own set
-// around, and there is more than one set it could be in: a timer armed by a
-// stream's producer is in that stream's, not the invocation's. Clearing it out
-// of a guess would leave the id behind in the set it really is in -- harmless
-// once, and unbounded for a producer that sleeps between chunks for the whole
-// of `stream_timeout_ms`.
+// Only an owner this module minted and has not released yet is accepted;
+// anything else -- an object a caller built, an owner already given back, an
+// owner a stream has ended -- lands on the invocation, which is the set that
+// is always swept. Filing into a released set would leave the entry with
+// nothing to sweep it, which is the leak this whole arrangement prevents.
+function resumeOwner(owner) {
+  entryOwner = SetPrototypeHas(streamOwners, owner) ? owner : invocationOwner;
+}
+
+// Which owner's sets each live timer is filed in.
+//
+// A timer id is a number, so unlike a budget guard it cannot carry its own
+// owner around, and there is more than one owner it could belong to: a timer
+// armed by a stream's producer belongs to that stream, not to the invocation.
+// Clearing it out of a guess would leave the id behind in the set it really is
+// in -- harmless once, and unbounded for a producer that sleeps between chunks
+// for the whole of `stream_timeout_ms`.
+//
+// The owner and not the set, because a timer's callback needs the owner: see
+// the timers section below for the chain that broke when it could only find
+// the set.
 const timerHome = new SafeMap();
 
-function fileTimer(set, id) {
+function fileTimer(owner, set, id) {
   SetPrototypeAdd(set, id);
-  MapPrototypeSet(timerHome, id, set);
+  MapPrototypeSet(timerHome, id, owner);
 }
 
 // Take one timer off the books. Says nothing about the timer itself: whoever
 // calls this has either cleared it or just watched it fire.
+//
+// Both of the owner's timer sets are cleared of the id. A timeout id and an
+// interval id come out of one counter in deno_web's `02_timers.js`, so an id
+// is in exactly one of the two and the delete from the other is a no-op --
+// which is cheaper than remembering which kind it was and cannot get the
+// answer wrong.
 function dropTimer(id) {
-  const set = MapPrototypeGet(timerHome, id);
-  if (set !== undefined) SetPrototypeDelete(set, id);
+  const owner = MapPrototypeGet(timerHome, id);
+  if (owner !== undefined) {
+    SetPrototypeDelete(owner.timeouts, id);
+    SetPrototypeDelete(owner.intervals, id);
+  }
   MapPrototypeDelete(timerHome, id);
+}
+
+// The stretch a live timer is filed against, or the invocation for a timer
+// nothing knows about (a `setTimeout` whose callback is a string to evaluate,
+// which is handed to deno untracked).
+function ownerOfTimer(id) {
+  const owner = MapPrototypeGet(timerHome, id);
+  return owner === undefined ? invocationOwner : owner;
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +755,41 @@ function sweepGuardSet(set) {
 // `context.waitUntil`: the sweep is the last thing the tail does, so a timer
 // awaited inside it has already fired by then.
 
+// # A timer's callback runs in the stretch that armed it
+//
+// Which set the *next* timer goes in is decided by `entryOwner` at the moment
+// `setTimeout` is called, and a timer fires long after the stretch that armed
+// it stopped running. So the callback has to put that stretch back, and until
+// it did, a whole shape of producer was broken:
+//
+//     new ReadableStream({
+//       start(controller) {
+//         const tick = () => { controller.enqueue(next()); setTimeout(tick, 200); };
+//         setTimeout(tick, 200);
+//       },
+//     })
+//
+// which is how a feed that must send its first frame at once paces itself, and
+// how every server-sent-events example that does not use `pull` is written.
+// The first timer was armed inside the invocation and handed to the stream by
+// `adopt`, so that one was safe. The one the callback arms was not:
+// `js/runtime.js` puts ownership back to the invocation as soon as it has
+// handed the stream's pump to the event loop, so the next tick was filed in
+// the invocation's set -- where the next request to this application swept it,
+// along with the rest of the chain. The producer never woke, and the client,
+// which had been sent 200 and part of a body, got the rest of it cut off. It
+// depended on somebody else's traffic, which is exactly the failure the
+// ownership section at the top of this file exists to prevent, reached through
+// timers instead of through `fetch`.
+//
+// Sticky, like `enter`: the owner is left in force rather than put back on the
+// way out. A callback's own continuations run in microtasks after it returns,
+// so an owner restored on the way out would leave the timer an `async` tick
+// arms after an `await` filed against the invocation again -- the same bug one
+// step further in. The cost is the one the ownership section already accepts:
+// an attribution that can be off by one stream while two of them are producing
+// at once, where both are swept by a stream of this same application.
+//
 // Lifted out of the module namespace before they are called. deno's timers
 // check their receiver -- `this` has to be undefined or globalThis -- and
 // calling `timers.setInterval(...)` makes the namespace object the receiver,
@@ -738,8 +798,18 @@ const nativeSetInterval = timers.setInterval;
 const nativeClearInterval = timers.clearInterval;
 
 function setInterval(callback, delay, ...args) {
-  const id = nativeSetInterval(callback, delay, ...args);
-  fileTimer(ownedIntervals(), id);
+  const owner = entryOwner;
+  let id = 0;
+  const tracked =
+    typeof callback === "function"
+      ? function (...called) {
+          resumeOwner(ownerOfTimer(id));
+          return ReflectApply(callback, this, called);
+        }
+      : callback;
+
+  id = nativeSetInterval(tracked, delay, ...args);
+  fileTimer(owner, owner.intervals, id);
   return id;
 }
 
@@ -749,29 +819,38 @@ function clearInterval(id) {
 }
 
 function setTimeout(callback, delay, ...args) {
-  const set = ownedTimeouts();
+  const owner = entryOwner;
 
-  // The callback is wrapped so a timeout takes itself off the books when it
-  // fires. Without that, a producer sleeping between chunks would leave one
-  // dead id per sleep in its stream's set, and a stream may run for the whole
-  // of `stream_timeout_ms`. `id` is read inside the wrapper rather than passed
-  // in because the wrapper has to exist before there is an id to name.
+  // The callback is wrapped for two jobs. The first is that a timeout takes
+  // itself off the books when it fires: without it, a producer sleeping
+  // between chunks would leave one dead id per sleep in its stream's set, and
+  // a stream may run for the whole of `stream_timeout_ms`. `id` is read inside
+  // the wrapper rather than passed in because the wrapper has to exist before
+  // there is an id to name.
+  //
+  // The second is `resumeOwner`, and it is what makes a self-paced producer
+  // work at all. See the note above this function.
   //
   // Only a function can be wrapped. `setTimeout` also accepts a string to be
   // evaluated, and that form is handed to deno untouched: its id is still
   // filed, so it is still cleared when the stretch ends -- just not the moment
-  // it fires, which is untidy rather than wrong.
+  // it fires, and whatever that string arms is filed against whichever stretch
+  // is in force. Nothing on this platform is written that way.
   let id = 0;
   const tracked =
     typeof callback === "function"
       ? function (...called) {
+          // Read before `dropTimer`, which is what takes the answer off the
+          // books.
+          const home = ownerOfTimer(id);
           dropTimer(id);
+          resumeOwner(home);
           return ReflectApply(callback, this, called);
         }
       : callback;
 
   id = nativeSetTimeout(tracked, delay, ...args);
-  fileTimer(set, id);
+  fileTimer(owner, owner.timeouts, id);
   return id;
 }
 
@@ -818,15 +897,24 @@ function sweepTimerSet(set) {
   return swept;
 }
 
-// Hand every timer in one set to another, keeping `timerHome` honest about
-// where each of them now lives. Used once, when a response stream takes over
-// what the handler that created it left running.
+// Hand every timer one owner holds to another, keeping `timerHome` honest
+// about who now holds them. Used once, when a response stream takes over what
+// the handler that created it left running.
+//
+// Both kinds at once, and by owner rather than by set, because `timerHome`
+// answers with the owner: a timer moved with its set alone would still name
+// the owner it came from, and its callback would put *that* one back in force.
 function moveTimers(from, to) {
-  for (const id of new SafeSetIterator(from)) {
-    SetPrototypeAdd(to, id);
+  for (const id of new SafeSetIterator(from.intervals)) {
+    SetPrototypeAdd(to.intervals, id);
     MapPrototypeSet(timerHome, id, to);
   }
-  SetPrototypeClear(from);
+  SetPrototypeClear(from.intervals);
+  for (const id of new SafeSetIterator(from.timeouts)) {
+    SetPrototypeAdd(to.timeouts, id);
+    MapPrototypeSet(timerHome, id, to);
+  }
+  SetPrototypeClear(from.timeouts);
 }
 
 // ---------------------------------------------------------------------------
@@ -914,8 +1002,7 @@ const streamScope = ObjectFreeze({
 
     const intervals = invocationOwner.intervals.size;
     const timeouts = invocationOwner.timeouts.size;
-    moveTimers(invocationOwner.intervals, owner.intervals);
-    moveTimers(invocationOwner.timeouts, owner.timeouts);
+    moveTimers(invocationOwner, owner);
 
     SetPrototypeAdd(streamOwners, owner);
     rearmGuards(owner);
@@ -929,7 +1016,7 @@ const streamScope = ObjectFreeze({
   // caller who got hold of this object could not file a timer somewhere nothing
   // looks; see the ownership section for the shape of the attack it answers.
   enter(owner) {
-    entryOwner = SetPrototypeHas(streamOwners, owner) ? owner : invocationOwner;
+    resumeOwner(owner);
   },
   leave() {
     entryOwner = invocationOwner;

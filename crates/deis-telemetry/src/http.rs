@@ -20,7 +20,7 @@ use tracing::{debug, error};
 use crate::auth::TelemetryAuth;
 use crate::now_us;
 use crate::prom;
-use crate::stats::ServiceStats;
+use crate::stats::{Access, ServiceStats};
 use crate::store::TelemetryStore;
 
 /// The exposition format version this endpoint speaks.
@@ -74,13 +74,29 @@ async fn guard(State(auth): State<TelemetryAuth>, request: Request, next: Next) 
 }
 
 async fn scrape(State(state): State<MetricsState>) -> impl IntoResponse {
+    ServiceStats::incr(&state.stats.metric_scrapes);
     let since_us = now_us() - (state.window_secs as i64).saturating_mul(1_000_000);
     let store = state.store.clone();
+    // Both failures below are storage failures and are counted as such, so
+    // that `storage_failures_total` is one number covering every path into
+    // the database. The scrape-specific counter is what tells an operator
+    // reading a later, successful scrape that earlier ones returned nothing -
+    // a 500 carries no body a scraper keeps, so without it the only trace of
+    // a failed export is a hole in somebody else's graph.
     let samples = match tokio::task::spawn_blocking(move || store.latest_metric_samples(since_us))
         .await
     {
-        Ok(Ok(samples)) => samples,
+        Ok(Ok(samples)) => {
+            state.stats.store_health.record_success(Access::Read);
+            samples
+        }
         Ok(Err(e)) => {
+            ServiceStats::incr(&state.stats.storage_failures);
+            ServiceStats::incr(&state.stats.metric_scrapes_failed);
+            state
+                .stats
+                .store_health
+                .record_failure(Access::Read, "read metric samples for export");
             error!(error = ?e, "cannot read metric samples, this scrape returns no data and the series will show a gap");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -89,6 +105,12 @@ async fn scrape(State(state): State<MetricsState>) -> impl IntoResponse {
             );
         }
         Err(e) => {
+            ServiceStats::incr(&state.stats.storage_failures);
+            ServiceStats::incr(&state.stats.metric_scrapes_failed);
+            state
+                .stats
+                .store_health
+                .record_failure(Access::Read, "read metric samples for export");
             error!(error = %e, "metric export worker panicked or was cancelled, this scrape returns no data");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

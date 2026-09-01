@@ -238,6 +238,9 @@ check proves, and what lands in the `.demo/` run directory.
   contracts to build against: bundle format, control-plane schema, proto
   shapes, and the wave-by-wave record of what has actually landed.
 - [DEMO.md](DEMO.md) — the demo script in detail.
+- [crates/deis-control/DEPLOYMENT.md](crates/deis-control/DEPLOYMENT.md) —
+  running the control plane outside the demo: the minimal configuration that
+  starts, what to back up, and a restore procedure checked by restoring.
 - [WAF_PROPOSAL.md](WAF_PROPOSAL.md) — a proposal for putting the Coraza engine
   in front of deis-proxy. Not implemented.
 - [crates/deis/CONTRIBUTING.md](crates/deis/CONTRIBUTING.md) — how to work in
@@ -313,6 +316,16 @@ order it is likely to matter:
   Backups exist (`deis-store snapshot` / `restore`, which take a consistent
   copy — `cp -r` of a WAL-mode SQLite tree is not one), but a failover does
   not.
+- **Backing up the platform is a manual procedure, and it is more than the
+  databases.** The complete set, and a restore verified against it, are in
+  [crates/deis-control/DEPLOYMENT.md](crates/deis-control/DEPLOYMENT.md). The
+  two pieces that are easy to miss are the control plane's **bundle store** —
+  the only copy of every version's code, kept as files beside the database
+  rather than in it — and the **secret master key**, without which the
+  encrypted secrets in the database are so much noise. A restore missing
+  either produces a control plane that answers `/health` with `OK`, lists
+  every application in the console, and cannot run one of them: `/health` is a
+  liveness probe and says nothing about whether the platform can serve.
 - **The CPU-time ceiling needs `/proc`.** There are now two ceilings on one
   invocation — 30 s of wall clock and 5 s of CPU time, both enforced from the
   same watchdog thread — but the CPU one is read out of the watched thread's

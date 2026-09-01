@@ -172,8 +172,12 @@ api_keys = [
 # its registration (default: 90). A node refreshes every third of this, so
 # two lost refreshes do not cost a healthy node its place. When it does
 # expire the node stops receiving deployment pushes and cron fires, is not
-# told, and comes back on its own the next time it registers. Nodes listed
-# above are not subject to it.
+# told, and comes back on its own the next time it registers. It is not
+# forgotten in the meantime: a node that stopped refreshing is still serving
+# what it last received, so every deploy and every application deletion names
+# it as a node they could not reach until it registers again - or until
+# DELETE /api/nodes/{id}/registration says the machine is really gone. Nodes
+# listed above are not subject to any of this.
 # node_registration_ttl_secs = 90
 
 # ========================================
@@ -183,7 +187,16 @@ api_keys = [
 # Directory holding uploaded application bundles: one sub-directory per
 # app, one content-addressed zip per version. This is the only copy of a
 # version's code the platform keeps, so put it on persistent storage.
-bundle_dir = "data/bundles"
+#
+# Make it absolute. A relative path is anchored to the directory the control
+# plane process was started in, which is fine until it is started from
+# somewhere else - a systemd unit, another shell, a container with a different
+# WORKDIR - and every uploaded version is suddenly somewhere the process is not
+# looking. Existing installations are repaired at startup: a version row whose
+# path was stored relative is re-anchored under whatever bundle_dir now
+# resolves to, and the startup log says how many were moved and how many of
+# them have no file there.
+bundle_dir = "/var/lib/deis-control/bundles"
 
 # Absolute base URL nodes use to reach this control plane. It ends up in
 # the bundle download links handed out with each assignment. Leave it unset

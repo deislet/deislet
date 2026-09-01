@@ -12,17 +12,46 @@
 //!
 //! Requests arrive from `SIGUSR1` (`deis-proxy -s reload`) and from the
 //! control client.
+//!
+//! # Why the upgrade socket is checked twice
+//!
+//! `SIGQUIT` is a one-way door: pingora's main loop commits to shutting down
+//! the moment it handles the signal, whether or not the socket transfer that
+//! follows succeeds. So everything the replacement can fail at has to have
+//! already succeeded when it writes its readiness byte, or the running
+//! process is killed for nothing and the machine is left with no listener at
+//! all.
+//!
+//! The last thing the replacement does, and the likeliest to fail, is bind
+//! the upgrade socket - and it is pingora that binds it, inside
+//! `Server::bootstrap()`, with `UnixAddr::new(path).unwrap()` and
+//! `bind(...).unwrap()`. A path over [`MAX_UPGRADE_SOCK_PATH_LEN`] bytes is
+//! `ENAMETOOLONG`, a path whose parent directory does not exist is `ENOENT`,
+//! and both are a panic in the replacement. Neither can be caught after the
+//! fact, and `bootstrap()` in upgrade mode blocks waiting for the transfer
+//! that only starts once the running process has been signalled, so the
+//! readiness byte cannot simply be moved after it.
+//!
+//! Hence two checks, in two places, for two audiences:
+//!
+//! - [`check_upgrade_socket_path`] runs at every startup, upgrade or not, so
+//!   an operator who mistyped the path is told on the first run rather than
+//!   on the day somebody upgrades.
+//! - [`prove_upgrade_socket_bindable`] runs in the replacement, immediately
+//!   before the readiness byte, and actually binds the path. It is the only
+//!   evidence that the bind pingora is about to attempt will work.
 
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use nix::unistd::{AccessFlags, Pid, access};
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use tokio::io::AsyncReadExt;
@@ -30,6 +59,8 @@ use tokio::net::unix::pipe;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+
+use crate::config::system::MAX_UPGRADE_SOCK_PATH_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessCommand {
@@ -68,18 +99,129 @@ pub fn announce_ready(fd: RawFd) -> Result<()> {
         .with_context(|| format!("writing to ready fd {fd}"))
 }
 
+/// Report readiness only once the upgrade socket has been proved bindable.
+///
+/// This is the whole of the ordering guarantee described in the module
+/// documentation, and it is a real bind rather than a guess: the path is
+/// unlinked (pingora's `get_fds_from` does the same before it binds), a
+/// `SOCK_STREAM` Unix listener is bound on it, and both the listener and the
+/// file are then removed again. What that rules out is every reason
+/// `bootstrap()` panics a moment later - `ENAMETOOLONG`, `ENOENT` for a
+/// missing parent directory, `ENOTDIR`, `EACCES`, `EADDRINUSE` behind a file
+/// that cannot be unlinked - while this process is still just a process and
+/// an error is still only an exit.
+///
+/// Removing the socket again leaves a gap between here and pingora's own
+/// bind. It is not a race: the running process is only signalled after the
+/// readiness byte this function precedes, and its `send_fds_to` retries
+/// `ENOENT` five times a second apart, which is far longer than the rest of
+/// this process's startup.
+///
+/// Only ever call this in a process that has not yet announced readiness. In
+/// a process that has - or in one started with `--upgrade` by hand, where the
+/// operator may have sent `SIGQUIT` already - the unlink would take away the
+/// socket the running process is mid-handover on.
+pub fn prove_upgrade_socket_bindable(path: &str) -> Result<()> {
+    check_upgrade_socket_path(path)?;
+    // Mirror pingora: it unlinks whatever is at the path before binding, so
+    // a leftover file here is not evidence of anything and removing it
+    // changes nothing about what pingora will do.
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path).with_context(|| {
+        format!(
+            "binding the upgrade socket {path}; the replacement cannot take over the listening \
+             sockets, so the running process is being kept"
+        )
+    })?;
+    drop(listener);
+    // Best effort: pingora unlinks the path itself before binding, so a file
+    // left here is harmless. Failing the upgrade over it would be worse than
+    // the leftover.
+    if let Err(e) = std::fs::remove_file(path) {
+        warn!(
+            path,
+            error = %e,
+            "could not remove the upgrade socket this process just bound to prove it could; \
+             pingora unlinks the path itself before binding, so the upgrade still works and what \
+             is left behind is a stale socket file"
+        );
+    }
+    Ok(())
+}
+
+/// Everything about an `upgrade_sock` path that can be judged without
+/// binding it, checked at every startup so an operator hears about it on the
+/// first run instead of on the day somebody upgrades.
+///
+/// The length is refused by [`SystemConfig`]'s own validation too, so a
+/// configuration naming one never gets this far; it is repeated here because
+/// this function is what [`prove_upgrade_socket_bindable`] leans on and the
+/// two must not be able to disagree about the limit.
+///
+/// The directory checks answer for the *effective* identity, which is the
+/// right one twice over: pingora binds the upgrade socket inside
+/// `bootstrap()`, before `daemonize()` has switched to `user`/`group`, and a
+/// replacement is spawned by a process that has already switched, so it runs
+/// this check as the identity that will do its own binding.
+///
+/// [`SystemConfig`]: crate::config::SystemConfig
+pub fn check_upgrade_socket_path(path: &str) -> Result<()> {
+    if path.len() > MAX_UPGRADE_SOCK_PATH_LEN {
+        bail!(
+            "upgrade_sock is {} bytes ({path}) but a Unix socket address holds at most \
+             {MAX_UPGRADE_SOCK_PATH_LEN}",
+            path.len()
+        );
+    }
+    let Some(parent) = Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        // A bare file name resolves against the working directory, which
+        // always exists; `resolve_paths` normally makes this unreachable.
+        return Ok(());
+    };
+    if !parent.is_dir() {
+        bail!(
+            "the directory holding upgrade_sock, {}, does not exist or is not a directory; \
+             the socket cannot be bound there",
+            parent.display()
+        );
+    }
+    // Binding creates an entry in that directory and pingora unlinks the old
+    // one first, so both bits are needed. `access` answers for the effective
+    // identity, which is the one that will do the binding.
+    access(parent, AccessFlags::W_OK | AccessFlags::X_OK).with_context(|| {
+        format!(
+            "the directory holding upgrade_sock, {}, cannot be written to by this process; \
+             the socket cannot be bound there",
+            parent.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Spawn `deis-proxy --upgrade` with the same configuration, wait for it to
 /// report that its startup succeeded, then ask pingora (via `SIGQUIT`) to
-/// transfer the listening sockets to it. If the replacement exits first the
-/// current process keeps serving.
+/// transfer the listening sockets to it. If the replacement exits first, or
+/// never answers, the current process keeps serving and the two branches
+/// below say so.
 ///
-/// The handshake only shrinks the window. Pingora's main loop commits to
-/// shutting down as soon as it handles `SIGQUIT`, whether or not the socket
-/// transfer succeeds, so a replacement that dies after it has bound the
-/// upgrade socket still takes the service down; deis-proxy only decides when the
-/// signal is sent. The replacement announces readiness right before it binds
-/// that socket, and pingora's transfer retries for about five seconds, which
-/// covers the gap.
+/// Those branches are the point of the handshake, and they are only worth
+/// anything because of what the replacement does before it answers: it has
+/// loaded its configuration, opened its database and its logs, prepared
+/// automatic certificates, and bound the upgrade socket once to prove it can
+/// be bound (see [`prove_upgrade_socket_bindable`]). Everything that
+/// ordinarily fails has already failed by then, so an upgrade that cannot
+/// work is a failed upgrade rather than an outage.
+///
+/// What is left is genuinely pingora's: its main loop commits to shutting
+/// down as soon as it handles `SIGQUIT`, whether or not the transfer that
+/// follows succeeds. A replacement killed in the window between its readiness
+/// byte and pingora's own bind still takes the service down. That window is
+/// microseconds of this process's own startup, and pingora's `send_fds_to`
+/// retries a refused or missing socket five times a second apart, which
+/// covers the handover itself.
 pub async fn graceful_upgrade(args: &RelaunchArgs) -> Result<()> {
     let (mut child, ready) = spawn_replacement(args)?;
     let pid = child.id();

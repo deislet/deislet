@@ -22,6 +22,16 @@
 //!   session cookie could not find it because a second cookie header had
 //!   overwritten it.
 //!
+//! # The one name the comma rule is wrong for
+//!
+//! Keeping the repeats is not the whole answer for `Cookie`. A client may
+//! split its cookies across several `Cookie` fields -- RFC 9113 section 8.2.3
+//! invites it, so that HTTP/2's header compressor can index each cookie
+//! separately, and browsers take the invitation -- and a server reconstructing
+//! the request must join them with `"; "`, not with the `", "` a `Headers`
+//! joins everything else with. [`combine_cookie_fields`] does that join, on
+//! the way into an isolate and nowhere else.
+//!
 //! [`HeaderPairs`] is that shape, and every crossing uses it: the request
 //! entering an isolate (`dispatcher/handlers.rs`), the request of an
 //! application-to-application call (`runtime/service_ops.rs`), the answer
@@ -76,6 +86,73 @@ pub fn fold_duplicate_names(pairs: HeaderPairs) -> HeaderPairs {
         }
     }
     folded
+}
+
+/// The one header whose repeats are joined with something other than a comma.
+const COOKIE: &str = "cookie";
+
+/// What separates two cookies inside one `Cookie` field.
+///
+/// RFC 9113 section 8.2.3 names these two octets for this one header: an
+/// HTTP/2 client may split its cookies across several `Cookie` fields, and a
+/// server reconstructing the request "MUST" join them with `0x3B 0x20`. The
+/// `Headers` rule -- join everything with `", "` -- is right for every other
+/// name and wrong for this one.
+const COOKIE_SEPARATOR: &str = "; ";
+
+/// Join the request's `Cookie` fields into the single field HTTP semantics
+/// say they are.
+///
+/// A `Cookie` field is a list of `name=value` pairs separated by `; `, and a
+/// client is allowed to split that list across several fields -- HTTP/2 makes
+/// it likely, because RFC 9113 section 8.2.3 lets a client split them so the
+/// header compressor can index each cookie separately, and browsers do.
+/// Everything downstream reads them the way the web reads them: the router
+/// deis-build generates does `request.headers.get("cookie").split(";")`, and
+/// `Headers.get` joins repeats with `", "`.
+///
+/// Left alone, a request that arrived as `Cookie: session=abc` and
+/// `Cookie: csrf=xyz` therefore reached a handler as the single value
+/// `"session=abc, csrf=xyz"` -- measured through the node, in
+/// `dispatcher::handlers_test` -- and the router's split cuts that into one
+/// entry: the cookie `session`, whose value is `abc, csrf=xyz`. Everything
+/// after the first cookie is gone. It is a real login failing, not a
+/// formatting nuisance: a session cookie sent second cannot be read at all.
+///
+/// So the fields are joined here, once, on the way into the isolate, with the
+/// separator that header actually uses. Every repeat collapses into the
+/// position of the first, which is the order the client sent them in and the
+/// order a `Cookie` field is meant to preserve. Nothing else is touched: this
+/// is the only header the Fetch specification's comma rule is wrong for, and
+/// a general "join by something else" would need the specification to say so
+/// for a second name before it could be written honestly.
+pub fn combine_cookie_fields(pairs: &mut HeaderPairs) {
+    if count_of(pairs, COOKIE) < 2 {
+        return;
+    }
+    let combined = pairs
+        .iter()
+        .filter(|(name, value)| name.eq_ignore_ascii_case(COOKIE) && !value.is_empty())
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<&str>>()
+        .join(COOKIE_SEPARATOR);
+
+    let mut placed = false;
+    pairs.retain_mut(|(name, value)| {
+        if !name.eq_ignore_ascii_case(COOKIE) {
+            return true;
+        }
+        if placed {
+            return false;
+        }
+        placed = true;
+        // The first field keeps its place and its spelling; only its value
+        // grows. A handler iterating the list sees the header where the client
+        // put it.
+        value.clear();
+        value.push_str(&combined);
+        true
+    });
 }
 
 /// The first value under a name, compared without regard to case.
@@ -193,6 +270,57 @@ mod tests {
     fn a_list_without_repeats_comes_through_unchanged() {
         let original = pairs(&[("content-type", "text/plain"), ("x-app", "demo")]);
         assert_eq!(fold_duplicate_names(original.clone()), original);
+    }
+
+    /// The defect, stated as a test: a login that arrives as two `Cookie`
+    /// fields loses every cookie but the first.
+    #[test]
+    fn repeated_cookie_fields_become_the_one_field_they_are() {
+        let mut list = pairs(&[
+            ("accept", "text/html"),
+            ("Cookie", "session=abc"),
+            ("x-trace", "7"),
+            ("cookie", "csrf=xyz"),
+            ("cookie", "theme=dark"),
+        ]);
+        combine_cookie_fields(&mut list);
+        assert_eq!(
+            list,
+            pairs(&[
+                ("accept", "text/html"),
+                ("Cookie", "session=abc; csrf=xyz; theme=dark"),
+                ("x-trace", "7"),
+            ]),
+            "the cookies are one field, joined the way a Cookie field joins them, where the \
+             first one arrived"
+        );
+    }
+
+    /// `", "` is the rule for every other repeated name, and it stays that
+    /// way: only this one header is joined differently, so nothing else may
+    /// move.
+    #[test]
+    fn no_other_repeated_name_is_touched() {
+        let original = pairs(&[
+            ("accept", "text/html"),
+            ("accept", "application/json"),
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-forwarded-for", "198.51.100.4"),
+            ("cookie", "session=abc"),
+        ]);
+        let mut list = original.clone();
+        combine_cookie_fields(&mut list);
+        assert_eq!(list, original, "a single Cookie field has nothing to join");
+    }
+
+    #[test]
+    fn an_empty_cookie_field_adds_no_separator() {
+        // A client that sends `Cookie:` with nothing after it has sent no
+        // cookie. Joining it in would produce a leading `; `, which the split
+        // downstream reads as a cookie with an empty name.
+        let mut list = pairs(&[("cookie", ""), ("cookie", "session=abc")]);
+        combine_cookie_fields(&mut list);
+        assert_eq!(list, pairs(&[("cookie", "session=abc")]));
     }
 
     /// The way in: every value of every name, in the order the client sent

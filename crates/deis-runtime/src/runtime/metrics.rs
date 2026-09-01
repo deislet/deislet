@@ -183,6 +183,39 @@ pub const TRACES_SAMPLED_OUT_TOTAL: &str = "deis_runtime_traces_sampled_out_tota
 /// deis-telemetry is unreachable or the buffer is too small for the traffic.
 pub const TRACES_DROPPED_TOTAL: &str = "deis_runtime_traces_dropped_total";
 
+/// When this node's process started counting, in seconds since the epoch.
+///
+/// # Why a counter needs this at all
+///
+/// Every `_total` above is cumulative for the life of *this process*: the
+/// registry lives in memory, it is created with the process, and it starts at
+/// zero. That is ordinary -- a Prometheus counter resets when its producer
+/// restarts, and `rate()` corrects for it -- but only because a scraper can
+/// see that the producer restarted. Here it cannot: a node pushes totals to
+/// deis-telemetry, which keeps the newest sample of each series and re-exports
+/// it, so a restart arrives as one number that is smaller than the last one
+/// and nothing on the wire says why. Measured: a node exporting
+/// `deis_runtime_requests_total{app_id="demo",environment="production"} 116`
+/// was restarted, served six requests, and the same series read 6 -- the 110
+/// before the restart were not "counted from a new baseline", they were gone,
+/// and every consumer reading the latest value was answered a number that had
+/// gone backwards.
+///
+/// So this is the missing datum, and only the node has it: the moment its
+/// counting began. All of this node's counters reset together, because there
+/// is exactly one registry and it is created with the process, so one series
+/// per node says it for all of them -- it is paired with them by the `node`
+/// label every shipped sample already carries. A consumer that remembers this
+/// value knows a decrease that comes with a new start time is a restart and a
+/// decrease without one is a fault, which are two different things and had
+/// been indistinguishable.
+///
+/// The name is the one the Prometheus ecosystem already uses for this
+/// question, prefixed like everything else this node ships. It carries no
+/// `app_id`: it is a fact about the process, not about any tenant, and
+/// deis-telemetry leaves an empty `app_id` off the exported line.
+pub const PROCESS_START_TIME_SECONDS: &str = "deis_runtime_process_start_time_seconds";
+
 /// Label carrying the environment half of a tenant on a shipped sample.
 const ENVIRONMENT_LABEL: &str = "environment";
 
@@ -225,8 +258,15 @@ pub enum RequestOutcome {
 /// The samples are counters and one histogram; the field is not called
 /// `counters` because [`EXECUTION_MS_BUCKET`] is neither one number nor a
 /// counter of events but a bucket of a distribution.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MetricsRegistry {
+    /// When this registry began counting, in microseconds since the epoch.
+    ///
+    /// Read once, here, rather than at each snapshot: it is the identity of
+    /// the run these totals belong to, and a value that moved between two
+    /// pushes would say a restart had happened when none had. Shipped as
+    /// [`PROCESS_START_TIME_SECONDS`]; see that constant for what it is for.
+    started_us: i64,
     samples: Mutex<HashMap<SampleKey, f64>>,
     /// Why the platform stopped an application's current invocation, kept
     /// between the cut-off and the request path that reports the failure.
@@ -250,6 +290,17 @@ pub struct MetricsRegistry {
 struct PendingCutOff {
     cause: InvocationOutcome,
     at: Instant,
+}
+
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self {
+            started_us: now_us(),
+            samples: Mutex::new(HashMap::new()),
+            cut_offs: Mutex::new(HashMap::new()),
+            traces: Arc::new(TraceRecorder::default()),
+        }
+    }
 }
 
 impl MetricsRegistry {
@@ -496,16 +547,27 @@ impl MetricsRegistry {
             .sum()
     }
 
-    /// Everything recorded so far, as samples stamped with `timestamp_us`.
+    /// Everything recorded so far, as samples stamped with `timestamp_us`,
+    /// with the moment this registry began counting last.
     ///
     /// Nothing is reset: the counters and the histogram buckets are all
     /// cumulative, so a push that fails loses nothing -- the next one carries
     /// the same totals and the consumer takes differences.
+    ///
+    /// Never empty, and that is deliberate. [`PROCESS_START_TIME_SECONDS`] is
+    /// what tells a consumer which run the totals beside it belong to, and the
+    /// scrape that most needs it is the one taken just after a restart, before
+    /// this node has served anything: the old run's totals are still inside
+    /// deis-telemetry's export window at that point, so without the marker
+    /// there is nothing at all to say that the producer behind them is gone.
+    /// A node with no traffic therefore still has something to say, which is
+    /// itself the answer to "is this node counting, and since when".
     pub fn snapshot(&self, timestamp_us: i64) -> Vec<MetricSample> {
         let samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
         let mut keys: Vec<&SampleKey> = samples.keys().collect();
         keys.sort();
-        keys.into_iter()
+        let mut out: Vec<MetricSample> = keys
+            .into_iter()
             .map(|key| {
                 // The key here is the tenant, because that is what a request
                 // is charged to. On the wire the two halves separate: a
@@ -533,7 +595,25 @@ impl MetricsRegistry {
                     timestamp_us,
                 }
             })
-            .collect()
+            .collect();
+
+        // Last, so that a caller reading `snapshot()[0]` still finds a counter
+        // and so the marker sits beside the totals it explains rather than in
+        // front of them. Seconds with the fraction kept, which is how every
+        // start-time series in this ecosystem is spelled.
+        out.push(MetricSample {
+            name: PROCESS_START_TIME_SECONDS.to_string(),
+            // No tenant: this is a fact about the process, and every counter
+            // it explains belongs to a different application. deis-telemetry
+            // leaves an empty `app_id` off the exported line, so the series
+            // reads `{node="..."}` -- which is exactly the label the counters
+            // are paired with.
+            app_id: String::new(),
+            labels: HashMap::new(),
+            value: self.started_us as f64 / 1_000_000.0,
+            timestamp_us,
+        });
+        out
     }
 
     /// How many distinct samples are being kept.
@@ -1231,10 +1311,12 @@ async fn push_once(
     credential: &TelemetryCredential,
     client: &mut MetricServiceClient<Channel>,
 ) {
+    // Never empty -- a snapshot always carries this run's start time, whether
+    // or not anything has been counted yet -- so there is no "nothing to say"
+    // case to skip. A node that has served nothing still reports that it is
+    // counting and since when, which is what makes the first counter after a
+    // restart readable as a fresh one rather than as a total that fell.
     let samples = stamp_node(registry.snapshot(now_us()), node_id);
-    if samples.is_empty() {
-        return;
-    }
     let count = samples.len();
 
     // The token goes in the request's gRPC metadata, where deis-telemetry's

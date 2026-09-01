@@ -12,6 +12,15 @@
 //! become a fourth unguarded entrance without deleting the call. The health
 //! service is registered without it on purpose - it names no application and
 //! reads no data. See [`crate::auth`].
+//!
+//! # The health status is not a constant
+//!
+//! It was one: `SERVING` for all three services, set once at startup and never
+//! touched again. That made it a liveness probe wearing a health probe's
+//! name, and a process whose database had filled its disk answered every
+//! check with `SERVING` while refusing every log line it was handed.
+//! [`health_follows_the_store`] now keeps it on what the database is actually
+//! doing, woken by [`crate::stats::StoreHealth`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,7 +44,7 @@ use crate::proto::log_service_server::LogServiceServer;
 use crate::proto::metric_service_server::MetricServiceServer;
 use crate::proto::trace_service_server::TraceServiceServer;
 use crate::service::{LogService, MetricService, QueryLimits, TraceService};
-use crate::stats::ServiceStats;
+use crate::stats::{Access, ServiceStats, StoreState};
 use crate::store::TelemetryStore;
 use crate::tail::{TailHub, TraceHub};
 use crate::{MAX_GRPC_MESSAGE_BYTES, now_us};
@@ -64,6 +73,7 @@ pub struct RunningServer {
     grpc: JoinHandle<()>,
     metrics: JoinHandle<()>,
     retention: JoinHandle<()>,
+    health: JoinHandle<()>,
 }
 
 impl RunningServer {
@@ -82,6 +92,7 @@ impl RunningServer {
             ("grpc", self.grpc),
             ("metrics-http", self.metrics),
             ("retention", self.retention),
+            ("health", self.health),
         ] {
             if let Err(e) = handle.await {
                 warn!(task = name, error = %e, "task did not stop cleanly; shutdown continues");
@@ -192,7 +203,7 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
     // The standard grpc.health.v1 service is the only liveness surface this
     // process offers, which is what deis-store and deis-queue offer too: one
     // probe shape for the whole platform, and no second answer that could
-    // disagree with it. Both services are reported separately so a caller can
+    // disagree with it. Each service is reported separately so a caller can
     // ask about the one it actually uses. It answers for this process only.
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -264,6 +275,18 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         }
     });
 
+    // The status above used to be the last word: set once, at startup, and
+    // never touched again. A process whose database had filled its disk, or
+    // had been restored unwritable, went on answering SERVING while refusing
+    // every push - an observability service that reports healthy and collects
+    // nothing, which nothing downstream has any other way to notice. From here
+    // on the three statuses follow the database itself.
+    let health = tokio::spawn(health_follows_the_store(
+        health_reporter,
+        stats.store_health.subscribe(),
+        subscribe(&shutdown),
+    ));
+
     let retention = tokio::spawn(retention_loop(
         store.clone(),
         Arc::clone(&stats),
@@ -298,7 +321,55 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         grpc,
         metrics,
         retention,
+        health,
     })
+}
+
+/// Keep the `grpc.health.v1` status of all three services on the truth about
+/// the database.
+///
+/// Woken by a change rather than polling, so the gap between a failed storage
+/// call and a probe that says so is one task wakeup, not one poll interval. A
+/// probe answering `SERVING` for even a few seconds after the store has gone
+/// is a probe a supervisor will believe.
+///
+/// All three services move together because all three sit on one database.
+/// Reporting them apart would suggest a caller could route around the failure
+/// by using a different one, and there is nowhere to route to.
+async fn health_follows_the_store(
+    mut reporter: tonic_health::server::HealthReporter,
+    mut state: watch::Receiver<StoreState>,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) {
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            changed = state.changed() => {
+                // An error means the sender is gone, which only happens as the
+                // process goes away; there is nothing left to report to.
+                if changed.is_err() {
+                    return;
+                }
+                let serving = state.borrow_and_update().is_serving();
+                if serving {
+                    reporter.set_serving::<LogServiceServer<LogService>>().await;
+                    reporter.set_serving::<TraceServiceServer<TraceService>>().await;
+                    reporter.set_serving::<MetricServiceServer<MetricService>>().await;
+                    info!("grpc.health.v1 now reports SERVING for all three services again");
+                } else {
+                    reporter.set_not_serving::<LogServiceServer<LogService>>().await;
+                    reporter.set_not_serving::<TraceServiceServer<TraceService>>().await;
+                    reporter.set_not_serving::<MetricServiceServer<MetricService>>().await;
+                    warn!(
+                        "grpc.health.v1 now reports NOT_SERVING for all three services: the \
+                         database behind them stopped answering, so anything this process is \
+                         handed from here on is refused rather than stored"
+                    );
+                }
+            }
+            _ = &mut shutdown => return,
+        }
+    }
 }
 
 /// A future that resolves once shutdown is requested.
@@ -360,6 +431,7 @@ async fn sweep_once(store: &TelemetryStore, stats: &Arc<ServiceStats>, policy: R
     .await;
     match outcome {
         Ok(Ok(outcome)) => {
+            stats.store_health.record_success(Access::Write);
             if outcome.is_empty() {
                 return;
             }
@@ -405,13 +477,36 @@ async fn sweep_once(store: &TelemetryStore, stats: &Arc<ServiceStats>, policy: R
                 "retention dropped expired data; those logs, traces and samples are gone for good"
             );
         }
-        Ok(Err(e)) => error!(
-            error = ?e,
-            "retention sweep failed, expired data stays on disk and the database keeps growing"
-        ),
-        Err(e) => error!(
-            error = %e,
-            "retention worker panicked or was cancelled, expired data stays on disk"
-        ),
+        // Both arms move two counters and the health state, not just the log.
+        // The sweeper is the one path into the database that runs without a
+        // caller, so on a service nobody is pushing to it is the first - and
+        // for an hour at a time the only - thing to notice that the database
+        // has stopped answering.
+        Ok(Err(e)) => {
+            ServiceStats::incr(&stats.storage_failures);
+            ServiceStats::incr(&stats.retention_sweeps_failed);
+            stats
+                .store_health
+                .record_failure(Access::Write, "retention sweep");
+            error!(
+                error = ?e,
+                interval_secs = policy.interval.as_secs(),
+                "retention sweep failed, expired data stays on disk and the database keeps growing; \
+                 the next attempt is one interval away"
+            );
+        }
+        Err(e) => {
+            ServiceStats::incr(&stats.storage_failures);
+            ServiceStats::incr(&stats.retention_sweeps_failed);
+            stats
+                .store_health
+                .record_failure(Access::Write, "retention sweep");
+            error!(
+                error = %e,
+                interval_secs = policy.interval.as_secs(),
+                "retention worker panicked or was cancelled, expired data stays on disk; \
+                 the next attempt is one interval away"
+            );
+        }
     }
 }

@@ -205,12 +205,14 @@ impl ServiceEnvironment {
 
 /// One entry of the `bindings` map.
 ///
-/// `deny_unknown_fields` is the point of the struct, the same as it is for
-/// [`crate::limits::DeclaredLimits`]: a misspelled key that parsed and was
-/// dropped would leave an author reading their own manifest and believing in a
-/// route that was never wired.
+/// A key this build does not know is ignored and named at `warn`, the same as
+/// in [`crate::limits::DeclaredLimits`] and for the same reason - see
+/// [`crate::forward`]. What is *not* ignored is anything ambiguous about the
+/// keys this build does read: [`DeclaredBindings::validate`] still refuses a
+/// name that could be two namespaces, or a service binding with nothing to
+/// call, because those are two meanings in one place rather than one meaning
+/// this build has not learned yet.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Binding {
     pub kind: BindingKind,
 

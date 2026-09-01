@@ -92,8 +92,32 @@ impl Backend {
         }
     }
 
-    /// The request heads this backend has been handed, newest last.
+    /// The request heads this backend has been handed that came from a
+    /// client, newest last.
+    ///
+    /// The edge's own health probes are left out. It asks every upstream
+    /// `GET /health` with `x-deis-app-id: _system` before it will route
+    /// anything to it (see `deis_proxy::config::system::health`), so a
+    /// backend sees requests no test made; every assertion here is about what
+    /// a client's request turned into after crossing the hop, and a probe is
+    /// not one. [`Backend::probe_heads`] has them.
     pub fn heads(&self) -> Vec<String> {
+        self.all_heads()
+            .into_iter()
+            .filter(|head| !is_health_probe(head))
+            .collect()
+    }
+
+    /// The edge's health probes, for a test that wants to prove it was asked.
+    pub fn probe_heads(&self) -> Vec<String> {
+        self.all_heads()
+            .into_iter()
+            .filter(|head| is_health_probe(head))
+            .collect()
+    }
+
+    /// Everything this backend was handed, probes included.
+    pub fn all_heads(&self) -> Vec<String> {
         self.heads
             .lock()
             .expect("the head log is not poisoned")
@@ -222,6 +246,45 @@ async fn seed_apps(database: &Path, apps: &[serde_json::Value]) {
         .expect("the applications are written");
 }
 
+/// Whether a head is the edge's own health probe rather than a client's
+/// request.
+///
+/// Both halves are needed and neither alone would do: `GET /health` is a path
+/// a client may ask any application for, and `x-deis-app-id: _system` is a
+/// header a client may send - the edge refuses that pair from a client, which
+/// is exactly why the pair only ever arrives here from the edge itself.
+fn is_health_probe(head: &str) -> bool {
+    let Some(request_line) = head.lines().next() else {
+        return false;
+    };
+    let target = request_line.split_whitespace().nth(1).unwrap_or_default();
+    target == "/health"
+        && head.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("x-deis-app-id") && value.trim() == "_system"
+            })
+        })
+}
+
+/// One plain HTTP request to an address, head and body together.
+///
+/// Not a method on [`Proxy`] because a listener can outlive the process that
+/// first bound it: after a zero-downtime upgrade the port is served by the
+/// replacement, and a test that keeps asking has to ask the address rather
+/// than the process it started.
+pub async fn request_to(addr: SocketAddr, path: &str, host: &str) -> String {
+    let Ok(mut stream) = TcpStream::connect(addr).await else {
+        return String::from("the connection was refused");
+    };
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return String::from("the request could not be written");
+    }
+    let mut answer = String::new();
+    let _ = stream.read_to_string(&mut answer).await;
+    answer
+}
+
 /// Read a message head and stop on the blank line that ends it.
 ///
 /// One byte at a time on purpose: a buffered read would pull whatever follows
@@ -324,6 +387,16 @@ pub struct ProxyOptions {
     /// Extra configuration appended verbatim, for tables this harness has no
     /// opinion about.
     pub extra_config: String,
+    /// Where the upgrade socket goes. `None` puts it in the proxy's own
+    /// directory; a test that wants to take the directory away while the
+    /// proxy runs needs one of its own.
+    pub upgrade_sock: Option<PathBuf>,
+    /// Extra top-level keys, written before the first table.
+    ///
+    /// Separate from `extra_config` because TOML has no way back out of a
+    /// table: a bare key appended after `[log.error_log]` becomes a key *of*
+    /// that table, which the proxy refuses as an unknown field.
+    pub top_level_config: String,
     /// Applications to write into the proxy's database before it starts, in
     /// the shape the control plane would have pushed them.
     pub apps: Vec<serde_json::Value>,
@@ -351,6 +424,8 @@ impl Default for ProxyOptions {
             http_port: None,
             tls: None,
             extra_config: String::new(),
+            upgrade_sock: None,
+            top_level_config: String::new(),
             apps: Vec::new(),
             dir: None,
             wait_for_forwarding: true,
@@ -436,6 +511,8 @@ impl Proxy {
             http_port,
             tls,
             extra_config,
+            upgrade_sock,
+            top_level_config,
             apps,
             dir,
             wait_for_forwarding,
@@ -473,6 +550,7 @@ impl Proxy {
              pid_file = \"{pid}\"\n\
              upgrade_sock = \"{sock}\"\n\
              max_request_body_bytes = {BODY_CEILING}\n\
+             {top_level_config}\
              \n\
              [[upstreams]]\n\
              host = \"{host}\"\n\
@@ -483,7 +561,9 @@ impl Proxy {
              path = \"{log}\"\n",
             db = database.display(),
             pid = dir.path().join("deis-proxy.pid").display(),
-            sock = dir.path().join("upgrade.sock").display(),
+            sock = upgrade_sock
+                .unwrap_or_else(|| dir.path().join("upgrade.sock"))
+                .display(),
             host = upstream.ip(),
             upstream_port = upstream.port(),
             log = log.display(),
@@ -680,6 +760,20 @@ impl Proxy {
     /// Everything the proxy has written to its error log so far.
     pub fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// The process id of the running proxy, for a test that has to signal it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the proxy process is still running.
+    ///
+    /// A test that expects a process to survive something has to be able to
+    /// say so about the process itself, not only about its port: a port that
+    /// still answers may be a replacement that took the listener over.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     pub fn log_tail(&self) -> String {

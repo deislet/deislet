@@ -122,6 +122,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let api_config = Arc::new(config.clone());
 
+    // Before anything can serve a bundle: a version row written by an earlier
+    // run may name its zip relative to the directory *that* run was started
+    // in, which is nothing this process can resolve - and the default
+    // `bundle_dir` is relative, so on most installations every row is. See
+    // `CatalogStore::anchor_bundle_paths`.
+    deis_control::api::anchor_bundle_paths(&database, &api_config).await;
+
     // One stop signal for the whole process, taken before anything is
     // started so every part gets the same edge: the listener stops
     // accepting, the node control channels are closed instead of being left

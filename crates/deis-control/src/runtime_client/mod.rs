@@ -14,8 +14,32 @@ pub mod proto {
     tonic::include_proto!("deis.management");
 }
 
-/// The invocation API of a node: queue and scheduled events. Only the cron
-/// half is used from here.
+/// The invocation API of a node: `OnScheduled` and `OnQueue`.
+///
+/// **This control plane calls exactly one of the two, and that is a decision
+/// rather than a gap.**
+///
+/// `OnScheduled` is cron. A schedule belongs to an application and not to a
+/// node (architecture principle 6), so this process is the one that keeps it,
+/// picks a node per occurrence and fires it - see [`crate::scheduler`].
+///
+/// `OnQueue` has no caller here and is not going to get one. A node leases its
+/// own messages straight from deis-queue: the deployment payload hands it that
+/// service's address (`crate::delivery::StorageWiring`) and this process is
+/// then out of the path entirely - it holds no queue client, never sees a
+/// message and has no lease it could pass on. What `OnQueue` is for is a
+/// caller that *does* hold the lease and wants the handler run elsewhere,
+/// which is why its response names the messages the handler did not complete
+/// and leaves acknowledging the rest to whoever called. For this control plane
+/// to use it, it would first have to start leasing messages it has no reason
+/// to hold, and then own the acknowledgement of every batch it pushed - a
+/// second delivery path racing the nodes' own pollers for messages that were
+/// already being delivered.
+///
+/// The generated client below therefore carries an `on_queue` method that
+/// nothing calls: the service is generated whole from
+/// `deis-runtime/proto/trigger.proto`. A call site added here would be that
+/// design change, not an oversight being corrected.
 pub mod trigger {
     tonic::include_proto!("deis.trigger");
 }
@@ -53,14 +77,24 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// node - running the job twice, which is worse than reporting it late.
 const TRIGGER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How many lost nodes are remembered at once. See [`DepartedNode`].
+///
+/// Two orders of magnitude above any fleet this platform runs, so reaching it
+/// means node ids are being invented rather than reused - and the alternative,
+/// an unbounded map fed by whoever holds a node key, is worse than forgetting
+/// the oldest entry and saying so.
+const MAX_DEPARTED_NODES: usize = 256;
+
 /// The node key this control plane presents on every call into a node's own
 /// management plane.
 ///
 /// A node serves `ApplyDeployment`, `UnloadApp`, `GetStatus`, `StartInspect`,
-/// `PushConfig` and the two trigger RPCs only to a caller that proves it is
+/// `PushConfig` and the trigger RPCs only to a caller that proves it is
 /// entitled to drive it, because those RPCs between them can take an
 /// application offline, list every tenant on the node and replace one
-/// tenant's code with a bundle of the caller's choosing. The proof is one of
+/// tenant's code with a bundle of the caller's choosing. Of the trigger pair
+/// this control plane only ever dials `OnScheduled`; see [`mod@trigger`] for
+/// why `OnQueue` has no caller here. The proof is one of
 /// this control plane's `node_preshared_keys` - the same value the node
 /// already holds as `[control] secret` for the other direction - and it is
 /// attached here as an interceptor rather than at each call site so that an
@@ -192,6 +226,63 @@ impl NodeSource {
     }
 }
 
+/// A node this control plane had on its fleet list and then lost.
+///
+/// Losing a registration is not the same as a node going away. It expires
+/// because the node **stopped talking to this control plane**, which is
+/// exactly the state in which it is still running whatever it last received
+/// and cannot be told anything new: it is not reachable for a push, and it is
+/// not asking for its assignments either, so nothing corrects it. Dropping the
+/// entry and remembering nothing is what let a deploy - and, worse, an
+/// application deletion - answer "every node took it" while a live node kept
+/// serving the old code and the deleted app's secrets.
+///
+/// The record is cleared when the node registers again, or when somebody says
+/// the machine is really gone with `DELETE /api/nodes/{id}/registration`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DepartedNode {
+    pub id: String,
+    /// Where it was last known to answer.
+    pub addr: String,
+    /// Last time it refreshed its registration.
+    pub last_registered_at: Option<DateTime<Utc>>,
+    /// When this control plane dropped it from the fleet list.
+    pub departed_at: DateTime<Utc>,
+}
+
+impl DepartedNode {
+    /// Why a fleet-wide operation could not include this node, in the words
+    /// the answer to a deploy or a delete carries back to whoever ran it.
+    pub fn describe(&self) -> String {
+        let last_seen = match self.last_registered_at {
+            Some(at) => at.to_rfc3339(),
+            None => "never".to_string(),
+        };
+        format!(
+            "this node stopped refreshing its registration (last seen {last_seen}) and was \
+             dropped from the fleet at {}, so nothing could be sent to it and it is still \
+             running whatever it last received. It rejoins by registering again; if the machine \
+             is really gone, DELETE /api/nodes/{}/registration clears this record",
+            self.departed_at.to_rfc3339(),
+            self.id
+        )
+    }
+}
+
+/// What a deregistration did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deregistered {
+    /// A node that was on the fleet list and asked to be taken off. It gets no
+    /// further push and no cron fire until it registers again.
+    FromFleet,
+    /// A node this control plane had already given up on: only the record that
+    /// it was lost is cleared, so fleet-wide operations stop reporting it.
+    Forgotten,
+    /// Named in `deis_runtime_nodes`; nothing was removed, because the file
+    /// says the node exists.
+    Configured,
+}
+
 /// One node this control plane may talk to.
 #[derive(Debug, Clone)]
 struct NodeEntry {
@@ -318,6 +409,9 @@ pub struct RuntimeNodeManager {
     /// registration or an expiry - and every read is a short, non-async
     /// snapshot.
     nodes: std::sync::RwLock<std::collections::BTreeMap<String, NodeEntry>>,
+    /// Registered nodes whose lease ran out, kept so that a fleet-wide
+    /// operation can say it did not reach them. See [`DepartedNode`].
+    departed: std::sync::RwLock<std::collections::BTreeMap<String, DepartedNode>>,
     health: DashMap<String, NodeHealth>,
     poll_interval: Duration,
     registration_ttl: Duration,
@@ -368,6 +462,7 @@ impl RuntimeNodeManager {
         }
         Self {
             nodes: std::sync::RwLock::new(entries),
+            departed: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             health,
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             registration_ttl: Duration::from_secs(registration_ttl_secs.max(1)),
@@ -424,6 +519,31 @@ impl RuntimeNodeManager {
         &self,
     ) -> std::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<String, NodeEntry>> {
         self.nodes.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn departed_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<String, DepartedNode>> {
+        self.departed.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Nodes this control plane has lost and has not been told about since,
+    /// oldest departure first.
+    ///
+    /// Every fan-out reads this, not only [`Self::ids`]: a node that is no
+    /// longer on the list is not a node that stopped existing, and an answer
+    /// that describes only the reachable half of the fleet is the answer that
+    /// says a deploy succeeded when it did not.
+    pub fn departed(&self) -> Vec<DepartedNode> {
+        let mut departed: Vec<DepartedNode> = self
+            .departed
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        departed.sort_by_key(|node| node.departed_at);
+        departed
     }
 
     pub fn is_empty(&self) -> bool {
@@ -487,6 +607,18 @@ impl RuntimeNodeManager {
         let addr = addr.trim().to_string();
         check_node_address(&addr)?;
 
+        // Back on the list, so this control plane no longer has a node it has
+        // lost: whatever it missed while it was away, its next assignment
+        // reconcile and the next push both reach it again.
+        let rejoined = self.departed_write().remove(id).is_some();
+        if rejoined {
+            info!(
+                node = %id,
+                address = %addr,
+                "A node this control plane had given up on registered again; fleet-wide operations stop reporting it as unreached, and it is a delivery target once more"
+            );
+        }
+
         let mut nodes = self.write();
         match nodes.get_mut(id) {
             Some(entry) => {
@@ -539,19 +671,34 @@ impl RuntimeNodeManager {
 
     /// Take a node off the list because it said it is going away.
     ///
-    /// Returns how the entry had arrived, or `None` when there was none. A
-    /// configured node cannot be removed this way: the file says it exists, so
-    /// dropping it would make the running fleet disagree with the file until
-    /// somebody restarted the process.
-    pub fn deregister(&self, id: &str) -> Option<NodeSource> {
+    /// Returns what was done, or `None` when this control plane has never
+    /// heard of the id. A configured node cannot be removed this way: the file
+    /// says it exists, so dropping it would make the running fleet disagree
+    /// with the file until somebody restarted the process.
+    ///
+    /// It also clears a node from [`Self::departed`], which is the only way an
+    /// operator has to say "that machine is really gone". Without it, a node
+    /// that was decommissioned without deregistering would be named as
+    /// unreached by every deployment and every deletion for ever.
+    pub fn deregister(&self, id: &str) -> Option<Deregistered> {
         let mut nodes = self.write();
-        let source = nodes.get(id)?.source;
-        if source == NodeSource::Registered {
-            nodes.remove(id);
+        let Some(entry) = nodes.get(id) else {
             drop(nodes);
-            self.health.remove(id);
+            return self
+                .departed_write()
+                .remove(id)
+                .map(|_| Deregistered::Forgotten);
+        };
+        if entry.source == NodeSource::Configured {
+            return Some(Deregistered::Configured);
         }
-        Some(source)
+        nodes.remove(id);
+        drop(nodes);
+        self.health.remove(id);
+        // A node that says it is stopping is not a node this control plane
+        // lost track of, so it leaves no record behind.
+        self.departed_write().remove(id);
+        Some(Deregistered::FromFleet)
     }
 
     /// Drop registrations nobody has refreshed inside the lifetime.
@@ -566,20 +713,59 @@ impl RuntimeNodeManager {
             Err(_) => return Vec::new(),
         };
         let mut nodes = self.write();
-        let stale: Vec<String> = nodes
-            .iter()
-            .filter(|(_, entry)| entry.source == NodeSource::Registered)
-            .filter(|(_, entry)| entry.last_registered_at.is_none_or(|last| now - last > ttl))
-            .map(|(id, _)| id.clone())
+        let stale: Vec<NodeEntry> = nodes
+            .values()
+            .filter(|entry| entry.source == NodeSource::Registered)
+            .filter(|entry| entry.last_registered_at.is_none_or(|last| now - last > ttl))
+            .cloned()
             .collect();
-        for id in &stale {
-            nodes.remove(id);
+        for entry in &stale {
+            nodes.remove(&entry.config.id);
         }
         drop(nodes);
-        for id in &stale {
-            self.health.remove(id);
+
+        // Remembered, not forgotten. This node stopped talking to this control
+        // plane, which is precisely the state in which it is still serving what
+        // it last received and nothing is going to correct it; a fan-out that
+        // only knew about the reachable half of the fleet used to report a
+        // deploy, and an application deletion, as complete.
+        let mut departed = self.departed_write();
+        for entry in &stale {
+            departed.insert(
+                entry.config.id.clone(),
+                DepartedNode {
+                    id: entry.config.id.clone(),
+                    addr: entry.config.addr.clone(),
+                    last_registered_at: entry.last_registered_at,
+                    departed_at: now,
+                },
+            );
         }
-        stale
+        // Bounded, because the ids come from whoever holds a node key and an
+        // entry is only ever cleared by that node coming back or by somebody
+        // saying the machine is gone. Far above any real fleet, so trimming is
+        // worth saying out loud when it happens.
+        while departed.len() > MAX_DEPARTED_NODES {
+            let Some(oldest) = departed
+                .values()
+                .min_by_key(|node| node.departed_at)
+                .map(|node| node.id.clone())
+            else {
+                break;
+            };
+            departed.remove(&oldest);
+            warn!(
+                node = %oldest,
+                kept = MAX_DEPARTED_NODES,
+                "More than {MAX_DEPARTED_NODES} nodes have been dropped from the fleet without coming back, so the oldest is being forgotten; if that machine is still running it will no longer be reported as unreached by a deployment or a deletion. Clear the ones that are really gone with DELETE /api/nodes/{{id}}/registration"
+            );
+        }
+        drop(departed);
+
+        for entry in &stale {
+            self.health.remove(&entry.config.id);
+        }
+        stale.into_iter().map(|entry| entry.config.id).collect()
     }
 
     /// Every node id, ordered by id.
@@ -814,10 +1000,10 @@ impl RuntimeNodeManager {
     ) -> Result<trigger::TriggerResponse, NodeError> {
         let channel = self.channel(id, TRIGGER_TIMEOUT).await?;
         // The trigger service is guarded on the node exactly like the
-        // management one: `OnQueue` and `OnScheduled` run an application's
-        // handler with that environment's secrets, so the same credential
-        // rides the same wrapper. Fixing one service and not the other would
-        // have left the cron door open.
+        // management one: both of its RPCs run an application's handler with
+        // that environment's secrets, so the same credential rides the same
+        // wrapper. Fixing one service and not the other would have left the
+        // cron door open.
         let mut client = TriggerClient::new(self.authorized(channel))
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
@@ -1265,11 +1451,11 @@ mod tests {
             .register("joined", "http://10.0.0.5:8086", None, Utc::now())
             .unwrap();
 
-        assert_eq!(manager.deregister("joined"), Some(NodeSource::Registered));
+        assert_eq!(manager.deregister("joined"), Some(Deregistered::FromFleet));
         assert_eq!(manager.ids(), vec!["from-file".to_string()]);
         assert_eq!(
             manager.deregister("from-file"),
-            Some(NodeSource::Configured),
+            Some(Deregistered::Configured),
             "the answer says why it stayed"
         );
         assert_eq!(manager.ids(), vec!["from-file".to_string()]);

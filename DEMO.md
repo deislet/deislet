@@ -402,6 +402,12 @@ curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
 - `deis-store-data/` / `deis-queue-data/` / `deis-telemetry-data/` 各自的数据目录
 - `origin/`：那个上游服务的根目录，里面只有一个 `payload.txt`；`verify` 校验取回来的
   正是它的内容，免得端口上换了个别的服务照样答 200 也算过
+
+  > 上面这份清单顺带回答了「真环境该备份什么」的一半：控制面那一侧要备的是
+  > `deis-control.db`、`bundles/`（每个版本代码的唯一一份，在库外）、`secret.key`
+  > （少了它库里的密文谁也解不开）和那份配置。只备数据库恢复出来的控制面照样启动、
+  > `/health` 照答 `OK`、控制台照列出所有应用，却一个也跑不起来。完整清单与实测过的
+  > 恢复步骤在 `crates/deis-control/DEPLOYMENT.md`。
 - `app-v1/` / `app-v2/`：示例应用的构建副本（构建会往项目里写 `dist/`，所以不在仓库里做）
 - `app-callee/`：被调方 `demo-auth` 的源码与构建副本，由脚本现写
 - `acme/`：deis-proxy 的 ACME 存储目录，按颁发机构主机名分层放账号密钥与证书

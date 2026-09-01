@@ -220,9 +220,75 @@ mod tests {
         assert_eq!(registry.value(REQUESTS_TOTAL, "demo"), 1.0);
     }
 
+    /// The defect, stated as a test: a `_total` that a consumer cannot tell a
+    /// restart from a decrease in.
+    ///
+    /// A node's counters live in memory and start at zero, so a restart makes
+    /// every one of them smaller than it was. deis-telemetry keeps the newest
+    /// sample of each series and re-exports it, so what a consumer is handed
+    /// is one number that went backwards with nothing to say why -- measured
+    /// against a running node, `deis_runtime_requests_total` for one tenant
+    /// read 116, the node was restarted, six requests were served, and the
+    /// same series read 6. Every push now carries the moment this run began,
+    /// so a smaller total that arrives with a later start time is a restart
+    /// and a smaller total that arrives with the same one is a fault.
     #[test]
-    fn an_empty_registry_produces_no_samples() {
-        assert!(MetricsRegistry::new().snapshot(1).is_empty());
+    fn every_push_says_which_run_the_totals_belong_to() {
+        let first = MetricsRegistry::new();
+        first.record_request("demo", Duration::from_millis(1), RequestOutcome::Ok);
+
+        let started = |registry: &MetricsRegistry| {
+            registry
+                .snapshot(1)
+                .into_iter()
+                .find(|sample| sample.name == PROCESS_START_TIME_SECONDS)
+                .map(|sample| {
+                    assert!(
+                        sample.app_id.is_empty(),
+                        "the start time is a fact about the process, not about a tenant"
+                    );
+                    sample.value
+                })
+                .expect("every snapshot carries the moment this run began")
+        };
+
+        let run = started(&first);
+        assert!(run > 0.0, "the start time has to be a real moment: {run}");
+        assert_eq!(
+            run,
+            started(&first),
+            "the start time may not move between two pushes of one run, or every push \
+             would read as a restart"
+        );
+
+        // A second registry is a second process, which is what a restart is.
+        // Its totals begin again at zero and its start time is a later one,
+        // which is the whole of what a consumer needs to tell the two apart.
+        let second = MetricsRegistry::new();
+        assert_eq!(second.value(REQUESTS_TOTAL, "demo"), 0.0);
+        assert!(
+            started(&second) >= run,
+            "a later run has to carry a start time no earlier than the one before it"
+        );
+    }
+
+    /// A node that has counted nothing still says it is counting.
+    ///
+    /// The scrape that most needs the start time is the one taken just after a
+    /// restart: the old run's totals are still inside deis-telemetry's export
+    /// window, and until this node serves its first request there would
+    /// otherwise be nothing at all to say the producer behind them is gone.
+    #[test]
+    fn an_empty_registry_still_reports_when_it_began() {
+        let samples = MetricsRegistry::new().snapshot(1);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![PROCESS_START_TIME_SECONDS],
+            "an idle node reports its start time and nothing else"
+        );
     }
 
     #[test]

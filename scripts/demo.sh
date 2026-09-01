@@ -6930,6 +6930,17 @@ check_dynamic_node_registration() {
     fail_check "$title" \
       "PUT .../registration for ${dynamic_id} answered HTTP ${status}, but the fleet shows source='${source:-<absent>}' registered_at='${registered_at:-<none>}' instead of a registered entry"
   fi
+
+  # Take the invented identity away again. Nothing refreshes it, and a
+  # registration nobody refreshes is a lease that runs out: the control plane
+  # then counts it among the nodes it has lost and names it in the answer to
+  # every later deployment and application deletion, because a node that
+  # stopped talking is normally one that is still serving what it last
+  # received. This one is not - it is a second name for the process that is
+  # already on the list as ${NODE_ID} - so the check that invented it removes
+  # it, which is also the only exercise the other half of the endpoint gets.
+  curl -s -o /dev/null -X DELETE -H "Authorization: Bearer ${SECRET}" \
+    "$(control_url)/api/nodes/${dynamic_id}/registration" || true
 }
 
 # ----------------------------------------------------------------------

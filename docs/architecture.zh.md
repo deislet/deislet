@@ -543,6 +543,12 @@ sequenceDiagram
   因为这些 SQLite 都开着 WAL，直接 `cp -r` 或 `rsync` 拷出来的目录可能缺最近的提交、
   也可能直接是坏的，而且打开时不会报错。做成子命令而不是 RPC，是因为它是运维动作，
   不该让任何能连到端口的人触发。
+  但**整个平台**的备份不止这一件事，而且最容易漏的两样都不在 deis-store 这边：控制面
+  的**包仓库**（`bundle_dir`，每个版本代码的唯一一份，是数据库旁边的文件，不在库里）
+  和**密钥主密钥**（`secret_key_file`，库里那些密文离了它就是一堆噪声）。少了任何一样
+  恢复出来的控制面都会照常启动、`/health` 照答 `OK`、控制台照列出所有应用，却一个也跑
+  不起来——`/health` 是存活探针，不回答「能不能服务」。完整清单、恢复脚本，以及一次真做
+  过的恢复实测，写在 `crates/deis-control/DEPLOYMENT.md`。
 - **地址由 deis-control 下发**给 deis-runtime，不写死在 deis-runtime 配置里：控制面
   配 `store_endpoint` / `queue_endpoint`，随每次下发进环境表，节点在进 Isolate 之前
   把它们取走。所以应用的 `ctx.env` 里看不到这两个键，也无法用同名变量把存储客户端

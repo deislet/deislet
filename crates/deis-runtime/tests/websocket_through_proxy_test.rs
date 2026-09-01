@@ -419,6 +419,15 @@ impl Proxy {
         seed_app(&database, APP);
         // No [control] section: standalone, so nothing is polled and the
         // application list written above is the whole routing table.
+        //
+        // `[health_check]` is pointed at this test's own application because
+        // deis-proxy asks every upstream whether it is ready before it will
+        // route to it, and by default it asks the `_system` application every
+        // real node loads at startup. The node above is a dispatcher stood up
+        // by hand with one application in it, so `_system` is not there and
+        // the default question has no answer. Asking for the application this
+        // node does serve keeps the probe a real HTTP request rather than
+        // turning the check off.
         std::fs::write(
             &config,
             format!(
@@ -432,6 +441,10 @@ impl Proxy {
                  [[upstreams]]\n\
                  host = \"{host}\"\n\
                  port = {upstream_port}\n\
+                 \n\
+                 [health_check]\n\
+                 path = \"/\"\n\
+                 app_id = \"{APP}\"\n\
                  \n\
                  [log.error_log]\n\
                  level = \"debug\"\n\

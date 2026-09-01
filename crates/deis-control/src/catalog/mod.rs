@@ -45,7 +45,7 @@ pub use model::{
     SecretMeta, Version,
 };
 pub use secrets::{SecretCipher, SecretsBackend};
-pub use store::CatalogStore;
+pub use store::{BundlePathRepair, CatalogStore};
 
 use thiserror::Error;
 

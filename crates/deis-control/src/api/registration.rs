@@ -33,7 +33,9 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::api::middleware::{NodeAuthConfig, node_auth};
-use crate::runtime_client::{NodeSource, Registered, RegistrationError, RuntimeNodeManager};
+use crate::runtime_client::{
+    Deregistered, NodeSource, Registered, RegistrationError, RuntimeNodeManager,
+};
 
 #[derive(Clone)]
 pub struct RegistrationState {
@@ -182,7 +184,7 @@ pub async fn deregister(
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
     match state.nodes.deregister(&node_id) {
-        Some(NodeSource::Registered) => {
+        Some(Deregistered::FromFleet) => {
             info!(
                 node = %node_id,
                 fleet_size = state.nodes.len(),
@@ -193,7 +195,18 @@ pub async fn deregister(
                 Json(json!({ "node_id": node_id, "removed": true })),
             )
         }
-        Some(NodeSource::Configured) => {
+        Some(Deregistered::Forgotten) => {
+            info!(
+                node = %node_id,
+                lost_nodes = state.nodes.departed().len(),
+                "Cleared the record of a node this control plane had lost; deployments and application deletions stop reporting it as unreached. If that machine is in fact still running, it is still serving what it last received"
+            );
+            (
+                StatusCode::OK,
+                Json(json!({ "node_id": node_id, "removed": true })),
+            )
+        }
+        Some(Deregistered::Configured) => {
             warn!(
                 node = %node_id,
                 "A node that is named in deis_runtime_nodes asked to be deregistered; it stays on the fleet list because the configuration file says it exists, so pushes and cron fires keep being aimed at it and will fail while it is down"

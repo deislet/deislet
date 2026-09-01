@@ -46,15 +46,23 @@ autonomous; it is **not** true that it never dials out.
 ## Running
 
 ```bash
+deis-runtime -c /etc/deis/deis-runtime.toml
+# or, equivalently
 DEIS_RUNTIME_CONFIG=/etc/deis/deis-runtime.toml cargo run -p deis-runtime
 ```
 
-There is no `--config` flag. The configuration file is whatever
-`DEIS_RUNTIME_CONFIG` names, or `./deis-runtime.toml` if that variable is
-unset and the file is there; with neither, the built-in defaults apply. Every
-setting is documented inline in [`deis-runtime.toml`](deis-runtime.toml), and
-each has an environment variable whose name is the TOML path with
-`DEIS_RUNTIME_` in front, upper-cased and joined by underscores.
+The configuration file is the one `-c` / `--config` names, then whatever
+`DEIS_RUNTIME_CONFIG` names, then `./deis-runtime.toml` if neither is given
+and the file is there; with none of the three, the built-in defaults apply. A
+file named by the flag or the variable and not found stops the node: running
+on the defaults instead would mean default ports, no control plane and no
+outbound allowlist, on a node whose `/health` says it is fine. The startup log
+says which file was read, or that none was.
+
+Every setting is documented inline in
+[`deis-runtime.toml`](deis-runtime.toml), and each has an environment variable
+whose name is the TOML path with `DEIS_RUNTIME_` in front, upper-cased and
+joined by underscores.
 
 A startup snapshot is built and reused only when `DEIS_RUNTIME_SNAPSHOT_PATH`
 names a file: the first start writes it, later starts load it. With the

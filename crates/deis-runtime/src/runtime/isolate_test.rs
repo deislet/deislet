@@ -3422,6 +3422,86 @@ export default function handler(context: any): Response {
         );
     }
 
+    /// A producer that paces itself with a self-rescheduling `setTimeout`
+    /// armed from `start()`, with ordinary traffic for the same application
+    /// underneath it.
+    ///
+    /// The chain is the shape every server-sent-events feed that has to send
+    /// its first frame at once is written in, and each link of it is armed
+    /// from inside the previous one's callback -- long after the invocation
+    /// that opened the stream has ended and put ownership back to itself. So
+    /// each link was filed in the *invocation's* timer set, where the next
+    /// request to this application swept it: the producer never woke, the node
+    /// ended the stream with nothing outstanding, and a client that had been
+    /// sent 200 and the frames made so far got the rest of its body cut off.
+    /// Whether it happened at all depended on somebody else's traffic.
+    #[tokio::test]
+    async fn a_producer_paced_by_its_own_timer_is_not_swept_by_the_next_request() {
+        let code = r#"
+            let produced = 0;
+            export default async function handler(context) {
+              const path = new URL(context.request.url).pathname;
+              if (path === "/progress") return new Response("produced=" + produced);
+
+              const encoder = new TextEncoder();
+              const stream = new ReadableStream({
+                start(controller) {
+                  const tick = () => {
+                    produced += 1;
+                    controller.enqueue(encoder.encode("frame" + produced + "\n"));
+                    if (produced >= 4) {
+                      controller.close();
+                      return;
+                    }
+                    setTimeout(tick, 20);
+                  };
+                  setTimeout(tick, 20);
+                },
+              });
+              return new Response(stream, {
+                headers: { "content-type": "text/event-stream" },
+              });
+            }
+        "#;
+        let mut runtime = streaming_runtime("selfpaced.production", code).await;
+
+        let (status, _, body) = answer_to(&mut runtime, "/feed").await;
+        assert_eq!(status, 200, "the head goes out before any frame exists");
+        let ResponseBody::Stream(mut reader) = body else {
+            panic!("the handler answered with a stream");
+        };
+
+        // One frame, which is enough for the producer's callback to have armed
+        // the next link of its chain.
+        let first = tokio::select! {
+            chunk = std::future::poll_fn(|cx| reader.poll_chunk(cx)) => chunk,
+            () = runtime.pump_response_streams() => panic!("the stream ended before its first frame"),
+        };
+        assert_eq!(first.as_deref(), Some(&b"frame1\n"[..]));
+
+        // An ordinary request for the same application, which is an invocation
+        // of its own and sweeps everything the invocation owns when it ends.
+        // Nothing the producer armed may be in that set.
+        let (progress, _, _) = answer_to(&mut runtime, "/progress").await;
+        assert_eq!(progress, 200);
+
+        let read = async {
+            let mut rest = Vec::new();
+            while let Some(chunk) = std::future::poll_fn(|cx| reader.poll_chunk(cx)).await {
+                rest.extend_from_slice(&chunk);
+            }
+            (rest, reader.failure())
+        };
+        let ((rest, failure), ()) = tokio::join!(read, runtime.pump_response_streams());
+        assert_eq!(
+            String::from_utf8(rest).unwrap(),
+            "frame2\nframe3\nframe4\n",
+            "the producer stopped waking after a request for the same application swept the \
+             timer it had armed, so the client's body was cut off after the 200 it already had"
+        );
+        assert_eq!(failure, None, "the producer finished, so nothing failed");
+    }
+
     #[tokio::test]
     async fn a_client_that_hangs_up_stops_the_producer() {
         // Otherwise the producer goes on making chunks nobody will ever read,
