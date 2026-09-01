@@ -194,6 +194,27 @@ pub struct BlobClient {
 }
 
 impl BlobClient {
+    /// The same client, speaking for one named binding of this tenant.
+    ///
+    /// Shares the channel: the tonic client is a reference-counted handle over
+    /// one HTTP/2 connection, so a version declaring four namespaces holds
+    /// four identities and one connection rather than four. `None` gives the
+    /// tenant's unnamed namespace, which is what an application that declares
+    /// no binding of this kind has always used.
+    pub(crate) fn for_binding(&self, binding: Option<&str>) -> Result<Self> {
+        let identity = self.identity.for_binding(binding)?;
+        tracing::debug!(
+            app_id = identity.tenant(),
+            binding = identity.binding().unwrap_or("<unnamed>"),
+            "object storage calls of this client are charged to {}",
+            identity.describe()
+        );
+        Ok(Self {
+            identity,
+            ..self.clone()
+        })
+    }
+
     /// Build a client that dials deis-store on its first call; see
     /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
     /// rather than connecting eagerly.

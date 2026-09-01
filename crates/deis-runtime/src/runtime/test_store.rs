@@ -87,7 +87,28 @@ impl TestStore {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         }
+    }
+
+    /// The same, with named bindings of one kind declared beside the unnamed
+    /// namespace this store already serves.
+    ///
+    /// Every name becomes a second namespace inside the same tenant, which is
+    /// the property the tests below actually check.
+    pub(crate) fn wiring_with_bindings<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+        kind: deis_bundle::BindingKind,
+        bindings: impl IntoIterator<Item = &'a str>,
+    ) -> ServiceWiring {
+        let mut wiring = self.wiring_for(names);
+        for binding in bindings {
+            wiring
+                .bindings
+                .insert(binding, deis_bundle::Binding::storage(kind));
+        }
+        wiring
     }
 }
 

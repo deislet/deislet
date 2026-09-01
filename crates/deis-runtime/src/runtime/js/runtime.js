@@ -917,7 +917,45 @@ function kvEncode(value) {
   );
 }
 
+// ---------------------------------------------------------
+// Named bindings
+// ---------------------------------------------------------
+//
+// Every storage object below carries the name of the namespace it speaks for,
+// and hands that name to the op as its first argument. The empty string is the
+// tenant's *unnamed* namespace: the one `context.services.kv` reaches, the one
+// deis-store keys by the tenant alone, and the one every application deployed
+// before named bindings existed has been reading and writing all along. A
+// named one is a second namespace beside it, inside the same tenant, and it is
+// empty on the day it is declared.
+//
+// The name lives on the object rather than being passed at each call site so
+// that a handle taken out of one - a prepared statement, an open transaction -
+// cannot be used against another by accident: the handle's own object carries
+// the binding, so the pair travels together. deis-store refuses the mismatch
+// too, which is the backstop; this is what keeps an ordinary program from
+// reaching it.
+//
+// `bindingName` is validated where a binding is declared, not here: the
+// objects below are built by `createServiceContext` out of the manifest's own
+// table, so a name reaching this file has already been through
+// `deis_bundle::DeclaredBindings::validate` at build, at upload and at load.
+const UNNAMED_NAMESPACE = "";
+
 class NativeKV {
+  // Which namespace this object speaks for. See UNNAMED_NAMESPACE.
+  #binding;
+
+  constructor(binding) {
+    this.#binding = binding || UNNAMED_NAMESPACE;
+  }
+
+  // The binding name, or "" for the tenant's unnamed namespace.
+  // Readable so a handler can log which namespace it is writing to.
+  get binding() {
+    return this.#binding;
+  }
+
   // get(key) -> the value as text, or null when the key is not there.
   // get(key, { type }) -> the value as "text", "json" or "arrayBuffer".
   //
@@ -926,7 +964,7 @@ class NativeKV {
   // every time.
   async get(key, options) {
     const type = kvValueType(options);
-    const bytes = await DenoCore.ops.op_kv_get(key);
+    const bytes = await DenoCore.ops.op_kv_get(this.#binding, key);
     if (bytes === null || bytes === undefined) return null;
     return kvDecode(bytes, type);
   }
@@ -950,7 +988,7 @@ class NativeKV {
   // it never does.
   async getWithMetadata(key, options) {
     const type = kvValueType(options);
-    const read = await DenoCore.ops.op_kv_get_with_metadata(key);
+    const read = await DenoCore.ops.op_kv_get_with_metadata(this.#binding, key);
     if (!read) return null;
     return {
       value: kvDecode(read.value, type),
@@ -1009,13 +1047,13 @@ class NativeKV {
       metadata = JSON.stringify(askedMetadata);
     }
 
-    await DenoCore.ops.op_kv_set(key, kvEncode(value), {
+    await DenoCore.ops.op_kv_set(this.#binding, key, kvEncode(value), {
       ttlSeconds: ttl,
       metadata: metadata
     });
   }
   async delete(key) {
-    await DenoCore.ops.op_kv_delete(key);
+    await DenoCore.ops.op_kv_delete(this.#binding, key);
   }
   // list() -> every key this application has
   // list("session:") -> the keys under a prefix
@@ -1097,7 +1135,7 @@ class NativeKV {
       cursor = askedCursor;
     }
 
-    const page = await DenoCore.ops.op_kv_list({
+    const page = await DenoCore.ops.op_kv_list(this.#binding, {
       prefix: prefix,
       limit: limit,
       cursor: cursor
@@ -1168,8 +1206,15 @@ class NativeTransaction {
   // application's handle, not the switch that closes it.
   #state;
 
-  constructor(state, expiresInMs) {
+  // The database this transaction belongs to. A binding is a separate file in
+  // deis-store, so a handle opened on one is meaningless against another; it
+  // travels with the handle rather than being read from whatever `database`
+  // the call site happens to name.
+  #binding;
+
+  constructor(state, expiresInMs, binding) {
     this.#state = state;
+    this.#binding = binding || UNNAMED_NAMESPACE;
     // How long deis-store granted this transaction, counted from when it
     // answered. A handler with slow work to do can look before it starts.
     this.expiresInMs = expiresInMs;
@@ -1190,6 +1235,7 @@ class NativeTransaction {
   async execute(sql, params = []) {
     return checkDbResult(
       await DenoCore.ops.op_db_execute_in_transaction(
+        this.#binding,
         this.#handle(),
         sql,
         JSON.stringify(params)
@@ -1201,6 +1247,7 @@ class NativeTransaction {
   async query(sql, params = []) {
     const res = checkDbResult(
       await DenoCore.ops.op_db_query_in_transaction(
+        this.#binding,
         this.#handle(),
         sql,
         JSON.stringify(params)
@@ -1212,15 +1259,28 @@ class NativeTransaction {
 }
 
 class NativeDB {
+  // Which namespace this object speaks for. A binding is a database file of its own in deis-store, not a schema inside one.
+  // See UNNAMED_NAMESPACE.
+  #binding;
+
+  constructor(binding) {
+    this.#binding = binding || UNNAMED_NAMESPACE;
+  }
+
+  // The binding name, or "" for the tenant's unnamed namespace.
+  get binding() {
+    return this.#binding;
+  }
+
   async execute(sql, params = []) {
     return checkDbResult(
-      await DenoCore.ops.op_db_execute(sql, JSON.stringify(params)),
+      await DenoCore.ops.op_db_execute(this.#binding, sql, JSON.stringify(params)),
       "execute"
     );
   }
   async query(sql, params = []) {
     const res = checkDbResult(
-      await DenoCore.ops.op_db_query(sql, JSON.stringify(params)),
+      await DenoCore.ops.op_db_query(this.#binding, sql, JSON.stringify(params)),
       "query"
     );
     return res.rows;
@@ -1294,7 +1354,7 @@ class NativeDB {
     });
 
     return checkDbResult(
-      await DenoCore.ops.op_db_batch(JSON.stringify(encoded)),
+      await DenoCore.ops.op_db_batch(this.#binding, JSON.stringify(encoded)),
       "batch"
     );
   }
@@ -1347,14 +1407,14 @@ class NativeDB {
     }
 
     const opened = checkDbResult(
-      await DenoCore.ops.op_db_begin_transaction({
+      await DenoCore.ops.op_db_begin_transaction(this.#binding, {
         timeoutMs: transactionTimeout(options)
       }),
       "transaction"
     );
 
     const state = { id: opened.transaction_id, ended: null };
-    const tx = new NativeTransaction(state, opened.expires_in_ms);
+    const tx = new NativeTransaction(state, opened.expires_in_ms, this.#binding);
 
     let value;
     try {
@@ -1363,7 +1423,7 @@ class NativeDB {
       state.ended = "rolled back";
       try {
         checkDbResult(
-          await DenoCore.ops.op_db_rollback_transaction(state.id),
+          await DenoCore.ops.op_db_rollback_transaction(this.#binding, state.id),
           "transaction.rollback"
         );
       } catch (rollbackError) {
@@ -1388,7 +1448,7 @@ class NativeDB {
     state.ended = "committed";
     try {
       checkDbResult(
-        await DenoCore.ops.op_db_commit_transaction(state.id),
+        await DenoCore.ops.op_db_commit_transaction(this.#binding, state.id),
         "transaction.commit"
       );
     } catch (error) {
@@ -1475,6 +1535,19 @@ function blobCondition(call, options) {
 }
 
 class BlobStore {
+  // Which namespace this object speaks for. A binding is an object-storage namespace of its own inside this tenant.
+  // See UNNAMED_NAMESPACE.
+  #binding;
+
+  constructor(binding) {
+    this.#binding = binding || UNNAMED_NAMESPACE;
+  }
+
+  // The binding name, or "" for the tenant's unnamed namespace.
+  get binding() {
+    return this.#binding;
+  }
+
   // get(key) -> the whole object, or null when the key is not there
   // get(key, { range }) -> one slice of it
   //
@@ -1515,7 +1588,7 @@ class BlobStore {
         );
       }
     }
-    const read = await DenoCore.ops.op_blob_get(key, { range: range });
+    const read = await DenoCore.ops.op_blob_get(this.#binding, key, { range: range });
     if (!read) return null;
     return blobObject(read);
   }
@@ -1526,7 +1599,7 @@ class BlobStore {
   // uploadedAt. This is how an application learns an object's size or media
   // type without paying for the object.
   async head(key) {
-    const meta = await DenoCore.ops.op_blob_head(key);
+    const meta = await DenoCore.ops.op_blob_head(this.#binding, key);
     if (!meta) return null;
     return {
       key: meta.key,
@@ -1595,7 +1668,7 @@ class BlobStore {
       if (limit > 2147483647) limit = 2147483647;
     }
 
-    const page = await DenoCore.ops.op_blob_list({
+    const page = await DenoCore.ops.op_blob_list(this.#binding, {
       prefix: prefix,
       delimiter: delimiter,
       limit: limit,
@@ -1648,7 +1721,7 @@ class BlobStore {
   //   if (written === null) { /* somebody else wrote first; read and retry */ }
   async put(key, data, options) {
     const contentType = blobString("blob.put", "contentType", optionOf(options, "contentType"));
-    const written = await DenoCore.ops.op_blob_put(key, blobEncode("blob.put", data), {
+    const written = await DenoCore.ops.op_blob_put(this.#binding, key, blobEncode("blob.put", data), {
       contentType: contentType,
       onlyIf: blobCondition("blob.put", options)
     });
@@ -1669,7 +1742,7 @@ class BlobStore {
   // caller required and is still stored - the same signal put() gives with
   // null, and the same response: read it again.
   async delete(key, options) {
-    return await DenoCore.ops.op_blob_delete(key, {
+    return await DenoCore.ops.op_blob_delete(this.#binding, key, {
       onlyIf: blobCondition("blob.delete", options)
     });
   }
@@ -1938,6 +2011,211 @@ const assetsBinding = ObjectFreeze({
   },
 });
 
+// ---------------------------------------------------------
+// Service bindings: calling another application on this platform
+// ---------------------------------------------------------
+//
+// `context.bindings.AUTH.fetch("/verify", { method: "POST", body })` -- the
+// same shape as any other fetch, so a handler that already talks to an HTTP
+// service moves to a service binding by changing what it calls, not how.
+//
+// What is different, and worth knowing before writing one:
+//
+//   * it never leaves this node. There is no address, no DNS and no socket, so
+//     the outbound policy is not involved and cannot be widened by it. A
+//     callee running on a different node is refused, in those words;
+//   * the callee has to agree. Naming it here is only asking; its own bundle
+//     names who may call it (`callableBy`);
+//   * it costs one subrequest out of this invocation's allowance, and a chain
+//     of them is bounded;
+//   * failures are told apart. "the callee is not here", "the callee will not
+//     take the call", "it failed inside the callee" and "your own budget ran
+//     out waiting" are four different messages, because they have four
+//     different fixes.
+//
+// The response is an ordinary Response with the body already read, which is
+// why there is no streaming form: a stream across the boundary would hold the
+// callee's runtime thread for a period governed by the callee's limits and
+// invisible to the caller's.
+
+// What a relative target is resolved against. Only the path and the query are
+// sent -- the callee is addressed by name, and this is only what its own
+// router matches on -- so the host here is never read by anything.
+const SERVICE_TARGET_BASE = "http://service.deis.local/";
+
+// The path and query of one service call, out of whatever `fetch` was given.
+//
+// Read by member rather than by `instanceof`, for the reason
+// `assetTargetOf` is: an application may have replaced `Request` or `URL`, and
+// an object built from its own constructor is still a request.
+function serviceTargetOf(binding, input) {
+  let raw;
+  if (typeof input === "string") {
+    raw = input;
+  } else if (input !== null && typeof input === "object" && typeof input.url === "string") {
+    raw = input.url;
+  } else if (input !== null && typeof input === "object" && typeof input.href === "string") {
+    raw = input.href;
+  } else {
+    throw new TypeError(
+      "bindings." + binding + ".fetch() takes a Request, a URL or a path; it was given " +
+        (input === null ? "null" : typeof input)
+    );
+  }
+  let url;
+  try {
+    url = new URLCtor(raw, SERVICE_TARGET_BASE);
+  } catch (e) {
+    throw new TypeError(
+      "bindings." + binding + ".fetch() was given " + JSON.stringify(raw) +
+        ", which is not a URL or a path"
+    );
+  }
+  return url.pathname + url.search;
+}
+
+// The headers of one service call, as a plain object.
+//
+// A Headers, a plain object or an array of pairs -- the three shapes `fetch`
+// takes. Whatever an application puts in `x-deis-caller` is replaced by the
+// platform before the call is dispatched, so a callee reading that header is
+// reading a fact rather than a claim.
+function serviceHeadersOf(init, request) {
+  const collected = {};
+  const absorb = (source) => {
+    if (!source) return;
+    if (typeof source.forEach === "function" && typeof source.entries === "function") {
+      // A Headers, or anything shaped like one.
+      source.forEach((value, name) => {
+        collected[String(name).toLowerCase()] = String(value);
+      });
+      return;
+    }
+    if (Array.isArray(source)) {
+      for (const pair of source) {
+        if (Array.isArray(pair) && pair.length === 2) {
+          collected[String(pair[0]).toLowerCase()] = String(pair[1]);
+        }
+      }
+      return;
+    }
+    if (typeof source === "object") {
+      for (const name of Object.keys(source)) {
+        collected[name.toLowerCase()] = String(source[name]);
+      }
+    }
+  };
+  // The request's own headers first, then the init's, so an init that names a
+  // header overrides the request it was built from -- which is what `fetch`
+  // does.
+  if (request && request.headers) absorb(request.headers);
+  if (init && init.headers) absorb(init.headers);
+  return collected;
+}
+
+// The body of one service call, as bytes, or null.
+//
+// Awaited here rather than streamed for the reason the response is collected:
+// what crosses between two isolates is a finished body.
+async function serviceBodyOf(binding, init, request) {
+  const source =
+    init && "body" in init ? init.body : request && typeof request.arrayBuffer === "function" ? request : null;
+  if (source === null || source === undefined) return null;
+  if (typeof source === "string") return new TextEncoder().encode(source);
+  if (source instanceof ArrayBuffer) return new Uint8Array(source);
+  if (ArrayBuffer.isView(source)) {
+    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+  }
+  if (typeof source.arrayBuffer === "function") {
+    const bytes = await source.arrayBuffer();
+    return new Uint8Array(bytes);
+  }
+  throw new TypeError(
+    "bindings." + binding + ".fetch(): body must be a string, an ArrayBuffer, an " +
+      "ArrayBufferView, or a Request or Response to read one from; got " + typeof source
+  );
+}
+
+// One service binding, as an application holds it.
+//
+// `fetch` is the only member: a service binding is a way to call an
+// application, and an application answers requests. `app` and `environment`
+// are readable so a handler can say in a log line which copy it is talking to
+// -- which matters most in a preview, where the answer is "the preview of the
+// other application", not production.
+class ServiceBinding {
+  #name;
+
+  constructor(name, app, environment) {
+    this.#name = name;
+    this.app = app;
+    this.environment = environment;
+    ObjectFreeze(this);
+  }
+
+  async fetch(input, init) {
+    const request = input !== null && typeof input === "object" ? input : null;
+    const answer = await DenoCore.ops.op_deis_service_call(
+      this.#name,
+      {
+        method:
+          (init && init.method) ||
+          (request && typeof request.method === "string" ? request.method : "GET"),
+        url: serviceTargetOf(this.#name, input),
+        headers: serviceHeadersOf(init, request)
+      },
+      await serviceBodyOf(this.#name, init, request)
+    );
+    return new ResponseCtor(answer.body, {
+      status: answer.status,
+      headers: answer.headers
+    });
+  }
+}
+
+// Build the table `context.bindings` publishes, out of what the manifest
+// declared.
+//
+// The names come from the platform, never from the application: `op_get_bindings`
+// answers with the manifest's own table as the node resolved it, so an
+// application cannot invent a binding at the call site and reach something it
+// never wrote down. A kind this build of the node does not know is skipped
+// with a line rather than made into an object that would fail on its first
+// method.
+function createBindings() {
+  const declared = DenoCore.ops.op_deis_get_bindings() || [];
+  const table = {};
+  for (const entry of declared) {
+    switch (entry.kind) {
+      case "kv":
+        table[entry.name] = new NativeKV(entry.name);
+        break;
+      case "database":
+        table[entry.name] = new NativeDB(entry.name);
+        break;
+      case "blob":
+        table[entry.name] = new BlobStore(entry.name);
+        break;
+      case "queue":
+        // A queue is already a name inside this tenant, so a queue binding is
+        // that name and needs no namespace under it. It is the same name a
+        // consumer declares in the manifest's `queues`.
+        table[entry.name] = new Queue(entry.name);
+        break;
+      case "service":
+        table[entry.name] = new ServiceBinding(entry.name, entry.app, entry.environment);
+        break;
+      default:
+        console.warn(
+          "binding " + JSON.stringify(entry.name) + " is of kind " +
+            JSON.stringify(entry.kind) + ", which this node has no binding for; " +
+            "it is not published on context.bindings or on env"
+        );
+    }
+  }
+  return table;
+}
+
 // The half of the context that does not depend on there being a request:
 // the environment, the platform services, `log` and waitUntil. Shared by the
 // fetch path, the queue path and the cron path so a queue or scheduled handler
@@ -1963,9 +2241,36 @@ function createServiceContext() {
     configurable: false,
   });
 
+  // Every named binding is published twice, on purpose, and they are the same
+  // object either way:
+  //
+  //   context.bindings.HOT   the platform's table, and the honest place: only
+  //                          bindings are in it, so a reader knows what they
+  //                          are looking at;
+  //   env.HOT                where code written for Cloudflare reaches for it,
+  //                          so a project ported from there needs no rewrite.
+  //
+  // On `env` they are defined and locked, exactly as `ASSETS` is: a variable
+  // or a secret of the same name is refused at build, at upload and at load
+  // (`Manifest::validate`), and if one somehow arrived it is overwritten here
+  // rather than allowed to decide what `env.HOT` means.
+  const bindings = createBindings();
+  for (const name of Object.keys(bindings)) {
+    ObjectDefineProperty(env, name, {
+      value: bindings[name],
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
+
   return {
     env,
+    bindings,
     services: {
+      // The tenant's *unnamed* namespaces: what an application has had since
+      // before bindings existed, and what its data is still in. A named
+      // binding is a second namespace beside these, never a renaming of them.
       kv: new NativeKV(),
       database: new NativeDB(),
       blob: new BlobStore(),

@@ -22,6 +22,7 @@ use std::io::{Cursor, Read};
 use serde::{Deserialize, Serialize};
 
 pub mod assets;
+pub mod bindings;
 pub mod compatibility;
 pub mod headers;
 pub mod limits;
@@ -31,6 +32,10 @@ pub mod routing;
 pub mod site;
 
 pub use assets::{AssetIndex, AssetMatch, guess_content_type};
+pub use bindings::{
+    Binding, BindingKind, CALLABLE_BY_EVERYONE, DeclaredBindings, MAX_BINDING_NAME_LEN,
+    ServiceEnvironment, callable_by_allows, validate_callable_by,
+};
 pub use compatibility::{
     CompatibilityDate, CompatibilityProfile, DeclaredCompatibility, FLAGS, Flag, FlagSpec,
     PLATFORM_KNOWN_THROUGH, flag_spec, known_flag_names,
@@ -115,8 +120,47 @@ pub struct Manifest {
     #[serde(default)]
     pub runtime: Option<String>,
     /// Which platform services the app declares it uses. Absent means false.
+    ///
+    /// The four keys are kinds, not names: this is what turns `ctx.services.kv`
+    /// on, and it is the tenant's *unnamed* namespace. A second namespace of
+    /// the same kind is a [`Self::bindings`] entry and is reached by the name
+    /// the author gave it.
     #[serde(default)]
     pub services: BTreeMap<String, bool>,
+
+    /// The namespaces and the applications this app reaches by name.
+    ///
+    /// Empty for every application written before bindings existed, which is
+    /// exactly right: such an application has its unnamed KV, database, object
+    /// store and default queue and nothing else, and both the code and the
+    /// data behind it are untouched by this field existing.
+    ///
+    /// Judged by [`Self::validate`], unlike [`Self::limits`] and
+    /// [`Self::compatibility`], because what is wrong with a binding
+    /// declaration is never a request a node could clamp: two names that are
+    /// one namespace on a case-insensitive filesystem, or a storage binding
+    /// carrying another application's id, are two meanings in one place. There
+    /// is no later moment at which either could be noticed - the first symptom
+    /// is data in the wrong namespace. See [`bindings`].
+    #[serde(default, skip_serializing_if = "DeclaredBindings::is_empty")]
+    pub bindings: DeclaredBindings,
+
+    /// Which applications this one agrees to be called by, through a service
+    /// binding.
+    ///
+    /// Consent, and it lives here - in the callee's own bundle, versioned with
+    /// the callee's own code - rather than anywhere a caller can reach. An
+    /// application naming another in its `bindings` is only *asking*; this is
+    /// the answer, and the node reads it out of the callee's current version
+    /// on every call, so withdrawing consent takes effect at the callee's next
+    /// deployment and nothing has to be redelivered to whoever named it.
+    ///
+    /// Empty is the default and consents to nobody, which is what an
+    /// application that has never thought about being called should mean.
+    /// [`CALLABLE_BY_EVERYONE`] is the one wildcard, and a node says so out
+    /// loud when it loads a version carrying it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callable_by: Vec<String>,
     /// Plain environment variables. Secret values never appear here.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -251,6 +295,37 @@ impl Manifest {
         self.site
             .validate()
             .map_err(|e| BundleError::InvalidManifest(e.to_string()))?;
+
+        // Same reason, and one more: a binding name becomes a namespace on the
+        // storage service, so a name that is wrong is a place an application
+        // writes without knowing. `self.app` goes in because an application
+        // binding itself in its own environment is a cycle, and the manifest
+        // is the only place that knows which application this is.
+        self.bindings
+            .validate(&self.app)
+            .map_err(BundleError::InvalidManifest)?;
+        validate_callable_by(&self.callable_by).map_err(BundleError::InvalidManifest)?;
+
+        // A binding is published on the environment table beside the
+        // application's own variables, and the platform's property wins, so a
+        // variable of the same name would be a value the author set and the
+        // handler never sees. Refused here rather than silently overwritten.
+        for (name, _) in self.bindings.iter() {
+            if self.env.contains_key(name) {
+                return Err(BundleError::InvalidManifest(format!(
+                    "{name:?} is both a binding and an environment variable. Bindings are \
+                     published on the environment table and the platform's property wins, so the \
+                     variable would be set by this bundle and never seen by a handler"
+                )));
+            }
+            if self.secrets.iter().any(|secret| secret == name) {
+                return Err(BundleError::InvalidManifest(format!(
+                    "{name:?} is both a binding and a secret. Bindings are published on the \
+                     environment table and the platform's property wins, so the secret would be \
+                     delivered to this node and never seen by a handler"
+                )));
+            }
+        }
 
         for asset in &self.assets {
             if asset.path.starts_with('/') {
@@ -440,6 +515,45 @@ mod tests {
         let m = Manifest::parse(MINIMAL).unwrap();
         assert!(m.check_app("demo").is_ok());
         assert!(m.check_app("other").is_err());
+    }
+
+    #[test]
+    fn rejects_a_binding_that_would_be_shadowed_by_a_variable() {
+        // Both halves of the same hazard: a binding is published on the
+        // environment table and the platform's property wins, so a variable or
+        // a secret of the same name is a value the author set and no handler
+        // will ever read. Refused where it is written.
+        let json = r#"{"schema":1,"app":"d","entry":"e.js","bindings":{"HOT":{"kind":"kv"}},"env":{"HOT":"x"}}"#;
+        let err = Manifest::parse(json).unwrap_err();
+        assert!(err.to_string().contains("environment variable"), "{err}");
+
+        let json = r#"{"schema":1,"app":"d","entry":"e.js","bindings":{"HOT":{"kind":"kv"}},"secrets":["HOT"]}"#;
+        let err = Manifest::parse(json).unwrap_err();
+        assert!(err.to_string().contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn a_binding_declaration_is_refused_wherever_a_manifest_is_read() {
+        // `validate` runs at build, at upload and at load, so a bundle that
+        // carries two names that are one namespace on a case-insensitive
+        // filesystem never reaches a node - and if one somehow did, the node
+        // would refuse it rather than run it.
+        let json = r#"{"schema":1,"app":"d","entry":"e.js","bindings":{"HOT":{"kind":"kv"},"hot":{"kind":"kv"}}}"#;
+        let err = Manifest::parse(json).unwrap_err();
+        assert!(err.to_string().contains("differ only in case"), "{err}");
+    }
+
+    #[test]
+    fn a_manifest_without_bindings_declares_none() {
+        // Every application written before bindings existed. The field is
+        // absent from what it serialises back out, so a round trip does not
+        // start writing an empty object into everybody's manifest.
+        let manifest = Manifest::parse(MINIMAL).unwrap();
+        assert!(manifest.bindings.is_empty());
+        assert!(manifest.callable_by.is_empty());
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains("bindings"), "{json}");
+        assert!(!json.contains("callable_by"), "{json}");
     }
 
     #[test]

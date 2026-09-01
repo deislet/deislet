@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Result};
 use deis_build_core::ProjectConfig;
 use deis_bundle::{
-    Asset, DeclaredCompatibility, DeclaredLimits, Manifest, QueueConsumer, Route, SUPPORTED_SCHEMA,
+    Asset, Binding, BindingKind, DeclaredBindings, DeclaredCompatibility, DeclaredLimits, Manifest,
+    QueueConsumer, Route, SUPPORTED_SCHEMA,
 };
 
 use crate::assets::StagedAsset;
@@ -61,6 +62,8 @@ pub fn build_manifest(
         entry: WORKER_ENTRY.to_string(),
         runtime: Some(RUNTIME_PROFILE.to_string()),
         services: services(config),
+        bindings: bindings(config)?,
+        callable_by: callable_by(config),
         env: environment(config),
         secrets: secret_names(config),
         routes: routes
@@ -178,6 +181,78 @@ fn compatibility(config: &ProjectConfig) -> Result<Option<DeclaredCompatibility>
         anyhow::anyhow!("the project's compatibility declaration is not usable: {e}")
     })?;
     Ok(Some(declared))
+}
+
+/// The namespaces and the applications this project reaches by name.
+///
+/// Translated here rather than re-used from the project file, and checked here
+/// rather than at upload, for the reason [`limits`] is: an author who wrote a
+/// binding this platform cannot honour should learn it from the build, with
+/// the project file still on screen, not from a rejected deploy. The checks
+/// themselves are `deis_bundle`'s, so the build, the control plane and the
+/// node refuse exactly the same declarations.
+///
+/// A project that declares nothing leaves the key out of the manifest
+/// entirely, which is what every application written before bindings existed
+/// looks like.
+fn bindings(config: &ProjectConfig) -> Result<DeclaredBindings> {
+    let mut declared = DeclaredBindings::new();
+    for (name, entry) in &config.bindings {
+        let kind = BindingKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == entry.kind.trim().to_ascii_lowercase())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "binding {:?} has kind {:?}, which is not one this platform has. The kinds \
+                     are: {}",
+                    name,
+                    entry.kind,
+                    BindingKind::ALL
+                        .iter()
+                        .map(|kind| kind.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        declared.insert(
+            name.trim().to_string(),
+            Binding {
+                kind,
+                app: entry
+                    .app
+                    .as_ref()
+                    .map(|app| app.trim().to_string())
+                    .filter(|app| !app.is_empty()),
+                environment: entry
+                    .environment
+                    .as_ref()
+                    .map(|env| env.trim().to_string())
+                    .filter(|env| !env.is_empty()),
+            },
+        );
+    }
+    declared
+        .validate(config.name.trim())
+        .map_err(|e| anyhow::anyhow!("the project's \"bindings\" block is not usable: {e}"))?;
+    Ok(declared)
+}
+
+/// Which applications this project agrees to be called by.
+///
+/// Copied through with blanks dropped; the shape is checked by
+/// `Manifest::validate`, which every reader of a manifest runs.
+fn callable_by(config: &ProjectConfig) -> Vec<String> {
+    let mut names: Vec<String> = config
+        .callable_by
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    // Sorted and deduplicated so two builds of one project produce the same
+    // bytes whatever order the author wrote the list in.
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Which platform services the app declares it uses.

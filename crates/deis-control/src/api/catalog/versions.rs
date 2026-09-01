@@ -4,7 +4,7 @@
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -14,8 +14,10 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use super::CatalogState;
+use crate::api::bindings::check_service_bindings;
 use crate::api::error::{ApiError, ApiResult};
 use crate::catalog::Version;
+use crate::identity::Principal;
 
 /// Version as seen from outside. `bundle_path` is deliberately absent: it
 /// is a control-plane local path and no client has any use for it.
@@ -119,6 +121,12 @@ pub async fn upload_version(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
     Query(query): Query<UploadQuery>,
+    // Who is uploading. `crate::api::authz` puts it there on every request it
+    // lets through, including the anonymous caller of an install with no
+    // authentication, so the default below is only ever reached by a router
+    // mounted without that middleware - which is a test, and which then has no
+    // credential to judge.
+    principal: Option<Extension<Principal>>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<UploadResponse>)> {
@@ -139,6 +147,52 @@ pub async fn upload_version(
     .map_err(|e| {
         ApiError::InternalError(format!("bundle processing task failed to complete: {e}"))
     })??;
+
+    // The second gate, and the only one that can be applied here: a service
+    // binding in this bundle is this application claiming a right to call
+    // another, and the route the upload arrived on named only this one. See
+    // `crate::api::bindings` for why consent is *not* checked here and where
+    // it is checked instead. Nothing has been written to the catalog yet - the
+    // bundle file on disk is content-addressed and shared, so a refusal here
+    // leaves no version anybody can deploy.
+    let principal = principal
+        .map(|Extension(principal)| principal)
+        .unwrap_or_else(Principal::anonymous);
+    if let Err(refusal) = check_service_bindings(&principal, &stored.manifest) {
+        warn!(
+            app_id = %app_id,
+            bundle_sha = %stored.sha256,
+            caller = %principal.label(),
+            binding = %refusal.binding,
+            callee = %refusal.callee,
+            needed = %refusal.required_scope,
+            held = %refusal.held,
+            "Refused a bundle upload: it declares a service binding to an application this \
+             credential is not entitled to. No version was created, so nothing can be deployed \
+             with that route in it, and the refusal is in the audit log"
+        );
+        return Err(ApiError::Forbidden(refusal.to_string()));
+    }
+    if !stored.manifest.bindings.is_empty() {
+        info!(
+            app_id = %app_id,
+            bundle_sha = %stored.sha256,
+            bindings = %stored.manifest.bindings.describe(),
+            "This version declares {} binding(s): {}",
+            stored.manifest.bindings.len(),
+            stored.manifest.bindings.describe()
+        );
+    }
+    if !stored.manifest.callable_by.is_empty() {
+        info!(
+            app_id = %app_id,
+            bundle_sha = %stored.sha256,
+            callable_by = %stored.manifest.callable_by.join(", "),
+            "This version agrees to be called through a service binding by: {}. A node checks \
+             this list, out of this bundle, on every such call",
+            stored.manifest.callable_by.join(", ")
+        );
+    }
 
     let (version, created) = state
         .store

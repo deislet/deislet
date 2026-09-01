@@ -122,6 +122,8 @@ mod tests {
             entry: WORKER_ENTRY.to_string(),
             runtime: Some("standard-v1".to_string()),
             services: Default::default(),
+            bindings: Default::default(),
+            callable_by: Vec::new(),
             env: Default::default(),
             secrets: Vec::new(),
             routes: Vec::new(),

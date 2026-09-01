@@ -4,6 +4,7 @@
 mod tests {
     use crate::runtime::ops::{init_ops_extension, ResponseStore};
     use crate::runtime::ws_server_ops::{create_ws_server_manager, init_ws_server_extension};
+    use crate::runtime::ServiceRouter;
     use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
     use std::cell::RefCell;
     // use std::collections::HashMap;
@@ -197,6 +198,9 @@ mod tests {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();

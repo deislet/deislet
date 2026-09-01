@@ -31,7 +31,13 @@ pub async fn set(
     value: Option<String>,
     output: Output,
 ) -> Result<()> {
-    let session = Session::open(&Overrides { app, environment })?;
+    let session = Session::open(&Overrides {
+        app,
+        environment,
+        // Not a storage command: there is no namespace inside a tenant to
+        // choose, only the tenant itself.
+        binding: None,
+    })?;
     let app = session.app()?.to_string();
     let environment = session.environment()?.to_string();
     check_secret_name(&name)?;
@@ -79,7 +85,13 @@ pub async fn set(
 }
 
 pub async fn list(app: Option<String>, environment: Option<String>, output: Output) -> Result<()> {
-    let session = Session::open(&Overrides { app, environment })?;
+    let session = Session::open(&Overrides {
+        app,
+        environment,
+        // Not a storage command: there is no namespace inside a tenant to
+        // choose, only the tenant itself.
+        binding: None,
+    })?;
     let app = session.app()?.to_string();
     let environment = session.environment()?.to_string();
 
@@ -134,7 +146,13 @@ pub async fn remove(
     name: String,
     output: Output,
 ) -> Result<()> {
-    let session = Session::open(&Overrides { app, environment })?;
+    let session = Session::open(&Overrides {
+        app,
+        environment,
+        // Not a storage command: there is no namespace inside a tenant to
+        // choose, only the tenant itself.
+        binding: None,
+    })?;
     let app = session.app()?.to_string();
     let environment = session.environment()?.to_string();
 

@@ -6,6 +6,7 @@
 //! destination really opens a socket and carries frames both ways, and a
 //! socket does not survive the request that opened it.
 
+use crate::runtime::ServiceRouter;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -259,6 +260,9 @@ async fn body_of(app: &str, code: &str, spec: IsolateSpec) -> String {
         None,
         spec,
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -477,6 +481,9 @@ async fn a_socket_does_not_outlive_the_invocation_that_opened_it() {
         None,
         probe_spec(&format!("ws://{addr}/"), policy),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -539,6 +546,9 @@ async fn an_open_socket_is_closed_when_the_invocation_that_opened_it_ends() {
         None,
         probe_spec(&format!("ws://{}/", server.addr), policy),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -575,6 +585,9 @@ async fn a_frame_the_invocation_did_not_read_does_not_reach_the_next_request() {
         None,
         probe_spec(&format!("ws://{}/", server.addr), policy),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -635,6 +648,9 @@ async fn the_sockets_one_request_opened_are_not_charged_to_the_next() {
         None,
         spec,
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -698,6 +714,9 @@ async fn the_wait_until_tail_may_still_use_a_socket_the_request_opened() {
         None,
         probe_spec(&format!("ws://{}/", server.addr), policy),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -808,6 +827,9 @@ async fn an_open_socket_is_closed_when_the_invocation_is_cut_off() {
         None,
         briefly(&format!("ws://{addr}/"), policy, 1_000),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -904,6 +926,9 @@ async fn a_socket_the_sweep_reclaimed_reports_closed_and_runs_no_listener_afterw
         None,
         probe_spec(&format!("ws://{}/", server.addr), policy),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -964,6 +989,9 @@ async fn a_polluted_object_prototype_does_not_decide_a_later_response() {
         None,
         IsolateSpec::default(),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -1034,6 +1062,9 @@ async fn a_response_used_as_an_init_still_carries_its_status_and_headers() {
         None,
         IsolateSpec::default(),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();
@@ -1123,6 +1154,9 @@ async fn a_connection_that_comes_up_after_its_invocation_ended_is_not_handed_to_
         None,
         spec,
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .unwrap();
     runtime.init_module().await.unwrap();

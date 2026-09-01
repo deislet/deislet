@@ -391,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn a_cached_body_that_is_not_text_survives_the_round_trip() {
         use crate::runtime::isolate::{AppRuntime, IsolateSpec};
-        use crate::runtime::ServiceWiring;
+        use crate::runtime::{ServiceRouter, ServiceWiring};
         use std::collections::HashMap;
 
         let code = r#"
@@ -438,6 +438,9 @@ mod tests {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so every service call it makes is
+            // refused as "not deployed on this node" -- which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -479,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn an_application_opens_a_named_cache_and_can_see_what_kind_of_cache_it_is() {
         use crate::runtime::isolate::{AppRuntime, IsolateSpec};
-        use crate::runtime::ServiceWiring;
+        use crate::runtime::{ServiceRouter, ServiceWiring};
         use std::collections::HashMap;
 
         let code = r#"
@@ -521,6 +524,9 @@ mod tests {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so every service call it makes is
+            // refused as "not deployed on this node" -- which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();

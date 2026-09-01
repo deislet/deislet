@@ -53,6 +53,11 @@ pub enum RuntimeMessage {
         spec: Box<IsolateSpec>,
         /// Which storage services this app declared and where they live.
         wiring: ServiceWiring,
+        /// The way back into this pool, so an isolate can be dispatched into
+        /// another isolate the same pool hosts. Handed over here rather than
+        /// read from a global, because the pool that owns the thread is the
+        /// pool whose applications this one may call.
+        router: super::service_ops::ServiceRouter,
         response: oneshot::Sender<Result<()>>,
     },
     /// Unload application
@@ -75,6 +80,18 @@ pub enum RuntimeMessage {
         queue: String,
         messages: Vec<LeasedMessage>,
         response: oneshot::Sender<Result<BatchOutcome>>,
+    },
+    /// Hand one application-to-application call to the callee's isolate.
+    ///
+    /// Its own variant rather than an `ExecuteRequest` with extra headers,
+    /// because the call chain has to reach the callee's isolate as data the
+    /// application cannot write: an application that could put a chain in a
+    /// header could name a chain it is not in, and both the cycle refusal and
+    /// the depth ceiling are computed from that chain.
+    ExecuteServiceCall {
+        app_id: String,
+        call: Box<super::service_call::ServiceCall>,
+        response: oneshot::Sender<Result<FetchResult>>,
     },
     /// Run an app's scheduled handler for one due cron expression
     ExecuteScheduled {
@@ -239,6 +256,7 @@ impl RuntimeThread {
                     app_repo,
                     spec,
                     wiring,
+                    router,
                     response,
                 } => {
                     tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
@@ -259,20 +277,26 @@ impl RuntimeThread {
                             app_id
                         );
                     }
-                    let result =
-                        match AppRuntime::new(app_id.clone(), code, app_repo, *spec, &wiring) {
-                            Ok(mut runtime) => match runtime.init_module().await {
-                                Ok(()) => {
-                                    hosted = Some(HostedApp {
-                                        app_id: app_id.clone(),
-                                        runtime,
-                                    });
-                                    Ok(())
-                                }
-                                Err(e) => Err(e),
-                            },
+                    let result = match AppRuntime::new(
+                        app_id.clone(),
+                        code,
+                        app_repo,
+                        *spec,
+                        &wiring,
+                        router,
+                    ) {
+                        Ok(mut runtime) => match runtime.init_module().await {
+                            Ok(()) => {
+                                hosted = Some(HostedApp {
+                                    app_id: app_id.clone(),
+                                    runtime,
+                                });
+                                Ok(())
+                            }
                             Err(e) => Err(e),
-                        };
+                        },
+                        Err(e) => Err(e),
+                    };
                     let _ = response.send(result);
                 }
 
@@ -312,6 +336,45 @@ impl RuntimeThread {
                             let _ = response.send(Err(anyhow::anyhow!("App not found")));
                         }
                     };
+                }
+
+                RuntimeMessage::ExecuteServiceCall {
+                    app_id,
+                    call,
+                    response,
+                } => {
+                    tracing::debug!(
+                        thread_id,
+                        app_id = %app_id,
+                        binding = %call.binding,
+                        caller = %call.caller_tenant(),
+                        "Thread {}: {} is calling {} through binding {}",
+                        thread_id,
+                        call.caller_tenant(),
+                        app_id,
+                        call.binding
+                    );
+                    match hosted_mut(&mut hosted, &app_id) {
+                        Some(runtime) => {
+                            if let Err(e) = runtime.execute_service_call(*call, response).await {
+                                tracing::error!(
+                                    app_id = %app_id,
+                                    error = %e,
+                                    "A service call into {} could not be run",
+                                    app_id
+                                );
+                            }
+                        }
+                        None => {
+                            // The thread was reassigned between the placement
+                            // read and this message being taken. The caller
+                            // gets the same answer as if the callee had never
+                            // been here, which is what it now is.
+                            let _ = response.send(Err(anyhow::anyhow!(
+                                "{app_id} is no longer loaded on this node"
+                            )));
+                        }
+                    }
                 }
 
                 RuntimeMessage::ExecuteQueueBatch {
@@ -521,6 +584,25 @@ pub struct RuntimePool {
     /// for an app that is no longer on this node, and every one of them would
     /// fail and eventually be dead lettered.
     consumers: Mutex<HashMap<String, Vec<ConsumerHandle>>>,
+    /// What the version currently serving each tenant declared about
+    /// bindings: who may call it, and which namespaces it reaches.
+    ///
+    /// Here rather than anywhere else because this is where the two halves of
+    /// a service call meet: the pool is what knows whether a callee is on this
+    /// node at all, and consent is the second question about the same callee.
+    /// Keeping it beside the placement means the answer is taken from the
+    /// version that is *serving right now* - a callee that withdraws consent
+    /// stops being callable at its own next deployment, with nothing to
+    /// redeliver to whoever named it.
+    serving: RwLock<HashMap<String, ServingVersion>>,
+    /// A handle back to this pool, for the isolates it hosts.
+    ///
+    /// A service call is dispatched by an op running inside one isolate into
+    /// another isolate this same pool hosts, so the op needs the pool. `Weak`
+    /// and not `Arc`: the isolates are owned by the threads the pool owns, so
+    /// an `Arc` here would be a cycle that never drops and would keep every
+    /// runtime thread alive after the node had finished with them.
+    self_ref: std::sync::Weak<RuntimePool>,
 }
 
 /// Which thread each loaded application sits on, and the threads themselves.
@@ -563,6 +645,19 @@ impl Placement {
     }
 }
 
+/// What the version currently serving one tenant declared about bindings.
+///
+/// Two facts about the same version, kept together because both are only true
+/// of the version that is serving and both stop being true the moment another
+/// one does.
+struct ServingVersion {
+    /// Who this version agrees to be called by, verbatim from its manifest.
+    callable_by: Vec<String>,
+    /// The namespaces and applications it reaches by name, so the next
+    /// version's table can be compared against it.
+    bindings: deis_bundle::DeclaredBindings,
+}
+
 /// A replacement isolate that is built and warm but is not serving yet.
 ///
 /// It holds a runtime thread of its own from the moment it is staged, which is
@@ -600,11 +695,20 @@ impl std::fmt::Debug for StagedVersion {
 
 impl RuntimePool {
     /// Create new thread pool
-    pub fn new(num_threads: Option<usize>) -> Self {
+    /// Build a pool.
+    ///
+    /// Answers an `Arc` rather than a bare value because the pool has to be
+    /// able to hand its isolates a way back to itself: a service call is one
+    /// isolate this pool hosts being dispatched into another. `Arc::new_cyclic`
+    /// is what lets the `Weak` exist before the pool does, so nothing has to
+    /// remember to attach it afterwards - a step that could be forgotten would
+    /// leave every service binding on the node quietly answering "not
+    /// available".
+    pub fn new(num_threads: Option<usize>) -> Arc<Self> {
         Self::new_with_repo(num_threads, None)
     }
 
-    pub fn new_with_repo(num_threads: Option<usize>, app_repo: Option<Arc<AppRepo>>) -> Self {
+    pub fn new_with_repo(num_threads: Option<usize>, app_repo: Option<Arc<AppRepo>>) -> Arc<Self> {
         // Ensure V8 platform is initialized (only once per process)
         init_v8_platform();
 
@@ -615,18 +719,80 @@ impl RuntimePool {
             num_threads
         );
 
-        let threads = (0..num_threads).map(RuntimeThread::new).collect();
+        Arc::new_cyclic(|self_ref| {
+            let threads = (0..num_threads).map(RuntimeThread::new).collect();
+            Self {
+                placement: RwLock::new(Placement {
+                    threads,
+                    of_app: HashMap::new(),
+                    staging: HashMap::new(),
+                    retiring: std::collections::HashSet::new(),
+                }),
+                app_repo,
+                consumers: Mutex::new(HashMap::new()),
+                serving: RwLock::new(HashMap::new()),
+                self_ref: self_ref.clone(),
+            }
+        })
+    }
 
-        Self {
-            placement: RwLock::new(Placement {
-                threads,
-                of_app: HashMap::new(),
-                staging: HashMap::new(),
-                retiring: std::collections::HashSet::new(),
-            }),
-            app_repo,
-            consumers: Mutex::new(HashMap::new()),
+    /// A handle an isolate can use to reach this pool, for service calls.
+    pub fn router(&self) -> super::service_ops::ServiceRouter {
+        super::service_ops::ServiceRouter::new(self.self_ref.clone())
+    }
+
+    /// Record what the version now serving one tenant declared, and say out
+    /// loud what the version it replaced declared and this one does not.
+    ///
+    /// Called wherever a version becomes the one that serves. The record is
+    /// written even when it is empty, because "this application consents to
+    /// nobody" and "this application is not loaded" are different answers and
+    /// a caller is told them apart.
+    ///
+    /// The line about dropped bindings is the only moment this is worth
+    /// saying. A binding name *is* its namespace, so a version that stops
+    /// declaring one has not renamed anything - the data written through the
+    /// old name is still in the store under the old name and is now
+    /// unreachable from this application. Nothing here can move it, and
+    /// nothing later will notice, so it is said at the one moment somebody is
+    /// deploying.
+    async fn record_serving(&self, tenant: &str, wiring: &ServiceWiring) {
+        let mut serving = self.serving.write().await;
+        if let Some(previous) = serving.get(tenant) {
+            if let Some(dropped) = wiring.describe_dropped(&previous.bindings) {
+                tracing::warn!(
+                    app_id = tenant,
+                    dropped = %dropped,
+                    "The version now serving {} no longer declares these storage bindings: {}. A \
+                     binding name is its namespace, so this is not a rename: everything written \
+                     through those names is still in the store under them and is no longer \
+                     reachable from this application. Declare the name again to reach it",
+                    tenant,
+                    dropped
+                );
+            }
         }
+        serving.insert(
+            tenant.to_string(),
+            ServingVersion {
+                callable_by: wiring.callable_by.clone(),
+                bindings: wiring.bindings.clone(),
+            },
+        );
+    }
+
+    /// Whether `caller_app` may call `callee_tenant`, and whether the callee is
+    /// on this node at all.
+    ///
+    /// `None` means the callee is not loaded here. `Some(false)` means it is
+    /// and does not consent. The two are kept apart all the way to the
+    /// application, because one is a scheduling question for an operator and
+    /// the other is a line somebody has to add to a manifest.
+    async fn consents_to(&self, callee_tenant: &str, caller_app: &str) -> Option<bool> {
+        let serving = self.serving.read().await;
+        serving
+            .get(callee_tenant)
+            .map(|version| deis_bundle::callable_by_allows(&version.callable_by, caller_app))
     }
 
     /// Reserve a thread to build an isolate on, starting one if every existing
@@ -693,6 +859,11 @@ impl RuntimePool {
     /// Give up an application's thread, leaving it idle for the next load.
     async fn release(&self, tenant: &str) {
         self.placement.write().await.of_app.remove(tenant);
+        // Its record goes with it. Left behind, its consent would answer for
+        // an application that is no longer here, and the caller would be told
+        // "not consented" for something that is really "not deployed" - the
+        // one distinction a caller needs in order to know whose problem it is.
+        self.serving.write().await.remove(tenant);
     }
 
     /// Drop the isolate a retiring thread still holds and give the thread back.
@@ -736,6 +907,114 @@ impl RuntimePool {
         }
 
         self.placement.write().await.retiring.remove(&thread_id);
+    }
+
+    /// Dispatch one application-to-application call into the callee's isolate.
+    ///
+    /// Everything that can be answered without entering the callee is answered
+    /// here, in this order, and each answer is a different variant so the
+    /// caller can tell them apart:
+    ///
+    /// 1. **is it here** - a callee this node does not host cannot be reached
+    ///    at all, because a service call never leaves the process;
+    /// 2. **does it consent** - read from the callee's own current bundle;
+    /// 3. **the call itself**, bounded by what the caller has left.
+    ///
+    /// Consent is checked before the message is posted rather than inside the
+    /// callee's isolate, so a refused call costs the callee nothing: no
+    /// isolate is entered, no invocation is counted against it, and nothing
+    /// appears in its logs. A caller must not be able to make a callee do work
+    /// simply by naming it.
+    pub async fn call_service(
+        &self,
+        callee_tenant: &str,
+        call: super::service_call::ServiceCall,
+        allowance: Option<Duration>,
+    ) -> Result<FetchResult, super::service_call::ServiceCallError> {
+        use super::service_call::ServiceCallError;
+
+        let binding = call.binding.clone();
+        let caller_app = call.caller_app().to_string();
+
+        match self.consents_to(callee_tenant, &caller_app).await {
+            None => {
+                return Err(ServiceCallError::NotDeployedHere {
+                    binding,
+                    callee: callee_tenant.to_string(),
+                });
+            }
+            Some(false) => {
+                return Err(ServiceCallError::NotConsented {
+                    binding,
+                    callee: callee_tenant.to_string(),
+                    caller: caller_app,
+                });
+            }
+            Some(true) => {}
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let posted = {
+            let placement = self.placement.read().await;
+            match placement.of_app.get(callee_tenant) {
+                // Loaded a moment ago and gone now: the callee was unloaded
+                // between the consent read and this one. "Not deployed here"
+                // is what it now is.
+                None => {
+                    return Err(ServiceCallError::NotDeployedHere {
+                        binding,
+                        callee: callee_tenant.to_string(),
+                    });
+                }
+                Some(id) => placement.threads[*id].send(RuntimeMessage::ExecuteServiceCall {
+                    app_id: callee_tenant.to_string(),
+                    call: Box::new(call),
+                    response: tx,
+                }),
+            }
+        };
+        if let Err(e) = posted {
+            // The callee's thread queue is full or its thread has stopped.
+            // That is the callee failing to take the call, not the caller
+            // running out of time, and it has not entered the callee's code.
+            return Err(ServiceCallError::CalleeFailed {
+                binding,
+                callee: callee_tenant.to_string(),
+                reason: e.to_string(),
+            });
+        }
+
+        // Bounded by what the *caller* has left, never by the callee's own
+        // timeout: the callee is held to its own budget by its own watchdog,
+        // and the caller must not be left waiting past the point where it can
+        // still answer the request it is itself serving. Which of the two ran
+        // out is the difference between these two variants.
+        let answered = match allowance {
+            Some(allowance) => match tokio::time::timeout(allowance, rx).await {
+                Ok(answered) => answered,
+                Err(_) => {
+                    return Err(ServiceCallError::CallerBudgetSpent {
+                        binding,
+                        callee: callee_tenant.to_string(),
+                    });
+                }
+            },
+            None => rx.await,
+        };
+
+        match answered {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(ServiceCallError::CalleeFailed {
+                binding,
+                callee: callee_tenant.to_string(),
+                reason: format!("{e:#}"),
+            }),
+            Err(_) => Err(ServiceCallError::CalleeFailed {
+                binding,
+                callee: callee_tenant.to_string(),
+                reason: "its runtime thread dropped the call without answering".to_string(),
+            }),
+        }
     }
 
     /// Post a message to the thread hosting `app_id`.
@@ -827,6 +1106,7 @@ impl RuntimePool {
             app_repo: self.app_repo.clone(),
             spec: Box::new(spec),
             wiring: wiring.clone(),
+            router: self.router(),
             response: tx,
         });
 
@@ -917,6 +1197,14 @@ impl RuntimePool {
             }
             previous.map(|id| (id, placement.threads[id].sender.clone()))
         };
+
+        // Recorded at the swap, beside the consumers, because both are things
+        // that must be true of the version that is *serving*: from this moment
+        // a service call into this tenant is answered against the new
+        // version's `callableBy`, and a version that withdrew consent stops
+        // being callable here without anything being redelivered to whoever
+        // named it.
+        self.record_serving(&tenant, &wiring).await;
 
         // Stop before the old isolate goes away, so a batch already leased is
         // handed to the isolate that can still handle it.
@@ -1400,7 +1688,7 @@ mod tests {
     use std::sync::Mutex;
 
     // Use global RuntimePool to avoid V8 issues from multiple creation/destruction
-    static TEST_POOL: Lazy<Mutex<RuntimePool>> =
+    static TEST_POOL: Lazy<Mutex<Arc<RuntimePool>>> =
         Lazy::new(|| Mutex::new(RuntimePool::new(Some(4))));
 
     /// Take the shared pool for one test.
@@ -1408,7 +1696,7 @@ mod tests {
     /// A poisoned lock is taken anyway: poisoning only means an earlier test
     /// panicked, and refusing every later test would report that one failure
     /// as several and hide which one was real.
-    fn pool() -> std::sync::MutexGuard<'static, RuntimePool> {
+    fn pool() -> std::sync::MutexGuard<'static, Arc<RuntimePool>> {
         TEST_POOL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1461,6 +1749,481 @@ mod tests {
 
         // Cleanup
         let _ = pool.unload_app("test_load_exec_app").await;
+    }
+
+    /// Load one application with a binding table and a consent list, the way a
+    /// deployment does: through the reserved keys in the env map, which is the
+    /// only channel the control plane has into a node.
+    async fn load_with_wiring(
+        pool: &RuntimePool,
+        tenant: &str,
+        code: &str,
+        wiring: ServiceWiring,
+    ) -> Result<()> {
+        let mut spec = IsolateSpec::default();
+        wiring.write_to_env(&mut spec.env);
+        pool.load_app(tenant.to_string(), code.to_string(), spec)
+            .await
+    }
+
+    /// A caller that answers with whatever the binding named in `?binding=`
+    /// answered, or with the message of whatever it threw. Both halves matter:
+    /// the refusals are the whole point of the feature, and a refusal that
+    /// reached the handler as a `TypeError` is what an author can catch.
+    const CALLER_CODE: &str = r#"
+        export default async function handler(context) {
+            const url = new URL(context.request.url);
+            const name = url.searchParams.get("binding");
+            try {
+                const answer = await context.bindings[name].fetch("/hello?from=caller");
+                return new Response(await answer.text(), { status: answer.status });
+            } catch (e) {
+                return new Response("threw: " + e.message, { status: 599 });
+            }
+        }
+    "#;
+
+    /// A callee that says who called it, out of the header the platform
+    /// stamps rather than out of anything the caller wrote.
+    const CALLEE_CODE: &str = r#"
+        export default async function handler(context) {
+            const caller = context.request.headers.get("x-deis-caller");
+            const url = new URL(context.request.url);
+            return new Response(
+                "callee saw " + caller + " asking for " + url.pathname + url.search,
+                { status: 201 }
+            );
+        }
+    "#;
+
+    fn service_wiring(bindings: &[(&str, &str)], callable_by: &[&str]) -> ServiceWiring {
+        let mut wiring = ServiceWiring::default();
+        for (name, target) in bindings {
+            let (app, environment) = match target.split_once('/') {
+                Some((app, environment)) => (app, Some(environment.to_string())),
+                None => (*target, None),
+            };
+            wiring.bindings.insert(
+                *name,
+                deis_bundle::Binding {
+                    kind: deis_bundle::BindingKind::Service,
+                    app: Some(app.to_string()),
+                    environment,
+                },
+            );
+        }
+        wiring.callable_by = callable_by.iter().map(|name| name.to_string()).collect();
+        wiring
+    }
+
+    async fn call_through(pool: &RuntimePool, caller: &str, binding: &str) -> (u16, String) {
+        let (status, _, body) = pool
+            .execute_request(
+                caller,
+                format!("http://localhost/?binding={binding}"),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("the caller itself must answer");
+        (
+            status,
+            String::from_utf8(body.into_bytes().unwrap_or_default())
+                .expect("the test handlers answer with text"),
+        )
+    }
+
+    #[tokio::test]
+    async fn one_application_calls_another_on_the_same_node() {
+        let pool = pool();
+
+        load_with_wiring(
+            &pool,
+            "sc-callee.production",
+            CALLEE_CODE,
+            service_wiring(&[], &["sc-caller"]),
+        )
+        .await
+        .expect("the callee loads");
+        load_with_wiring(
+            &pool,
+            "sc-caller.production",
+            CALLER_CODE,
+            service_wiring(&[("AUTH", "sc-callee")], &[]),
+        )
+        .await
+        .expect("the caller loads");
+
+        let (status, body) = call_through(&pool, "sc-caller.production", "AUTH").await;
+
+        // The callee's own status comes back, not a status this node invented,
+        // and the caller header is the platform's statement about who called.
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(
+            body,
+            "callee saw sc-caller.production asking for /hello?from=caller"
+        );
+
+        let _ = pool.unload_app("sc-caller.production").await;
+        let _ = pool.unload_app("sc-callee.production").await;
+    }
+
+    #[tokio::test]
+    async fn a_callee_that_did_not_consent_is_not_entered() {
+        // Being named by a caller is not consent. The callee here lists
+        // somebody else, so the call is refused before its isolate is touched
+        // -- which is what stops a caller making a callee do work simply by
+        // naming it.
+        let pool = pool();
+
+        load_with_wiring(
+            &pool,
+            "nc-callee.production",
+            CALLEE_CODE,
+            service_wiring(&[], &["somebody-else"]),
+        )
+        .await
+        .expect("the callee loads");
+        load_with_wiring(
+            &pool,
+            "nc-caller.production",
+            CALLER_CODE,
+            service_wiring(&[("AUTH", "nc-callee")], &[]),
+        )
+        .await
+        .expect("the caller loads");
+
+        let (status, body) = call_through(&pool, "nc-caller.production", "AUTH").await;
+        assert_eq!(status, 599, "the caller must catch a TypeError: {body}");
+        assert!(body.contains("callableBy"), "{body}");
+        assert!(body.contains("nc-caller"), "{body}");
+
+        let _ = pool.unload_app("nc-caller.production").await;
+        let _ = pool.unload_app("nc-callee.production").await;
+    }
+
+    #[tokio::test]
+    async fn a_callee_that_is_not_on_this_node_says_so_rather_than_failing_vaguely() {
+        // The distinction an operator needs: this is a scheduling answer, not
+        // a manifest one, and it must not read like a refusal by the callee.
+        let pool = pool();
+
+        load_with_wiring(
+            &pool,
+            "nd-caller.production",
+            CALLER_CODE,
+            service_wiring(&[("AUTH", "never-deployed")], &[]),
+        )
+        .await
+        .expect("the caller loads");
+
+        let (status, body) = call_through(&pool, "nd-caller.production", "AUTH").await;
+        assert_eq!(status, 599, "{body}");
+        assert!(body.contains("not deployed on this node"), "{body}");
+        assert!(
+            body.contains("never-deployed.production"),
+            "the refusal must name the environment it looked for: {body}"
+        );
+
+        let _ = pool.unload_app("nd-caller.production").await;
+    }
+
+    #[tokio::test]
+    async fn a_binding_follows_the_callers_own_environment_unless_it_names_one() {
+        // The data-crossing case. A preview of one application must reach the
+        // preview of the other, never production, unless the manifest says
+        // production in so many words.
+        let pool = pool();
+
+        load_with_wiring(
+            &pool,
+            "env-callee.preview",
+            CALLEE_CODE,
+            service_wiring(&[], &["env-caller"]),
+        )
+        .await
+        .expect("the preview of the callee loads");
+        load_with_wiring(
+            &pool,
+            "env-caller.preview",
+            CALLER_CODE,
+            service_wiring(
+                &[("SAME", "env-callee"), ("PROD", "env-callee/production")],
+                &[],
+            ),
+        )
+        .await
+        .expect("the preview of the caller loads");
+
+        // The binding that names no environment reaches the preview, because
+        // that is where the caller is.
+        let (status, body) = call_through(&pool, "env-caller.preview", "SAME").await;
+        assert_eq!(status, 201, "{body}");
+
+        // The one that names production reaches production - which is not
+        // deployed here, and says so. That it did not silently answer out of
+        // the preview is the whole assertion.
+        let (status, body) = call_through(&pool, "env-caller.preview", "PROD").await;
+        assert_eq!(status, 599, "{body}");
+        assert!(body.contains("env-callee.production"), "{body}");
+
+        let _ = pool.unload_app("env-caller.preview").await;
+        let _ = pool.unload_app("env-callee.preview").await;
+    }
+
+    #[tokio::test]
+    async fn a_cycle_is_refused_rather_than_left_to_deadlock() {
+        // A -> B -> A. Without the chain check, A's runtime thread would be
+        // waiting inside its own op for a message it cannot read, and the only
+        // way out would be two budgets expiring. The refusal happens at the
+        // second hop, inside B, and B answers it as an ordinary failure.
+        let pool = pool();
+
+        let bounce = r#"
+            export default async function handler(context) {
+                try {
+                    const answer = await context.bindings.BACK.fetch("/back");
+                    return new Response("unexpectedly reached: " + await answer.text(), { status: 200 });
+                } catch (e) {
+                    return new Response("threw: " + e.message, { status: 598 });
+                }
+            }
+        "#;
+
+        load_with_wiring(
+            &pool,
+            "cy-b.production",
+            bounce,
+            service_wiring(&[("BACK", "cy-a")], &["cy-a"]),
+        )
+        .await
+        .expect("b loads");
+        load_with_wiring(
+            &pool,
+            "cy-a.production",
+            CALLER_CODE,
+            service_wiring(&[("AUTH", "cy-b")], &["cy-b"]),
+        )
+        .await
+        .expect("a loads");
+
+        let started = std::time::Instant::now();
+        let (status, body) = call_through(&pool, "cy-a.production", "AUTH").await;
+        // B answered 598 with the refusal in its body, and A passed that body
+        // through with B's status.
+        assert_eq!(status, 598, "{body}");
+        assert!(body.contains("is a cycle"), "{body}");
+        assert!(body.contains("cy-a.production"), "{body}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a cycle must be refused structurally, not by waiting for a budget to run out;              this one took {:?}",
+            started.elapsed()
+        );
+
+        let _ = pool.unload_app("cy-a.production").await;
+        let _ = pool.unload_app("cy-b.production").await;
+    }
+
+    #[tokio::test]
+    async fn a_chain_of_service_calls_is_bounded() {
+        // Five applications in a line. The first four hops are inside the
+        // ceiling; the fifth is refused, because every frame in a chain is
+        // another runtime thread held for as long as the chain lasts, and a
+        // request that could pass through any number of them is a way for one
+        // caller to occupy the node.
+        let pool = pool();
+
+        // Each link calls the next and answers with what it got, so the
+        // refusal at the far end travels back through every hop.
+        let link = r#"
+            export default async function handler(context) {
+                try {
+                    const answer = await context.bindings.NEXT.fetch("/on");
+                    return new Response(await answer.text(), { status: answer.status });
+                } catch (e) {
+                    return new Response("threw: " + e.message, { status: 596 });
+                }
+            }
+        "#;
+        let last = r#"
+            export default async function handler(context) {
+                return new Response("reached the end", { status: 200 });
+            }
+        "#;
+
+        let names = ["dp-a", "dp-b", "dp-c", "dp-d", "dp-e"];
+        // Loaded from the far end back, so a link is never loaded before the
+        // one it calls; nothing depends on the order, but it keeps the test
+        // from proving "not deployed here" by accident.
+        load_with_wiring(
+            &pool,
+            "dp-e.production",
+            last,
+            service_wiring(&[], &["dp-d"]),
+        )
+        .await
+        .expect("the last link loads");
+        for pair in names.windows(2).rev() {
+            let (here, next) = (pair[0], pair[1]);
+            let callers: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != here)
+                .collect();
+            load_with_wiring(
+                &pool,
+                &format!("{here}.production"),
+                link,
+                service_wiring(&[("NEXT", next)], &callers),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{here} loads: {e}"));
+        }
+
+        let (status, body) = pool
+            .execute_request(
+                "dp-a.production",
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .map(|(status, _, body)| {
+                (
+                    status,
+                    String::from_utf8(body.into_bytes().unwrap_or_default()).unwrap_or_default(),
+                )
+            })
+            .expect("the first link answers");
+
+        assert_eq!(status, 596, "the fifth hop must be refused: {body}");
+        assert!(body.contains("applications deep"), "{body}");
+        assert!(
+            body.contains(
+                "dp-a.production -> dp-b.production -> dp-c.production -> dp-d.production"
+            ),
+            "the refusal must print the chain it would have extended: {body}"
+        );
+
+        for name in names {
+            let _ = pool.unload_app(&format!("{name}.production")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_call_spends_the_invocations_subrequest_allowance() {
+        // A service call is fan-out and costs a runtime thread, so it comes
+        // out of the same allowance an outbound socket does. With a ceiling of
+        // one, the second call in an invocation is refused with nothing
+        // dispatched.
+        let pool = pool();
+
+        let twice = r#"
+            export default async function handler(context) {
+                const first = await context.bindings.AUTH.fetch("/one");
+                try {
+                    await context.bindings.AUTH.fetch("/two");
+                    return new Response("both went through", { status: 200 });
+                } catch (e) {
+                    return new Response(
+                        "first=" + first.status + " second threw: " + e.message,
+                        { status: 597 }
+                    );
+                }
+            }
+        "#;
+
+        load_with_wiring(
+            &pool,
+            "sq-callee.production",
+            CALLEE_CODE,
+            service_wiring(&[], &["sq-caller"]),
+        )
+        .await
+        .expect("the callee loads");
+
+        let mut spec = IsolateSpec::default();
+        spec.limits.max_subrequests = 1;
+        service_wiring(&[("AUTH", "sq-callee")], &[]).write_to_env(&mut spec.env);
+        pool.load_app("sq-caller.production".to_string(), twice.to_string(), spec)
+            .await
+            .expect("the caller loads");
+
+        let (status, body) = pool
+            .execute_request(
+                "sq-caller.production",
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .map(|(status, _, body)| {
+                (
+                    status,
+                    String::from_utf8(body.into_bytes().unwrap_or_default()).unwrap_or_default(),
+                )
+            })
+            .expect("the caller answers");
+
+        assert_eq!(status, 597, "{body}");
+        assert!(body.contains("first=201"), "{body}");
+        assert!(body.contains("ceiling for this application"), "{body}");
+
+        let _ = pool.unload_app("sq-caller.production").await;
+        let _ = pool.unload_app("sq-callee.production").await;
+    }
+
+    #[tokio::test]
+    async fn withdrawing_consent_takes_effect_at_the_callees_next_deployment() {
+        // Consent is read from the version that is serving, so a callee that
+        // stops listing a caller stops being callable without anything being
+        // redelivered to the caller - which is why it is checked here and not
+        // resolved into the caller's deployment.
+        let pool = pool();
+
+        load_with_wiring(
+            &pool,
+            "wd-callee.production",
+            CALLEE_CODE,
+            service_wiring(&[], &["wd-caller"]),
+        )
+        .await
+        .expect("the callee loads");
+        load_with_wiring(
+            &pool,
+            "wd-caller.production",
+            CALLER_CODE,
+            service_wiring(&[("AUTH", "wd-callee")], &[]),
+        )
+        .await
+        .expect("the caller loads");
+
+        let (status, _) = call_through(&pool, "wd-caller.production", "AUTH").await;
+        assert_eq!(status, 201);
+
+        // The callee ships a version that consents to nobody. The caller is
+        // untouched: same bundle, same deployment, same binding.
+        let mut spec = IsolateSpec::default();
+        service_wiring(&[], &[]).write_to_env(&mut spec.env);
+        let staged = pool
+            .stage_app(
+                "wd-callee.production".to_string(),
+                CALLEE_CODE.to_string(),
+                spec,
+            )
+            .await
+            .expect("the new version of the callee stages");
+        pool.activate(staged).await.expect("it activates");
+
+        let (status, body) = call_through(&pool, "wd-caller.production", "AUTH").await;
+        assert_eq!(status, 599, "{body}");
+        assert!(body.contains("callableBy"), "{body}");
+
+        let _ = pool.unload_app("wd-caller.production").await;
+        let _ = pool.unload_app("wd-callee.production").await;
     }
 
     #[tokio::test]

@@ -37,7 +37,8 @@ use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
 use deis_wire::conventions::{
-    MAX_GRPC_MESSAGE_BYTES, STORAGE_TOKEN_HEADER, STREAM_CHUNK_BYTES, TENANT_HEADER, split_tenant,
+    BINDING_HEADER, MAX_GRPC_MESSAGE_BYTES, STORAGE_TOKEN_HEADER, STREAM_CHUNK_BYTES,
+    TENANT_HEADER, is_valid_binding_name, split_tenant,
 };
 
 /// KV and the SQL database share one proto file and one gRPC service
@@ -87,10 +88,21 @@ const MAX_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 struct Identity {
     tenant_header: MetadataValue<Ascii>,
     token_header: Option<MetadataValue<Ascii>>,
+    /// Which namespace inside the tenant these calls act in, or `None` for the
+    /// tenant's unnamed one - the namespace an application reaches through
+    /// `context.services.kv` and the one every application had before named
+    /// bindings existed.
+    ///
+    /// Not part of the credential and deliberately not treated as one: the
+    /// token authorises the tenant, and a binding is always inside the tenant
+    /// it is stamped beside. Naming a binding an application never declared
+    /// reaches an empty namespace of the operator's own tenant, which is why
+    /// this needs no separate permission.
+    binding_header: Option<MetadataValue<Ascii>>,
 }
 
 impl Identity {
-    fn new(tenant: String, token: Option<&str>) -> Result<Self> {
+    fn new(tenant: String, token: Option<&str>, binding: Option<&str>) -> Result<Self> {
         if split_tenant(&tenant).is_none() {
             bail!(
                 "{tenant:?} is not a storage tenant; it must be an application and an environment \
@@ -111,9 +123,27 @@ impl Identity {
             })?),
             None => None,
         };
+        let binding_header =
+            match binding.map(str::trim).filter(|b| !b.is_empty()) {
+                Some(binding) => {
+                    if !is_valid_binding_name(binding) {
+                        bail!(
+                            "{binding:?} is not a binding name: a name is 1 to 64 characters of \
+                         ASCII letters, digits, '_' or '-', because it becomes part of a \
+                         directory and a database file name in deis-store. Leave --binding out \
+                         to read and write the namespace `context.services.kv` uses."
+                        );
+                    }
+                    Some(binding.parse::<MetadataValue<Ascii>>().map_err(|_| {
+                        anyhow!("binding {binding:?} cannot be sent as gRPC metadata")
+                    })?)
+                }
+                None => None,
+            };
         Ok(Self {
             tenant_header,
             token_header,
+            binding_header,
         })
     }
 
@@ -126,6 +156,15 @@ impl Identity {
             request
                 .metadata_mut()
                 .insert(STORAGE_TOKEN_HEADER, token.clone());
+        }
+        // Stamped here rather than per call for the reason the token is: a
+        // call that named the tenant and forgot the binding would read and
+        // write the unnamed namespace while the operator believed they were
+        // looking at the one they asked for, and nothing would fail.
+        if let Some(binding) = &self.binding_header {
+            request
+                .metadata_mut()
+                .insert(BINDING_HEADER, binding.clone());
         }
         request
     }
@@ -150,6 +189,14 @@ impl std::fmt::Debug for Identity {
                 } else {
                     "<absent>"
                 },
+            )
+            .field(
+                "binding",
+                &self
+                    .binding_header
+                    .as_ref()
+                    .and_then(|binding| binding.to_str().ok())
+                    .unwrap_or("<unnamed>"),
             )
             .finish()
     }
@@ -345,8 +392,17 @@ impl StorageSession {
     /// socket yet - `connect_lazy` defers that to the first RPC - so a
     /// deis-store that is down does not stop this session from being built,
     /// only from doing anything.
-    pub fn connect(endpoint: &str, tenant: &str, token: Option<&str>) -> Result<Self> {
-        let identity = Identity::new(tenant.to_string(), token)?;
+    /// `binding` names one of the tenant's named namespaces, or `None` for
+    /// its unnamed one - which is what `context.services.kv`, `.database` and
+    /// `.blob` reach, and where an application that declares no binding keeps
+    /// everything it has.
+    pub fn connect(
+        endpoint: &str,
+        tenant: &str,
+        token: Option<&str>,
+        binding: Option<&str>,
+    ) -> Result<Self> {
+        let identity = Identity::new(tenant.to_string(), token, binding)?;
         let unary = lazy_channel(endpoint, Some(REQUEST_TIMEOUT))?;
         let streaming = lazy_channel(endpoint, None)?;
         Ok(Self {
@@ -826,7 +882,7 @@ mod tests {
 
     #[test]
     fn a_bare_app_id_is_not_a_tenant() {
-        let error = Identity::new("demo".to_string(), None)
+        let error = Identity::new("demo".to_string(), None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("demo.production"), "{error}");
@@ -834,7 +890,7 @@ mod tests {
 
     #[test]
     fn a_valid_tenant_with_no_token_builds() {
-        let identity = Identity::new("demo.production".to_string(), None).unwrap();
+        let identity = Identity::new("demo.production".to_string(), None, None).unwrap();
         assert!(identity.token_header.is_none());
     }
 
@@ -843,13 +899,14 @@ mod tests {
         // An empty header would be presented as a token and refused by a
         // deis-store that checks one; sending nothing at least works against
         // a service that requires no proof.
-        let identity = Identity::new("demo.production".to_string(), Some("   ")).unwrap();
+        let identity = Identity::new("demo.production".to_string(), Some("   "), None).unwrap();
         assert!(identity.token_header.is_none());
     }
 
     #[test]
     fn a_real_token_is_carried() {
-        let identity = Identity::new("demo.production".to_string(), Some("abc123==")).unwrap();
+        let identity =
+            Identity::new("demo.production".to_string(), Some("abc123=="), None).unwrap();
         assert!(identity.token_header.is_some());
     }
 
@@ -860,15 +917,53 @@ mod tests {
         // is actually made. It also needs a Tokio runtime in scope to build
         // at all - hence `#[tokio::test]` rather than `#[test]` - even
         // though nothing here is awaited.
-        StorageSession::connect("http://127.0.0.1:1", "demo.production", None)
+        StorageSession::connect("http://127.0.0.1:1", "demo.production", None, None)
             .expect("building a session must not require deis-store to be reachable");
     }
 
     #[test]
     fn a_malformed_endpoint_is_refused_at_connect() {
-        let error = StorageSession::connect("not a url", "demo.production", None)
+        let error = StorageSession::connect("not a url", "demo.production", None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("not a url"), "{error}");
+    }
+
+    #[test]
+    fn a_binding_is_a_namespace_and_not_a_second_credential() {
+        // Its own header beside the tenant and the token, never folded into
+        // either: the token authorises the tenant, and the binding chooses a
+        // namespace inside the tenant it is stamped next to. A name this CLI
+        // could not send would refuse the session rather than silently reach
+        // the unnamed namespace under the name the operator typed.
+        let identity = Identity::new("demo.production".to_string(), None, Some("HOT")).unwrap();
+        let request = identity.stamp(());
+        assert_eq!(
+            request.metadata().get(TENANT_HEADER).unwrap(),
+            "demo.production"
+        );
+        assert_eq!(request.metadata().get(BINDING_HEADER).unwrap(), "HOT");
+
+        // No binding is the unnamed namespace, and the header is simply not
+        // sent - which is exactly what every call this CLI made before named
+        // bindings existed looked like.
+        let unnamed = Identity::new("demo.production".to_string(), None, None).unwrap();
+        assert!(unnamed.stamp(()).metadata().get(BINDING_HEADER).is_none());
+        // A blank one means the same thing rather than an empty namespace.
+        let blank = Identity::new("demo.production".to_string(), None, Some("  ")).unwrap();
+        assert!(blank.stamp(()).metadata().get(BINDING_HEADER).is_none());
+    }
+
+    #[test]
+    fn a_binding_name_that_could_address_another_namespace_is_refused() {
+        for hostile in ["a@b", "a.b", "..", "a/b", &"x".repeat(65)] {
+            let error = Identity::new("demo.production".to_string(), None, Some(hostile))
+                .expect_err("must be refused")
+                .to_string();
+            assert!(
+                error.contains("is not a binding name"),
+                "{hostile}: {error}"
+            );
+        }
     }
 }

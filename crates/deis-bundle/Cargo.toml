@@ -7,6 +7,12 @@ authors.workspace = true
 description = "The Deislet application bundle format: manifest, asset index and archive layout"
 
 [dependencies]
+# For the one rule a binding name has to obey. A binding name is composed onto
+# a tenant id and becomes a directory and a database file name in deis-store,
+# so its character set is the storage services' rule and not this crate's -
+# `deis_wire::conventions` is where that rule lives, and a second copy of it
+# here would drift into a manifest this crate accepts and a node refuses.
+deis-wire = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

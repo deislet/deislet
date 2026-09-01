@@ -148,7 +148,7 @@ impl ApplicationManager {
         Self {
             apps: DashMap::new(),
             versions: DashMap::new(),
-            runtime_pool: Arc::new(RuntimePool::new(num_threads)),
+            runtime_pool: RuntimePool::new(num_threads),
             inspect_sessions: DashMap::new(),
             default_limits: ExecutionLimits::default(),
             default_memory_limit_mb: crate::config::default_memory_limit_mb(),
@@ -160,7 +160,7 @@ impl ApplicationManager {
         Self {
             apps: DashMap::new(),
             versions: DashMap::new(),
-            runtime_pool: Arc::new(RuntimePool::new_with_repo(num_threads, Some(app_repo))),
+            runtime_pool: RuntimePool::new_with_repo(num_threads, Some(app_repo)),
             inspect_sessions: DashMap::new(),
             default_limits: ExecutionLimits::default(),
             default_memory_limit_mb: crate::config::default_memory_limit_mb(),

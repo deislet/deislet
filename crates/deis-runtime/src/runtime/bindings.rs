@@ -37,10 +37,38 @@
 //!
 //! # What gets constructed
 //!
-//! Only what the app's manifest declared under `services` (see
-//! [`deis_bundle::Manifest::services`]). An app that never asked for a
-//! database holds no database connection, which is both cheaper and the
-//! honest answer to "what can this app reach".
+//! Only what the app's manifest declared: the four `services` booleans, plus
+//! every `bindings` entry (see [`deis_bundle::Manifest::bindings`]). An app
+//! that never asked for a database holds no database connection, which is both
+//! cheaper and the honest answer to "what can this app reach".
+//!
+//! # Named bindings, and what the unnamed one still is
+//!
+//! `services.kv = true` turns on the tenant's **unnamed** KV namespace, which
+//! is what `context.services.kv` reaches and what every application deployed
+//! before bindings existed has been writing into. Nothing about it moves: the
+//! calls it makes carry no binding header, so deis-store keys them by the
+//! tenant alone, exactly as before. A binding is a *second* namespace beside
+//! it, reached by the name the author chose, and it is empty on the day it is
+//! declared because it has never existed before.
+//!
+//! The two declarations are separate on purpose. `services.kv` answers "does
+//! this application use the unnamed KV"; a `kv` binding answers "and this
+//! other namespace as well". An application may have either, both or neither,
+//! and an application that has only bindings gets a connection to deis-store
+//! but no `context.services.kv` - which is the honest answer, because it never
+//! asked for that namespace.
+//!
+//! **Renaming a binding does not move its data.** The namespace is the name;
+//! a version that declares `WARM` where the last one declared `HOT` gets an
+//! empty namespace, and everything written through `HOT` is still in the store
+//! under `HOT`, unreachable from the new version. Nothing here can move it,
+//! because deis-store has no rename and a namespace holds an unbounded number
+//! of rows, files and objects. So what this module does instead is say so:
+//! [`ServiceWiring::describe_dropped`] is compared against the previous
+//! version's table when a new one becomes the one that serves, and the log
+//! line names the binding that went away, says its data is still there, and
+//! gives the one action that reaches it again.
 //!
 //! # What happens when a service is down
 //!
@@ -56,7 +84,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use deis_wire::conventions::STORAGE_TOKEN_HEADER;
+use deis_wire::conventions::{BINDING_HEADER, STORAGE_TOKEN_HEADER};
 use deno_core::OpState;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
@@ -117,15 +145,42 @@ pub const STORAGE_TOKEN_KEY: &str = deis_wire::conventions::STORAGE_TOKEN_ENV;
 /// spelling is Cloudflare's, so a Pages project's code reads the same here.
 pub const ASSETS_BINDING_KEY: &str = "ASSETS";
 
+/// Reserved deployment-env key carrying this version's binding table.
+///
+/// Entries separated by commas, fields by colons:
+/// `HOT:kv,DOCS:blob,AUTH:service:auth-api,BILLING:service:billing/production`.
+/// Every field is a name from the manifest and every name is ASCII letters,
+/// digits, `_` and `-`, so none of the three separators can occur inside one -
+/// which is what makes the encoding unambiguous without quoting.
+///
+/// It travels here rather than being read from the bundle a second time for
+/// the reason the service list does: this map is the channel the control plane
+/// already has into a node, and a node that had to reopen the archive to learn
+/// what the isolate may reach would be reading the same manifest twice and
+/// could disagree with itself.
+pub const BINDINGS_KEY: &str = "DEIS_BINDINGS";
+
+/// Reserved deployment-env key listing the applications this version agrees to
+/// be called by through a service binding, comma-separated.
+///
+/// The callee's half of a service call, taken verbatim from its own manifest's
+/// `callableBy`. It travels with the deployment rather than being looked up
+/// anywhere else so that consent is a property of the version that is serving:
+/// a version that stops consenting stops being callable the moment it becomes
+/// the one that serves, and nothing has to be redelivered to whoever named it.
+pub const CALLABLE_BY_KEY: &str = "DEIS_CALLABLE_BY";
+
 /// Every key this module claims. Anything spelled this way in a deployment's
 /// env map is platform wiring and is removed before the app sees the map.
-pub const RESERVED_ENV_KEYS: [&str; 6] = [
+pub const RESERVED_ENV_KEYS: [&str; 8] = [
     SERVICES_KEY,
     STORE_ENDPOINT_KEY,
     QUEUE_ENDPOINT_KEY,
     QUEUE_CONSUMERS_KEY,
     STORAGE_TOKEN_KEY,
     ASSETS_BINDING_KEY,
+    BINDINGS_KEY,
+    CALLABLE_BY_KEY,
 ];
 
 /// How long one dial to a storage service may take before the call that
@@ -160,6 +215,29 @@ impl ServiceKind {
             Self::Database => "database",
             Self::Blob => "blob",
             Self::Queue => "queue",
+        }
+    }
+
+    /// Every kind, so the union in [`ServiceWiring::connected_kinds`] and an
+    /// error message can list them without a second copy of this set going
+    /// stale.
+    pub const ALL: [ServiceKind; 4] = [Self::Kv, Self::Database, Self::Blob, Self::Queue];
+
+    /// Which service a binding of this kind is served by, or `None` for a
+    /// kind that is served by nothing this module dials.
+    ///
+    /// [`deis_bundle::BindingKind::Service`] is that kind: a call to another
+    /// application is dispatched inside this node and has no address of its
+    /// own. Spelled as a match rather than a name lookup so that adding a
+    /// binding kind is a compile error here rather than a binding that
+    /// silently builds no client.
+    pub fn of_binding(kind: deis_bundle::BindingKind) -> Option<Self> {
+        match kind {
+            deis_bundle::BindingKind::Kv => Some(Self::Kv),
+            deis_bundle::BindingKind::Database => Some(Self::Database),
+            deis_bundle::BindingKind::Blob => Some(Self::Blob),
+            deis_bundle::BindingKind::Queue => Some(Self::Queue),
+            deis_bundle::BindingKind::Service => None,
         }
     }
 
@@ -224,6 +302,15 @@ impl ServiceDeclaration {
 
     /// Build from a bundle manifest's `services` map, taking the entries set
     /// to true.
+    ///
+    /// The `bindings` block deliberately does **not** contribute here. This
+    /// set means one thing and one thing only: which of the tenant's *unnamed*
+    /// namespaces the application asked for, which is what
+    /// `context.services.kv` and its three siblings reach. Which kinds need a
+    /// connection at all is a wider question and is answered once, by
+    /// [`ServiceWiring::connected_kinds`]. Folding the two together here would
+    /// give an application a `context.services.kv` it never declared as soon
+    /// as it declared any KV binding.
     pub fn from_manifest(manifest: &deis_bundle::Manifest) -> Self {
         Self::from_names(
             manifest
@@ -294,6 +381,20 @@ pub struct ServiceWiring {
     /// control plane has no shared secret configured. Carried here rather
     /// than left in the env map because the map becomes `ctx.env`.
     pub storage_token: Option<String>,
+    /// The namespaces and the applications this version reaches by name,
+    /// exactly as its manifest declared them.
+    ///
+    /// The isolate's copy of the manifest's `bindings` block: it decides which
+    /// clients are built, which names `context.bindings` publishes, and which
+    /// `(application, environment)` a service binding resolves to. It carries
+    /// no credential and no address - a storage binding is a name composed
+    /// onto this tenant, and a service binding is a pair of names this node
+    /// either runs or does not.
+    pub bindings: deis_bundle::DeclaredBindings,
+    /// Which applications this version agrees to be called by, verbatim from
+    /// its manifest. Empty consents to nobody, which is what an application
+    /// that never thought about being called should mean.
+    pub callable_by: Vec<String>,
 }
 
 impl std::fmt::Debug for ServiceWiring {
@@ -306,6 +407,8 @@ impl std::fmt::Debug for ServiceWiring {
             .field("declaration", &self.declaration)
             .field("endpoints", &self.endpoints)
             .field("consumers", &self.consumers)
+            .field("bindings", &self.bindings.describe())
+            .field("callable_by", &self.callable_by)
             .field("storage_token", &token_state(&self.storage_token))
             .finish()
     }
@@ -325,6 +428,8 @@ impl ServiceWiring {
         Self {
             declaration: ServiceDeclaration::from_manifest(manifest),
             endpoints,
+            bindings: manifest.bindings.clone(),
+            callable_by: manifest.callable_by.clone(),
             // Not a manifest concept: it is minted per deployment by the
             // control plane, so a caller that has one adds it afterwards.
             storage_token: None,
@@ -351,6 +456,8 @@ impl ServiceWiring {
         let queue = env.remove(QUEUE_ENDPOINT_KEY);
         let consumers = env.remove(QUEUE_CONSUMERS_KEY).unwrap_or_default();
         let storage_token = env.remove(STORAGE_TOKEN_KEY);
+        let bindings = env.remove(BINDINGS_KEY).unwrap_or_default();
+        let callable_by = env.remove(CALLABLE_BY_KEY).unwrap_or_default();
         // Nothing is read out of it -- the binding is built from the version's
         // own asset bundle, not from a string. Removing it is the whole point:
         // `js/runtime.js` writes `env.ASSETS` over whatever this map held, and
@@ -366,6 +473,13 @@ impl ServiceWiring {
             },
             consumers: parse_consumers(&consumers),
             storage_token: non_empty(storage_token),
+            bindings: parse_bindings(&bindings),
+            callable_by: callable_by
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect(),
         }
     }
 
@@ -386,6 +500,12 @@ impl ServiceWiring {
         }
         if let Some(token) = &self.storage_token {
             env.insert(STORAGE_TOKEN_KEY.to_string(), token.clone());
+        }
+        if !self.bindings.is_empty() {
+            env.insert(BINDINGS_KEY.to_string(), encode_bindings(&self.bindings));
+        }
+        if !self.callable_by.is_empty() {
+            env.insert(CALLABLE_BY_KEY.to_string(), self.callable_by.join(","));
         }
         if !self.consumers.is_empty() {
             let list = self
@@ -413,7 +533,69 @@ impl ServiceWiring {
 
     /// Whether this app asked for anything at all.
     pub fn is_empty(&self) -> bool {
-        self.declaration.is_empty() && self.consumers.is_empty()
+        self.declaration.is_empty() && self.consumers.is_empty() && self.bindings.is_empty()
+    }
+
+    /// Whether the manifest's `services` map turned on this kind's unnamed
+    /// namespace, which is the one `context.services.*` reaches.
+    pub fn services_declares(&self, kind: ServiceKind) -> bool {
+        self.declaration.declares(kind)
+    }
+
+    /// Which kinds need a client built: the `services` map, plus the kind of
+    /// every declared binding.
+    ///
+    /// The union, and the one place it is taken. A `kv` binding needs a
+    /// connection to deis-store whether or not the application also asked for
+    /// the unnamed KV, and a queue binding needs a connection to deis-queue
+    /// whether or not it consumes anything.
+    pub fn connected_kinds(&self) -> BTreeSet<ServiceKind> {
+        let mut kinds: BTreeSet<ServiceKind> = ServiceKind::ALL
+            .into_iter()
+            .filter(|kind| self.declaration.declares(*kind))
+            .collect();
+        for kind in self.bindings.kinds() {
+            if let Some(kind) = ServiceKind::of_binding(kind) {
+                kinds.insert(kind);
+            }
+        }
+        kinds
+    }
+
+    /// The binding names this version declares of one kind, in manifest order.
+    pub fn binding_names(&self, kind: deis_bundle::BindingKind) -> Vec<String> {
+        self.bindings
+            .names_of(kind)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// What to tell an operator about the bindings a new version dropped.
+    ///
+    /// A binding name *is* its namespace, so a version that stops declaring a
+    /// name does not rename anything: the new name is an empty namespace and
+    /// everything written through the old one is still in the store, under the
+    /// old name, and no longer reachable from this application. Nothing on
+    /// this node can move it - deis-store has no rename, and a namespace holds
+    /// an unbounded number of rows, files and objects - so the one thing worth
+    /// doing is saying it while somebody is deploying.
+    ///
+    /// Returns `None` when nothing was dropped, which is the ordinary case and
+    /// is not worth a log line. Only storage kinds are reported: a service
+    /// binding has no data behind it, so dropping one loses nothing.
+    pub fn describe_dropped(&self, previous: &deis_bundle::DeclaredBindings) -> Option<String> {
+        let dropped: Vec<String> = previous
+            .iter()
+            .filter(|(name, binding)| {
+                binding.kind.is_storage() && self.bindings.get(name).is_none()
+            })
+            .map(|(name, binding)| format!("{name} ({})", binding.kind.as_str()))
+            .collect();
+        if dropped.is_empty() {
+            return None;
+        }
+        Some(dropped.join(", "))
     }
 
     /// The queues this app should be polled for: the declared consumers, but
@@ -439,7 +621,7 @@ impl ServiceWiring {
             return Vec::new();
         };
 
-        if !self.declaration.declares(ServiceKind::Queue) {
+        if !self.connected_kinds().contains(&ServiceKind::Queue) {
             tracing::warn!(
                 app_id = tenant,
                 "{} declares queue consumers but does not declare the queue service; \
@@ -455,6 +637,98 @@ impl ServiceWiring {
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.trim().is_empty())
+}
+
+/// Write a binding table into the one line [`BINDINGS_KEY`] carries.
+///
+/// `NAME:kind` for a namespace of this tenant, `NAME:service:app` or
+/// `NAME:service:app/environment` for a call to another application. The
+/// counterpart is [`parse_bindings`], and both live here so the side that
+/// writes the map and the side that reads it cannot drift apart.
+fn encode_bindings(bindings: &deis_bundle::DeclaredBindings) -> String {
+    bindings
+        .iter()
+        .map(|(name, binding)| match binding.kind {
+            deis_bundle::BindingKind::Service => {
+                let app = binding.app.as_deref().unwrap_or_default();
+                match binding.service_environment() {
+                    deis_bundle::ServiceEnvironment::Same => {
+                        format!("{name}:service:{app}")
+                    }
+                    deis_bundle::ServiceEnvironment::Named(environment) => {
+                        format!("{name}:service:{app}/{environment}")
+                    }
+                }
+            }
+            kind => format!("{name}:{}", kind.as_str()),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Read a binding table back out of [`BINDINGS_KEY`].
+///
+/// An entry that does not parse is dropped with the reason said out loud, and
+/// the rest are kept. That is the recoverable half: a binding this build does
+/// not understand is one name that answers "no such binding" where the
+/// application uses it, while refusing the whole line would take away every
+/// other namespace the application has - including ones it is mid-write on.
+/// The declaration is validated at build, at upload and again when the node
+/// parsed the manifest, so anything reaching here that does not parse is a
+/// disagreement between two builds of the platform rather than an author's
+/// mistake.
+fn parse_bindings(list: &str) -> deis_bundle::DeclaredBindings {
+    let mut bindings = deis_bundle::DeclaredBindings::new();
+    for entry in list.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let mut fields = entry.split(':');
+        let name = fields.next().unwrap_or("").trim();
+        let kind = fields.next().unwrap_or("").trim();
+        let target = fields.next().map(str::trim);
+        let Some(kind) = deis_bundle::BindingKind::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == kind)
+        else {
+            tracing::warn!(
+                binding = name,
+                kind,
+                "This deployment carries a binding {:?} of kind {:?}, which this build of the \
+                 node has no binding for; every use of that name will fail with \"no such \
+                 binding\" until the node is upgraded",
+                name,
+                kind
+            );
+            continue;
+        };
+        let binding = match kind {
+            deis_bundle::BindingKind::Service => {
+                let Some(target) = target.filter(|target| !target.is_empty()) else {
+                    tracing::warn!(
+                        binding = name,
+                        "This deployment carries a service binding {:?} that names no \
+                         application to call; every use of that name will fail",
+                        name
+                    );
+                    continue;
+                };
+                let (app, environment) = match target.split_once('/') {
+                    Some((app, environment)) => (app, Some(environment.to_string())),
+                    None => (target, None),
+                };
+                deis_bundle::Binding {
+                    kind,
+                    app: Some(app.to_string()),
+                    environment,
+                }
+            }
+            kind => deis_bundle::Binding::storage(kind),
+        };
+        bindings.insert(name, binding);
+    }
+    bindings
 }
 
 /// Parse `name[:batch_size[:max_concurrency]]` entries. A field that does not
@@ -572,6 +846,19 @@ pub struct StorageIdentity {
     /// Parsed once, so a token that cannot be sent as metadata is refused
     /// when the client is built rather than on every call.
     token: Option<MetadataValue<Ascii>>,
+    /// Which namespace inside the tenant this client speaks for, or `None`
+    /// for the tenant's unnamed one.
+    ///
+    /// Beside the token rather than folded into it, because it is not part of
+    /// what is being proved: the token authorises the tenant, and the binding
+    /// selects a namespace *inside* the tenant it is stamped next to. That is
+    /// the whole security argument for named bindings - a wrong or forged
+    /// binding reaches another namespace of the caller's own data and can
+    /// never reach another tenant's, because the tenant half is the half the
+    /// storage service checks a credential against.
+    binding: Option<MetadataValue<Ascii>>,
+    /// The binding name as written, for log lines and for [`Self::binding`].
+    binding_name: Option<String>,
 }
 
 impl std::fmt::Debug for StorageIdentity {
@@ -580,6 +867,10 @@ impl std::fmt::Debug for StorageIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageIdentity")
             .field("tenant", &self.tenant.as_str())
+            .field(
+                "binding",
+                &self.binding_name.as_deref().unwrap_or("<unnamed>"),
+            )
             .field(
                 "token",
                 &if self.token.is_some() {
@@ -620,7 +911,66 @@ impl StorageIdentity {
             })?),
             None => None,
         };
-        Ok(Self { tenant, token })
+        Ok(Self {
+            tenant,
+            token,
+            binding: None,
+            binding_name: None,
+        })
+    }
+
+    /// The same tenant and the same proof, speaking for one named namespace
+    /// inside it.
+    ///
+    /// `None` gives back the unnamed namespace, which is what
+    /// `context.services.kv` and every application deployed before bindings
+    /// existed address. The name is checked here, once when the client is
+    /// built, rather than on every call: a name the storage service would
+    /// refuse is a manifest that should never have been accepted, and finding
+    /// out at load time names the application instead of one request.
+    pub fn for_binding(&self, binding: Option<&str>) -> Result<Self> {
+        let Some(name) = binding.map(str::trim).filter(|name| !name.is_empty()) else {
+            return Ok(Self {
+                tenant: self.tenant.clone(),
+                token: self.token.clone(),
+                binding: None,
+                binding_name: None,
+            });
+        };
+        if !deis_wire::conventions::is_valid_binding_name(name) {
+            return Err(anyhow!(
+                "{name:?} is not a usable binding name for {}: a name becomes part of a directory \
+                 and a database file name in deis-store, so it must be 1 to 64 characters of \
+                 ASCII letters, digits, '_' or '-'",
+                self.tenant.as_str()
+            ));
+        }
+        Ok(Self {
+            tenant: self.tenant.clone(),
+            token: self.token.clone(),
+            binding: Some(name.parse::<MetadataValue<Ascii>>().map_err(|_| {
+                anyhow!(
+                    "the binding name {name:?} of {} cannot be sent as gRPC metadata",
+                    self.tenant.as_str()
+                )
+            })?),
+            binding_name: Some(name.to_string()),
+        })
+    }
+
+    /// Which namespace inside the tenant this client speaks for, or `None`
+    /// for the unnamed one.
+    pub fn binding(&self) -> Option<&str> {
+        self.binding_name.as_deref()
+    }
+
+    /// How this identity reads in a log line: the tenant, and the namespace
+    /// inside it when there is one.
+    pub fn describe(&self) -> String {
+        match &self.binding_name {
+            Some(name) => format!("{}@{name}", self.tenant.as_str()),
+            None => self.tenant.as_str().to_string(),
+        }
     }
 
     /// The tenant -- application and environment -- calls are charged to.
@@ -644,7 +994,68 @@ impl StorageIdentity {
                 .metadata_mut()
                 .insert(STORAGE_TOKEN_HEADER, token.clone());
         }
+        // Stamped here rather than in each client, for the reason the token
+        // is: a client that stamped the tenant and forgot the binding would
+        // read and write the tenant's unnamed namespace while the application
+        // believed it was using the one it named, and nothing would fail.
+        if let Some(binding) = &self.binding {
+            request
+                .metadata_mut()
+                .insert(BINDING_HEADER, binding.clone());
+        }
         request
+    }
+}
+
+/// Every client of one kind an isolate holds: the tenant's unnamed namespace,
+/// and one per named binding of that kind.
+///
+/// Two collections and not one map with an optional key, because the two are
+/// different declarations with different meanings. The unnamed namespace
+/// exists when `services.<kind>` is true, and it is the one an application
+/// written before bindings existed has been using all along; a named one
+/// exists when the manifest declares a binding, and it starts empty. Folding
+/// them together would make "the application declared kv" and "the application
+/// declared a kv binding called HOT" one fact, and the first symptom would be
+/// `context.services.kv` quietly answering out of somebody's `HOT`.
+#[derive(Clone)]
+pub struct Bound<T> {
+    unnamed: Option<T>,
+    named: std::collections::BTreeMap<String, T>,
+}
+
+impl<T> Default for Bound<T> {
+    fn default() -> Self {
+        Self {
+            unnamed: None,
+            named: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> Bound<T> {
+    /// The client for one binding name, or for the unnamed namespace when the
+    /// name is empty.
+    ///
+    /// `None` means the application never declared it, which is the answer an
+    /// op turns into "service not available" or "no such binding". There is no
+    /// fallback from a named binding to the unnamed one: an application that
+    /// asked for `HOT` and got the unnamed namespace would be writing into the
+    /// wrong place with nothing failing.
+    pub fn get(&self, binding: &str) -> Option<&T> {
+        match binding.trim() {
+            "" => self.unnamed.as_ref(),
+            name => self.named.get(name),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.unnamed.is_none() && self.named.is_empty()
+    }
+
+    /// The binding names, for a log line. The unnamed namespace is not one.
+    pub fn names(&self) -> Vec<&str> {
+        self.named.keys().map(String::as_str).collect()
     }
 }
 
@@ -654,11 +1065,17 @@ impl StorageIdentity {
 /// that looks for a missing client answers "service not available". There is
 /// no in-process stand-in for any of them: an app that believes it wrote
 /// something is worse off than one told plainly that it could not.
+///
+/// The queue is deliberately one client and not a [`Bound`]: deis-queue has
+/// always keyed messages by `(tenant, queue, id)`, so a name inside a tenant
+/// is what a queue already is. A queue binding names the queue, which is the
+/// same name a consumer declares in the manifest's `queues`, and it needs no
+/// second namespace underneath it.
 #[derive(Clone, Default)]
 pub struct AppServices {
-    pub kv: Option<KvClient>,
-    pub database: Option<DbClient>,
-    pub blob: Option<BlobClient>,
+    pub kv: Bound<KvClient>,
+    pub database: Bound<DbClient>,
+    pub blob: Bound<BlobClient>,
     pub queue: Option<QueueClient>,
 }
 
@@ -673,11 +1090,18 @@ impl AppServices {
     /// namespace is the failure this pair exists to prevent and it is not
     /// recoverable once a preview has written over production's data.
     ///
+    /// A binding of one of these kinds adds a *second* namespace inside that
+    /// same tenant, and never a second tenant: the name is composed onto the
+    /// tenant after the capability token for it has already been chosen, so a
+    /// binding widens what this application can address inside its own data
+    /// and nothing else.
+    ///
     /// Fails only on things that can never work, and only for an app that
     /// actually reaches a storage service: a tenant that is not two legal
-    /// parts, an address that is not a URL, or a capability token that cannot
-    /// be sent as metadata. A service that is merely unreachable is not an
-    /// error here -- see the module docs.
+    /// parts, an address that is not a URL, a capability token that cannot
+    /// be sent as metadata, or a binding name that is not a legal namespace.
+    /// A service that is merely unreachable is not an error here -- see the
+    /// module docs.
     ///
     /// Must be called from inside a Tokio runtime: building a lazy channel
     /// registers a connector with the reactor. Every caller in this crate is
@@ -685,12 +1109,13 @@ impl AppServices {
     pub fn connect(tenant: &str, wiring: &ServiceWiring) -> Result<Self> {
         let mut services = Self::default();
 
+        let connected = wiring.connected_kinds();
         let store_kinds: Vec<ServiceKind> =
             [ServiceKind::Kv, ServiceKind::Database, ServiceKind::Blob]
                 .into_iter()
-                .filter(|kind| wiring.declaration.declares(*kind))
+                .filter(|kind| connected.contains(kind))
                 .collect();
-        let declares_queue = wiring.declaration.declares(ServiceKind::Queue);
+        let declares_queue = connected.contains(&ServiceKind::Queue);
 
         // Who the clients speak as: the tenant they are charged to and the
         // token that proves this node may act as it. Built where a client is
@@ -705,16 +1130,40 @@ impl AppServices {
                 Some(endpoint) => {
                     let identity = identity()?;
                     for kind in store_kinds {
+                        // The unnamed namespace exists only when the manifest
+                        // says `services.<kind>`. A version that declares only
+                        // bindings gets the connection and the named
+                        // namespaces, and `context.services.<kind>` answers
+                        // "not available" -- which is true: it never asked for
+                        // that namespace.
+                        let unnamed = wiring.services_declares(kind);
                         match kind {
                             ServiceKind::Kv => {
-                                services.kv = Some(KvClient::connect_lazy(endpoint, &identity)?)
+                                let base = KvClient::connect_lazy(endpoint, &identity)?;
+                                services.kv = bind_all(
+                                    &base,
+                                    unnamed,
+                                    &wiring.binding_names(deis_bundle::BindingKind::Kv),
+                                    KvClient::for_binding,
+                                )?;
                             }
                             ServiceKind::Database => {
-                                services.database =
-                                    Some(DbClient::connect_lazy(endpoint, &identity)?)
+                                let base = DbClient::connect_lazy(endpoint, &identity)?;
+                                services.database = bind_all(
+                                    &base,
+                                    unnamed,
+                                    &wiring.binding_names(deis_bundle::BindingKind::Database),
+                                    DbClient::for_binding,
+                                )?;
                             }
                             ServiceKind::Blob => {
-                                services.blob = Some(BlobClient::connect_lazy(endpoint, &identity)?)
+                                let base = BlobClient::connect_lazy(endpoint, &identity)?;
+                                services.blob = bind_all(
+                                    &base,
+                                    unnamed,
+                                    &wiring.binding_names(deis_bundle::BindingKind::Blob),
+                                    BlobClient::for_binding,
+                                )?;
                             }
                             ServiceKind::Queue => unreachable!("queue is not served by the store"),
                         }
@@ -723,12 +1172,15 @@ impl AppServices {
                         app_id = tenant,
                         endpoint,
                         services = wiring.declaration.to_csv(),
+                        bindings = %wiring.bindings.describe(),
                         proven = identity.is_proven(),
                         "Bound {} to deis-store at {} for {}; every read and write is charged to \
-                         that tenant, so another environment of this app sees none of it",
+                         that tenant, so another environment of this app sees none of it. Named \
+                         bindings are further namespaces inside that same tenant: {}",
                         tenant,
                         endpoint,
-                        wiring.declaration.to_csv()
+                        wiring.declaration.to_csv(),
+                        wiring.bindings.describe()
                     );
                 }
                 None => tracing::error!(
@@ -786,28 +1238,56 @@ impl AppServices {
 
     /// Whether anything at all was constructed.
     pub fn is_empty(&self) -> bool {
-        self.kv.is_none() && self.database.is_none() && self.blob.is_none() && self.queue.is_none()
+        self.kv.is_empty()
+            && self.database.is_empty()
+            && self.blob.is_empty()
+            && self.queue.is_none()
     }
 
     /// Hand the clients to the isolate.
     ///
-    /// Only what exists is inserted; the ops look the clients up by type and
-    /// treat an absent one as "service not available", which is exactly the
-    /// answer an app that did not declare the service should get.
+    /// The whole set of each kind goes in, not one client per kind: an op is
+    /// handed a binding name and looks it up, so an application reaching for
+    /// `HOT` and an application reaching for its unnamed namespace go through
+    /// the same op and differ only in what they asked for. An absent set, or a
+    /// name that is not in one, is "service not available" -- which is exactly
+    /// the answer an app that did not declare it should get.
     pub fn install(&self, state: &mut OpState) {
-        if let Some(kv) = &self.kv {
-            state.put(kv.clone());
+        if !self.kv.is_empty() {
+            state.put(self.kv.clone());
         }
-        if let Some(database) = &self.database {
-            state.put(database.clone());
+        if !self.database.is_empty() {
+            state.put(self.database.clone());
         }
-        if let Some(blob) = &self.blob {
-            state.put(blob.clone());
+        if !self.blob.is_empty() {
+            state.put(self.blob.clone());
         }
         if let Some(queue) = &self.queue {
             state.put(queue.clone());
         }
     }
+}
+
+/// Build the unnamed client and one per named binding, off one base client
+/// that already holds the tenant and its token.
+///
+/// One place rather than three copies of the same loop, because the thing that
+/// must not vary between the kinds is exactly this: which namespaces exist and
+/// that each is built from the same identity.
+fn bind_all<T: Clone>(
+    base: &T,
+    unnamed: bool,
+    names: &[String],
+    rebind: impl Fn(&T, Option<&str>) -> Result<T>,
+) -> Result<Bound<T>> {
+    let mut bound = Bound::default();
+    if unnamed {
+        bound.unnamed = Some(rebind(base, None)?);
+    }
+    for name in names {
+        bound.named.insert(name.clone(), rebind(base, Some(name))?);
+    }
+    Ok(bound)
 }
 
 /// Remove any reserved platform key from a map that an application authored.

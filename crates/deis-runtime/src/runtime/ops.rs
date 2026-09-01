@@ -1,6 +1,7 @@
 // Runtime Ops definitions
 // Provides interfaces for JavaScript to call Rust
 
+use super::bindings::Bound;
 use super::kv_client::KvClient;
 use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
 use deno_error::JsErrorBox;
@@ -17,11 +18,49 @@ use std::time::Instant;
 /// `TypeError: invalid_argument` with the real text discarded, so an app
 /// whose store is down could not tell that from a bad argument. Every message
 /// below therefore says both what failed and why it might have.
-pub(super) fn service_unavailable(service: &str) -> JsErrorBox {
-    JsErrorBox::generic(format!(
+/// The message an app gets when it reaches for a service it does not have.
+pub(super) fn unavailable_message(service: &str) -> String {
+    format!(
         "{service} service is not available to this app: its manifest does not declare \"{service}\", \
          or the control plane sent no address for it"
-    ))
+    )
+}
+
+/// The client of one kind for one binding name, out of the set this isolate
+/// holds.
+///
+/// `binding` is the empty string for the tenant's unnamed namespace - what
+/// `context.services.kv` and its three siblings reach - and a declared name
+/// otherwise. **There is no fallback between the two.** A named binding that
+/// is not there answers "no such binding" rather than quietly using the
+/// unnamed namespace, because an application that asked for `HOT` and silently
+/// got the unnamed one would be reading and writing the wrong namespace with
+/// nothing failing.
+///
+/// One function rather than the same twelve lines in every op: the thing that
+/// must not vary is which namespace a call ends up in.
+pub(super) fn bound_client<T: Clone + 'static>(
+    state: &Rc<RefCell<OpState>>,
+    service: &'static str,
+    binding: &str,
+) -> Result<T, String> {
+    let set = { state.borrow().try_borrow::<Bound<T>>().cloned() };
+    let name = binding.trim();
+    match set.as_ref().and_then(|set| set.get(name)) {
+        Some(client) => Ok(client.clone()),
+        None if name.is_empty() => Err(unavailable_message(service)),
+        None => {
+            let declared = set
+                .as_ref()
+                .map(|set| set.names().join(", "))
+                .filter(|names| !names.is_empty())
+                .unwrap_or_else(|| "none".to_string());
+            Err(format!(
+                "this app has no {service} binding named \"{name}\"; the {service} bindings its \
+                 manifest declares are: {declared}"
+            ))
+        }
+    }
 }
 
 /// A call that reached the client but did not come back.
@@ -40,6 +79,13 @@ pub(super) fn service_call_failed(call: &str, error: impl std::fmt::Display) -> 
 
 /// KV Get operation.
 ///
+/// Every KV op takes the binding name first, and the empty string is the
+/// tenant's unnamed namespace - the one `context.services.kv` reaches and the
+/// one every application deployed before named bindings existed has been
+/// using. It is a parameter rather than a second op per binding because which
+/// namespace a call lands in must be one decision made in one place; see
+/// [`bound_client`].
+///
 /// Answers a `Uint8Array`, or null when the key is not there. The bytes cross
 /// as a buffer rather than as a string: a KV value is whatever the
 /// application wrote, and only the caller knows whether it is text. Deciding
@@ -50,16 +96,10 @@ pub(super) fn service_call_failed(call: &str, error: impl std::fmt::Display) -> 
 #[serde]
 async fn op_kv_get(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] key: String,
 ) -> Result<Option<ToJsBuffer>, JsErrorBox> {
-    let client_opt = {
-        let state_borrow = state.borrow();
-        state_borrow.try_borrow::<KvClient>().cloned()
-    };
-
-    let Some(client) = client_opt else {
-        return Err(service_unavailable("kv"));
-    };
+    let client: KvClient = bound_client(&state, "kv", &binding).map_err(JsErrorBox::generic)?;
 
     client
         .get(key)
@@ -113,6 +153,7 @@ pub struct KvReadResult {
 #[op2]
 async fn op_kv_set(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] key: String,
     #[buffer] value: JsBuffer,
     #[serde] options: KvSetOptions,
@@ -127,14 +168,7 @@ async fn op_kv_set(
         }
     }
 
-    let client_opt = {
-        let state_borrow = state.borrow();
-        state_borrow.try_borrow::<KvClient>().cloned()
-    };
-
-    let Some(client) = client_opt else {
-        return Err(service_unavailable("kv"));
-    };
+    let client: KvClient = bound_client(&state, "kv", &binding).map_err(JsErrorBox::generic)?;
 
     client
         .set_with_options(key, value.to_vec(), options.ttl_seconds, options.metadata)
@@ -152,16 +186,10 @@ async fn op_kv_set(
 #[serde]
 async fn op_kv_get_with_metadata(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] key: String,
 ) -> Result<Option<KvReadResult>, JsErrorBox> {
-    let client_opt = {
-        let state_borrow = state.borrow();
-        state_borrow.try_borrow::<KvClient>().cloned()
-    };
-
-    let Some(client) = client_opt else {
-        return Err(service_unavailable("kv"));
-    };
+    let client: KvClient = bound_client(&state, "kv", &binding).map_err(JsErrorBox::generic)?;
 
     client
         .get_with_metadata(key)
@@ -180,16 +208,10 @@ async fn op_kv_get_with_metadata(
 #[op2]
 async fn op_kv_delete(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] key: String,
 ) -> Result<(), JsErrorBox> {
-    let client_opt = {
-        let state_borrow = state.borrow();
-        state_borrow.try_borrow::<KvClient>().cloned()
-    };
-
-    let Some(client) = client_opt else {
-        return Err(service_unavailable("kv"));
-    };
+    let client: KvClient = bound_client(&state, "kv", &binding).map_err(JsErrorBox::generic)?;
 
     client
         .delete(key)
@@ -260,16 +282,10 @@ pub struct KvListPageResult {
 #[serde]
 async fn op_kv_list(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[serde] options: KvListOptions,
 ) -> Result<KvListPageResult, JsErrorBox> {
-    let client_opt = {
-        let state_borrow = state.borrow();
-        state_borrow.try_borrow::<KvClient>().cloned()
-    };
-
-    let Some(client) = client_opt else {
-        return Err(service_unavailable("kv"));
-    };
+    let client: KvClient = bound_client(&state, "kv", &binding).map_err(JsErrorBox::generic)?;
 
     let page = client
         .list(

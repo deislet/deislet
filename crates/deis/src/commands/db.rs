@@ -23,6 +23,10 @@ use crate::settings::Overrides;
 pub struct QueryArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub sql: String,
     /// One per `?` placeholder, in order. Each is parsed as JSON when it
     /// parses (`42`, `true`, `null`, `"already-quoted"`) and taken as a plain
@@ -35,8 +39,9 @@ pub async fn query(args: QueryArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
     let storage = session.storage().await?;
 
     let result = storage
@@ -92,6 +97,10 @@ pub async fn query(args: QueryArgs, output: Output) -> Result<()> {
 pub struct ExecuteArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub sql: String,
     pub params: Vec<String>,
     pub yes: bool,
@@ -101,8 +110,9 @@ pub async fn execute(args: ExecuteArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
 
     confirm_destructive(
         &tenant,

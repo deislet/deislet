@@ -50,6 +50,50 @@ pub struct ProjectConfig {
     /// Queues this app consumes from.
     #[serde(default)]
     pub queues: Vec<QueueConsumerConfig>,
+    /// The namespaces and the applications this project reaches by name.
+    ///
+    /// Copied verbatim into the bundle manifest, where the shape and every
+    /// rule about it live (`deis_bundle::bindings`). Nothing is invented here:
+    /// a declaration this build cannot honour fails the build, with the
+    /// project file still on the author's screen, rather than producing a
+    /// bundle the control plane would reject.
+    ///
+    /// ```json
+    /// "bindings": {
+    ///   "HOT":  { "kind": "kv" },
+    ///   "AUTH": { "kind": "service", "app": "auth-api" }
+    /// }
+    /// ```
+    #[serde(default)]
+    pub bindings: HashMap<String, BindingConfig>,
+    /// Which applications may call this one through a service binding.
+    ///
+    /// The consenting half of a service binding, and it belongs here - in the
+    /// callee's own project - because it is the callee agreeing. `["*"]` means
+    /// every application on this platform.
+    #[serde(rename = "callableBy", alias = "callable_by", default)]
+    pub callable_by: Vec<String>,
+}
+
+/// One entry of the project file's `bindings` map.
+///
+/// A mirror of `deis_bundle::Binding` rather than a re-export, for the reason
+/// every other block in this file is: the project file is camelCase and
+/// tolerant of keys a newer build added, while the manifest is snake_case and
+/// refuses anything it does not know. The translation, and every check, is
+/// `deis-build-adapter-deislet`'s `manifest::bindings`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingConfig {
+    /// `kv`, `database`, `blob`, `queue` or `service`.
+    pub kind: String,
+    /// The application a `service` binding calls.
+    #[serde(default)]
+    pub app: Option<String>,
+    /// Which environment of that application. Absent means the caller's own,
+    /// which is the default a preview stack needs: `pr-42` of one application
+    /// reaches `pr-42` of the other rather than production.
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 fn default_function_root() -> String {

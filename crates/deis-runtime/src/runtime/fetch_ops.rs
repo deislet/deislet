@@ -89,7 +89,7 @@ fn allowance(remaining: Duration) -> Duration {
 /// Zero means the budget is already gone: `js/bootstrap.js` aborts the call
 /// before a socket is opened rather than starting something it knows cannot
 /// finish.
-fn budget_ms(state: &OpState) -> f64 {
+pub(super) fn budget_ms(state: &OpState) -> f64 {
     let Some(deadline) = state
         .try_borrow::<ExecutionDeadline>()
         .and_then(|slot| slot.get())

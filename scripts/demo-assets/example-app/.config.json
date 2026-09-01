@@ -11,14 +11,40 @@
       "LOG_LEVEL": "info",
       "ASSETS": "an-application-cannot-take-this-name"
     },
-    "secrets": ["DEMO_SECRET"]
+    "secrets": [
+      "DEMO_SECRET"
+    ]
   },
   "services": {
-    "kv": { "enabled": true },
-    "queue": { "enabled": true }
+    "kv": {
+      "enabled": true
+    },
+    "queue": {
+      "enabled": true
+    }
   },
-  "queues": [{ "name": "jobs", "batchSize": 10, "maxConcurrency": 2 }],
-  "cron": ["* * * * *"],
+  "bindings": {
+    "HOT": {
+      "kind": "kv"
+    },
+    "COLD": {
+      "kind": "kv"
+    },
+    "AUTH": {
+      "kind": "service",
+      "app": "demo-auth"
+    }
+  },
+  "queues": [
+    {
+      "name": "jobs",
+      "batchSize": 10,
+      "maxConcurrency": 2
+    }
+  ],
+  "cron": [
+    "* * * * *"
+  ],
   "limits": {
     "timeoutMs": 1000,
     "memoryMb": 32,
@@ -29,7 +55,9 @@
     "notFound": "404-page"
   },
   "vendors": {
-    "deislet": { "enabled": true }
+    "deislet": {
+      "enabled": true
+    }
   },
   "build": {
     "outDir": "./dist"

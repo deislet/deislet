@@ -187,7 +187,7 @@ API key 能不能从控制面领到那张令牌。
 
 ## verify 检查什么
 
-`./scripts/demo.sh verify` 分十四组跑三十六项，每项打印它据以判断的证据：
+`./scripts/demo.sh verify` 分十九组跑七十九项，每项打印它据以判断的证据：
 
 | 组 | 检查 | 证明了什么 |
 |---|---|---|
@@ -220,8 +220,15 @@ API key 能不能从控制面领到那张令牌。
 | | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
 | | 不带 API key 打 `GET /api/apps/:app/environments/:env/storage-token` | 401，什么也拿不到；同一发带上 key 才拿到租户名、deis-store 地址与令牌本身（令牌不打印）。这张令牌绕过控制面直接对 deis-store 生效、而且不过期，所以它和部署走同一道门——这是「成功了算失败」的第三项 |
 | | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾看不到 `storage_auth_secret`，它只拿到这一个租户的令牌 |
+| 具名绑定 | 同一个 key 经 `ctx.bindings.HOT`、`ctx.bindings.COLD` 和 `ctx.services.kv` 各写一次，再直接问 `KvStore.Get` | 读回来是三个不同的值；直接问 deis-store 时带 `x-deis-binding: HOT` 拿到 HOT 那个、不带这个头拿到无名那个。所以具名的命名空间是开在无名那个**旁边**，不是盖在它上面——早先部署的应用数据一个字节没挪 |
+| | 把 `..`、`a.b`、`a@b`、`../../etc`、超长名字当作 binding 头发给 deis-store；再拿 `demo` 的令牌去点名 `demo-auth` | 五个恶意名字全部在碰到磁盘之前被拒（`is not a namespace id`）；换租户那一发即使带着合法 binding 也被拒。令牌管的是租户，binding 只在租户内部选命名空间——一个伪造的名字最坏够到调用方自己那个租户的另一个空命名空间 |
+| | `deis kv put --binding HOT` 写，再用三种方式读 | 带 `--binding HOT` 读得到，并把命名空间印成 `demo.production@HOT` 而不是光租户；同一条命令不带 `--binding` 读回 `found=false`；应用侧 `ctx.bindings.HOT` 读到的就是 CLI 写的那个值 |
 | 队列 | `POST /api/enqueue` 后轮询 `/api/kv/job:<key>` | 消息进了 deis-queue，节点的轮询任务领到并交给 `_queue.ts` |
 | cron | 轮询 `/api/kv/cron:last-run` | 控制面到点挑了**一个**节点触发，应用的 `_scheduled.ts` 真的跑了 |
+| 应用间调用 | `demo` 经 AUTH 绑定调 `demo-auth` | 被调方跑的是它自己的 handler、答的是它自己的 202、看得见调用方发的 body 和头；它读到的 `x-deis-caller` 是 `demo.production`——而调用方在那个头里写的是别的名字，平台盖掉了。整条路上没有任何地址 |
+| | 同一个处理函数改打 `http://127.0.0.1:<节点端口>/api/call` | 打不通：那是被调方唯一能被 HTTP 到达的地址，出站策略拒绝它。所以上一行那次成功不是「fetch 换了个短名字」，是另一套机制——服务绑定里根本没有能放地址的字段 |
+| | `demo` 的 preview 打同一条路径 | 同一个 bundle、同一个绑定，解析到的是 `demo-auth.preview` 而不是生产，并因为那个环境没部署而当场报错。默认跟着调用方自己的环境走：一个预览去调另一个应用的生产，是下游谁也看不见的串数据 |
+| | 把 `demo-auth` 换成一版 `callableBy` 为空的，再换回来 | 中间那次调用被拒（调用方那边什么都没重新投递、bundle 和绑定一个字没改），换回来又通。同意是被调方自己写的，由节点按它**当前正在服务的那一版**逐次查 |
 | 环境 | 同一应用的 production 与 preview 各打一发 | 两个环境在同一台节点上并行，各返回各自版本的标签 |
 | | 在一个环境写 KV，去另一个环境读 | 读不到——两个环境是两个存储租户 |
 | 资源上限 | production（v1，manifest 里写 `timeoutMs: 1000`）打 `/api/slow?ms=2000` 与 `?ms=200` | 前一发在约 1 秒被切、后一发正常返回：节点默认是 30000ms，两发都会过，所以在起作用的是应用自己报的那个数。节点日志里那句「narrows the default execution timeout: 1000ms（platform default 30000ms）」是它自己的说法 |
@@ -239,6 +246,7 @@ API key 能不能从控制面领到那张令牌。
 | 机队 | 控制面的 `/api/runtime` | 节点自己 `PUT .../registration` 登记上了；写在配置文件里的地址没有被节点自报的主机名覆盖掉 |
 | | 拿节点凭据给一个**没写在** `deis_runtime_nodes` 里的 id 也发一次 `PUT .../registration` | 机队里真的多出这个 id，且 `source` 是 `registered` 而非 `configured`——证明一台配置文件从未提过的机器，光靠自己登记就能加入机队，而不是全靠这行演示脚本里唯一的节点本来就在配置文件里、这条登记路径从没被真正走过 |
 | | `deis status` | 节点是健康的、问得到的，而且它自己报出正在服务哪些环境——「目录说该跑什么」与「节点说在跑什么」是两回事 |
+| 账号与作用域 | 拿一把只有 `deploy:demo/*` 的 token 传一个声明了 `AUTH` 服务绑定的 bundle | 403，而且回话点名少的是 `read:demo-auth/*`；给同一个账号加上这一条，同一个 bundle 就传上去了。一个应用在 manifest 里点另一个应用的名，是在**主张**一项调用权，而这次上传走的路由只说得出调用方是谁——所以这一道单查。`read` 是这套语法里最弱的动词，任何别的动词都蕴含它：这是团队之间的一道边界，不是第二个发版权限。那次拒绝在审计日志里 |
 
 日志那一项和存储小节的两项都需要 `grpcurl`：分别用来直接问 deis-telemetry 和
 deis-store，缺了会各自报为失败并说明原因，而不是悄悄跳过或者放宽标准去凑一个通过。

@@ -84,6 +84,84 @@ pub fn is_valid_tenant_part(part: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+// ---- naming a namespace inside one tenant -----------------------------
+//
+// A tenant is one application in one environment, and that is the boundary
+// the storage services enforce. Inside it an application may want more than
+// one namespace - hot data apart from cold, two buckets, a second database -
+// and that is what a *binding* names. These four items are the whole of the
+// mechanism, and they live here because deis-bundle validates a name,
+// deis-runtime stamps it on a call, and deis-store and deis-queue turn it
+// into a column value, a file name and a directory. A disagreement about the
+// separator would put one application's writes in another namespace of its
+// own, silently.
+
+/// Header naming which namespace inside the tenant a storage call wants.
+///
+/// Absent means the tenant's unnamed namespace - the one every application
+/// had before bindings existed, and the one `context.services.kv` still
+/// reaches. This header is deliberately *not* a credential and does not need
+/// to be: [`STORAGE_TOKEN_HEADER`] authorises the tenant, and a binding is
+/// always inside the tenant it is stamped beside, so the worst a forged value
+/// can reach is another namespace of the caller's own data.
+pub const BINDING_HEADER: &str = "x-deis-binding";
+
+/// Separator between a tenant and a binding name inside a namespace id.
+///
+/// Deliberately a character [`is_valid_tenant_part`] and
+/// [`is_valid_binding_name`] both refuse, which is what makes
+/// [`namespace_id`] injective: no pair of (tenant, binding) can spell another
+/// pair's namespace, and no namespace with a binding can spell a bare tenant.
+/// It is also legal in a file name on every platform this runs on, because
+/// deis-store turns a namespace id into a database file and a directory.
+pub const BINDING_SEPARATOR: char = '@';
+
+/// Whether a string may name a binding.
+///
+/// The same character set as [`is_valid_tenant_part`], for the same reason:
+/// the value becomes part of a file name and a directory name in deis-store,
+/// so it is checked hard rather than sanitised. Case is preserved - authors
+/// write `HOT`, the way they would on Cloudflare - and uniqueness is enforced
+/// case-insensitively where a manifest is validated, because two names that
+/// differ only in case would be one directory on a case-insensitive
+/// filesystem.
+pub fn is_valid_binding_name(name: &str) -> bool {
+    is_valid_tenant_part(name)
+}
+
+/// The namespace one storage call acts in: a tenant, and the binding inside
+/// it when the call names one.
+///
+/// `None` returns the tenant unchanged, which is why an application deployed
+/// before bindings existed keeps reading and writing exactly the rows, files
+/// and objects it always had.
+pub fn namespace_id(tenant: &str, binding: Option<&str>) -> String {
+    match binding {
+        Some(binding) => format!("{tenant}{BINDING_SEPARATOR}{binding}"),
+        None => tenant.to_string(),
+    }
+}
+
+/// Split a namespace id back into its tenant and its binding.
+///
+/// Returns `None` for anything that is not a legal tenant, optionally
+/// followed by the separator and a legal binding name. Two separators, an
+/// empty binding and a binding holding a `.` are all refused rather than
+/// read loosely: this is what a storage service parses before it touches
+/// anything on disk.
+pub fn split_namespace(namespace: &str) -> Option<(&str, Option<&str>)> {
+    match namespace.split_once(BINDING_SEPARATOR) {
+        Some((tenant, binding)) => {
+            if split_tenant(tenant).is_some() && is_valid_binding_name(binding) {
+                Some((tenant, Some(binding)))
+            } else {
+                None
+            }
+        }
+        None => split_tenant(namespace).map(|_| (namespace, None)),
+    }
+}
+
 /// Ceiling for a single gRPC message, applied to both directions on every
 /// service in the platform.
 ///
@@ -326,6 +404,71 @@ mod tests {
             STORAGE_TOKEN_HEADER,
         ] {
             assert_eq!(h, h.to_ascii_lowercase(), "{h} must be lowercase");
+        }
+    }
+
+    #[test]
+    fn a_binding_names_a_namespace_inside_one_tenant() {
+        let tenant = tenant_id("shop", "production");
+        assert_eq!(namespace_id(&tenant, None), "shop.production");
+        assert_eq!(namespace_id(&tenant, Some("HOT")), "shop.production@HOT");
+        assert_eq!(
+            split_namespace("shop.production@HOT"),
+            Some(("shop.production", Some("HOT")))
+        );
+        assert_eq!(
+            split_namespace("shop.production"),
+            Some(("shop.production", None))
+        );
+    }
+
+    #[test]
+    fn no_two_binding_names_can_spell_the_same_namespace() {
+        // The property the whole mechanism rests on. The separator is refused
+        // by both halves of a namespace id, so the only string a pair can
+        // produce is its own - there is no (tenant, binding) that spells
+        // another pair's namespace, and none that spells a bare tenant.
+        assert!(!is_valid_tenant_part("a@b"));
+        assert!(!is_valid_binding_name("a@b"));
+        assert!(!is_valid_binding_name("a.b"));
+        assert!(!is_valid_binding_name(""));
+
+        let mut seen = std::collections::HashSet::new();
+        for app in ["shop", "shop-eu", "shop_eu"] {
+            for env in ["production", "preview-1"] {
+                for binding in [None, Some("HOT"), Some("COLD"), Some("HOT-2")] {
+                    let id = namespace_id(&tenant_id(app, env), binding);
+                    assert!(seen.insert(id.clone()), "{id} was produced twice");
+                    assert_eq!(
+                        split_namespace(&id).map(|(t, b)| (t.to_string(), b.map(str::to_string))),
+                        Some((tenant_id(app, env), binding.map(str::to_string))),
+                        "{id} did not round trip"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_namespace_id_cannot_be_talked_into_another_tenant() {
+        // The attempt an application would actually make: put a separator, a
+        // dot or a traversal inside the name it declares, and reach a
+        // namespace belonging to something else. Every one of them is refused
+        // before it becomes a file name.
+        for hostile in [
+            "shop.production@..",
+            "shop.production@a.b",
+            "shop.production@a@b",
+            "shop.production@",
+            "shop.production@a/b",
+            "shop@HOT",
+            "@HOT",
+            "shop.production.preview@HOT",
+        ] {
+            assert!(
+                split_namespace(hostile).is_none(),
+                "{hostile} must not parse as a namespace"
+            );
         }
     }
 

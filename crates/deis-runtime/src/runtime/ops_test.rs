@@ -64,6 +64,7 @@ mod tests {
 
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::test_store::TestStore;
+    use crate::runtime::ServiceRouter;
     use tokio::sync::oneshot;
 
     /// Run one GET through a real isolate wired to `store`'s KV, and return
@@ -78,6 +79,9 @@ mod tests {
             None,
             IsolateSpec::default(),
             &store.kv_wiring(),
+            // No pool behind this isolate, so every service call it makes is
+            // refused as "not deployed on this node" -- which is what it is.
+            ServiceRouter::detached(),
         )
         .expect("the isolate is built");
         runtime.init_module().await.expect("the module loads");
@@ -100,6 +104,168 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(status, 200, "{body}");
         body
+    }
+
+    /// The same probe, but with named bindings declared beside the unnamed
+    /// namespace, so a handler can reach `ctx.bindings.HOT` as well as
+    /// `ctx.services.kv`.
+    async fn binding_probe(
+        app_id: &str,
+        store: &TestStore,
+        bindings: &[&str],
+        body_js: &str,
+    ) -> String {
+        let code = format!("export default async function handler(ctx) {{\n{body_js}\n}}");
+        let wiring =
+            store.wiring_with_bindings(["kv"], deis_bundle::BindingKind::Kv, bindings.to_vec());
+        let mut runtime = AppRuntime::new(
+            app_id.to_string(),
+            code,
+            None,
+            IsolateSpec::default(),
+            &wiring,
+            ServiceRouter::detached(),
+        )
+        .expect("the isolate is built");
+        runtime.init_module().await.expect("the module loads");
+
+        let (tx, rx) = oneshot::channel();
+        runtime
+            .execute_fetch(
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (status, _, body) = rx.await.expect("a response").expect("a response");
+        let body = body
+            .into_bytes()
+            .map(|bytes| String::from_utf8(bytes).expect("these handlers answer with JSON"))
+            .unwrap_or_default();
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
+    #[tokio::test]
+    async fn two_named_bindings_of_one_application_never_see_each_other() {
+        // The property the whole mechanism rests on, checked against a real
+        // deis-store rather than against the composition function: the same
+        // key written through two bindings of one application is two values,
+        // and neither is the unnamed namespace's.
+        //
+        // The names are chosen to be the nastiest pair the encoding has to
+        // survive: one is a prefix of the other, so an encoding that joined
+        // the name and the key without a separator the name cannot contain
+        // would put `HOT` + `2:k` and `HOT2` + `:k` in one place.
+        let store = TestStore::start().await;
+        let body = binding_probe(
+            "kv_two_bindings_app.production",
+            &store,
+            &["HOT", "HOT2"],
+            r#"await ctx.services.kv.put("k", "unnamed");
+                await ctx.bindings.HOT.put("k", "hot");
+                await ctx.bindings.HOT2.put("k", "hot2");
+                await ctx.bindings.HOT.put("2:k", "hot-with-a-colliding-key");
+                return new Response(JSON.stringify({
+                    unnamed: await ctx.services.kv.get("k"),
+                    hot: await ctx.bindings.HOT.get("k"),
+                    hot2: await ctx.bindings.HOT2.get("k"),
+                    collider: await ctx.bindings.HOT.get("2:k"),
+                    hotKeys: (await ctx.bindings.HOT.list()).keys.map((e) => e.name),
+                    hot2Keys: (await ctx.bindings.HOT2.list()).keys.map((e) => e.name),
+                    unnamedKeys: (await ctx.services.kv.list()).keys.map((e) => e.name),
+                    envIsTheSameObject: ctx.env.HOT === ctx.bindings.HOT,
+                }));"#,
+        )
+        .await;
+
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(seen["unnamed"], "unnamed", "{body}");
+        assert_eq!(seen["hot"], "hot", "{body}");
+        assert_eq!(seen["hot2"], "hot2", "{body}");
+        assert_eq!(seen["collider"], "hot-with-a-colliding-key", "{body}");
+        // Each namespace enumerates only its own keys. This is the assertion
+        // that would fail if two bindings shared a namespace: HOT2 would see
+        // three keys, or HOT would see HOT2's.
+        assert_eq!(seen["hotKeys"], serde_json::json!(["2:k", "k"]), "{body}");
+        assert_eq!(seen["hot2Keys"], serde_json::json!(["k"]), "{body}");
+        assert_eq!(seen["unnamedKeys"], serde_json::json!(["k"]), "{body}");
+        assert_eq!(
+            seen["envIsTheSameObject"], true,
+            "a binding is published on env and on context.bindings, and it is one object: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_deployed_before_bindings_existed_keeps_its_data() {
+        // The other half of the promise. An application writes through
+        // `ctx.services.kv` -- which is what it had before any of this
+        // existed -- and then a later version declares a binding. The old data
+        // must still be exactly where it was, and the new namespace must start
+        // empty.
+        let store = TestStore::start().await;
+
+        let before = kv_probe(
+            "kv_upgrade_app.production",
+            &store,
+            r#"await ctx.services.kv.put("legacy", "written-before-bindings");
+                return new Response(JSON.stringify({
+                    value: await ctx.services.kv.get("legacy"),
+                }));"#,
+        )
+        .await;
+        let before: serde_json::Value = serde_json::from_str(&before).expect("a JSON body");
+        assert_eq!(before["value"], "written-before-bindings");
+
+        let after = binding_probe(
+            "kv_upgrade_app.production",
+            &store,
+            &["HOT"],
+            r#"return new Response(JSON.stringify({
+                    unnamed: await ctx.services.kv.get("legacy"),
+                    hot: await ctx.bindings.HOT.get("legacy"),
+                    hotKeys: (await ctx.bindings.HOT.list()).keys.length,
+                }));"#,
+        )
+        .await;
+        let after: serde_json::Value = serde_json::from_str(&after).expect("a JSON body");
+        assert_eq!(
+            after["unnamed"], "written-before-bindings",
+            "declaring a binding must not move what the unnamed namespace holds"
+        );
+        assert_eq!(
+            after["hot"],
+            serde_json::Value::Null,
+            "a new binding is a new namespace and starts empty"
+        );
+        assert_eq!(after["hotKeys"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_name_the_manifest_did_not_declare_is_not_reachable() {
+        // A binding is reachable by the name its manifest wrote down and by no
+        // other route: there is no way to name a namespace at the call site,
+        // which is what keeps "what can this application reach" answerable out
+        // of the manifest rather than out of the code.
+        let store = TestStore::start().await;
+        let body = binding_probe(
+            "kv_undeclared_app.production",
+            &store,
+            &["HOT"],
+            r#"return new Response(JSON.stringify({
+                    declared: Object.keys(ctx.bindings),
+                    cold: ctx.bindings.COLD === undefined,
+                    envCold: ctx.env.COLD === undefined,
+                }));"#,
+        )
+        .await;
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(seen["declared"], serde_json::json!(["HOT"]), "{body}");
+        assert_eq!(seen["cold"], true, "{body}");
+        assert_eq!(seen["envCold"], true, "{body}");
     }
 
     #[tokio::test]
@@ -314,6 +480,9 @@ mod tests {
             // The store is running and reachable; this application simply
             // never declared that it uses KV.
             &store.wiring_for(["database"]),
+            // No pool behind this isolate, so every service call it makes is
+            // refused as "not deployed on this node" -- which is what it is.
+            ServiceRouter::detached(),
         )
         .expect("the isolate is built");
         runtime.init_module().await.expect("the module loads");

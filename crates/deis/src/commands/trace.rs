@@ -120,6 +120,7 @@ async fn list(args: Args, output: Output) -> Result<()> {
     let settings = resolve(&Overrides {
         app: args.app.clone(),
         environment: args.environment.clone(),
+        binding: None,
     })?;
     let filters = filters(&args, &settings)?;
 
@@ -265,6 +266,7 @@ async fn follow(args: Args, output: Output) -> Result<()> {
     let settings = resolve(&Overrides {
         app: args.app.clone(),
         environment: args.environment.clone(),
+        binding: None,
     })?;
     let filters = filters(&args, &settings)?;
 

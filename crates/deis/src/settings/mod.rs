@@ -224,6 +224,17 @@ pub fn save_project_file(dir: &Path, file: &ProjectFile) -> Result<PathBuf> {
 pub struct Overrides {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant a storage command acts in.
+    ///
+    /// Only `deis kv`, `deis db` and `deis blob` ever set it, and it is
+    /// deliberately not resolved from the project file or an environment
+    /// variable the way `app` and `environment` are: those two say *which
+    /// tenant* a command is about, and getting one wrong is the same mistake
+    /// whatever the command. A binding says which namespace inside that
+    /// tenant, it is only meaningful for three commands, and a value picked up
+    /// from a file would silently redirect a `deis kv put` that named no
+    /// binding at all.
+    pub binding: Option<String>,
 }
 
 /// Everything the platform commands need to know, already resolved.

@@ -23,6 +23,8 @@ pub mod response_headers;
 mod response_stream;
 pub mod route_match;
 mod runtime_init;
+mod service_call;
+mod service_ops;
 mod snapshot;
 mod tenant;
 #[cfg(test)]
@@ -32,8 +34,8 @@ mod ws_server_ops;
 
 pub use bindings::{
     strip_reserved_env, wire_deployment_env, AppServices, QueueConsumerSpec, ServiceDeclaration,
-    ServiceEndpoints, ServiceKind, ServiceWiring, QUEUE_CONSUMERS_KEY, QUEUE_ENDPOINT_KEY,
-    RESERVED_ENV_KEYS, SERVICES_KEY, STORE_ENDPOINT_KEY,
+    ServiceEndpoints, ServiceKind, ServiceWiring, BINDINGS_KEY, CALLABLE_BY_KEY,
+    QUEUE_CONSUMERS_KEY, QUEUE_ENDPOINT_KEY, RESERVED_ENV_KEYS, SERVICES_KEY, STORE_ENDPOINT_KEY,
 };
 pub use blob_client::BlobClient;
 pub use blob_ops::init_blob_extension;
@@ -57,6 +59,11 @@ pub use response_stream::{
     init_response_stream_extension, response_streams, ResponseBody, ResponseStreams, StreamReader,
 };
 pub use runtime_init::{build_runtime_extensions, init_lazy_extensions};
+pub use service_call::{
+    CallPath, ServiceBindings, ServiceCall, ServiceCallError, ServiceTarget, CALLER_HEADER,
+    MAX_SERVICE_CALL_DEPTH, MAX_SERVICE_RESPONSE_BYTES,
+};
+pub use service_ops::{init_service_extension, ServiceRouter};
 pub use snapshot::load_or_create_startup_snapshot;
 pub use tenant::Tenant;
 pub use tls_ops::init_tls_ops_extension;

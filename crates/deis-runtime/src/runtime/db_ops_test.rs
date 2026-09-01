@@ -4,6 +4,7 @@
 mod tests {
     use crate::runtime::db_ops::init_db_extension;
     use crate::runtime::ops::{init_ops_extension, ResponseStore};
+    use crate::runtime::ServiceRouter;
     use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
     use std::cell::RefCell;
     // use std::collections::HashMap;
@@ -156,6 +157,9 @@ mod tests {
             None,
             IsolateSpec::default(),
             &store.wiring_for(["database"]),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .expect("the isolate is built");
         runtime.init_module().await.expect("the module loads");

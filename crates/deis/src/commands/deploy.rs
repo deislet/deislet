@@ -32,6 +32,7 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app.clone(),
         environment: args.environment.clone(),
+        binding: None,
     })?;
     let app = session.app()?.to_string();
     let environment = session.environment()?.to_string();

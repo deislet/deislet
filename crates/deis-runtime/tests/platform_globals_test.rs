@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 
 use deis_runtime::runtime::isolate::AppRuntime;
+use deis_runtime::runtime::ServiceRouter;
 use deis_runtime::runtime::{IsolateSpec, ServiceWiring};
 use tokio::sync::oneshot;
 
@@ -51,6 +52,9 @@ async fn runtime_for(app: &str, code: &str) -> AppRuntime {
         None,
         IsolateSpec::default(),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .expect("the isolate is built");
     runtime.init_module().await.expect("the module loads");

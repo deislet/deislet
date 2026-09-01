@@ -18,6 +18,8 @@ use super::response_headers::{count_of, fold_duplicate_names, HeaderPairs};
 use super::response_stream::{response_streams, ResponseBody, ResponseStreams};
 use super::route_match::{match_routes, path_from_url};
 use super::runtime_init::{build_runtime_extensions, init_lazy_extensions};
+use super::service_call::{CallPath, ServiceBindings};
+use super::service_ops::ServiceRouter;
 use super::snapshot::load_or_create_startup_snapshot;
 use super::ws_server_ops::{create_ws_server_manager, WsServerManager};
 use crate::app::types::AppPermissions;
@@ -1109,6 +1111,15 @@ pub struct AppRuntime {
     /// [`Self::begin_invocation`]; see [`SubrequestBudget`] for why fan-out
     /// needs a ceiling none of the other budgets provides.
     subrequest_budget: Rc<SubrequestBudget>,
+    /// The chain of applications that led to the invocation currently running,
+    /// shared with the isolate's `OpState`.
+    ///
+    /// Empty for an invocation that arrived from outside this platform, and
+    /// written only by [`Self::execute_service_call`]. It is what the cycle
+    /// refusal and the depth ceiling are computed from, which is why it lives
+    /// beside the budgets rather than travelling in a header the application
+    /// could write.
+    call_path: CallPath,
     /// Which of the platform's answers this application gets. See
     /// [`IsolateSpec::compatibility`]: this is the one thing this isolate asks
     /// when an old answer and a better one both exist, and it is a bit test,
@@ -1152,6 +1163,7 @@ impl AppRuntime {
         app_repo: Option<Arc<crate::app_repo::AppRepo>>,
         spec: IsolateSpec,
         wiring: &ServiceWiring,
+        router: ServiceRouter,
     ) -> Result<Self> {
         let IsolateSpec {
             entry_point,
@@ -1297,6 +1309,30 @@ impl AppRuntime {
 
         let execution_deadline: ExecutionDeadline = Rc::new(Cell::new(None));
         let subrequest_budget = Rc::new(SubrequestBudget::new(max_subrequests));
+        let call_path: CallPath = Rc::new(RefCell::new(Vec::new()));
+
+        // Resolved once, here, because a binding that follows the caller's own
+        // environment depends on which environment *this* isolate is, and that
+        // never changes for one isolate. Resolving per call would let one
+        // manifest mean two things in one isolate's lifetime.
+        let service_bindings = ServiceBindings::resolve(
+            &wiring.bindings,
+            crate::app::AppKey::parse_tenant(&app_id)
+                .as_ref()
+                .map(|key| key.environment())
+                .unwrap_or(deis_wire::conventions::DEFAULT_ENVIRONMENT),
+        );
+        if !service_bindings.is_empty() {
+            tracing::info!(
+                app_id = %app_id,
+                bindings = %service_bindings.describe(),
+                "{} may call, by name: {}. A service call is dispatched inside this node and \
+                 never leaves it, so a callee that is not loaded here is refused with that in \
+                 the message rather than being reached over the network",
+                app_id,
+                service_bindings.describe()
+            );
+        }
 
         {
             let sys = RealSys;
@@ -1407,10 +1443,28 @@ impl AppRuntime {
             state.put(execution_deadline.clone());
 
             // The invocation's outbound-call allowance, read and spent by
-            // `op_deis_fetch_guard` and by the outbound WebSocket dial. Zero
-            // is refused by configuration validation and by the manifest
-            // clamp, so an isolate always has a usable ceiling here.
+            // `op_deis_fetch_guard`, by the outbound WebSocket dial and by a
+            // service call. Zero is refused by configuration validation and by
+            // the manifest clamp, so an isolate always has a usable ceiling
+            // here.
             state.put(subrequest_budget.clone());
+
+            // What this isolate may call, the way back into the pool that
+            // would dispatch it, and the chain it is currently part of. All
+            // three are needed to answer one service call, and an isolate
+            // missing any of them refuses every service call rather than
+            // making an unjudged one.
+            state.put(service_bindings);
+            state.put(router);
+            state.put(call_path.clone());
+
+            // Which queues this version declared as bindings. Only a list of
+            // names: a queue binding is the queue's own name inside this
+            // tenant, so the one queue client above already reaches it and
+            // there is nothing more to build.
+            state.put(super::service_ops::QueueBindings(
+                wiring.binding_names(deis_bundle::BindingKind::Queue),
+            ));
 
             // The same policy the HTTP client's resolver was built with, put
             // where `op_deis_fetch_guard` can read it. Both halves have to see
@@ -1524,6 +1578,7 @@ impl AppRuntime {
             metrics,
             execution_deadline,
             subrequest_budget,
+            call_path,
             compatibility,
             timers_swept: false,
         })
@@ -2006,6 +2061,58 @@ impl AppRuntime {
         // On the path where the request answered, the tail below has already
         // done most of this; on the path where it was cut off, nothing has.
         self.end_invocation();
+        outcome
+    }
+
+    /// Serve one call from another application on this node.
+    ///
+    /// The same invocation an inbound request gets - the same handler, the
+    /// same watchdog, the same timeout, the same CPU and memory ceilings, the
+    /// same log stream and the same trace record - because it *is* an
+    /// invocation of this application and the caller lends it nothing. What is
+    /// different is only what surrounds it: the chain that led here is
+    /// installed before the handler runs and taken away after, so that a
+    /// service call this application makes in turn extends the chain instead
+    /// of starting a new one.
+    ///
+    /// The chain arrives as data on the message, never in a header. An
+    /// application that could write it could name a chain it is not in, and
+    /// both the cycle refusal and the depth ceiling are computed from it.
+    ///
+    /// It is cleared however this returns, including when the handler was cut
+    /// off: a chain left behind would attach itself to the next inbound
+    /// request this isolate served, and that request would then be refused for
+    /// a cycle it has nothing to do with.
+    pub async fn execute_service_call(
+        &mut self,
+        call: super::service_call::ServiceCall,
+        response_tx: oneshot::Sender<Result<FetchResult>>,
+    ) -> Result<()> {
+        let super::service_call::ServiceCall {
+            path,
+            binding,
+            url,
+            method,
+            headers,
+            body,
+        } = call;
+        let caller = path.last().cloned().unwrap_or_default();
+        tracing::debug!(
+            target: "app",
+            app_id = %self.app_id,
+            caller = %caller,
+            binding = %binding,
+            method = %method,
+            url = %url,
+            "Serving a service call from {} through its binding {}",
+            caller,
+            binding
+        );
+        self.call_path.replace(path);
+        let outcome = self
+            .execute_fetch(url, method, headers, body, response_tx)
+            .await;
+        self.call_path.borrow_mut().clear();
         outcome
     }
 

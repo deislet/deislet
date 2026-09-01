@@ -51,6 +51,15 @@ pub fn resolve(overrides: &Overrides) -> Result<Settings> {
 pub struct Session {
     pub settings: Settings,
     pub control: Control,
+    /// Which namespace inside the tenant a storage command acts in, or `None`
+    /// for the tenant's unnamed one.
+    ///
+    /// Kept on the session rather than in [`Settings`] because it is not a
+    /// setting: it is not read from the project file or the environment, it
+    /// has no default worth remembering, and it means nothing to any command
+    /// that is not `deis kv`, `deis db` or `deis blob`. See
+    /// [`crate::settings::Overrides::binding`].
+    binding: Option<String>,
 }
 
 impl Session {
@@ -59,7 +68,34 @@ impl Session {
     pub fn open(overrides: &Overrides) -> Result<Self> {
         let settings = resolve(overrides)?;
         let control = Control::new(settings.control_endpoint()?, settings.token())?;
-        Ok(Self { settings, control })
+        Ok(Self {
+            settings,
+            control,
+            binding: overrides
+                .binding
+                .as_ref()
+                .map(|binding| binding.trim().to_string())
+                .filter(|binding| !binding.is_empty()),
+        })
+    }
+
+    /// The namespace this command acts in, as a person should read it:
+    /// `demo.production`, or `demo.production@HOT` when a binding was named.
+    ///
+    /// Every line `deis kv`, `deis db` and `deis blob` print uses this rather
+    /// than the bare tenant. A `deis kv get` that printed only the tenant
+    /// would tell an operator which application and environment they had
+    /// looked at and not which of its namespaces, which is exactly the thing
+    /// named bindings make ambiguous.
+    ///
+    /// It is the same spelling deis-store keys the data by
+    /// (`deis_wire::conventions::namespace_id`), so what is printed here is
+    /// findable on disk.
+    pub fn namespace(&self) -> Result<String> {
+        Ok(deis_wire::conventions::namespace_id(
+            &self.tenant()?,
+            self.binding.as_deref(),
+        ))
     }
 
     /// The application this command is about, checked against the naming rule
@@ -108,6 +144,15 @@ impl Session {
                  operator sets on deis-control itself; `deis config` has no lever for it."
             );
         };
-        StorageSession::connect(&endpoint, &tenant, credentials.token.as_deref())
+        // The capability token is for the tenant, and the binding selects a
+        // namespace inside it. That ordering is the whole authorisation story:
+        // the credential this CLI already holds says which tenant's data may
+        // be touched, and naming a binding cannot reach past it.
+        StorageSession::connect(
+            &endpoint,
+            &tenant,
+            credentials.token.as_deref(),
+            self.binding.as_deref(),
+        )
     }
 }

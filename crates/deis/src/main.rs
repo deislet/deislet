@@ -81,6 +81,24 @@ struct Target {
     environment: Option<String>,
 }
 
+/// The same, plus which namespace inside the tenant the command acts in.
+///
+/// Only `deis kv`, `deis db` and `deis blob` take it, because a binding is a
+/// namespace inside one tenant's storage and nothing else in this CLI is about
+/// storage. Leaving it out means the tenant's *unnamed* namespace, which is
+/// what `context.services.kv`, `.database` and `.blob` reach and where an
+/// application that declares no binding keeps everything it has.
+#[derive(Args, Clone, Debug, Default)]
+struct DataTarget {
+    #[command(flatten)]
+    target: Target,
+
+    /// Named binding to act in. Omitted means the namespace
+    /// `context.services.*` uses.
+    #[arg(long, value_name = "NAME")]
+    binding: Option<String>,
+}
+
 /// The same, for a command that is about a whole application.
 #[derive(Args, Clone, Debug, Default)]
 struct AppTarget {
@@ -557,7 +575,7 @@ enum KvAction {
     /// Read one value.
     Get {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -576,7 +594,7 @@ enum KvAction {
     /// Write one value.
     Put {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -611,7 +629,7 @@ enum KvAction {
     /// be typed back before anything is deleted.
     Delete {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -627,7 +645,7 @@ enum KvAction {
     /// List keys under a prefix.
     List {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -651,7 +669,7 @@ enum DbAction {
     /// Run a SELECT and show what came back.
     Query {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -674,7 +692,7 @@ enum DbAction {
     /// screen before typing it back.
     Execute {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -702,7 +720,7 @@ enum BlobAction {
     /// assumed.
     List {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -733,7 +751,7 @@ enum BlobAction {
     /// Show one object's size, media type and etag without downloading it.
     Head {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -745,7 +763,7 @@ enum BlobAction {
     /// Read one object.
     Get {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -779,7 +797,7 @@ enum BlobAction {
     /// Write one object.
     Put {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -814,7 +832,7 @@ enum BlobAction {
     /// be typed back before anything is deleted.
     Delete {
         #[command(flatten)]
-        target: Target,
+        target: DataTarget,
 
         #[command(flatten)]
         format: Format,
@@ -1214,8 +1232,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::kv::get(
                     commands::kv::GetArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         key,
                         file,
                     },
@@ -1234,8 +1253,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::kv::put(
                     commands::kv::PutArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         key,
                         value,
                         file,
@@ -1254,8 +1274,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::kv::delete(
                     commands::kv::DeleteArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         key,
                         yes,
                     },
@@ -1272,8 +1293,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::kv::list(
                     commands::kv::ListArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         prefix,
                         limit,
                         cursor,
@@ -1293,8 +1315,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::db::query(
                     commands::db::QueryArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         sql,
                         params,
                     },
@@ -1311,8 +1334,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::db::execute(
                     commands::db::ExecuteArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         sql,
                         params,
                         yes,
@@ -1335,8 +1359,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::blob::list(
                     commands::blob::ListArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         prefix,
                         delimiter,
                         limit,
@@ -1354,8 +1379,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::blob::head(
                     commands::blob::HeadArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         key,
                     },
                     format.into(),
@@ -1374,8 +1400,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::blob::get(
                     commands::blob::GetArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         key,
                         file,
                         offset,
@@ -1398,8 +1425,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::blob::put(
                     commands::blob::PutArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         key,
                         file,
                         content_type,
@@ -1420,8 +1448,9 @@ async fn run(cli: Cli) -> Result<()> {
             } => {
                 commands::blob::delete(
                     commands::blob::DeleteArgs {
-                        app: target.app,
-                        environment: target.environment,
+                        app: target.target.app,
+                        environment: target.target.environment,
+                        binding: target.binding,
                         key,
                         yes,
                         if_match,

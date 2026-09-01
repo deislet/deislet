@@ -86,6 +86,7 @@ mod tests {
                     max_concurrency: Some(2),
                 },
             ],
+            ..ServiceWiring::default()
         };
 
         let mut map = HashMap::new();
@@ -133,6 +134,7 @@ mod tests {
                     max_concurrency: None,
                 },
             ],
+            ..ServiceWiring::default()
         };
 
         let mut map = HashMap::new();
@@ -224,12 +226,13 @@ mod tests {
                 queue: Some("http://127.0.0.1:8091".to_string()),
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
 
         let services = connect_or_panic("demo.production", &wiring);
-        assert!(services.kv.is_some());
-        assert!(services.database.is_none());
-        assert!(services.blob.is_none());
+        assert!(services.kv.get("").is_some());
+        assert!(services.database.get("").is_none());
+        assert!(services.blob.get("").is_none());
         assert!(services.queue.is_none(), "queue was not declared");
     }
 
@@ -243,6 +246,7 @@ mod tests {
                 queue: Some("http://127.0.0.1:8091".to_string()),
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
 
         // Every client is charged to the pair, not to the application: a
@@ -250,15 +254,15 @@ mod tests {
         // production stored.
         let services = connect_or_panic("demo-app.preview-7", &wiring);
         assert_eq!(
-            services.kv.as_ref().map(|c| c.tenant()),
+            services.kv.get("").map(|c| c.tenant()),
             Some("demo-app.preview-7")
         );
         assert_eq!(
-            services.database.as_ref().map(|c| c.tenant()),
+            services.database.get("").map(|c| c.tenant()),
             Some("demo-app.preview-7")
         );
         assert_eq!(
-            services.blob.as_ref().map(|c| c.tenant()),
+            services.blob.get("").map(|c| c.tenant()),
             Some("demo-app.preview-7")
         );
         assert_eq!(
@@ -281,6 +285,7 @@ mod tests {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
 
         let error = match AppServices::connect("demo", &wiring) {
@@ -302,6 +307,7 @@ mod tests {
             declaration: ServiceDeclaration::from_names(["kv"]),
             endpoints: ServiceEndpoints::default(),
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
         let services = connect_or_panic("demo.production", &wiring);
         assert!(services.is_empty());
@@ -319,6 +325,7 @@ mod tests {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
         let error = match AppServices::connect("demo.production", &wiring) {
             Ok(_) => panic!("an address that is not a URL must be refused"),
@@ -340,12 +347,13 @@ mod tests {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
         let services = match AppServices::connect("demo.production", &wiring) {
             Ok(services) => services,
             Err(error) => panic!("a lazy client is built even when nothing answers: {error}"),
         };
-        assert!(services.kv.is_some());
+        assert!(services.kv.get("").is_some());
     }
 
     #[test]
@@ -358,6 +366,7 @@ mod tests {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
         assert!(AppServices::connect("bad\nid.production", &wiring).is_err());
     }
@@ -373,6 +382,7 @@ mod tests {
                 batch_size: None,
                 max_concurrency: None,
             }],
+            ..ServiceWiring::default()
         };
         assert!(wiring.active_consumers("demo.production").is_empty());
     }
@@ -391,6 +401,7 @@ mod tests {
                 batch_size: None,
                 max_concurrency: None,
             }],
+            ..ServiceWiring::default()
         };
         assert!(wiring.active_consumers("demo.production").is_empty());
     }
@@ -409,6 +420,7 @@ mod tests {
                 batch_size: None,
                 max_concurrency: None,
             }],
+            ..ServiceWiring::default()
         };
         assert_eq!(wiring.active_consumers("demo.production").len(), 1);
     }
@@ -726,6 +738,8 @@ mod tests {
         let services = connect_or_panic(tenant, &wiring);
         let kv = services
             .kv
+            .get("")
+            .cloned()
             .expect("kv was declared and an address was sent");
 
         kv.set("k".to_string(), b"v".to_vec())
@@ -754,6 +768,8 @@ mod tests {
         let services = connect_or_panic("demo.production", &wiring);
         let kv = services
             .kv
+            .get("")
+            .cloned()
             .expect("kv was declared and an address was sent");
 
         let error = kv

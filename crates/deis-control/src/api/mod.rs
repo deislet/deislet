@@ -1,6 +1,7 @@
 pub mod apps;
 pub mod audit;
 pub mod authz;
+pub mod bindings;
 pub mod catalog;
 pub mod commands;
 pub mod configs;

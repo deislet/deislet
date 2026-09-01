@@ -2,7 +2,7 @@
 //!
 //! Errors are returned as [`JsErrorBox`] rather than `std::io::Error`, because
 //! only the former's message survives the trip into JavaScript; see
-//! `super::ops::service_unavailable`.
+//! `super::ops::bound_client`.
 //!
 //! Two shapes here are worth knowing before reading the ops. Bodies cross as
 //! buffers in both directions - `#[buffer] JsBuffer` in, [`ToJsBuffer`] out -
@@ -16,19 +16,19 @@
 use super::blob_client::{
     BlobClient, BlobListRequest, BlobMeta, BlobPrecondition, Conditional, RangeRequest,
 };
-use super::ops::{service_call_failed, service_unavailable};
+use super::ops::{bound_client, service_call_failed};
 use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-fn client(state: &Rc<RefCell<OpState>>) -> Result<BlobClient, JsErrorBox> {
-    let state_borrow = state.borrow();
-    state_borrow
-        .try_borrow::<BlobClient>()
-        .cloned()
-        .ok_or_else(|| service_unavailable("blob"))
+/// The object store one call means: the tenant's unnamed namespace when
+/// `binding` is empty, and the named one otherwise. See
+/// [`super::ops::bound_client`] for why a name that is not declared is refused
+/// rather than falling back.
+fn client(state: &Rc<RefCell<OpState>>, binding: &str) -> Result<BlobClient, JsErrorBox> {
+    bound_client(state, "blob", binding).map_err(JsErrorBox::generic)
 }
 
 /// What the store knows about one object, as JavaScript receives it.
@@ -280,6 +280,7 @@ fn precondition_of(
 #[serde]
 async fn op_blob_get(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] key: String,
     #[serde] options: BlobGetOptions,
 ) -> Result<Option<BlobReadResult>, JsErrorBox> {
@@ -287,7 +288,7 @@ async fn op_blob_get(
         Some(range) => Some(range_of(range)?),
         None => None,
     };
-    let found = client(&state)?
+    let found = client(&state, &binding)?
         .read(key, range)
         .await
         .map_err(|e| service_call_failed("blob.get", e))?;
@@ -306,9 +307,10 @@ async fn op_blob_get(
 #[serde]
 async fn op_blob_head(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] key: String,
 ) -> Result<Option<BlobMetaResult>, JsErrorBox> {
-    let found = client(&state)?
+    let found = client(&state, &binding)?
         .head(key)
         .await
         .map_err(|e| service_call_failed("blob.head", e))?;
@@ -320,9 +322,10 @@ async fn op_blob_head(
 #[serde]
 async fn op_blob_list(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[serde] options: BlobListOptions,
 ) -> Result<BlobListPageResult, JsErrorBox> {
-    let page = client(&state)?
+    let page = client(&state, &binding)?
         .list(BlobListRequest {
             prefix: options.prefix.unwrap_or_default(),
             delimiter: options.delimiter,
@@ -352,6 +355,7 @@ async fn op_blob_list(
 #[serde]
 async fn op_blob_put(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] key: String,
     #[buffer] data: JsBuffer,
     #[serde] options: BlobPutOptions,
@@ -360,7 +364,7 @@ async fn op_blob_put(
         Some(only_if) => precondition_of("blob.put", only_if)?,
         None => None,
     };
-    let written = client(&state)?
+    let written = client(&state, &binding)?
         .write(key, data.to_vec(), options.content_type, precondition)
         .await
         .map_err(|e| service_call_failed("blob.put", e))?;
@@ -378,6 +382,7 @@ async fn op_blob_put(
 #[op2]
 async fn op_blob_delete(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] key: String,
     #[serde] options: BlobDeleteOptions,
 ) -> Result<bool, JsErrorBox> {
@@ -385,7 +390,7 @@ async fn op_blob_delete(
         Some(only_if) => precondition_of("blob.delete", only_if)?,
         None => None,
     };
-    let removed = client(&state)?
+    let removed = client(&state, &binding)?
         .delete(key, precondition)
         .await
         .map_err(|e| service_call_failed("blob.delete", e))?;

@@ -26,6 +26,15 @@ pub enum ApiError {
     /// The message names the configuration key, because the caller is the
     /// one who has to go and ask for it to be set.
     NotConfigured(String),
+    /// The caller authenticated and is not entitled to what the request
+    /// contains.
+    ///
+    /// Its own variant rather than a [`Self::BadRequest`] because the request
+    /// is perfectly well formed and would succeed for a wider credential, and
+    /// because `crate::api::authz` records every 403 in the audit log whatever
+    /// route produced it - so a refusal here is written down beside the ones
+    /// the route gate makes.
+    Forbidden(String),
     InternalError(String),
     DatabaseError(String),
 }
@@ -38,6 +47,7 @@ impl IntoResponse for ApiError {
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             ApiError::NotConfigured(msg) => (StatusCode::CONFLICT, msg),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::DatabaseError(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

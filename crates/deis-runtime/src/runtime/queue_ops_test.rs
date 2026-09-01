@@ -11,7 +11,7 @@
 #[cfg(test)]
 mod tests {
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
-    use crate::runtime::ServiceWiring;
+    use crate::runtime::{ServiceRouter, ServiceWiring};
     use std::collections::HashMap;
 
     /// Run one handler and hand back what it answered.
@@ -24,6 +24,9 @@ mod tests {
             // No queue endpoint, so no queue client is installed: the ops are
             // reached, and answer that the service is not available.
             &ServiceWiring::default(),
+            // No pool behind this isolate, so every service call it makes is
+            // refused as "not deployed on this node" -- which is what it is.
+            ServiceRouter::detached(),
         )
         .expect("the isolate builds");
         runtime.init_module().await.expect("the module loads");

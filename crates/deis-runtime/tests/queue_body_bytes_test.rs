@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use deis_runtime::runtime::isolate::AppRuntime;
+use deis_runtime::runtime::ServiceRouter;
 use deis_runtime::runtime::{IsolateSpec, LeasedMessage, ServiceWiring};
 use tokio::sync::oneshot;
 
@@ -73,6 +74,9 @@ async fn a_queue_handler_reads_text_as_text_and_anything_else_as_bytes() {
         None,
         IsolateSpec::default(),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .expect("the module builds");
     runtime.init_module().await.expect("the module loads");
@@ -134,6 +138,9 @@ async fn every_shape_queue_send_accepts_reaches_the_op_as_bytes() {
         None,
         IsolateSpec::default(),
         &ServiceWiring::default(),
+        // No pool behind this isolate, so a service call it made would be
+        // refused as "not deployed on this node", which is what it is.
+        ServiceRouter::detached(),
     )
     .expect("the module builds");
     runtime.init_module().await.expect("the module loads");

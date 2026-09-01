@@ -8,7 +8,7 @@ mod tests {
         REQUEST_ERRORS_TOTAL, TIMEOUT_CUTOFFS_TOTAL,
     };
     use crate::runtime::queue_client::LeasedMessage;
-    use crate::runtime::ResponseBody;
+    use crate::runtime::{ResponseBody, ServiceRouter};
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
@@ -89,6 +89,9 @@ mod tests {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         );
         assert!(
             result.is_ok(),
@@ -110,6 +113,9 @@ mod tests {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         );
         assert!(
             result.is_ok(),
@@ -136,6 +142,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         );
         assert!(
             result.is_ok(),
@@ -163,6 +172,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         );
         assert!(
             result.is_ok(),
@@ -185,6 +197,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         );
         assert!(result.is_ok());
     }
@@ -198,6 +213,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         );
         assert!(result.is_err());
     }
@@ -216,6 +234,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         );
         assert!(result.is_ok());
 
@@ -278,6 +299,9 @@ export default function handler(context: any): Response {
             None,
             spec,
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -310,6 +334,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -339,6 +366,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -366,6 +396,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -407,6 +440,9 @@ export default function handler(context: any): Response {
             None,
             spec,
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -432,6 +468,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -455,6 +494,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -490,6 +532,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -543,6 +588,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -600,6 +648,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -659,6 +710,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -697,6 +751,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -739,6 +796,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -784,6 +844,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -830,6 +893,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -890,6 +956,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -933,6 +1002,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -965,6 +1037,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -1004,6 +1079,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -1049,6 +1127,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -1087,6 +1168,7 @@ export default function handler(context: any): Response {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
 
         let code = r#"
@@ -1106,6 +1188,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &wiring,
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -1151,6 +1236,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             wiring,
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .expect("the isolate is built");
         runtime.init_module().await.expect("the module loads");
@@ -1442,6 +1530,7 @@ export default function handler(context: any): Response {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
 
         let code = r#"
@@ -1462,6 +1551,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &wiring,
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -1511,6 +1603,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -1552,6 +1647,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -1594,6 +1692,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -1639,6 +1740,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -1687,6 +1791,9 @@ export default function handler(context: any): Response {
                 ..Default::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -1729,6 +1836,9 @@ export default function handler(context: any): Response {
                 ..Default::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -1777,6 +1887,9 @@ export default function handler(context: any): Response {
                 ..Default::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -1807,6 +1920,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -1846,6 +1962,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -1904,6 +2023,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -2132,6 +2254,9 @@ export default function handler(context: any): Response {
                 ..IsolateSpec::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -2230,6 +2355,9 @@ export default function handler(context: any): Response {
                 ..IsolateSpec::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -2275,6 +2403,9 @@ export default function handler(context: any): Response {
                 ..IsolateSpec::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
 
@@ -2392,6 +2523,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -2568,6 +2702,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -2924,8 +3061,15 @@ export default function handler(context: any): Response {
 
     /// Run one handler and hand back its body.
     async fn body_of(app: &str, code: &str, spec: IsolateSpec, wiring: &ServiceWiring) -> String {
-        let mut runtime =
-            AppRuntime::new(app.to_string(), code.to_string(), None, spec, wiring).unwrap();
+        let mut runtime = AppRuntime::new(
+            app.to_string(),
+            code.to_string(),
+            None,
+            spec,
+            wiring,
+            ServiceRouter::detached(),
+        )
+        .unwrap();
         runtime.init_module().await.unwrap();
 
         let (tx, rx) = oneshot::channel();
@@ -3040,6 +3184,7 @@ export default function handler(context: any): Response {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
         let policy = crate::runtime::FetchPolicy::new(["127.0.0.1"], Vec::<String>::new()).unwrap();
 
@@ -3094,6 +3239,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -3324,6 +3472,9 @@ export default function handler(context: any): Response {
                 ..IsolateSpec::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -3383,6 +3534,9 @@ export default function handler(context: any): Response {
                 ..IsolateSpec::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -3548,6 +3702,9 @@ export default function handler(context: any): Response {
             None,
             probe_spec(&url, policy),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -3783,6 +3940,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -3865,6 +4025,9 @@ export default function handler(context: any): Response {
             None,
             spec,
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -3970,6 +4133,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -4029,6 +4195,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -4071,6 +4240,7 @@ export default function handler(context: any): Response {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
 
         let code = r#"
@@ -4107,6 +4277,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &wiring,
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -4154,6 +4327,7 @@ export default function handler(context: any): Response {
                 queue: None,
             },
             consumers: Vec::new(),
+            ..ServiceWiring::default()
         };
 
         let code = r#"
@@ -4244,6 +4418,9 @@ export default function handler(context: any): Response {
             None,
             IsolateSpec::default(),
             &wiring,
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -4974,6 +5151,9 @@ export default function handler(context: any): Response {
             None,
             spec,
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -5037,6 +5217,9 @@ export default function handler(context: any): Response {
             None,
             spec,
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -5165,6 +5348,9 @@ export default function handler(context: any): Response {
             None,
             spec,
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -5257,6 +5443,9 @@ export default function handler(context: any): Response {
             None,
             spec,
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();
@@ -5341,6 +5530,9 @@ export default function handler(context: any): Response {
             None,
             spec,
             &ServiceWiring::default(),
+            // No pool behind this isolate, so a service call it made would be
+            // refused as "not deployed on this node", which is what it is.
+            ServiceRouter::detached(),
         )
         .unwrap();
         runtime.init_module().await.unwrap();

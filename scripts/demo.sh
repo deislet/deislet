@@ -56,6 +56,10 @@ ACME_ZONE="deislet.test"
 # overwrite what production stored.
 APP_SRC_DIR="${APP_SRC_DIR:-${ROOT_DIR}/scripts/demo-assets/example-app}"
 APP_ID="${APP_ID:-demo}"
+# The second application, which the example app calls through a service
+# binding. Two applications is the smallest arrangement in which the question
+# a service binding asks -- may this one call that one -- has an answer.
+CALLEE_APP_ID="${CALLEE_APP_ID:-demo-auth}"
 ENV_NAME="${ENV_NAME:-production}"
 # A second environment of the same application, deployed to a different
 # version on the same node. It is what proves an application is identified by
@@ -390,6 +394,7 @@ API_KEY=$API_KEY
 STORAGE_AUTH_SECRET=$STORAGE_AUTH_SECRET
 SECRET_KEY_FILE=$SECRET_KEY_FILE
 APP_ID=$APP_ID
+CALLEE_APP_ID=$CALLEE_APP_ID
 ENV_NAME=$ENV_NAME
 PREVIEW_ENV_NAME=$PREVIEW_ENV_NAME
 NODE_ID=$NODE_ID
@@ -1218,6 +1223,64 @@ report_field() {
   jq -r "$2 // empty" < "${LOG_DIR}/$1.json" 2>/dev/null || true
 }
 
+# The second application: the one the example app calls.
+#
+# It exists because a service binding needs two applications, and because the
+# consenting half of one lives in the *callee's* own bundle. Written here
+# rather than kept in `demo-assets` for the same reason the WebSocket handler
+# is written into the staged copy: it is scaffolding for a check, and the
+# moment a second example project appears this stops writing anything.
+#
+# `callableBy` is the whole of the consent. It names `demo` and nothing else,
+# so the check below can prove both halves from one deployment: `demo` gets
+# through, and a caller that is not on the list does not.
+prepare_callee_source() {
+  local dest="${DEMO_DIR}/app-callee"
+
+  rm -rf "$dest"
+  mkdir -p "${dest}/functions"
+
+  cat > "${dest}/.config.json" <<JSON
+{
+  "version": "1.0.0",
+  "name": "${CALLEE_APP_ID}",
+  "runtime": "standard-v1",
+  "language": "typescript",
+  "functionRoot": "./functions",
+  "compatibilityDate": "2026-09-01",
+  "callableBy": ["${APP_ID}"],
+  "vendors": { "deislet": { "enabled": true } },
+  "build": { "outDir": "./dist" }
+}
+JSON
+
+  cat > "${dest}/functions/verify.ts" <<'TS'
+// The callee of the demo's service binding.
+//
+// It answers with what the platform told it about the call rather than with
+// anything the caller wrote: `x-deis-caller` is stamped by the node over
+// whatever the caller put there, so a callee reading it is reading a fact.
+export default async function handler(context: any): Promise<Response> {
+  const caller = context.request.headers.get("x-deis-caller");
+  const note = context.request.headers.get("x-demo-note");
+  const body = await context.request.text();
+  return new Response(
+    JSON.stringify({
+      calledBy: caller,
+      note,
+      received: body,
+      // Proof the callee ran its own handler rather than anything of the
+      // caller's: this is the callee's own environment table.
+      handlerOf: "verify",
+    }),
+    { status: 202, headers: { "content-type": "application/json; charset=utf-8" } },
+  );
+}
+TS
+
+  echo "$dest"
+}
+
 deploy_example_app() {
   if ! command -v jq >/dev/null 2>&1; then
     echo "⚠️  jq not found; the example app is not deployed and nothing can be verified"
@@ -1261,6 +1324,19 @@ deploy_example_app() {
   # and neither can see the other's KV.
   #
   # It is also the second version production rolls back from later.
+  # The application the example app's AUTH binding calls. Deployed after the
+  # caller on purpose: a binding is resolved when the call is made, not when
+  # the caller is deployed, so neither application has to exist before the
+  # other and there is no order to get right.
+  local src_callee
+  src_callee=$(prepare_callee_source) || return 1
+  # `--app` is spelled out because the demo puts DEIS_APP in the CLI's
+  # environment for the example app, and a deploy that took the environment's
+  # answer would file this bundle under the wrong application - which the
+  # control plane refuses, correctly, by comparing the manifest.
+  cli_deploy "$src_callee" "$ENV_NAME" cli-deploy-callee --app "$CALLEE_APP_ID" || return 1
+  echo "   ✓ deis deploy: ${CALLEE_APP_ID} is serving ${ENV_NAME}; it consents to be called by ${APP_ID}"
+
   local src_v2
   src_v2=$(prepare_app_source v2) || return 1
   cli_deploy "$src_v2" "$PREVIEW_ENV_NAME" cli-deploy-v2-preview || return 1
@@ -2863,6 +2939,331 @@ check_kv_roundtrip() {
 # every check above would still pass - loopback alone would still be
 # standing in for the whole of it, silently, which is exactly the gap
 # crates/deis-store/src/auth.rs exists to close.
+# ---- named bindings ---------------------------------------------------
+#
+# The claim: an application can declare any number of namespaces of a kind,
+# reach each by the name it chose, and never have two of them touch. The
+# checks below prove it from three sides -- from inside the isolate, from
+# deis-store's own service, and from the CLI -- because the first alone would
+# be satisfied by a node that kept three maps in memory.
+
+check_named_bindings_are_separate_namespaces() {
+  local title="two named kv bindings of one application never see each other"
+  local key="binding-probe-$$"
+  local headers="${LOG_DIR}/verify-binding.headers"
+
+  # The same key, written through three namespaces of the one tenant.
+  app_request "$headers" "/api/bindings/HOT?key=${key}" -X PUT --data-binary "hot-value" >/dev/null
+  if [ "$(http_status "$headers")" != "201" ]; then
+    fail_check "$title" "PUT through HOT answered $(http_status "$headers")"
+    return
+  fi
+  app_request "$headers" "/api/bindings/COLD?key=${key}" -X PUT --data-binary "cold-value" >/dev/null
+  app_request "$headers" "/api/bindings/default?key=${key}" -X PUT --data-binary "unnamed-value" >/dev/null
+
+  local hot cold unnamed hot_ns same_object
+  hot=$(app_request "${LOG_DIR}/verify-binding-hot.headers" "/api/bindings/HOT?key=${key}")
+  cold=$(app_request "${LOG_DIR}/verify-binding-cold.headers" "/api/bindings/COLD?key=${key}")
+  unnamed=$(app_request "${LOG_DIR}/verify-binding-plain.headers" "/api/bindings/default?key=${key}")
+  hot_ns=$(echo "$hot" | jq -r '.namespace // empty')
+  same_object=$(echo "$hot" | jq -r '.sameObjectOnEnv // empty')
+
+  if [ "$(echo "$hot" | jq -r '.value // empty')" != "hot-value" ] \
+    || [ "$(echo "$cold" | jq -r '.value // empty')" != "cold-value" ] \
+    || [ "$(echo "$unnamed" | jq -r '.value // empty')" != "unnamed-value" ]; then
+    fail_check "$title" \
+      "the same key read back differently per namespace was expected; HOT=$(echo "$hot" | jq -c '.value'), COLD=$(echo "$cold" | jq -c '.value'), unnamed=$(echo "$unnamed" | jq -c '.value')"
+    return
+  fi
+  if [ "$same_object" != "true" ] || [ "$hot_ns" != "HOT" ]; then
+    fail_check "$title" \
+      "env.HOT and context.bindings.HOT must be one object and the object must know its own name; sameObjectOnEnv=${same_object}, namespace=${hot_ns}"
+    return
+  fi
+
+  # Reading it back through the node proves the isolate got three answers, not
+  # where they are kept. deis-store's own KvStore.Get, with the binding header
+  # this platform stamps, is what proves the three are three namespaces on
+  # disk -- and the same call without the header is what proves the unnamed
+  # one is exactly where it always was.
+  if ! command -v grpcurl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+    fail_check "$title" \
+      "the three namespaces answered hot-value / cold-value / unnamed-value through the node, but grpcurl or openssl is missing so deis-store could not be asked directly"
+    return
+  fi
+
+  local tenant token direct_hot direct_plain
+  tenant="${APP_ID}.${ENV_NAME}"
+  token=$(storage_token "$tenant")
+  direct_hot=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${tenant}" -H "x-deis-storage-token: ${token}" \
+    -H "x-deis-binding: HOT" \
+    -d "{\"key\":\"${key}\"}" \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
+    | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
+  direct_plain=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${tenant}" -H "x-deis-storage-token: ${token}" \
+    -d "{\"key\":\"${key}\"}" \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
+    | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
+
+  if [ "$direct_hot" = "hot-value" ] && [ "$direct_plain" = "unnamed-value" ]; then
+    pass_check "$title" \
+      "key ${key} written through HOT, COLD and context.services.kv reads back as hot-value, cold-value and unnamed-value; deis-store's own KvStore.Get for tenant ${tenant} answers hot-value with x-deis-binding: HOT and unnamed-value with no binding header at all, so the named namespaces are beside the unnamed one and not on top of it"
+  else
+    fail_check "$title" \
+      "deis-store answered ${direct_hot:-<nothing>} for tenant ${tenant} with binding HOT and ${direct_plain:-<nothing>} with no binding; expected hot-value and unnamed-value"
+  fi
+}
+
+check_a_binding_cannot_reach_another_tenant() {
+  local title="a binding name cannot be made to address another tenant"
+
+  if ! command -v grpcurl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl or openssl is missing, so this check could not be run"
+    return
+  fi
+
+  local tenant token
+  tenant="${APP_ID}.${ENV_NAME}"
+  token=$(storage_token "$tenant")
+
+  # Every shape that would have to work for a binding to escape its tenant:
+  # the tenant separator, the namespace separator, a traversal, and a name
+  # long enough to run past the ceiling. deis-store refuses each before it
+  # touches anything on disk, because the composed value is validated as a
+  # whole and neither half may contain the other's separator.
+  local hostile refused=0 total=0 sample=""
+  for hostile in ".." "a.b" "a@b" "../../etc" "$(printf 'x%.0s' $(seq 1 65))"; do
+    total=$((total + 1))
+    local answer
+    answer=$(grpcurl -plaintext -max-time 5 \
+      -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+      -H "x-deis-tenant: ${tenant}" -H "x-deis-storage-token: ${token}" \
+      -H "x-deis-binding: ${hostile}" \
+      -d '{"key":"anything"}' \
+      "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true)
+    if echo "$answer" | grep -qi "namespace id"; then
+      refused=$((refused + 1))
+      [ -z "$sample" ] && sample=$(echo "$answer" | tr '\n' ' ' | head -c 160)
+    fi
+  done
+
+  # And the token itself: it is minted for the tenant, so it does not become a
+  # different token for a different binding. A call naming another tenant is
+  # refused whatever binding it asks for.
+  local cross
+  cross=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${CALLEE_APP_ID}.${ENV_NAME}" -H "x-deis-storage-token: ${token}" \
+    -H "x-deis-binding: HOT" \
+    -d '{"key":"anything"}' \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true)
+
+  if [ "$refused" -eq "$total" ] && echo "$cross" | grep -qi "unauthenticated\|token"; then
+    pass_check "$title" \
+      "deis-store refused all ${total} hostile binding names for tenant ${tenant} (\"${sample}\"), and the capability token minted for ${tenant} was refused when it named ${CALLEE_APP_ID}.${ENV_NAME} even with a legal binding: the token authorises the tenant and the binding only chooses a namespace inside it"
+    return
+  fi
+  fail_check "$title" \
+    "${refused} of ${total} hostile binding names were refused, and the cross-tenant call answered: $(echo "$cross" | tr '\n' ' ' | head -c 200)"
+}
+
+check_cli_reads_a_named_binding() {
+  local title="deis kv reads the namespace a binding names, and says which one"
+  local key="cli-binding-$$"
+
+  if ! deis_cli kv put "$key" "written-through-hot" --binding HOT -e "$ENV_NAME" \
+    > "${LOG_DIR}/verify-cli-binding-put.log" 2>&1; then
+    fail_check "$title" "deis kv put --binding HOT failed: $(tail -n 5 "${LOG_DIR}/verify-cli-binding-put.log")"
+    return
+  fi
+
+  local hot unnamed
+  hot=$(deis_cli kv get "$key" --binding HOT -e "$ENV_NAME" --json 2>/dev/null || true)
+  unnamed=$(deis_cli kv get "$key" -e "$ENV_NAME" --json 2>/dev/null || true)
+
+  # `.found` is read without a `//` fallback: jq treats `false` as unset, so
+  # `.found // empty` would turn the very answer this check is looking for
+  # into no answer at all. The value comes back base64 because a KV value is
+  # bytes and this CLI never puts raw bytes on a terminal.
+  local hot_value hot_tenant unnamed_found
+  hot_value=$(echo "$hot" | jq -r '.value_base64 // empty' 2>/dev/null \
+    | openssl base64 -d -A 2>/dev/null || true)
+  hot_tenant=$(echo "$hot" | jq -r '.tenant // empty' 2>/dev/null || true)
+  unnamed_found=$(echo "$unnamed" | jq -r 'if has("found") then .found else "" end' 2>/dev/null || true)
+
+  # The same key through the isolate's own HOT binding, so the CLI and the
+  # application are shown to be looking at one namespace rather than two that
+  # happen to answer.
+  local through_app
+  through_app=$(app_request "${LOG_DIR}/verify-cli-binding-app.headers" \
+    "/api/bindings/HOT?key=${key}" | jq -r '.value // empty' || true)
+
+  if [ "$hot_value" = "written-through-hot" ] \
+    && [ "$hot_tenant" = "${APP_ID}.${ENV_NAME}@HOT" ] \
+    && [ "$unnamed_found" = "false" ] \
+    && [ "$through_app" = "written-through-hot" ]; then
+    pass_check "$title" \
+      "deis kv put --binding HOT wrote ${key}; reading it back with --binding HOT gives written-through-hot and reports the namespace as ${hot_tenant}, the same command without --binding reports found=false, and the application reading ctx.bindings.HOT sees the CLI's value"
+  else
+    fail_check "$title" \
+      "--binding HOT read ${hot_value:-<nothing>} in namespace ${hot_tenant:-<none>}, the unnamed namespace reported found=${unnamed_found:-<none>}, and the app read ${through_app:-<nothing>}"
+  fi
+}
+
+# ---- service bindings -------------------------------------------------
+
+check_one_application_calls_another() {
+  local title="an application calls another application on this platform"
+  local headers="${LOG_DIR}/verify-service-call.headers"
+  local body
+  body=$(app_request "$headers" "/api/call")
+
+  local status called_by note received app environment
+  status=$(echo "$body" | jq -r '.status // empty' 2>/dev/null || true)
+  app=$(echo "$body" | jq -r '.app // empty' 2>/dev/null || true)
+  environment=$(echo "$body" | jq -r '.environment // empty' 2>/dev/null || true)
+  called_by=$(echo "$body" | jq -r '.body | fromjson | .calledBy // empty' 2>/dev/null || true)
+  note=$(echo "$body" | jq -r '.body | fromjson | .note // empty' 2>/dev/null || true)
+  received=$(echo "$body" | jq -r '.body | fromjson | .received // empty' 2>/dev/null || true)
+
+  if [ "$(http_status "$headers")" = "200" ] \
+    && [ "$status" = "202" ] \
+    && [ "$called_by" = "${APP_ID}.${ENV_NAME}" ] \
+    && [ "$note" = "sent by the caller" ] \
+    && [ "$received" = "ticket-from-v1" ] \
+    && [ "$app" = "$CALLEE_APP_ID" ] \
+    && [ "$environment" = "$ENV_NAME" ]; then
+    pass_check "$title" \
+      "${APP_ID} reached ${CALLEE_APP_ID}.${ENV_NAME} through its AUTH binding with no address anywhere: the callee ran its own handler, answered its own 202, saw the body and the header the caller sent, and read x-deis-caller as ${called_by} -- which the caller had set to \"a-caller-that-is-not-me\" and the platform overwrote"
+  else
+    fail_check "$title" \
+      "expected the callee to answer 202 as ${CALLEE_APP_ID}.${ENV_NAME} and to see caller ${APP_ID}.${ENV_NAME}; the node answered $(http_status "$headers") and the body was $(printf '%s' "$body" | head -c 300)"
+  fi
+}
+
+check_a_service_binding_is_not_a_hole_in_the_outbound_policy() {
+  local title="a service call reaches an application no address would have reached"
+
+  # The callee listens nowhere of its own: it is an isolate on this node, and
+  # the only HTTP address that leads to it is this node's own, which is a
+  # loopback address. This is what the outbound policy says about that -- so
+  # the successful call above is not the fetch below with a shorter name, it
+  # is a different mechanism with no address in it at all.
+  local target="http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/call"
+  local body
+  body=$(app_fetch service-egress "$target")
+  answered_json "$title" service-egress "$body" || return
+
+  local available reached error
+  available=$(echo "$body" | jq -r '.available // false' 2>/dev/null || true)
+  reached=$(echo "$body" | jq -r '.reached // false' 2>/dev/null || true)
+  error=$(echo "$body" | jq -r '.error // empty' 2>/dev/null || true)
+
+  if [ "$available" != "true" ]; then
+    fail_check "$title" \
+      "nothing was refused: the isolate has no fetch to refuse with. $(echo "$body" | tr '\n' ' ' | head -c 200)"
+    return
+  fi
+  if [ "$reached" = "true" ]; then
+    fail_check "$title" \
+      "the handler reached this node's own HTTP port on its own, so the outbound policy is not refusing private addresses and the comparison this check makes is meaningless"
+    return
+  fi
+
+  # The node said so about the address, not about a binding: the two
+  # mechanisms do not share a decision point, which is why one cannot be
+  # widened into the other.
+  local logged
+  logged=$(node_log 2>/dev/null | grep -m 1 "Refused an outbound fetch" | grep "127.0.0.1" || true)
+
+  if [ -n "$logged" ]; then
+    pass_check "$title" \
+      "a handler fetching ${target} -- the only HTTP address the callee can be reached at -- is refused by the outbound policy (${error}), while the same handler reaching the same application through its AUTH binding answers 202. The binding carries no address, so nothing about the policy was widened to make it work"
+  else
+    fail_check "$title" \
+      "the handler was refused (${error:-<no message>}) but no node log line names the refused address, so it is not clear the outbound policy is what stopped it"
+  fi
+}
+
+check_a_preview_calls_the_preview_and_not_production() {
+  local title="a service binding follows the caller's own environment"
+  local headers="${LOG_DIR}/verify-service-preview.headers"
+
+  # The preview of the caller runs the same bundle, so the same AUTH binding.
+  # The callee has no preview deployed, so this must fail -- loudly, naming
+  # the environment it looked for -- rather than quietly answering out of the
+  # callee's production copy, which is another tenant's data.
+  local body environment refused
+  body=$(env_request "$PREVIEW_ENV_NAME" "$headers" "/api/call")
+  environment=$(echo "$body" | jq -r '.environment // empty' 2>/dev/null || true)
+  refused=$(echo "$body" | jq -r '.refused // empty' 2>/dev/null || true)
+
+  if [ "$(http_status "$headers")" = "502" ] \
+    && [ "$environment" = "$PREVIEW_ENV_NAME" ] \
+    && echo "$refused" | grep -q "${CALLEE_APP_ID}.${PREVIEW_ENV_NAME}" \
+    && echo "$refused" | grep -q "not deployed on this node"; then
+    pass_check "$title" \
+      "the ${PREVIEW_ENV_NAME} of ${APP_ID} runs the same bundle and the same AUTH binding, and it resolved to ${CALLEE_APP_ID}.${PREVIEW_ENV_NAME} -- which is not deployed -- rather than to ${CALLEE_APP_ID}.${ENV_NAME}, which is. It failed saying so: \"$(printf '%s' "$refused" | head -c 140)\""
+  else
+    fail_check "$title" \
+      "expected the preview's binding to resolve to ${CALLEE_APP_ID}.${PREVIEW_ENV_NAME} and be refused; the node answered $(http_status "$headers"), environment=${environment:-<none>}, refusal=$(printf '%s' "${refused:-<none>}" | head -c 200)"
+  fi
+}
+
+check_a_callee_decides_who_may_call_it() {
+  local title="being named by a caller is not consent"
+
+  # The callee lists exactly one application. The check deploys a version of
+  # it that lists nobody, tries the same call, and puts the original back --
+  # so what is proven is that consent is read from the version serving the
+  # callee at the moment of the call, not resolved into the caller's
+  # deployment when the caller was deployed.
+  local src="${DEMO_DIR}/app-callee"
+  local original
+  original=$(cat "${src}/.config.json")
+
+  if ! command -v jq >/dev/null 2>&1; then
+    fail_check "$title" "jq is missing, so this check could not be run"
+    return
+  fi
+
+  local withdrawn
+  withdrawn=$(jq '.callableBy = []' "${src}/.config.json") \
+    && printf '%s\n' "$withdrawn" > "${src}/.config.json"
+  if ! cli_deploy "$src" "$ENV_NAME" cli-deploy-callee-withdrawn --app "$CALLEE_APP_ID"; then
+    printf '%s\n' "$original" > "${src}/.config.json"
+    fail_check "$title" "could not deploy the callee with consent withdrawn"
+    return
+  fi
+
+  local body refused
+  body=$(app_request "${LOG_DIR}/verify-service-consent.headers" "/api/call")
+  refused=$(echo "$body" | jq -r '.refused // empty' 2>/dev/null || true)
+
+  # Put the consenting version back, so every later check sees the platform
+  # as the rest of the run left it.
+  printf '%s\n' "$original" > "${src}/.config.json"
+  cli_deploy "$src" "$ENV_NAME" cli-deploy-callee-restored --app "$CALLEE_APP_ID" || true
+
+  local restored
+  restored=$(app_request "${LOG_DIR}/verify-service-consent-back.headers" "/api/call" \
+    | jq -r '.status // empty' 2>/dev/null || true)
+
+  if echo "$refused" | grep -q "callableBy" \
+    && echo "$refused" | grep -q "${APP_ID}" \
+    && [ "$restored" = "202" ]; then
+    pass_check "$title" \
+      "with ${CALLEE_APP_ID} deployed listing nobody, the identical call from ${APP_ID} -- same bundle, same binding, nothing redelivered to it -- was refused: \"$(printf '%s' "$refused" | head -c 160)\". Redeploying the callee with ${APP_ID} on the list made the same call answer 202 again"
+  else
+    fail_check "$title" \
+      "expected a refusal naming callableBy while consent was withdrawn and 202 after it was restored; the refusal was $(printf '%s' "${refused:-<none>}" | head -c 200) and the restored call answered ${restored:-<none>}"
+  fi
+}
+
 check_storage_capability_token() {
   local title="a storage call presenting no capability token is refused"
 
@@ -4939,6 +5340,72 @@ check_a_scoped_token_reaches_one_environment_and_no_other() {
   fi
 }
 
+check_a_credential_cannot_wire_an_app_to_one_it_cannot_see() {
+  local title="a service binding needs authority over the application it names"
+  ensure_account app-team deployer
+
+  # A credential that owns the caller outright and has never heard of the
+  # callee. Uploading the example app's own bundle with it is the whole test:
+  # that bundle declares "AUTH": a service binding to ${CALLEE_APP_ID}, which
+  # is one application claiming a right to call another, and the route the
+  # upload arrives on names only the caller.
+  # `deploy` and nothing else, because that is the credential a build pipeline
+  # for this application actually holds, and the account's own role -
+  # `deployer` - is the ceiling that stops it holding more.
+  local minted token
+  minted=$(deis_cli token create --account app-team \
+    --scope "deploy:${APP_ID}/*" \
+    caller-pipeline --json 2>/dev/null || echo '{}')
+  token=$(echo "$minted" | jq -r '.secret // empty')
+  if [ -z "$token" ]; then
+    fail_check "$title" "could not mint a scoped token: ${minted}"
+    return
+  fi
+
+  local bundle="${DEMO_DIR}/app-v1/dist/deislet/bundle.zip"
+  if [ ! -f "$bundle" ]; then
+    fail_check "$title" "the example app's bundle is not at ${bundle}, so nothing could be uploaded"
+    return
+  fi
+
+  local refused told
+  refused=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/zip" \
+    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions")
+  told=$(curl -s -X POST \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/zip" \
+    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions" \
+    | jq -r '.error // empty' 2>/dev/null || true)
+
+  # The same bundle, with the same account, once it may also *see* the callee.
+  # Read is the weakest verb in the grammar, which is the point: this is a
+  # boundary between teams, not a second deploy permission.
+  local widened widened_token accepted
+  widened=$(deis_cli token create --account app-team \
+    --scope "deploy:${APP_ID}/*" --scope "read:${CALLEE_APP_ID}/*" \
+    caller-pipeline-widened --json 2>/dev/null || echo '{}')
+  widened_token=$(echo "$widened" | jq -r '.secret // empty')
+  accepted=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${widened_token}" -H "Content-Type: application/zip" \
+    --data-binary "@${bundle}" "$(control_url)/api/apps/${APP_ID}/versions")
+
+  # And it is written down, like every other refusal on the human API.
+  local audited
+  audited=$(deis_cli audit --app "$APP_ID" --outcome refused --json 2>/dev/null \
+    | jq -r '[.entries[] | select(.action == "version.upload" and .status == 403)] | length' 2>/dev/null || echo 0)
+
+  if [ "$refused" = "403" ] \
+    && echo "$told" | grep -q "read:${CALLEE_APP_ID}/\*" \
+    && { [ "$accepted" = "200" ] || [ "$accepted" = "201" ]; } \
+    && [ "${audited:-0}" -ge 1 ]; then
+    pass_check "$title" \
+      "a token carrying deploy:${APP_ID}/* -- everything a build pipeline for the caller needs -- could not upload a bundle declaring a service binding to ${CALLEE_APP_ID}: HTTP ${refused}, \"$(printf '%s' "$told" | head -c 140)\". Adding read:${CALLEE_APP_ID}/* to the same account let the identical bundle through (HTTP ${accepted}), and the refusal is in the audit log (${audited} refused version.upload row(s))"
+  else
+    fail_check "$title" \
+      "expected 403 naming read:${CALLEE_APP_ID}/* and then an accepted upload; the narrow token got ${refused} saying \"$(printf '%s' "${told:-nothing}" | head -c 160)\", the widened one got ${accepted}, and the audit log holds ${audited:-0} refused version.upload row(s)"
+  fi
+}
+
 check_a_wide_credential_cannot_mint_a_storage_token() {
   local title="minting a storage token needs that exact tenant written down"
   ensure_account data-team maintainer
@@ -5500,6 +5967,12 @@ verify_demo() {
   check_secret_delivery
   echo "-- storage --"
   check_kv_roundtrip
+  # Named bindings. The isolation check seeds the key the CLI check reads, so
+  # it runs first; the hostile-name check needs nothing of theirs and only
+  # asks deis-store.
+  check_named_bindings_are_separate_namespaces
+  check_a_binding_cannot_reach_another_tenant
+  check_cli_reads_a_named_binding
   check_storage_capability_token
   check_storage_token_requires_the_api_key
   check_data_cli_reads_the_apps_write
@@ -5517,6 +5990,13 @@ verify_demo() {
   check_queue_consumer_concurrency
   echo "-- cron --"
   check_cron
+  echo "-- calling another application --"
+  # The consent check redeploys the callee twice and puts it back the way it
+  # was, so it runs after the two that need the callee as the run left it.
+  check_one_application_calls_another
+  check_a_service_binding_is_not_a_hole_in_the_outbound_policy
+  check_a_preview_calls_the_preview_and_not_production
+  check_a_callee_decides_who_may_call_it
   echo "-- environments --"
   check_second_environment
   check_environment_kv_isolation
@@ -5560,6 +6040,7 @@ verify_demo() {
   # ship rather than only be refused.
   check_the_configured_api_key_is_listed_as_unscoped
   check_a_scoped_token_reaches_one_environment_and_no_other
+  check_a_credential_cannot_wire_an_app_to_one_it_cannot_see
   check_a_wide_credential_cannot_mint_a_storage_token
   check_a_revoked_token_stops_at_its_next_call
   check_the_audit_log_names_who_changed_what

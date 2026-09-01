@@ -2074,6 +2074,7 @@ dependencies = [
 name = "deis-bundle"
 version = "0.1.0"
 dependencies = [
+ "deis-wire",
  "hex",
  "serde",
  "serde_json",

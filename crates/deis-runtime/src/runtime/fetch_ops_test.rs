@@ -64,7 +64,7 @@ mod tests {
         use crate::config::ExecutionLimits;
         use crate::runtime::fetch_policy::FetchPolicy;
         use crate::runtime::isolate::{AppRuntime, IsolateSpec};
-        use crate::runtime::ServiceWiring;
+        use crate::runtime::{ServiceRouter, ServiceWiring};
         use std::collections::HashMap;
 
         let code = r#"
@@ -96,6 +96,9 @@ mod tests {
                 ..IsolateSpec::default()
             },
             &ServiceWiring::default(),
+            // No pool behind this isolate, so every service call it makes is
+            // refused as "not deployed on this node" -- which is what it is.
+            ServiceRouter::detached(),
         )
         .expect("the isolate builds");
         runtime.init_module().await.expect("the module loads");

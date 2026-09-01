@@ -55,6 +55,7 @@ pub async fn query(args: QueryArgs, output: Output) -> Result<()> {
     let settings = resolve(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: None,
     })?;
     let app = settings.checked_app()?.to_string();
     let environment = environment_filter(&settings, args.all_environments)?;
@@ -180,6 +181,7 @@ pub async fn tail(args: TailArgs, output: Output) -> Result<()> {
     let settings = resolve(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: None,
     })?;
     let app = settings.checked_app()?.to_string();
     let environment = environment_filter(&settings, args.all_environments)?;

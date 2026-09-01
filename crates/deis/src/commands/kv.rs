@@ -29,6 +29,10 @@ use crate::settings::Overrides;
 pub struct GetArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub key: String,
     /// Write the value's bytes here instead of showing them.
     pub file: Option<PathBuf>,
@@ -38,8 +42,9 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
     let storage = session.storage().await?;
 
     let Some(value) = storage.kv_get(&args.key).await? else {
@@ -121,6 +126,10 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
 pub struct PutArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub key: String,
     /// The value, as text. `clap` refuses this together with `file`.
     pub value: Option<String>,
@@ -134,8 +143,9 @@ pub async fn put(args: PutArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
 
     let value = read_value(args.value, args.file.as_deref())?;
     let bytes = value.len();
@@ -166,6 +176,10 @@ pub async fn put(args: PutArgs, output: Output) -> Result<()> {
 pub struct DeleteArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub key: String,
     pub yes: bool,
 }
@@ -174,8 +188,9 @@ pub async fn delete(args: DeleteArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
 
     confirm_destructive(&tenant, &format!("delete kv key {:?}", args.key), args.yes)?;
 
@@ -208,6 +223,10 @@ pub async fn delete(args: DeleteArgs, output: Output) -> Result<()> {
 pub struct ListArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub prefix: String,
     pub limit: i32,
     pub cursor: Option<String>,
@@ -217,8 +236,9 @@ pub async fn list(args: ListArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
     let storage = session.storage().await?;
 
     let page = storage

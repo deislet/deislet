@@ -2,6 +2,7 @@
 // Provides SQL database operation functionality
 
 use super::db_client::DbClient;
+use super::ops::bound_client;
 use deno_core::{extension, op2, OpState};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -13,12 +14,18 @@ use std::rc::Rc;
 /// service. Returned rather than thrown for the same reason the calls below
 /// report a store failure that way: `js/runtime.js` turns exactly one shape
 /// into an exception, so there is one place that decides what a handler sees.
-fn db_client(state: &Rc<RefCell<OpState>>) -> Result<DbClient, JsonValue> {
-    state
-        .borrow()
-        .try_borrow::<DbClient>()
-        .cloned()
-        .ok_or_else(|| serde_json::json!({ "error": "Database client not configured" }))
+/// The database one call means: the tenant's unnamed one when `binding` is
+/// empty, and the named one otherwise.
+///
+/// A binding is a *second database file* in deis-store, not a schema inside
+/// one, so the handles this module hands out - a prepared statement, an open
+/// transaction - belong to the database they were opened on. deis-store checks
+/// that itself: a handle carries the namespace it was minted for and using it
+/// under another one is refused there, which is why nothing here has to track
+/// it a second time. `js/runtime.js` keeps a handle's binding on the object
+/// that owns it, so an ordinary program never reaches that refusal.
+fn db_client(state: &Rc<RefCell<OpState>>, binding: &str) -> Result<DbClient, JsonValue> {
+    bound_client(state, "database", binding).map_err(|error| serde_json::json!({ "error": error }))
 }
 
 /// What `ctx.services.database.transaction` may ask for when it opens one.
@@ -46,20 +53,14 @@ pub struct TransactionOptions {
 #[serde]
 async fn op_db_execute(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] sql: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
     // Get DbClient
-    let client = {
-        let state_borrow = state.borrow();
-        match state_borrow.try_borrow::<DbClient>() {
-            Some(c) => c.clone(),
-            None => {
-                return serde_json::json!({
-                    "error": "Database client not configured"
-                });
-            }
-        }
+    let client = match db_client(&state, &binding) {
+        Ok(client) => client,
+        Err(unavailable) => return unavailable,
     };
 
     // Execute SQL
@@ -97,20 +98,14 @@ async fn op_db_execute(
 #[serde]
 async fn op_db_query(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] sql: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
     // Get DbClient
-    let client = {
-        let state_borrow = state.borrow();
-        match state_borrow.try_borrow::<DbClient>() {
-            Some(c) => c.clone(),
-            None => {
-                return serde_json::json!({
-                    "error": "Database client not configured"
-                });
-            }
-        }
+    let client = match db_client(&state, &binding) {
+        Ok(client) => client,
+        Err(unavailable) => return unavailable,
     };
 
     // Query SQL
@@ -208,18 +203,15 @@ fn decode_batch_statements(
 ///   failed
 #[op2]
 #[serde]
-async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: String) -> JsonValue {
+async fn op_db_batch(
+    state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
+    #[string] statements_json: String,
+) -> JsonValue {
     // Get DbClient
-    let client = {
-        let state_borrow = state.borrow();
-        match state_borrow.try_borrow::<DbClient>() {
-            Some(c) => c.clone(),
-            None => {
-                return serde_json::json!({
-                    "error": "Database client not configured"
-                });
-            }
-        }
+    let client = match db_client(&state, &binding) {
+        Ok(client) => client,
+        Err(unavailable) => return unavailable,
     };
 
     let statements = match decode_batch_statements(&statements_json) {
@@ -264,16 +256,22 @@ async fn op_db_batch(state: Rc<RefCell<OpState>>, #[string] statements_json: Str
 /// - statement_id: Prepared statement ID
 #[op2]
 #[string]
-async fn op_db_prepare(state: Rc<RefCell<OpState>>, #[string] sql: String) -> String {
+async fn op_db_prepare(
+    state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
+    #[string] sql: String,
+) -> String {
     // Get DbClient
-    let client = {
-        let state_borrow = state.borrow();
-        match state_borrow.try_borrow::<DbClient>() {
-            Some(c) => c.clone(),
-            None => {
-                tracing::error!("Database client not configured");
-                return String::new();
-            }
+    let client = match db_client(&state, &binding) {
+        Ok(client) => client,
+        Err(unavailable) => {
+            tracing::error!(
+                target: "app",
+                binding = %binding,
+                "database.prepare could not be served: {}",
+                unavailable["error"].as_str().unwrap_or("no database client")
+            );
+            return String::new();
         }
     };
 
@@ -301,20 +299,14 @@ async fn op_db_prepare(state: Rc<RefCell<OpState>>, #[string] sql: String) -> St
 #[serde]
 async fn op_db_execute_prepared(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] statement_id: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
     // Get DbClient
-    let client = {
-        let state_borrow = state.borrow();
-        match state_borrow.try_borrow::<DbClient>() {
-            Some(c) => c.clone(),
-            None => {
-                return serde_json::json!({
-                    "error": "Database client not configured"
-                });
-            }
-        }
+    let client = match db_client(&state, &binding) {
+        Ok(client) => client,
+        Err(unavailable) => return unavailable,
     };
 
     // Execute prepared statement
@@ -352,20 +344,14 @@ async fn op_db_execute_prepared(
 #[serde]
 async fn op_db_query_prepared(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] statement_id: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
     // Get DbClient
-    let client = {
-        let state_borrow = state.borrow();
-        match state_borrow.try_borrow::<DbClient>() {
-            Some(c) => c.clone(),
-            None => {
-                return serde_json::json!({
-                    "error": "Database client not configured"
-                });
-            }
-        }
+    let client = match db_client(&state, &binding) {
+        Ok(client) => client,
+        Err(unavailable) => return unavailable,
     };
 
     // Query prepared statement
@@ -404,9 +390,10 @@ async fn op_db_query_prepared(
 #[serde]
 async fn op_db_begin_transaction(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[serde] options: TransactionOptions,
 ) -> JsonValue {
-    let client = match db_client(&state) {
+    let client = match db_client(&state, &binding) {
         Ok(client) => client,
         Err(unavailable) => return unavailable,
     };
@@ -450,11 +437,12 @@ async fn op_db_begin_transaction(
 #[serde]
 async fn op_db_execute_in_transaction(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] transaction_id: String,
     #[string] sql: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
-    let client = match db_client(&state) {
+    let client = match db_client(&state, &binding) {
         Ok(client) => client,
         Err(unavailable) => return unavailable,
     };
@@ -498,11 +486,12 @@ async fn op_db_execute_in_transaction(
 #[serde]
 async fn op_db_query_in_transaction(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] transaction_id: String,
     #[string] sql: String,
     #[string] params: Option<String>,
 ) -> JsonValue {
-    let client = match db_client(&state) {
+    let client = match db_client(&state, &binding) {
         Ok(client) => client,
         Err(unavailable) => return unavailable,
     };
@@ -538,9 +527,10 @@ async fn op_db_query_in_transaction(
 #[serde]
 async fn op_db_commit_transaction(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] transaction_id: String,
 ) -> JsonValue {
-    let client = match db_client(&state) {
+    let client = match db_client(&state, &binding) {
         Ok(client) => client,
         Err(unavailable) => return unavailable,
     };
@@ -569,9 +559,10 @@ async fn op_db_commit_transaction(
 #[serde]
 async fn op_db_rollback_transaction(
     state: Rc<RefCell<OpState>>,
+    #[string] binding: String,
     #[string] transaction_id: String,
 ) -> JsonValue {
-    let client = match db_client(&state) {
+    let client = match db_client(&state, &binding) {
         Ok(client) => client,
         Err(unavailable) => return unavailable,
     };

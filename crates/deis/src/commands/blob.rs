@@ -145,6 +145,10 @@ fn range(
 pub struct GetArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub key: String,
     pub file: Option<PathBuf>,
     /// First byte to read, counted from the start of the object.
@@ -162,8 +166,9 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
     let range = range(args.offset, args.length, args.suffix)?;
     let storage = session.storage().await?;
 
@@ -263,6 +268,10 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
 pub struct PutArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub key: String,
     /// The object's bytes. Absent means read them from stdin, which is what
     /// lets `deis blob put key --content-type image/png < file.png` work
@@ -281,8 +290,9 @@ pub async fn put(args: PutArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
     let condition = condition(args.if_match.clone(), args.if_none_match.clone())?;
 
     let data = match &args.file {
@@ -357,6 +367,10 @@ fn describe_condition(condition: &BlobCondition) -> String {
 pub struct DeleteArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub key: String,
     pub yes: bool,
     /// Delete only if the object carries this etag, or `*` for any existing
@@ -371,8 +385,9 @@ pub async fn delete(args: DeleteArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
     let condition = condition(args.if_match.clone(), args.if_none_match.clone())?;
 
     confirm_destructive(
@@ -409,6 +424,10 @@ pub async fn delete(args: DeleteArgs, output: Output) -> Result<()> {
 pub struct HeadArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub key: String,
 }
 
@@ -420,8 +439,9 @@ pub async fn head(args: HeadArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
     let storage = session.storage().await?;
 
     let Some(info) = storage.blob_head(&args.key).await? else {
@@ -465,6 +485,10 @@ pub async fn head(args: HeadArgs, output: Output) -> Result<()> {
 pub struct ListArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
+    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
+    /// what `context.services.*` reaches, and where an application that
+    /// declares no binding keeps everything it has.
+    pub binding: Option<String>,
     pub prefix: String,
     /// Roll keys up at this separator, so one folder is one line.
     pub delimiter: Option<String>,
@@ -484,8 +508,9 @@ pub async fn list(args: ListArgs, output: Output) -> Result<()> {
     let session = Session::open(&Overrides {
         app: args.app,
         environment: args.environment,
+        binding: args.binding,
     })?;
-    let tenant = session.tenant()?;
+    let tenant = session.namespace()?;
     let storage = session.storage().await?;
 
     let mut objects = Vec::new();
