@@ -42,6 +42,29 @@ pub struct ControlConfig {
     /// Enable API authentication (default: false for backward compatibility)
     #[serde(default)]
     pub api_auth_enabled: bool,
+    /// Origins a web page may read this control plane's answers from, each
+    /// written in full - "https://console.example.com", scheme and port
+    /// included, no trailing slash.
+    ///
+    /// Empty, which is the default, means none. The console this binary
+    /// serves is delivered from this same port, so every call it makes is
+    /// same-origin and needs no entry here; `npm run dev` proxies `/api`
+    /// through the vite server, so that is same-origin too. An entry is
+    /// needed only for a console hosted somewhere else.
+    ///
+    /// It used to be `*` - every origin, all methods, all headers - and
+    /// combined with `api_auth_enabled` defaulting to off that let any page
+    /// the operator happened to visit create an owner account on their
+    /// control plane, mint a root token, deploy, and read every answer.
+    /// `*` is therefore rejected if it appears here: an origin that may
+    /// read the audit log has to be named.
+    ///
+    /// Naming an origin does not hand it authority. A page on another origin
+    /// never gets the unauthenticated admission that a caller on this
+    /// machine gets - it presents a token like any other remote caller. See
+    /// [`crate::api::authz::authorize`].
+    #[serde(default)]
+    pub api_cors_allowed_origins: Vec<String>,
     /// TLS configuration (optional)
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -204,6 +227,7 @@ impl Default for ControlConfig {
             node_preshared_keys: Vec::new(),
             api_keys: Vec::new(),
             api_auth_enabled: false,
+            api_cors_allowed_origins: Vec::new(),
             tls: None,
             deis_runtime_nodes: Vec::new(),
             deis_runtime_poll_interval: default_deis_runtime_poll_interval(),

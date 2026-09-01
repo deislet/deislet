@@ -3,6 +3,7 @@
 use super::bindings::{AppServices, ServiceWiring};
 use super::cache_ops::{create_cache_store, CacheStore};
 use super::fetch_policy::FetchPolicy;
+use super::header_list::{count_of, fold_duplicate_names, HeaderPairs};
 use super::loader::DbModuleLoader;
 use super::metrics::{
     now_us, recorder, InvocationKind, InvocationOutcome, InvocationTrace, MetricsRegistry,
@@ -15,7 +16,6 @@ use super::ops::{
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
 use super::rate_limit::RateLimiter;
-use super::response_headers::{count_of, fold_duplicate_names, HeaderPairs};
 use super::response_stream::{
     record_broken_body, response_streams, ResponseBody, ResponseStreams, StreamOwner,
 };
@@ -900,7 +900,7 @@ fn warn_cut_off(app_id: &str, watch: &Watch, cut_off: &CutOff) {
 ///
 /// The headers are a *list*, not a map, and repeats have already been folded
 /// or kept according to the application's compatibility date by the time one
-/// of these is built; see [`super::response_headers`].
+/// of these is built; see [`super::header_list`].
 type FetchResult = (u16, HeaderPairs, ResponseBody);
 
 /// The request as `js/runtime.js` sees it -- everything except the body.
@@ -913,7 +913,16 @@ type FetchResult = (u16, HeaderPairs, ResponseBody);
 struct JsRequest {
     url: String,
     method: String,
-    headers: HashMap<String, String>,
+    /// `[[name, value], ...]`, in the order the client sent them, repeats
+    /// included.
+    ///
+    /// A map here kept one value per name, so a request carrying two `Cookie`
+    /// lines, two `Accept` lines or an `X-Forwarded-For` chain reached the
+    /// handler with one of them -- and, because it was a `HashMap`, with no
+    /// defined answer about which. `js/runtime.js` hands the list straight to
+    /// the `Headers` constructor, which takes a sequence of pairs and rebuilds
+    /// the repeats as repeats. See [`super::header_list`].
+    headers: HeaderPairs,
     /// Route placeholder values (e.g. `:id` in "/users/:id"), resolved against
     /// the app's configured route patterns. Empty when no pattern matches, or
     /// when the app has no route patterns configured yet.
@@ -980,7 +989,7 @@ struct JsResponse {
     status: u16,
     /// `[[name, value], ...]`, in the order the handler set them, repeats
     /// included. A map here is what used to drop every `Set-Cookie` but the
-    /// last one - see [`super::response_headers`] - so the decision about
+    /// last one - see [`super::header_list`] - so the decision about
     /// repeats is made below, where this application's compatibility profile
     /// is in scope, and never by the shape of this field.
     #[serde(default)]
@@ -1742,13 +1751,15 @@ impl AppRuntime {
     fn begin_invocation(&mut self, trace_id: String) {
         *self.trace.borrow_mut() = trace_id;
         self.timers_swept = false;
-        // The outbound-call allowance belongs to one invocation, exactly as
-        // the wall-clock and CPU budgets do. Reset here and not in
-        // `end_invocation`, because a response stream's producer runs on after
-        // the request has been answered and must keep spending the same
-        // allowance: a handler that could reset it by returning would have as
-        // many calls as it liked from inside a stream.
-        self.subrequest_budget.reset();
+        // An allowance of its own for the invocation about to start, and the
+        // one the last invocation was spending left alone. This used to reset
+        // a single counter the whole isolate shared, which gave the producer
+        // of any response stream still running a fresh ceiling every time
+        // *anything else* -- another request, a cron tick, a queue batch --
+        // began. See [`SubrequestBudget`]: what owns an allowance is an
+        // invocation, and a stream is the one piece of an invocation that
+        // outlives it.
+        self.subrequest_budget.begin_invocation();
         if let Some(sockets) = self.outbound_sockets() {
             sockets.begin_invocation();
         }
@@ -2232,7 +2243,7 @@ impl AppRuntime {
         &mut self,
         url: String,
         method: String,
-        headers: HashMap<String, String>,
+        headers: HeaderPairs,
         body: Option<Vec<u8>>,
         response_tx: oneshot::Sender<Result<FetchResult>>,
     ) -> Result<()> {
@@ -2355,7 +2366,7 @@ impl AppRuntime {
         started: Instant,
         url: String,
         method: String,
-        headers: HashMap<String, String>,
+        headers: HeaderPairs,
         body: Option<Vec<u8>>,
         response_tx: oneshot::Sender<Result<FetchResult>>,
     ) -> Result<()> {
@@ -2764,7 +2775,15 @@ impl AppRuntime {
             trace_id: self.current_trace_id(),
             target,
         };
-        let (id, reader) = self.response_streams().borrow_mut().open(deadline, owner);
+        // The allowance the handler was spending, handed to the stream with
+        // whatever is left of it: the producer's outbound calls are the same
+        // invocation's fan-out, made a little later. Read here, while that
+        // invocation is still the one in force.
+        let allowance = self.subrequest_budget.invocation();
+        let (id, reader) = self
+            .response_streams()
+            .borrow_mut()
+            .open(deadline, owner, allowance);
 
         self.execution_deadline.set(Some(deadline));
 

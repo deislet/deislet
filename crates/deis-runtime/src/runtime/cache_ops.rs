@@ -41,13 +41,37 @@
 //! application opened it by hand -- which is the right answer, because it is
 //! the same cache.
 //!
-//! # Freshness
+//! # Freshness, and what is not stored at all
 //!
 //! An entry carries the lifetime the response asked for. The JavaScript side
 //! reads `s-maxage`, then `max-age`, off the response's `Cache-Control` and
 //! passes it here as whole seconds; zero means the response said nothing and
 //! the store's own default applies. Expiry is from the write, not from the
 //! last read: reading a cached response does not make it fresher.
+//!
+//! The same field decides whether the response reaches this module at all.
+//! This is a *shared* cache -- one store per isolate, read by every later
+//! request to the same application, from every client -- so `js/runtime.js`
+//! refuses `no-store`, `private`, `no-cache` and a shared lifetime of zero,
+//! and tells the caller which of them it was. The first two are what RFC 9111
+//! says for a shared cache. The other two both mean "check with the origin
+//! before reusing this", and there is nothing here that can check: no
+//! revalidation, no conditional request, no upstream to ask. An entry that may
+//! only be served after a check that cannot be made is one that may never be
+//! served, so it is refused rather than kept for the default lifetime -- which
+//! is what used to happen to every `no-cache` and `max-age=0` response.
+//!
+//! # One variant per key
+//!
+//! A response that carries `Vary` says its body depends on named headers of
+//! the request. The values those names had are stored *with* the entry, and
+//! `match` hands the entry back only to a request whose values are the same;
+//! anything else is a miss. So the store holds one variant per key -- a second
+//! `put` replaces the first -- which costs a hit and never costs the wrong
+//! answer. `Vary: *`, and a varying response whose key was a bare URL rather
+//! than a `Request`, are refused at `put`: neither can be told apart from
+//! another caller's copy, and serving one user's page to the next is the
+//! failure this whole arrangement exists to prevent.
 //!
 //! # Why a body is bytes and the rest is a string
 //!

@@ -5,6 +5,7 @@ pub mod bindings;
 pub mod catalog;
 pub mod commands;
 pub mod configs;
+pub mod cors;
 pub mod error;
 pub mod events;
 pub mod grpc;
@@ -22,7 +23,7 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use std::future::Future;
 use std::sync::Arc;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -58,6 +59,10 @@ pub struct ApiRouter {
     /// key so an operator sees both, rather than only the one that
     /// `api_auth_enabled` controls.
     pub node_auth: middleware::NodeAuthConfig,
+    /// The browser origins allowed to read this API's answers, empty for the
+    /// default, which is none. Reported at startup next to the two
+    /// credentials because it is the third thing that decides who gets in.
+    pub cors_origins: Vec<String>,
     pub tls_enabled: bool,
 }
 
@@ -241,19 +246,29 @@ pub fn build_api_router(
         },
     ));
 
-    let app = Router::new()
+    let human = Router::new()
         .route("/", get(static_files::serve_index))
         .route("/health", get(handle_health))
         .route("/deis.svg", get(static_files::serve_favicon))
         .route("/assets/*path", get(static_files::serve_assets))
-        .merge(protected_routes)
-        // Permissive CORS covers the dashboard, which browsers load. It
-        // stops here on purpose: nodes are not browsers, and a page on any
-        // origin being able to *read* the assignment list is exactly the
-        // access this channel exists to withhold.
-        .layer(CorsLayer::permissive())
-        .merge(node_routes)
-        .layer(TraceLayer::new_for_http());
+        .merge(protected_routes);
+
+    // Cross-origin access to the human API, which is off unless the file
+    // names the origins. It used to be `CorsLayer::permissive()`, and with
+    // `api_auth_enabled` off that meant any page the operator visited could
+    // drive this control plane *and read the answers*; see `api::cors`. The
+    // console this binary serves is same-origin, so it never needed it.
+    //
+    // Where the layer stops is unchanged and still deliberate: nodes are not
+    // browsers, and a page being able to read the assignment list is exactly
+    // the access that channel exists to withhold.
+    let cors = cors::CorsPolicy::from_origins(&config.api_cors_allowed_origins);
+    let human = match cors.layer {
+        Some(layer) => human.layer(layer),
+        None => human,
+    };
+
+    let app = human.merge(node_routes).layer(TraceLayer::new_for_http());
 
     let tls_enabled = config
         .tls
@@ -266,6 +281,7 @@ pub fn build_api_router(
         auth_config,
         authz: authz_state,
         node_auth,
+        cors_origins: cors.origins,
         tls_enabled,
     }
 }
@@ -507,6 +523,7 @@ pub fn log_api_ready(
     tls_enabled: bool,
     auth_config: &middleware::AuthConfig,
     node_auth: &middleware::NodeAuthConfig,
+    cors_origins: &[String],
     grpc_shared: bool,
 ) {
     let scheme = if tls_enabled { "https" } else { "http" };
@@ -519,6 +536,14 @@ pub fn log_api_ready(
     }
     info!("📡 API: {}://localhost:{}", scheme, port);
     info!("📊 Health: {}://localhost:{}/health", scheme, port);
+    // Said in its own line because it stopped being an exception. It used to
+    // be served to anyone who could route to the port, whatever
+    // api_auth_enabled said and whatever machine the caller was on; a scrape
+    // now follows the same two rules as every other read.
+    info!(
+        "📈 Metrics: {}://localhost:{}/api/metrics - a scrape from another host presents a credential (`deis token create --scopes 'read:*/*'`); one from this machine needs none while api_auth_enabled is off",
+        scheme, port
+    );
     info!(
         "{} TLS: {}",
         if tls_enabled { "🔒" } else { "⚠️" },
@@ -532,7 +557,22 @@ pub fn log_api_ready(
         );
     } else {
         info!(
-            "⚠️  Human API: NO CREDENTIAL REQUIRED (api_auth_enabled is off, so the dashboard and every catalog route are served to anyone on this machine as \"anonymous\"; a caller from another host gets 401, and a credential that is presented is still held to its scopes)"
+            "⚠️  Human API: NO CREDENTIAL REQUIRED (api_auth_enabled is off, so the dashboard and every catalog route are served to this machine's own tools as \"anonymous\"; a caller from another host gets 401, so does a web page loaded from another origin whichever machine its browser is on, and a credential that is presented is still held to its scopes)"
+        );
+    }
+    // The third thing that decides who gets in, and the one an operator
+    // cannot see from either credential. Named here because turning it on is
+    // the only way a console on another origin reads anything at all, and
+    // because leaving it off is now the default.
+    if cors_origins.is_empty() {
+        info!(
+            "🚫 Cross-origin browser access: NONE (the console served from this port is same-origin and unaffected; a console hosted elsewhere needs its origin in api_cors_allowed_origins)"
+        );
+    } else {
+        info!(
+            "🌐 Cross-origin browser access: {} ({}) - and a page on one of those still presents a credential; being listed is not authority",
+            cors_origins.len(),
+            cors_origins.join(", ")
         );
     }
     // Said separately because it is a separate credential: this one is not
@@ -612,6 +652,7 @@ pub async fn start_api_server(
         api.tls_enabled,
         &api.auth_config,
         &api.node_auth,
+        &api.cors_origins,
         false,
     );
 

@@ -12,7 +12,6 @@ mod tests {
         AppKey, ApplicationManager,
     };
     use once_cell::sync::Lazy;
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     /// Everything `emit` writes to `tracing`, message and fields together, as
@@ -177,7 +176,7 @@ mod tests {
                     target,
                     "http://localhost/".to_string(),
                     "GET".to_string(),
-                    HashMap::new(),
+                    Vec::new(),
                     None,
                 )
                 .await
@@ -222,7 +221,7 @@ mod tests {
                 &key("test4"),
                 "http://localhost/test/path".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await;
@@ -345,7 +344,7 @@ mod tests {
                 &key("kvtest"),
                 "http://localhost/set".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -357,7 +356,7 @@ mod tests {
                 &key("kvtest"),
                 "http://localhost/get".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -394,7 +393,7 @@ mod tests {
                 &key("params_app"),
                 "http://localhost/users/42".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await;

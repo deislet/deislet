@@ -17,8 +17,6 @@
 //! assertions in `src/runtime/isolate_test.rs` because what is under test is
 //! two requests through one isolate, which is the platform seen from outside.
 
-use std::collections::HashMap;
-
 use deis_runtime::runtime::isolate::AppRuntime;
 use deis_runtime::runtime::ServiceRouter;
 use deis_runtime::runtime::{IsolateSpec, ServiceWiring};
@@ -32,7 +30,7 @@ async fn request(runtime: &mut AppRuntime, path: &str) -> serde_json::Value {
         .execute_fetch(
             format!("http://localhost{path}"),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
             tx,
         )

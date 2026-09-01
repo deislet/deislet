@@ -260,6 +260,7 @@ async fn main() -> Result<(), anyhow::Error> {
         api.tls_enabled,
         &api.auth_config,
         &api.node_auth,
+        &api.cors_origins,
         true,
     );
 

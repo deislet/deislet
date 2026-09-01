@@ -20,8 +20,8 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use bytes::Bytes;
 use deis_bundle::{
-    decoded_segments, percent_decode, AssetIndex, HeaderField, Manifest, RedirectAction,
-    ASSETS_PREFIX,
+    decoded_segments, percent_decode, AssetIndex, HeaderField, HeaderNamesWritten, Manifest,
+    RedirectAction, ASSETS_PREFIX,
 };
 use sha2::{Digest, Sha256};
 
@@ -150,20 +150,51 @@ pub struct AssetAnswer {
 #[derive(Debug, Clone)]
 pub struct AssetFetch {
     pub status: u16,
-    /// Lower-case names, in the order they should be set. `_headers` blocks
-    /// have already been applied, so a name appears once.
+    /// Lower-case names, in the order they should be set. A list and not a
+    /// map: `_headers` blocks have already been applied, and a block may set
+    /// one name twice - two `Link` preloads, a session cookie and a CSRF
+    /// cookie - so a name can appear more than once and both values have to
+    /// reach the `Response` the function builds out of this.
     pub headers: Vec<(String, String)>,
     /// Empty for a redirect, and for a HEAD the caller decides to make.
     pub body: Bytes,
 }
 
-/// Put the site's headers over the defaults, later winning, as a response
-/// builder would.
+/// Put the site's headers over the defaults the node computed.
+///
+/// `into` is what the node worked out for itself - the content type, the tag,
+/// the cache policy, or a redirect's location - and `extra` is what `_headers`
+/// says about this path, already resolved block against block by
+/// [`deis_bundle::HeaderTable::apply`].
+///
+/// The first field of a name replaces the node's own value for it, in the
+/// place that value stood, so a block that overrides `Cache-Control` does not
+/// move it to the end of the list. Every field after that joins its group
+/// rather than replacing it: this used to overwrite on every field, which
+/// handed a function the second of two `Link` preloads and dropped the first,
+/// and would have dropped one of two `Set-Cookie` values the same way.
+/// [`HeaderNamesWritten`] is where that distinction is decided, once, for
+/// every layer that writes these headers onto something.
 fn merge(into: &mut Vec<(String, String)>, extra: &[HeaderField]) {
+    let mut written = HeaderNamesWritten::for_fields(extra);
     for field in extra {
-        match into.iter_mut().find(|(name, _)| *name == field.name) {
-            Some(existing) => existing.1 = field.value.clone(),
-            None => into.push((field.name.clone(), field.value.clone())),
+        let pair = (field.name.clone(), field.value.clone());
+        if !written.replaces(&field.name) {
+            let after = into
+                .iter()
+                .rposition(|(name, _)| *name == field.name)
+                .map_or(into.len(), |index| index + 1);
+            into.insert(after, pair);
+            continue;
+        }
+        match into.iter().position(|(name, _)| *name == field.name) {
+            Some(first) => {
+                // Everything dropped sat at or after `first`, so the list
+                // never shrinks past it and the name keeps its place.
+                into.retain(|(name, _)| *name != field.name);
+                into.insert(first, pair);
+            }
+            None => into.push(pair),
         }
     }
 }

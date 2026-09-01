@@ -65,7 +65,7 @@ mod tests {
             .execute_fetch(
                 format!("http://localhost{path}"),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -554,7 +554,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/upload".to_string(),
                 "POST".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 Some(payload.clone()),
                 tx,
             )
@@ -601,7 +601,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/first".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -616,7 +616,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/empty".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -661,7 +661,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "POST".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 sent("only once"),
                 tx,
             )
@@ -679,7 +679,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -723,7 +723,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "POST".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 sent("hello body"),
                 tx,
             )
@@ -764,7 +764,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "POST".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 sent(r#"{"key":"value"}"#),
                 tx,
             )
@@ -809,7 +809,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "POST".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 sent("once"),
                 tx,
             )
@@ -858,7 +858,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -907,7 +907,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -972,7 +972,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/after".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1051,7 +1051,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1093,7 +1093,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1141,7 +1141,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1203,7 +1203,7 @@ export default function handler(context: any): Response {
                 .execute_fetch(
                     "http://localhost/".to_string(),
                     "GET".to_string(),
-                    HashMap::new(),
+                    Vec::new(),
                     None,
                     tx,
                 )
@@ -1250,7 +1250,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1565,7 +1565,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1617,7 +1617,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1657,8 +1657,7 @@ export default function handler(context: any): Response {
 
         runtime.init_module().await.unwrap();
 
-        let mut headers = HashMap::new();
-        headers.insert("host".to_string(), "localhost".to_string());
+        let headers: Vec<(String, String)> = vec![("host".to_string(), "localhost".to_string())];
 
         let (tx, rx) = oneshot::channel();
         let result = runtime
@@ -1707,7 +1706,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1750,8 +1749,7 @@ export default function handler(context: any): Response {
 
         runtime.init_module().await.unwrap();
 
-        let mut headers = HashMap::new();
-        headers.insert("host".to_string(), "localhost".to_string());
+        let headers: Vec<(String, String)> = vec![("host".to_string(), "localhost".to_string())];
 
         let (tx, rx) = oneshot::channel();
         let result = runtime
@@ -1806,7 +1804,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/users/123".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1851,7 +1849,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/posts/1".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -1976,7 +1974,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -2037,7 +2035,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -2268,7 +2266,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/spin".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -2299,7 +2297,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -2369,7 +2367,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/wait".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -2417,7 +2415,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/spin".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -2487,7 +2485,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/wait".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -2537,7 +2535,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -2692,11 +2690,11 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let mut headers = HashMap::new();
-        headers.insert(
+        let mut headers: Vec<(String, String)> = Vec::new();
+        headers.push((
             "content-type".to_string(),
             format!("multipart/form-data; boundary={boundary}"),
-        );
+        ));
 
         let mut runtime = AppRuntime::new(
             "formdata_app.production".to_string(),
@@ -3079,7 +3077,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -3261,7 +3259,7 @@ export default function handler(context: any): Response {
         let (status, headers, body) = answer_to(&mut runtime, "/feed").await;
         assert_eq!(status, 200);
         assert_eq!(
-            crate::runtime::response_headers::first_value(&headers, "content-type"),
+            crate::runtime::header_list::first_value(&headers, "content-type"),
             Some("text/event-stream")
         );
         assert!(
@@ -3327,6 +3325,100 @@ export default function handler(context: any): Response {
         assert_eq!(
             String::from_utf8(rest).unwrap(),
             "chunk2\nchunk3\nchunk4\nchunk5\nchunk6\n"
+        );
+    }
+
+    /// The fan-out ceiling, from the one place that outlives the invocation
+    /// that opened it.
+    ///
+    /// A response stream's producer goes on making outbound calls after its
+    /// request has been answered, by design. The allowance it spends is the
+    /// allowance of the invocation that created it, and nothing else may
+    /// refill it: the next request, cron tick or queue batch for the same
+    /// application is a different invocation with an allowance of its own.
+    #[tokio::test]
+    async fn a_stream_keeps_the_allowance_of_the_invocation_that_opened_it() {
+        let upstream =
+            serve(axum::Router::new().route("/", axum::routing::get(|| async { "ok" }))).await;
+        let code = r#"
+            let made = 0;
+            let refused = 0;
+            export default async function handler(ctx) {
+                const path = new URL(ctx.request.url).pathname;
+                if (path === "/tally") {
+                    return new Response(JSON.stringify({ made, refused }));
+                }
+                const encoder = new TextEncoder();
+                const stream = new ReadableStream({
+                    async pull(controller) {
+                        try {
+                            await fetch(ctx.env.PROBE_URL);
+                            made += 1;
+                            controller.enqueue(encoder.encode("x"));
+                        } catch (e) {
+                            refused += 1;
+                            controller.close();
+                        }
+                    },
+                });
+                return new Response(stream);
+            }
+        "#;
+
+        let spec = IsolateSpec {
+            env: HashMap::from([(
+                "PROBE_URL".to_string(),
+                format!("http://localhost:{}/", upstream.port()),
+            )]),
+            fetch_policy: allow_localhost(upstream.port()),
+            limits: ExecutionLimits {
+                max_subrequests: 3,
+                ..ExecutionLimits::default()
+            },
+            ..IsolateSpec::default()
+        };
+        let mut runtime = AppRuntime::new(
+            "stream_budget.production".to_string(),
+            code.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (_, _, body) = answer_to(&mut runtime, "/feed").await;
+        let ResponseBody::Stream(mut reader) = body else {
+            panic!("the handler answered with a stream");
+        };
+
+        // Ordinary traffic for the same application between chunks, which is
+        // the whole point: each of those is an invocation of its own.
+        let mut chunks = 0;
+        for _ in 0..12 {
+            let chunk = tokio::select! {
+                chunk = std::future::poll_fn(|cx| reader.poll_chunk(cx)) => chunk,
+                () = runtime.pump_response_streams() => None,
+            };
+            if chunk.is_none() {
+                break;
+            }
+            chunks += 1;
+            let (_, _, tally) = answer_to(&mut runtime, "/tally").await;
+            let _ = text(tally);
+        }
+
+        let (_, _, tally) = answer_to(&mut runtime, "/tally").await;
+        let tally: serde_json::Value = serde_json::from_str(&text(tally).unwrap()).unwrap();
+        println!("TALLY: {tally} chunks={chunks}");
+        assert_eq!(
+            tally["made"], 3,
+            "the producer inherited the invocation's ceiling of 3 outbound calls and no more"
+        );
+        assert_eq!(
+            tally["refused"], 1,
+            "the call past the ceiling has to be refused rather than granted"
         );
     }
 
@@ -3716,7 +3808,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -3951,9 +4043,9 @@ export default function handler(context: any): Response {
 
         let mut seen = Vec::new();
         for start_interval in [true, false] {
-            let mut headers = HashMap::new();
+            let mut headers: Vec<(String, String)> = Vec::new();
             if start_interval {
-                headers.insert("x-start-interval".to_string(), "yes".to_string());
+                headers.push(("x-start-interval".to_string(), "yes".to_string()));
             }
             let (tx, rx) = oneshot::channel();
             runtime
@@ -4039,7 +4131,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/arm".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -4055,7 +4147,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/check".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -4100,7 +4192,7 @@ export default function handler(context: any): Response {
                 .execute_fetch(
                     format!("http://localhost{path}"),
                     "GET".to_string(),
-                    HashMap::new(),
+                    Vec::new(),
                     None,
                     tx,
                 )
@@ -4546,7 +4638,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -4608,7 +4700,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "POST".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 sent("héllo"),
                 tx,
             )
@@ -4690,7 +4782,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -4831,7 +4923,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -5564,7 +5656,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -5580,7 +5672,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx2,
             )
@@ -5631,7 +5723,7 @@ export default function handler(context: any): Response {
                 .execute_fetch(
                     "http://localhost/".to_string(),
                     "GET".to_string(),
-                    HashMap::new(),
+                    Vec::new(),
                     None,
                     tx,
                 )
@@ -5763,7 +5855,7 @@ export default function handler(context: any): Response {
             runtime.execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             ),
@@ -5798,7 +5890,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -5856,7 +5948,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -5872,7 +5964,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -5943,7 +6035,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -5984,7 +6076,7 @@ export default function handler(context: any): Response {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )

@@ -12,7 +12,6 @@
 mod tests {
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::{ServiceRouter, ServiceWiring};
-    use std::collections::HashMap;
 
     /// Run one handler and hand back what it answered.
     async fn answer(code: &str) -> (u16, String) {
@@ -36,7 +35,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )

@@ -485,3 +485,154 @@ fn a_site_with_no_rules_costs_nothing_extra() {
     assert!(bundle.site().is_empty());
     assert!(bundle.serve("/nothing", &HeaderMap::new(), false).is_none());
 }
+
+#[test]
+fn two_link_lines_in_one_block_both_reach_the_client() {
+    // The defect, stated at the only place it could still be seen: the wire.
+    // The parser, the table and the manifest all carry two `Link` values, and
+    // the node then wrote them onto the response with `insert`, which replaces
+    // every value a name already has - so the stylesheet preload was dropped
+    // and only the script one was sent. Nothing logged it.
+    let bundle = Site::new()
+        .file("index.html", "home")
+        .headers(
+            "/*",
+            &[
+                ("link", "</app.css>; rel=preload; as=style"),
+                ("link", "</app.js>; rel=preload; as=script"),
+            ],
+        )
+        .bundle();
+
+    let response = serve(&bundle, "/index.html");
+    let sent: Vec<&str> = response
+        .headers()
+        .get_all("link")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            "</app.css>; rel=preload; as=style",
+            "</app.js>; rel=preload; as=script"
+        ],
+        "both preloads go out, in the order the author wrote them"
+    );
+}
+
+#[test]
+fn two_set_cookie_lines_in_one_block_both_reach_the_client() {
+    // The same shape with the name that makes it a login bug: a session cookie
+    // and a CSRF cookie may not be folded into one header value, so sending
+    // one of the two logs the visitor out on their next form post.
+    let bundle = Site::new()
+        .file("index.html", "home")
+        .headers(
+            "/*",
+            &[
+                ("set-cookie", "session=abc; Path=/; HttpOnly"),
+                ("set-cookie", "csrf=xyz; Path=/"),
+            ],
+        )
+        .bundle();
+
+    let response = serve(&bundle, "/index.html");
+    let sent: Vec<&str> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        sent,
+        vec!["session=abc; Path=/; HttpOnly", "csrf=xyz; Path=/"]
+    );
+}
+
+#[test]
+fn a_repeated_name_survives_on_a_redirect_too() {
+    // A redirect takes the other branch of the response builder, so it is its
+    // own chance to drop the second value.
+    let bundle = Site::new()
+        .redirect("/old", "/new", 302)
+        .headers("/old", &[("set-cookie", "a=1"), ("set-cookie", "b=2")])
+        .bundle();
+
+    let response = serve(&bundle, "/old");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+}
+
+#[test]
+fn a_block_still_overrides_a_header_the_node_computed_rather_than_joining_it() {
+    // The other half of the same rule, which is what stops the fix from being
+    // "append everything": the first value of a name replaces what the node
+    // worked out for itself. A response carrying both the node's
+    // `must-revalidate` and the author's `immutable` would be a cache policy
+    // no cache can act on.
+    let bundle = Site::new()
+        .file("app.css", "body{}")
+        .headers(
+            "/app.css",
+            &[
+                ("cache-control", "public, max-age=31536000, immutable"),
+                ("link", "</a.woff2>; rel=preload; as=font"),
+                ("link", "</b.woff2>; rel=preload; as=font"),
+            ],
+        )
+        .bundle();
+
+    let response = serve(&bundle, "/app.css");
+    let cache: Vec<&str> = response
+        .headers()
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        cache,
+        vec!["public, max-age=31536000, immutable"],
+        "one value, the author's - not theirs beside the node's"
+    );
+    assert_eq!(response.headers().get_all("link").iter().count(), 2);
+}
+
+#[test]
+fn a_repeated_name_reaches_a_function_through_assets_fetch() {
+    // `env.ASSETS.fetch()` is the second writer of the same list, and it had
+    // the same defect: the pairs handed to JavaScript kept one value per name,
+    // so a handler that returned what the asset layer gave it sent one cookie
+    // of two even after the wire path was right.
+    let bundle = Site::new()
+        .file("index.html", "home")
+        .headers(
+            "/*",
+            &[("set-cookie", "session=abc"), ("set-cookie", "csrf=xyz")],
+        )
+        .bundle();
+
+    let sent = bundle.fetch_asset("/index.html").headers;
+    let cookies: Vec<&str> = sent
+        .iter()
+        .filter(|(name, _)| name == "set-cookie")
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(cookies, vec!["session=abc", "csrf=xyz"], "got: {sent:?}");
+}
+
+#[test]
+fn assets_fetch_keeps_an_overridden_header_where_the_node_put_it() {
+    // The order of the pairs is what a function turns into a `Response`, so an
+    // override has to take the place of the value it replaced rather than
+    // being appended: two nodes answering the same path must produce the same
+    // bytes.
+    let bundle = Site::new()
+        .file("data.bin", "\u{0}\u{1}")
+        .headers("/data.bin", &[("content-type", "application/wasm")])
+        .bundle();
+
+    let sent = bundle.fetch_asset("/data.bin").headers;
+    let names: Vec<&str> = sent.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["content-type", "etag", "cache-control"]);
+}

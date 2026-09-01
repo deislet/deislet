@@ -994,13 +994,13 @@ impl ApplicationManager {
     /// may legitimately appear twice - `Set-Cookie` always may - and a map
     /// here silently kept one of them. Whether repeats survive was already
     /// decided inside the isolate, from the application's compatibility date;
-    /// see `crate::runtime::response_headers`.
+    /// see `crate::runtime::header_list`.
     pub async fn execute_app(
         &self,
         key: &AppKey,
         url: String,
         method: String,
-        headers: std::collections::HashMap<String, String>,
+        headers: crate::runtime::HeaderPairs,
         body: Option<Vec<u8>>,
     ) -> Result<(
         u16,
@@ -1206,7 +1206,6 @@ mod manager_test;
 mod memory_ceiling {
     use super::*;
     use crate::app::types::{AppConfig, ResourceLimits};
-    use std::collections::HashMap;
 
     /// Allocates until something stops it. `new Array(n).fill(0)` is used
     /// rather than a bare `new Array(n)`, which V8 is free to leave as a
@@ -1248,7 +1247,7 @@ mod memory_ceiling {
                 key,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await

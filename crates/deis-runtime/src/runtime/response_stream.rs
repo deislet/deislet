@@ -47,6 +47,7 @@
 //! it. See `AppRuntime::pump_response_streams`.
 
 use super::metrics::{now_us, recorder, InvocationKind, InvocationOutcome, InvocationTrace};
+use super::ops::SubrequestAllowance;
 use bytes::Bytes;
 use deno_core::{extension, op2, JsBuffer, OpState};
 use deno_error::JsErrorBox;
@@ -187,6 +188,17 @@ struct OpenStream {
     /// The tenant and invocation this body answers. See [`StreamOwner`].
     owner: StreamOwner,
 
+    /// The outbound-call allowance of the invocation that opened this stream.
+    ///
+    /// A producer goes on making calls after the request has been answered,
+    /// and this is what it spends: the same allowance the handler was
+    /// spending, with whatever is left of it, and never a fresh one. Held here
+    /// because this registry already has exactly the stream's lifetime -- it
+    /// is dropped when the stream is closed, on every path that closes one --
+    /// so there is no second table to keep in step and nothing to leak when a
+    /// producer ends badly. See [`super::ops::SubrequestBudget`].
+    allowance: Rc<SubrequestAllowance>,
+
     /// Where produced chunks go. Bounded; see [`QUEUED_CHUNKS`].
     sink: mpsc::Sender<Bytes>,
 
@@ -244,7 +256,12 @@ impl ResponseStreams {
     /// inside one isolate, so a `u32` that wraps after four billion streams is
     /// wide enough, and the wrap cannot collide with a live stream unless four
     /// billion are open at once.
-    pub fn open(&mut self, deadline: Instant, owner: StreamOwner) -> (u32, StreamReader) {
+    pub fn open(
+        &mut self,
+        deadline: Instant,
+        owner: StreamOwner,
+        allowance: Rc<SubrequestAllowance>,
+    ) -> (u32, StreamReader) {
         let (sink, chunks) = mpsc::channel(QUEUED_CHUNKS);
         let failure = Arc::new(Mutex::new(None));
         self.next_id = self.next_id.wrapping_add(1);
@@ -253,6 +270,7 @@ impl ResponseStreams {
             id,
             OpenStream {
                 owner,
+                allowance,
                 sink,
                 failure: failure.clone(),
                 deadline,
@@ -262,6 +280,16 @@ impl ResponseStreams {
             },
         );
         (id, StreamReader { chunks, failure })
+    }
+
+    /// The outbound-call allowance one open stream inherited, or `None` for a
+    /// stream that has already ended.
+    ///
+    /// Read by [`super::ops::subrequest_allowance`] when a producer makes an
+    /// outbound call; see
+    /// [`super::ops::SubrequestBudget`] for what an allowance belongs to.
+    pub fn allowance_of(&self, id: u32) -> Option<Rc<SubrequestAllowance>> {
+        self.open.get(&id).map(|stream| stream.allowance.clone())
     }
 
     pub fn is_empty(&self) -> bool {

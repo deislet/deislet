@@ -37,6 +37,14 @@ mod tests {
         }
     }
 
+    /// The outbound-call allowance a stream inherits from the invocation that
+    /// opened it. Nothing in this file makes an outbound call, so any
+    /// allowance will do; what matters elsewhere is that the registry holds
+    /// one and drops it with the stream.
+    fn allowance() -> std::rc::Rc<crate::runtime::ops::SubrequestAllowance> {
+        std::rc::Rc::new(crate::runtime::ops::SubrequestAllowance::new(10))
+    }
+
     #[tokio::test]
     async fn the_queue_holds_two_chunks_and_then_makes_the_producer_wait() {
         // This is where the memory bound is. A queue that accepted a third
@@ -44,7 +52,7 @@ mod tests {
         // client that never reads would let a producer put the whole body in
         // the node's memory, which is the thing streaming exists to avoid.
         let mut streams = ResponseStreams::default();
-        let (id, mut reader) = streams.open(in_a_minute(), owner());
+        let (id, mut reader) = streams.open(in_a_minute(), owner(), allowance());
         let sink = streams.sinks().pop().unwrap();
 
         sink.send(Bytes::from_static(b"one")).await.unwrap();
@@ -73,7 +81,7 @@ mod tests {
         // truncated one's transfer fails. That distinction is this pair of
         // assertions.
         let mut finished = ResponseStreams::default();
-        let (id, reader) = finished.open(in_a_minute(), owner());
+        let (id, reader) = finished.open(in_a_minute(), owner(), allowance());
         finished.sinks()[0]
             .send(Bytes::from_static(b"all of it"))
             .await
@@ -84,7 +92,7 @@ mod tests {
         assert_eq!(failure, None, "a stream that finished must not look failed");
 
         let mut broken = ResponseStreams::default();
-        let (id, reader) = broken.open(in_a_minute(), owner());
+        let (id, reader) = broken.open(in_a_minute(), owner(), allowance());
         broken.sinks()[0]
             .send(Bytes::from_static(b"half of "))
             .await
@@ -110,10 +118,21 @@ mod tests {
         // closing all of them because one ran out would be a far worse bug than
         // the one being fixed.
         let mut streams = ResponseStreams::default();
-        let (long, _long_reader) = streams.open(Instant::now() + Duration::from_secs(60), owner());
-        let (short, _short_reader) =
-            streams.open(Instant::now() - Duration::from_millis(1), owner());
-        let (gone, gone_reader) = streams.open(Instant::now() + Duration::from_secs(60), owner());
+        let (long, _long_reader) = streams.open(
+            Instant::now() + Duration::from_secs(60),
+            owner(),
+            allowance(),
+        );
+        let (short, _short_reader) = streams.open(
+            Instant::now() - Duration::from_millis(1),
+            owner(),
+            allowance(),
+        );
+        let (gone, gone_reader) = streams.open(
+            Instant::now() + Duration::from_secs(60),
+            owner(),
+            allowance(),
+        );
 
         assert_eq!(streams.expired(Instant::now()), vec![short]);
         assert!(

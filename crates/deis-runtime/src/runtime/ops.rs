@@ -479,7 +479,7 @@ fn op_deis_set_response_body(state: &mut OpState, #[buffer] body: JsBuffer) {
 /// holds it across an await.
 pub type ExecutionDeadline = Rc<Cell<Option<Instant>>>;
 
-/// How many outbound calls the invocation currently running may still make.
+/// How many outbound calls one invocation may still make.
 ///
 /// The ceiling on *fan-out*, which no other budget in this runtime bounds. An
 /// invocation that answers one inbound request with two hundred outbound ones
@@ -491,24 +491,21 @@ pub type ExecutionDeadline = Rc<Cell<Option<Instant>>>;
 /// against a ceiling of a thousand. Cloudflare bounds subrequests per
 /// invocation for the same reason.
 ///
-/// Reset by `AppRuntime::begin_invocation`, so the count belongs to one
-/// request together with its `waitUntil` tail, one queue batch, one cron tick
-/// or one inbound WebSocket message -- the same granularity the wall-clock and
-/// CPU budgets are armed at. It is deliberately *not* reset at the end of an
-/// invocation: a response stream's producer runs on after the request has been
-/// answered, and giving it a fresh allowance would let a handler have as many
-/// calls as it liked by making them from inside a stream.
+/// One of these belongs to one invocation -- a request together with its
+/// `waitUntil` tail, one queue batch, one cron tick, one inbound WebSocket
+/// message -- and to the response streams that invocation left producing. See
+/// [`SubrequestBudget`] for how an op finds the right one.
 ///
 /// `Cell` rather than an atomic: an isolate is one thread, every charge
 /// happens inside an op on that thread, and nothing holds the value across an
 /// await.
 #[derive(Debug)]
-pub struct SubrequestBudget {
+pub struct SubrequestAllowance {
     ceiling: u32,
     spent: Cell<u32>,
 }
 
-impl SubrequestBudget {
+impl SubrequestAllowance {
     pub fn new(ceiling: u32) -> Self {
         Self {
             ceiling,
@@ -548,10 +545,102 @@ impl SubrequestBudget {
         self.spent.set(self.spent.get().saturating_sub(1));
     }
 
-    /// Start the count again for a new invocation.
-    pub fn reset(&self) {
-        self.spent.set(0);
+    /// How many calls have been taken out of this allowance. Tests only: an
+    /// op charges and refuses, and never needs to ask.
+    #[cfg(test)]
+    pub fn spent(&self) -> u32 {
+        self.spent.get()
     }
+}
+
+/// The allowances alive in one isolate, and which invocation's is the current
+/// one.
+///
+/// # Why this is not one counter per isolate
+///
+/// It was, and the counter was reset by `AppRuntime::begin_invocation`. That
+/// reads as "each invocation starts with the whole allowance", and it is that
+/// for every invocation that ends when its handler does. It is not that for a
+/// response stream: a stream's producer goes on making outbound calls after
+/// the request has been answered, by design, spending the allowance of the
+/// invocation that opened it -- and `begin_invocation` fires for the *next*
+/// request, cron tick or queue batch too. So any other traffic for the same
+/// application handed the producer a fresh ceiling. Measured on a ceiling of
+/// three: a stream completed twelve outbound calls, none of them refused,
+/// simply because ordinary requests were being served alongside it. Resetting
+/// in `end_invocation` instead does not help; it makes the same hole out of
+/// the handler's own return.
+///
+/// What owns an allowance is an *invocation*, and a response stream is the one
+/// piece of an invocation that outlives it. So each invocation gets an
+/// allowance of its own here, a stream keeps the one that was in force when it
+/// opened (`ResponseStreams` holds it and drops it when the stream ends), and
+/// nothing can refill either.
+#[derive(Debug)]
+pub struct SubrequestBudget {
+    ceiling: u32,
+    /// The allowance of the invocation running now. Replaced, never reset:
+    /// resetting is what a stream still holding it would have felt.
+    invocation: RefCell<Rc<SubrequestAllowance>>,
+}
+
+impl SubrequestBudget {
+    pub fn new(ceiling: u32) -> Self {
+        Self {
+            ceiling,
+            invocation: RefCell::new(Rc::new(SubrequestAllowance::new(ceiling))),
+        }
+    }
+
+    /// The allowance of the invocation running now.
+    pub fn invocation(&self) -> Rc<SubrequestAllowance> {
+        self.invocation.borrow().clone()
+    }
+
+    /// Give the invocation about to start an allowance of its own.
+    ///
+    /// A *new* allowance, so the streams still holding the last one keep what
+    /// is left of it and get nothing more.
+    pub fn begin_invocation(&self) {
+        *self.invocation.borrow_mut() = Rc::new(SubrequestAllowance::new(self.ceiling));
+    }
+}
+
+/// The allowance one outbound call belongs to.
+///
+/// `scope` is the node's id for the response stream whose producer is making
+/// the call, or `0` for the invocation running now. It is not something an
+/// application can choose: `js/bootstrap.js` reads it off the same `entryOwner`
+/// that decides which stretch owns a timer and which owns the call's own
+/// deadline, and that variable is written only by the stream scope, which is
+/// claimed once at isolate build and unreachable from application code.
+///
+/// It travels *with* the charge rather than being published when the stretch
+/// changes, which costs nothing: a producer steps twice per chunk, and an op
+/// dispatch per step would come out of the application's own op-rate
+/// allowance -- the ceiling a stream writing small chunks already meets first.
+/// It is also the more exact of the two, because it is read at the instant the
+/// call is made rather than at the last moment anything thought to say so.
+///
+/// A stream id this isolate does not have open -- one that has just ended --
+/// falls back to the invocation's allowance rather than to none: that is the
+/// always-bounded answer, and it is the same fallback `streamScope.enter`
+/// makes for an owner it does not recognise.
+///
+/// And if an application ever did reach the op table, the worst a scope it
+/// invented could name is another bounded allowance of its own: every id here
+/// resolves either to an open stream of this isolate or to this invocation,
+/// and there is no spelling for "no allowance". The ceiling holds even with
+/// the argument chosen by the caller, which is why it may be one.
+pub fn subrequest_allowance(state: &OpState, scope: u32) -> Option<Rc<SubrequestAllowance>> {
+    let budget = state.try_borrow::<Rc<SubrequestBudget>>()?;
+    if scope == 0 {
+        return Some(budget.invocation());
+    }
+    let of_stream = state
+        .try_borrow::<Rc<RefCell<super::response_stream::ResponseStreams>>>()
+        .and_then(|streams| streams.borrow().allowance_of(scope));
+    Some(of_stream.unwrap_or_else(|| budget.invocation()))
 }
 
 // Environment variables store

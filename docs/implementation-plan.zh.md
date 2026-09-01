@@ -43,12 +43,17 @@ deis init  →  写代码  →  deis dev  →  deis deploy
 唯一拿得到的界面，演示脚本要是绕过它去调 API，就只证明了控制面是对的，而把唯一有人
 真正敲的那个入口留在没人验过的状态。
 
-演示分十三组逐项验证二十五条性质：CLI 部署与版本列表、资产 + ETag/304、路由占位符、
-经 deis-proxy 的 WebSocket 握手与文本 / 二进制帧、出网策略的一通一堵、Web Crypto 的
-值本身、密钥只见名不见值且不落盘、KV 往返与「不带凭据令牌会被拒」、队列产销、
-cron 单节点执行、双环境并行、双环境 KV 互不可见、回滚（代码与静态资产一起回）、
-日志可查、`deis tail` 跟到开流之后才产生的那一行、节点自注册（含配置文件从未提过的
-节点靠登记入队）、`deis status` 报出真正在服务的节点。逐条见 `DEMO.md`。
+演示分组逐项验证平台声称的每一条性质：CLI 部署与版本列表、资产 + ETag/304、静态站点
+规则、路由占位符、经 deis-proxy 的 WebSocket 握手与文本 / 二进制帧、流式响应过前门、
+出网策略的一通一堵、Web Crypto 的值本身、密钥只见名不见值且不落盘、KV / SQL / 对象
+存储往返与「不带凭据令牌会被拒」、具名绑定互不串门、队列产销与死信、cron 单节点执行、
+应用间调用、双环境并行、双环境 KV 互不可见、限额（超时 / 堆 / 出站次数）、compatibility
+date、账号与作用域 token 与审计日志、ACME 签发与续期、回滚（代码与静态资产一起回）、
+日志可查、`deis tail` 跟到开流之后才产生的那一行、节点自注册、`deis status` 报出真正
+在服务的节点。
+
+**组数与条数写在 `README.md` 与 `DEMO.md`，这里不再抄一份**：这个数字每加一条检查就变
+一次，抄在第三个地方就是第三处会过期的记述。逐条见 `DEMO.md`。
 
 ---
 
@@ -58,13 +63,13 @@ cron 单节点执行、双环境并行、双环境 KV 互不可见、回滚（�
 |---|---|---|---|
 | `deis-proxy` | `deis-proxy` | 完成度高 | 加了 `x-deis-environment` 盖章；路径级路由与每环境的自动地址已接上（从控制面轮询路由表），资产缓存仍缺 |
 | `deis-runtime` | `deis-runtime` | 执行链路完整，无资产、无绑定注入、无队列消费 | 资产优先、`context.params`、存储绑定、队列消费、cron 处理、日志与指标投递都已接上 |
-| `deis-control` | `deis-control` | 节点管理完整，**产品模型为零** | catalog（应用/版本/环境/部署/路由/密钥）+ 节点自取通道 + cron 调度 |
+| `deis-control` | `deis-control` | 节点管理完整，**产品模型为零** | catalog（应用/版本/环境/部署/路由/密钥）+ 节点自取通道 + cron 调度 + 给数据面的路由表与存储令牌端点 + 账号 / 角色 / 作用域 token / 只增不改的审计日志 |
 | `deis-build` | `deis-build` | 三个第三方目标可用 | 四个目标，deislet 产出 `bundle.zip` |
-| `deis` | `deis` | init/build/validate 可用，deploy 是桩 | 完整：deploy / versions / rollback / status / secret / logs / tail / trace / kv / db / blob / config，`dev` 起真运行时 |
+| `deis` | `deis` | init/build/validate 可用，deploy 是桩 | 完整：deploy / versions / rollback / status / secret / logs / tail / trace / kv / db / blob / queue / account / token / audit / config，`dev` 起真运行时 |
 | `deis-wire` | — | 协议与模型完整 | 加了 `conventions`：头名、租户 id、消息上限、保留键 |
 | `deis-bundle` | — | **不存在** | 新建：包格式的唯一定义，编译器/控制面/节点三方共用 |
-| `deis-store` | `deis-store` | **不存在** | 有：KV / Database / Blob 三套 gRPC |
-| `deis-queue` | `deis-queue` | **不存在** | 有：Send / Pull / Ack / Nack / 死信 |
+| `deis-store` | `deis-store` | **不存在** | 有：KV / Database / Blob 三套 gRPC（对象存储不止读写删，见 §5.1）；快照与恢复是两个子命令 |
+| `deis-queue` | `deis-queue` | **不存在** | 有：Send / SendBatch / Pull / Ack / Nack / 死信（列举与放回） |
 | `deis-telemetry` | `deis-telemetry` | **不存在** | 有：PushLogs / Query / Tail、PushTraces / QueryTraces / TailTraces、PushMetrics / QueryMetrics / Prometheus |
 
 三个新组件各自独立进程、独立数据目录、独立端口。它们都是「哑」服务：只认**一个**租户维度，不认版本、不认部署、不回调任何人。
@@ -97,6 +102,13 @@ assets/                  # 静态资产，原样保留目录结构
   "entry": "worker/index.js",
   "runtime": "standard-v1",
   "services": { "kv": true, "database": true, "blob": false, "queue": true },
+  "bindings": {
+    "HOT": { "kind": "kv" },
+    "DOCS": { "kind": "blob" },
+    "AUTH": { "kind": "service", "app": "auth-api" }
+  },
+  "callable_by": ["storefront"],
+  "compatibility": { "date": "2026-09-01", "flags": ["multiple_set_cookie_headers"] },
   "env": { "LOG_LEVEL": "info" },
   "secrets": ["API_KEY"],
   "routes": [ { "pattern": "/api/users/:id", "methods": ["GET"] } ],
@@ -118,6 +130,29 @@ assets/                  # 静态资产，原样保留目录结构
 
 - `secrets` 只列名字，值永远不进包。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
+- `services` 的四个键是**种类**，管的是那个租户**不带名字**的那一份命名空间——
+  `ctx.services.kv` 拿到的就是它。同种类的第二份是 `bindings` 里的一条，靠作者给的
+  名字取用。
+- `bindings` 是一张**平表**：名字 → `{ "kind": ... }`，`kind` 五选一
+  （`kv` / `database` / `blob` / `queue` / `service`）。前四种是本租户内部又一个命名
+  空间（租户边界一点没动：绑定名是验过能力令牌之后用
+  `deis_wire::conventions::namespace_id` 拼到租户后面的，`shop.production@HOT`）；
+  `service` 是**打给另一个应用**的调用，多带一个 `app`，可选的 `environment` 省略时
+  就是调用方自己所在的那个环境。名字在 `context.bindings.<名字>` 和 `env.<名字>` 上
+  是同一个对象；判重不分大小写，因为它会变成 deis-store 里的目录名与文件名。形状与
+  校验只在 `deis_bundle::bindings` 一处，构建 / 控制面 / 节点 / isolate 四方共用。
+- `callable_by` 是**被调方**的同意书，写在被调方自己的包里，跟着它自己的代码走版本。
+  调用方在 `bindings` 里点名只是**在问**；这里才是答复，节点每次调用都从被调方当前
+  那一版里读一次，所以撤回同意在被调方下次部署时生效，不必回头惊动谁。默认空数组，
+  意思是谁都不同意；唯一的通配是 `deis_bundle::CALLABLE_BY_EVERYONE`，节点装载带着
+  它的版本时会在日志里明说。
+- `compatibility` 钉的是「这个应用是照哪一天的平台写的」：`date` 是那一天，`flags` 是
+  按名字提前拿或者往后压的单项行为（名字在 `deis_bundle::compatibility::FLAGS`，
+  一个 `enable` 一个 `disable`）。整个键缺席意思是这个应用早于这套机制，于是钉在平台
+  最老的那套行为上。这里**不**由 `Manifest::validate` 判——一个包在比它声明的日期新的
+  节点上完全好用、在更老的节点上不可用，回答这个问题的是
+  `Manifest::compatibility_profile`，构建、上传、下发、装载四处都调它。详见
+  `architecture.zh.md` §9 末节。
 - `site` 是静态站点自己带的规则，包里没有这些规则时整个键不出现。三样东西：
   `redirects` 是 `_redirects` 解析出来的表（**顺序即语义**，首条命中者胜，200 是改写、
   404 是带 404 状态返回目标）；`headers` 是 `_headers` 解析出来的表（所有命中的块叠加，
@@ -213,9 +248,52 @@ CREATE TABLE secrets (
 
 主密钥从 `deis-control` 配置的 `secret_key_file` 读取（32 字节），不进数据库、不进日志。
 
+上面这七张是最早那一批。后来又加了四张，都在同一个 `schema.rs` 里，形状按同样的规矩
+读：
+
+```sql
+CREATE TABLE retired_app_names (   -- 删过的应用名，不给第二个人接着用
+  app_id       TEXT PRIMARY KEY,
+  retired_at   INTEGER NOT NULL,
+  environments TEXT NOT NULL,      -- 这个名字曾经铺到过哪些租户；少列一个就会
+                                   -- 让运维只清掉一半
+  released_at  INTEGER             -- 有人明确放出来之后才为非空
+);
+
+CREATE TABLE accounts (            -- 人或者机器，各有一个角色
+  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL,              -- 角色名
+  created_at INTEGER NOT NULL, disabled_at INTEGER
+);
+
+CREATE TABLE api_tokens (          -- 一枚凭据
+  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id),
+  name TEXT NOT NULL, origin TEXT NOT NULL,
+  secret_hash TEXT,                -- 只存密的那一半的 sha256；配置文件里的
+                                   -- api_keys 这一列是 NULL，它对着文件验
+  scopes TEXT NOT NULL,
+  unscoped INTEGER NOT NULL,       -- 单独一列：作用域为空是「什么都不能做」，
+                                   -- 无作用域是「什么都能做」，这两件事不能只
+                                   -- 差一次 NULL 判断
+  created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER
+);
+
+CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE 或 DELETE 它
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL,
+  actor_kind TEXT NOT NULL, actor_account TEXT, actor_credential TEXT,
+  action TEXT NOT NULL, app_id TEXT, environment TEXT, target TEXT,
+  method TEXT NOT NULL, path TEXT NOT NULL, peer TEXT,
+  outcome TEXT NOT NULL,           -- 被拒的调用和成功的调用一样要记
+  status INTEGER NOT NULL, detail TEXT
+);
+```
+
+`audit_log` 没有删除端点：`DELETE /api/audit` 是 405，连没有作用域的那把 key 也一样。
+一条能被清掉的审计日志，在需要它的那一刻正好是不可信的。
+
 **现状**：全部建好，见 `crates/deis-control/src/database/schema.rs` 与
 `crates/deis-control/src/catalog/`。REST 在 `api/catalog/`：应用、版本（上传/下载）、
-环境、部署、回滚、路由、密钥。
+环境、部署、回滚、路由、密钥；账号、token 与审计日志在 `api/` 下自己的模块里。
 
 **这里曾经有一处例外**：`routes` 表建了、REST 有了，却没有任何消费方。现在有了——
 控制面在 `deis_wire::conventions::ROUTING_TABLE_ROUTE`（`GET /api/routing-table`）上
@@ -305,9 +383,44 @@ deis-store 与 deis-queue 按**租户**隔离数据，租户 id 是 `conventions
 
 一个进程，三套 gRPC 服务，复用现有 `storage.proto`（`KvStore` + `Database`）和 `blob.proto`（`BlobStore`）。
 
-- **KV**：表 `kv(tenant, key, value BLOB, metadata TEXT, expires_at INTEGER)`，主键 `(tenant, key)`。`List` 用前缀范围扫描。过期项惰性删除 + 后台清理。
-- **Database**：每个租户一个独立 SQLite 文件 `<data>/db/<tenant>.sqlite`。`Execute` / `Query` / `Batch` / `Prepare` 直接透传。
-- **Blob**：内容落 `<data>/blob/<tenant>/<sha256 前两级分片>`，元数据表 `blob(tenant, key, sha256, size, content_type, created_at)`。`Put` / `Get` 改成**流式**（`stream PutRequest` / `stream GetResponse`），分块 1 MB。
+- **KV**：表 `kv(tenant, key, value BLOB, metadata TEXT, expires_at INTEGER)`，主键
+  `(tenant, key)`。`KvStore` 有 `Get` / `Set` / `Delete` / `List` / `Has` 五个方法。
+  `Set` 可带 `ttl_seconds`（从写入那一刻算起的相对秒数）和一段不透明的 `metadata`；
+  `Get` 把值、`metadata` 和 `expires_at` 一起答回来，因为它们本来就是同一行的三列，
+  分两次问既多一趟往返、又可能读到互相对不上的两半；`List` 用前缀范围扫描，带
+  `limit` / `cursor`，`include_metadata = true` 时这一页换成 `entries`（每条带
+  `metadata` 与到期时刻）而不是纯 `keys`——两者绝不同时填，一页可能有上千个键，
+  名字发两遍就把这个服务最大的那条回话再翻一倍。过期项惰性删除 + 后台清理。
+  `Has` 目前**没有调用方**，应用够不到，见「仍然开着的」。
+- **Database**：每个租户一个独立 SQLite 文件 `<data>/db/<tenant>.sqlite`。方法分三组：
+  `Execute` / `Query` / `Batch` 是一次一句或一次一批；`Prepare` / `ExecutePrepared` /
+  `QueryPrepared` 是预编译语句；`BeginTransaction` / `ExecuteInTransaction` /
+  `QueryInTransaction` / `CommitTransaction` / `RollbackTransaction` 是**交互式事务**
+  ——deis-store 把一条连接钉在这个事务上，所以「读—判断—写」能在一个事务里走完，
+  这是本平台比 Cloudflare D1 多出来的那一件（`cloudflare-comparison.zh.md` §5.2）。
+  一次一句、一次一批和交互式事务这三样应用都能用（`ctx.services.database` 的
+  `execute` / `query` / `batch` / `transaction`）；预编译语句那三个**只到 op 这一层
+  为止**，JS 侧一处都没有调，见「仍然开着的」。
+- **Blob**：内容落 `<data>/blob/<tenant>/<sha256 前两级分片>`，元数据表
+  `blob(tenant, key, sha256, size, content_type, created_at)`。**不止 put / get /
+  delete**，`BlobStore` 是五个方法，四件事都一路接到了应用手里（`ctx.services.blob`
+  与 `deis blob` 两头都能用）：
+  - `Put` / `Get` 流式分块，块大小是 `deis_wire::conventions::STREAM_CHUNK_BYTES`
+    （1 MiB），两边都不许假设整个正文装得进一条消息；
+  - `Head` 只读元数据那一行，不搬正文——问「这个对象在不在、多大」不必为此把它读出来
+    再扔掉；
+  - `List` 按前缀列一页，带 `limit` / `cursor`；`delimiter` 把键卷成一层「目录」放进
+    `prefixes`（S3 的那个形状）。**所以应用不需要自己在 KV 里另建一张键索引**——这份
+    文档早先只写了 put / get / delete，照着写的人建的正是那张多余的表；
+  - `Get` 可带 `range`：`span` 是 `bytes=<起>-<止>` 的语义，`suffix` 是 `bytes=-<n>`，
+    收的就是 HTTP `Range` 头的那套规矩，免得应用自己再发明一套。服务端把真正取到的
+    `offset` / `length` 和**这一段自己的 sha256** 一起答回来，因为整个对象的读是拿
+    `BlobInfo.sha256` 校的，切片对不上它；
+  - `Put` 的头与 `Delete` 可带 `precondition`（`if_match` / `if_none_match`，比的是对象
+    的 sha256，`*` 是通配）。条件在提交那一刻、在执行写入的同一个事务里判定，所以两个
+    写者抢同一个键不会都认为自己赢了——**这是本平台唯一的原子协调原语**。输的一方拿到
+    的是 `precondition_failed` 这个字段而不是一句话，因为只有这一种写失败是应该重读重
+    试的，其余都不该。
 
 ### 5.2 deis-queue
 
@@ -331,7 +444,8 @@ deis-store 与 deis-queue 按**租户**隔离数据，租户 id 是 `conventions
 
 ### 5.3 deis-telemetry
 
-复用 `logging.proto` 的 `LogService.PushLogs`，新增：
+复用 `telemetry.proto`（`crates/deis-telemetry/proto/telemetry.proto`，这个文件从来
+没有叫过 `logging.proto`）的 `LogService.PushLogs`，新增：
 
 ```protobuf
 rpc Query(QueryRequest) returns (QueryResponse);      // 按 app / 时间 / 级别 / trace_id 查
@@ -342,7 +456,9 @@ rpc QueryMetrics(QueryMetricsRequest) returns (QueryMetricsResponse);
 
 日志表按天分区，保留期可配。指标存时序表，同时通过独立 HTTP 端口的 `/metrics` 导出 Prometheus 格式。
 
-**现状**：五个 RPC 与 Prometheus 端口都有。**投递方只有 deis-runtime 一个**——
+**现状**：上面这五个 RPC 与 Prometheus 端口都有；波次 D4 之后还多了第三套服务
+`TraceService`（`PushTraces` / `QueryTraces` / `TailTraces`），一次调用一条轨迹，
+`deis trace`（含 `--follow`）读的就是它。所以这个组件现在是三套服务、八个 RPC。**投递方只有 deis-runtime 一个**——
 deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout，所以
 访问量与耗时这两个本该由 deis-proxy 提供的主要数字，现在只能从节点侧推算，
 而被 deis-proxy 挡在门外的请求在这里完全看不见。`Tail` 与 `Query` 已经有 CLI 消费方
@@ -459,7 +575,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 ### 仍然开着的
 
 - ~~**`UpdateApp` 仍带 `bytes package_data`**~~ **已关闭**：字段删了，字段号和名字都写成 `reserved`，免得将来有人拿同一个号装别的东西、和旧客户端悄悄对不上。RPC 本身仍是 `Unimplemented` 并指向 `ApplyDeployment`。
-- ~~**控制面的 `routes` 表没人消费**~~ **已关闭**：控制面另供 `GET /api/routing-table`，deis-proxy 每 5 秒拉一次，路径前缀真的影响去向；每个环境还多了一个自动地址 `<环境>--<应用>.<域>`（默认环境另有短名 `<应用>.<域>`），由 proxy 配置里的 `routing.preview_zone` 打开。分隔符是标签内的 `--` 而不是点，因为一张通配证书只覆盖一层标签。**仍要人手做的**：那条通配 DNS 记录和那张通配证书——ACME 自动签发还没做。
+- ~~**控制面的 `routes` 表没人消费**~~ **已关闭**：控制面另供 `GET /api/routing-table`，deis-proxy 每 5 秒拉一次，路径前缀真的影响去向；每个环境还多了一个自动地址 `<环境>--<应用>.<域>`（默认环境另有短名 `<应用>.<域>`），由 proxy 配置里的 `routing.preview_zone` 打开。分隔符是标签内的 `--` 而不是点，因为一张通配证书只覆盖一层标签。**仍要人手做的**：那条通配 DNS 记录。通配证书这一半后来有了两条路——`crates/deis-proxy/src/acme/` 的 ACME（RFC 8555）客户端默认关、`[tls.acme]` 打开，把 `include_preview_addresses` 一开就给每个环境地址各签一张；或者仍然人手放一张 `*.<区>`，因为 `http-01` 签不出通配（那要 `dns-01`）。
 - **只有 deis-runtime 在往 deis-telemetry 投递**：deis-proxy / deis-store / deis-queue / deis-control 都还只写自己的 stdout。
 - **`trigger.proto` 的 `QueueEvent` 还没有 `environment` 字段**（`ScheduledEvent` 已经有了），而且它的 `QueueMessage.body` 还是 `string`，与真正在用的 `queue.proto`（已改成 `bytes`）不一致。队列消费目前由节点自己按 `(应用, 环境)` 轮询，走的是 `queue.proto`，不走这个消息，所以两处都还没被踩到；一旦有别的调用方用 `Trigger/OnQueue` 投递批次，就会既指不准环境、又损坏二进制消息体。
 - ~~**Web 标准的全局大半没装上，`fetch` 也在其中**~~ **已关闭**：这一条记的是
@@ -492,6 +608,12 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
   时间闸（默认 5 秒，只在能读 `/proc` 的机器上成立）。详见
   `docs/architecture.zh.md` §9。
 - **`StartInspectRequest` 已加 `environment`**，但调试通道本身还只覆盖到单个环境的用法。
+- **四个符号至今没有任何真实调用方**，是 D6 说的第二种走样又冒出来的一小截：
+  `KvStore.Has`（`kv_client.rs` 有 `has()`，但没有 op、没有 JS 绑定、没有命令行，
+  只有它自己的测试在调）；`op_db_prepare` / `op_db_execute_prepared` /
+  `op_db_query_prepared`（三个 op 都注册进了 op 表，`js/runtime.js` 一处都没有调
+  它们，所以预编译语句应用够不到）。两条路都行：接上去，或者删掉。**不要**把它们
+  当成能力写进文档——这个仓库上一次这么做，作者照着建了一张根本不需要的索引表。
 
 ### 波次 C
 

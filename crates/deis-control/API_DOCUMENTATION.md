@@ -55,9 +55,28 @@ curl -H "X-API-Key: your-secret-api-key-1" \
 
 ### Public Endpoints
 
-The following endpoints do not require an API key:
-- `GET /health` - Health check
-- `GET /api/metrics` - Prometheus scrape
+One endpoint does not require a credential:
+- `GET /health` - health check. It answers the constant `OK`, so a prober
+  learns nothing a TCP connect had not already told it, and the load balancer
+  or orchestrator asking has no credential to be given.
+
+`GET /api/metrics` used to be on this list and is not: it hands out the
+cluster size, the node count, the uptime and the event totals. See
+[Metrics API](#metrics-api) for what a Prometheus scrape presents.
+
+### Cross-Origin Access
+
+A page loaded from another origin can read this API's answers only when its
+origin is named in `api_cors_allowed_origins`, and `*` is refused there. The
+console this binary serves is delivered from the same port, so it is
+same-origin and needs no entry; `npm run dev` proxies `/api` through the vite
+server, so the development console is same-origin too.
+
+Being named is not authority. With `api_auth_enabled` off a caller that
+presents nothing is admitted from the machine the control plane runs on - and
+a page from another origin is refused there whichever machine its browser is
+on, because a browser on that machine is a loopback peer and every page it has
+open would otherwise be one. A console hosted elsewhere presents a token.
 
 ### Node Endpoints Use a Different Credential
 
@@ -985,6 +1004,19 @@ GET /api/metrics/summary
 GET /api/metrics
 ```
 
+Authenticated like every other read, and requiring `read:*/*`: the exposition
+names no application but counts all of them. Give the scraper an account of
+its own -
+
+```bash
+deis account create prometheus --role viewer
+deis token create --account prometheus --scope 'read:*/*' scrape
+```
+
+- and put the token in the scrape config's `authorization` block. A scrape
+from the machine the control plane runs on needs no credential while
+`api_auth_enabled` is off, exactly like any other read from there.
+
 **Response Example**:
 ```
 # HELP deis_control_nodes_total Total number of nodes
@@ -1108,8 +1140,9 @@ curl http://localhost:8080/api/commands/status/550e8400-e29b-41d4-a716-446655440
 # 6. List events
 curl "http://localhost:8080/api/events?node_id=deis-runtime-1&limit=10"
 
-# 7. Get Prometheus metrics
-curl http://localhost:8080/api/metrics
+# 7. Get Prometheus metrics (a credential, unless the scrape is on this box
+#    and api_auth_enabled is off)
+curl -H "Authorization: Bearer $DEIS_TOKEN" http://localhost:8080/api/metrics
 ```
 
 ---

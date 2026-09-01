@@ -44,7 +44,7 @@ pub use compatibility::{
     CompatibilityDate, CompatibilityProfile, DeclaredCompatibility, FLAGS, Flag, FlagSpec,
     PLATFORM_KNOWN_THROUGH, flag_spec, known_flag_names,
 };
-pub use headers::{HeaderField, HeaderRule, HeaderTable, parse_headers};
+pub use headers::{HeaderField, HeaderNamesWritten, HeaderRule, HeaderTable, parse_headers};
 pub use limits::DeclaredLimits;
 pub use path::{percent_decode, percent_encode_uri};
 pub use redirects::{

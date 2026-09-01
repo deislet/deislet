@@ -29,7 +29,6 @@
 //!   it was added. See [`crate::PLATFORM_HEADER_PREFIX`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Weak;
 
@@ -37,7 +36,8 @@ use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
 
-use super::ops::{AppId, SubrequestBudget};
+use super::header_list::{self, HeaderPairs};
+use super::ops::{subrequest_allowance, AppId, SubrequestAllowance};
 use super::pool::RuntimePool;
 use super::service_call::{
     caller_allowance, collect_body, CallPath, ServiceBindings, ServiceCall, ServiceCallError,
@@ -80,7 +80,7 @@ impl ServiceRouter {
 #[derive(Serialize)]
 pub struct ServiceCallResult {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: HeaderPairs,
     pub body: ToJsBuffer,
 }
 
@@ -93,8 +93,10 @@ pub struct ServiceRequest {
     /// is not a URL to anywhere: the callee is addressed by name, and this is
     /// only what its router matches on.
     pub url: String,
+    /// `[[name, value], ...]`, in the order the caller wrote them, repeats
+    /// included; see [`super::header_list`].
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: HeaderPairs,
 }
 
 /// Call another application on this platform.
@@ -112,6 +114,10 @@ async fn op_deis_service_call(
     #[string] binding: String,
     #[serde] request: ServiceRequest,
     #[buffer] body: Option<JsBuffer>,
+    /// Which stretch of application code is making the call, so the callee is
+    /// charged to the right allowance; see
+    /// [`super::ops::subrequest_allowance`].
+    scope: u32,
 ) -> Result<ServiceCallResult, JsErrorBox> {
     let (router, bindings, path, caller, trace_id, budget, subrequests) = {
         let state = state.borrow();
@@ -131,7 +137,10 @@ async fn op_deis_service_call(
             // hop of, and it is the platform's account of that, not a claim.
             super::ops::current_trace_id(&state),
             super::fetch_ops::budget_ms(&state),
-            state.try_borrow::<Rc<SubrequestBudget>>().cloned(),
+            // The allowance this call belongs to, resolved once from the scope
+            // the caller named, so the charge and the refunds below act on the
+            // same one; see `fetch_ops`.
+            subrequest_allowance(&state, scope),
         )
     };
 
@@ -241,12 +250,23 @@ async fn op_deis_service_call(
     // further in, and including a header no component has invented yet.
     // Replacing only `x-deis-caller` left all of those crossing into the
     // callee as though the platform had written them.
+    //
+    // A list and not a map, for the reason `crate::runtime::header_list`
+    // gives: a callee is a handler like any other, and a call that forwarded
+    // the two `Cookie` lines of the request it is a hop of used to deliver one
+    // of them.
     let mut headers = request.headers;
-    let swept: Vec<String> = headers
-        .keys()
+    // Each name once, however many times the caller wrote it: the list below
+    // is only ever read by the log line, and "2 header(s): x-deis-caller,
+    // x-deis-caller" would have an operator looking for a second header that
+    // does not exist.
+    let mut swept: Vec<String> = headers
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
         .filter(|name| crate::is_platform_header(name))
-        .cloned()
         .collect();
+    swept.sort();
+    swept.dedup();
     // The two routing headers are said nothing about. A caller that built its
     // call out of the request it is serving forwards them without meaning
     // anything by it -- they are what this node stamped on its own inbound
@@ -278,10 +298,11 @@ async fn op_deis_service_call(
             claimed.join(", ")
         );
     }
-    for name in swept {
-        headers.remove(&name);
-    }
-    headers.insert(CALLER_HEADER.to_string(), caller.clone());
+    headers.retain(|(name, _)| !crate::is_platform_header(name));
+    // One value, whatever the caller sent: this is the node's own account of
+    // who is calling, and a second value would be read by the callee as a
+    // comma-joined pair of callers.
+    header_list::set_unique(&mut headers, CALLER_HEADER, caller.clone());
 
     let call = ServiceCall {
         path: chain,
@@ -292,7 +313,18 @@ async fn op_deis_service_call(
         url: format!("{SERVICE_CALL_ORIGIN}{}", request.url),
         method: request.method,
         headers,
-        body: body.map(|body| body.to_vec()),
+        // Empty stays absent, exactly as it does on the inbound HTTP path in
+        // `dispatcher/handlers.rs`: a request with no body and one with a
+        // zero-length body are the same thing to a handler, and `new
+        // Request(url, { body })` refuses an empty body on a GET. Reading the
+        // body off a `Request` the caller passed -- which is the documented
+        // shape, `bindings.AUTH.fetch(context.request)` -- yields a
+        // zero-length buffer for every GET, so without this the callee's
+        // handler failed before it ran, with a message about a method it
+        // never chose.
+        body: body
+            .map(|body| body.to_vec())
+            .filter(|body| !body.is_empty()),
     };
 
     let outcome = pool
@@ -365,12 +397,12 @@ async fn op_deis_service_call(
 /// "it failed": a call that reached the callee spent a runtime thread and the
 /// callee did whatever it did, so it counts, exactly as a `fetch` that came
 /// back with a 500 counts.
-fn refund(should: bool, subrequests: &Option<Rc<SubrequestBudget>>) {
+fn refund(should: bool, subrequests: &Option<Rc<SubrequestAllowance>>) {
     if !should {
         return;
     }
-    if let Some(budget) = subrequests {
-        budget.refund();
+    if let Some(allowance) = subrequests {
+        allowance.refund();
     }
 }
 

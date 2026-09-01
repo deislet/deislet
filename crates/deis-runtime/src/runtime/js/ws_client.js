@@ -88,6 +88,27 @@ const TextEncoder = encoding.TextEncoder;
 const Blob = file.Blob;
 const utf8 = new TextEncoder();
 
+// Which stretch of application code is dialling, so the connection is charged
+// to the right outbound-call allowance.
+//
+// An outbound WebSocket costs one subrequest, out of the same allowance an
+// outbound `fetch` spends, and which allowance that is depends on whether the
+// caller is an invocation or the producer of a response stream that outlived
+// one -- see `runtime/ops.rs`. The answer lives in `bootstrap.js`, beside the
+// sets that decide which stretch owns a timer, and it cannot be imported from
+// here: `bootstrap.js` imports *this* file, so reaching back would be a cycle.
+// It is handed over instead, once, while the isolate is being built. Until
+// then -- and in any build that never hands one over -- every dial is charged
+// to the invocation, which is the always-bounded answer.
+let readScope = () => 0;
+
+// Take the reader `bootstrap.js` holds. Called once, from there, and by
+// nothing an application can reach: this module's exports are consumed by
+// `bootstrap.js` and never published on the global object.
+function useChargedScope(reader) {
+  if (typeof reader === "function") readScope = reader;
+}
+
 const CONNECTING = 0;
 const OPEN = 1;
 const CLOSING = 2;
@@ -329,6 +350,7 @@ class WebSocket extends event.EventTarget {
         this.#url,
         op_deis_fetch_budget_ms(),
         protocols,
+        readScope(),
       );
     } catch (e) {
       // A refusal by the outbound policy arrives here, and reaches the
@@ -485,4 +507,4 @@ event.defineEventHandler(WebSocket.prototype, "message");
 event.defineEventHandler(WebSocket.prototype, "error");
 event.defineEventHandler(WebSocket.prototype, "close");
 
-export { WebSocket };
+export { useChargedScope, WebSocket };

@@ -11,7 +11,7 @@
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use deis_bundle::HeaderField;
+use deis_bundle::{HeaderField, HeaderNamesWritten};
 
 use super::{if_none_match_matches, AssetAnswer, AssetHit, AssetOutcome};
 
@@ -123,7 +123,19 @@ fn redirect_response(status: u16, location: &str, extra: &[HeaderField]) -> Resp
 /// again when the version loads (`deis_bundle::headers`), so nothing here has
 /// to re-litigate that; what is left is a value that turned out not to be a
 /// legal header, which is dropped rather than allowed to fail the request.
+///
+/// This is the last line that touches these headers before they go on the
+/// wire, and it used to `insert` every one of them. `insert` replaces every
+/// value a name already has, so a block that set `Link` twice put one preload
+/// on the response and dropped the other, and a block that set `Set-Cookie`
+/// twice sent one cookie of two - after the parser, the table and the manifest
+/// had all carried both correctly. Only the first value of a name replaces
+/// what the response already carries; the rest are appended, which is what
+/// [`HeaderNamesWritten`] decides. A value dropped just above never claims its
+/// name, so if the first `Cache-Control` an author wrote is unusable the
+/// second still overrides the node's own rather than landing beside it.
 fn apply_site_headers(response: &mut Response, extra: &[HeaderField]) {
+    let mut written = HeaderNamesWritten::for_fields(extra);
     for field in extra {
         let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(field.name.as_bytes()),
@@ -135,7 +147,11 @@ fn apply_site_headers(response: &mut Response, extra: &[HeaderField]) {
             );
             continue;
         };
-        response.headers_mut().insert(name, value);
+        if written.replaces(&field.name) {
+            response.headers_mut().insert(name, value);
+        } else {
+            response.headers_mut().append(name, value);
+        }
     }
 }
 

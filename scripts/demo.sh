@@ -55,6 +55,17 @@ ACME_ZONE="deislet.test"
 # app gets its own KV, database, blob and queue namespace and cannot read or
 # overwrite what production stored.
 APP_SRC_DIR="${APP_SRC_DIR:-${ROOT_DIR}/scripts/demo-assets/example-app}"
+# A second, much smaller project, built and never deployed. The example app
+# above declares queues, cron, KV and a service binding, and `deis build`
+# refuses to build it for Deno Deploy because Deno Deploy has no queues - so
+# the one project the demo deploys cannot also be the one that shows four
+# targets coming out of one source tree. This is that one: a fetch handler and
+# nothing else, which every vendor here can host.
+PORTABLE_SRC_DIR="${PORTABLE_SRC_DIR:-${ROOT_DIR}/scripts/demo-assets/portable-app}"
+# The string that handler answers with. Every vendor's output is searched for
+# it, so an adapter that laid down the right file names around none of the
+# application fails rather than passes.
+PORTABLE_MARKER="portable-handler-marker"
 APP_ID="${APP_ID:-demo}"
 # The second application, which the example app calls through a service
 # binding. Two applications is the smallest arrangement in which the question
@@ -583,6 +594,15 @@ start_origin() {
   # subrequest ceiling, which counts every hop a redirect chain takes -- so a
   # handler containing exactly one `fetch` can exhaust the ceiling, and that
   # cannot be shown against a destination that answers straight away.
+  #
+  # /redirect-to is the third, and it is the security half of the same
+  # sentence: it answers 302 with whatever Location it is handed. Every hop of
+  # /redirect stays inside this origin, which the node allows, so a node that
+  # judged only the URL the application named would pass the ceiling check
+  # unchanged. Pointing a hop somewhere the policy refuses is the only way to
+  # show that each hop is judged, and it needs an origin willing to send a
+  # visitor off its own address -- which is what an open redirect on a
+  # perfectly ordinary upstream is.
   cat > "${dir}/origin.py" <<'ORIGIN_PY'
 import functools
 import http.server
@@ -603,6 +623,9 @@ class Origin(http.server.SimpleHTTPRequestHandler):
         if parsed.path == "/redirect":
             self.send_redirect(urllib.parse.parse_qs(parsed.query))
             return
+        if parsed.path == "/redirect-to":
+            self.send_redirect_to(urllib.parse.parse_qs(parsed.query))
+            return
         super().do_GET()
 
     def send_redirect(self, query):
@@ -612,6 +635,16 @@ class Origin(http.server.SimpleHTTPRequestHandler):
         target = "/redirect?hops=%d" % (hops - 1) if hops > 1 else "/payload.txt"
         self.send_response(302)
         self.send_header("Location", target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def send_redirect_to(self, query):
+        # One hop, to an address chosen by the caller. The Location is sent
+        # exactly as given, absolute host and all: what is being exercised is
+        # a hop that leaves this origin, so rewriting it to something local
+        # would remove the only thing this route is for.
+        self.send_response(302)
+        self.send_header("Location", query.get("url", ["/payload.txt"])[0])
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -2277,6 +2310,147 @@ check_route_parameter() {
 }
 
 # ----------------------------------------------------------------------
+# The proxy choosing an application by host *and* path prefix
+# ----------------------------------------------------------------------
+#
+# The README puts "host and path prefix" in bold, and until this check nothing
+# exercised the second half. Every request the demo sends through deis-proxy
+# either carries `x-deis-app-id` - which names an application outright and
+# never consults a route - or reaches an environment's automatic address under
+# `routing.preview_zone`, which is a host and nothing else. A proxy that
+# ignored `path_prefix` entirely, or matched it as a plain string prefix, left
+# all of that green.
+#
+# The catalog is what this reads from, and it is reached with curl rather than
+# with `deis`: routes are an operator's object and the CLI has no verb for one
+# (the same reason `upload_altered_bundle` above talks to the control plane
+# directly). What is under test is the proxy, not the command.
+
+# A host two applications are bound to here, one of them under a path prefix
+# of the other.
+#
+# One label on purpose. deis-proxy orders a certificate for every host in the
+# routing table, and `is_certifiable_name` in crates/deis-proxy/src/acme/names.rs
+# leaves out anything that is not a public host name - a single label among
+# them, since there is no registered domain for an authority to check. So this
+# name routes without adding an order at the stub authority, which is what the
+# certificate checks below count.
+ROUTED_HOST="${ROUTED_HOST:-deislet-edge}"
+# The prefix the second application answers under, and a path that begins with
+# the same letters while being outside it. `/verifyx` is the case a plain
+# string prefix would swallow.
+ROUTED_PREFIX="/verify"
+ROUTED_NEAR_MISS="/verifyx"
+
+# Create one route unless the catalog already has it.
+#
+# `verify` can be run twice against one demo and the catalog accepts duplicate
+# routes without complaint, so a second run would otherwise pile up rules that
+# say the same thing.
+ensure_catalog_route() {
+  local app=$1 environment=$2 host=$3 prefix=$4
+  local existing
+  existing=$(curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)/api/routes" \
+    | jq -r --arg app "$app" --arg host "$host" --arg prefix "$prefix" \
+      '[.routes[] | select(.app_id == $app and .host == $host and .path_prefix == $prefix)] | length' \
+    2>/dev/null || echo 0)
+  if [ "${existing:-0}" -ge 1 ]; then
+    return 0
+  fi
+  curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${API_KEY}" -H 'content-type: application/json' \
+    -d "{\"host\":\"${host}\",\"path_prefix\":\"${prefix}\",\"priority\":0}" \
+    "$(control_url)/api/apps/${app}/environments/${environment}/routes"
+}
+
+# One request through deis-proxy for a host the catalog claims, with no
+# `x-deis-app-id` on it. The absence is the point: with the header there is
+# nothing for a route to decide.
+routed_request() {
+  local host=$1
+  local path=$2
+  local header_file=$3
+  curl -s -D "$header_file" -m 10 --noproxy '*' -H "Host: ${host}" \
+    "http://127.0.0.1:${DEIS_PROXY_PORT}${path}"
+}
+
+check_the_proxy_routes_by_host_and_path_prefix() {
+  local title="deis-proxy picks the application by host and path prefix, not by host alone"
+  local created_root created_prefix
+
+  created_root=$(ensure_catalog_route "$APP_ID" "$ENV_NAME" "$ROUTED_HOST" "/")
+  created_prefix=$(ensure_catalog_route "$CALLEE_APP_ID" "$ENV_NAME" "$ROUTED_HOST" "$ROUTED_PREFIX")
+  case "${created_root}${created_prefix}" in
+    *4[0-9][0-9]*|*5[0-9][0-9]*)
+      fail_check "$title" \
+        "the catalog refused a route: / -> ${APP_ID} answered '${created_root}', ${ROUTED_PREFIX} -> ${CALLEE_APP_ID} answered '${created_prefix}'"
+      return
+      ;;
+  esac
+
+  # The proxy pulls the routing table on its own schedule, so the condition is
+  # polled rather than waited out: what ends this loop is the prefix route
+  # answering, which is the same fact the check is about.
+  local headers="${LOG_DIR}/verify-routed.headers"
+  local rounds=30 body=""
+  while [ "$rounds" -gt 0 ]; do
+    body=$(routed_request "$ROUTED_HOST" "$ROUTED_PREFIX" "$headers")
+    case "$body" in
+      *'"handlerOf"'*) break ;;
+    esac
+    rounds=$((rounds - 1))
+    poll_pause
+  done
+
+  local prefix_status prefix_handler
+  prefix_status=$(http_status "$headers")
+  prefix_handler=$(echo "$body" | jq -r '.handlerOf // empty' 2>/dev/null || true)
+  if [ "$prefix_handler" != "verify" ]; then
+    fail_check "$title" \
+      "http://${ROUTED_HOST}${ROUTED_PREFIX} through deis-proxy did not reach ${CALLEE_APP_ID}: HTTP ${prefix_status:-none}, body $(printf '%s' "$body" | tr '\n' ' ' | head -c 200)"
+    return
+  fi
+
+  # The same host, a path the prefix does not cover: the other application.
+  local root_body root_label
+  root_body=$(routed_request "$ROUTED_HOST" "/hello/routed" "${LOG_DIR}/verify-routed-root.headers")
+  root_label=$(echo "$root_body" | jq -r '.label // empty' 2>/dev/null || true)
+
+  # A path that starts with the same letters and is not inside the prefix. It
+  # belongs to the `/` route, so the answer is the other application's own
+  # not-found page - which no other application on this demo serves.
+  local near_body near_status
+  near_body=$(routed_request "$ROUTED_HOST" "$ROUTED_NEAR_MISS" "${LOG_DIR}/verify-routed-near.headers")
+  near_status=$(http_status "${LOG_DIR}/verify-routed-near.headers")
+
+  # And a host nothing claims, so that "the host decided it" is observed and
+  # not assumed: without this the two answers above would also be produced by
+  # a proxy that routed on the path alone.
+  local stranger_status
+  stranger_status=$(curl -s -o /dev/null -w '%{http_code}' -m 10 --noproxy '*' \
+    -H "Host: nothing-claims-this" "http://127.0.0.1:${DEIS_PROXY_PORT}${ROUTED_PREFIX}")
+
+  if [ "$root_label" != "v1" ]; then
+    fail_check "$title" \
+      "${ROUTED_PREFIX} reached ${CALLEE_APP_ID}, but /hello/routed on the same host did not reach ${APP_ID}: $(printf '%s' "$root_body" | tr '\n' ' ' | head -c 200)"
+    return
+  fi
+  if [ "$near_status" != "404" ] || ! echo "$near_body" | grep -q "$SITE_NOT_FOUND_MARKER"; then
+    fail_check "$title" \
+      "${ROUTED_NEAR_MISS} answered HTTP ${near_status} without ${APP_ID}'s own not-found page, so the ${ROUTED_PREFIX} route is matching on letters rather than on path segments and has captured a path that is not under it: $(printf '%s' "$near_body" | tr '\n' ' ' | head -c 160)"
+    return
+  fi
+  if [ "$stranger_status" != "404" ]; then
+    fail_check "$title" \
+      "${ROUTED_PREFIX} on a host no route claims answered HTTP ${stranger_status} rather than 404, so the host is not part of the decision and these routes are answering for every name that reaches this proxy"
+    return
+  fi
+
+  pass_check "$title" \
+    "two routes on the one host ${ROUTED_HOST}: / to ${APP_ID}/${ENV_NAME} and ${ROUTED_PREFIX} to ${CALLEE_APP_ID}/${ENV_NAME}. With no x-deis-app-id on any of them, GET ${ROUTED_PREFIX} answered HTTP ${prefix_status} from ${CALLEE_APP_ID}'s own handler (handlerOf=${prefix_handler}), GET /hello/routed answered from ${APP_ID} version ${root_label}, GET ${ROUTED_NEAR_MISS} answered ${APP_ID}'s 404 page because a prefix covers whole path segments and not the letters they start with, and the same ${ROUTED_PREFIX} on a host nothing claims answered HTTP ${stranger_status}"
+}
+
+# ----------------------------------------------------------------------
 # The WebSocket hop
 # ----------------------------------------------------------------------
 #
@@ -2864,6 +3038,14 @@ check_a_producer_that_throws_leaves_a_failed_transfer() {
   fi
 }
 
+# How many times this node has said, at warn, that it closed a stream for
+# running past its budget. Counted rather than merely looked for: several
+# checks leave a stream behind that meets the same fate, so what is evidence
+# about one of them is the number this grows by while it runs.
+stream_budget_log_lines() {
+  node_log | grep " WARN " | grep -c "is past stream_timeout_ms" || true
+}
+
 check_a_stream_past_its_budget_is_closed_by_the_node() {
   local title="a stream that runs past stream_timeout_ms is closed by the node"
   local report="${LOG_DIR}/verify-stream-budget.json"
@@ -2873,6 +3055,15 @@ check_a_stream_past_its_budget_is_closed_by_the_node() {
     fail_check "$title" "python3 is not installed, so no stream was opened"
     return
   fi
+
+  # How many times the node has already said this, before this check opens
+  # anything. The count matters because the line is not this check's alone:
+  # the parallel-request check above abandons an endless stream of its own,
+  # which this node then closes at the same ceiling and logs in the same
+  # words. Asserting only that the line exists was therefore satisfied before
+  # this stream was opened, and said nothing about it.
+  local logged_before
+  logged_before=$(stream_budget_log_lines)
 
   # Read for well past the ceiling. The node is what has to end this, and the
   # client keeps asking until it does.
@@ -2889,16 +3080,21 @@ check_a_stream_past_its_budget_is_closed_by_the_node() {
 
   local floor=$(( DEMO_STREAM_TIMEOUT_MS / 2 ))
   local ceiling=$(( DEMO_STREAM_TIMEOUT_MS * 2 ))
-  local logged
-  logged=$(grep -c "is past stream_timeout_ms" "${LOG_DIR}/deis-runtime.log" 2>/dev/null || echo 0)
+  # Only the lines this check caused, and only lines carrying the level the
+  # evidence claims. `stream_budget_log_lines` counts at warn, so a line
+  # demoted to debug - which is where a message stops being something an
+  # operator sees - fails here rather than passing on the wording alone.
+  local logged said
+  logged=$(( $(stream_budget_log_lines) - logged_before ))
+  said=$(node_log | grep " WARN " | grep "is past stream_timeout_ms" | tail -n 1)
 
   if [ "$timed_out" != "true" ] && [ "$clean" != "true" ] \
     && [ "$last" -ge "$floor" ] && [ "$last" -le "$ceiling" ] && [ "$logged" -ge 1 ]; then
     pass_check "$title" \
-      "an endless stream ran for ${last}ms against the ${DEMO_STREAM_TIMEOUT_MS}ms ceiling this node is configured with, delivered ${frames} frame(s), and was then ended without its terminating chunk. The node's log says why, at warn, ${logged} time(s): \"is past stream_timeout_ms\""
+      "an endless stream ran for ${last}ms against the ${DEMO_STREAM_TIMEOUT_MS}ms ceiling this node is configured with, delivered ${frames} frame(s), and was then ended without its terminating chunk. The node wrote ${logged} new line(s) at warn about it while this check ran, the last of them: \"$(printf '%s' "$said" | log_message | head -c 200)\""
   else
     fail_check "$title" \
-      "expected the node to close the stream between ${floor}ms and ${ceiling}ms and to say so; last frame at ${last}ms, clean_end=${clean}, client gave up=${timed_out}, log lines=${logged}"
+      "expected the node to close the stream between ${floor}ms and ${ceiling}ms and to say so at warn; last frame at ${last}ms, clean_end=${clean}, client gave up=${timed_out}, new warn line(s) about the ceiling=${logged}"
   fi
 }
 
@@ -2972,9 +3168,22 @@ check_a_request_is_served_while_a_stream_is_open() {
   fi
 }
 
+# How many times this node has said, at warn, that it cleared timers an
+# invocation left armed. The same counted-not-found reason as
+# `stream_budget_log_lines`: a `verify` run twice against one demo would
+# otherwise satisfy the assertion below with the first run's line.
+timer_cleared_log_lines() {
+  node_log | grep " WARN " | grep -c "were still armed when this invocation ended" || true
+}
+
 check_no_timer_outlives_the_request_that_armed_it() {
   local title="no timer outlives the request that armed it, however the handler files it"
   local headers="${LOG_DIR}/verify-timers.headers"
+
+  # Before anything is armed, so the line quoted at the end is one this
+  # request caused.
+  local said_before
+  said_before=$(timer_cleared_log_lines)
 
   # One request arms everything it can; a second, in the same isolate, reads
   # whether any of it is still ticking. Two requests is the whole point: a timer
@@ -3007,20 +3216,24 @@ check_no_timer_outlives_the_request_that_armed_it() {
 
   # The node has to say what it cleared, with the numbers: an operator whose
   # application is slower than it should be needs this line to be findable.
-  local said
-  said=$(grep -h "were still armed when this invocation ended" \
-    "${LOG_DIR}/deis-runtime.log" 2>/dev/null | tail -1 || true)
+  # At warn, which is what the evidence below claims and what nothing used to
+  # read - the old grep took the last line matching the words, which for a
+  # message this long is tracing's wrapped continuation and carries no level
+  # at all.
+  local said_after said
+  said_after=$(timer_cleared_log_lines)
+  said=$(node_log | grep " WARN " | grep "were still armed when this invocation ended" | tail -n 1)
 
   if [ "$armed_interval" -gt 0 ] && [ "$armed_timeout" -gt 0 ] \
     && [ "$scope" = "undefined" ] && [ "$claim" = "null" ] \
     && [ "${invented#threw:}" != "$invented" ] && [ "${adopted#threw:}" != "$adopted" ] \
     && [ "$after_i" = "$before_i" ] && [ "$after_t" = "$before_t" ] \
-    && [ "$after_o" = "$before_o" ] && [ -n "$said" ]; then
+    && [ "$after_o" = "$before_o" ] && [ "$said_after" -gt "$said_before" ]; then
     pass_check "$title" \
       "the arming request watched its own timers fire (${armed_interval} interval tick(s), ${armed_timeout} tick(s) of a setTimeout that rearms itself) and could reach neither door to the runtime's ownership of them: __deis_runtime_stream_scope is ${scope} and the claim answers ${claim}, so enter() ${invented} and adopt() ${adopted}. A later request through the same isolate then sat for 250ms and none of the three counters moved (${before_i}/${before_t}/${before_o}). The node said so at warn: \"$(printf '%s' "$said" | sed 's/.*: //' | head -c 160)\""
   else
     fail_check "$title" \
-      "arming request: intervalTicks=${armed_interval} timeoutTicks=${armed_timeout} scope=${scope} claim=${claim} invented=${invented} adopted=${adopted}; later request: intervals ${before_i}->${after_i}, timeouts ${before_t}->${after_t}, redirected ${before_o}->${after_o}; node log line: \"${said}\""
+      "arming request: intervalTicks=${armed_interval} timeoutTicks=${armed_timeout} scope=${scope} claim=${claim} invented=${invented} adopted=${adopted}; later request: intervals ${before_i}->${after_i}, timeouts ${before_t}->${after_t}, redirected ${before_o}->${after_o}; warn lines naming cleared timers went ${said_before} -> ${said_after} and the last one reads \"$(printf '%s' "${said:-<none>}" | log_message | head -c 160)\""
   fi
 }
 
@@ -3681,6 +3894,176 @@ check_a_single_value_cannot_be_bigger_than_a_row_may_be() {
     fail_check "$title" \
       "expected a refusal naming the 8388608-byte value ceiling; the call exited ${rc} saying: $(echo "$message" | head -c 300)"
   fi
+}
+
+# ----------------------------------------------------------------------
+# What a tenant's SQL may touch
+# ----------------------------------------------------------------------
+#
+# The two checks above are about what a statement may *cost*. This one is
+# about what it may *reach*, which is the question the cost ceilings leave
+# entirely open - and the only one of the three storage services where nothing
+# asked it. KV has check_a_binding_cannot_reach_another_tenant and blob has
+# the tenant its capability token names; SQL had the runaway query and the
+# oversized cell, and neither of them would notice if every tenant's statement
+# ran against every tenant's file.
+#
+# A file per tenant is not by itself isolation, because plain SQLite can name
+# a second file: `PRAGMA database_list` hands a caller the absolute path of
+# its own database, which is every other tenant's path with one component
+# changed; `ATTACH DATABASE` then opens that path to read and write; `VACUUM
+# INTO` writes a copy of the caller's data anywhere the process can write. All
+# three are ordinary SQL and all three arrive through the same
+# `context.services.database` an application already has.
+#
+# So the boundary is held under the SQL, by an authorizer callback and by
+# `SQLITE_LIMIT_ATTACHED` pinned to zero
+# (crates/deis-store/src/database.rs). This is the witness that it is held,
+# driven the way a person drives it: `deis db`, once as each of two tenants of
+# the same application, with the second one naming the first one's file by its
+# real path on this machine.
+
+# Run one statement as one tenant, and echo the exit status followed by
+# everything the command said, on one line.
+#
+# Both halves are asserted on by the check below and they fail differently: a
+# refusal that came back as an exit status with no message teaches an
+# application author nothing, and a refusal reported in prose that exited zero
+# is one no script can branch on.
+tenant_sql() {
+  local environment=$1
+  local verb=$2
+  local sql=$3
+  local out="${LOG_DIR}/verify-sql-isolation.log"
+  local rc=0
+  case "$verb" in
+    execute)
+      deis_cli db execute -y -e "$environment" "$sql" --json > "$out" 2>&1 || rc=$?
+      ;;
+    *)
+      deis_cli db query -e "$environment" "$sql" --json > "$out" 2>&1 || rc=$?
+      ;;
+  esac
+  printf '%s %s\n' "$rc" "$(tr '\n' ' ' < "$out" | sed 's/  */ /g')"
+}
+
+check_a_tenants_sql_cannot_reach_another_tenants_tables_or_files() {
+  local title="one tenant's SQL cannot read another tenant's tables, or name its file"
+  local table="tenant_isolation_probe"
+  local marker="only-${ENV_NAME}-may-read-this-$$-${RANDOM}"
+  # Where deis-store keeps this tenant's file: <data_dir>/db/<tenant>.sqlite,
+  # the layout crates/deis-store/src/database.rs documents. Spelled out here
+  # because the whole point is that the other tenant names a path that really
+  # exists and really holds the rows below - a refusal to open a file that was
+  # not there would prove nothing.
+  local victim_file="${DEMO_DIR}/deis-store-data/db/${APP_ID}.${ENV_NAME}.sqlite"
+  local answer rc message
+
+  answer=$(tenant_sql "$ENV_NAME" execute \
+    "CREATE TABLE IF NOT EXISTS ${table} (marker TEXT)")
+  if [ "${answer%% *}" != "0" ]; then
+    fail_check "$title" "${ENV_NAME} could not create ${table}: ${answer#* }"
+    return
+  fi
+  answer=$(tenant_sql "$ENV_NAME" execute \
+    "INSERT INTO ${table} (marker) VALUES ('${marker}')")
+  if [ "${answer%% *}" != "0" ]; then
+    fail_check "$title" "${ENV_NAME} could not write its marker row: ${answer#* }"
+    return
+  fi
+
+  answer=$(tenant_sql "$ENV_NAME" query \
+    "SELECT marker FROM ${table} WHERE marker = '${marker}'")
+  case "${answer#* }" in
+    *"$marker"*) ;;
+    *)
+      fail_check "$title" \
+        "${ENV_NAME} cannot read back its own row, so there is nothing for the other tenant to be kept away from: ${answer#* }"
+      return
+      ;;
+  esac
+
+  if [ ! -f "$victim_file" ]; then
+    fail_check "$title" \
+      "${ENV_NAME} wrote a row but ${victim_file} does not exist, so the path the other tenant names below is not the file holding it and every refusal after this would be about nothing"
+    return
+  fi
+
+  # Now the other tenant. The same application, its other environment, which
+  # this platform charges as a separate tenant - so this is the case an
+  # application author actually meets, and not a contrived second app.
+  local read_rc read_message attach_rc attach_message expr_rc expr_message
+  local pragma_rc pragma_message vacuum_rc vacuum_message
+  local copy="${DEMO_DIR}/sql-isolation-copy-$$.sqlite"
+
+  answer=$(tenant_sql "$PREVIEW_ENV_NAME" query "SELECT marker FROM ${table}")
+  read_rc=${answer%% *}; read_message=${answer#* }
+  answer=$(tenant_sql "$PREVIEW_ENV_NAME" query \
+    "ATTACH DATABASE '${victim_file}' AS victim")
+  attach_rc=${answer%% *}; attach_message=${answer#* }
+  # The same ATTACH with the filename built by an expression, which is the
+  # spelling SQLite cannot hand to the authorizer: it arrives with the name
+  # missing and has to be refused on the action alone.
+  answer=$(tenant_sql "$PREVIEW_ENV_NAME" query \
+    "ATTACH DATABASE ('${victim_file}' || '') AS victim")
+  expr_rc=${answer%% *}; expr_message=${answer#* }
+  # How a tenant would learn the path in the first place.
+  answer=$(tenant_sql "$PREVIEW_ENV_NAME" query "PRAGMA database_list")
+  pragma_rc=${answer%% *}; pragma_message=${answer#* }
+  # And writing a file rather than reading one.
+  answer=$(tenant_sql "$PREVIEW_ENV_NAME" execute "VACUUM INTO '${copy}'")
+  vacuum_rc=${answer%% *}; vacuum_message=${answer#* }
+
+  local copied=no
+  [ -e "$copy" ] && copied=yes
+  rm -f "$copy"
+
+  if [ "$read_rc" = "0" ] || [ "$attach_rc" = "0" ] || [ "$expr_rc" = "0" ] \
+    || [ "$pragma_rc" = "0" ] || [ "$vacuum_rc" = "0" ] || [ "$copied" = "yes" ]; then
+    fail_check "$title" \
+      "${APP_ID}.${PREVIEW_ENV_NAME} was allowed something it must not be: SELECT exited ${read_rc}, ATTACH ${attach_rc}, ATTACH from an expression ${expr_rc}, PRAGMA database_list ${pragma_rc}, VACUUM INTO ${vacuum_rc} (wrote a file: ${copied}). The SELECT said: $(printf '%s' "$read_message" | head -c 200)"
+    return
+  fi
+
+  # The refusals also have to say which rule refused them. "database error"
+  # on all five would be this same set of exit codes and would leave an
+  # author with nothing to act on.
+  case "$read_message" in
+    *"no such table"*) ;;
+    *)
+      fail_check "$title" \
+        "${PREVIEW_ENV_NAME} was refused the read, but not as a table it does not have: ${read_message}. It matters which: a tenant whose statement failed for some other reason may still be looking at the wrong file"
+      return
+      ;;
+  esac
+  local refusal
+  for refusal in "$attach_message" "$expr_message"; do
+    case "$refusal" in
+      *ATTACH*) ;;
+      *)
+        fail_check "$title" \
+          "an ATTACH from ${PREVIEW_ENV_NAME} was refused without naming ATTACH: ${refusal}"
+        return
+        ;;
+    esac
+  done
+  case "$pragma_message" in
+    *"PRAGMA database_list"*) ;;
+    *)
+      fail_check "$title" "PRAGMA database_list was refused without naming itself: ${pragma_message}"
+      return
+      ;;
+  esac
+  case "$vacuum_message" in
+    *VACUUM*) ;;
+    *)
+      fail_check "$title" "VACUUM INTO was refused without naming VACUUM: ${vacuum_message}"
+      return
+      ;;
+  esac
+
+  pass_check "$title" \
+    "${APP_ID}.${ENV_NAME} wrote a row only it should see into ${table}, and it is in ${victim_file} on this machine. ${APP_ID}.${PREVIEW_ENV_NAME} - the same application, the other environment, a separate tenant - selected from that table and was told \"$(printf '%s' "$read_message" | sed 's/^error: //' | head -c 90)\"; naming the file outright was refused (\"$(printf '%s' "$attach_message" | sed 's/^error: //' | head -c 120)\"), and so was the same ATTACH with the path built by an expression, PRAGMA database_list that would have told it the path, and VACUUM INTO, which wrote no file. Five statements, five refusals, each naming what it refused"
 }
 
 # ----------------------------------------------------------------------
@@ -4935,9 +5318,16 @@ check_app_fetch_allowed() {
 # and a call that gets through is a failure - not a curiosity, and not
 # something to note and move on from.
 #
-# Note what is *not* asserted: no wording, no status code, no particular
-# refusal message. Only that the application did not reach it. Any refusal
-# passes; only an answer fails.
+# Nothing is asserted about what the *handler* was told: no wording, no status
+# code, no particular refusal message. A refusal reaches an application as an
+# ordinary failed fetch and that is all it has to be.
+#
+# What is asserted is why the node did not make the call, read from the node's
+# own line rather than from the message the handler caught. Without it this
+# check passed on a destination that was merely unreachable - a name that does
+# not resolve, a port nothing listens on - because from inside the isolate
+# those are the same answer, and the sentence it printed about the policy was
+# this script's opinion rather than something anybody had observed.
 check_app_fetch_refused() {
   local title="a handler's fetch to deis-store is refused"
   local target="http://127.0.0.1:${DEIS_STORE_PORT}/"
@@ -4965,8 +5355,128 @@ check_app_fetch_refused() {
     return
   fi
 
+  # The node's own account of the decision, naming this destination and the
+  # rule that stopped it. A DNS failure or a dead port produces a line here
+  # too, and it says something else - which is the whole reason to read it.
+  local refused_line
+  refused_line=$(node_log 2>/dev/null \
+    | grep -m 1 "Refused an outbound fetch from ${APP_ID}.${ENV_NAME} to ${target}:" || true)
+  case "$refused_line" in
+    *"the platform's own service endpoints"*) ;;
+    *)
+      fail_check "$title" \
+        "the call was not made (${error}), but the node's line for ${target} does not say the egress policy refused it as one of the platform's own service endpoints: \"$(printf '%s' "${refused_line:-never written}" | log_message | head -c 200)\". An address that is merely unreachable answers the handler exactly the same way, so without that line this check would report a policy it never saw"
+      return
+      ;;
+  esac
+
   pass_check "$title" \
-    "the handler asked for ${target} and the platform did not make the call: ${error}. It sits on the same loopback interface as the origin the same handler reaches freely, so what stopped it is the policy and not the network"
+    "the handler asked for ${target} and the platform did not make the call: ${error}. The node says why, at warn: \"$(printf '%s' "$refused_line" | log_message | head -c 200)\" - so what stopped it is the policy, not the network it sits on with the origin this same handler reaches freely"
+}
+
+# The security half of what a redirect chain costs.
+#
+# check_a_redirect_chain_costs_a_subrequest_per_hop watches the accounting: one
+# fetch() of a URL that redirects N times spends N+1 of the invocation's
+# outbound calls. Every hop of that chain lands back on the demo's own origin,
+# which the node allows - so a node that judged the URL the application named
+# and then followed the redirects with no further questions passes it exactly
+# as a node that judges every hop does. The accounting was witnessed; the
+# policy was not.
+#
+# This is the case that tells them apart, and it is the one an attacker
+# reaches for. The application names one address, and it is an address it is
+# allowed to name. The origin answers 302 to the control plane - an address no
+# application on this node may call. If a hop is not judged, that call is
+# made, and a handler has reached the platform's own API by asking a server it
+# is allowed to talk to for directions.
+#
+# The pair is what makes it evidence. The same handler, the same origin and
+# the same redirect route, sent once to a hop the policy refuses and once to a
+# hop it allows: one is stopped naming the hop's own address, the other
+# arrives with the origin's body. So what stopped the first is where the hop
+# pointed, and not the redirect.
+check_a_redirect_hop_to_a_refused_host_is_stopped() {
+  local title="the outbound policy judges every hop of a redirect, not just the address the handler named"
+
+  if [ -z "${DEIS_ORIGIN_PORT:-}" ]; then
+    fail_check "$title" \
+      "this run's state names no fetch origin, so there is no allowed address to be redirected away from. Restart it: ./scripts/demo.sh stop && ./scripts/demo.sh start"
+    return
+  fi
+
+  # Where the hop lands. The control plane rather than deis-store, so that
+  # this check and check_app_fetch_refused leave one node log line each and
+  # neither can be read as the other's.
+  local refused_hop="http://127.0.0.1:${DEIS_CONTROL_PORT}/api/apps"
+  local refused_encoded="http%3A%2F%2F127.0.0.1%3A${DEIS_CONTROL_PORT}%2Fapi%2Fapps"
+  local allowed_encoded="http%3A%2F%2F127.0.0.1%3A${DEIS_ORIGIN_PORT}%2Fpayload.txt"
+  local origin="http://127.0.0.1:${DEIS_ORIGIN_PORT}/redirect-to?url="
+
+  local refused_body allowed_body
+  refused_body=$(app_fetch redirect-hop-refused "${origin}${refused_encoded}")
+  answered_json "$title" redirect-hop-refused "$refused_body" || return
+  allowed_body=$(app_fetch redirect-hop-allowed "${origin}${allowed_encoded}")
+  answered_json "$title" redirect-hop-allowed "$allowed_body" || return
+
+  local refused_reached refused_error allowed_reached allowed_status allowed_text
+  refused_reached=$(echo "$refused_body" | jq -r '.reached // false' 2>/dev/null || true)
+  refused_error=$(echo "$refused_body" | jq -r '.error // empty' 2>/dev/null || true)
+  allowed_reached=$(echo "$allowed_body" | jq -r '.reached // false' 2>/dev/null || true)
+  allowed_status=$(echo "$allowed_body" | jq -r '.status // empty' 2>/dev/null || true)
+  allowed_text=$(echo "$allowed_body" | jq -r '.body // empty' 2>/dev/null || true)
+
+  # The control first. If the redirect route itself does not work, the
+  # refusal above is a broken fixture and not a policy decision, and saying so
+  # here is what keeps the two apart.
+  case "$allowed_text" in
+    *"$ORIGIN_BODY"*) ;;
+    *)
+      fail_check "$title" \
+        "the same handler, the same origin and the same /redirect-to route sent to a hop the node allows did not arrive: reached=${allowed_reached}, HTTP ${allowed_status:-none}, body $(printf '%s' "$allowed_text" | tr '\n' ' ' | head -c 160). Until that works, a refusal on the other hop says nothing about the policy"
+      return
+      ;;
+  esac
+
+  if [ "$refused_reached" = "true" ]; then
+    fail_check "$title" \
+      "the handler fetched an address the node allows, the origin answered 302 to ${refused_hop}, and the node followed it: a handler can reach anything on this machine through an upstream willing to redirect, which is every egress rule on this node undone by one Location header"
+    return
+  fi
+
+  # The refusal has to name where the *hop* pointed. Naming the URL the
+  # handler passed would mean the first call was refused - which would be a
+  # different platform and a much smaller claim.
+  case "$refused_error" in
+    *"${refused_hop}"*) ;;
+    *)
+      fail_check "$title" \
+        "the call did not complete, but the refusal does not name ${refused_hop}, so it is not the hop that was judged: $(printf '%s' "${refused_error:-<none>}" | head -c 240)"
+      return
+      ;;
+  esac
+  case "$refused_error" in
+    *"the platform's own service endpoints"*) ;;
+    *)
+      fail_check "$title" \
+        "the hop to ${refused_hop} did not complete, but not because the egress policy refused it: $(printf '%s' "$refused_error" | head -c 240). A hop that merely failed to connect would answer the handler the same way"
+      return
+      ;;
+  esac
+
+  # And the node's own line about it, which is where an operator watching for
+  # applications probing the platform sees this happen.
+  local logged
+  logged=$(node_log 2>/dev/null \
+    | grep -m 1 "Refused an outbound fetch from ${APP_ID}.${ENV_NAME} to ${refused_hop}:" || true)
+  if [ -z "$logged" ]; then
+    fail_check "$title" \
+      "the hop was refused to the handler, but the node wrote no line naming ${refused_hop} as a destination it refused, so nothing an operator reads records that an application was redirected onto the platform's own API"
+    return
+  fi
+
+  pass_check "$title" \
+    "the handler called one address, ${origin}<...>, which is the single entry in this node's [fetch] allow. Pointed at ${refused_hop} the origin's 302 was refused where it landed - \"$(printf '%s' "$refused_error" | head -c 200)\" - and the node recorded it at warn: \"$(printf '%s' "$logged" | log_message | head -c 160)\". Pointed at /payload.txt instead, the identical call followed the hop and came back with the origin's own body (HTTP ${allowed_status}, \"${ORIGIN_BODY}\"), so it is where the hop went that decided it"
 }
 
 # The Web Crypto globals, judged on their values.
@@ -5150,7 +5660,10 @@ acme_certificate_file() {
 # a loop ends is the condition it re-reads after this returns. Port 9 is
 # discard; nothing answers it, so curl fails, waits its retry delay and fails
 # again, which is the second.
-acme_pause() {
+#
+# Named for what it does rather than for the certificate checks it was written
+# for: the memory cut-off check waits on a metrics sample with it too.
+poll_pause() {
   curl -sf -o /dev/null -m 1 --retry 1 --retry-delay 1 --retry-all-errors \
     "http://127.0.0.1:9/" >/dev/null 2>&1 || true
 }
@@ -5168,7 +5681,7 @@ wait_for_acme_issue() {
       return 0
     fi
     attempts=$((attempts - 1))
-    acme_pause
+    poll_pause
   done
   return 1
 }
@@ -5219,8 +5732,24 @@ check_acme_certificate_follows_the_routing_table() {
     fi
   done
 
+  # What the authority actually fetched from this proxy, and for which names.
+  # The evidence line has always ended by saying the authority validated these
+  # names over http-01, and nothing checked it: a stub that issued on request
+  # without ever calling back would have left this list empty and the sentence
+  # standing.
   local validated
   validated=$(acme_ca_stats | jq -r '[.validations[] | select(.matched) | .name] | sort | join(", ")')
+  for name in "$ACME_PRODUCTION_NAME" "$ACME_PREVIEW_NAME"; do
+    case ", ${validated}," in
+      *", ${name},"*) ;;
+      *)
+        fail_check "$claim" \
+          "the authority issued for [${issued}], but its record of the challenges it fetched back from this proxy does not name ${name}: [${validated:-none}]. A certificate nobody was challenged for says nothing about whether this proxy can answer for the name"
+        return
+        ;;
+    esac
+  done
+
   pass_check "$claim" \
     "the authority issued for [${issued}] and neither name appears anywhere in ${DEIS_PROXY_CONFIG}; both came from routing.preview_zone = \"${ACME_ZONE}\" applied to the app and environments the control plane publishes. It validated [${validated}] by fetching /.well-known/acme-challenge/<token> from the proxy's own HTTP port"
 }
@@ -5314,10 +5843,35 @@ check_acme_challenge_answers_only_what_was_published() {
       ;;
   esac
 
+  # The positive, without which the two refusals above prove nothing: a proxy
+  # that answered 404 to every challenge path in existence would satisfy both
+  # of them. This number was already printed in the evidence and never
+  # asserted, which is a sentence about a real challenge answer resting on a
+  # count that was allowed to be zero.
+  # `|| true` and not `|| echo 0`: grep prints its own zero before exiting
+  # non-zero, so the second form makes the value two lines long on exactly
+  # the count this assertion is about.
   local served
-  served=$(grep -a -c "an http-01 challenge answer was served" "${LOG_DIR}/deis_proxy_error.log" 2>/dev/null || echo 0)
+  served=$(grep -a -c "an http-01 challenge answer was served" "${LOG_DIR}/deis_proxy_error.log" 2>/dev/null || true)
+  if [ "${served:-0}" -lt 1 ]; then
+    fail_check "$claim" \
+      "the proxy answered 404 to a token nothing published and served no file for a traversal, but it has never served a real challenge answer either (${served} in ${LOG_DIR}/deis_proxy_error.log). A proxy that refused every challenge path would pass both halves above, so with nothing served there is no evidence the path answers what was published"
+    return
+  fi
+
   pass_check "$claim" \
     "the proxy served ${served} real challenge answer(s) to the authority, answered 404 to a token nothing published, and returned no file for ../../../etc/passwd in either its plain or its percent-encoded form"
+}
+
+# How many renewal passes this proxy has finished. Zero is a real answer here
+# - it is what a proxy that has never got that far reports - so the count has
+# to survive being zero, which `grep -c ... || echo 0` does not: grep prints
+# its own zero first and the value becomes two lines.
+acme_pass_count() {
+  local counted
+  counted=$(grep -a -c "automatic certificate pass finished" \
+    "${LOG_DIR}/deis_proxy_error.log" 2>/dev/null || true)
+  echo "${counted:-0}"
 }
 
 check_acme_does_not_reissue_a_current_certificate() {
@@ -5329,16 +5883,16 @@ check_acme_does_not_reissue_a_current_certificate() {
   # the proxy's own count of finished passes, read from its log, not a
   # duration: check_interval_secs is 2 in this configuration.
   local start_passes attempts
-  start_passes=$(grep -a -c "automatic certificate pass finished" "${LOG_DIR}/deis_proxy_error.log" 2>/dev/null || echo 0)
+  start_passes=$(acme_pass_count)
   passes=$start_passes
   attempts=30
   while [ "$attempts" -gt 0 ]; do
-    passes=$(grep -a -c "automatic certificate pass finished" "${LOG_DIR}/deis_proxy_error.log" 2>/dev/null || echo 0)
+    passes=$(acme_pass_count)
     if [ "$((passes - start_passes))" -ge 3 ]; then
       break
     fi
     attempts=$((attempts - 1))
-    acme_pause
+    poll_pause
   done
 
   after=$(acme_ca_stats | jq -r '.issued | length')
@@ -5429,7 +5983,7 @@ EOF
       break
     fi
     attempts=$((attempts - 1))
-    acme_pause
+    poll_pause
   done
 
   accounts_after=$(acme_ca_stats | jq -r '.accounts')
@@ -5461,6 +6015,129 @@ EOF
 
   pass_check "$claim" \
     "a second deis-proxy over ${ACME_STORE_DIR} logged \"the stored ACME account key was loaded\", finished a renewal pass, and left the authority at ${accounts_after} account and ${issued_after} certificates - it asked for nothing"
+}
+
+# ----------------------------------------------------------------------
+# The compiler
+# ----------------------------------------------------------------------
+#
+# The README says one project builds for four hosts. The demo built one of
+# them: `deis deploy` compiles for `deislet` because that is the only vendor
+# the example app enables, and nothing here had ever run the other three
+# adapters at all. Three of the four claims in that sentence were carried by
+# the sentence.
+#
+# This builds the portable fixture for all four and looks at what came out. It
+# deploys nothing: three of these artifacts are for platforms that are not
+# running anywhere near this machine, so what can be checked is that each one
+# exists, carries this application rather than a stub, and is accompanied by
+# the file that host needs to accept it - `wrangler.toml` for Cloudflare,
+# `deno.json` for Deno Deploy, `edgeone.json` for EdgeOne. Without that last
+# part the check would pass on four copies of one bundle in four directories.
+#
+# `deis build` is run directly rather than through `deis_cli`: a build talks to
+# nothing, and handing it the demo's control-plane endpoint and credential
+# would suggest otherwise.
+
+# One file out of a build, checked for existence and for carrying the fixture's
+# marker. Echoes what is wrong, or nothing when it is right.
+portable_artifact_fault() {
+  local file=$1
+  local what=$2
+  if [ ! -f "$file" ]; then
+    echo "${what} is missing (${file})"
+    return
+  fi
+  if ! grep -q "$PORTABLE_MARKER" "$file"; then
+    echo "${what} does not carry the handler's marker, so it is not this application"
+  fi
+}
+
+check_every_compiler_target_is_built() {
+  local title="one project compiles for all four targets, each with the files that host needs"
+  local dir="${DEMO_DIR}/app-portable"
+  local log="${LOG_DIR}/cli-build-portable.log"
+
+  if [ ! -f "${PORTABLE_SRC_DIR}/.config.json" ]; then
+    fail_check "$title" "no portable fixture at ${PORTABLE_SRC_DIR}"
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail_check "$title" "python3 is needed to look inside the deislet bundle"
+    return
+  fi
+
+  # A fresh copy every time: a build writes dist/ into the project it is
+  # given, and artifacts left by a previous run would be indistinguishable
+  # from artifacts this one produced.
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  cp -R "${PORTABLE_SRC_DIR}/." "$dir/"
+
+  if ! ( cd "$dir" && "${BIN_DIR}/deis" build -v all ) > "$log" 2>&1; then
+    fail_check "$title" \
+      "deis build -v all failed: $(tail -n 6 "$log" | tr '\n' ' ' | head -c 300)"
+    return
+  fi
+
+  # What each vendor has to have produced. The entry file is the application;
+  # the second file is what makes the directory deployable to that host and to
+  # no other.
+  local faults=""
+  faults="${faults}$(portable_artifact_fault "${dir}/dist/cloudflare/index.js" "Cloudflare's index.js") "
+  faults="${faults}$(portable_artifact_fault "${dir}/dist/deno/src/api/where.ts" "Deno's copy of the handler") "
+  faults="${faults}$(portable_artifact_fault "${dir}/dist/tencent/edge-functions/index.js" "EdgeOne's index.js") "
+
+  local file
+  for file in "dist/cloudflare/wrangler.toml" "dist/cloudflare/package.json" \
+    "dist/deno/deno.json" "dist/deno/_deis_internal/router.ts" \
+    "dist/tencent/edgeone.json" "dist/deislet/bundle.zip"; do
+    [ -f "${dir}/${file}" ] || faults="${faults}${file} was not written "
+  done
+
+  # The deislet bundle is a zip, so its entry is read out of the archive
+  # rather than grepped through the compression.
+  local bundled=""
+  if [ -f "${dir}/dist/deislet/bundle.zip" ]; then
+    bundled=$(python3 - "${dir}/dist/deislet/bundle.zip" "$PORTABLE_MARKER" <<'BUNDLE'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    names = archive.namelist()
+    worker = archive.read("worker/index.js").decode("utf-8", "replace")
+print("ok" if sys.argv[2] in worker and "manifest.json" in names else "")
+BUNDLE
+)
+    [ "$bundled" = "ok" ] || faults="${faults}the deislet bundle has no manifest.json, or its worker is not this application "
+  fi
+
+  # And that the three JavaScript entries are three files rather than one
+  # copied three times: each adapter builds the context its own host hands a
+  # handler, so two vendors producing byte-identical output would mean one of
+  # them was never really targeted.
+  local cf_sum eo_sum
+  cf_sum=$(openssl dgst -sha256 "${dir}/dist/cloudflare/index.js" 2>/dev/null | awk '{print $NF}')
+  eo_sum=$(openssl dgst -sha256 "${dir}/dist/tencent/edge-functions/index.js" 2>/dev/null | awk '{print $NF}')
+  if [ -n "$cf_sum" ] && [ "$cf_sum" = "$eo_sum" ]; then
+    faults="${faults}Cloudflare's and EdgeOne's entry files are byte-identical, so one adapter emitted the other's output "
+  fi
+
+  # The vendor's own configuration has to be about this project.
+  grep -q '^name = "portable"' "${dir}/dist/cloudflare/wrangler.toml" 2>/dev/null \
+    || faults="${faults}wrangler.toml does not name the project "
+  grep -q '"portable"' "${dir}/dist/tencent/edgeone.json" 2>/dev/null \
+    || faults="${faults}edgeone.json does not name the project "
+  grep -q "/api/where" "${dir}/dist/deno/_deis_internal/router.ts" 2>/dev/null \
+    || faults="${faults}Deno's router does not carry the route the function tree defines "
+
+  faults=$(echo "$faults" | sed 's/^ *//; s/ *$//')
+  if [ -n "$faults" ]; then
+    fail_check "$title" \
+      "deis build -v all reported success, but: ${faults}. The build said: $(tail -n 5 "$log" | tr '\n' ' ' | head -c 200)"
+    return
+  fi
+
+  pass_check "$title" \
+    "one \`deis build -v all\` over ${PORTABLE_SRC_DIR} wrote four directories: dist/deislet/bundle.zip (a manifest and a worker carrying this handler), dist/cloudflare (index.js plus the wrangler.toml naming \"portable\" and a package.json), dist/deno (the handler, a generated router that knows /api/where, and deno.json) and dist/tencent (edge-functions/index.js and edgeone.json). Every entry carries the handler's own marker, and Cloudflare's and EdgeOne's differ from one another, so each adapter built the shape its host expects rather than copying one output four times"
 }
 
 check_cli_deploy() {
@@ -5552,13 +6229,29 @@ check_cli_secret_list() {
   # The human form is checked too. It is the one somebody will actually read,
   # and it is a different code path from --json, so a value could leak in one
   # while the other stayed clean.
-  deis_cli secret list -e "$ENV_NAME" > "$text" 2>&1 || true
+  #
+  # Its exit status is judged rather than discarded, and its output has to
+  # name the secret before the sweep below means anything. Both were missing:
+  # a command that failed wrote an error message into this file, an error
+  # message contains no secret, and the check went on to report that "neither
+  # the JSON nor the human output contains the value" about an output that
+  # was never produced.
+  if ! deis_cli secret list -e "$ENV_NAME" > "$text" 2>&1; then
+    fail_check "$title" \
+      "the --json form worked but the human form failed, so the listing a person actually reads was never produced: $(tail -n 3 "$text" | tr '\n' ' ')"
+    return
+  fi
 
   local names
   names=$(jq -r '.secrets[].name' < "$json" 2>/dev/null | tr '\n' ' ' || true)
 
   if ! echo "$names" | grep -q "DEMO_SECRET"; then
     fail_check "$title" "DEMO_SECRET is not listed; names were: ${names:-none}"
+    return
+  fi
+  if ! grep -q "DEMO_SECRET" "$text"; then
+    fail_check "$title" \
+      "the human listing does not name DEMO_SECRET at all, so finding no value in it says nothing: $(head -c 200 "$text" | tr '\n' ' ')"
     return
   fi
 
@@ -5572,7 +6265,7 @@ check_cli_secret_list() {
   fi
 
   pass_check "$title" \
-    "names listed: ${names}- and neither the JSON nor the human output contains the value. There is no command that prints one: the control plane has no endpoint that returns it"
+    "names listed: ${names}- both forms of the command ran, both name DEMO_SECRET, and neither contains the value. There is no command that prints one: the control plane has no endpoint that returns it"
 }
 
 check_cli_status() {
@@ -6052,30 +6745,44 @@ check_the_audit_log_names_who_changed_what() {
   local report="${LOG_DIR}/verify-audit-secret.json"
   deis_cli audit --action secret.write --limit 20 --json > "$report" 2>/dev/null || true
 
-  local total app environment target outcome actor from
+  # The row is chosen by what happened - a secret written on this
+  # application's ${ENV_NAME} and accepted - and never by the name it carries.
+  # It used to be selected with `select(.target == "DEMO_SECRET")` and then
+  # asserted to have that target, which is the check reading back its own
+  # filter: a control plane that recorded every secret write against an empty
+  # name, or against the value instead of the name, would have produced no
+  # matching row and the assertion would have been about a row that was not
+  # there rather than about the name being right. Only one row can match: the
+  # other secret.write in this report is the scoped token's refused attempt on
+  # the preview.
+  local entry total app environment target outcome actor from
   total=$(jq -r '.total // 0' < "$report" 2>/dev/null || echo 0)
-  app=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .app_id) // empty' < "$report" 2>/dev/null || true)
-  environment=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .environment) // empty' < "$report" 2>/dev/null || true)
-  target=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .target) // empty' < "$report" 2>/dev/null || true)
-  outcome=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .outcome) // empty' < "$report" 2>/dev/null || true)
-  actor=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .actor_credential) // empty' < "$report" 2>/dev/null || true)
+  entry=$(jq -c --arg app "$APP_ID" --arg env "$ENV_NAME" \
+    'first(.entries[] | select(.app_id == $app and .environment == $env and .outcome == "accepted"))' \
+    < "$report" 2>/dev/null || true)
+  app=$(echo "$entry" | jq -r '.app_id // empty' 2>/dev/null || true)
+  environment=$(echo "$entry" | jq -r '.environment // empty' 2>/dev/null || true)
+  target=$(echo "$entry" | jq -r '.target // empty' 2>/dev/null || true)
+  outcome=$(echo "$entry" | jq -r '.outcome // empty' 2>/dev/null || true)
+  actor=$(echo "$entry" | jq -r '.actor_credential // empty' 2>/dev/null || true)
   # "From where" is half of what the line is for, and it is the field most
   # easily left empty: it comes from the connection rather than from the
   # request, so a server assembled without connect info would record every
   # call as coming from nowhere and nothing else would notice.
-  from=$(jq -r 'first(.entries[] | select(.target == "DEMO_SECRET") | .peer) // empty' < "$report" 2>/dev/null || true)
+  from=$(echo "$entry" | jq -r '.peer // empty' 2>/dev/null || true)
 
   # The whole reason a secret write is recorded by name and never by value.
   local leaked=no
   grep -q "$DEMO_SECRET_VALUE" "$report" 2>/dev/null && leaked=yes
 
-  if [ "$app" = "$APP_ID" ] && [ "$environment" = "$ENV_NAME" ] && [ "$target" = "DEMO_SECRET" ] \
+  if [ "${total:-0}" -ge 1 ] \
+    && [ "$app" = "$APP_ID" ] && [ "$environment" = "$ENV_NAME" ] && [ "$target" = "DEMO_SECRET" ] \
     && [ "$outcome" = "accepted" ] && [ -n "$actor" ] && [ -n "$from" ] && [ "$leaked" = "no" ]; then
     pass_check "$title" \
       "\`deis audit --action secret.write\` returned ${total} line(s); the one for DEMO_SECRET names ${app}/${environment}, the secret ${target}, the credential ${actor} that wrote it, the address ${from} it came from and the outcome ${outcome}. The ${#DEMO_SECRET_VALUE}-character value is not in the report, and the audit table lives in the same database the secret sweep already greps"
   else
     fail_check "$title" \
-      "the line for DEMO_SECRET reports app '${app:-none}', environment '${environment:-none}', target '${target:-none}', outcome '${outcome:-none}', credential '${actor:-none}' from '${from:-nowhere}' out of ${total} line(s), and the value was $( [ "$leaked" = yes ] && echo PRESENT || echo absent )"
+      "the accepted secret.write on ${APP_ID}/${ENV_NAME} reports app '${app:-none}', environment '${environment:-none}', target '${target:-none}' (expected DEMO_SECRET), outcome '${outcome:-none}', credential '${actor:-none}' from '${from:-nowhere}' out of ${total} line(s), and the value was $( [ "$leaked" = yes ] && echo PRESENT || echo absent )"
   fi
 }
 
@@ -6094,13 +6801,19 @@ check_a_refused_call_is_recorded_with_the_reason() {
     < "$report" 2>/dev/null || true)
   anonymous=$(jq -r '[.entries[] | select(.actor_kind == "anonymous")] | length' < "$report" 2>/dev/null || echo 0)
 
+  # The anonymous count is asserted rather than only printed. It is the half
+  # of the claim that is about callers the platform cannot name - the
+  # storage-token check makes one such call - and a control plane that only
+  # recorded refusals it could attribute to a credential would leave exactly
+  # those out while this line went on reporting a number.
   if [ "${total:-0}" -ge 1 ] && [ "$deploy_refusal" = "403" ] \
+    && [ "${anonymous:-0}" -ge 1 ] \
     && echo "$detail" | grep -q "deploy:${APP_ID}/${ENV_NAME}"; then
     pass_check "$title" \
       "${total} refusal(s) are on the record, ${anonymous} of them from a caller who presented nothing at all. The scoped token's attempt to deploy ${APP_ID}/${ENV_NAME} is there as HTTP ${deploy_refusal} with the reason \"${detail}\" - which is how an operator finds a pipeline still holding a credential that was narrowed"
   else
     fail_check "$title" \
-      "the log holds ${total:-0} refusal(s); the refused deploy on ${APP_ID}/${ENV_NAME} reports status '${deploy_refusal:-none}' with detail '${detail:-none}'"
+      "the log holds ${total:-0} refusal(s), ${anonymous:-0} of them anonymous (expected at least one of each); the refused deploy on ${APP_ID}/${ENV_NAME} reports status '${deploy_refusal:-none}' with detail '${detail:-none}'"
   fi
 }
 
@@ -6333,18 +7046,55 @@ check_cli_trace() {
 # `deis_runtime_memory_cutoffs_total` in the same breath, so a row that says
 # memory-limit is that callback having run.
 #
-# The counter itself is named in the evidence but is not what this check waits
-# on: a node pushes its counters every ten seconds and its traces every one, so
-# the verdict is here long before the sample is, and gating on the sample would
-# make the check a race against a timer rather than a statement about the
-# platform. The row is the deterministic witness; the counter is read once and
-# reported as it stands.
+# The counter is the second half of that verdict, and this check waits for it
+# rather than assuming it. A node pushes its traces every second and its
+# counters every ten - metrics.rs takes `flush_interval_secs * 3` with a floor
+# of ten, and this demo configures a one-second flush - so the row arrives
+# first and the sample follows, which is a reason to wait for the sample and
+# not a reason to skip it.
+#
+# It used to be read once, straight after the row, and reported however it
+# stood. An unchanged counter printed a sentence about cadence and the check
+# passed; so did a counter that was never readable at all, which is how this
+# was found - pointing the read below at a port nothing listens on left the
+# check green while it printed "still reads nothing, which is the cadence and
+# not a gap". The README sells this counter as the second proof that a heap
+# ceiling is enforced, and a proof that cannot fail is not one.
+
 # What deis-telemetry currently reports for this tenant's memory cut-offs, or
-# nothing when no node has pushed that series yet.
+# nothing - which covers both "no node has pushed that series yet" and "the
+# scrape endpoint did not answer". The waiter below fails on either rather
+# than excusing them, because from here they are the same missing evidence.
 memory_cutoff_counter() {
   curl -s -m 5 "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" 2>/dev/null \
     | grep "^deis_runtime_memory_cutoffs_total{app_id=\"${APP_ID}\",environment=\"${ENV_NAME}\"" \
     | awk '{print $NF}' || true
+}
+
+# Read that counter until it stands above $1, and echo what it last read.
+#
+# Every round is a real read of the series rather than a wait long enough to
+# be safe, and the budget is a count of rounds rather than a duration this
+# script measures: sixty of them at about a second each is six times the
+# ten-second push interval, so exhausting it means the sample is not coming
+# rather than that it is late. `awk` does the comparison because the
+# exposition format renders this as a gauge, and a gauge may carry a decimal
+# point that `-gt` cannot read.
+await_memory_cutoff_counter() {
+  local floor=${1:-0}
+  local rounds=${2:-60}
+  local now=""
+  while [ "$rounds" -gt 0 ]; do
+    now=$(memory_cutoff_counter)
+    if [ -n "$now" ] && awk -v now="$now" -v floor="$floor" 'BEGIN { exit !(now > floor) }'; then
+      echo "$now"
+      return 0
+    fi
+    rounds=$((rounds - 1))
+    poll_pause
+  done
+  echo "$now"
+  return 1
 }
 
 check_memory_cutoff() {
@@ -6386,19 +7136,24 @@ check_memory_cutoff() {
     return
   fi
 
-  local ceiling after counter_note
+  local ceiling after
   ceiling=$(node_log \
     | sed -n "s/.*App ${APP_ID}.${ENV_NAME} narrows the default heap ceiling: \([0-9]*\)MB.*/\1/p" \
     | head -n 1)
-  after=$(memory_cutoff_counter)
-  if [ -n "$after" ] && [ "$after" != "$before" ]; then
-    counter_note="deis_runtime_memory_cutoffs_total for this tenant went from ${before:-nothing} to ${after} while this check ran"
-  else
-    counter_note="deis_runtime_memory_cutoffs_total for this tenant still reads ${after:-nothing}, which is the cadence and not a gap: a node pushes its traces every second and its cumulative counters every ten, so the verdict arrives first and the sample follows"
+
+  # The counter has to arrive, and not arriving is the failure being waited
+  # for: a scrape endpoint that is down, a node whose metrics shipper has
+  # stopped, a callback that records the verdict without charging the counter.
+  # Every one of those leaves the README's second proof missing while the
+  # first still reads perfectly, which is exactly the state nobody notices.
+  if ! after=$(await_memory_cutoff_counter "${before:-0}"); then
+    fail_check "$title" \
+      "deis trace calls the invocation memory-limit, but deis_runtime_memory_cutoffs_total{app_id=\"${APP_ID}\",environment=\"${ENV_NAME}\"} never rose above ${before:-nothing}: after sixty reads of http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics it reads ${after:-nothing}. A node pushes that series every ten seconds, so a minute of reads is not a cadence problem - the near-heap-limit callback increments the counter in the same breath as it records the verdict, and one of the two never left the node"
+    return
   fi
 
   pass_check "$title" \
-    "GET /api/heap allocated past the ${ceiling:-?}MB heap this version's manifest asks for and answered HTTP ${status} after ${seconds}s. deis trace calls that invocation memory-limit, which nothing but the near-heap-limit callback can produce - from the request path an out-of-heap kill and a handler that threw are the same terminated execution: $(echo "$TRACE_ROW" | sed 's/[[:space:]][[:space:]]*/ /g'). The same callback increments deis_runtime_memory_cutoffs_total; ${counter_note}"
+    "GET /api/heap allocated past the ${ceiling:-?}MB heap this version's manifest asks for and answered HTTP ${status} after ${seconds}s. deis trace calls that invocation memory-limit, which nothing but the near-heap-limit callback can produce - from the request path an out-of-heap kill and a handler that threw are the same terminated execution: $(echo "$TRACE_ROW" | sed 's/[[:space:]][[:space:]]*/ /g'). The same callback increments deis_runtime_memory_cutoffs_total, and deis-telemetry's scrape for this tenant went from ${before:-nothing} to ${after} while this check waited for it"
 }
 
 check_cli_tail() {
@@ -6488,6 +7243,11 @@ verify_demo() {
   echo "-- the CLI deploys --"
   check_cli_deploy
   check_cli_versions
+  echo "-- the compiler --"
+  # Beside the deploy, because it is about the same command's first step. It
+  # builds a second, much smaller project and deploys none of it: three of the
+  # four targets are for platforms nothing here runs.
+  check_every_compiler_target_is_built
   echo "-- asset-first serving --"
   check_static_asset
   # The three files a static site configures itself with, and the way back
@@ -6501,6 +7261,10 @@ verify_demo() {
   check_assets_binding_is_not_shadowable
   echo "-- routing --"
   check_route_parameter
+  # Through deis-proxy and with no x-deis-app-id header, which is the only
+  # arrangement in which a route decides anything. It leaves two rules in the
+  # catalog on a host nothing else here uses.
+  check_the_proxy_routes_by_host_and_path_prefix
   echo "-- websockets --"
   # Through deis-proxy, which is the only check here that goes through it.
   # Everything else addresses the node directly, so a proxy that mangled an
@@ -6528,6 +7292,9 @@ verify_demo() {
   # before the rollback moves production around underneath them.
   check_app_fetch_allowed
   check_app_fetch_refused
+  # Straight after the refusal, because it is the same policy asked the same
+  # question about an address the application never named.
+  check_a_redirect_hop_to_a_refused_host_is_stopped
   check_web_crypto
   check_named_caches
   echo "-- secrets --"
@@ -6551,6 +7318,10 @@ verify_demo() {
   # `context.services.database` binding reaches.
   check_a_runaway_query_is_stopped_and_names_its_ceiling
   check_a_single_value_cannot_be_bigger_than_a_row_may_be
+  # What a tenant's SQL may reach, as opposed to what it may spend. It writes
+  # a table in production and reads for it from the preview, so it runs after
+  # both cost checks and before anything that moves either environment.
+  check_a_tenants_sql_cannot_reach_another_tenants_tables_or_files
   # Object storage past put / get / delete. The listing check seeds the
   # objects the four after it read, so it runs first.
   check_blob_listing

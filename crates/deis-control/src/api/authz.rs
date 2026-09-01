@@ -33,8 +33,19 @@
 //! that a credential which *is* presented goes unchecked, and it must not
 //! mean that the whole human API is published to whatever can route to this
 //! port. With it off, [`resolve`] admits an unauthenticated caller only from
-//! the machine this control plane runs on, and a credential that resolves is
-//! held to its own scopes exactly as it would be with the flag on.
+//! the machine this control plane runs on *and* only when the caller is not a
+//! web page on another origin, and a credential that resolves is held to its
+//! own scopes exactly as it would be with the flag on.
+//!
+//! The second half of that is [`from_another_origin`], and it exists because
+//! "on this machine" turned out not to mean what it sounds like. A browser
+//! running on the operator's box is on this machine, so every page it has
+//! open is - and with `CorsLayer::permissive()` in front of this gate, a page
+//! on any origin could `fetch()` the human API with no credential, create an
+//! owner account, mint an unscoped root token, deploy, and read every answer.
+//! The permissive layer is gone (see [`crate::api::cors`]), and this is the
+//! other half: the admission is for the operator's own tools, not for
+//! whatever their browser happens to have loaded.
 //!
 //! # The query string is read for exactly one route
 //!
@@ -60,7 +71,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -98,6 +109,32 @@ const UNCONFIGURED_OFF_BOX_DETAIL: &str = "This control plane requires no creden
                                           api_auth_enabled = true in its configuration and \
                                           restart: it prints one owner token at startup, and \
                                           every caller - on this machine or not - presents that.";
+
+/// What a web page on another origin is told when it calls a control plane
+/// that demands no credential.
+///
+/// It says the same thing [`UNCONFIGURED_OFF_BOX_DETAIL`] says - there is no
+/// token to ask anyone for - and adds the one instruction that gets a console
+/// hosted elsewhere working, because a developer looking at a 401 in a
+/// browser console has nothing else to go on.
+const CROSS_ORIGIN_DETAIL: &str = "This control plane requires no credential \
+                                   (api_auth_enabled is off), and that admission is for callers \
+                                   on the machine it runs on - never for a page loaded from \
+                                   another origin, whichever machine the browser is on. A console \
+                                   hosted elsewhere presents a token (`deis token create`) and \
+                                   needs its own origin listed in api_cors_allowed_origins.";
+
+/// Every path [`authorize`] hands straight to the handler without resolving a
+/// caller, checking a scope or writing a line.
+///
+/// Kept as a list rather than spelled into the `if`, because an exemption and
+/// [`classify`] are two descriptions of the same set of routes and they can
+/// disagree. `/api/metrics` was in both: exempt here and `metrics.read`
+/// there, with the exemption winning and the table entry never running, so a
+/// route that looked guarded was served to any host with nothing presented.
+/// `nothing_the_gate_stands_aside_for_is_a_route_the_table_guards` holds the
+/// two together.
+const UNGATED_PATHS: [&str; 1] = ["/health"];
 
 /// Which component of the resource a route names in its body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,6 +493,17 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         ["api", "events", ..] => {
             Requirement::new("event.read", Verb::Read, Resource::Every, Resource::Every)
         }
+        // Both the Prometheus text at `/api/metrics` and the JSON summary
+        // next to it. The exposition names no application, but it counts all
+        // of them - cluster size, node count, uptime, event totals - so it is
+        // `Every` rather than `Any`: a credential scoped to one preview
+        // environment has no business reading the size of the fleet.
+        //
+        // A scrape from another host therefore carries a token minted for it
+        // (`deis token create --scopes 'read:*/*'`), which is a real
+        // requirement Prometheus meets with `authorization` in the scrape
+        // config. A scrape from this machine needs none while
+        // `api_auth_enabled` is off, exactly like every other read.
         ["api", "metrics", ..] => {
             Requirement::new("metrics.read", Verb::Read, Resource::Every, Resource::Every)
         }
@@ -555,24 +603,52 @@ pub struct AuthzState {
 /// 5. write the audit line, with the outcome the response actually had.
 ///
 /// With `api_auth_enabled` off, step 1 admits a caller who presented nothing
-/// as anonymous - but only from a loopback peer, because a control plane
-/// listening on 0.0.0.0 with nothing required is otherwise handing the whole
-/// human API to anything that can route to the port. Step 3 runs whatever the
+/// as anonymous - but only from a loopback peer that is not a web page on
+/// another origin, because a control plane listening on 0.0.0.0 with nothing
+/// required is otherwise handing the whole human API to anything that can
+/// route to the port, and a browser on the box is a loopback peer with a page
+/// of somebody else's choosing in it. Step 3 runs whatever the
 /// flag says: not requiring a credential cannot mean that a `deploy:app/preview`
 /// token which is presented may mint a storage capability for another tenant.
 /// Step 5 runs on every path, so even an unauthenticated platform gets a
 /// record of every deploy, rollback and secret change.
 pub async fn authorize(State(state): State<AuthzState>, request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
-    // Unchanged from the flat-key days: the health probe has no caller, and
-    // Prometheus generally cannot present a credential.
-    if path == "/health" || path == "/api/metrics" {
+    // The one route in front of this gate, and the only one that can be:
+    // `/health` answers the constant "OK", so a prober learns nothing a TCP
+    // connect did not already tell it, and the load balancer or orchestrator
+    // asking has no credential to present and no way to be given one.
+    //
+    // `/api/metrics` used to be on this line too. It is not a probe: it hands
+    // out the cluster size, the node count, the uptime and the event totals,
+    // and being here meant it ignored `api_auth_enabled` and the loopback
+    // rule together, so any host that could route to the port read them. A
+    // scrape now goes through the gate like every other read - which is also
+    // what makes the `["api", "metrics", ..]` line in [`classify`] mean
+    // something, having been unreachable for `/api/metrics` itself while this
+    // returned first.
+    if UNGATED_PATHS.contains(&path.as_str()) {
         return next.run(request).await;
     }
 
     let method = request.method().clone();
     let headers = request.headers().clone();
     let query = request.uri().query().map(str::to_string);
+    // The address this request was actually sent to, as the sender wrote it:
+    // `:authority` over HTTP/2 and absolute-form URIs, the `Host` header over
+    // HTTP/1.1. Compared with `Origin` to tell the console this port serves
+    // from a page somewhere else.
+    let own_authority = request
+        .uri()
+        .authority()
+        .map(|authority| authority.as_str().to_string())
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
+    let another_origin = from_another_origin(&headers, own_authority.as_deref());
     // Kept as an address and not only as text: with nothing enforced it is
     // what decides whether an unauthenticated caller is admitted at all.
     let peer_addr = request
@@ -581,7 +657,7 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
         .map(|ConnectInfo(addr)| *addr);
     let peer = peer_addr.map(|addr| addr.to_string());
 
-    let principal = match resolve(&state, &headers, peer_addr).await {
+    let principal = match resolve(&state, &headers, peer_addr, another_origin).await {
         Ok(principal) => principal,
         Err(refusal) => {
             let requirement = classify(&method, &path, query.as_deref());
@@ -754,6 +830,56 @@ fn is_local_peer(peer: Option<SocketAddr>) -> bool {
     }
 }
 
+/// The header a browser sets to say what relation the page that made this
+/// request has to the address it went to. It is a forbidden header name, so
+/// script cannot write it, and no non-browser client sends it at all.
+const SEC_FETCH_SITE: &str = "sec-fetch-site";
+
+/// Whether a browser says this request came from a page on another origin.
+///
+/// The unauthenticated admission below is for the operator's own tools on
+/// the operator's own machine - `deis`, curl, the console this port serves. A
+/// browser is on that machine too, and so is every page it has open, which is
+/// how a page on `https://evil.example` came to be able to drive this API. So
+/// the peer address is not the whole question; what the browser says about
+/// the page is the other half.
+///
+/// Two signals, in order of how much they are worth:
+///
+/// 1. `Sec-Fetch-Site`. The browser computes it from the two origins itself
+///    and script cannot set it, so it is better evidence than anything this
+///    process could work out - and it survives a reverse proxy rewriting the
+///    address, which the comparison below does not. `same-origin` is the
+///    console this port serves; `none` is an address typed into the bar or a
+///    bookmark. Anything else is another page, including `same-site`, which
+///    is a *different* origin on the same registrable domain, and including
+///    any value a later browser invents.
+/// 2. `Origin` against the address the request was actually sent to, for the
+///    browsers old enough not to send the first. A page on another origin
+///    cannot forge either half: the browser fills in `Origin` from the page
+///    and the authority from the URL being fetched.
+///
+/// A client that sends neither - every non-browser caller there is - is not a
+/// page, and is left alone.
+fn from_another_origin(headers: &HeaderMap, own_authority: Option<&str>) -> bool {
+    if let Some(site) = headers.get(SEC_FETCH_SITE).and_then(|v| v.to_str().ok()) {
+        return !matches!(site.trim(), "same-origin" | "none");
+    }
+
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    // `null` - a sandboxed frame, a `data:` document, some redirect chains -
+    // splits into nothing and is another origin, which is the answer it
+    // should get: an opaque origin is precisely one this cannot vouch for.
+    match (origin.split_once("://"), own_authority) {
+        (Some((_, stated)), Some(own)) => !stated.eq_ignore_ascii_case(own),
+        // An origin this cannot parse, or a request whose own address this
+        // cannot see, is not evidence of same-origin.
+        _ => true,
+    }
+}
+
 /// The caller nobody authenticated, on a control plane that requires nobody
 /// to be - admitted from this machine, refused from anywhere else.
 ///
@@ -770,16 +896,35 @@ fn is_local_peer(peer: Option<SocketAddr>) -> bool {
 /// the machine the control plane runs on, and refuses only the callers who
 /// are somewhere else - which is exactly the set that was never meant to be
 /// served without a credential.
-fn anonymous_from(peer: Option<SocketAddr>) -> Result<Principal, Refusal> {
-    if is_local_peer(peer) {
-        return Ok(Principal::anonymous());
+///
+/// "On this machine" is two questions, not one, because a browser on the
+/// operator's machine is on it and every page it has open is too. A page from
+/// another origin is refused here whatever its peer address, and reaches this
+/// API the way any other remote caller does: with a token. See
+/// [`from_another_origin`].
+fn anonymous_from(
+    peer: Option<SocketAddr>,
+    from_another_origin: bool,
+) -> Result<Principal, Refusal> {
+    if !is_local_peer(peer) {
+        return Err(Refusal {
+            log_reason: "this control plane requires no credential, so it admits an \
+                         unauthenticated caller only from its own machine, and this one is not \
+                         on it",
+            caller_detail: UNCONFIGURED_OFF_BOX_DETAIL,
+            credential: None,
+        });
     }
-    Err(Refusal {
-        log_reason: "this control plane requires no credential, so it admits an unauthenticated \
-                     caller only from its own machine, and this one is not on it",
-        caller_detail: UNCONFIGURED_OFF_BOX_DETAIL,
-        credential: None,
-    })
+    if from_another_origin {
+        return Err(Refusal {
+            log_reason: "this call came from a web page on another origin, and the admission \
+                         for an unauthenticated caller is for this machine's own tools rather \
+                         than for whatever a browser on it has loaded",
+            caller_detail: CROSS_ORIGIN_DETAIL,
+            credential: None,
+        });
+    }
+    Ok(Principal::anonymous())
 }
 
 /// Turn what a request carries into the caller it belongs to.
@@ -793,6 +938,7 @@ async fn resolve(
     state: &AuthzState,
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
+    from_another_origin: bool,
 ) -> Result<Principal, Refusal> {
     let presented: Vec<String> = presented_credentials(headers)
         .into_iter()
@@ -801,7 +947,7 @@ async fn resolve(
 
     if presented.is_empty() {
         if !state.enforced {
-            return anonymous_from(peer);
+            return anonymous_from(peer, from_another_origin);
         }
         return Err(Refusal {
             log_reason: "no credential was presented",
@@ -877,7 +1023,7 @@ async fn resolve(
         // call is treated as the one that offered nothing at all - admitted
         // from this machine, refused from anywhere else - and the audit line
         // says anonymous rather than inventing an account.
-        return anonymous_from(peer);
+        return anonymous_from(peer, from_another_origin);
     }
     Err(refusal)
 }
@@ -1176,6 +1322,7 @@ mod tests {
             ),
             ("GET", "/api/events", "event.read", Verb::Read),
             ("GET", "/api/events/stats", "event.read", Verb::Read),
+            ("GET", "/api/metrics", "metrics.read", Verb::Read),
             ("GET", "/api/metrics/summary", "metrics.read", Verb::Read),
             ("GET", "/api/runtime", "node.list", Verb::Read),
             (
@@ -1445,6 +1592,92 @@ mod tests {
         );
     }
 
+    /// The exemption list and the table are two descriptions of the same
+    /// routes, so a path in both is a disagreement with a silent winner: the
+    /// gate returns first and the table entry never runs. `/api/metrics` was
+    /// exactly that - `metrics.read` in the table, exempt here - and the
+    /// result was a route that read as guarded and was served to any host
+    /// with nothing presented.
+    #[test]
+    fn nothing_the_gate_stands_aside_for_is_a_route_the_table_guards() {
+        for path in UNGATED_PATHS {
+            assert_eq!(
+                requirement("GET", path).action,
+                "unclassified",
+                "{path} is both exempt from the gate and described by the table; the exemption \
+                 wins and the table entry never runs"
+            );
+        }
+    }
+
+    /// What the browser says about the page, which is the other half of "on
+    /// this machine": the operator's browser is on it, and so is every page
+    /// they have open.
+    #[test]
+    fn a_page_on_another_origin_is_told_apart_from_this_machines_own_tools() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            headers
+        };
+        let own = Some("localhost:8080");
+
+        // `deis`, curl, a node, Prometheus: no browser headers at all.
+        assert!(!from_another_origin(&with(&[]), own));
+
+        // The console this port serves, and an address typed into the bar.
+        assert!(!from_another_origin(
+            &with(&[("sec-fetch-site", "same-origin")]),
+            own
+        ));
+        assert!(!from_another_origin(
+            &with(&[("sec-fetch-site", "none")]),
+            own
+        ));
+        assert!(!from_another_origin(
+            &with(&[("origin", "http://localhost:8080")]),
+            own
+        ));
+
+        // The page that could take this control plane over. `same-site` is a
+        // different origin on the same domain and counts; so does a value no
+        // browser sends today, because the fallback has to be the closed one.
+        for site in ["cross-site", "same-site", "something-new"] {
+            assert!(
+                from_another_origin(&with(&[("sec-fetch-site", site)]), own),
+                "sec-fetch-site: {site} was taken for this machine's own tools"
+            );
+        }
+        assert!(from_another_origin(
+            &with(&[("origin", "https://evil.example")]),
+            own
+        ));
+        // An opaque origin - a sandboxed frame, a `data:` document - vouches
+        // for nothing, so it is not the one case that gets in.
+        assert!(from_another_origin(&with(&[("origin", "null")]), own));
+        // Nor is a request whose own address this cannot see.
+        assert!(from_another_origin(
+            &with(&[("origin", "http://localhost:8080")]),
+            None
+        ));
+
+        // The browser's own word beats the comparison, because it is computed
+        // from the two real origins and survives a proxy rewriting the
+        // address - which is what `npm run dev` does when it forwards /api.
+        assert!(!from_another_origin(
+            &with(&[
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "http://localhost:5173"),
+            ]),
+            own
+        ));
+    }
+
     /// A peer this cannot place is not on this machine. The mapped-IPv4 case
     /// is the one that bites: a local `deis` reaching a control plane bound
     /// to `::` arrives as ::ffff:127.0.0.1, whose `Ipv6Addr::is_loopback` is
@@ -1576,6 +1809,9 @@ mod gate_tests {
             .route("/api/apps/:app/environments/:env/storage-token", get(ok))
             .route("/api/runtime/:node/apps/:app", delete(ok))
             .route("/api/audit", get(ok))
+            .route("/api/events", get(ok))
+            .route("/api/metrics", get(ok))
+            .route("/api/metrics/summary", get(ok))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 authorize,
@@ -1616,12 +1852,32 @@ mod gate_tests {
         credential: Option<&str>,
         body: &str,
     ) -> (StatusCode, String) {
+        call_marked(gate, peer, method, path, credential, body, &[]).await
+    }
+
+    /// The same call, plus whatever a browser would have stamped on it.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_marked(
+        gate: &Gate,
+        peer: &str,
+        method: &str,
+        path: &str,
+        credential: Option<&str>,
+        body: &str,
+        browser_marks: &[(&str, &str)],
+    ) -> (StatusCode, String) {
         let mut builder = HttpRequest::builder()
             .method(method)
             .uri(path)
+            // What a browser and `deis` alike send: the address they went to.
+            // Present so the Origin comparison has its other half.
+            .header("host", "localhost:8080")
             .header("content-type", "application/json");
         if let Some(credential) = credential {
             builder = builder.header("Authorization", format!("Bearer {credential}"));
+        }
+        for (name, value) in browser_marks {
+            builder = builder.header(*name, *value);
         }
         let mut request = builder.body(Body::from(body.to_string())).unwrap();
         request.extensions_mut().insert(ConnectInfo(
@@ -2020,13 +2276,107 @@ mod gate_tests {
         assert_eq!(deploy.app_id.as_deref(), Some("demo"));
     }
 
-    /// The probe and the metrics scrape stay open, as they were: neither has
-    /// a caller that could present anything.
+    /// The probe stays open, and it is now the only thing that is. It
+    /// answers the constant "OK", so a prober learns nothing a TCP connect
+    /// did not already tell it, and the orchestrator asking has no credential
+    /// to present.
     #[tokio::test]
     async fn the_health_probe_is_not_behind_the_gate() {
         let gate = gate(true, vec![]).await;
-        assert_eq!(call(&gate, "GET", "/health", None).await, StatusCode::OK);
+        assert_eq!(
+            call_from(&gate, OFF_THE_BOX, "GET", "/health", None, "{}")
+                .await
+                .0,
+            StatusCode::OK
+        );
         assert!(lines(&gate).await.is_empty());
+    }
+
+    /// `/api/metrics` used to be next to `/health` on that line, and it is
+    /// not a probe: it hands out the cluster size, the node count, the uptime
+    /// and the event totals. Sitting in front of the gate meant it ignored
+    /// `api_auth_enabled` *and* the loopback rule at once, so any host that
+    /// could route to the port read all of it with nothing to present.
+    #[tokio::test]
+    async fn a_metrics_scrape_obeys_the_same_two_rules_as_every_other_read() {
+        // Rule one: a control plane that demands a credential demands it here
+        // too, whichever spelling of the route is asked for.
+        let enforced = gate(true, vec!["a-key".to_string()]).await;
+        for path in ["/api/metrics", "/api/metrics/summary"] {
+            assert_eq!(
+                call(&enforced, "GET", path, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{path} was served with no credential by a control plane that demands one"
+            );
+            assert_eq!(
+                call(&enforced, "GET", path, Some("a-key")).await,
+                StatusCode::OK,
+                "{path} refused the credential this control plane is configured with"
+            );
+        }
+
+        // Rule two: with nothing required, a scrape from another host is
+        // still refused, because that is the rule that guards everything else
+        // on such an install.
+        let open = gate(false, vec![]).await;
+        for path in ["/api/metrics", "/api/metrics/summary"] {
+            assert_eq!(
+                call_from(&open, OFF_THE_BOX, "GET", path, None, "{}")
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED,
+                "{path} was served to a host off this machine with nothing presented"
+            );
+            // And the local scrape - the sidecar on the box, the demo - keeps
+            // working with nothing, exactly as every other read does.
+            assert_eq!(
+                call(&open, "GET", path, None).await,
+                StatusCode::OK,
+                "{path} stopped working for a scrape on this machine"
+            );
+        }
+    }
+
+    /// The scrape a real Prometheus off the box does: a token minted for it,
+    /// scoped to reading, and nothing more than reading.
+    #[tokio::test]
+    async fn a_read_scoped_token_scrapes_from_another_host_and_can_do_nothing_else() {
+        let gate = gate(false, vec![]).await;
+        gate.state
+            .identity
+            .create_account("prometheus", Role::Viewer)
+            .await
+            .unwrap();
+        let (_, secret) = gate
+            .state
+            .identity
+            .create_token(
+                "prometheus",
+                "scrape",
+                Authority::Scoped(Scope::parse_list("read:*/*").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        for path in ["/api/metrics", "/api/metrics/summary"] {
+            assert_eq!(
+                call_from(&gate, OFF_THE_BOX, "GET", path, Some(&secret), "{}")
+                    .await
+                    .0,
+                StatusCode::OK,
+                "a scrape credential could not read {path} from another host"
+            );
+        }
+
+        // The same credential is a viewer and nothing else: the audit log,
+        // which names every application and everybody who touched one, is not
+        // part of scraping.
+        assert_eq!(
+            call_from(&gate, OFF_THE_BOX, "GET", "/api/audit", Some(&secret), "{}")
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
     }
 
     /// Unloading an application from a node is a real outage: the node stops
@@ -2099,6 +2449,93 @@ mod gate_tests {
             .filter(|line| line.action == "node.app.unload" && line.outcome == Outcome::Refused)
             .collect();
         assert_eq!(refused.len(), 4, "{refused:?}");
+    }
+
+    /// The other half of "on this machine". A browser on the operator's box
+    /// is a loopback peer, so every page it has open was one too: with
+    /// `CorsLayer::permissive()` in front of this gate, a page on any origin
+    /// could create an owner account, mint a root token, deploy and read the
+    /// audit log, with no credential and with the answers readable. The
+    /// permissive layer is gone; this is the half that does not depend on it.
+    #[tokio::test]
+    async fn a_page_on_another_origin_gets_nothing_from_a_control_plane_that_requires_nothing() {
+        let gate = gate(false, vec![]).await;
+
+        // Every way a browser says "this came from somewhere else", against
+        // the two calls that end the game: mint a credential, read the log.
+        for marks in [
+            vec![("origin", "https://evil.example")],
+            vec![("sec-fetch-site", "cross-site")],
+            vec![("sec-fetch-site", "same-site")],
+            vec![
+                ("origin", "https://evil.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+        ] {
+            for (method, path) in [
+                ("POST", "/api/accounts"),
+                ("GET", "/api/audit"),
+                ("POST", "/api/apps/demo/environments/production/deployments"),
+            ] {
+                let (status, body) =
+                    call_marked(&gate, ON_THE_BOX, method, path, None, "{}", &marks).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path} was served to a page marked {marks:?}"
+                );
+                assert!(
+                    body.contains("api_cors_allowed_origins"),
+                    "the refusal has to say what a console hosted elsewhere does instead: {body}"
+                );
+            }
+        }
+
+        // The console this port serves, on the same box, is untouched - and
+        // so is `deis`, which sends none of these headers at all.
+        for marks in [
+            vec![("sec-fetch-site", "same-origin")],
+            vec![("sec-fetch-site", "none")],
+            vec![("origin", "http://localhost:8080")],
+            vec![],
+        ] {
+            let (status, _) =
+                call_marked(&gate, ON_THE_BOX, "GET", "/api/audit", None, "{}", &marks).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the console on this machine stopped working, marked {marks:?}"
+            );
+        }
+
+        // Every refusal is on the record, and named as the caller nobody
+        // authenticated rather than invented into an account.
+        let refused: Vec<_> = lines(&gate)
+            .await
+            .into_iter()
+            .filter(|line| line.outcome == Outcome::Refused)
+            .collect();
+        assert_eq!(refused.len(), 12, "{refused:?}");
+        assert!(refused.iter().all(|line| line.actor_kind == "anonymous"));
+    }
+
+    /// A page on another origin holding a credential is a console the
+    /// operator set up, and it works: this rule withholds the admission that
+    /// needs no credential, not the API.
+    #[tokio::test]
+    async fn a_credential_still_works_from_a_page_on_another_origin() {
+        let gate = gate(false, vec!["a-key".to_string()]).await;
+        let (status, _) = call_marked(
+            &gate,
+            ON_THE_BOX,
+            "GET",
+            "/api/audit",
+            Some("a-key"),
+            "{}",
+            &[("origin", "https://console.example.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// `api_auth_enabled = false` means no credential is required. It does

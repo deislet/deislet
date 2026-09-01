@@ -1,12 +1,12 @@
 // Runtime thread pool - multi-core support
 
 use super::bindings::{consumer_queue_client, ServiceWiring};
+use super::header_list::HeaderPairs;
 use super::isolate::{AppRuntime, IsolateSpec};
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::{
     self, BatchInvoker, BatchOutcome, ConsumerHandle, ConsumerSettings, QueuePort,
 };
-use super::response_headers::HeaderPairs;
 use super::response_stream::ResponseBody;
 use crate::app_repo::AppRepo;
 use anyhow::Result;
@@ -99,7 +99,7 @@ pub enum RuntimeMessage {
         app_id: String,
         url: String,
         method: String,
-        headers: HashMap<String, String>,
+        headers: HeaderPairs,
         body: Option<Vec<u8>>,
         response: oneshot::Sender<Result<FetchResult>>,
     },
@@ -1829,7 +1829,7 @@ impl RuntimePool {
         app_id: &str,
         url: String,
         method: String,
-        headers: HashMap<String, String>,
+        headers: HeaderPairs,
         body: Option<Vec<u8>>,
     ) -> Result<FetchResult> {
         let (tx, rx) = oneshot::channel();
@@ -2188,7 +2188,7 @@ mod tests {
                 "test_load_exec_app",
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await;
@@ -2273,7 +2273,7 @@ mod tests {
                 caller,
                 format!("http://localhost/?binding={binding}"),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -2537,7 +2537,7 @@ mod tests {
                 "dp-a.production",
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -2607,7 +2607,7 @@ mod tests {
                 "sq-caller.production",
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -2747,7 +2747,7 @@ mod tests {
                 "after_spin_app.production",
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -2812,7 +2812,7 @@ mod tests {
                     name,
                     "http://localhost/".to_string(),
                     "GET".to_string(),
-                    HashMap::new(),
+                    Vec::new(),
                     None,
                 )
                 .await
@@ -2914,7 +2914,7 @@ mod tests {
                 "env_wiring_app.production",
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -2967,7 +2967,7 @@ mod tests {
                 "queueless_app",
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3006,7 +3006,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3028,7 +3028,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3072,7 +3072,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3218,7 +3218,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3234,7 +3234,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3263,7 +3263,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3287,7 +3287,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3312,7 +3312,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3439,7 +3439,7 @@ mod tests {
                 app,
                 "http://localhost/stream".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3475,7 +3475,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3497,7 +3497,7 @@ mod tests {
                 app,
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
             )
             .await
@@ -3573,5 +3573,84 @@ mod tests {
 
         let _ = pool.unload_app("hdr-caller.production").await;
         let _ = pool.unload_app("hdr-callee.production").await;
+    }
+
+    #[tokio::test]
+    async fn a_service_call_carries_every_value_of_a_repeated_header() {
+        // The shape a caller actually writes is
+        // `bindings.AUTH.fetch(context.request)`: the call is a hop of the
+        // request it is serving and carries that request's headers. Those
+        // crossed as a map, so a caller forwarding a request with two `Cookie`
+        // lines delivered one of them -- the same defect as on the inbound
+        // path, one hop further in. See `runtime/header_list.rs`.
+        //
+        // The request forwarded here is a GET with no body, which is also what
+        // pins the other half: reading a body off it yields a zero-length
+        // buffer, and a callee handed one used to fail before it ran with
+        // "Request with GET/HEAD method cannot have body".
+        let pool = pool();
+
+        let mirror = r#"
+            export default function handler(context) {
+                return new Response(JSON.stringify({
+                    cookie: context.request.headers.get("cookie"),
+                    accept: context.request.headers.get("accept"),
+                    auth: context.request.headers.get("authorization"),
+                }), { status: 200 });
+            }
+        "#;
+        // The `authorization` here is the init overriding the request's own,
+        // which is what `fetch` does: one credential reaches the callee, not
+        // the caller's and the init's joined together.
+        let caller = r#"
+            export default async function handler(context) {
+                const outbound = new Request("https://ignored.invalid/probe", {
+                    headers: [
+                        ["cookie", "session=abc"],
+                        ["cookie", "csrf=xyz"],
+                        ["accept", "text/html"],
+                        ["accept", "application/json"],
+                        ["authorization", "Bearer caller"],
+                    ],
+                });
+                const answer = await context.bindings.AUTH.fetch(outbound, {
+                    headers: { authorization: "Bearer init" },
+                });
+                return new Response(await answer.text(), { status: answer.status });
+            }
+        "#;
+
+        load_with_wiring(
+            &pool,
+            "repeat-callee.production",
+            mirror,
+            service_wiring(&[], &["repeat-caller"]),
+        )
+        .await
+        .expect("the callee loads");
+        load_with_wiring(
+            &pool,
+            "repeat-caller.production",
+            caller,
+            service_wiring(&[("AUTH", "repeat-callee")], &[]),
+        )
+        .await
+        .expect("the caller loads");
+
+        let (status, body) = call_through(&pool, "repeat-caller.production", "AUTH").await;
+        assert_eq!(status, 200, "{body}");
+        let seen: serde_json::Value = serde_json::from_str(&body).expect("the callee answers JSON");
+        assert_eq!(
+            seen["cookie"], "session=abc, csrf=xyz",
+            "a cookie was dropped on the way to the callee"
+        );
+        assert_eq!(seen["accept"], "text/html, application/json");
+        assert_eq!(
+            seen["auth"], "Bearer init",
+            "an init header replaces the request's rather than being added beside it"
+        );
+
+        let _ = pool.unload_app("repeat-caller.production").await;
+        let _ = pool.unload_app("repeat-callee.production").await;
     }
 }

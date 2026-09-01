@@ -346,3 +346,63 @@ fn a_repeated_name_survives_the_manifest_round_trip() {
         2
     );
 }
+
+/// The shared rule, tested on its own rather than only through the three
+/// layers that ask it.
+///
+/// [`HeaderNamesWritten`] is the one place that decides whether a value
+/// *replaces* what a layer underneath already had for that name or *joins*
+/// the group the current write is building. Three layers now depend on that
+/// answer and none of them owns it: this table, the node writing a bundle's
+/// headers onto a finished response, and the pairs `env.ASSETS.fetch()` hands
+/// to JavaScript. Each of them used to carry its own copy of the loop, and
+/// each copy in turn was found replacing on *every* value - which sends one
+/// `Link` of two preloads and one `Set-Cookie` of a session and a CSRF
+/// cookie. The block tests above would catch a regression here only through
+/// this table; a change that broke the rule for the other two would not fail
+/// anything at all until it reached a response.
+mod the_rule_every_layer_shares {
+    use super::*;
+
+    #[test]
+    fn the_first_value_of_a_name_replaces_and_the_rest_join() {
+        let fields = vec![
+            HeaderField {
+                name: "link".to_string(),
+                value: "</a.css>".to_string(),
+            },
+            HeaderField {
+                name: "cache-control".to_string(),
+                value: "public".to_string(),
+            },
+            HeaderField {
+                name: "link".to_string(),
+                value: "</b.js>".to_string(),
+            },
+        ];
+        let mut written = HeaderNamesWritten::for_fields(&fields);
+        let verdicts: Vec<bool> = fields
+            .iter()
+            .map(|field| written.replaces(&field.name))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![true, true, false],
+            "the second `Link` joins the first; it does not replace the group the block just wrote"
+        );
+    }
+
+    #[test]
+    fn a_value_the_caller_drops_never_claims_its_name() {
+        // The node drops a value that turns out not to be a legal HTTP
+        // header, and asks only for the ones it is actually going to write.
+        // If a dropped value had claimed the name, the next value of that
+        // name would join a group that was never written and sit beside the
+        // node's own `Cache-Control` instead of overruling it.
+        let mut written = HeaderNamesWritten::default();
+        assert!(
+            written.replaces("cache-control"),
+            "the surviving value is still the first write of its name"
+        );
+    }
+}

@@ -2,6 +2,7 @@
 
 use super::AppState;
 use crate::app::AppKey;
+use crate::runtime::header_list;
 use crate::{is_platform_header, APP_ID_HEADER, ENVIRONMENT_HEADER, PLATFORM_HEADER_PREFIX};
 use axum::{
     body::{Body, Bytes},
@@ -117,6 +118,132 @@ pub(crate) fn declared_body_length(headers: &HeaderMap) -> Option<usize> {
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+/// The scheme this node's listener speaks.
+///
+/// Not read off the request, and that is the point. A client can put anything
+/// in an absolute request target (`GET https://anywhere/ HTTP/1.1`) or in an
+/// HTTP/2 `:scheme`, and this node accepts requests straight off the network:
+/// every other node on the installation can reach it and the demo talks to it
+/// directly, which is the same reason the `x-deis-` sweep below has to be made
+/// here as well as at the edge. So the scheme is what this node *knows* --
+/// what it is serving on -- rather than what the request claimed.
+///
+/// The cost is on an installation whose edge terminates TLS: an application
+/// there is answering an `https://` request and is told `http://`. That is the
+/// honest answer this node can give today. Closing it needs the edge to say
+/// so, on a channel a client cannot write: deis-proxy knows (`RequestCtx::tls`)
+/// and stamps only the two routing headers, and a header a client could also
+/// send would not be evidence of anything. An absolute redirect built from
+/// this reaches the right site either way -- the edge answers a plain request
+/// for an HTTPS application with a 301 to itself.
+const NODE_SCHEME: &str = "http";
+
+/// The authority a request that named none is answered under.
+///
+/// HTTP/1.0 has no `Host`, and a request built inside this node -- a test, a
+/// probe -- may carry none either. Something has to stand in, and the name of
+/// this machine's own loopback is the one answer that cannot be mistaken for a
+/// real site.
+const UNNAMED_AUTHORITY: &str = "localhost";
+
+/// What the request was for, as the handler reads it off `context.request.url`.
+///
+/// This used to be `format!("http://localhost{uri}")`. The path and the query
+/// were right and everything to the left of them was invented, so an
+/// application that derived a canonical URL, an absolute redirect, a signed
+/// callback or a link in an email put `localhost` in front of it -- correct on
+/// a developer's machine and wrong everywhere the platform actually runs.
+///
+/// The authority is the one the client addressed: HTTP/2's `:authority` (which
+/// `hyper` puts in the URI) when there is one, and the `Host` header
+/// otherwise. That is what "the host the client used" means, and it is what
+/// the edge routed on when it routed by host at all.
+///
+/// # What a client may and may not do with it
+///
+/// A client chooses its own `Host`, on this platform as on every other, so an
+/// application that signs or emails a URL built from this must treat the
+/// authority as input -- the same care every framework's documentation asks
+/// for. What it may *not* do is change the shape of the URL, and that is what
+/// [`usable_authority`] is for: a value carrying `/`, `?`, `#`, `@`, a space
+/// or a control character would move the path, add a query, turn the host into
+/// userinfo, or split the string outright. Those are refused here rather than
+/// pasted into a URL, because a handler cannot defend against a `request.url`
+/// whose path is not the path it was asked for.
+pub(crate) fn request_url(uri: &Uri, headers: &HeaderMap, key: &AppKey) -> String {
+    let claimed = uri
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+        });
+
+    let authority = match claimed {
+        None => UNNAMED_AUTHORITY,
+        Some(claimed) if usable_authority(claimed) => claimed,
+        Some(refused) => {
+            // Warn, not error: the request is still answered, and answered
+            // correctly -- the path and the query are the client's own. What
+            // is lost is the application's ability to build an absolute URL
+            // for this request, which is worth an operator's attention because
+            // nothing else will report it. The value is escaped and the tenant
+            // named, so a client sending these in a loop is findable rather
+            // than merely noisy.
+            tracing::warn!(
+                app_id = %key.app_id(),
+                environment = %key.environment(),
+                authority = %refused.escape_debug(),
+                path = %uri.path(),
+                "A request for {} named an authority that is not a host, so the URL its handler \
+                 is given says {} instead. Anything but a host and a port there would move the \
+                 path, add a query or turn the host into userinfo inside a URL the application \
+                 reads as this request's own",
+                key,
+                UNNAMED_AUTHORITY
+            );
+            UNNAMED_AUTHORITY
+        }
+    };
+
+    let target = uri
+        .path_and_query()
+        .map(|target| target.as_str())
+        .unwrap_or("/");
+    format!("{NODE_SCHEME}://{authority}{target}")
+}
+
+/// Whether a claimed authority is a host, and only a host.
+///
+/// Deliberately narrower than the grammar: no userinfo (`@`), because a URL
+/// reader takes everything before it as a user name and the *host* becomes
+/// whatever follows, so `Host: shop.example.com@evil.invalid` would answer
+/// with a URL whose origin is `evil.invalid`. No percent-escapes either --
+/// nothing legitimate needs one in a host, and allowing them would mean this
+/// check and the URL parser inside the isolate had to agree about decoding.
+///
+/// What is left is what a real `Host` carries: a registered name, an IPv4
+/// literal, a bracketed IPv6 literal, and an optional `:port`.
+fn usable_authority(authority: &str) -> bool {
+    // A `Host` longer than this is not a name anybody serves; the ceiling is
+    // here so the string cannot become a way to make every log line and every
+    // URL in an isolate arbitrarily long.
+    const LONGEST: usize = 255;
+
+    if authority.is_empty() || authority.len() > LONGEST {
+        return false;
+    }
+    // A leading `:` is a port with no host; a leading `[` is an IPv6 literal,
+    // which is the one legal use of the brackets.
+    if authority.starts_with(':') {
+        return false;
+    }
+    authority.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'[' | b']' | b'_')
+    })
 }
 
 /// Unified request handler - routes to applications via the tenant headers.
@@ -256,8 +383,9 @@ pub async fn handle_request(
         }
     }
 
-    // Use full URI (including path and query)
-    let url = format!("http://localhost{}", uri);
+    // The URL of the request being answered, as the handler will read it off
+    // `context.request.url`.
+    let url = request_url(&uri, &headers, &key);
 
     tracing::debug!(
         app_id = %key.app_id(),
@@ -294,22 +422,22 @@ pub async fn handle_request(
     // that an application cannot receive a header of its own under `x-deis-`,
     // which is the same bargain deis-bundle already strikes on the response
     // side by refusing a bundle that sets one.
-    let mut header_map = std::collections::HashMap::new();
-    let mut forged: Vec<&str> = Vec::new();
-    for (name, value) in headers.iter() {
-        if is_platform_header(name.as_str()) {
-            // The two routing headers are ordinary, documented traffic on the
-            // way in; they are put back below with the values this node
-            // resolved. Anything else under the prefix has no honest sender.
-            if name.as_str() != APP_ID_HEADER && name.as_str() != ENVIRONMENT_HEADER {
-                forged.push(name.as_str());
-            }
-            continue;
-        }
-        if let Ok(value_str) = value.to_str() {
-            header_map.insert(name.to_string(), value_str.to_string());
-        }
-    }
+    //
+    // A list and not a map, which is the other half of what a handler is
+    // given: see `crate::runtime::header_list`. A map kept one value per name,
+    // so a request with two `Cookie` lines, two `Accept` lines or an
+    // `X-Forwarded-For` chain reached the handler with one of them and nothing
+    // said the rest had been dropped.
+    let (mut request_headers, swept) =
+        header_list::from_header_map(&headers, |name| !is_platform_header(name));
+    // The two routing headers are ordinary, documented traffic on the way in;
+    // they are put back below with the values this node resolved. Anything
+    // else under the prefix has no honest sender.
+    let forged: Vec<&str> = swept
+        .iter()
+        .map(String::as_str)
+        .filter(|name| *name != APP_ID_HEADER && *name != ENVIRONMENT_HEADER)
+        .collect();
     if !forged.is_empty() {
         tracing::warn!(
             app_id = %key.app_id(),
@@ -329,12 +457,21 @@ pub async fn handle_request(
 
     // Put back what this node decided, so an application reading either of
     // them reads the request it is actually serving. Not the client's copy:
-    // routing takes the *first* value of a repeated header while this map
-    // keeps the last, so a client sending the environment twice used to have
-    // a handler running in one environment read the name of the other.
-    header_map.insert(APP_ID_HEADER.to_string(), key.app_id().to_string());
-    header_map.insert(
-        ENVIRONMENT_HEADER.to_string(),
+    // routing takes the *first* value of a repeated header, and a client
+    // sending the environment twice would otherwise have a handler running in
+    // one environment read the name of the other.
+    //
+    // `set_unique` and not a push, because these two are this node's answer
+    // rather than a contribution to a list: appending a second value would be
+    // read by a handler as `"production, preview"`.
+    header_list::set_unique(
+        &mut request_headers,
+        APP_ID_HEADER,
+        key.app_id().to_string(),
+    );
+    header_list::set_unique(
+        &mut request_headers,
+        ENVIRONMENT_HEADER,
         key.environment().to_string(),
     );
 
@@ -349,7 +486,7 @@ pub async fn handle_request(
     // "websocket" then took its non-upgrade branch and the handshake never
     // happened.
     if ws.is_some() {
-        header_map.insert("upgrade".to_string(), "websocket".to_string());
+        header_list::set_unique(&mut request_headers, "upgrade", "websocket".to_string());
     }
 
     let limit = state.max_request_body_bytes;
@@ -402,7 +539,7 @@ pub async fn handle_request(
     // Execute application
     match state
         .app_manager
-        .execute_app(&key, url, method.to_string(), header_map, body_opt)
+        .execute_app(&key, url, method.to_string(), request_headers, body_opt)
         .await
     {
         Ok((status, resp_headers, resp_body)) => {
@@ -410,7 +547,7 @@ pub async fn handle_request(
             if status == 101 {
                 if let Some(ws_upgrade) = ws {
                     // Extract WebSocket ID
-                    if let Some(ws_id) = crate::runtime::response_headers::first_value(
+                    if let Some(ws_id) = crate::runtime::header_list::first_value(
                         &resp_headers,
                         "X-Runtime-WebSocket-ID",
                     ) {

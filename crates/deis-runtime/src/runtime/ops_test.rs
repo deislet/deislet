@@ -91,7 +91,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -134,7 +134,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -492,7 +492,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -515,26 +515,22 @@ mod tests {
     /// and the ceiling would bound nothing in exactly the case it exists for.
     #[test]
     fn a_subrequest_allowance_is_spent_once_per_call_and_refunded_when_nothing_left_the_isolate() {
-        use crate::runtime::ops::SubrequestBudget;
+        use crate::runtime::ops::SubrequestAllowance;
 
-        let budget = SubrequestBudget::new(3);
-        assert_eq!(budget.charge(), Ok(1), "the first call of an invocation");
-        assert_eq!(budget.charge(), Ok(2));
-        assert_eq!(budget.charge(), Ok(3));
+        let allowance = SubrequestAllowance::new(3);
+        assert_eq!(allowance.charge(), Ok(1), "the first call of an invocation");
+        assert_eq!(allowance.charge(), Ok(2));
+        assert_eq!(allowance.charge(), Ok(3));
         assert_eq!(
-            budget.charge(),
+            allowance.charge(),
             Err(3),
             "the refusal reports the ceiling, which is what the message has to name"
         );
 
         // A destination the policy refused, or one abandoned before a socket
         // was opened, never left the isolate and gives its charge back.
-        budget.refund();
-        assert_eq!(budget.charge(), Ok(3));
-
-        // A new invocation starts with the whole allowance again.
-        budget.reset();
-        assert_eq!(budget.charge(), Ok(1));
+        allowance.refund();
+        assert_eq!(allowance.charge(), Ok(3));
     }
 
     /// A refund with no charge behind it must not hand out an unbounded
@@ -546,12 +542,118 @@ mod tests {
     /// the ceiling off, and nothing would report it.
     #[test]
     fn an_unmatched_refund_cannot_wrap_the_counter_round() {
+        use crate::runtime::ops::SubrequestAllowance;
+
+        let allowance = SubrequestAllowance::new(1);
+        allowance.refund();
+        allowance.refund();
+        assert_eq!(allowance.charge(), Ok(1));
+        assert_eq!(allowance.charge(), Err(1));
+    }
+
+    /// Each invocation gets an allowance of its own, and the one an earlier
+    /// invocation was spending is left exactly where it was.
+    ///
+    /// This is the whole of the ownership rule, at the level it is decided.
+    /// The budget used to be one counter for the isolate, reset at the start of
+    /// every invocation -- so a response stream still holding it, which is the
+    /// one thing allowed to spend past the request it belongs to, had its
+    /// ceiling handed back to it by every unrelated request that arrived.
+    #[test]
+    fn a_new_invocation_gets_its_own_allowance_and_does_not_refill_the_last_one() {
         use crate::runtime::ops::SubrequestBudget;
 
-        let budget = SubrequestBudget::new(1);
-        budget.refund();
-        budget.refund();
-        assert_eq!(budget.charge(), Ok(1));
-        assert_eq!(budget.charge(), Err(1));
+        let budget = SubrequestBudget::new(3);
+
+        // One invocation, which spends two of its three and then leaves a
+        // response stream producing -- the stream keeps this allowance.
+        budget.begin_invocation();
+        let streaming = budget.invocation();
+        assert_eq!(streaming.charge(), Ok(1));
+        assert_eq!(streaming.charge(), Ok(2));
+
+        // Ordinary traffic for the same application: a second invocation, with
+        // an allowance of its own.
+        budget.begin_invocation();
+        let next = budget.invocation();
+        assert!(
+            !Rc::ptr_eq(&streaming, &next),
+            "a new invocation must not be handed the allowance the last one was spending"
+        );
+        assert_eq!(next.charge(), Ok(1), "the new invocation starts from zero");
+
+        // And the stream's is untouched: one call left, then refusals.
+        assert_eq!(
+            streaming.spent(),
+            2,
+            "the stream's allowance was refilled by somebody else's request"
+        );
+        assert_eq!(streaming.charge(), Ok(3));
+        assert_eq!(streaming.charge(), Err(3));
+    }
+
+    /// Which allowance a call is charged to is decided by the scope it names,
+    /// and a scope naming a stream this isolate no longer has falls back to
+    /// the invocation's rather than to nothing.
+    #[test]
+    fn a_call_is_charged_to_the_allowance_its_scope_names() {
+        use crate::runtime::ops::{subrequest_allowance, SubrequestBudget};
+        use crate::runtime::response_stream::{response_streams, StreamOwner};
+        use deno_core::{JsRuntime, RuntimeOptions};
+        use std::time::{Duration, Instant};
+
+        // A bare runtime, only for its `OpState`: this is about the lookup,
+        // not about anything an application does.
+        let runtime = JsRuntime::new(RuntimeOptions::default());
+        let op_state = runtime.op_state();
+
+        let budget = Rc::new(SubrequestBudget::new(5));
+        op_state.borrow_mut().put(budget.clone());
+
+        budget.begin_invocation();
+        let of_the_stream = budget.invocation();
+
+        // A response stream opened by that invocation, holding its allowance.
+        let stream_id = {
+            let streams = response_streams(&mut op_state.borrow_mut());
+            let (id, _reader) = streams.borrow_mut().open(
+                Instant::now() + Duration::from_secs(60),
+                StreamOwner {
+                    tenant: "scope_lookup.production".to_string(),
+                    trace_id: "trace".to_string(),
+                    target: "http://localhost/feed".to_string(),
+                },
+                of_the_stream.clone(),
+            );
+            id
+        };
+
+        // The next request for this application.
+        budget.begin_invocation();
+        let of_the_invocation = budget.invocation();
+
+        let state = op_state.borrow();
+        assert!(
+            Rc::ptr_eq(
+                &subrequest_allowance(&state, stream_id).expect("a budget is installed"),
+                &of_the_stream
+            ),
+            "a producer's call has to come out of the allowance its own invocation had"
+        );
+        assert!(
+            Rc::ptr_eq(
+                &subrequest_allowance(&state, 0).expect("a budget is installed"),
+                &of_the_invocation
+            ),
+            "scope 0 is the invocation running now"
+        );
+        assert!(
+            Rc::ptr_eq(
+                &subrequest_allowance(&state, stream_id + 1).expect("a budget is installed"),
+                &of_the_invocation
+            ),
+            "a scope naming no open stream falls back to the invocation's allowance, which is \
+             the one that is always bounded"
+        );
     }
 }

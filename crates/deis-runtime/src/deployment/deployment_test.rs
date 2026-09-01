@@ -582,7 +582,7 @@ async fn secrets_reach_the_isolate_and_never_the_disk() {
             &demo(),
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
         )
         .await
@@ -637,7 +637,7 @@ async fn a_declared_service_gets_a_client_built_from_the_address_the_order_carri
             &demo(),
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
         )
         .await
@@ -688,7 +688,7 @@ async fn an_app_that_declares_no_service_is_told_so_rather_than_given_one() {
             &demo(),
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
         )
         .await
@@ -741,7 +741,7 @@ async fn a_version_that_will_not_load_never_interrupts_the_one_serving() {
             &demo(),
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
         )
         .await
@@ -767,7 +767,7 @@ async fn cookies_from(apps: &ApplicationManager, key: &AppKey) -> Vec<String> {
             key,
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
         )
         .await
@@ -890,7 +890,7 @@ async fn cookies_and_source(apps: &ApplicationManager, key: &AppKey) -> (Vec<Str
             key,
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
         )
         .await
@@ -915,7 +915,7 @@ async fn cookies_and_source(apps: &ApplicationManager, key: &AppKey) -> (Vec<Str
 /// The entry used to be written through `Object.fromEntries`, which keeps one
 /// value per name, so a response that was right on the miss came back with one
 /// cookie instead of two on the hit -- the same defect
-/// `runtime/response_headers.rs` exists to have caught once, reintroduced one
+/// `runtime/header_list.rs` exists to have caught once, reintroduced one
 /// layer in. Both requests here go to the same isolate, under a version that
 /// asked for every `Set-Cookie`, so the two answers have to be the same
 /// answer.
@@ -1351,7 +1351,7 @@ async fn secret_seen(apps: &ApplicationManager, key: &AppKey) -> String {
             key,
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
         )
         .await

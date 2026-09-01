@@ -30,7 +30,8 @@
 //! # The subrequest ceiling
 //!
 //! Because every hop comes through here, this is also where an invocation's
-//! outbound calls are counted, against [`SubrequestBudget`]. **A redirect
+//! outbound calls are counted, against the invocation's
+//! [`super::ops::SubrequestAllowance`]. **A redirect
 //! chain costs one per hop, not one for the chain**: three hops are three
 //! connections this node opens, three name resolutions and three sets of
 //! response headers to read, and an accounting that charged a chain of ten as
@@ -56,7 +57,7 @@ use deno_core::{extension, op2, OpState};
 use deno_error::JsErrorBox;
 
 use super::fetch_policy::{loggable, FetchPolicy};
-use super::ops::{AppId, ExecutionDeadline, SubrequestBudget};
+use super::ops::{subrequest_allowance, AppId, ExecutionDeadline};
 
 /// How much of the invocation's budget an outbound call is allowed to keep for
 /// itself, so that what is left is enough for the handler to notice the
@@ -117,10 +118,15 @@ fn op_deis_fetch_budget_ms(state: &mut OpState) -> f64 {
 /// will actually be given -- the inner request's own, not the argument the
 /// application passed, so that what is judged and what is dialled cannot come
 /// apart.
+///
+/// `scope` says which stretch of application code is making the call, so that
+/// the hop is charged to the right allowance: see
+/// [`super::ops::subrequest_allowance`].
 #[op2]
 async fn op_deis_fetch_guard(
     state: Rc<RefCell<OpState>>,
     #[string] url: String,
+    scope: u32,
 ) -> Result<(), JsErrorBox> {
     let (policy, app_id, budget, subrequests) = {
         let state = state.borrow();
@@ -131,7 +137,13 @@ async fn op_deis_fetch_guard(
                 .map(|app| app.0.clone())
                 .unwrap_or_default(),
             budget_ms(&state),
-            state.try_borrow::<Rc<SubrequestBudget>>().cloned(),
+            // The allowance this call belongs to, resolved once here from the
+            // scope the caller named, so the charge below and the refunds
+            // further down act on the same one. Resolving it again after an
+            // await could answer differently -- a response stream's producer
+            // may have stepped in between -- and a refund that landed
+            // elsewhere would credit an invocation that never made the call.
+            subrequest_allowance(&state, scope),
         )
     };
 
@@ -155,7 +167,7 @@ async fn op_deis_fetch_guard(
 
     // Charged before the destination is resolved, and before any await, so
     // that a hundred calls started at once cannot all pass a check that is
-    // only committed later; see [`SubrequestBudget::charge`]. A call the
+    // only committed later; see [`super::ops::SubrequestAllowance::charge`]. A call the
     // policy then refuses, or one abandoned while the host was being looked
     // up, gives its charge back below: nothing left the isolate.
     //

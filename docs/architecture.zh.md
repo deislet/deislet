@@ -142,7 +142,7 @@ erDiagram
     APP ||--o{ VERSION : "每次上传产生"
     ENVIRONMENT ||--o{ DEPLOYMENT : "按时间排，最新的一行即当前"
     DEPLOYMENT }o--|| VERSION : "指向"
-    ENVIRONMENT ||--o{ ROUTE : "记录（尚无人消费）"
+    ENVIRONMENT ||--o{ ROUTE : "记录，deis-proxy 按它选应用"
     ENVIRONMENT ||--o{ SECRET : "持有"
     VERSION ||--|| BUNDLE : "含"
     BUNDLE ||--o{ ASSET : "含静态资产"
@@ -218,7 +218,10 @@ deis-runtime 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪�
 | SECRET | 有。AES-256-GCM 落库，主密钥从 `secret_key_file` 读；面板与 CLI 只能写和删，读不回来 |
 | CRON | 有，且挂对了对象：调度器按 `(app_id, environment)` 维护，到点调某一个节点的 `Trigger.OnScheduled` |
 | ASSET | 有。打进包里，节点建内存索引，命中直接返回并带 ETag。同一份包里还带着这个站点自己的规则——`_redirects`、`_headers` 和「路径谁都没认领时答什么」，构建期解析、装载时编译（见 §4） |
-| BINDING / NAMESPACE | **没建，也不打算建**。见 §8 |
+| BINDING / NAMESPACE | 控制面**没有**这张表，也不打算建——具名绑定是**包的属性**，`bindings` 块写在 manifest 里随版本走，形状由 `deis-bundle` 唯一定义。所以「一个应用一个环境只有一份 KV」这条限制早已不在，见 §8 |
+| ACCOUNT / API_TOKEN | 有。`accounts`（名字、角色、停用时刻）与 `api_tokens`（所属账号、来源、作用域、是否无作用域、最后使用与吊销时刻）。token 在库里只留密的那一半的 sha256，所以读到这两张表的人手上没有一把能用的钥匙 |
+| AUDIT_LOG | 有，且**只增不改**：全仓没有一处 UPDATE 或 DELETE 它，`DELETE /api/audit` 是 405（连没有作用域的那把 key 也一样）。改状态的调用和被拒的调用一样记，被拒的那条还记下「本来需要什么作用域」 |
+| RETIRED_APP_NAME | 有。删掉一个应用并不能删掉它在 deis-store / deis-queue 里的数据（两个服务都没有「丢掉一个租户」这个动作），所以名字被扣下而不是放回去：`retired_app_names` 记着它铺到过哪些租户，有人明确放出来之前，没有第二个应用能用这个名字接手那些数据 |
 
 ---
 
@@ -320,8 +323,13 @@ flowchart TB
 - **预览子域**。运维在 proxy 配置里写 `routing.preview_zone`，每个环境就有了
   `<环境>--<应用>.<域>`，默认环境另有一个短名 `<应用>.<域>`。分隔符是一个 DNS 标签
   里的 `--` 而不是点，为的是证书：一张通配证书只覆盖一层标签，`*.<域>` 盖得住
-  `pr-42--shop.<域>`，盖不住 `pr-42.shop.<域>`。**这一条只做到了地址这一半**：那条
-  通配 DNS 记录和那张通配证书仍然要人手放，因为 ACME 自动签发还没做（见 §11）。
+  `pr-42--shop.<域>`，盖不住 `pr-42.shop.<域>`。**仍然要人手做的只剩那条通配 DNS
+  记录**：证书这一半 ACME 已经接上了（`crates/deis-proxy/src/acme/`，`[tls.acme]`
+  打开，默认关）。它走 `http-01`——代理本来就替它服务的每个域名占着 80 端口，自己
+  就能答挑战——代价是**签不出通配证书**：RFC 8555 只允许 `dns-01` 签通配。所以预览
+  地址有两条路：把 `include_preview_addresses` 打开，让每个环境地址各签一张（省事，
+  但每张各占一次颁发额度）；或者仍然人手放一张 `*.<域>` 的通配证书（一张管全部）。
+  见 §11。
 
 **deis-proxy 的资产缓存仍然没做**：原则 1 里「proxy 只做缓存」的那一半没有实现，
 每个资产请求都会走到节点，由节点从内存索引里回。配置里的 `[cache]` 段目前没有任何
@@ -429,7 +437,7 @@ sequenceDiagram
 |---|---|---|---|
 | **deis-store** | KV | SQLite 表（tenant, key, value, metadata, expires_at） | `storage.proto` 的 `KvStore` |
 | | Database | 每租户一个独立 SQLite 文件 `db/<tenant>.sqlite` | `storage.proto` 的 `Database` |
-| | Blob | 内容寻址落盘 `blob/<tenant>/…` + SQLite 元数据 | `blob.proto`，Get/Put 流式分块 |
+| | Blob | 内容寻址落盘 `blob/<tenant>/…` + SQLite 元数据 | `blob.proto`：`Get`（可带 `Range`）/ `Head` / `List`（前缀、分隔符、游标）/ `Put` / `Delete`，Get 与 Put 流式分块；`Put` / `Delete` 可带 `Precondition`（`if_match` / `if_none_match`，版本标识就是对象的 sha256） |
 | **deis-queue** | Queue | SQLite 表做持久队列，另有死信表 | `queue.proto`：`Send` / `SendBatch` / `Pull` / `Ack` / `Nack` / `ListDeadLetters` / `ReplayDeadLetters` |
 
 ### 租户维度只有一个，值是「应用 + 环境」
@@ -643,14 +651,9 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 
 ## 8. 服务声明与密钥
 
-### 服务：留在包里，没有 bindings 表
+### 服务：先有「用不用」，后来又有了 bindings 表
 
-早前设计打算把 `AppManifest.resources: Vec<String>` 换成一张结构化的绑定表，
-形如 `{ "name": "MY_KV", "kind": "kv", "namespace": "foo-prod" }`，存进控制面。
-**落地时没有这么做**，因为 namespace 那一列没有内容可填：租户已经由
-`(应用, 环境)` 唯一决定，一个应用的 KV 就是它自己那份，不需要再指一次。
-
-现在的形状是：包的 manifest 里声明**用不用**某个服务，
+第一层是**用不用**某个服务，写在包的 manifest 里：
 
 ```json
 { "services": { "kv": true, "database": true, "blob": false, "queue": true } }
@@ -661,9 +664,31 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
 （`DEIS_STORE_ENDPOINT` / `DEIS_QUEUE_ENDPOINT` / `DEIS_SERVICES` /
 `DEIS_QUEUE_CONSUMERS`），这些键在进 Isolate 之前被取走。
 
-**代价要说清楚**：应用不能给同一种服务开两个互不相通的命名空间——没有
-`MY_KV` 与 `CACHE_KV` 之分，一个应用一个环境只有一份 KV。真需要多命名空间时，
-再补一层映射，那时才需要 bindings 表。
+第二层是**具名绑定**。早前这里写的是「不做 bindings 表」，理由是那张表上的
+`namespace` 一列没内容可填：租户已经由 `(应用, 环境)` 唯一决定。这条判断后来被推翻了
+——不是因为租户变了，而是因为「一个应用一个环境只有一份 KV」本身就是个限制：热数据和
+冷数据、两套互不相干的索引，只能挤在同一个键空间里靠前缀分家。现在 manifest 里有一张
+`bindings` 表（形状定义在 `deis-bundle/src/bindings.rs`，构建 / 控制面 / 节点 / isolate
+四方共用一份）：
+
+```json
+{ "bindings": {
+    "HOT":  { "kind": "kv" },
+    "COLD": { "kind": "kv" },
+    "AUTH": { "kind": "service", "app": "demo-auth" } } }
+```
+
+`kind` 有五种：`kv` / `database` / `blob` / `queue` 是**本租户内部的一个命名空间**，
+`service` 是**另一个应用**（见 §12 的「应用间调用」一行）。名字在
+`context.bindings.<名字>` 和 `env.<名字>` 上拿到同一个对象。
+
+**租户边界一点没动**：绑定名是在能力令牌验过之后、由
+`deis_wire::conventions::namespace_id` 拼到租户后面的（`shop.production@HOT`），
+分隔符 `@` 在租户两段和绑定名里都非法，所以这个拼法是单射的——没有哪一对
+`(租户, 绑定)` 能拼出另一对的命名空间。不带名字的 `context.services.*` 仍是那个**无名**
+命名空间，调用不带 `x-deis-binding` 头，所以早先部署的应用数据原地不动。绑定名判重
+不分大小写（它会变成 deis-store 里的目录名和文件名），`ASSETS` 和 `DEIS_` 开头的名字
+是保留的。队列绑定不需要这套拼法：deis-queue 本来就是按 `(租户, 队列名, id)` 存的。
 
 ### 密钥
 
@@ -818,9 +843,20 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
 
 **边做边定**
 
-- 证书自动签发（ACME）。**这一条现在是自动子域唯一还欠的东西**：地址那一半已经做了
-  （`routing.preview_zone` 一配，每个环境就有 `<环境>--<应用>.<域>`），但那张 `*.<域>`
-  的泛域名证书仍然要运维手动放、手动续。`examples/pingap` 有现成模块可参考。
+- ~~证书自动签发（ACME）~~ **已做**：`crates/deis-proxy/src/acme/` 是一个 RFC 8555
+  客户端，默认关闭，`[tls.acme]` 打开。要签哪些名字不另列清单，取自这台机器**本来
+  就在服务的两张表**——控制面推下来的应用域名，加上目录路由表里的具体主机名；三类
+  名字排除在外：通配（`http-01` 签不了）、运维自己在 `certificates` 里指定过文件的
+  名字（那是他的决定），以及压根不是公网主机名的（IP 字面量、单标签名）。账号密钥与
+  证书按**颁发机构主机名分目录**放在 `storage_dir` 下，所以把 `directory_url` 从测试
+  环境改成正式环境等于全部重签，而不是拿着一批浏览器不认的测试证书继续服务。续期是
+  一条后台任务（默认每 12 小时过一遍，剩余有效期少于 `renew_before_days`（默认 30
+  天）就重签），失败按还剩多少余地分级：还有余地记 `WARN`，少于 `alarm_before_days`
+  （默认 7 天）记 `ERROR`，两种都写清第几次失败、还剩几天、下次什么时候试。
+  **仍然要人手放的只剩通配证书**：RFC 8555 只允许 `dns-01` 签通配，这个实现不说那套
+  协议。`crates/deis-proxy/tests/support/acme_ca.rs` 是一个只跑在环回口上的假 CA，
+  八个集成测试跑的都是真的 `deis-proxy` 进程；`scripts/demo.sh verify` 的「automatic
+  certificates」一组另有五条检查。
 - （已定）`deis dev` 怎么执行用户代码：起一个本地 `deis-runtime`，用控制面同一个
   `ApplyDeployment` 把包交给它。另外两条路——调 deno CLI、把 deno_core 嵌进 deis
   ——都不再考虑，因为它们跑的都不是线上那个引擎。
@@ -836,7 +872,7 @@ WebSocket 消息，这四条路径原来是同一个写法，问题也一样。�
 
 **已知缺口（不阻塞现有功能，但都会被踩到）**
 
-- ~~**控制面的 routes 表没人消费**~~ **已接上**：控制面另开了一条给数据面的 `GET /api/routing-table`，deis-proxy 每 5 秒拉一次并按它选应用，路径前缀和每环境的自动地址都成立了（§4）。仍然要人手做的只剩那条通配 DNS 记录和那张通配证书——ACME 还没做，见上面「边做边定」的第一条。
+- ~~**控制面的 routes 表没人消费**~~ **已接上**：控制面另开了一条给数据面的 `GET /api/routing-table`，deis-proxy 每 5 秒拉一次并按它选应用，路径前缀和每环境的自动地址都成立了（§4）。仍然要人手做的只剩那条通配 DNS 记录——证书那一半 ACME 已经接上，见上面「边做边定」的第一条。
 - **只有 deis-runtime 在往 deis-telemetry 投递**，deis-proxy / deis-store /
   deis-queue / deis-control 都还只写自己的 stdout（§7）。
 - ~~**`UpdateApp` 仍带 `bytes package_data`**~~ **已删**：那个字段现在是
@@ -919,7 +955,7 @@ SSR。
 | Request / Response | 成立 | JS 侧是 deno_fetch 自己的 `Request` / `Response`，手写的最小实现已删除：`Response.json()` / `Response.redirect()` / `Response.error()`、`ok`、`arrayBuffer()` / `blob()` / `formData()`、`clone()`、`Headers.getSetCookie()`、`body` 是真 `ReadableStream`，都实测可用。此前唯一的保留——`JsRequest.body` / `JsResponse.body` 过 Rust↔JS 边界是 `Option<String>`，二进制主体会被有损转换——已改成字节（op 边界 `#[buffer]` / `ToJsBuffer`），二进制原样穿过。响应方向后来又多了一种形状：`ResponseBody` 三选一——没有 body、一整块字节、一条还在生产的流。前两种就是原来那个`Option<Vec<u8>>` 的两半，绝大多数响应仍然走它；`new Response(stream)` 和 `fetch()` 答回来的响应走第三种，边生产边发，见 `runtime/response_stream.rs`。请求体仍然是整块的 |
 | 环境变量 | 成立 | 控制面下发的 `env` 表注入 `context.env`，平台保留键先被取走 |
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
-| KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本 |
+| KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本。读写删之外还有四样：`put` 可带 `expirationTtl`（从写入起算的相对秒数）与一段不透明的 `metadata`；`get` 可以按 `type: text / json / arrayBuffer` 取；`getWithMetadata` 一次把值、metadata 和到期时刻取回来（它们本来就是同一行的三列）；`list({ prefix, limit, cursor })` 按游标翻页，每条自带 metadata 与到期时刻。服务端另有一个 `Has`，**目前没有任何调用方**——op 表、JS 绑定和命令行都够不到它，只有 `KvClient` 自己的测试在调 |
 | Cache API | 成立 | 标准入口是 `context.services.cache`，`globalThis.caches.default` 指向同一个实例；`caches.open(name)` 另开一个互不串门的命名空间（键在 Rust 侧按名字长度前缀合成，两个名字不可能撞在一起）；`caches.scope` 把这个 store 的身份和起始时刻交给应用，好让它分清「这一条被淘汰了」和「整个 store 换了一个」——后者才是发版那天会让应用重做已经做过的事的那一种。后端是 moka 进程内缓存，`Cache-Control` 的 `max-age` / `s-maxage` 决定过期。语义上是单 Isolate 缓存：换节点、换版本都读不到。**此前这一格是有保留的**：body 过边界是字符串，写入前先当 UTF-8 解码，`0x80..=0xff` 的字节一律变成 `ef bf bd`——`caches.default` 是每个 Isolate 自带的，一张放进去的图片会在读出来时静默损坏，没有任何报错。现已改成按字节走（`op_cache_set` 收 `#[buffer] JsBuffer`，`op_cache_get` 答 `ToJsBuffer`），status/headers 仍是文本，因为那部分确实是文本 |
 | 生命周期 `waitUntil` | 成立 | `runtime.js` 的 `__deis_runtime_wait_until_all` |
 | 结构化日志 | 成立 | 环形缓冲 + `LogShipper` → deis-telemetry，`Query` 能查回来 |
@@ -1080,8 +1116,8 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | 特性 | 实况 | 依据 |
 |---|---|---|
 | SQL 数据库 | 成立 | deis-store 的 `Database` 服务，每租户一个 SQLite 文件；节点按 manifest 建 `DbClient` |
-| 对象存储 | 成立 | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；Isolate 侧 `context.services.blob` 收字符串 / `ArrayBuffer` / `ArrayBufferView`，有顶着真 deis-store 的端到端测试 |
-| 消息队列 | 成立 | deis-queue 的 `Send`/`Pull`/`Ack`/`Nack` + 节点的 `queue_consumer` 轮询任务；消息体按字节走（`queue.proto` 的 `body` 是 `bytes`），`send()` 接受字符串、普通对象或 `ArrayBuffer`/`ArrayBufferView`；消费端 `message.body` 是发送时的原文，body 不是合法 UTF-8 时为 `null`，只能靠 `message.bytes()` 读 |
+| 对象存储 | 成立 | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；Isolate 侧 `context.services.blob` 收字符串 / `ArrayBuffer` / `ArrayBufferView`，有顶着真 deis-store 的端到端测试。读写之外还有三样：`list({ prefix, delimiter, limit, cursor })` 按游标翻页、按分隔符把键卷成一层层「目录」；`head(key)` 只取元数据不取正文；`get(key, { range })` 取一段——`range` 收 HTTP `Range` 头原文，也收 `{ offset, length }` / `{ suffix }`。写和删可以带条件：`onlyIf: { ifMatch }` / `{ ifNoneMatch }` 比的是对象的 sha256，`{ ifNoneMatch: "*" }` 就是「只创建一次」。条件写没抢到时 `put()` 返回 `null`（不是抛异常），所以「读—改—写」是应用自己能写出来的一个循环——**这是本平台唯一的原子协调原语**。`deis blob list` / `head` / `get --offset` / `put --if-match` 是命令行这一侧的同一套 |
+| 消息队列 | 成立 | deis-queue 的 `Send`/`SendBatch`/`Pull`/`Ack`/`Nack`/`ListDeadLetters`/`ReplayDeadLetters` + 节点的 `queue_consumer` 轮询任务；`sendBatch()` 一次投一批，落库是一个事务，所以整批要么都进去要么一条都没有，失败之后原样重发是安全的；试过太多次的消息进死信表，`deis queue dead-letters` 能看、`deis queue replay` 能放回；消息体按字节走（`queue.proto` 的 `body` 是 `bytes`），`send()` 接受字符串、普通对象或 `ArrayBuffer`/`ArrayBufferView`；消费端 `message.body` 是发送时的原文，body 不是合法 UTF-8 时为 `null`，只能靠 `message.bytes()` 读 |
 | 定时任务 | 成立 | 控制面按 `(app, environment)` 调度 → 节点 `Trigger.OnScheduled` → 跑 `scheduled` 导出 |
 | 具名绑定 | 成立 | manifest 的 `bindings` 块（形状在 `deis-bundle`，构建 / 控制面 / 节点 / isolate 四方共用一份）。一个应用可以声明任意多个 `kv` / `database` / `blob` / `queue` 绑定，各取一个名字，在 `context.bindings.<名字>` 和 `env.<名字>` 上拿到同一个对象。**租户边界一点没动**：绑定名是在能力令牌验过之后、用 `deis_wire::conventions::namespace_id` 拼到租户后面的（`shop.production@HOT`），分隔符 `@` 在租户两段和绑定名里都非法，所以这个拼法单射——没有哪一对 `(租户, 绑定)` 能拼出另一对的命名空间。不带名字的 `context.services.*` 还是那个**无名**命名空间，调用不带 `x-deis-binding` 头，早先部署的应用数据原地不动。绑定名判重不分大小写，因为它会变成 deis-store 里的目录名和文件名。队列绑定不需要这套拼法：deis-queue 本来就是按 `(租户, 队列名, id)` 存的 |
 | 应用间调用（service bindings） | 成立 | `bindings` 里 `"kind": "service"` 的那一种，`context.bindings.AUTH.fetch(...)`。**不带任何地址**——没有主机、端口、URL 或要解析的名字——派发是节点进程内部的一条消息（`RuntimeMessage::ExecuteServiceCall`）送到托管被调方 isolate 的那条运行时线程，所以 `fetch_policy` 既不参与也放不开。两道闸：被调方在自己 bundle 的 `callableBy` 里同意（节点按被调方**当前那一版**逐次查），上传方在作用域里持有 `read:<被调方>/<环境>`（控制面上传时查一次并进审计）。默认调**调用方自己那个环境**，因为 `(应用, 环境)` 就是租户。一次调用花一个 subrequest 配额，链路深度上限 4，成环当场拒（A→B→A 会让 A 的线程等一条它自己读不到的消息，那是死锁不是慢）。被调方跑的是它自己的 invocation：自己的超时、CPU、内存、日志、轨迹；调用方另按自己剩下的预算等，两种超时在消息里是两句不同的话。只在本节点内：被调方不在这台机器上时，调用方得到的就是这句话 |

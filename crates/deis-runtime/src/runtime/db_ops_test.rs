@@ -137,7 +137,6 @@ mod tests {
 
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::test_store::TestStore;
-    use std::collections::HashMap;
     use tokio::sync::oneshot;
 
     /// A table to write into, created outside any transaction.
@@ -169,7 +168,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )

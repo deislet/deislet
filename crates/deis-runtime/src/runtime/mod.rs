@@ -8,6 +8,7 @@ mod db_ops;
 mod deno_telemetry_stub;
 mod fetch_ops;
 pub mod fetch_policy;
+pub mod header_list;
 pub mod isolate;
 mod kv_client;
 pub mod loader;
@@ -19,7 +20,6 @@ mod queue_client;
 pub mod queue_consumer;
 mod queue_ops;
 pub mod rate_limit;
-pub mod response_headers;
 mod response_stream;
 pub mod route_match;
 mod runtime_init;
@@ -46,6 +46,7 @@ pub use db_ops::init_db_extension;
 pub use deno_telemetry_stub::init_deno_telemetry_extension;
 pub use fetch_ops::init_fetch_guard_extension;
 pub use fetch_policy::FetchPolicy;
+pub use header_list::HeaderPairs;
 pub use isolate::IsolateSpec;
 pub use kv_client::{KvClient, KvRead};
 pub use metrics::{
@@ -57,7 +58,6 @@ pub use pool::{RuntimePool, StagedVersion};
 pub use queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};
 pub use queue_consumer::{BatchOutcome, ConsumerSettings};
 pub use queue_ops::init_queue_extension;
-pub use response_headers::HeaderPairs;
 pub use response_stream::{
     init_response_stream_extension, response_streams, ResponseBody, ResponseStreams, StreamReader,
 };

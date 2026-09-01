@@ -109,7 +109,8 @@
 //! closes it and opens the next never holds more than one and can still make
 //! this node perform hundreds of connections for a single inbound request, so
 //! a connection here also costs one of the invocation's subrequests
-//! ([`SubrequestBudget`]) -- the same allowance an outbound `fetch` spends,
+//! ([`crate::runtime::ops::SubrequestAllowance`]) -- the same allowance an
+//! outbound `fetch` spends,
 //! because it is the same shared thing being spent: the node's outbound
 //! capacity. A connection the policy refuses gives its charge back; one that
 //! was dialled and did not come up does not, because it left the isolate.
@@ -142,7 +143,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::runtime::fetch_policy::{loggable, FetchPolicy};
 use crate::runtime::isolate::OutboundSockets;
-use crate::runtime::ops::{AppId, ExecutionDeadline, SubrequestBudget};
+use crate::runtime::ops::{subrequest_allowance, AppId, ExecutionDeadline};
 
 /// How many outbound sockets one isolate may hold open at once.
 ///
@@ -878,6 +879,10 @@ async fn op_deis_ws_connect(
     #[string] url: String,
     budget_ms: f64,
     #[serde] protocols: Vec<String>,
+    /// Which stretch of application code is dialling, so the connection is
+    /// charged to the right allowance; see
+    /// [`crate::runtime::ops::subrequest_allowance`].
+    scope: u32,
 ) -> Result<Opened, JsErrorBox> {
     let (policy, app_id, deadline, subrequests, sockets, asked_in) = {
         let mut state = state.borrow_mut();
@@ -889,7 +894,10 @@ async fn op_deis_ws_connect(
         let deadline = state
             .try_borrow::<ExecutionDeadline>()
             .and_then(|slot| slot.get());
-        let subrequests = state.try_borrow::<Rc<SubrequestBudget>>().cloned();
+        // The allowance this connection belongs to, resolved once from the
+        // scope the caller named, so the charge below and the refund on a
+        // refusal act on the same one; see `fetch_ops`.
+        let subrequests = subrequest_allowance(&state, scope);
         let sockets = ws_state(&mut state);
         let asked_in = sockets.epoch.get();
         (policy, app_id, deadline, subrequests, sockets, asked_in)
@@ -986,7 +994,8 @@ async fn op_deis_ws_connect(
 
     // One of the invocation's outbound calls, charged before anything is
     // dialled and before the awaits below, for the reason
-    // [`SubrequestBudget::charge`] gives: a count committed after an await
+    // [`crate::runtime::ops::SubrequestAllowance::charge`] gives: a count
+    // committed after an await
     // would not bound a burst of connections started at once. The socket cap
     // above is a different question -- how many may be open together -- and
     // neither answers the other.

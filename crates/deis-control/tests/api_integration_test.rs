@@ -944,3 +944,313 @@ async fn pushing_config_to_an_unconnected_node_is_a_404_not_a_500() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(body.contains("control channel"), "{body}");
 }
+
+/// The takeover, end to end, and what stops it now.
+///
+/// Three things that each read as reasonable put it together:
+/// `api_auth_enabled` defaults to off; an unauthenticated caller is admitted
+/// when the peer is on this machine; and the human API was wrapped in
+/// `CorsLayer::permissive()`. A browser on the operator's box is a loopback
+/// peer, so any page they visited could `fetch()` the control plane with no
+/// credential, create an owner account, mint an unscoped root token, deploy,
+/// and read the audit log - and read every answer, because
+/// `access-control-allow-origin: *` is exactly the permission to read a
+/// response.
+#[tokio::test]
+async fn a_web_page_on_another_origin_cannot_drive_the_control_plane() {
+    let config = ControlConfig::default();
+    assert!(
+        !config.api_auth_enabled,
+        "this test is about the default install, so it must be the default that is exercised"
+    );
+    assert!(
+        config.api_cors_allowed_origins.is_empty(),
+        "cross-origin access has to be off unless an operator names the origins"
+    );
+    let database = Arc::new(Database::init(":memory:").await.unwrap());
+    let sessions = Arc::new(SessionManager::new());
+    let config_manager = Arc::new(ConfigManager::new(
+        Arc::clone(&database),
+        Arc::clone(&sessions),
+    ));
+    let command_executor = Arc::new(CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&database),
+    ));
+    let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+
+    tokio::spawn(async move {
+        let _ = deis_control::api::start_api_server(
+            sessions,
+            database,
+            config_manager,
+            command_executor,
+            metrics_collector,
+            config,
+            18391,
+        )
+        .await;
+    });
+    wait_for_server_ready(18391).await;
+
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:18391";
+
+    // 1. The preflight. Without an `access-control-allow-origin` naming the
+    //    page's origin, the browser never sends the call at all, so a JSON
+    //    body or any method past POST does not leave it.
+    for (method, path) in [
+        ("POST", "/api/accounts"),
+        ("POST", "/api/accounts/attacker/tokens"),
+        ("DELETE", "/api/runtime/node-1/apps/demo"),
+    ] {
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, format!("{base}{path}"))
+            .header("Origin", "https://evil.example")
+            .header("Access-Control-Request-Method", method)
+            .header("Access-Control-Request-Headers", "content-type")
+            .send()
+            .await
+            .expect("the preflight itself is answered, one way or another");
+        assert!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "the preflight for {method} {path} told the page it may make the call"
+        );
+    }
+
+    // 2. The call itself, made anyway - a page cannot do this, but nothing
+    //    about the answer may depend on that. It is refused, and the refusal
+    //    says what a console hosted elsewhere does instead.
+    let created = client
+        .post(format!("{base}/api/accounts"))
+        .header("Origin", "https://evil.example")
+        .header("Sec-Fetch-Site", "cross-site")
+        .json(&serde_json::json!({"name": "attacker", "role": "owner"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 401);
+    assert!(
+        created
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "even the refusal must not be readable by the page that caused it"
+    );
+    assert!(
+        created
+            .text()
+            .await
+            .unwrap()
+            .contains("api_cors_allowed_origins"),
+        "the refusal has to name what an operator changes"
+    );
+
+    // 3. And no account was created, so nothing downstream of it exists.
+    let accounts = client
+        .get(format!("{base}/api/accounts"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accounts.status(), 200, "the local operator is unaffected");
+    let listed: serde_json::Value = accounts.json().await.unwrap();
+    let names = serde_json::to_string(&listed).unwrap();
+    assert!(!names.contains("attacker"), "{names}");
+
+    // 4. The console this port serves is same-origin, so it is untouched:
+    //    same call, marked the way a browser marks its own page.
+    let same_origin = client
+        .post(format!("{base}/api/accounts"))
+        .header("Origin", base)
+        .header("Sec-Fetch-Site", "same-origin")
+        .json(&serde_json::json!({"name": "operator", "role": "owner"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        same_origin.status(),
+        200,
+        "the console served from this port stopped working"
+    );
+}
+
+/// Reading the cluster's size, node count, uptime and event totals is a read
+/// like any other. It used to be exempt from `api_auth_enabled` and from the
+/// loopback rule at once, so any host that could route to the port had it.
+#[tokio::test]
+async fn a_metrics_scrape_needs_the_credential_the_rest_of_the_api_needs() {
+    let config = ControlConfig {
+        api_auth_enabled: true,
+        api_keys: vec!["the-only-key".to_string()],
+        ..Default::default()
+    };
+    let database = Arc::new(Database::init(":memory:").await.unwrap());
+    let sessions = Arc::new(SessionManager::new());
+    let config_manager = Arc::new(ConfigManager::new(
+        Arc::clone(&database),
+        Arc::clone(&sessions),
+    ));
+    let command_executor = Arc::new(CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&database),
+    ));
+    let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+
+    tokio::spawn(async move {
+        let _ = deis_control::api::start_api_server(
+            sessions,
+            database,
+            config_manager,
+            command_executor,
+            metrics_collector,
+            config,
+            18392,
+        )
+        .await;
+    });
+    wait_for_server_ready(18392).await;
+
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:18392";
+
+    for path in ["/api/metrics", "/api/metrics/summary"] {
+        let anonymous = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(
+            anonymous.status(),
+            401,
+            "{path} was served with no credential by a control plane that demands one"
+        );
+
+        let scrape = client
+            .get(format!("{base}{path}"))
+            .header("Authorization", "Bearer the-only-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(scrape.status(), 200, "{path} refused a valid credential");
+    }
+
+    // The probe is still the one thing in front of the gate: it answers a
+    // constant, and the orchestrator asking has nothing to present.
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), 200);
+    assert_eq!(health.text().await.unwrap(), "OK");
+}
+
+/// The way back for an operator who does host a console somewhere else: name
+/// the origin, and mint it a credential. Naming it is what lets the browser
+/// read the answers; the credential is what gets past the gate, because the
+/// admission that needs none is for this machine's own tools.
+#[tokio::test]
+async fn a_named_origin_is_answered_and_every_other_origin_is_not() {
+    let config = ControlConfig {
+        api_cors_allowed_origins: vec![
+            "https://console.example.com".to_string(),
+            // The two spellings that cannot work, next to the one that can:
+            // neither may take the good entry down with it.
+            "*".to_string(),
+            "https://trailing.example.com/".to_string(),
+        ],
+        api_keys: vec!["console-key".to_string()],
+        api_auth_enabled: true,
+        ..Default::default()
+    };
+    let database = Arc::new(Database::init(":memory:").await.unwrap());
+    let sessions = Arc::new(SessionManager::new());
+    let config_manager = Arc::new(ConfigManager::new(
+        Arc::clone(&database),
+        Arc::clone(&sessions),
+    ));
+    let command_executor = Arc::new(CommandExecutor::new(
+        Arc::clone(&sessions),
+        Arc::clone(&database),
+    ));
+    let metrics_collector = Arc::new(MetricsCollector::new(Arc::clone(&sessions)));
+
+    tokio::spawn(async move {
+        let _ = deis_control::api::start_api_server(
+            sessions,
+            database,
+            config_manager,
+            command_executor,
+            metrics_collector,
+            config,
+            18393,
+        )
+        .await;
+    });
+    wait_for_server_ready(18393).await;
+
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:18393";
+
+    // The named origin is preflighted for itself, by name and not by `*`.
+    let preflight = client
+        .request(reqwest::Method::OPTIONS, format!("{base}/api/apps"))
+        .header("Origin", "https://console.example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://console.example.com")
+    );
+    // `Vary: origin`, or a cache in front of this could hand one origin the
+    // answer that was written for another.
+    assert!(
+        preflight
+            .headers()
+            .get_all("vary")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.to_ascii_lowercase().contains("origin"))
+    );
+
+    // And its calls are readable, with the credential the API requires.
+    let listed = client
+        .get(format!("{base}/api/apps"))
+        .header("Origin", "https://console.example.com")
+        .header("Sec-Fetch-Site", "cross-site")
+        .header("Authorization", "Bearer console-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    assert_eq!(
+        listed
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://console.example.com")
+    );
+
+    // Nobody else, including the two entries that could never work.
+    for other in [
+        "https://evil.example",
+        "https://trailing.example.com",
+        "http://console.example.com",
+    ] {
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, format!("{base}/api/apps"))
+            .header("Origin", other)
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "{other} was allowed to read this control plane's answers"
+        );
+    }
+}

@@ -261,7 +261,10 @@ pub struct ServiceCall {
     pub binding: String,
     pub url: String,
     pub method: String,
-    pub headers: HashMap<String, String>,
+    /// `[[name, value], ...]`, in the order they were written, repeats
+    /// included; see [`super::header_list`]. The callee is a handler like any
+    /// other and reads them through the same `Headers`.
+    pub headers: super::header_list::HeaderPairs,
     pub body: Option<Vec<u8>>,
 }
 

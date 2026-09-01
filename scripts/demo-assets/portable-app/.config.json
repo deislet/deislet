@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "name": "portable",
+  "runtime": "standard-v1",
+  "language": "typescript",
+  "functionRoot": "./functions",
+  "compatibilityDate": "2026-09-01",
+  "environment": {
+    "variables": {
+      "BUILD_LABEL": "portable"
+    }
+  },
+  "vendors": {
+    "deislet": { "enabled": true },
+    "cloudflare": { "enabled": true },
+    "deno": { "enabled": true },
+    "tencent": { "enabled": true }
+  },
+  "build": {
+    "outDir": "./dist"
+  }
+}

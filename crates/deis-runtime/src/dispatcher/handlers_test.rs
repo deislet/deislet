@@ -943,3 +943,247 @@ mod the_platform_s_own_headers_are_the_platform_s {
         );
     }
 }
+
+/// What a handler is told about the request it is answering: the URL it was
+/// asked for, and every header the client actually sent.
+mod what_the_handler_is_told_about_the_request {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::any;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use crate::app::types::AppConfig;
+    use crate::app::{AppKey, ApplicationManager};
+    use crate::config::default_max_request_body_bytes;
+    use crate::dispatcher::handlers::handle_request;
+    use crate::dispatcher::AppState;
+    use crate::APP_ID_HEADER;
+
+    /// An app that answers with what it was handed: the request's own URL and
+    /// the header names that arrived more than once.
+    async fn mirror_router(app_id: &str) -> Router {
+        let code = r#"
+            export default async function handler(context) {
+                const r = context.request;
+                const seen = [];
+                for (const [name, value] of r.headers) seen.push(name + "=" + value);
+                return new Response(JSON.stringify({
+                    url: r.url,
+                    cookie: r.headers.get("cookie"),
+                    accept: r.headers.get("accept"),
+                    forwarded: r.headers.get("x-forwarded-for"),
+                    all: seen,
+                }), { status: 200 });
+            }
+        "#;
+        let manager = Arc::new(ApplicationManager::with_threads(Some(1)));
+        manager
+            .load_app(
+                AppKey::production(app_id),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the mirror app loads");
+
+        Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(manager, default_max_request_body_bytes()))
+    }
+
+    async fn answer(router: Router, request: Request<Body>) -> serde_json::Value {
+        let response = router.oneshot(request).await.expect("the node answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        serde_json::from_slice(&body).expect("the app answered JSON")
+    }
+
+    #[tokio::test]
+    async fn the_url_is_the_one_the_client_asked_for() {
+        let router = mirror_router("http-request-url").await;
+        let answered = answer(
+            router,
+            Request::builder()
+                .method("GET")
+                .uri("/checkout?ref=email")
+                .header("host", "shop.example.com")
+                .header(APP_ID_HEADER, "http-request-url")
+                .body(Body::empty())
+                .expect("buildable"),
+        )
+        .await;
+        assert_eq!(
+            answered["url"], "http://shop.example.com/checkout?ref=email",
+            "an app deriving a canonical URL, a redirect or a signed callback gets this string"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_value_of_a_repeated_header_reaches_the_handler() {
+        let router = mirror_router("http-request-headers").await;
+        let answered = answer(
+            router,
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("host", "shop.example.com")
+                .header(APP_ID_HEADER, "http-request-headers")
+                .header("cookie", "session=abc")
+                .header("cookie", "csrf=xyz")
+                .header("accept", "text/html")
+                .header("accept", "application/json")
+                .header("x-forwarded-for", "203.0.113.7")
+                .header("x-forwarded-for", "198.51.100.4")
+                .body(Body::empty())
+                .expect("buildable"),
+        )
+        .await;
+        println!("ANSWER: {answered}");
+        assert!(
+            answered["cookie"].as_str().unwrap().contains("session=abc")
+                && answered["cookie"].as_str().unwrap().contains("csrf=xyz"),
+            "both cookies have to reach the handler: {answered}"
+        );
+        assert!(
+            answered["forwarded"]
+                .as_str()
+                .unwrap()
+                .contains("203.0.113.7"),
+            "the whole X-Forwarded-For chain has to reach the handler: {answered}"
+        );
+    }
+}
+
+/// The URL a handler is given, at the level it is built.
+///
+/// The end-to-end check above proves the value reaches an application; these
+/// pin the parts a client controls, and in particular that none of them can
+/// change the *shape* of the URL. A handler can be careful about the host it
+/// was addressed by; it cannot be careful about a `request.url` whose path is
+/// not the path it was asked for.
+mod the_url_a_handler_is_given {
+    use axum::http::{HeaderMap, HeaderValue, Uri};
+
+    use crate::app::AppKey;
+    use crate::dispatcher::handlers::request_url;
+
+    fn host(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    /// The tenant the log line names when an authority is refused. Nothing
+    /// here asserts on it; it is what makes such a line findable.
+    fn key() -> AppKey {
+        AppKey::production("shop")
+    }
+
+    #[test]
+    fn the_host_the_client_addressed_is_the_one_in_the_url() {
+        assert_eq!(
+            request_url(
+                &"/orders/17?ref=email".parse::<Uri>().unwrap(),
+                &host("shop.example.com"),
+                &key()
+            ),
+            "http://shop.example.com/orders/17?ref=email"
+        );
+    }
+
+    #[test]
+    fn a_port_and_an_ipv6_literal_are_hosts_too() {
+        assert_eq!(
+            request_url(
+                &"/".parse::<Uri>().unwrap(),
+                &host("shop.example.com:8443"),
+                &key()
+            ),
+            "http://shop.example.com:8443/"
+        );
+        assert_eq!(
+            request_url(
+                &"/".parse::<Uri>().unwrap(),
+                &host("[2001:db8::1]:8080"),
+                &key()
+            ),
+            "http://[2001:db8::1]:8080/"
+        );
+    }
+
+    #[test]
+    fn an_http2_authority_is_read_before_the_host_header() {
+        // HTTP/2 has no `Host`; hyper puts `:authority` in the URI. A request
+        // that carries both is answered from the authority, which is the one
+        // the connection was actually made under.
+        assert_eq!(
+            request_url(
+                &"http://shop.example.com/basket".parse::<Uri>().unwrap(),
+                &host("stale.example.invalid"),
+                &key()
+            ),
+            "http://shop.example.com/basket"
+        );
+    }
+
+    #[test]
+    fn a_request_that_names_no_host_still_gets_a_url() {
+        assert_eq!(
+            request_url(
+                &"/health".parse::<Uri>().unwrap(),
+                &HeaderMap::new(),
+                &key()
+            ),
+            "http://localhost/health"
+        );
+    }
+
+    #[test]
+    fn nothing_a_client_sends_can_change_the_shape_of_the_url() {
+        // Each of these would rewrite the URL rather than name a host: the
+        // first two move the path and add a query, the third turns the host
+        // into userinfo so the *origin* becomes the attacker's, and the last
+        // two are not hosts at all.
+        for fabricated in [
+            "shop.example.com/../admin",
+            "shop.example.com?next=https://evil.invalid",
+            "shop.example.com@evil.invalid",
+            "shop example com",
+            "",
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_str(fabricated) {
+                headers.insert("host", value);
+            }
+            assert_eq!(
+                request_url(&"/orders/17".parse::<Uri>().unwrap(), &headers, &key()),
+                "http://localhost/orders/17",
+                "a Host of {fabricated:?} was pasted into the URL a handler reads"
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_cannot_claim_the_request_arrived_over_tls() {
+        // This node serves cleartext; whatever terminates TLS is in front of
+        // it, and a client can write an absolute request target, an HTTP/2
+        // `:scheme` and any `X-Forwarded-Proto` it likes. None of them may
+        // become the scheme an application signs a callback with.
+        let mut headers = host("shop.example.com");
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(
+            request_url(
+                &"https://shop.example.com/pay".parse::<Uri>().unwrap(),
+                &headers,
+                &key()
+            ),
+            "http://shop.example.com/pay"
+        );
+    }
+}

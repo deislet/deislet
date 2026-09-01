@@ -56,19 +56,59 @@ node_preshared_keys = [
 # Enable HTTP API authentication (default: false)
 #
 # Covers the dashboard and the human API: with it on, every endpoint except
-# /health and /api/metrics requires a credential - one of the api_keys below,
-# or a token minted with `deis token create` - and each one is checked against
-# the scopes it carries.
+# /health requires a credential - one of the api_keys below, or a token
+# minted with `deis token create` - and each one is checked against the scopes
+# it carries. /health is the only exception, because it answers the constant
+# "OK" and the orchestrator probing it has nothing to present.
 #
-# With it OFF the human API is open to anyone who can reach this port, exactly
-# as it was before there were accounts: accounts and scopes are recorded and
-# not enforced. The audit log is written either way, attributing an
-# unauthenticated call to "anonymous".
+# /api/metrics used to be an exception too, and is not: it hands out the
+# cluster size, the node count, the uptime and the event totals. A Prometheus
+# on another host scrapes it with a token of its own -
+#
+#   deis account create prometheus --role viewer
+#   deis token create --account prometheus --scope 'read:*/*' scrape
+#
+# - which goes in the scrape config's `authorization` block. A scrape from
+# this machine needs nothing while this setting is off, like any other read.
+#
+# With it OFF no credential is REQUIRED, which is not the same as the human
+# API being published. A caller that presents nothing is served only from the
+# machine the control plane runs on, and a page loaded from another origin is
+# refused whichever machine its browser is on - see
+# api_cors_allowed_origins below. A credential that IS presented is held to
+# its scopes whatever this setting says. The audit log is written either way,
+# attributing an unauthenticated call to "anonymous".
 #
 # It does NOT cover the node endpoints, which always use
 # node_preshared_keys - see above. Turning this off makes a dashboard
 # convenient; it must never be able to publish the platform's secrets.
 api_auth_enabled = true
+
+# Origins a web page may read this control plane's answers from
+# (default: none)
+#
+# The console this binary serves comes from this same port, so its calls are
+# same-origin and need no entry here; `npm run dev` proxies /api through the
+# vite server, so the development console is same-origin too. An entry is
+# needed only for a console hosted somewhere else.
+#
+# This used to be `*` - any origin, all methods, all headers. Combined with
+# api_auth_enabled defaulting to off, that meant any page the operator
+# happened to visit in a browser on the box could call this control plane
+# with no credential, create an owner account, mint a root token, deploy,
+# and READ every answer. `*` is therefore refused here: an origin that may
+# read the audit log has to be named.
+#
+# Naming an origin is not authority. A page on another origin never gets the
+# admission that needs no credential; it presents a token like any other
+# remote caller.
+#
+# Write each origin in full, with the scheme and the port, and no trailing
+# slash - that is what a browser sends, and an entry in any other shape can
+# never match. Bad entries are dropped with an ERROR line at startup.
+#
+# api_cors_allowed_origins = ["https://console.example.com"]
+api_cors_allowed_origins = []
 
 # API Keys list
 # Clients can provide the API Key in either of the following ways:
@@ -270,8 +310,8 @@ bundle_dir = "data/bundles"
 # curl -H "Authorization: Bearer deis-control-admin-key-1234567890abcdef" http://localhost:8080/api/runtime
 
 # Endpoints that do not require an API key:
-# - /health - Health check
-# - /api/metrics - Prometheus Metrics
+# - /health - Health check, and the only one. It answers a constant, so a
+#   prober learns nothing a TCP connect had not already told it.
 # - the node endpoints, which require a node_preshared_keys value
 #   instead:
 #     PUT    /api/nodes/{node_id}/registration

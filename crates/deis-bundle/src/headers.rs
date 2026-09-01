@@ -275,12 +275,12 @@ impl HeaderTable {
             for name in &rule.remove {
                 out.retain(|field| &field.name != name);
             }
-            // Names this block has already taken over from the earlier ones,
-            // so its second `Link:` line joins its first instead of replacing
-            // the group the block itself just wrote.
-            let mut taken: Vec<&str> = Vec::with_capacity(rule.set.len());
+            let mut written = HeaderNamesWritten::for_fields(&rule.set);
             for field in &rule.set {
-                if taken.contains(&field.name.as_str()) {
+                if !written.replaces(&field.name) {
+                    // The block has already taken this name over from the
+                    // earlier blocks, so its second `Link:` line joins its
+                    // first instead of replacing the group it just wrote.
                     let after = out
                         .iter()
                         .rposition(|existing| existing.name == field.name)
@@ -288,7 +288,6 @@ impl HeaderTable {
                     out.insert(after, field.clone());
                     continue;
                 }
-                taken.push(&field.name);
                 match out.iter().position(|existing| existing.name == field.name) {
                     Some(first) => {
                         // Everything dropped sat at or after `first`, so the
@@ -302,6 +301,64 @@ impl HeaderTable {
             }
         }
         out
+    }
+}
+
+/// The header names a writer has put down so far, so that it can tell a value
+/// that *replaces* from a value that *joins*.
+///
+/// That one bit is the whole of the rule every layer that writes these headers
+/// needs, and it is why it lives here rather than as three loops that agree
+/// today. The first value of a name replaces whatever the layer underneath
+/// already had under it - the content type the index guessed, the node's own
+/// cache policy - and every value after it joins that name's group. A writer
+/// that replaced on every value kept the last one and dropped the rest, which
+/// is one `Link` of two preloads and one `Set-Cookie` of a session and a CSRF
+/// cookie: a preload that never happens, and a login that stops working. That
+/// defect has been found three times on this platform - on the isolate's
+/// response path, in the cache, and here - each time in a place that had
+/// written its own copy of this loop.
+///
+/// The callers write onto three different things: [`HeaderTable::apply`] onto
+/// its own `Vec<HeaderField>`, the node onto the `http::HeaderMap` of a
+/// finished response, and `env.ASSETS.fetch()` onto the name/value pairs an op
+/// hands to JavaScript. None of those types is this crate's to know about, so
+/// what they share is this decision and not the write itself.
+///
+/// It is driven by the caller, one call per value it is actually going to
+/// write, rather than handed out as an iterator over the whole list. That is
+/// deliberate: the node drops a value that turns out not to be a legal HTTP
+/// header, and if a dropped value had already claimed its name, the next value
+/// of that name would join a group that was never written and sit beside the
+/// node's own value instead of replacing it.
+///
+/// Names arrive lower-cased from [`check_name`], so they are compared exactly.
+/// A caller holding names in whatever spelling a handler wrote - the isolate's
+/// response path is the one - has to compare without regard to case instead,
+/// which is why that path does not use this.
+#[derive(Debug, Default)]
+pub struct HeaderNamesWritten<'a> {
+    // A vector rather than a set: a block holds a handful of names, and a
+    // linear scan over that beats hashing every one of them.
+    seen: Vec<&'a str>,
+}
+
+impl<'a> HeaderNamesWritten<'a> {
+    /// Start on a list of this many fields.
+    pub fn for_fields(fields: &[HeaderField]) -> Self {
+        Self {
+            seen: Vec::with_capacity(fields.len()),
+        }
+    }
+
+    /// Record that `name` is being written, and say whether this write is the
+    /// first of that name - the one that replaces, rather than joins.
+    pub fn replaces(&mut self, name: &'a str) -> bool {
+        if self.seen.contains(&name) {
+            return false;
+        }
+        self.seen.push(name);
+        true
     }
 }
 

@@ -340,7 +340,7 @@ async function fetch(input, init = undefined) {
   // a handler's existing error path catches it -- and logs the refusal on the
   // node with the application, the destination and the reason. Nothing is
   // dialled when this rejects.
-  await op_deis_fetch_guard(currentUrl);
+  await op_deis_fetch_guard(currentUrl, chargedScope());
 
   const signal = boundedByExecutionBudget(current.signal);
 
@@ -428,7 +428,7 @@ async function fetch(input, init = undefined) {
     // write down was judged by: the same schemes, the same address ranges,
     // the same ports, the same allowlist, the same refusal of this platform's
     // own endpoints.
-    await op_deis_fetch_guard(followingUrl);
+    await op_deis_fetch_guard(followingUrl, chargedScope());
 
     current = following;
     currentUrl = followingUrl;
@@ -493,6 +493,11 @@ function newOwner() {
     guards: new SafeSet(),
     intervals: new SafeSet(),
     timeouts: new SafeSet(),
+    // The node's id for the response stream this owner belongs to, or 0 for
+    // the invocation. It travels with every outbound call this owner makes, so
+    // the allowance a producer spends is the one its own invocation had rather
+    // than whichever invocation happens to be running; see `runtime/ops.rs`.
+    stream: 0,
   };
 }
 
@@ -510,6 +515,32 @@ const streamOwners = new SafeSet();
 // everything no stream step armed, which is every path that existed before
 // streams did.
 let entryOwner = invocationOwner;
+
+// Which stretch is making an outbound call right now: the node's id for a
+// response stream, or 0 for the invocation.
+//
+// Read at the moment a call is charged and passed to the op that charges it,
+// rather than published to the node whenever `entryOwner` changes. Two
+// reasons, and the second is the one that decides it:
+//
+//   * an op dispatch per change would come out of the application's own
+//     op-rate allowance -- a producer steps twice per chunk, and a stream
+//     writing small chunks is already the case that meets that ceiling first;
+//   * it is read at the instant of the charge, so it is what is true then,
+//     not what was true the last time anything thought to say so.
+//
+// The node turns it into an allowance in `runtime/ops.rs`. An application
+// cannot choose it: `entryOwner` is written only by the stream scope below,
+// which `js/runtime.js` claims once while the isolate is being built and which
+// answers null to everything after that.
+function chargedScope() {
+  return entryOwner === invocationOwner ? 0 : entryOwner.stream;
+}
+
+// The outbound `WebSocket` dials from its own module, which cannot import this
+// one -- this file imports *it*. So the reader is handed over rather than
+// reached for, once, here. See `js/ws_client.js`.
+wsClient.useChargedScope(chargedScope);
 
 function ownedGuards() {
   return entryOwner.guards;
@@ -809,6 +840,14 @@ function moveTimers(from, to) {
 // points new entries at those sets; `release` ends all of it when the stream
 // does.
 //
+// Three things follow the answer, not two. The timers and the fetch guards are
+// sets in this file; the third is the *count* of outbound calls, which is kept
+// by the node -- `chargedScope` above is what every charge carries so that the
+// node knows whose count to spend. A response stream inherits the allowance of
+// the invocation that opened it and never gets another, so an isolate serving
+// ordinary traffic beside a stream cannot hand that stream a fresh ceiling,
+// which is what a single per-isolate counter did.
+//
 // `enter` is sticky, and that is the part worth reading twice. `js/runtime.js`
 // calls it immediately before each step of a stream's producer, and *nothing*
 // clears it except the start of the next armed stretch (`leave`, called at the
@@ -859,8 +898,12 @@ const streamScope = ObjectFreeze({
   // Hand everything the stretch that just ran still has open to a new owner,
   // and put its outbound calls on the stream's clock. The counts come back with
   // the owner so the caller can say in the log what this stream took over.
-  adopt() {
+  adopt(stream) {
     const owner = newOwner();
+    // The node's id for this stream, which is how it names the allowance the
+    // producer inherits. `runtime/isolate.rs` filed that allowance under this
+    // id before it asked for the producer to start.
+    owner.stream = stream;
     let calls = 0;
     for (const guard of new SafeSetIterator(invocationOwner.guards)) {
       guard.set = owner.guards;
@@ -890,6 +933,13 @@ const streamScope = ObjectFreeze({
   },
   leave() {
     entryOwner = invocationOwner;
+  },
+  // Which stretch is spending, for the one caller that charges an outbound
+  // call from `js/runtime.js` rather than from here: a service binding's
+  // `fetch`. Reading it is all it may do -- nothing on this object lets a
+  // caller set it, which is what keeps the answer the runtime's.
+  scope() {
+    return chargedScope();
   },
   // End everything this stream held, and say how much there was.
   //

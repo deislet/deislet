@@ -3,7 +3,6 @@
 
 use deis_runtime::runtime::isolate::AppRuntime;
 use deis_runtime::runtime::{IsolateSpec, ServiceRouter, ServiceWiring, WsServerMessage};
-use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
 #[tokio::test]
@@ -63,8 +62,7 @@ async fn test_websocket_direct_bridging() {
 
     // 3. Simulate Gateway Handshake
     // Step A: Execute Fetch to trigger Upgrade
-    let mut headers = HashMap::new();
-    headers.insert("upgrade".to_string(), "websocket".to_string());
+    let headers: Vec<(String, String)> = vec![("upgrade".to_string(), "websocket".to_string())];
 
     let (tx, rx) = oneshot::channel();
     runtime
@@ -84,12 +82,10 @@ async fn test_websocket_direct_bridging() {
         .expect("Fetch returned error");
 
     assert_eq!(status, 101);
-    let ws_id = deis_runtime::runtime::response_headers::first_value(
-        &resp_headers,
-        "X-Runtime-WebSocket-ID",
-    )
-    .expect("Missing WebSocket ID header")
-    .to_string();
+    let ws_id =
+        deis_runtime::runtime::header_list::first_value(&resp_headers, "X-Runtime-WebSocket-ID")
+            .expect("Missing WebSocket ID header")
+            .to_string();
 
     // 4. Setup Bridge Channels
     // Channel for JS -> Rust messages

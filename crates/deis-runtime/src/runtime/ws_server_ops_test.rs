@@ -181,7 +181,6 @@ mod tests {
     async fn test_ws_server_api_availability() {
         use crate::runtime::isolate::{AppRuntime, IsolateSpec};
         use crate::runtime::ServiceWiring;
-        use std::collections::HashMap;
 
         let code = r#"
             export default function handler() {
@@ -213,7 +212,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )

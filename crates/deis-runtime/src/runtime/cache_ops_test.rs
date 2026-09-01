@@ -397,7 +397,6 @@ mod tests {
     async fn a_cached_body_that_is_not_text_survives_the_round_trip() {
         use crate::runtime::isolate::{AppRuntime, IsolateSpec};
         use crate::runtime::{ServiceRouter, ServiceWiring};
-        use std::collections::HashMap;
 
         let code = r#"
             const ALL = new Uint8Array(256);
@@ -455,7 +454,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -488,7 +487,6 @@ mod tests {
     async fn an_application_opens_a_named_cache_and_can_see_what_kind_of_cache_it_is() {
         use crate::runtime::isolate::{AppRuntime, IsolateSpec};
         use crate::runtime::{ServiceRouter, ServiceWiring};
-        use std::collections::HashMap;
 
         let code = r#"
             export default async function handler() {
@@ -541,7 +539,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
@@ -720,5 +718,224 @@ mod tests {
             None,
             "the oversized response must not be in the store"
         );
+    }
+}
+
+/// What the Cache API will and will not store, driven the way an application
+/// reaches it.
+#[cfg(test)]
+mod what_the_cache_refuses_to_store {
+    use crate::runtime::isolate::{AppRuntime, IsolateSpec};
+    use crate::runtime::{ServiceRouter, ServiceWiring};
+
+    async fn runtime(app: &str, code: &str) -> AppRuntime {
+        let mut runtime = AppRuntime::new(
+            app.to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .expect("the app builds");
+        runtime.init_module().await.expect("the module loads");
+        runtime
+    }
+
+    async fn ask(runtime: &mut AppRuntime, headers: &[(&str, &str)]) -> String {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        runtime
+            .execute_fetch(
+                "http://localhost/account".to_string(),
+                "GET".to_string(),
+                headers,
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (status, _headers, body) = rx.await.expect("an answer").expect("an answer");
+        let body = String::from_utf8(body.into_bytes().unwrap_or_default()).expect("text");
+        assert_eq!(status, 200, "the handler failed: {body}");
+        body
+    }
+
+    /// The canonical shape: check the cache, fall through to a handler whose
+    /// answer depends on who is asking, cache the answer under the request
+    /// itself.
+    const VARYING: &str = r#"
+        export default async function handler(context) {
+            const hit = await caches.default.match(context.request);
+            if (hit) return new Response("HIT:" + (await hit.text()));
+            const who = context.request.headers.get("authorization") ?? "nobody";
+            const fresh = new Response("page-for:" + who, {
+                headers: { vary: "authorization" },
+            });
+            await caches.default.put(context.request, fresh.clone());
+            return new Response("MISS:" + (await fresh.text()));
+        }
+    "#;
+
+    /// A response that says its body depends on a header is only handed back
+    /// to a request that carries the same value for it.
+    ///
+    /// Without this the pattern above -- the one the Cache API exists for --
+    /// served the first caller's page to everybody who came after: the entry
+    /// was stored under the URL alone and `Vary` appeared nowhere in either
+    /// half of the implementation.
+    #[tokio::test]
+    async fn one_users_page_is_not_served_to_another() {
+        let mut runtime = runtime("cache_vary_app.production", VARYING).await;
+
+        let alice = ask(&mut runtime, &[("authorization", "Bearer alice")]).await;
+        assert_eq!(alice, "MISS:page-for:Bearer alice");
+
+        let bob = ask(&mut runtime, &[("authorization", "Bearer bob")]).await;
+        assert_eq!(
+            bob, "MISS:page-for:Bearer bob",
+            "Bob was served the page the cache stored for Alice"
+        );
+
+        // And the entry is still a cache: the same caller asking again is a
+        // hit, which is the whole reason for storing it. Bob's `put` replaced
+        // Alice's -- one variant per key -- so it is his that is there.
+        let bob_again = ask(&mut runtime, &[("authorization", "Bearer bob")]).await;
+        assert_eq!(
+            bob_again, "HIT:page-for:Bearer bob",
+            "a repeat of the request that was cached has to be a hit"
+        );
+
+        // A caller carrying none of the varying headers is a different variant
+        // again, and must not be given the one stored for a caller who did.
+        let anonymous = ask(&mut runtime, &[]).await;
+        assert_eq!(anonymous, "MISS:page-for:nobody");
+    }
+
+    /// A varying response stored under a key that is not a `Request`.
+    ///
+    /// There is nothing to read the varying headers from, so the entry would
+    /// be handed to whoever asked for that string next. Refused, and the
+    /// message names the fix.
+    #[tokio::test]
+    async fn a_varying_response_stored_under_a_bare_url_is_refused() {
+        let code = r#"
+            export default async function handler(context) {
+                let refused = null;
+                try {
+                    await caches.default.put(
+                        "https://example.invalid/account",
+                        new Response("page", { headers: { vary: "authorization" } })
+                    );
+                } catch (e) {
+                    refused = e.message;
+                }
+                const hit = await caches.default.match("https://example.invalid/account");
+                return new Response(JSON.stringify({
+                    refused,
+                    stored: hit === undefined ? null : await hit.text(),
+                }));
+            }
+        "#;
+        let mut runtime = runtime("cache_vary_bare_key.production", code).await;
+        let answered = ask(&mut runtime, &[]).await;
+        let seen: serde_json::Value = serde_json::from_str(&answered).expect("json");
+        assert_eq!(
+            seen["stored"],
+            serde_json::Value::Null,
+            "a response whose variant cannot be identified must not be stored"
+        );
+        let refused = seen["refused"].as_str().unwrap_or_default();
+        assert!(
+            refused.contains("Pass the Request itself as the key"),
+            "the refusal has to name the fix: {refused}"
+        );
+    }
+
+    /// `Vary: *` is the response saying no later request may reuse it.
+    #[tokio::test]
+    async fn a_response_that_varies_on_everything_is_refused() {
+        let code = r#"
+            export default async function handler(context) {
+                let refused = null;
+                try {
+                    await caches.default.put(
+                        context.request,
+                        new Response("page", { headers: { vary: "*" } })
+                    );
+                } catch (e) {
+                    refused = e.message;
+                }
+                const hit = await caches.default.match(context.request);
+                return new Response(JSON.stringify({
+                    refused,
+                    stored: hit === undefined ? null : await hit.text(),
+                }));
+            }
+        "#;
+        let mut runtime = runtime("cache_vary_star.production", code).await;
+        let seen: serde_json::Value =
+            serde_json::from_str(&ask(&mut runtime, &[]).await).expect("json");
+        assert_eq!(seen["stored"], serde_json::Value::Null);
+        assert!(
+            seen["refused"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Vary: *"),
+            "the refusal has to name the directive: {seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_that_says_do_not_reuse_me_is_not_stored() {
+        let code = r#"
+            export default async function handler(context) {
+                const directive = context.request.headers.get("x-directive");
+                const key = "https://example.invalid/" + directive;
+                let refused = null;
+                try {
+                    await caches.default.put(key, new Response("secret", {
+                        headers: { "cache-control": directive },
+                    }));
+                } catch (e) {
+                    refused = e.message;
+                }
+                const hit = await caches.default.match(key);
+                return new Response(JSON.stringify({
+                    refused,
+                    stored: hit === undefined ? null : await hit.text(),
+                }));
+            }
+        "#;
+        let mut runtime = runtime("cache_directive_app.production", code).await;
+        for directive in [
+            "no-store",
+            "private",
+            "no-cache",
+            "max-age=0",
+            // A shared cache reads `s-maxage` first, so this one is stale on
+            // arrival however long `max-age` says.
+            "max-age=600, s-maxage=0",
+            // The field-name forms. Three regular expressions scanning the
+            // same string used to read `private="set-cookie"` as an ordinary
+            // header value and store the response.
+            "private=\"set-cookie\"",
+            "no-cache=\"set-cookie\"",
+            // Not the first directive, and spelled the way a real upstream
+            // spells it.
+            "public, max-age=600, no-store",
+        ] {
+            let answered = ask(&mut runtime, &[("x-directive", directive)]).await;
+            let seen: serde_json::Value = serde_json::from_str(&answered).expect("json");
+            println!("{directive} -> {seen}");
+            assert_eq!(
+                seen["stored"],
+                serde_json::Value::Null,
+                "a response carrying Cache-Control: {directive} was stored anyway"
+            );
+        }
     }
 }

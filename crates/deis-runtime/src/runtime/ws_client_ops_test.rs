@@ -243,7 +243,7 @@ async fn a_request_to(
         .execute_fetch(
             format!("http://localhost{path}"),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
             tx,
         )
@@ -839,7 +839,7 @@ async fn an_open_socket_is_closed_when_the_invocation_is_cut_off() {
         .execute_fetch(
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
             tx,
         )
@@ -998,9 +998,7 @@ async fn a_polluted_object_prototype_does_not_decide_a_later_response() {
 
     let (status, headers, body) = a_request_to(&mut runtime, "/plain").await;
     assert_eq!((status, body.as_str()), (200, "plain"));
-    assert!(
-        crate::runtime::response_headers::first_value(&headers, "X-Runtime-WebSocket-ID").is_none()
-    );
+    assert!(crate::runtime::header_list::first_value(&headers, "X-Runtime-WebSocket-ID").is_none());
 
     let polluting = a_request_to(&mut runtime, "/pollute").await;
 
@@ -1016,8 +1014,7 @@ async fn a_polluted_object_prototype_does_not_decide_a_later_response() {
              Object.prototype"
         );
         assert!(
-            crate::runtime::response_headers::first_value(&headers, "X-Runtime-WebSocket-ID")
-                .is_none(),
+            crate::runtime::header_list::first_value(&headers, "X-Runtime-WebSocket-ID").is_none(),
             "request {attempt} after the pollution was answered as a WebSocket \
              upgrade: {headers:?}"
         );
@@ -1028,7 +1025,7 @@ async fn a_polluted_object_prototype_does_not_decide_a_later_response() {
     let (status, headers, body) = polluting;
     assert_eq!((status, body.as_str()), (200, "polluted"));
     assert!(
-        crate::runtime::response_headers::first_value(&headers, "X-Runtime-WebSocket-ID").is_none(),
+        crate::runtime::header_list::first_value(&headers, "X-Runtime-WebSocket-ID").is_none(),
         "{headers:?}"
     );
 }
@@ -1072,7 +1069,7 @@ async fn a_response_used_as_an_init_still_carries_its_status_and_headers() {
     let (status, headers, body) = a_request_to(&mut runtime, "/").await;
     assert_eq!((status, body.as_str()), (201, "rewritten"));
     assert_eq!(
-        crate::runtime::response_headers::first_value(&headers, "x-kept"),
+        crate::runtime::header_list::first_value(&headers, "x-kept"),
         Some("yes")
     );
 }

@@ -13,8 +13,6 @@
 //! calls `retry()` on the ones that did not hold, so a failure names itself in
 //! `outcome.failed` instead of arriving as a bare assertion.
 
-use std::collections::HashMap;
-
 use deis_runtime::runtime::isolate::AppRuntime;
 use deis_runtime::runtime::ServiceRouter;
 use deis_runtime::runtime::{IsolateSpec, LeasedMessage, ServiceWiring};
@@ -150,7 +148,7 @@ async fn every_shape_queue_send_accepts_reaches_the_op_as_bytes() {
         .execute_fetch(
             "http://localhost/".to_string(),
             "GET".to_string(),
-            HashMap::new(),
+            Vec::new(),
             None,
             tx,
         )

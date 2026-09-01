@@ -245,8 +245,11 @@ deis kv get session:abc --file ./out.bin
 deis kv put flag:beta on --ttl 3600
 deis db query "SELECT id, email FROM users WHERE id = ?" --param 42
 deis db execute "UPDATE users SET email = ? WHERE id = ?" --param a@b.c --param 42 -y
+deis blob list avatars/ --delimiter / --all
+deis blob head avatars/42.png
 deis blob get avatars/42.png --file ./42.png
-deis blob put avatars/42.png --file ./42.png --content-type image/png
+deis blob get video.mp4 --offset 0 --length 65536
+deis blob put avatars/42.png --file ./42.png --content-type image/png --if-match <etag>
 ```
 
 Values go in from a file (or on stdin) and come out to a file, so binary
@@ -263,10 +266,19 @@ capability token first, with the same credential that deploys, and the
 control plane answers with the tenant name, the store address and the token.
 Nothing is minted by hand.
 
-Two shapes deliberately missing, because the service behind them has no such
-call: `deis blob` has no `list` (`BlobStore` is `Put`/`Get`/`Delete` only),
-and `deis db` has no `batch` or interactive transaction — an application gets
-both through `context.services.database`, the command line does not.
+`deis blob` offers every verb `BlobStore` answers, and a verb the store has
+that the command line cannot reach is an RPC delivered to nobody:
+`blob list` (a prefix as its argument, plus `--delimiter`, `--limit`,
+`--cursor` and `--all`),
+`blob head`, `blob get --offset/--length/--suffix` for one slice of an object,
+and `--if-match` / `--if-none-match` on `blob put` and `blob delete` for a
+conditional write against the object's etag.
+`blob_offers_every_verb_the_store_answers` in `src/main.rs` is the parse-level
+half of that; `scripts/demo.sh` runs the same commands against a live store.
+
+One shape is deliberately missing, because it is a session rather than a call:
+`deis db` has no `batch` or interactive transaction — an application gets both
+through `context.services.database`, the command line does not.
 
 ### `deis config set|get|unset|list`
 

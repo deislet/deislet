@@ -88,6 +88,7 @@ const ObjectDefineProperty = Object.defineProperty;
 const ObjectFreeze = Object.freeze;
 const NativeWeakSet = WeakSet;
 const NativeMap = Map;
+const NativeSet = Set;
 const hasOwn = typeof Object.hasOwn === "function"
   ? Object.hasOwn
   : (target, key) => Object.prototype.hasOwnProperty.call(target, key);
@@ -701,39 +702,211 @@ function cacheKeyOf(request) {
   );
 }
 
+// One `Cache-Control` field, taken apart into the directives it carries.
+//
+// Written once and read by everything below, because the field decides two
+// separate things -- whether the response may be stored at all, and how long
+// it stays fresh -- and a regular expression per question, scanning the same
+// string, is one chance per pair of them to disagree about what a directive
+// is. A quoted value is understood, so `private="set-cookie"` is the `private`
+// directive rather than a header value that happens to contain the word, and
+// `no-cache="set-cookie"` is `no-cache`. Both used to be stored.
+//
+// Answers a Map of directive name (lower case) to its value, or `true` for a
+// directive that carries none. An absent or unreadable field answers an empty
+// Map, which every reader below treats as "the response said nothing".
+function cacheControlOf(response) {
+  const directives = new NativeMap();
+  const headers = response && response.headers;
+  const raw = headers && typeof headers.get === "function"
+    ? headers.get("cache-control")
+    : null;
+  if (typeof raw !== "string") return directives;
+
+  let name = "";
+  let value = "";
+  let inValue = false;
+  let quoted = false;
+  const finish = () => {
+    const directive = name.trim().toLowerCase();
+    if (directive !== "") directives.set(directive, inValue ? value.trim() : true);
+    name = "";
+    value = "";
+    inValue = false;
+  };
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (quoted) {
+      if (c === "\\" && i + 1 < raw.length) {
+        value += raw[++i];
+        continue;
+      }
+      if (c === '"') {
+        quoted = false;
+        continue;
+      }
+      value += c;
+      continue;
+    }
+    if (c === '"' && inValue) {
+      quoted = true;
+      continue;
+    }
+    if (c === ",") {
+      finish();
+      continue;
+    }
+    if (c === "=" && !inValue) {
+      inValue = true;
+      continue;
+    }
+    if (inValue) value += c;
+    else name += c;
+  }
+  finish();
+  return directives;
+}
+
+// A directive's value as whole seconds, or null when it named none or named
+// something that is not a count.
+function wholeSeconds(value) {
+  if (typeof value !== "string") return null;
+  const digits = value.trim();
+  if (digits === "" || /[^0-9]/.test(digits)) return null;
+  const seconds = Number(digits);
+  return Number.isFinite(seconds) ? seconds : null;
+}
+
 // How long the response asked to stay fresh, in whole seconds, or 0 when it
 // named no lifetime and the store's default should apply.
 //
 // `s-maxage` wins over `max-age` where both are present: this is a shared
 // cache, and that is what the directive is for.
-function freshnessSeconds(response) {
-  const headers = response && response.headers;
-  const control = headers && typeof headers.get === "function"
-    ? headers.get("cache-control")
-    : null;
-  if (!control) return 0;
-
-  const shared = /(?:^|[,\s])s-maxage\s*=\s*"?(\d+)"?/i.exec(control);
-  const own = /(?:^|[,\s])max-age\s*=\s*"?(\d+)"?/i.exec(control);
-  const chosen = shared || own;
-  if (!chosen) return 0;
-
-  const seconds = Number(chosen[1]);
-  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+//
+// A lifetime of zero never reaches here: it means the response is stale the
+// moment it is stored, which `refusesToBeStored` turns into a refusal. Without
+// that, "the response asked for zero" and "the response asked for nothing"
+// were the same answer here, and a `max-age=0` response -- the ordinary way of
+// saying *check with me every time* -- was kept for the store's ten-minute
+// default.
+function freshnessSeconds(directives) {
+  const shared = wholeSeconds(directives.get("s-maxage"));
+  const chosen = shared !== null ? shared : wholeSeconds(directives.get("max-age"));
+  if (chosen === null || chosen <= 0) return 0;
   // The op takes a u32; a longer lifetime than that is indistinguishable from
   // "as long as this isolate lives" anyway.
-  return Math.min(Math.floor(seconds), 4294967295);
+  return Math.min(Math.floor(chosen), 4294967295);
 }
 
-function refusesToBeStored(response) {
-  const headers = response && response.headers;
-  const control = headers && typeof headers.get === "function"
-    ? headers.get("cache-control")
-    : null;
-  if (!control) return null;
-  if (/(?:^|[,\s])no-store(?:\s*(?:,|$))/i.test(control)) return "no-store";
-  if (/(?:^|[,\s])private(?:\s*(?:,|$))/i.test(control)) return "private";
+// Why this response may not be put in a cache that later requests read, or
+// null when it may.
+//
+// This store is a *shared* cache: one per isolate, read by every later request
+// to the same application, from every client. RFC 9111 gives each of these
+// directives a meaning for such a cache, and this is that meaning and no
+// interpretation of it:
+//
+//   * `no-store` -- must not be stored at all;
+//   * `private` -- must not be stored by a shared cache. It is the directive a
+//     response carries when its body is one user's;
+//   * `no-cache` -- may be stored, but must not be reused without first
+//     revalidating with the origin. There is no revalidation here: nothing in
+//     this cache can ask an upstream whether an entry is still good. An entry
+//     that may only be served after a check that cannot be made is one that may
+//     never be served, so storing it would spend the store's memory on
+//     something no `match` is allowed to hand back;
+//   * a shared lifetime of zero (`s-maxage=0`, or `max-age=0` with no
+//     `s-maxage`) -- stale on arrival, which is the same position as `no-cache`
+//     for a cache that cannot revalidate.
+//
+// `must-revalidate` and `proxy-revalidate` are deliberately not here: they
+// constrain what happens once an entry is *stale*, and an entry served inside
+// its own lifetime is not stale. This store drops an entry when its lifetime
+// ends rather than serving it on, so it never reaches the case they govern.
+function refusesToBeStored(directives) {
+  if (directives.has("no-store")) {
+    return "no-store, which means it may not be stored at all";
+  }
+  if (directives.has("private")) {
+    return "private, which means it is one user's and a cache every later " +
+      "request reads may not hold it";
+  }
+  if (directives.has("no-cache")) {
+    return "no-cache, which means it may only be served after revalidating " +
+      "with the origin, and this cache cannot revalidate";
+  }
+  const shared = wholeSeconds(directives.get("s-maxage"));
+  const lifetime = shared !== null ? shared : wholeSeconds(directives.get("max-age"));
+  if (lifetime === 0) {
+    return "a lifetime of zero seconds, which means it is stale as soon as it " +
+      "is stored, and this cache cannot revalidate a stale entry";
+  }
   return null;
+}
+
+// The header names a response says its body depends on, lower-cased, sorted
+// and without repeats.
+//
+// Sorted so that `Vary: Accept-Language, Authorization` and
+// `Vary: Authorization, Accept-Language` describe the same entry: the order the
+// names were written in means nothing, and two entries that differ only by it
+// would otherwise never match each other.
+function varyNames(response) {
+  const headers = response && response.headers;
+  const raw = headers && typeof headers.get === "function" ? headers.get("vary") : null;
+  if (typeof raw !== "string" || raw === "") return [];
+  const names = [];
+  for (const part of raw.split(",")) {
+    const name = part.trim().toLowerCase();
+    if (name !== "" && names.indexOf(name) === -1) names.push(name);
+  }
+  names.sort();
+  return names;
+}
+
+// What those names were worth on one request: `[[name, value or null], ...]`.
+//
+// A key that is not a `Request` -- a URL or a string, both of which the Cache
+// API accepts -- carries no headers, so every name is worth null. On the way
+// in that is refused (see `put` below); on the way out it is exactly right: a
+// `match` given a bare URL is asking for the variant that carries none of the
+// varying headers, and an entry stored for a caller who carried them is not
+// that variant.
+function varySelector(names, request) {
+  const headers = readableHeaders(request);
+  return names.map((name) => [name, headers ? headers.get(name) : null]);
+}
+
+// The headers of a cache key that is a `Request`, or null for one that is a
+// URL or a string -- both of which the Cache API accepts and neither of which
+// carries any.
+function readableHeaders(request) {
+  const headers = request && request.headers;
+  return headers && typeof headers.get === "function" ? headers : null;
+}
+
+// Whether a stored entry is the variant this request is asking for.
+//
+// An entry stored with no selector is the ordinary case -- the response named
+// no `Vary` -- and matches anything. An entry that named one matches only a
+// request whose values for those headers are the ones it was stored for; every
+// other request is a miss, and a miss is a refetch, which is the whole point.
+// Without this, an application following the pattern the Cache API is written
+// for -- check the cache, fall through to a handler that answers differently
+// for different users, cache the answer -- served the first user's page to
+// everybody who came after.
+function selectedBy(stored, request) {
+  if (!Array.isArray(stored) || stored.length === 0) return true;
+  const names = [];
+  for (const entry of stored) {
+    if (!Array.isArray(entry) || entry.length !== 2) return false;
+    names.push(entry[0]);
+  }
+  const asked = varySelector(names, request);
+  for (let i = 0; i < stored.length; i++) {
+    if (stored[i][1] !== asked[i][1]) return false;
+  }
+  return true;
 }
 
 class Cache {
@@ -748,16 +921,43 @@ class Cache {
   async put(request, response) {
     const key = cacheKeyOf(request);
 
-    // A response that declares itself uncacheable is not stored, and the
-    // caller is told rather than left to believe it was. Cloudflare's Cache
-    // API refuses the same two directives, and silently keeping a `private`
-    // response in a cache every later request reads is how one user's data
-    // reaches another.
-    const refusal = refusesToBeStored(response);
+    // A response that declares itself unusable by a cache like this one is not
+    // stored, and the caller is told rather than left to believe it was.
+    // Silently keeping a `private` or `no-cache` response in a store every
+    // later request reads is how one user's data reaches another.
+    const directives = cacheControlOf(response);
+    const refusal = refusesToBeStored(directives);
     if (refusal) {
       throw new TypeError(
         "cache.put: this response carries Cache-Control: " + refusal +
-          ", so it was not stored"
+          ". It was not stored"
+      );
+    }
+
+    // What the response says its body depends on. `Vary: *` is the response
+    // saying that nothing may reuse it -- the specification's own words are
+    // that such an entry always fails to match -- so it is refused here rather
+    // than stored as something no `match` could ever hand back.
+    const vary = varyNames(response);
+    if (vary.indexOf("*") !== -1) {
+      throw new TypeError(
+        "cache.put: this response carries Vary: *, which means no later " +
+          "request may reuse it. It was not stored"
+      );
+    }
+    if (vary.length > 0 && !readableHeaders(request)) {
+      // The key was a URL or a string, so there is nothing to read the varying
+      // headers off, and an entry whose selector is unknown is exactly the one
+      // that must not be stored: a later `match` under that same string would
+      // be answered with it whoever asked. Refused rather than stored, with
+      // the fix named in the message, because this is the shape that serves
+      // one user's page to another.
+      throw new TypeError(
+        "cache.put: this response varies on " + vary.join(", ") +
+          ", and the key given for " + key + " was not a Request, so there is " +
+          "nothing to read those headers from and no way to tell one caller's " +
+          "copy from another's. Pass the Request itself as the key. It was " +
+          "not stored"
       );
     }
 
@@ -776,7 +976,7 @@ class Cache {
     // appears more than once. `Object.fromEntries` here stored the last cookie
     // only, so a login that also issued a CSRF token was answered correctly on
     // the miss and with one cookie on the hit -- the same defect
-    // `runtime/response_headers.rs` exists to have caught once, one layer in.
+    // `runtime/header_list.rs` exists to have caught once, one layer in.
     //
     // Nothing is folded here, and that is deliberate. Which of the two answers
     // an application gets is decided once, on the way out of this isolate, from
@@ -791,12 +991,18 @@ class Cache {
       status: response.status,
       headers: headerPairs(response.headers)
     };
+    // What this entry is the variant *for*, kept beside it because that is the
+    // only place `match` can read it: the store is keyed by URL, and nothing
+    // knows a response varied until the entry it varied on has been read. One
+    // variant per key, therefore -- a second `put` for the same URL replaces
+    // it -- which costs a hit and never costs a wrong answer.
+    if (vary.length > 0) meta.vary = varySelector(vary, request);
     await DenoCore.ops.op_cache_set(
       this.name,
       key,
       JSON.stringify(meta),
       body,
-      freshnessSeconds(response)
+      freshnessSeconds(directives)
     );
   }
   async match(request) {
@@ -805,6 +1011,10 @@ class Cache {
     if (!hit) return undefined;
     try {
       const meta = JSON.parse(hit.meta);
+      // The entry is under the right URL; whether it is the right *variant* is
+      // a second question, and answering it wrongly is how one user's page is
+      // served to another.
+      if (!selectedBy(meta.vary, request)) return undefined;
       // A 204 or a 304 may not carry a body at all, and the constructor
       // refuses an empty buffer as loudly as a full one -- so an entry with
       // nothing in it is rebuilt with a null body rather than a zero-length
@@ -2118,35 +2328,33 @@ function serviceTargetOf(binding, input) {
 // platform before the call is dispatched, so a callee reading that header is
 // reading a fact rather than a claim.
 function serviceHeadersOf(init, request) {
-  const collected = {};
+  // Pairs, not an object, for the reason `headerPairs` below is: a callee is a
+  // handler like any other, and an object keeps one value per name. A call
+  // built out of the request it is a hop of -- `bindings.AUTH.fetch(request)`,
+  // which is the shape everyone writes -- used to arrive at the callee with
+  // one of the caller's two `Cookie` lines and one of its two `Accept` lines.
+  const collected = [];
   const absorb = (source) => {
-    if (!source) return;
-    if (typeof source.forEach === "function" && typeof source.entries === "function") {
-      // A Headers, or anything shaped like one.
-      source.forEach((value, name) => {
-        collected[String(name).toLowerCase()] = String(value);
-      });
-      return;
-    }
-    if (Array.isArray(source)) {
-      for (const pair of source) {
-        if (Array.isArray(pair) && pair.length === 2) {
-          collected[String(pair[0]).toLowerCase()] = String(pair[1]);
-        }
-      }
-      return;
-    }
-    if (typeof source === "object") {
-      for (const name of Object.keys(source)) {
-        collected[name.toLowerCase()] = String(source[name]);
-      }
+    for (const [name, value] of headerPairs(source)) {
+      collected.push([String(name).toLowerCase(), String(value)]);
     }
   };
   // The request's own headers first, then the init's, so an init that names a
   // header overrides the request it was built from -- which is what `fetch`
-  // does.
+  // does. Overrides, not adds: the init's value replaces every value the
+  // request carried under that name, so `{ headers: { authorization: mine } }`
+  // sends one credential rather than two.
   if (request && request.headers) absorb(request.headers);
-  if (init && init.headers) absorb(init.headers);
+  if (init && init.headers) {
+    const overridden = new NativeSet();
+    for (const [name] of headerPairs(init.headers)) {
+      overridden.add(String(name).toLowerCase());
+    }
+    for (let i = collected.length - 1; i >= 0; i--) {
+      if (overridden.has(collected[i][0])) collected.splice(i, 1);
+    }
+    absorb(init.headers);
+  }
   return collected;
 }
 
@@ -2192,6 +2400,10 @@ class ServiceBinding {
 
   async fetch(input, init) {
     const request = input !== null && typeof input === "object" ? input : null;
+    // The body is awaited before the scope is read, not after: reading it can
+    // suspend, and the answer has to be which stretch is making the call *now*
+    // rather than which one was running when the body started being collected.
+    const body = await serviceBodyOf(this.#name, init, request);
     const answer = await DenoCore.ops.op_deis_service_call(
       this.#name,
       {
@@ -2201,7 +2413,12 @@ class ServiceBinding {
         url: serviceTargetOf(this.#name, input),
         headers: serviceHeadersOf(init, request)
       },
-      await serviceBodyOf(this.#name, init, request)
+      body,
+      // A service call spends the same allowance an outbound fetch does, so it
+      // has to say the same thing about whose allowance it is: the invocation's,
+      // or the response stream whose producer is making the call. See
+      // `runtime/ops.rs`.
+      StreamScope.scope()
     );
     return new ResponseCtor(answer.body, {
       status: answer.status,
@@ -2620,19 +2837,24 @@ function respond(status, headers, body) {
   return { status: status, headers: headerPairs(headers) };
 }
 
-// A header list as [name, value] pairs, never as an object. Both boundaries a
-// header list crosses go through here: the answer leaving this isolate, and the
-// entry `Cache.put` writes into the response cache.
+// A header list as [name, value] pairs, never as an object. Every boundary a
+// header list crosses on this side goes through here: the answer leaving this
+// isolate, the entry `Cache.put` writes into the response cache, and the
+// request one application sends another through a service binding. The fourth,
+// the inbound request, is built as a list by the node and handed to `Headers`
+// unchanged.
 //
 // One name may legitimately appear twice, and for `Set-Cookie` it has to: the
 // Fetch specification exempts that one header from being combined, so
-// iterating a `Headers` yields one entry per cookie. An object keeps one value
-// per key, so an answer that set a session cookie and a CSRF cookie used to
-// arrive at the client with exactly one of them and nothing said so.
+// iterating a `Headers` yields one entry per cookie. On the way in the
+// repeatable names are the ordinary ones -- `Cookie`, `Accept`,
+// `Accept-Language`, `X-Forwarded-For`. An object keeps one value per key, so
+// an answer that set a session cookie and a CSRF cookie used to arrive at the
+// client with exactly one of them and nothing said so.
 //
 // Whether the repeats survive is not decided here. The node decides it, once,
 // from the application's compatibility date -- see
-// `runtime/response_headers.rs` -- so an application written before the fix
+// `runtime/header_list.rs` -- so an application written before the fix
 // still gets the bytes it was written against. This side's job is only to stop
 // throwing the information away before anyone can choose.
 function headerPairs(headers) {
@@ -2896,7 +3118,7 @@ globalThis.__deis_runtime_stream_begin = function(id) {
   // exception to "nothing outlives its invocation" is visible at the moment it
   // is made rather than only when the stream ends. The stream's own budget is
   // logged beside this by `runtime/isolate.rs`, which is what bounds all of it.
-  const adopted = StreamScope.adopt();
+  const adopted = StreamScope.adopt(id);
   const owner = adopted.owner;
   const held = adopted.held;
   if (held.calls > 0 || held.intervals > 0 || held.timeouts > 0) {

@@ -65,7 +65,6 @@ mod tests {
         use crate::runtime::fetch_policy::FetchPolicy;
         use crate::runtime::isolate::{AppRuntime, IsolateSpec};
         use crate::runtime::{ServiceRouter, ServiceWiring};
-        use std::collections::HashMap;
 
         let code = r#"
             export default async function handler() {
@@ -108,7 +107,7 @@ mod tests {
             .execute_fetch(
                 "http://localhost/".to_string(),
                 "GET".to_string(),
-                HashMap::new(),
+                Vec::new(),
                 None,
                 tx,
             )
