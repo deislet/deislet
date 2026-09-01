@@ -93,6 +93,33 @@ async fn main() -> Result<(), anyhow::Error> {
     let database = Arc::new(deis_control::Database::init(&opts.database).await?);
     info!("Database initialized: {}", opts.database);
 
+    // Before anything can connect: take back what the previous process was
+    // still claiming. Nothing is connected yet and nothing is waiting on a
+    // command, so every node row that still reads as live and every command
+    // still short of an ending belongs to an instance that is gone. Left
+    // alone they never change again - which is what an operator was seeing
+    // when a long-dead node kept showing as Active and a command sat at Sent
+    // for weeks.
+    match database.withdraw_in_flight_beliefs().await {
+        Ok(withdrawn) if withdrawn.nodes > 0 || withdrawn.commands > 0 => warn!(
+            nodes = withdrawn.nodes,
+            commands = withdrawn.commands,
+            "A previous instance stopped without finishing: {} node(s) still recorded as holding \
+             a channel are now marked disconnected, and {} command(s) still waiting for an answer \
+             are recorded as Timeout, because the channels they were sent down died with that \
+             process",
+            withdrawn.nodes,
+            withdrawn.commands
+        ),
+        Ok(_) => info!("No node or command was left in flight by a previous instance"),
+        Err(e) => warn!(
+            error = %e,
+            "Could not take back what a previous instance left in flight; nodes it recorded as \
+             live may still read that way until they reconnect, and its unfinished commands keep \
+             their in-flight status"
+        ),
+    }
+
     let api_config = Arc::new(config.clone());
 
     // One stop signal for the whole process, taken before anything is
@@ -152,6 +179,17 @@ async fn main() -> Result<(), anyhow::Error> {
     ));
     let scheduler_task = Arc::clone(&scheduler).start(shutdown.clone()).await;
 
+    // The two deadlines this control plane records - how long a node may be
+    // silent, and how long a command may go unanswered - are both written
+    // down and neither used to be read. This is what reads them.
+    let reaper = Arc::new(deis_control::Reaper::new(
+        Arc::clone(&sessions),
+        Arc::clone(&db),
+        Arc::clone(&command_executor),
+        &api_config,
+    ));
+    let reaper_task = Arc::clone(&reaper).start(shutdown.clone()).await;
+
     // Both loops stop on the signal by themselves; this waits for them to
     // actually be out of a tick. Aborting instead would cut the cron
     // scheduler between sending a trigger and recording that it ran, so the
@@ -165,8 +203,13 @@ async fn main() -> Result<(), anyhow::Error> {
             shutdown.wait().await;
             let mut scheduler_task = scheduler_task;
             let mut runtime_poll_task = runtime_poll_task;
+            let mut reaper_task = reaper_task;
             let stopped = async {
-                let _ = tokio::join!(&mut scheduler_task, &mut runtime_poll_task);
+                let _ = tokio::join!(
+                    &mut scheduler_task,
+                    &mut runtime_poll_task,
+                    &mut reaper_task
+                );
             };
             if tokio::time::timeout(deis_control::shutdown::DRAIN_GRACE, stopped)
                 .await
@@ -174,13 +217,14 @@ async fn main() -> Result<(), anyhow::Error> {
             {
                 scheduler_task.abort();
                 runtime_poll_task.abort();
+                reaper_task.abort();
                 warn!(
                     grace_secs = deis_control::shutdown::DRAIN_GRACE.as_secs(),
                     "A background loop was still inside a call to a node when the grace period ran out and was cut; if that was a cron trigger, the occurrence may have run on the node without this process recording it, so the next instance can fire the same occurrence again"
                 );
             } else {
                 info!(
-                    "Cron scheduler and runtime node poller stopped cleanly; no scheduled trigger and no node health probe runs from this instance any more"
+                    "Cron scheduler, runtime node poller and liveness sweep stopped cleanly; no scheduled trigger, no node health probe and no expiry runs from this instance any more"
                 );
             }
         }

@@ -67,6 +67,7 @@ use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
 use crate::config::LoggingConfig;
+use crate::telemetry::{report_posture, TelemetryCredential};
 
 /// Generated clients for deis-telemetry's `MetricService` and `TraceService`
 /// (package `deis.telemetry`).
@@ -315,7 +316,14 @@ impl MetricsRegistry {
     /// the check that the cut-off happened inside this invocation's own span,
     /// that stale cause would be pinned on whichever request failed next --
     /// naming the wrong invocation is worse than naming none.
-    fn take_cut_off(&self, app_id: &str, duration: Duration) -> Option<InvocationOutcome> {
+    ///
+    /// Public because a queue batch and a cron tick need the same answer as a
+    /// request and do not go through [`Self::record_request_with`]: a handler
+    /// that was cut off and one that threw both come back as an error, and
+    /// only the cut-off the platform noted says which. Taking it is the point
+    /// -- one cut-off explains one invocation, and leaving it behind would let
+    /// it explain the next one too.
+    pub fn take_cut_off(&self, app_id: &str, duration: Duration) -> Option<InvocationOutcome> {
         let mut cut_offs = self.cut_offs.lock().unwrap_or_else(|e| e.into_inner());
         let pending = *cut_offs.get(app_id)?;
         if pending.at.elapsed() > duration {
@@ -919,6 +927,10 @@ pub const TRACE_BUFFER_ENV: &str = "DEIS_TRACE_BUFFER";
 pub struct MetricShipperConfig {
     /// deis-telemetry address, e.g. `http://127.0.0.1:8092`.
     pub endpoint: Option<String>,
+    /// The capability token this node presents on every metric and trace push.
+    /// The same credential the log shipper carries, from the same setting:
+    /// one service, one connection, one secret. See [`crate::telemetry`].
+    pub credential: TelemetryCredential,
     /// Whether to push at all.
     pub enabled: bool,
     /// Seconds between metric pushes.
@@ -939,6 +951,7 @@ impl Default for MetricShipperConfig {
     fn default() -> Self {
         Self {
             endpoint: None,
+            credential: TelemetryCredential::default(),
             enabled: false,
             interval_secs: 15,
             trace_interval_secs: 5,
@@ -953,6 +966,7 @@ impl From<&LoggingConfig> for MetricShipperConfig {
     fn from(config: &LoggingConfig) -> Self {
         Self {
             endpoint: config.endpoint.clone(),
+            credential: TelemetryCredential::from_secret(config.auth_secret.as_deref()),
             enabled: config.enabled,
             // Metrics are cumulative totals, not events, so they are pushed on
             // their own slower cadence than logs: a missed push costs nothing
@@ -1099,8 +1113,10 @@ impl MetricShipper {
             "Telemetry shipper started; this node's counters and its invocation traces will be \
              queryable through deis-telemetry"
         );
+        report_posture(&self.config.credential, &endpoint);
 
         let registry = self.registry.clone();
+        let credential = self.config.credential.clone();
         let interval_secs = self.config.interval_secs;
         let trace_interval_secs = self.config.trace_interval_secs;
         let trace_batch_size = self.config.trace_batch_size;
@@ -1118,12 +1134,13 @@ impl MetricShipper {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        push_once(&registry, &node_id, &mut client).await;
+                        push_once(&registry, &node_id, &credential, &mut client).await;
                     }
                     _ = trace_ticker.tick() => {
                         push_traces_once(
                             registry.traces(),
                             &node_id,
+                            &credential,
                             trace_batch_size,
                             &mut traces,
                         )
@@ -1137,10 +1154,17 @@ impl MetricShipper {
             // its way out are still queryable. Traces are drained batch by
             // batch rather than once: a busy node can have more of them
             // buffered than one push carries, and they exist nowhere else.
-            push_once(&registry, &node_id, &mut client).await;
+            push_once(&registry, &node_id, &credential, &mut client).await;
             loop {
                 let before = registry.traces().pending();
-                push_traces_once(registry.traces(), &node_id, trace_batch_size, &mut traces).await;
+                push_traces_once(
+                    registry.traces(),
+                    &node_id,
+                    &credential,
+                    trace_batch_size,
+                    &mut traces,
+                )
+                .await;
                 // No progress means deis-telemetry is not taking them, and
                 // retrying would only hold the shutdown open.
                 if registry.traces().pending() >= before {
@@ -1194,7 +1218,7 @@ fn stamp_node(mut samples: Vec<MetricSample>, node_id: &str) -> Vec<MetricSample
     samples
 }
 
-fn now_us() -> i64 {
+pub(super) fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -1204,6 +1228,7 @@ fn now_us() -> i64 {
 async fn push_once(
     registry: &MetricsRegistry,
     node_id: &str,
+    credential: &TelemetryCredential,
     client: &mut MetricServiceClient<Channel>,
 ) {
     let samples = stamp_node(registry.snapshot(now_us()), node_id);
@@ -1212,11 +1237,13 @@ async fn push_once(
     }
     let count = samples.len();
 
+    // The token goes in the request's gRPC metadata, where deis-telemetry's
+    // interceptor reads it, and not in the message's own `metadata` map.
     match client
-        .push_metrics(PushMetricsRequest {
+        .push_metrics(credential.stamp(PushMetricsRequest {
             samples,
             metadata: Default::default(),
-        })
+        }))
         .await
     {
         Ok(response) => {
@@ -1233,6 +1260,15 @@ async fn push_once(
                 debug!(count, "Pushed metric samples to deis-telemetry");
             }
         }
+        Err(status) if status.code() == tonic::Code::Unauthenticated => error!(
+            count,
+            carrying_a_token = credential.is_present(),
+            error = %status.message(),
+            "deis-telemetry refused this node's metrics: a credential mismatch, not an outage. \
+             Retrying cannot fix it, and until it is fixed no counter and no latency bucket from \
+             this node reaches any dashboard. Set logging.auth_secret to the same value as \
+             deis-telemetry's auth_secret"
+        ),
         Err(status) => warn!(
             count,
             error = %status,
@@ -1252,6 +1288,7 @@ async fn push_once(
 async fn push_traces_once(
     recorder: &Arc<TraceRecorder>,
     node_id: &str,
+    credential: &TelemetryCredential,
     batch_size: usize,
     client: &mut TraceServiceClient<Channel>,
 ) {
@@ -1264,12 +1301,12 @@ async fn push_traces_once(
     let records: Vec<TraceRecord> = batch.iter().map(|trace| trace.to_proto(node_id)).collect();
 
     match client
-        .push_traces(PushTracesRequest {
+        .push_traces(credential.stamp(PushTracesRequest {
             records,
             sampled_out: gaps.sampled_out,
             dropped: gaps.dropped,
             metadata: Default::default(),
-        })
+        }))
         .await
     {
         Ok(response) => {
@@ -1291,13 +1328,27 @@ async fn push_traces_once(
             // not also erase the evidence that traces were lost during it.
             recorder.restore_gaps(gaps);
             let returned = recorder.requeue(batch);
-            warn!(
-                count,
-                returned,
-                error = %status,
-                "Pushing invocation traces to deis-telemetry failed; they stay queued and go \
-                 out on the next tick. Nothing is lost until the buffer reaches its ceiling."
-            );
+            if status.code() == tonic::Code::Unauthenticated {
+                error!(
+                    count,
+                    returned,
+                    carrying_a_token = credential.is_present(),
+                    error = %status.message(),
+                    "deis-telemetry refused this node's invocation traces: a credential \
+                     mismatch, not an outage. Retrying cannot fix it; the records queue until \
+                     the buffer fills and are then discarded, so `deis trace` will never show \
+                     an invocation this node served. Set logging.auth_secret to the same value \
+                     as deis-telemetry's auth_secret"
+                );
+            } else {
+                warn!(
+                    count,
+                    returned,
+                    error = %status,
+                    "Pushing invocation traces to deis-telemetry failed; they stay queued and go \
+                     out on the next tick. Nothing is lost until the buffer reaches its ceiling."
+                );
+            }
         }
     }
 }

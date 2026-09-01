@@ -31,6 +31,7 @@ const KEYS: &[&str] = &[
     "control.endpoint",
     "control.token",
     "telemetry.endpoint",
+    "queue.endpoint",
     "defaults.app",
     "defaults.environment",
 ];
@@ -97,6 +98,12 @@ pub fn set(key: &str, value: &str, output: Output) -> Result<()> {
                 .get_or_insert_with(EndpointSection::default)
                 .endpoint = Some(value.to_string());
         }
+        "queue.endpoint" => {
+            project
+                .queue
+                .get_or_insert_with(EndpointSection::default)
+                .endpoint = Some(value.to_string());
+        }
         "defaults.app" => {
             settings::check_name("application", value)?;
             project
@@ -150,6 +157,7 @@ pub fn get(key: &str, output: Output) -> Result<()> {
     let (value, source) = match key {
         "control.endpoint" => described(settings.control_endpoint.as_ref()),
         "telemetry.endpoint" => described(settings.telemetry_endpoint.as_ref()),
+        "queue.endpoint" => described(settings.queue_endpoint.as_ref()),
         "defaults.app" => described(settings.app.as_ref()),
         "defaults.environment" => (
             Some(settings.environment.value.clone()),
@@ -256,6 +264,11 @@ pub fn unset(key: &str, output: Output) -> Result<()> {
             .as_mut()
             .and_then(|t| t.endpoint.take())
             .is_some(),
+        "queue.endpoint" => project
+            .queue
+            .as_mut()
+            .and_then(|q| q.endpoint.take())
+            .is_some(),
         "defaults.app" => project
             .defaults
             .as_mut()
@@ -320,6 +333,11 @@ pub fn list(output: Output) -> Result<()> {
                 .telemetry_endpoint
                 .as_ref()
                 .map(|s| s.source.clone()),
+        ),
+        (
+            "queue.endpoint",
+            settings.queue_endpoint.as_ref().map(|s| s.value.clone()),
+            settings.queue_endpoint.as_ref().map(|s| s.source.clone()),
         ),
         (
             "defaults.app",
@@ -424,6 +442,7 @@ fn variable_for(key: &str) -> Option<&'static str> {
         "control.endpoint" => Some(settings::ENV_CONTROL_ENDPOINT),
         "control.token" => Some(settings::ENV_CONTROL_TOKEN),
         "telemetry.endpoint" => Some(settings::ENV_TELEMETRY_ENDPOINT),
+        "queue.endpoint" => Some(settings::ENV_QUEUE_ENDPOINT),
         "defaults.app" => Some(settings::ENV_APP),
         "defaults.environment" => Some(settings::ENV_ENVIRONMENT),
         _ => None,

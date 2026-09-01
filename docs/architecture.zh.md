@@ -430,7 +430,7 @@ sequenceDiagram
 | **deis-store** | KV | SQLite 表（tenant, key, value, metadata, expires_at） | `storage.proto` 的 `KvStore` |
 | | Database | 每租户一个独立 SQLite 文件 `db/<tenant>.sqlite` | `storage.proto` 的 `Database` |
 | | Blob | 内容寻址落盘 `blob/<tenant>/…` + SQLite 元数据 | `blob.proto`，Get/Put 流式分块 |
-| **deis-queue** | Queue | SQLite 表做持久队列，另有死信表 | `queue.proto`：`Send` / `SendBatch` / `Pull` / `Ack` / `Nack` |
+| **deis-queue** | Queue | SQLite 表做持久队列，另有死信表 | `queue.proto`：`Send` / `SendBatch` / `Pull` / `Ack` / `Nack` / `ListDeadLetters` / `ReplayDeadLetters` |
 
 ### 租户维度只有一个，值是「应用 + 环境」
 
@@ -466,7 +466,12 @@ sequenceDiagram
   Nack 必须原样带回来，所以租约过期、消息被别人领走之后，先前那个消费者的 Ack 不再
   作数——否则它会把别人正在处理的那条销掉。
 - **死信**：重试超过阈值进死信表，不再投递。`ListDeadLetters` 与 `ReplayDeadLetters`
-  两个 RPC 让人能看见它们、并把它们放回队列，不必直接读库。
+  两个 RPC 让人能看见它们、并把它们放回队列，不必直接读库；命令行这一头是 `deis queue
+  dead-letters` 和 `deis queue replay`。每条死信还记着是哪一种失败把它送进来的：消费者
+  自己报了失败（处理函数跑过了，拒掉了这条消息体），还是租约一次次到期、始终没人应答
+  （处理函数比租约慢，或者节点握着消息挂了）。这两种要修的地方不一样，而光看重试次数
+  它们长得一模一样，所以原因写在行上，不只写进日志——等有人来看这张表的时候，那条日志
+  多半已经滚没了。
 - **批量投递**：`SendBatch` 一次收一整批，落库是**一个事务**——要么整批都进去，要么一
   条都没有。所以被拒的批次不会留下半批，调用方把同一个数组原样重发是安全的。一批装多
   少条由服务端的 `max_batch_messages`（默认 100）说了算，不由调用方说了算。
@@ -1080,7 +1085,7 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | 定时任务 | 成立 | 控制面按 `(app, environment)` 调度 → 节点 `Trigger.OnScheduled` → 跑 `scheduled` 导出 |
 | 具名绑定 | 成立 | manifest 的 `bindings` 块（形状在 `deis-bundle`，构建 / 控制面 / 节点 / isolate 四方共用一份）。一个应用可以声明任意多个 `kv` / `database` / `blob` / `queue` 绑定，各取一个名字，在 `context.bindings.<名字>` 和 `env.<名字>` 上拿到同一个对象。**租户边界一点没动**：绑定名是在能力令牌验过之后、用 `deis_wire::conventions::namespace_id` 拼到租户后面的（`shop.production@HOT`），分隔符 `@` 在租户两段和绑定名里都非法，所以这个拼法单射——没有哪一对 `(租户, 绑定)` 能拼出另一对的命名空间。不带名字的 `context.services.*` 还是那个**无名**命名空间，调用不带 `x-deis-binding` 头，早先部署的应用数据原地不动。绑定名判重不分大小写，因为它会变成 deis-store 里的目录名和文件名。队列绑定不需要这套拼法：deis-queue 本来就是按 `(租户, 队列名, id)` 存的 |
 | 应用间调用（service bindings） | 成立 | `bindings` 里 `"kind": "service"` 的那一种，`context.bindings.AUTH.fetch(...)`。**不带任何地址**——没有主机、端口、URL 或要解析的名字——派发是节点进程内部的一条消息（`RuntimeMessage::ExecuteServiceCall`）送到托管被调方 isolate 的那条运行时线程，所以 `fetch_policy` 既不参与也放不开。两道闸：被调方在自己 bundle 的 `callableBy` 里同意（节点按被调方**当前那一版**逐次查），上传方在作用域里持有 `read:<被调方>/<环境>`（控制面上传时查一次并进审计）。默认调**调用方自己那个环境**，因为 `(应用, 环境)` 就是租户。一次调用花一个 subrequest 配额，链路深度上限 4，成环当场拒（A→B→A 会让 A 的线程等一条它自己读不到的消息，那是死锁不是慢）。被调方跑的是它自己的 invocation：自己的超时、CPU、内存、日志、轨迹；调用方另按自己剩下的预算等，两种超时在消息里是两句不同的话。只在本节点内：被调方不在这台机器上时，调用方得到的就是这句话 |
-| 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match`。站点自己的规则也在：`_redirects`（按作者顺序，首条命中者胜；200 是改写、404 是带 404 状态返回目标）、`_headers`（所有命中的块叠加、靠后的覆盖靠前的，`! 名字` 去掉前面设过的）、以及 `assets.notFound` 三选一的兜底（`none` / `404-page` / `single-page-app`）。三样都在构建期解析、写错就构建失败并报出行号，在节点装载那一版时编译成表。函数想主动取包里的文件走 `env.ASSETS.fetch()`——`ASSETS` 是保留键，应用设不了同名变量把它顶掉 |
+| 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match`。站点自己的规则也在：`_redirects`（按作者顺序，首条命中者胜；200 是改写、404 是带 404 状态返回目标）、`_headers`（所有命中的块叠加、靠后的覆盖靠前的，同一个块里一个名字写两遍就发两条——`Link` 与 `Set-Cookie` 不许合并成一条，`! 名字` 去掉前面设过的该名字的全部取值）、以及 `assets.notFound` 三选一的兜底（`none` / `404-page` / `single-page-app`）。三样都在构建期解析、写错就构建失败并报出行号，在节点装载那一版时编译成表。函数想主动取包里的文件走 `env.ASSETS.fetch()`——`ASSETS` 是保留键，应用设不了同名变量把它顶掉 |
 | WebAssembly | 成立 | V8 自带 |
 | WebSocket | 成立 | 服务端（`WebSocketPair` 桥接）与客户端（走 `fetch_policy.rs` 出网策略的 `WebSocket` 全局）都有；HTTP 升级、经过 deis-proxy 的一跳、文本帧与二进制帧都有真测试覆盖（`websocket_bridging_test.rs`、`websocket_through_proxy_test.rs`，见 §11） |
 | BroadcastChannel | **不成立** | `deno_web` 带着 `01_broadcast_channel.js` 被 import 进来了，但没有把 `BroadcastChannel` 装到 `globalThis` 上——8.1 节没要求它，`bootstrap.js` 补全局时就没带上。探针实测：`typeof BroadcastChannel === "undefined"`。真要开还有一层要想清楚：进程内广播是跨应用的，得先按 (应用, 环境) 隔离 |

@@ -46,6 +46,7 @@
 //! application is answered while a stream is open rather than queued behind
 //! it. See `AppRuntime::pump_response_streams`.
 
+use super::metrics::{now_us, recorder, InvocationKind, InvocationOutcome, InvocationTrace};
 use bytes::Bytes;
 use deno_core::{extension, op2, JsBuffer, OpState};
 use deno_error::JsErrorBox;
@@ -157,8 +158,35 @@ impl StreamReader {
     }
 }
 
+/// Who a stream belongs to, kept beside it so the end of a body can be
+/// reported after the invocation that started it has finished.
+///
+/// A stream outlives its request by design: the head goes out, the invocation
+/// is recorded, and the producer runs on afterwards from the runtime thread's
+/// pump. So by the time a body stops short there is no invocation running on
+/// the isolate to ask -- `AppId` is still there, but the id that ties this
+/// body to the request it answered is not. Copied in when the stream opens,
+/// which is the last moment both are known.
+#[derive(Clone, Debug)]
+pub struct StreamOwner {
+    /// The tenant, `app.environment`, as every log line and trace record on
+    /// this platform names it.
+    pub tenant: String,
+    /// The invocation that answered with this body. Without it the line below
+    /// is unfindable from the trace an operator is reading, which is the whole
+    /// question being asked: "the request said 200 -- did the client get the
+    /// body?"
+    pub trace_id: String,
+    /// What the request was aimed at, so the record reads like the request it
+    /// belongs to rather than like a stream id nobody has seen before.
+    pub target: String,
+}
+
 /// One open response stream, from the node's side.
 struct OpenStream {
+    /// The tenant and invocation this body answers. See [`StreamOwner`].
+    owner: StreamOwner,
+
     /// Where produced chunks go. Bounded; see [`QUEUED_CHUNKS`].
     sink: mpsc::Sender<Bytes>,
 
@@ -199,9 +227,11 @@ pub struct ResponseStreams {
     open: HashMap<u32, OpenStream>,
 }
 
-/// What one finished stream cost, so the caller can say so in one line.
-#[derive(Debug, Clone, Copy)]
+/// What one finished stream cost, and who it belonged to, so the caller can
+/// say so in one line that can be found again.
+#[derive(Debug, Clone)]
 pub struct StreamTally {
+    pub owner: StreamOwner,
     pub chunks: u64,
     pub bytes: u64,
     pub lived: std::time::Duration,
@@ -214,7 +244,7 @@ impl ResponseStreams {
     /// inside one isolate, so a `u32` that wraps after four billion streams is
     /// wide enough, and the wrap cannot collide with a live stream unless four
     /// billion are open at once.
-    pub fn open(&mut self, deadline: Instant) -> (u32, StreamReader) {
+    pub fn open(&mut self, deadline: Instant, owner: StreamOwner) -> (u32, StreamReader) {
         let (sink, chunks) = mpsc::channel(QUEUED_CHUNKS);
         let failure = Arc::new(Mutex::new(None));
         self.next_id = self.next_id.wrapping_add(1);
@@ -222,6 +252,7 @@ impl ResponseStreams {
         self.open.insert(
             id,
             OpenStream {
+                owner,
                 sink,
                 failure: failure.clone(),
                 deadline,
@@ -292,6 +323,7 @@ impl ResponseStreams {
     /// closing a stream *is* removing it from this map.
     pub fn close(&mut self, id: u32) -> Option<StreamTally> {
         self.open.remove(&id).map(|stream| StreamTally {
+            owner: stream.owner,
             chunks: stream.chunks,
             bytes: stream.bytes,
             lived: stream.opened_at.elapsed(),
@@ -408,6 +440,11 @@ fn op_deis_stream_close(state: &mut OpState, id: u32) {
     if let Some(tally) = tally {
         tracing::debug!(
             target: "app",
+            // The same two dimensions the failure below carries, for the same
+            // reason: a line about one application's body that names neither
+            // the application nor the invocation is stored and never found.
+            app_id = %tally.owner.tenant,
+            trace_id = %tally.owner.trace_id,
             stream_id = id,
             chunks = tally.chunks,
             bytes = tally.bytes,
@@ -432,24 +469,89 @@ fn op_deis_stream_close(state: &mut OpState, id: u32) {
 #[op2(fast)]
 fn op_deis_stream_fail(state: &mut OpState, id: u32, #[string] message: String) {
     let streams = response_streams(state);
-    let mut streams = streams.borrow_mut();
-    streams.record_failure(id, message.clone());
-    // Dropping the entry drops the node's end of the queue, which is what ends
-    // the body; the failure recorded a line above is what the reader finds
-    // when it gets there.
-    let tally = streams.close(id);
-    let bytes = tally.map(|t| t.bytes).unwrap_or(0);
+    let tally = {
+        let mut streams = streams.borrow_mut();
+        streams.record_failure(id, message.clone());
+        // Dropping the entry drops the node's end of the queue, which is what
+        // ends the body; the failure recorded a line above is what the reader
+        // finds when it gets there.
+        streams.close(id)
+    };
+    let Some(tally) = tally else {
+        // Already closed -- the node reaped it, or the client went away --
+        // and its owner went with it. Nothing is said, because the path that
+        // closed it has already said it.
+        return;
+    };
     tracing::error!(
         target: "app",
+        // The two dimensions this line had neither of. Without `app_id` it
+        // reached deis-telemetry, was stored, and was invisible to `deis logs
+        // <app>` and to every per-application query, while the shipper
+        // reported a clean delivery -- a line nobody can find is a line that
+        // was not written. `trace_id` is what ties it to the request that was
+        // answered 200 half a minute earlier.
+        app_id = %tally.owner.tenant,
+        trace_id = %tally.owner.trace_id,
         stream_id = id,
-        chunks = tally.map(|t| t.chunks).unwrap_or(0),
-        bytes,
-        "A response stream failed after its head had already been sent: {}. The client was \
+        chunks = tally.chunks,
+        bytes = tally.bytes,
+        lived_ms = tally.lived.as_millis() as u64,
+        "A response stream of {} failed after its head had already been sent: {}. The client was \
          answered 200 and has been given {} bytes; its read of the rest fails, because the body \
          is deliberately left without its terminating chunk",
+        tally.owner.tenant,
         message,
-        bytes
+        tally.bytes
     );
+    record_broken_body(
+        &tally,
+        &message,
+        // The producer threw. The platform stopped nothing here and no ceiling
+        // was crossed: this is the application's own failure, arriving too
+        // late to be answered with a 500.
+        InvocationOutcome::ApplicationError,
+    );
+}
+
+/// File the invocation whose body the client did not get.
+///
+/// The invocation was recorded the moment the head went out, as `ok` with the
+/// status the client was given -- which was true then and is not true now. The
+/// record cannot be taken back: it has been pushed, and a trace store is
+/// append-only by design. So what is filed is a second invocation under the
+/// *same* trace id, saying how the body ended, and `deis trace --trace-id`
+/// then shows both -- the request that answered 200, and the body that did not
+/// arrive. Leaving only the first is the silent wrong answer: an operator
+/// asking "did that request succeed" is told yes by the one component that
+/// knows it did not.
+///
+/// Every way a body can stop short comes through here -- the producer threw,
+/// the stream ran past `stream_timeout_ms`, the isolate was cut off or taken
+/// away -- because they are one fact to the client and differ only in the
+/// verdict, which is why the caller supplies it.
+pub fn record_broken_body(tally: &StreamTally, reason: &str, outcome: InvocationOutcome) {
+    let mut trace = InvocationTrace::new(&tally.owner.tenant, InvocationKind::HttpRequest);
+    trace.trace_id = tally.owner.trace_id.clone();
+    trace.outcome = outcome;
+    trace.duration = tally.lived;
+    trace.started_us = (now_us() - (tally.lived.as_micros().min(i64::MAX as u128) as i64)).max(0);
+    trace.target = tally.owner.target.clone();
+    // The status the client was actually given, which is the point: a record
+    // that said 0 would read as an invocation that never answered, and this
+    // one did answer -- with a head it could not make good on.
+    trace.status = 200;
+    trace.error = reason.to_string();
+    trace
+        .attributes
+        .insert("response_body".to_string(), "truncated".to_string());
+    trace
+        .attributes
+        .insert("bytes_sent".to_string(), tally.bytes.to_string());
+    trace
+        .attributes
+        .insert("chunks_sent".to_string(), tally.chunks.to_string());
+    recorder().record_invocation(trace);
 }
 
 extension!(

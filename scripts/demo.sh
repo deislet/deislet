@@ -761,6 +761,13 @@ deis_cli_env() {
   DEIS_CLI_ENV=(
     "DEIS_CONTROL_ENDPOINT=$(control_url)"
     "DEIS_TELEMETRY_ENDPOINT=http://127.0.0.1:${DEIS_TELEMETRY_PORT}"
+    # Where deis-queue listens, for `deis queue dead-letters` and `deis queue
+    # replay`. It is not fetched from the control plane the way deis-store's
+    # address is - the storage-token route answers with the store's address
+    # and the tenant's token, and that same token is what deis-queue checks -
+    # so the CLI is told it here, exactly as a person would put it in
+    # deis.toml under [queue].
+    "DEIS_QUEUE_ENDPOINT=http://127.0.0.1:${DEIS_QUEUE_PORT}"
     "DEIS_APP=${APP_ID}"
     "DEIS_ENVIRONMENT=${ENV_NAME}"
     "DEIS_CONFIG_HOME=${DEMO_DIR}/deis-config"
@@ -4115,6 +4122,113 @@ check_queue_consumer_concurrency() {
   fi
 }
 
+# The dead letter table, from a terminal.
+#
+# A message that fails more times than the queue's ceiling allows is not
+# deleted: deis-queue moves it to a dead letter table and stops delivering it.
+# Until `deis queue` existed nothing outside deis-queue's own tests ever read
+# that table, so the work in it was reachable only by opening queue.sqlite
+# with the sqlite3 shell on whichever host holds it - which made the dead
+# letter table a place work went to disappear rather than a place it waits.
+#
+# The poison needs no change to the application. A job whose key is longer
+# than the 1024 bytes deis-store accepts (crates/deis-store/src/kv.rs) can
+# never be written, so the consumer's put throws on every delivery, the
+# handler asks for that message back, and the queue gives up on it once the
+# attempts run out.
+check_queue_dead_letters() {
+  local title="a message the consumer cannot handle is dead lettered, and deis queue shows it and puts it back"
+  local out="${LOG_DIR}/cli-queue-dead-letters"
+  local headers="${LOG_DIR}/verify-queue-dead-letter.headers"
+  local key
+  key="poison-$$-${RANDOM}-$(printf '%1100s' '' | tr ' ' 'x')"
+
+  local sent
+  sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+    -H 'content-type: application/json' \
+    -d "{\"key\":\"${key}\",\"value\":\"never-stored\"}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue")
+  if [ "$(http_status "$headers")" != "202" ]; then
+    fail_check "$title" "POST /api/enqueue answered $(http_status "$headers"): ${sent}"
+    return
+  fi
+
+  # The wait is real: the node hands the message back with a ten-second retry
+  # delay and the queue only gives up at the fifth delivery, so this is around
+  # a minute. Polled on the condition - the message appearing in the table -
+  # rather than assumed, and every poll is the operator's own command.
+  local waited=0 found="" listed=""
+  while [ "$waited" -lt 180 ]; do
+    if deis_cli queue dead-letters --queue jobs --json \
+      > "${out}-list.json" 2> "${out}-list.log"; then
+      # Selected by body rather than by position: two verify runs against one
+      # demo would each have their own poison message in this table.
+      found=$(jq -r --arg key "$key" \
+        '.messages[] | select((.body_base64 | @base64d) | contains($key)) | .id' \
+        < "${out}-list.json" 2>/dev/null | head -n 1)
+      if [ -n "$found" ]; then
+        listed=$(jq -c --arg id "$found" '.messages[] | select(.id == $id)' \
+          < "${out}-list.json" 2>/dev/null || true)
+        break
+      fi
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+
+  if [ -z "$found" ]; then
+    fail_check "$title" \
+      "nothing was dead lettered for ${key:0:24}... within ${waited}s; the last listing was $(head -c 300 "${out}-list.json" 2>/dev/null || echo '<none>'), the last error $(tail -n 2 "${out}-list.log" 2>/dev/null | tr '\n' ' ')"
+    return
+  fi
+
+  local attempts reason ceiling
+  attempts=$(echo "$listed" | jq -r '.attempts // empty' 2>/dev/null || true)
+  reason=$(echo "$listed" | jq -r '.reason // empty' 2>/dev/null || true)
+  ceiling=5
+
+  # The human report, which is what an operator actually reads.
+  if ! deis_cli queue dead-letters --queue jobs > "${out}-report.txt" 2>&1; then
+    fail_check "$title" \
+      "deis queue dead-letters failed without --json: $(tail -n 3 "${out}-report.txt" | tr '\n' ' ')"
+    return
+  fi
+
+  # And back out again. --delay is what an operator uses to put work back
+  # while a fix is still rolling out; an hour here also keeps this demo's
+  # consumer from spending the rest of the run re-poisoning itself.
+  if ! deis_cli queue replay --queue jobs "$found" --delay 3600 --json \
+    > "${out}-replay.json" 2> "${out}-replay.log"; then
+    fail_check "$title" \
+      "deis queue replay failed: $(tail -n 3 "${out}-replay.log" | tr '\n' ' ')"
+    return
+  fi
+  local replayed not_found
+  replayed=$(jq -r '.replayed // empty' < "${out}-replay.json" 2>/dev/null || true)
+  not_found=$(jq -r '.not_found // empty' < "${out}-replay.json" 2>/dev/null || true)
+
+  # It has to be gone from the table: the replay moves the row, it does not
+  # copy it, and a message still listed here is one nobody has put back.
+  local still_there=""
+  if deis_cli queue dead-letters --queue jobs --json \
+    > "${out}-after.json" 2> "${out}-after.log"; then
+    still_there=$(jq -r --arg id "$found" '.messages[] | select(.id == $id) | .id' \
+      < "${out}-after.json" 2>/dev/null || true)
+  fi
+
+  if [ "$attempts" = "$ceiling" ] \
+    && [ "$reason" = "the consumer reported it failed" ] \
+    && grep -q "$found" "${out}-report.txt" \
+    && grep -q "the consumer reported it failed" "${out}-report.txt" \
+    && [ "$replayed" = "1" ] && [ "$not_found" = "0" ] && [ -z "$still_there" ]; then
+    pass_check "$title" \
+      "the consumer failed the message ${ceiling} times over ${waited}s and the queue gave up on it; \`deis queue dead-letters\` showed it as ${found} with ${attempts} attempts and the reason \"${reason}\" - not \"its lease lapsed\", which is the other way a message gets here and needs a different fix - and \`deis queue replay --delay 3600\` put it back and left the table without it"
+  else
+    fail_check "$title" \
+      "expected ${ceiling} attempts with the reason \"the consumer reported it failed\", the id and the reason in the human report, and a replay of 1 with 0 not found that empties the row; got attempts '${attempts:-<none>}', reason '${reason:-<none>}', replayed '${replayed:-<none>}', not_found '${not_found:-<none>}', still listed '${still_there:-<no>}'"
+  fi
+}
+
 check_cron() {
   # The whole cron path in one observation: the expression rode into the
   # control plane inside the bundle manifest, the scheduler rebuilt its task
@@ -6449,6 +6563,10 @@ verify_demo() {
   check_queue_roundtrip
   check_queue_send_batch
   check_queue_consumer_concurrency
+  # Last of the queue checks: it is the only one that has to wait for the
+  # attempt ceiling to be reached, and it leaves a message on the queue with a
+  # long delay rather than in the dead letter table.
+  check_queue_dead_letters
   echo "-- cron --"
   check_cron
   echo "-- calling another application --"

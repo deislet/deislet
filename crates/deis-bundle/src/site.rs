@@ -147,7 +147,9 @@ pub struct SiteConfig {
     #[serde(default)]
     pub redirects: Vec<crate::redirects::RedirectRule>,
     /// `_headers`, in the order the author wrote them. All matching blocks
-    /// apply and a later one wins a conflict.
+    /// apply and a later one wins a conflict, but a name written twice inside
+    /// one block is sent twice: `Link` and `Set-Cookie` may not be folded into
+    /// one value, so this is a list of fields and not a map of names.
     #[serde(default)]
     pub headers: Vec<crate::headers::HeaderRule>,
     #[serde(default)]

@@ -128,6 +128,11 @@ tokio = { version = "1.48", features = ["test-util"] }
 # against the real server in tests is what catches a change on that side; unit
 # tests on either half alone cannot.
 deis-store = { path = "../deis-store" }
+# The same reasoning for the telemetry credential: this node derives a token
+# over a subject and deis-telemetry recomputes it over its own, and nothing but
+# a push to the real collector proves the two strings agree. Test-only -- the
+# node does not link the collector's server, its database or its HTTP stack.
+deis-telemetry = { path = "../deis-telemetry" }
 hyper = "1.7"
 tower = "0.5"
 tempfile = "3"

@@ -102,6 +102,35 @@ impl MessageHandler {
                 state.as_str()
             );
         }
+        // A node now keeps the name it announces, so a second stream from the
+        // same node lands on the same id as the first. That is the moment to
+        // let the older one go: the node has just proved, by opening a fresh
+        // channel and registering on it, that it is no longer using the old
+        // one - a machine that rebooted, or one whose connection was cut
+        // somewhere that never told this side. Left in place the two would
+        // both answer to the same node id and `SessionManager::get_node`
+        // would hand commands to whichever it happened to find first, which
+        // could be the channel to nowhere.
+        //
+        // Only the entry is dropped here. The older stream's own task still
+        // owns its cleanup and removes nothing but its own session id, so
+        // this cannot race it into deleting the new session.
+        if let Some(previous) = self.sessions.get_node(&request.id)
+            && previous.id != session.id
+        {
+            let _ = previous.apply(NodeEvent::Disconnected).await;
+            self.sessions.remove(&previous.id);
+            tracing::warn!(
+                node_id = %request.id,
+                superseded_instance = %previous.instance_id,
+                instance_id = %session.instance_id,
+                "Node {} registered again while an earlier channel of its own was still open; \
+                 the earlier one is dropped, because a command sent down it would have gone \
+                 nowhere",
+                request.id
+            );
+        }
+
         self.sessions.add(Arc::clone(session));
 
         tracing::info!(
@@ -145,7 +174,14 @@ impl MessageHandler {
         session: &Arc<NodeSession>,
     ) -> HeartbeatAck {
         let now = Utc::now();
-        *session.last_heartbeat.lock().await = now;
+        // Read and replaced under one lock, because the gap since the last
+        // beat is what says whether this node had already been given up on.
+        let silence = {
+            let mut last = session.last_heartbeat.lock().await;
+            let silence = now - *last;
+            *last = now;
+            silence
+        };
         // The heartbeat is still acknowledged when the session has no row for
         // it: the wire has no way to answer "register first", and a node that
         // was refused would only retry. What it does not do any more is
@@ -153,15 +189,50 @@ impl MessageHandler {
         // already closed, to `Active` - which is how such a node used to end
         // up counted among the live ones by `crate::metrics` and shown as
         // active by `/api/sessions`.
-        if let Err(state) = session.apply(NodeEvent::Heartbeat).await {
-            tracing::warn!(
+        match session.apply(NodeEvent::Heartbeat).await {
+            Ok(state) => {
+                // A node the sweep had given up on is back. Worth a line of
+                // its own, and worth the number: it closes the incident the
+                // warning from `crate::reaper` opened, and the gap is how
+                // long the node was actually gone.
+                if silence >= chrono::Duration::seconds(self.config.heartbeat_timeout as i64) {
+                    tracing::info!(
+                        node_id = %session.node_id,
+                        instance_id = %session.instance_id,
+                        silent_secs = silence.num_seconds(),
+                        heartbeat_timeout_secs = self.config.heartbeat_timeout,
+                        "Node {} is answering again after {}s of silence, past the {}s \
+                         heartbeat_timeout, and counts as live once more",
+                        session.node_id,
+                        silence.num_seconds(),
+                        self.config.heartbeat_timeout
+                    );
+                }
+
+                // The persisted state used to be written once, at
+                // registration, and never again - so `nodes.state` read
+                // `Registered` for the whole life of a node that had been
+                // serving for weeks. It is one indexed update beside the two
+                // that `save_heartbeat` already does.
+                if let Some(db) = &self.database
+                    && let Err(e) = db.update_node_state(&session.node_id, state).await
+                {
+                    tracing::warn!(
+                        node_id = %session.node_id,
+                        error = %e,
+                        "Could not record that a node is live; the open session is right and the \
+                         nodes table is behind"
+                    );
+                }
+            }
+            Err(state) => tracing::warn!(
                 node_id = %session.node_id,
                 instance_id = %session.instance_id,
                 state = state.as_str(),
                 "Heartbeat from a node whose session is {}; acknowledged, but it is not counted \
                  as active until it registers on a live session",
                 state.as_str()
-            );
+            ),
         }
 
         // Save heartbeat to database if available
@@ -219,10 +290,24 @@ impl MessageHandler {
     pub async fn handle_disconnect(&self, session: &Arc<NodeSession>, reason: &str) {
         // Already disconnected is not worth a line: cleanup can run twice for
         // one stream and the second run has nothing left to say.
-        let _ = session.apply(NodeEvent::Disconnected).await;
+        let ended = session.apply(NodeEvent::Disconnected).await;
 
         // Save disconnection event to database
         if let Some(db) = &self.database {
+            // Only on the run that actually ended the session. Writing on the
+            // second run would take a node that has already reconnected on a
+            // new stream and mark its row disconnected again.
+            if let Ok(state) = ended
+                && let Err(e) = db.update_node_state(&session.node_id, state).await
+            {
+                tracing::warn!(
+                    node_id = %session.node_id,
+                    error = %e,
+                    "Could not record that a node disconnected; the nodes table still reads as \
+                     though its channel were open"
+                );
+            }
+
             let event = Event {
                 event_type: "NodeDisconnected".to_string(),
                 node_id: Some(session.node_id.clone()),
@@ -285,5 +370,101 @@ mod tests {
             .expect("the disconnection must be recorded");
         assert_eq!(event.node_id.as_deref(), Some("test-node"));
         assert!(event.message.contains("Test disconnect"));
+    }
+
+    /// Two channels, one node. A node keeps the name it announces, so a
+    /// reconnect while the old stream is still half-open - a machine that
+    /// rebooted, a connection cut somewhere that never told this side - now
+    /// lands on the same node id as the channel it is replacing.
+    /// `SessionManager::get_node` answers with whichever it finds first, so
+    /// leaving both in place would have meant commands going down the dead
+    /// one at random.
+    #[tokio::test]
+    async fn registering_again_drops_the_node_s_earlier_channel() {
+        let config = Arc::new(ControlConfig::default());
+        let sessions = Arc::new(SessionManager::new());
+        let handler = MessageHandler::new(Arc::clone(&config), Arc::clone(&sessions));
+
+        let info = || NodeInfo {
+            node_role: NodeRole::Proxy("1.0.0".to_string()),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: vec![8080],
+        };
+        let request = || RegisterRequest {
+            id: "node-alpha".to_string(),
+            info: info(),
+        };
+
+        let first = Arc::new(NodeSession::new("node-alpha".to_string(), info()));
+        handler.handle_register(request(), &first).await;
+
+        let second = Arc::new(NodeSession::new("node-alpha".to_string(), info()));
+        handler.handle_register(request(), &second).await;
+
+        assert_eq!(sessions.count(), 1, "one node, one live channel");
+        assert_eq!(
+            sessions.get_node("node-alpha").map(|s| s.id.clone()),
+            Some(second.id.clone()),
+            "the channel that is open now is the one commands go down"
+        );
+        assert_eq!(
+            first.get_state().await,
+            NodeState::Disconnected,
+            "the superseded channel is finished, so nothing arriving on it counts"
+        );
+    }
+
+    /// The persisted row used to be written once, at registration, and never
+    /// again - so a node that had been serving for weeks still read
+    /// `Registered` in the database.
+    #[tokio::test]
+    async fn a_heartbeat_brings_the_node_row_up_to_date() {
+        let config = Arc::new(ControlConfig::default());
+        let sessions = Arc::new(SessionManager::new());
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let handler =
+            MessageHandler::new(config, Arc::clone(&sessions)).with_database(Arc::clone(&database));
+
+        let session = Arc::new(NodeSession::new(
+            "node-alpha".to_string(),
+            NodeInfo {
+                node_role: NodeRole::Proxy("1.0.0".to_string()),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: vec![8080],
+            },
+        ));
+        handler
+            .handle_register(
+                RegisterRequest {
+                    id: "node-alpha".to_string(),
+                    info: NodeInfo {
+                        node_role: NodeRole::Proxy("1.0.0".to_string()),
+                        listen_host: "127.0.0.1".to_string(),
+                        listen_port: vec![8080],
+                    },
+                },
+                &session,
+            )
+            .await;
+        handler
+            .handle_heartbeat(
+                crate::message::HeartbeatRequest {
+                    id: "node-alpha".to_string(),
+                },
+                &session,
+            )
+            .await;
+
+        let state: String = database
+            .with_connection(|conn| {
+                Ok::<_, crate::database::DatabaseError>(conn.query_row(
+                    "SELECT state FROM nodes WHERE id = 'node-alpha'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, NodeState::Active.as_str());
     }
 }

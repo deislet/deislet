@@ -6,7 +6,17 @@ bind_addr = "0.0.0.0"
 # HTTP API and gRPC port
 port = 8080
 
-# Heartbeat configuration (seconds)
+# Heartbeat configuration (seconds).
+#
+# heartbeat_interval is how often a node is asked to beat. heartbeat_timeout
+# is how long it may then be silent before this control plane stops reporting
+# it as live: its session becomes Unresponsive, which is what tells an
+# operator apart a node that hung up from one that is still connected and has
+# stopped answering - a frozen host, a partition, a power cut.
+#
+# Keep the timeout at two or three intervals. A healthy node is silent for one
+# whole interval between beats, so a timeout at or below the interval marks
+# every node unresponsive between its own heartbeats.
 heartbeat_interval = 30
 heartbeat_timeout = 90
 

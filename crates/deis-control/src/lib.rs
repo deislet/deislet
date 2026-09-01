@@ -14,6 +14,7 @@ pub mod handler;
 pub mod identity;
 pub mod message;
 pub mod metrics;
+pub mod reaper;
 pub mod runtime_client;
 pub mod scheduler;
 pub mod server;
@@ -31,7 +32,7 @@ pub use config::{ControlConfig, RuntimeNodeConfig, TlsConfig};
 pub use config_manager::{ConfigManager, ConfigStats, PushError};
 pub use database::{
     CommandEntry, CommandStatus, ConfigEntry, Database, DatabaseError, Event, EventSeverity,
-    HeartbeatEntry,
+    HeartbeatEntry, Withdrawn,
 };
 pub use delivery::{
     DeliveryReason, DeliveryReport, DeploymentDeliverer, DeploymentPayload, PublicAddress,
@@ -46,6 +47,7 @@ pub use message::{
     Message, MessageType, NodeInfo, NodeRole, RegisterRequest, RegisterResponse,
 };
 pub use metrics::{MetricsCollector, MetricsSummary, NodesMetrics, SystemMetrics};
+pub use reaper::Reaper;
 pub use runtime_client::RuntimeNodeManager;
 pub use scheduler::{CronKey, CronScheduler, CronTask};
 pub use server::ControlServer;

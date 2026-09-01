@@ -320,23 +320,70 @@ async fn op_kv_list(
 #[derive(Debug, Clone)]
 pub struct AppId(pub String);
 
+/// The invocation this isolate is running right now, as the id everything it
+/// writes is stamped with.
+///
+/// The same reason [`AppId`] exists, one dimension further in. `app_id`
+/// narrows a query to a tenant; this narrows it to the *one* request, queue
+/// batch or cron tick a line came from, which is the difference between
+/// reading an application's log and reading what happened to somebody's
+/// request. deis-telemetry stores it in its own column on both the log entry
+/// and the invocation record, so `deis trace` gives an id and `deis logs
+/// --trace-id` gives that invocation's lines.
+///
+/// Shared with the isolate, and mutable, for the same reason
+/// [`super::service_call::CallPath`] is: what it holds belongs to whichever
+/// invocation is running, and every invocation on this isolate runs through
+/// the same `OpState`. `AppRuntime::begin_invocation` sets it and
+/// `end_invocation` clears it, so an op that reads it between invocations
+/// reads an empty string rather than the previous request's id -- attributing
+/// a line to the wrong invocation is worse than attributing it to none.
+pub type CurrentTrace = Rc<RefCell<String>>;
+
+/// Read the invocation id an op should stamp what it writes with, or the empty
+/// string when nothing is running.
+///
+/// Empty is the wire's own spelling of "no invocation": the proto field is a
+/// string and deis-telemetry stores an absent trace as `""`, so there is no
+/// second way to say it here either.
+pub fn current_trace_id(state: &OpState) -> String {
+    state
+        .try_borrow::<CurrentTrace>()
+        .map(|trace| trace.borrow().clone())
+        .unwrap_or_default()
+}
+
+/// Mint an id for one invocation.
+///
+/// A v4 UUID without its dashes: 32 hex characters that survive being pasted
+/// into `deis logs --trace-id` unquoted, and that no two nodes can collide on
+/// without anything coordinating them -- there is no allocator here to ask,
+/// and a node that had to ask one could not trace an invocation while the
+/// control plane was unreachable.
+pub fn new_trace_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 /// Log operation: the sink behind an application's `console.*` calls.
 ///
 /// An isolate built without an [`AppId`] in its state logs with an empty
 /// application id, which the log layer treats as "no application" -- the line
-/// still reaches deis-telemetry, it is just not attributable to a tenant.
+/// still reaches deis-telemetry, it is just not attributable to a tenant. The
+/// invocation id is treated the same way and for the same reason; see
+/// [`CurrentTrace`].
 #[op2(fast)]
 fn op_log(state: &mut OpState, #[string] level: String, #[string] message: String) {
     let app_id = state
         .try_borrow::<AppId>()
         .map(|app| app.0.clone())
         .unwrap_or_default();
+    let trace_id = current_trace_id(state);
 
     match level.as_str() {
-        "info" => tracing::info!(target: "app", app_id, "{}", message),
-        "warn" => tracing::warn!(target: "app", app_id, "{}", message),
-        "error" => tracing::error!(target: "app", app_id, "{}", message),
-        _ => tracing::debug!(target: "app", app_id, "{}", message),
+        "info" => tracing::info!(target: "app", app_id, trace_id, "{}", message),
+        "warn" => tracing::warn!(target: "app", app_id, trace_id, "{}", message),
+        "error" => tracing::error!(target: "app", app_id, trace_id, "{}", message),
+        _ => tracing::debug!(target: "app", app_id, trace_id, "{}", message),
     }
 }
 

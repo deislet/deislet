@@ -410,6 +410,15 @@ enum Commands {
         action: BlobAction,
     },
 
+    /// Look at what an environment's queues gave up on, and put it back.
+    ///
+    /// Producing and consuming messages is the application's job; this is
+    /// the half of a queue only a person can do.
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
+    },
+
     /// Show or change where the platform is and which credential to use.
     Config {
         #[command(subcommand)]
@@ -853,6 +862,66 @@ enum BlobAction {
         /// only a key that does not exist.
         #[arg(long, value_name = "ETAG", conflicts_with = "if_match")]
         if_none_match: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueAction {
+    /// List the messages a queue gave up on: what is stuck, and why.
+    ///
+    /// One page unless --all is given. Every queue of the environment unless
+    /// --queue names one, because the question this answers is usually "what
+    /// is stuck?" rather than "what is stuck in this one queue".
+    DeadLetters {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Only this queue. Omitted reads every queue of the environment.
+        #[arg(long, value_name = "NAME")]
+        queue: Option<String>,
+
+        /// Show at most this many. deis-queue caps it, and also stops a page
+        /// early when the bodies would be too large to send.
+        #[arg(long)]
+        limit: Option<i32>,
+
+        /// Resume from a previous page's cursor.
+        #[arg(long)]
+        cursor: Option<String>,
+
+        /// Walk every page instead of stopping after one.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Put named dead letters back on their queue, with their attempts reset.
+    ///
+    /// For after the cause has been fixed: a replayed message is delivered
+    /// again as many times as a new one, so replaying before the fix simply
+    /// spends the attempts again. There is no --all and there will not be
+    /// one - deis-queue refuses a replay that names no message, because
+    /// putting a whole queue of poison messages back cannot be undone.
+    Replay {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Which queue the messages belong to.
+        #[arg(long, value_name = "NAME")]
+        queue: String,
+
+        /// Ids from `deis queue dead-letters`. At least one.
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<String>,
+
+        /// Hold them back this many seconds before a consumer may have them.
+        #[arg(long, value_name = "SECONDS")]
+        delay: Option<i32>,
     },
 }
 
@@ -1462,6 +1531,49 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
 
+        Commands::Queue { action } => match action {
+            QueueAction::DeadLetters {
+                target,
+                format,
+                queue,
+                limit,
+                cursor,
+                all,
+            } => {
+                commands::queue::dead_letters(
+                    commands::queue::DeadLettersArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        queue,
+                        limit,
+                        cursor,
+                        all,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+            QueueAction::Replay {
+                target,
+                format,
+                queue,
+                ids,
+                delay,
+            } => {
+                commands::queue::replay(
+                    commands::queue::ReplayArgs {
+                        app: target.app,
+                        environment: target.environment,
+                        queue,
+                        ids,
+                        delay,
+                    },
+                    format.into(),
+                )
+                .await
+            }
+        },
+
         Commands::Config { action } => match action {
             ConfigAction::Set { key, value, format } => {
                 commands::config::set(&key, &value, format.into())
@@ -1504,6 +1616,7 @@ mod tests {
                 "select 1",
             ],
             vec!["deis", "blob", "get", "-e", "preview", "mykey"],
+            vec!["deis", "queue", "dead-letters", "-e", "preview"],
         ] {
             Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
@@ -1552,6 +1665,8 @@ mod tests {
             vec!["deis", "kv", "list", "--json"],
             vec!["deis", "db", "query", "select 1", "--json"],
             vec!["deis", "blob", "get", "mykey", "--json"],
+            vec!["deis", "queue", "dead-letters", "--json"],
+            vec!["deis", "queue", "replay", "--queue", "jobs", "m1", "--json"],
         ] {
             Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
@@ -1590,6 +1705,11 @@ mod tests {
             vec!["deis", "db", "query", "select 1", "-y"],
             vec!["deis", "blob", "get", "mykey", "-y"],
             vec!["deis", "blob", "put", "mykey", "-y"],
+            // A replay deletes nothing and overwrites nothing: it moves
+            // named messages back onto their queue, and naming them is the
+            // deliberate act. What guards it is that there is no way to name
+            // them all at once.
+            vec!["deis", "queue", "replay", "--queue", "jobs", "m1", "-y"],
         ] {
             assert!(
                 Cli::try_parse_from(&argv).is_err(),
@@ -1623,6 +1743,57 @@ mod tests {
                 "{argv:?} must parse: deis-store answers this and nothing else offers it"
             );
         }
+    }
+
+    /// The two calls deis-queue answers for an operator have to be reachable
+    /// from the command line, or the dead letter table is somewhere work goes
+    /// to disappear: the platform stops retrying, says so in one log line,
+    /// and nothing afterwards can show what is in there or put it back.
+    ///
+    /// `ListDeadLetters` and `ReplayDeadLetters` were implemented, registered
+    /// and tested with no caller anywhere - this is the parse-level half of
+    /// giving them one, and `scripts/demo.sh` runs both against a live queue.
+    #[test]
+    fn queue_offers_both_calls_deis_queue_answers_for_an_operator() {
+        for argv in [
+            vec!["deis", "queue", "dead-letters"],
+            vec!["deis", "queue", "dead-letters", "--queue", "jobs"],
+            vec![
+                "deis",
+                "queue",
+                "dead-letters",
+                "--limit",
+                "10",
+                "--cursor",
+                "1700000000:m1",
+                "--all",
+            ],
+            vec!["deis", "queue", "replay", "--queue", "jobs", "m1"],
+            vec![
+                "deis", "queue", "replay", "--queue", "jobs", "m1", "m2", "--delay", "30",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "{argv:?} must parse: deis-queue answers this and nothing else offers it"
+            );
+        }
+    }
+
+    /// A replay names the messages it means, one by one, all the way down to
+    /// deis-queue - which refuses one that names none. Putting a whole queue
+    /// of poison messages back cannot be undone, and each of them comes back
+    /// with a fresh set of delivery attempts to spend.
+    #[test]
+    fn a_replay_that_names_no_message_is_refused_at_the_command_line() {
+        assert!(
+            Cli::try_parse_from(["deis", "queue", "replay", "--queue", "jobs"]).is_err(),
+            "a replay must name at least one message id"
+        );
+        assert!(
+            Cli::try_parse_from(["deis", "queue", "replay", "--queue", "jobs", "--all"]).is_err(),
+            "there is no --all, and adding one would be a way to replay poison by accident"
+        );
     }
 
     /// The two conditions are mutually exclusive: a write cannot require both

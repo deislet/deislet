@@ -58,6 +58,24 @@ const DEFAULT_DEAD_LETTER_PAGE: i32 = 50;
 /// Hard ceiling on one dead letter page, whatever the caller asks for.
 const MAX_DEAD_LETTER_PAGE: i32 = 500;
 
+/// A message given up on because the consumer said it could not handle it.
+///
+/// Stored on the row and not only logged, because it is the first thing an
+/// operator reading the dead letter table has to know and the log line it was
+/// written to has usually rotated away by then. This and
+/// [`DIED_LEASE_LAPSED`] are the only two ways a message reaches that table,
+/// and they call for different fixes: this one means the handler ran and
+/// refused the body, so the body is what to look at.
+const DIED_CONSUMER_FAILED: &str = "the consumer reported it failed";
+
+/// A message given up on because nobody ever answered for it.
+///
+/// The other reason, and the one attempts alone cannot be told apart from:
+/// each delivery lapsed without an `Ack` or a `Nack` - a handler slower than
+/// its lease, or a node that died holding the message - so the body may be
+/// perfectly good and the lease or the handler is what to look at.
+const DIED_LEASE_LAPSED: &str = "its lease lapsed";
+
 /// Ceiling on the bodies one `PullResponse` may carry.
 ///
 /// Half the gRPC message ceiling, leaving the other half for framing and for
@@ -154,6 +172,10 @@ pub struct DeadLetter {
     pub attempts: i32,
     pub created_at: i64,
     pub died_at: i64,
+    /// Which of the two ways it ran out of attempts: [`DIED_CONSUMER_FAILED`]
+    /// or [`DIED_LEASE_LAPSED`]. Empty for a row written before the column
+    /// existed, which a reader shows as unknown rather than guessing.
+    pub reason: String,
 }
 
 /// What one `Nack` did.
@@ -259,12 +281,16 @@ impl QueueService {
                      attempts   INTEGER NOT NULL,
                      created_at INTEGER NOT NULL,
                      died_at    INTEGER NOT NULL,
+                     -- Why it was given up on; empty on a row written before
+                     -- the queue recorded it.
+                     reason     TEXT    NOT NULL DEFAULT '',
                      PRIMARY KEY (tenant, queue, id)
                  );
                  CREATE INDEX IF NOT EXISTS dead_letter_died_at
                      ON dead_letter(died_at);",
             )?;
             add_lease_token_column(conn)?;
+            add_dead_letter_reason_column(conn)?;
             Ok(())
         })
         .await?;
@@ -465,7 +491,7 @@ impl QueueService {
             .await?;
 
         for (id, attempts) in &retired {
-            warn_dead_lettered(tenant, &queue, id, *attempts, ceiling, "its lease lapsed");
+            warn_dead_lettered(tenant, &queue, id, *attempts, ceiling, DIED_LEASE_LAPSED);
         }
         if leased.is_empty() {
             tracing::trace!(tenant = %tenant, queue = %queue, "pull found nothing ready");
@@ -629,7 +655,14 @@ impl QueueService {
                     }
 
                     if attempts >= ceiling {
-                        move_to_dead_letter(tx, &tenant_id, &table_queue, &handle.id, now)?;
+                        move_to_dead_letter(
+                            tx,
+                            &tenant_id,
+                            &table_queue,
+                            &handle.id,
+                            now,
+                            DIED_CONSUMER_FAILED,
+                        )?;
                         dead.push((handle.id.clone(), attempts));
                     } else {
                         // The token goes back to empty along with the
@@ -648,14 +681,7 @@ impl QueueService {
             .await?;
 
         for (id, attempts) in &dead {
-            warn_dead_lettered(
-                tenant,
-                &queue,
-                id,
-                *attempts,
-                ceiling,
-                "the consumer reported it failed",
-            );
+            warn_dead_lettered(tenant, &queue, id, *attempts, ceiling, DIED_CONSUMER_FAILED);
         }
         for id in &stale {
             warn_stale_lease(tenant, &queue, id, "return");
@@ -729,7 +755,7 @@ impl QueueService {
                 // repeats or skips a row when several died in the same
                 // second.
                 let mut stmt = conn.prepare(
-                    "SELECT queue, id, body, attempts, created_at, died_at
+                    "SELECT queue, id, body, attempts, created_at, died_at, reason
                        FROM dead_letter
                       WHERE tenant = ?1
                         AND (?3 IS NULL OR queue = ?3)
@@ -771,6 +797,7 @@ impl QueueService {
                         attempts: row.get(3)?,
                         created_at: row.get(4)?,
                         died_at: row.get(5)?,
+                        reason: row.get(6)?,
                     });
                 }
                 Ok((page, stopped_at_budget))
@@ -1124,6 +1151,35 @@ fn add_lease_token_column(conn: &rusqlite::Connection) -> QueueResult<()> {
     Ok(())
 }
 
+/// Add the `reason` column to a `dead_letter` table written before it
+/// existed.
+///
+/// Same shape as [`add_lease_token_column`] and for the same reason: the rows
+/// are fine, they simply predate the column, and `CREATE TABLE IF NOT EXISTS`
+/// does nothing at all to a table that is already there. Existing rows keep
+/// the empty string, which is the one value a reader renders as "unknown" -
+/// inventing a reason for a message this service never recorded one for would
+/// point an operator at the wrong half of the system.
+fn add_dead_letter_reason_column(conn: &rusqlite::Connection) -> QueueResult<()> {
+    let mut present = false;
+    conn.pragma(None, "table_info", "dead_letter", |row| {
+        let column: String = row.get(1)?;
+        if column == "reason" {
+            present = true;
+        }
+        Ok(())
+    })?;
+    if present {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE dead_letter ADD COLUMN reason TEXT NOT NULL DEFAULT ''")?;
+    tracing::info!(
+        "added the reason column to an existing queue database; dead letters already in it are \
+         listed with no reason, because this service never recorded one for them"
+    );
+    Ok(())
+}
+
 /// Move every ready message that has already used its attempts into the dead
 /// letter table. Returns the ids and attempt counts, for the caller to log.
 fn retire_exhausted(
@@ -1146,29 +1202,36 @@ fn retire_exhausted(
     drop(select);
 
     for (id, _) in &exhausted {
-        move_to_dead_letter(tx, tenant, queue, id, now)?;
+        move_to_dead_letter(tx, tenant, queue, id, now, DIED_LEASE_LAPSED)?;
     }
     Ok(exhausted)
 }
 
 /// Copy one message into the dead letter table and remove it from the queue.
 /// The caller is inside the transaction, so both halves land together.
+///
+/// `reason` is one of the two constants at the top of this module and is
+/// written on the row rather than only into the log: the log line an operator
+/// would otherwise have to find has usually gone by the time anybody reads
+/// the table.
 fn move_to_dead_letter(
     tx: &Transaction<'_>,
     tenant: &str,
     queue: &str,
     id: &str,
     now: i64,
+    reason: &str,
 ) -> QueueResult<()> {
     tx.execute(
-        "INSERT INTO dead_letter (tenant, queue, id, body, attempts, created_at, died_at)
-              SELECT tenant, queue, id, body, attempts, created_at, ?4
+        "INSERT INTO dead_letter (tenant, queue, id, body, attempts, created_at, died_at, reason)
+              SELECT tenant, queue, id, body, attempts, created_at, ?4, ?5
                 FROM messages
                WHERE tenant = ?1 AND queue = ?2 AND id = ?3
          ON CONFLICT(tenant, queue, id) DO UPDATE SET
               attempts = excluded.attempts,
-              died_at  = excluded.died_at",
-        rusqlite::params![tenant, queue, id, now],
+              died_at  = excluded.died_at,
+              reason   = excluded.reason",
+        rusqlite::params![tenant, queue, id, now, reason],
     )?;
     tx.execute(
         "DELETE FROM messages WHERE tenant = ?1 AND queue = ?2 AND id = ?3",
@@ -1412,6 +1475,11 @@ impl From<DeadLetter> for DeadLetterMessage {
             attempts: dead.attempts,
             created_at: dead.created_at,
             died_at: dead.died_at,
+            // Which of the two ways it died. A caller that shows an operator
+            // the table has to be able to say this: "the handler refused it"
+            // and "nobody ever answered" are the same row otherwise, and the
+            // fix for one is not the fix for the other.
+            reason: dead.reason,
         }
     }
 }
@@ -1665,6 +1733,10 @@ mod tests {
         assert_eq!(dead[0].body, b"poison");
         assert_eq!(dead[0].created_at, T0);
         assert_eq!(dead[0].died_at, T0);
+        // Which of the two ways it died, kept on the row. The handler ran and
+        // refused this body every time, so what an operator reads next is the
+        // body - not the lease, which was never the problem here.
+        assert_eq!(dead[0].reason, DIED_CONSUMER_FAILED);
     }
 
     /// The consumer never reports anything - it crashes every time. The
@@ -1700,6 +1772,12 @@ mod tests {
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].id, id);
         assert_eq!(dead[0].attempts, 2);
+        // The other reason, and the whole point of recording it: nobody ever
+        // answered for this message. Attempts alone read identically to the
+        // test above, where the handler did answer and refused the body, and
+        // the two send an operator to opposite halves of the system.
+        assert_eq!(dead[0].reason, DIED_LEASE_LAPSED);
+        assert_ne!(dead[0].reason, DIED_CONSUMER_FAILED);
     }
 
     /// The failure the lease token exists for.
@@ -2219,6 +2297,58 @@ mod tests {
             AckOutcome {
                 acknowledged: 1,
                 stale_leases: 0
+            }
+        );
+    }
+
+    /// The same for the dead letter table. A queue.sqlite written before the
+    /// reason was recorded holds messages an operator still has to be able to
+    /// list and replay, so the column is added and the rows already there are
+    /// listed with no reason rather than with an invented one.
+    #[tokio::test]
+    async fn dead_letters_from_before_the_reason_existed_are_still_readable() {
+        let dir = TempDir::new().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dead_letter (
+                 tenant     TEXT    NOT NULL,
+                 queue      TEXT    NOT NULL,
+                 id         TEXT    NOT NULL,
+                 body       BLOB    NOT NULL,
+                 attempts   INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 died_at    INTEGER NOT NULL,
+                 PRIMARY KEY (tenant, queue, id)
+             );
+             INSERT INTO dead_letter (tenant, queue, id, body, attempts, created_at, died_at)
+                  VALUES ('app-one.production', 'jobs', 'old', CAST('poison' AS BLOB), 5, 1, 2);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let clock = Clock::fixed(T0);
+        let service = QueueService::open_with_clock(dir.path(), 4, QueueLimits::default(), clock)
+            .await
+            .expect("an existing queue must open, not be refused");
+        let a = tenant("app-one.production");
+
+        let dead = service.dead_letters(&a, "jobs").await.unwrap();
+        assert_eq!(dead.len(), 1, "the message must still be listed");
+        assert_eq!(dead[0].id, "old");
+        assert_eq!(dead[0].attempts, 5);
+        assert_eq!(
+            dead[0].reason, "",
+            "no reason was ever recorded for this row, and none may be invented for it"
+        );
+        // And it can still be put back, which is the whole point of listing it.
+        assert_eq!(
+            service
+                .replay_dead_letters(&a, "jobs", vec!["old".to_string()], None)
+                .await
+                .unwrap(),
+            ReplayOutcome {
+                replayed: 1,
+                not_found: 0
             }
         );
     }

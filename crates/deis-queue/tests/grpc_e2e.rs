@@ -453,6 +453,14 @@ async fn a_message_that_keeps_failing_is_dead_lettered_and_never_seen_again() {
     assert_eq!(dead.messages[0].queue_name, "jobs");
     assert_eq!(dead.messages[0].body, b"poison");
     assert_eq!(dead.messages[0].attempts, MAX_ATTEMPTS);
+    // And it says which of the two ways the message died. Over the wire,
+    // because this is the field the operator's view is built on: a caller
+    // that can see the attempts but not the reason cannot tell a handler that
+    // refuses this body from a consumer that never answered at all.
+    assert_eq!(
+        dead.messages[0].reason, "the consumer reported it failed",
+        "every attempt here was handed back by the consumer"
+    );
     assert!(dead.next_cursor.is_empty(), "one page held everything");
 }
 

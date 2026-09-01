@@ -21,6 +21,17 @@
 //! ordinary structured field. Shipping the joined string instead would make
 //! a query for `demo` return nothing at all, which reads exactly like an app
 //! that never logged.
+//!
+//! # Which invocation a line belongs to
+//!
+//! `trace_id` is lifted the same way and for the same kind of reason. It is
+//! the id of the one request, queue batch or cron tick that wrote the line
+//! (see [`crate::runtime::ops::CurrentTrace`]), deis-telemetry keeps it in a
+//! column beside `app_id`, and the whole of what it buys is the join: `deis
+//! trace` names an invocation and `deis logs --trace-id` answers with the
+//! lines that invocation wrote, out of everything the application logged that
+//! minute. Left in the generic field map the value would still arrive and the
+//! query would still find nothing.
 
 use super::buffer::LogBuffer;
 use super::types::{LogEntry, LogLevel};
@@ -44,6 +55,20 @@ const APP_ID_FIELD: &str = "app_id";
 /// whose `app_id` is a tenant. Named to match the control plane's REST field
 /// and the `x-deis-environment` header, so one word means one thing.
 const ENVIRONMENT_FIELD: &str = "environment";
+
+/// Event field naming the invocation an entry came from, lifted out of the
+/// field map into [`LogEntry::trace_id`].
+///
+/// A column of its own in deis-telemetry, next to `app_id`, and the only one
+/// that can answer "what else did *this* request write". Left in the generic
+/// field map it would still be shipped, but `deis logs --trace-id` filters on
+/// the column and would match nothing, which reads exactly like an invocation
+/// that logged nothing at all.
+///
+/// An empty value is absent, the same way an empty `app_id` is: the wire type
+/// spells "no invocation" as the empty string, and every line a node writes
+/// about itself rather than about an invocation carries one.
+const TRACE_ID_FIELD: &str = "trace_id";
 
 /// Event field holding the human-readable text, which every `tracing` macro
 /// records under this name.
@@ -83,6 +108,7 @@ where
             Some(app_id) => Some(split_tenant_field(&app_id, &mut entry.fields)),
             None => None,
         };
+        entry.trace_id = visitor.trace_id.filter(|id| !id.is_empty());
 
         self.buffer.push(entry);
     }
@@ -106,12 +132,13 @@ fn split_tenant_field(app_id: &str, fields: &mut HashMap<String, String>) -> Str
     }
 }
 
-/// Splits an event's fields into the three places they belong: the message, the
-/// application id, and everything else.
+/// Splits an event's fields into the four places they belong: the message, the
+/// application id, the invocation id, and everything else.
 #[derive(Default)]
 struct EntryVisitor {
     message: Option<String>,
     app_id: Option<String>,
+    trace_id: Option<String>,
     fields: HashMap<String, String>,
 }
 
@@ -121,6 +148,7 @@ impl EntryVisitor {
         match name {
             MESSAGE_FIELD => self.message = Some(value),
             APP_ID_FIELD => self.app_id = Some(value),
+            TRACE_ID_FIELD => self.trace_id = Some(value),
             _ => {
                 self.fields.insert(name.to_string(), value);
             }

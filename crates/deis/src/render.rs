@@ -51,6 +51,12 @@ impl Output {
 /// exactly the wrong next line would make the call happen. `skip_confirmation`
 /// is `-y`/`--yes`, which is what a script should pass instead once it has
 /// decided on its own that the call is correct.
+///
+/// `action` is a verb phrase this appends "on `<tenant>`" to - "delete kv key
+/// \"x\"", or "run `DELETE ...` against the database" - so it must not end in
+/// a preposition of its own. See [`destructive_subject`], which is where both
+/// halves of the confirmation are composed and the one place that spelling
+/// lives.
 pub fn confirm_destructive(
     tenant: &str,
     action: &str,
@@ -62,15 +68,17 @@ pub fn confirm_destructive(
         return Ok(());
     }
 
+    let subject = destructive_subject(action, tenant);
+
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         anyhow::bail!(
-            "{action} on {tenant} is destructive and this is not a terminal to confirm it on. \
-             Pass -y/--yes once you are sure - that is what a script or a CI job should do."
+            "{subject} is destructive and this is not a terminal to confirm it on. Pass -y/--yes \
+             once you are sure - that is what a script or a CI job should do."
         );
     }
 
     eprintln!();
-    eprintln!("{}", format!("About to {action} on {tenant}.").red().bold());
+    eprintln!("{}", format!("About to {subject}.").red().bold());
     eprintln!("{}", "This cannot be undone.".red());
     eprint!("Type {tenant} to continue: ");
     std::io::stderr().flush().ok();
@@ -84,6 +92,21 @@ pub fn confirm_destructive(
         anyhow::bail!("confirmation did not match {tenant}; nothing was done");
     }
     Ok(())
+}
+
+/// What is about to happen and where: the phrase both halves of a
+/// confirmation are built on.
+///
+/// One place, because there are two of them - the prompt a person reads and
+/// the refusal a script gets - and a caller that writes the preposition into
+/// its own action phrase breaks the sentence in both. That is not
+/// hypothetical: `deis db execute` passed "run `<sql>` against the database
+/// of", and the operator's last words before changing a live database read
+/// "About to run `DELETE ...` against the database of on demo.production."
+///
+/// So `action` ends where "on `<tenant>`" attaches, and nowhere else.
+pub fn destructive_subject(action: &str, tenant: &str) -> String {
+    format!("{action} on {tenant}")
 }
 
 /// How a KV value or a blob object should be shown when a person did not ask
@@ -329,6 +352,19 @@ mod tests {
             .to_string();
         assert!(error.contains("-y/--yes"), "{error}");
         assert!(error.contains("demo.production"), "{error}");
+    }
+
+    #[test]
+    fn the_confirmation_reads_as_one_sentence_in_both_halves() {
+        // Both halves, from the same phrase: the prompt a person reads and
+        // the refusal a script gets. The action ends where "on <tenant>"
+        // attaches, so neither sentence can grow a second preposition.
+        let subject = destructive_subject("delete kv key \"x\"", "demo.production");
+        assert_eq!(subject, "delete kv key \"x\" on demo.production");
+        assert_eq!(
+            format!("About to {subject}."),
+            "About to delete kv key \"x\" on demo.production."
+        );
     }
 
     #[test]

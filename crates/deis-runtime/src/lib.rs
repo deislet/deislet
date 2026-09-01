@@ -61,4 +61,5 @@ pub mod logging;
 pub mod management;
 pub mod resource;
 pub mod runtime;
+pub mod telemetry;
 pub mod trigger;

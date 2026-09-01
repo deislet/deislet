@@ -19,6 +19,7 @@ fn clear_env() {
         ENV_CONTROL_ENDPOINT,
         ENV_CONTROL_TOKEN,
         ENV_TELEMETRY_ENDPOINT,
+        ENV_QUEUE_ENDPOINT,
         ENV_APP,
         ENV_ENVIRONMENT,
         ENV_CONFIG_HOME,
@@ -53,6 +54,9 @@ endpoint = "http://control.example:8085"
 [telemetry]
 endpoint = "http://telemetry.example:8092"
 
+[queue]
+endpoint = "http://queue.example:8091"
+
 [defaults]
 app = "shop"
 environment = "staging"
@@ -68,9 +72,39 @@ environment = "staging"
         settings.telemetry_endpoint().unwrap(),
         "http://telemetry.example:8092"
     );
+    assert_eq!(
+        settings.queue_endpoint().unwrap(),
+        "http://queue.example:8091"
+    );
     assert_eq!(settings.app().unwrap(), "shop");
     assert_eq!(settings.environment(), "staging");
     assert_eq!(settings.app.as_ref().unwrap().source, Source::Project);
+}
+
+/// Only the dead letter commands need it, and a checkout that has never
+/// named deis-queue must be told where to write the address rather than
+/// handed a transport error from a call it could not have made.
+#[test]
+fn a_project_that_never_named_deis_queue_is_told_both_ways_to_name_it() {
+    let _guard = env_lock();
+    clear_env();
+    let dir = tempfile::tempdir().unwrap();
+
+    let error = Settings::load(dir.path(), &Overrides::default())
+        .unwrap()
+        .queue_endpoint()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("[queue]"), "{error}");
+    assert!(error.contains(ENV_QUEUE_ENDPOINT), "{error}");
+
+    set_env(ENV_QUEUE_ENDPOINT, "http://from-env:8091/");
+    let settings = Settings::load(dir.path(), &Overrides::default()).unwrap();
+    assert_eq!(
+        settings.queue_endpoint().unwrap(),
+        "http://from-env:8091",
+        "a trailing slash is trimmed the way the other two addresses are"
+    );
 }
 
 #[test]

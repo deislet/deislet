@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::super::{ResponseBody, ResponseStreams};
+    use crate::runtime::response_stream::StreamOwner;
     use bytes::Bytes;
     use std::future::poll_fn;
     use std::time::{Duration, Instant};
@@ -24,6 +25,18 @@ mod tests {
         Instant::now() + Duration::from_secs(60)
     }
 
+    /// A stand-in for the tenant and invocation a real stream is opened
+    /// under. The tests below are about the queue and the deadlines, not
+    /// about who the body belongs to, but a stream always has an owner --
+    /// that is what makes the end of one findable.
+    fn owner() -> StreamOwner {
+        StreamOwner {
+            tenant: "demo.production".to_string(),
+            trace_id: "trace-under-test".to_string(),
+            target: "http://localhost/stream".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn the_queue_holds_two_chunks_and_then_makes_the_producer_wait() {
         // This is where the memory bound is. A queue that accepted a third
@@ -31,7 +44,7 @@ mod tests {
         // client that never reads would let a producer put the whole body in
         // the node's memory, which is the thing streaming exists to avoid.
         let mut streams = ResponseStreams::default();
-        let (id, mut reader) = streams.open(in_a_minute());
+        let (id, mut reader) = streams.open(in_a_minute(), owner());
         let sink = streams.sinks().pop().unwrap();
 
         sink.send(Bytes::from_static(b"one")).await.unwrap();
@@ -60,7 +73,7 @@ mod tests {
         // truncated one's transfer fails. That distinction is this pair of
         // assertions.
         let mut finished = ResponseStreams::default();
-        let (id, reader) = finished.open(in_a_minute());
+        let (id, reader) = finished.open(in_a_minute(), owner());
         finished.sinks()[0]
             .send(Bytes::from_static(b"all of it"))
             .await
@@ -71,7 +84,7 @@ mod tests {
         assert_eq!(failure, None, "a stream that finished must not look failed");
 
         let mut broken = ResponseStreams::default();
-        let (id, reader) = broken.open(in_a_minute());
+        let (id, reader) = broken.open(in_a_minute(), owner());
         broken.sinks()[0]
             .send(Bytes::from_static(b"half of "))
             .await
@@ -97,9 +110,10 @@ mod tests {
         // closing all of them because one ran out would be a far worse bug than
         // the one being fixed.
         let mut streams = ResponseStreams::default();
-        let (long, _long_reader) = streams.open(Instant::now() + Duration::from_secs(60));
-        let (short, _short_reader) = streams.open(Instant::now() - Duration::from_millis(1));
-        let (gone, gone_reader) = streams.open(Instant::now() + Duration::from_secs(60));
+        let (long, _long_reader) = streams.open(Instant::now() + Duration::from_secs(60), owner());
+        let (short, _short_reader) =
+            streams.open(Instant::now() - Duration::from_millis(1), owner());
+        let (gone, gone_reader) = streams.open(Instant::now() + Duration::from_secs(60), owner());
 
         assert_eq!(streams.expired(Instant::now()), vec![short]);
         assert!(

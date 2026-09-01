@@ -8,11 +8,27 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
+// `states()` on both machines, which is how the two sweeps below spell their
+// status lists from the tables instead of by hand.
+use yasm::StateMachine;
 
 pub use command_status::{CommandEvent, CommandFSM, CommandStatus};
 
 use crate::message::NodeRole;
-use crate::session::{NodeSession, NodeState};
+use crate::session::{NodeFSM, NodeSession, NodeState};
+
+/// What a process that is no longer running left mid-flight.
+///
+/// Reported by [`Database::withdraw_in_flight_beliefs`] so that startup can
+/// say how much it had to take back, which is also the size of what the
+/// previous instance left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Withdrawn {
+    /// `nodes` rows that still claimed a live channel.
+    pub nodes: usize,
+    /// Commands that were still waiting for an answer.
+    pub commands: usize,
+}
 
 /// Database error types
 #[derive(Error, Debug)]
@@ -234,11 +250,32 @@ impl Database {
         let connected_at = session.connected_at.to_rfc3339();
 
         self.with_connection(move |conn| {
+            // Updated in place, not replaced. A node keeps the id it announces
+            // across reconnects, so every reconnect now lands on the row that
+            // is already there - and `INSERT OR REPLACE` implements that as a
+            // DELETE followed by an INSERT, which would fire the
+            // `ON DELETE CASCADE` on `heartbeats.node_id` and
+            // `commands.node_id` and throw away the node's whole history every
+            // time it came back. `ON CONFLICT ... DO UPDATE` writes the same
+            // columns without the row ever ceasing to exist.
+            //
+            // `connected_at` moves with the new session on purpose: it is when
+            // the channel this row describes was opened, not when the node was
+            // first ever seen.
             conn.execute(
                 r#"
-                INSERT OR REPLACE INTO nodes
+                INSERT INTO nodes
                 (id, instance_id, node_role, version, host, ports, state, connected_at, last_heartbeat, metadata)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(id) DO UPDATE SET
+                    instance_id = excluded.instance_id,
+                    node_role = excluded.node_role,
+                    version = excluded.version,
+                    host = excluded.host,
+                    ports = excluded.ports,
+                    state = excluded.state,
+                    connected_at = excluded.connected_at,
+                    last_heartbeat = excluded.last_heartbeat
                 "#,
                 params![
                     node_id,
@@ -273,6 +310,112 @@ impl Database {
                 params![state_str, node_id],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Take back everything a previous process was still claiming.
+    ///
+    /// This process holds no control channel and is waiting on no command, so
+    /// every `nodes` row that still reads `Connected`, `Registered`, `Active`
+    /// or `Unresponsive`, and every command still short of an ending, belongs
+    /// to an instance that is gone. Left alone they are permanent lies: the
+    /// node rows say nodes are live when nothing is even connected, and the
+    /// commands wait for an answer down a channel that died with the process
+    /// that opened it.
+    ///
+    /// A command is ended as `Timeout` rather than `Failed` because that is
+    /// what actually happened - no answer reached anyone inside the deadline -
+    /// and because whoever was waiting on it was handed a timeout when the
+    /// process died.
+    ///
+    /// Rows are updated, never deleted: `heartbeats` and `commands` cascade
+    /// off `nodes`, and an incident is the worst moment to find that tidying
+    /// up destroyed the history.
+    ///
+    /// Must run before the listener opens, or it would catch a live node.
+    pub async fn withdraw_in_flight_beliefs(&self) -> Result<Withdrawn, DatabaseError> {
+        // Spelled from the two tables rather than by hand, so a state added to
+        // either machine is covered here on the day it is added.
+        let live_states: Vec<String> = NodeFSM::states()
+            .iter()
+            .filter(|state| **state != NodeState::Disconnected)
+            .map(|state| state.as_str().to_string())
+            .collect();
+        let unfinished: Vec<String> = CommandFSM::states()
+            .iter()
+            .filter(|status| !status.is_terminal())
+            .map(|status| status.as_str().to_string())
+            .collect();
+
+        self.with_connection(move |conn| {
+            let node_places = vec!["?"; live_states.len()].join(", ");
+            let nodes = conn.execute(
+                &format!("UPDATE nodes SET state = ?1 WHERE state IN ({node_places})"),
+                rusqlite::params_from_iter(
+                    std::iter::once(NodeState::Disconnected.as_str().to_string())
+                        .chain(live_states),
+                ),
+            )?;
+
+            let command_places = vec!["?"; unfinished.len()].join(", ");
+            let commands = conn.execute(
+                &format!(
+                    "UPDATE commands SET status = ?1, completed_at = ?2, error_message = ?3 \
+                     WHERE status IN ({command_places})"
+                ),
+                rusqlite::params_from_iter(
+                    [
+                        CommandStatus::Timeout.as_str().to_string(),
+                        Utc::now().to_rfc3339(),
+                        "The control plane restarted while this command was in flight, so no \
+                         answer can reach it any more"
+                            .to_string(),
+                    ]
+                    .into_iter()
+                    .chain(unfinished),
+                ),
+            )?;
+
+            Ok(Withdrawn { nodes, commands })
+        })
+        .await
+    }
+
+    /// Every command whose deadline has passed and which has not reached an
+    /// ending yet.
+    ///
+    /// Answers ids rather than doing the update itself, so that each one goes
+    /// through [`Database::record_command_event`] - the one place that
+    /// consults [`CommandFSM`]. A command that reached an ending between this
+    /// query and that write is dropped there, so the first ending still wins.
+    ///
+    /// A row with no `timeout_at` is not selected: nothing recorded a deadline
+    /// for it and nothing here may invent one. Both writers always set it, and
+    /// [`Database::withdraw_in_flight_beliefs`] catches such a row at the next
+    /// restart.
+    pub async fn list_overdue_commands(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, DatabaseError> {
+        let unfinished: Vec<String> = CommandFSM::states()
+            .iter()
+            .filter(|status| !status.is_terminal())
+            .map(|status| status.as_str().to_string())
+            .collect();
+
+        self.with_connection(move |conn| {
+            let places = vec!["?"; unfinished.len()].join(", ");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id FROM commands \
+                 WHERE timeout_at IS NOT NULL AND timeout_at <= ?1 AND status IN ({places})"
+            ))?;
+            let ids = stmt.query_map(
+                rusqlite::params_from_iter(std::iter::once(now.to_rfc3339()).chain(unfinished)),
+                |row| row.get::<_, String>(0),
+            )?;
+            ids.collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::from)
         })
         .await
     }
@@ -498,19 +641,39 @@ impl Database {
         .await
     }
 
-    /// Clean old heartbeat records (keep last N per node)
-    pub async fn cleanup_old_heartbeats(&self, keep_count: usize) -> Result<(), DatabaseError> {
+    /// Keep only the newest `keep_per_node` heartbeats of each node.
+    ///
+    /// This is what the signature always said - "keep last N per node" - and
+    /// not what the query did, which was to keep the newest N rows in the
+    /// whole table regardless of which node they came from.
+    ///
+    /// A heartbeat arrives from every node every `heartbeat_interval`, for
+    /// ever, so this is the fastest-growing table in the database: at the
+    /// default 30s that is 2,880 rows per node per day, a million a year.
+    /// Nothing called this until [`crate::reaper`] did.
+    pub async fn cleanup_old_heartbeats(&self, keep_per_node: usize) -> Result<(), DatabaseError> {
         self.with_connection(move |conn| {
+            // Per node, not across the whole table. The cap used to be global:
+            // `ORDER BY timestamp DESC LIMIT n` over every row, so the rows
+            // that went first were simply the oldest anywhere. A node that had
+            // gone quiet has, by definition, the oldest heartbeats in the
+            // table, so a busy fleet would evict the history of exactly the
+            // node an operator had opened the page to look at - and it would
+            // evict more of it the more nodes there were.
             conn.execute(
                 r#"
                 DELETE FROM heartbeats
-                WHERE id NOT IN (
-                    SELECT id FROM heartbeats
-                    ORDER BY timestamp DESC
-                    LIMIT ?1
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY node_id ORDER BY timestamp DESC, id DESC
+                        ) AS rank
+                        FROM heartbeats
+                    )
+                    WHERE rank > ?1
                 )
                 "#,
-                params![keep_count],
+                params![keep_per_node],
             )?;
             Ok(())
         })
@@ -1409,5 +1572,271 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value_before, None);
+    }
+
+    /// A node keeps the name it announces, so every reconnect now lands on
+    /// the row that is already there. `INSERT OR REPLACE` implemented that as
+    /// a DELETE plus an INSERT, and `heartbeats` and `commands` both cascade
+    /// off `nodes` - so with stable ids it would have thrown away the node's
+    /// whole history every time it came back, which is worse than the
+    /// orphaned rows it replaced.
+    #[tokio::test]
+    async fn a_node_coming_back_keeps_its_history() {
+        let db = Database::init(":memory:").await.unwrap();
+        let node_info = crate::message::NodeInfo {
+            node_role: NodeRole::Proxy("1.0.0".to_string()),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: vec![8080],
+        };
+
+        let first = crate::session::NodeSession::new("node-alpha".to_string(), node_info.clone());
+        db.save_node(&first).await.unwrap();
+        db.save_heartbeat(&HeartbeatEntry {
+            node_id: "node-alpha".to_string(),
+            instance_id: first.instance_id.clone(),
+            timestamp: Utc::now(),
+            latency_ms: None,
+        })
+        .await
+        .unwrap();
+
+        // The same node reconnects: same announced name, new session, so a
+        // new instance id.
+        let second = crate::session::NodeSession::new("node-alpha".to_string(), node_info);
+        assert_ne!(first.instance_id, second.instance_id);
+        db.save_node(&second).await.unwrap();
+
+        let rows: i64 = db
+            .with_connection(|conn| {
+                Ok::<_, DatabaseError>(
+                    conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "one node, one row, however often it reconnects");
+
+        assert_eq!(
+            db.get_recent_heartbeats("node-alpha", 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the reconnect must not have cascaded the heartbeat history away"
+        );
+
+        let instance: String = db
+            .with_connection(|conn| {
+                Ok::<_, DatabaseError>(conn.query_row(
+                    "SELECT instance_id FROM nodes WHERE id = 'node-alpha'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            instance, second.instance_id,
+            "the row describes the channel that is open now"
+        );
+    }
+
+    /// What a process that stopped without finishing leaves behind. Nothing
+    /// is connected at startup and nothing is waiting on a command, so both
+    /// kinds of leftover are claims this process cannot make - and left alone
+    /// they never change again.
+    #[tokio::test]
+    async fn startup_takes_back_what_a_dead_process_was_still_claiming() {
+        let db = Database::init(":memory:").await.unwrap();
+        let node_info = crate::message::NodeInfo {
+            node_role: NodeRole::Proxy("1.0.0".to_string()),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: vec![8080],
+        };
+
+        let session = crate::session::NodeSession::new("node-alpha".to_string(), node_info);
+        session
+            .apply(crate::session::NodeEvent::Registered)
+            .await
+            .unwrap();
+        session
+            .apply(crate::session::NodeEvent::Heartbeat)
+            .await
+            .unwrap();
+        db.save_node(&session).await.unwrap();
+
+        let sent = "11111111-1111-1111-1111-111111111111";
+        let done = "22222222-2222-2222-2222-222222222222";
+        for id in [sent, done] {
+            db.save_command(&CommandEntry {
+                id: id.to_string(),
+                node_id: "node-alpha".to_string(),
+                command_type: "restart".to_string(),
+                command_data: JsonValue::Null,
+                status: CommandStatus::Pending,
+                created_at: Utc::now(),
+                sent_at: None,
+                completed_at: None,
+                // Still well inside its deadline, so only the restart itself
+                // can end it: this is the case the periodic sweep never sees.
+                timeout_at: Some(Utc::now() + chrono::Duration::seconds(600)),
+                response_data: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+        }
+        db.record_command_event(sent, CommandEvent::Delivered, None, None)
+            .await
+            .unwrap();
+        db.record_command_event(done, CommandEvent::Succeeded, None, None)
+            .await
+            .unwrap();
+
+        let withdrawn = db.withdraw_in_flight_beliefs().await.unwrap();
+        assert_eq!(
+            withdrawn,
+            Withdrawn {
+                nodes: 1,
+                commands: 1
+            }
+        );
+
+        let state: String = db
+            .with_connection(|conn| {
+                Ok::<_, DatabaseError>(conn.query_row(
+                    "SELECT state FROM nodes WHERE id = 'node-alpha'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, NodeState::Disconnected.as_str());
+
+        assert_eq!(
+            db.get_command(sent).await.unwrap().unwrap().status,
+            CommandStatus::Timeout,
+            "nothing can answer a command whose channel died with the process that sent it"
+        );
+        assert_eq!(
+            db.get_command(done).await.unwrap().unwrap().status,
+            CommandStatus::Completed,
+            "a command that already ended is not reopened"
+        );
+
+        // Idempotent: a restart that finds nothing in flight reports nothing.
+        assert_eq!(
+            db.withdraw_in_flight_beliefs().await.unwrap(),
+            Withdrawn {
+                nodes: 0,
+                commands: 0
+            }
+        );
+    }
+
+    /// The deadline the sweep reads is the one the writers record. A command
+    /// with none is left alone rather than being given an invented one.
+    #[tokio::test]
+    async fn a_command_with_no_deadline_is_not_overdue() {
+        let db = Database::init(":memory:").await.unwrap();
+        let session = crate::session::NodeSession::new(
+            "node-alpha".to_string(),
+            crate::message::NodeInfo {
+                node_role: NodeRole::Proxy("1.0.0".to_string()),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: vec![8080],
+            },
+        );
+        db.save_node(&session).await.unwrap();
+
+        db.save_command(&CommandEntry {
+            id: "33333333-3333-3333-3333-333333333333".to_string(),
+            node_id: "node-alpha".to_string(),
+            command_type: "restart".to_string(),
+            command_data: JsonValue::Null,
+            status: CommandStatus::Pending,
+            created_at: Utc::now() - chrono::Duration::seconds(600),
+            sent_at: None,
+            completed_at: None,
+            timeout_at: None,
+            response_data: None,
+            error_message: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.list_overdue_commands(Utc::now())
+                .await
+                .unwrap()
+                .is_empty(),
+            "no deadline was recorded, so none may be assumed"
+        );
+    }
+
+    /// The retention cap is per node. It used to be global - the newest N
+    /// rows anywhere - which meant the history that went first belonged to
+    /// whichever node had been quietest, and a node that has gone quiet is
+    /// exactly the one being looked at.
+    #[tokio::test]
+    async fn trimming_the_heartbeat_history_keeps_every_node_s_own() {
+        let db = Database::init(":memory:").await.unwrap();
+        let node_info = crate::message::NodeInfo {
+            node_role: NodeRole::Proxy("1.0.0".to_string()),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: vec![8080],
+        };
+        for id in ["node-quiet", "node-busy"] {
+            db.save_node(&crate::session::NodeSession::new(
+                id.to_string(),
+                node_info.clone(),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // The quiet node's two beats are the oldest rows in the table, so a
+        // global cap would drop them first.
+        let base = Utc::now() - chrono::Duration::seconds(10_000);
+        for n in 0..2 {
+            db.save_heartbeat(&HeartbeatEntry {
+                node_id: "node-quiet".to_string(),
+                instance_id: "node-quiet-a".to_string(),
+                timestamp: base + chrono::Duration::seconds(n),
+                latency_ms: None,
+            })
+            .await
+            .unwrap();
+        }
+        for n in 0..20 {
+            db.save_heartbeat(&HeartbeatEntry {
+                node_id: "node-busy".to_string(),
+                instance_id: "node-busy-a".to_string(),
+                timestamp: Utc::now() + chrono::Duration::seconds(n),
+                latency_ms: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        db.cleanup_old_heartbeats(5).await.unwrap();
+
+        assert_eq!(
+            db.get_recent_heartbeats("node-quiet", 100)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the quiet node keeps all it has; it is under the cap"
+        );
+        assert_eq!(
+            db.get_recent_heartbeats("node-busy", 100)
+                .await
+                .unwrap()
+                .len(),
+            5,
+            "the busy node is trimmed to the cap"
+        );
     }
 }

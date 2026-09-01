@@ -771,9 +771,25 @@ class Cache {
     // mojibake back with nothing reporting an error. The status and the
     // headers are text and still travel as JSON beside the body.
     const body = new Uint8Array(await response.clone().arrayBuffer());
+    // Pairs, not an object, for the reason `headerPairs` below is: an object
+    // keeps one value per name, and `Set-Cookie` is the one name that legally
+    // appears more than once. `Object.fromEntries` here stored the last cookie
+    // only, so a login that also issued a CSRF token was answered correctly on
+    // the miss and with one cookie on the hit -- the same defect
+    // `runtime/response_headers.rs` exists to have caught once, one layer in.
+    //
+    // Nothing is folded here, and that is deliberate. Which of the two answers
+    // an application gets is decided once, on the way out of this isolate, from
+    // its compatibility date; a cached entry is not on its way anywhere. A
+    // response rebuilt by `match` below is returned by the handler and leaves
+    // through that same gate, so folding at this point would be a second copy
+    // of the rule -- one that agrees with the first only while the flag is off,
+    // and disagrees with it in exactly the case the flag exists for. Storing
+    // the whole list keeps the choice where it is made: a list can always be
+    // folded later, and a folded list can never be unfolded.
     const meta = {
       status: response.status,
-      headers: Object.fromEntries(response.headers.entries())
+      headers: headerPairs(response.headers)
     };
     await DenoCore.ops.op_cache_set(
       this.name,
@@ -796,6 +812,9 @@ class Cache {
       const body = hit.body.byteLength === 0 ? null : hit.body;
       return new Response(body, {
         status: meta.status,
+        // The list `put` stored, handed back as it was: the `Headers`
+        // constructor takes a sequence of pairs, so the repeats it holds are
+        // rebuilt as repeats rather than collapsed on the way in.
         headers: meta.headers
       });
     } catch {
@@ -2601,8 +2620,9 @@ function respond(status, headers, body) {
   return { status: status, headers: headerPairs(headers) };
 }
 
-// Headers leave this isolate as a list of [name, value] pairs, never as an
-// object.
+// A header list as [name, value] pairs, never as an object. Both boundaries a
+// header list crosses go through here: the answer leaving this isolate, and the
+// entry `Cache.put` writes into the response cache.
 //
 // One name may legitimately appear twice, and for `Set-Cookie` it has to: the
 // Fetch specification exempts that one header from being combined, so
@@ -2617,6 +2637,16 @@ function respond(status, headers, body) {
 // throwing the information away before anyone can choose.
 function headerPairs(headers) {
   if (Array.isArray(headers)) return headers;
+  // A `Headers` first, because it is the one form that carries repeats and the
+  // one form `Object.keys` cannot read at all: its entries live behind the
+  // prototype, so the plain-object branch below would answer with an empty
+  // list and drop every header the caller had. Iterating it yields one entry
+  // per `Set-Cookie`, which is the whole reason this function exists.
+  if (headers && typeof headers.forEach === "function") {
+    const pairs = [];
+    headers.forEach((value, name) => pairs.push([name, value]));
+    return pairs;
+  }
   const pairs = [];
   for (const name of Object.keys(headers || {})) pairs.push([name, headers[name]]);
   return pairs;

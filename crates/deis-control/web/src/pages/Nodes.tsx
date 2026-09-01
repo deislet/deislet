@@ -30,6 +30,10 @@ function getStateBadgeVariant(state: string) {
     case 'Inactive':
     case 'Disconnected':
       return 'secondary'
+    // Still connected but silent past heartbeat_timeout, which is a node to
+    // go and look at rather than one that simply went away.
+    case 'Unresponsive':
+      return 'destructive'
     case 'Error':
       return 'destructive'
     default:

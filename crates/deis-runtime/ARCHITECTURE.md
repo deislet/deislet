@@ -73,6 +73,17 @@ keep serving.
 - **Ring Buffer**: Fixed-size circular buffer (e.g., 10k entries) prevents OOM.
 - **Async Shipping**: Background tasks handle network IO; application logic is never blocked.
 - **Resilience**: Backpressure handling (drop oldest) and exponential backoff retries.
+- **Which invocation a line belongs to**: every invocation is given a `trace_id`
+  when it starts; `op_log` stamps it on each line and the same id goes on the
+  invocation's trace record, which is what makes `deis trace` and
+  `deis logs --trace-id` two halves of one query. It survives the hops one
+  invocation takes - the cold start that a request paid for, the `waitUntil`
+  tail, and a service call into another application, which continues the
+  caller's trace rather than starting its own. See `runtime::ops::CurrentTrace`.
+- **Credential**: with `logging.auth_secret` set, all three channels (logs,
+  traces, metrics) present deis-telemetry's capability token. Without it a
+  collector that has an `auth_secret` refuses everything this node produces.
+  See `src/telemetry.rs`.
 
 ### 3. Management Interface (`src/management/`)
 - **Protocol**: gRPC over HTTP/2.
@@ -170,6 +181,7 @@ rate_limit_ops_per_sec = 1000.0
 [logging]                   # shipping to deis-telemetry
 enabled = false
 # endpoint = "http://127.0.0.1:8092"
+# auth_secret = "the same value as deis-telemetry's auth_secret"
 buffer_size = 10000
 flush_interval_secs = 5
 batch_size = 100

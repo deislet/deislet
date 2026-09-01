@@ -243,6 +243,15 @@ message DeadLetterMessage {
   int64 created_at = 5;
   // Unix second it was moved to the dead letter table.
   int64 died_at = 6;
+  // Which of the two ways it used up its attempts, in the same words the
+  // server's log line uses: "the consumer reported it failed", or "its lease
+  // lapsed". They call for different fixes - a handler that throws on this
+  // body, against a handler that outlives its lease or a node that died
+  // holding the message - and attempts alone cannot tell them apart.
+  //
+  // Empty for a row written before the queue recorded this, which is the one
+  // case a reader has to render as "unknown" rather than as a reason.
+  string reason = 7;
 }
 
 message ListDeadLettersResponse {

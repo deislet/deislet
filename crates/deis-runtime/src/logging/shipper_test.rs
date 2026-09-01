@@ -7,6 +7,7 @@ mod tests {
         LogSink, PushOutcome, ShipperConfig, ShipperState,
     };
     use crate::logging::types::{LogEntry, LogLevel};
+    use crate::telemetry::TelemetryCredential;
     use anyhow::Result;
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -73,6 +74,7 @@ mod tests {
         ShipperConfig {
             // Never dialled: every test drives a ScriptedSink directly.
             endpoint: Some("http://127.0.0.1:1".to_string()),
+            credential: TelemetryCredential::default(),
             flush_interval_secs: 1,
             batch_size,
             max_retries: 1,
@@ -373,6 +375,7 @@ mod tests {
         let logging = LoggingConfig {
             enabled: true,
             endpoint: Some("http://127.0.0.1:8092".to_string()),
+            auth_secret: Some("shared-with-the-collector".to_string()),
             buffer_size: 1,
             flush_interval_secs: 9,
             batch_size: 8,
@@ -387,6 +390,21 @@ mod tests {
         assert_eq!(config.batch_size, 8);
         assert_eq!(config.max_retries, 7);
         assert_eq!(config.max_pending_entries, 6);
+        assert!(
+            config.credential.is_present(),
+            "a configured auth_secret has to become a token the shipper actually carries; \
+             without it deis-telemetry refuses every batch and the node retries forever"
+        );
+
+        let unauthenticated = ShipperConfig::from(&LoggingConfig {
+            auth_secret: None,
+            ..logging
+        });
+        assert!(
+            !unauthenticated.credential.is_present(),
+            "and no secret has to mean no header at all: an empty one is presented and refused \
+             where none is served by a collector that requires none"
+        );
     }
 
     #[tokio::test]

@@ -113,7 +113,7 @@ async fn op_deis_service_call(
     #[serde] request: ServiceRequest,
     #[buffer] body: Option<JsBuffer>,
 ) -> Result<ServiceCallResult, JsErrorBox> {
-    let (router, bindings, path, caller, budget, subrequests) = {
+    let (router, bindings, path, caller, trace_id, budget, subrequests) = {
         let state = state.borrow();
         (
             state.try_borrow::<ServiceRouter>().cloned(),
@@ -126,6 +126,10 @@ async fn op_deis_service_call(
                 .try_borrow::<AppId>()
                 .map(|app| app.0.clone())
                 .unwrap_or_default(),
+            // Read here, from the caller's own isolate, and not taken from
+            // anything the caller wrote: this is the invocation the call is a
+            // hop of, and it is the platform's account of that, not a claim.
+            super::ops::current_trace_id(&state),
             super::fetch_ops::budget_ms(&state),
             state.try_borrow::<Rc<SubrequestBudget>>().cloned(),
         )
@@ -281,6 +285,7 @@ async fn op_deis_service_call(
 
     let call = ServiceCall {
         path: chain,
+        trace_id,
         binding: binding.clone(),
         // The path and query the application asked for, behind the platform's
         // own origin: see `SERVICE_CALL_ORIGIN`.

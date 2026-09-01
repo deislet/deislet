@@ -96,6 +96,10 @@ impl ControlService for GrpcControlService {
             async move {
                 let mut current_session: Option<Arc<NodeSession>> = None;
                 let mut authenticated = false;
+                // The name the node gave for itself in the handshake. It is
+                // the node's identity for as long as this stream lives, and
+                // across every stream it ever opens.
+                let mut announced_id: Option<String> = None;
                 // Told apart in the log and in the recorded event, because
                 // the two mean opposite things to whoever reads them: a node
                 // that went away is a node to go looking for, while a channel
@@ -128,6 +132,7 @@ impl ControlService for GrpcControlService {
                                     &handler,
                                     &mut current_session,
                                     &mut authenticated,
+                                    &mut announced_id,
                                 )
                                 .await;
                             }
@@ -188,6 +193,7 @@ async fn handle_payload(
     handler: &MessageHandler,
     current_session: &mut Option<Arc<NodeSession>>,
     authenticated: &mut bool,
+    announced_id: &mut Option<String>,
 ) {
     match payload {
         Payload::Authenticate(req) => {
@@ -202,6 +208,13 @@ async fn handle_payload(
                 .iter()
                 .any(|key| crate::api::middleware::secret_eq(key, &req.secret));
             *authenticated = valid;
+            if valid {
+                // Kept, because this is the only place the node ever says who
+                // it is. Registration used to mint a fresh UUID instead and
+                // throw this away; see the `Register` arm below for what that
+                // cost.
+                *announced_id = Some(req.instance_id.clone());
+            }
 
             let message = if valid {
                 format!("Authenticated: {}", req.instance_id)
@@ -249,16 +262,43 @@ async fn handle_payload(
                 }
             };
 
-            // Reconstruct internal RegisterRequest
-            let internal_req = InternalRegisterRequest {
-                id: Uuid::new_v4().to_string(), // Or use associated_id if available context
-                info: node_info.clone(),
+            // A node is whatever it called itself in the handshake - its
+            // configured `associated_id`, which is the same string every time
+            // that node connects.
+            //
+            // This used to be `Uuid::new_v4()`, a brand new identity per
+            // connection. Everything this control plane keeps per node hangs
+            // off that id: its rows in `configs`, its command history, its
+            // heartbeats. So a node that restarted, or merely reconnected
+            // after a blip, silently orphaned all of its configuration and
+            // left one more row in `nodes` behind it, for ever, with nothing
+            // able to match the new record to the old one.
+            let node_id = match announced_id.as_deref().map(str::trim) {
+                Some(id) if !id.is_empty() => id.to_string(),
+                // Unreachable while registration requires a handshake, and
+                // refused rather than assumed: a blank id would file every
+                // such node under one shared row, so they would read each
+                // other's configuration.
+                _ => {
+                    error!(
+                        "A node reached registration without a usable name from its \
+                         handshake; refusing, because filing it under a made-up or blank id \
+                         would orphan its configuration or let it read another node's"
+                    );
+                    let reply = Payload::RegisterResponse(RegisterResponse {
+                        success: false,
+                        message: "Authenticate with a non-empty instance_id before registering"
+                            .to_string(),
+                    });
+                    send_payload(tx, reply).await;
+                    return;
+                }
             };
 
-            // Create session with gRPC sender
-            // Note: node_id is derived from context, here simplistic
-            // Ideally we track node_id from auth phase
-            let node_id = internal_req.id.clone();
+            let internal_req = InternalRegisterRequest {
+                id: node_id.clone(),
+                info: node_info.clone(),
+            };
 
             let session = Arc::new(NodeSession::new(node_id, node_info).with_sender(tx.clone()));
 
@@ -490,5 +530,249 @@ mod tests {
             ),
             other => panic!("expected an auth response, got {other:?}"),
         }
+    }
+
+    /// A node names itself in the handshake and keeps that name. Everything
+    /// this control plane remembers per node - its `configs` rows, its
+    /// command history, its heartbeats - hangs off `nodes.id`, so a node that
+    /// gets a fresh id on every reconnect orphans all of it and leaves one
+    /// more row behind each time.
+    #[tokio::test]
+    async fn a_node_keeps_the_name_it_announces_across_a_reconnect() {
+        let sessions = Arc::new(SessionManager::new());
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let service = GrpcControlService::new(
+            Arc::new(ControlConfig {
+                node_preshared_keys: vec!["node-psk".to_string()],
+                ..ControlConfig::default()
+            }),
+            Arc::clone(&sessions),
+        )
+        .with_database(Arc::clone(&database));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        for round in 1..=2 {
+            let mut client = ControlServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("the test server must accept a node");
+            let (node_tx, node_rx) = mpsc::channel(4);
+            node_tx
+                .send(ControlMessage {
+                    payload: Some(ClientPayload::Authenticate(AuthenticateRequest {
+                        instance_id: "node-alpha".to_string(),
+                        secret: "node-psk".to_string(),
+                    })),
+                })
+                .await
+                .unwrap();
+
+            let mut inbound = client
+                .establish_channel(ReceiverStream::new(node_rx))
+                .await
+                .unwrap()
+                .into_inner();
+            match inbound
+                .next()
+                .await
+                .expect("a reply is due")
+                .unwrap()
+                .payload
+            {
+                Some(Payload::AuthResponse(response)) => assert!(response.success),
+                other => panic!("expected an auth response, got {other:?}"),
+            }
+
+            let node_info = NodeInfo {
+                node_role: crate::message::NodeRole::Proxy("1.0.0".to_string()),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: vec![8080],
+            };
+            node_tx
+                .send(ControlMessage {
+                    payload: Some(ClientPayload::Register(deis_wire::pb::RegisterRequest {
+                        node_info_json: serde_json::to_string(&node_info).unwrap(),
+                    })),
+                })
+                .await
+                .unwrap();
+            match inbound
+                .next()
+                .await
+                .expect("a reply is due")
+                .unwrap()
+                .payload
+            {
+                Some(Payload::RegisterResponse(response)) => assert!(response.success),
+                other => panic!("expected a register response, got {other:?}"),
+            }
+
+            assert!(
+                sessions.get_node("node-alpha").is_some(),
+                "round {round}: the session must be filed under the name the node announced"
+            );
+
+            // The node hangs up, exactly as a restart or a dropped connection
+            // does, and the stream task tears the session down.
+            drop(node_tx);
+            drop(inbound);
+            while sessions.get_node("node-alpha").is_some() {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let rows: i64 = database
+            .with_connection(|conn| {
+                Ok::<_, crate::database::DatabaseError>(conn.query_row(
+                    "SELECT COUNT(*) FROM nodes",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "two connections from one node must leave one node row, not one row per connection"
+        );
+    }
+
+    /// A node that freezes, loses its network or has its power cut keeps its
+    /// end of the TCP connection open - none of those sends a FIN - so
+    /// nothing about the stream ever changes. Before the sweep existed the
+    /// session it had registered stayed `Active` until the process restarted,
+    /// which is precisely the answer an operator must not get to "which nodes
+    /// are alive".
+    ///
+    /// The whole path on purpose: a real server, a real node client, a real
+    /// registration and heartbeat, then silence.
+    #[tokio::test]
+    async fn a_node_that_goes_quiet_stops_being_reported_as_live() {
+        let sessions = Arc::new(SessionManager::new());
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        // One second of grace, so the test waits on the real clock the
+        // shipped default reads, only a shorter one.
+        let config = Arc::new(ControlConfig {
+            node_preshared_keys: vec!["node-psk".to_string()],
+            heartbeat_interval: 1,
+            heartbeat_timeout: 2,
+            ..ControlConfig::default()
+        });
+        let service = GrpcControlService::new(Arc::clone(&config), Arc::clone(&sessions))
+            .with_database(Arc::clone(&database));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        let shutdown = Shutdown::new();
+        let reaper = Arc::new(crate::reaper::Reaper::new(
+            Arc::clone(&sessions),
+            Arc::clone(&database),
+            Arc::new(CommandExecutor::new(
+                Arc::clone(&sessions),
+                Arc::clone(&database),
+            )),
+            &config,
+        ));
+        let reaper_task = Arc::clone(&reaper).start(shutdown.clone()).await;
+
+        let mut client = ControlServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("the test server must accept a node");
+        let (node_tx, node_rx) = mpsc::channel(4);
+        node_tx
+            .send(ControlMessage {
+                payload: Some(ClientPayload::Authenticate(AuthenticateRequest {
+                    instance_id: "node-alpha".to_string(),
+                    secret: "node-psk".to_string(),
+                })),
+            })
+            .await
+            .unwrap();
+        let mut inbound = client
+            .establish_channel(ReceiverStream::new(node_rx))
+            .await
+            .unwrap()
+            .into_inner();
+        inbound.next().await.expect("a reply is due").unwrap();
+
+        let node_info = NodeInfo {
+            node_role: crate::message::NodeRole::Proxy("1.0.0".to_string()),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: vec![8080],
+        };
+        node_tx
+            .send(ControlMessage {
+                payload: Some(ClientPayload::Register(deis_wire::pb::RegisterRequest {
+                    node_info_json: serde_json::to_string(&node_info).unwrap(),
+                })),
+            })
+            .await
+            .unwrap();
+        inbound.next().await.expect("a reply is due").unwrap();
+        node_tx
+            .send(ControlMessage {
+                payload: Some(ClientPayload::Heartbeat(Heartbeat {
+                    status: "ok".to_string(),
+                })),
+            })
+            .await
+            .unwrap();
+        inbound.next().await.expect("a reply is due").unwrap();
+
+        let session = sessions
+            .get_node("node-alpha")
+            .expect("the node registered, so it holds a session");
+        assert_eq!(session.get_state().await, crate::session::NodeState::Active);
+
+        // The node now freezes. It holds its half of the stream open and says
+        // nothing more, which is exactly what a paused host or a partition
+        // looks like from this side: no error, no close, no further message.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while session.get_state().await == crate::session::NodeState::Active {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the node has been silent for far longer than the 2s heartbeat_timeout and is \
+                 still reported Active"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            session.get_state().await,
+            crate::session::NodeState::Unresponsive,
+            "a node that is silent but still connected is unresponsive, not disconnected: it \
+             never hung up"
+        );
+
+        // The node thaws on the same stream, which is what a resumed VM or a
+        // healed partition does, and is live again without reconnecting.
+        node_tx
+            .send(ControlMessage {
+                payload: Some(ClientPayload::Heartbeat(Heartbeat {
+                    status: "ok".to_string(),
+                })),
+            })
+            .await
+            .unwrap();
+        inbound.next().await.expect("a reply is due").unwrap();
+        assert_eq!(session.get_state().await, crate::session::NodeState::Active);
+
+        shutdown.trigger();
+        reaper_task.await.unwrap();
     }
 }

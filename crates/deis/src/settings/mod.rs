@@ -33,6 +33,7 @@ pub const CREDENTIALS_FILE: &str = "credentials.toml";
 pub const ENV_CONTROL_ENDPOINT: &str = "DEIS_CONTROL_ENDPOINT";
 pub const ENV_CONTROL_TOKEN: &str = "DEIS_CONTROL_TOKEN";
 pub const ENV_TELEMETRY_ENDPOINT: &str = "DEIS_TELEMETRY_ENDPOINT";
+pub const ENV_QUEUE_ENDPOINT: &str = "DEIS_QUEUE_ENDPOINT";
 pub const ENV_APP: &str = "DEIS_APP";
 pub const ENV_ENVIRONMENT: &str = "DEIS_ENVIRONMENT";
 /// Overrides [`config_home`] whole. Set by the tests so they never touch the
@@ -98,6 +99,13 @@ pub struct ProjectFile {
     pub control: Option<EndpointSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<EndpointSection>,
+    /// Where deis-queue listens. In the project file beside the other two
+    /// addresses rather than fetched from the control plane, because the
+    /// control plane does not hand this one out: its storage-token route
+    /// answers with deis-store's address and the tenant's capability token,
+    /// and that token is the credential deis-queue checks too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<EndpointSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defaults: Option<DefaultsSection>,
 }
@@ -245,6 +253,7 @@ pub struct Settings {
     pub project_dir: PathBuf,
     pub control_endpoint: Option<Setting>,
     pub telemetry_endpoint: Option<Setting>,
+    pub queue_endpoint: Option<Setting>,
     pub app: Option<Setting>,
     pub environment: Setting,
     /// Never printed. [`Settings::token_source`] is what output uses.
@@ -284,6 +293,15 @@ impl Settings {
                 .telemetry
                 .as_ref()
                 .and_then(|t| t.endpoint.clone())
+                .map(|v| Setting::new(v, Source::Project)),
+        ]);
+
+        let queue_endpoint = first(&[
+            from_env(ENV_QUEUE_ENDPOINT),
+            project
+                .queue
+                .as_ref()
+                .and_then(|q| q.endpoint.clone())
                 .map(|v| Setting::new(v, Source::Project)),
         ]);
 
@@ -329,6 +347,7 @@ impl Settings {
             project_dir: project_dir.to_path_buf(),
             control_endpoint,
             telemetry_endpoint,
+            queue_endpoint,
             app,
             environment,
             token,
@@ -355,6 +374,25 @@ impl Settings {
                 "no deis-telemetry address is configured, so there is nowhere to read logs from. \
                  Add it to {}:\n\n  [telemetry]\n  endpoint = \"http://127.0.0.1:8092\"\n\nor set \
                  {ENV_TELEMETRY_ENDPOINT} for this shell.",
+                self.project_dir.join(PROJECT_FILE).display()
+            ),
+        }
+    }
+
+    /// Where deis-queue listens, or an error that says how to set it.
+    ///
+    /// Only the dead letter commands need it. They are an operator reading
+    /// and repairing a queue directly, which is why the address is named in
+    /// the project the way deis-telemetry's is: a person who can reach the
+    /// control plane cannot necessarily route to deis-queue, and the control
+    /// plane has no route that would tell them where it is.
+    pub fn queue_endpoint(&self) -> Result<&str> {
+        match &self.queue_endpoint {
+            Some(setting) => Ok(setting.value.trim_end_matches('/')),
+            None => bail!(
+                "no deis-queue address is configured, so there is nowhere to read the dead \
+                 letters from. Add it to {}:\n\n  [queue]\n  endpoint = \
+                 \"http://127.0.0.1:8091\"\n\nor set {ENV_QUEUE_ENDPOINT} for this shell.",
                 self.project_dir.join(PROJECT_FILE).display()
             ),
         }

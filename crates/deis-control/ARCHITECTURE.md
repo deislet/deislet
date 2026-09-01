@@ -125,17 +125,33 @@ stateDiagram-v2
     [*] --> Connected
     Connected --> Registered : Registered
     Registered --> Active : Heartbeat
+    Registered --> Unresponsive : HeartbeatExpired
+    Active --> Unresponsive : HeartbeatExpired
+    Unresponsive --> Active : Heartbeat
     Connected --> Disconnected : Disconnected
     Registered --> Disconnected : Disconnected
     Active --> Disconnected : Disconnected
+    Unresponsive --> Disconnected : Disconnected
     Active --> Active : Heartbeat
 ```
 
-Two rules are worth reading off it. There is no arrow from `Connected` to
+Three rules are worth reading off it. There is no arrow from `Connected` to
 `Active`: a heartbeat from a node that never registered is acknowledged and
 then ignored, so it is not counted among the live nodes by `src/metrics/` and
-not shown as active by `/api/sessions`. And nothing leaves `Disconnected`: a
+not shown as active by `/api/sessions`. Nothing leaves `Disconnected`: a
 session whose stream closed stays closed, whatever arrives after it.
+
+And `Active` is a claim with an expiry date rather than a resting place.
+`HeartbeatExpired` is sent by `src/reaper/` once a node has been silent for
+longer than the configured `heartbeat_timeout`, which is what makes a frozen,
+partitioned or powered-off node stop being reported as live — none of those
+closes a TCP connection, so without that arrow nothing about the session ever
+changed again. `Unresponsive` is told apart from `Disconnected` on purpose:
+that node hung up, this one is still holding a channel open and has stopped
+answering, and the two send an operator to different places. The way back is
+an ordinary heartbeat, because a resumed host or a healed partition arrives on
+the same stream and would otherwise be stranded — from the node's side nothing
+ever broke.
 
 ### 4. Catalog (`src/catalog/`)
 

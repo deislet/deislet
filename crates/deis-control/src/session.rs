@@ -24,13 +24,26 @@ use crate::message::{NodeInfo, NodeRole};
 /// ended has ended; and `Heartbeat` has no row in `Connected`, so a node that
 /// skipped registration cannot appear on the dashboard or in the fleet
 /// metrics as active.
+///
+/// What was still missing after that is how long `Active` is good for.
+/// `Active` was written by a heartbeat and then nothing ever took it away
+/// except the stream ending, so a node that froze, lost its network or had
+/// its power cut - none of which closes a TCP connection - stayed `Active`
+/// for as long as the process ran. An operator's first question in an
+/// incident is which nodes are alive, and the answer was wrong in the
+/// direction that hurts: everything looked healthy.
+///
+/// So a heartbeat is evidence with an expiry date, and `Unresponsive` is
+/// where a node sits once that date passes. The configured
+/// `heartbeat_timeout` is what sets the date, and [`crate::reaper`] is what
+/// compares it to the clock.
 pub mod node_fsm {
     use yasm::*;
 
     define_state_machine! {
         name: NodeFSM,
-        states: { Connected, Registered, Active, Disconnected },
-        inputs: { Registered, Heartbeat, Disconnected },
+        states: { Connected, Registered, Active, Unresponsive, Disconnected },
+        inputs: { Registered, Heartbeat, HeartbeatExpired, Disconnected },
         initial: Connected,
         transitions: {
             Connected + Registered => Registered,
@@ -40,10 +53,29 @@ pub mod node_fsm {
             // regularly it says hello.
             Registered + Heartbeat => Active,
             Active + Heartbeat => Active,
+            // Silence past `heartbeat_timeout` withdraws the claim that the
+            // node is live. It is reachable from `Registered` as well as from
+            // `Active`, because a node that registers and then freezes before
+            // its first heartbeat is exactly as absent as one that stops
+            // beating later, and the clock for both starts when the stream
+            // opens. `Connected` has no row on purpose: a session that never
+            // registered is not in the session manager, is not a delivery
+            // target and appears nowhere as live, so there is no claim to
+            // withdraw.
+            Registered + HeartbeatExpired => Unresponsive,
+            Active + HeartbeatExpired => Unresponsive,
+            // Silence is not death. A paused VM, a garbage-collection stall
+            // or a healed partition leaves the same stream open and the node
+            // simply starts beating again; refusing to believe it would strand
+            // a perfectly good node until something forced it to reconnect,
+            // and nothing on the node's side would - from over there the
+            // stream never broke.
+            Unresponsive + Heartbeat => Active,
             // The stream can close from any state the session ever reached.
             Connected + Disconnected => Disconnected,
             Registered + Disconnected => Disconnected,
             Active + Disconnected => Disconnected,
+            Unresponsive + Disconnected => Disconnected,
         }
     }
 }
@@ -69,6 +101,7 @@ impl NodeState {
             NodeState::Connected => "Connected",
             NodeState::Registered => "Registered",
             NodeState::Active => "Active",
+            NodeState::Unresponsive => "Unresponsive",
             NodeState::Disconnected => "Disconnected",
         }
     }
@@ -140,6 +173,15 @@ impl NodeSession {
     pub async fn get_state(&self) -> NodeState {
         self.state.lock().await.clone()
     }
+
+    /// How long it has been since this node was last heard from.
+    ///
+    /// The clock starts when the stream opens rather than at the first
+    /// heartbeat, so a node that connects, registers and then says nothing
+    /// runs out of time on the same schedule as one that stops beating later.
+    pub async fn silence(&self, now: chrono::DateTime<Utc>) -> chrono::Duration {
+        now - *self.last_heartbeat.lock().await
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +232,20 @@ impl SessionManager {
     pub fn iter(&self) -> dashmap::iter::Iter<'_, String, Arc<NodeSession>> {
         self.sessions.iter()
     }
+
+    /// Every session as of this moment, with no lock held afterwards.
+    ///
+    /// For callers that await between sessions. Walking the map directly
+    /// keeps a shard guard alive for the whole walk, and a guard held across
+    /// an await blocks whichever task wants that shard - a node registering,
+    /// a stream tearing down - on the worker thread instead of in the
+    /// scheduler.
+    pub fn snapshot(&self) -> Vec<Arc<NodeSession>> {
+        self.sessions
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect()
+    }
 }
 
 impl Default for SessionManager {
@@ -223,7 +279,16 @@ mod tests {
             assert_eq!(state.as_str(), state.to_string());
         }
         let names: Vec<&str> = NodeFSM::states().iter().map(NodeState::as_str).collect();
-        assert_eq!(names, ["Connected", "Registered", "Active", "Disconnected"]);
+        assert_eq!(
+            names,
+            [
+                "Connected",
+                "Registered",
+                "Active",
+                "Unresponsive",
+                "Disconnected"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -283,6 +348,69 @@ mod tests {
         assert_eq!(
             StateMachineQuery::<NodeFSM>::terminal_states(),
             vec![NodeState::Disconnected]
+        );
+    }
+
+    /// The rule that was missing entirely: `Active` is a claim with an expiry
+    /// date. Nothing but the stream ending used to take it away, so a frozen
+    /// or partitioned node - neither of which closes a connection - was
+    /// reported healthy for as long as the process ran.
+    #[tokio::test]
+    async fn silence_withdraws_the_claim_that_a_node_is_live() {
+        let session = session();
+        session.apply(NodeEvent::Registered).await.unwrap();
+        session.apply(NodeEvent::Heartbeat).await.unwrap();
+
+        assert_eq!(
+            session.apply(NodeEvent::HeartbeatExpired).await,
+            Ok(NodeState::Unresponsive)
+        );
+    }
+
+    /// A node that registers and then freezes before its first heartbeat is
+    /// as absent as one that stops beating later, so `Registered` runs out
+    /// too rather than sitting there for ever.
+    #[tokio::test]
+    async fn a_node_that_never_beats_runs_out_as_well() {
+        let session = session();
+        session.apply(NodeEvent::Registered).await.unwrap();
+
+        assert_eq!(
+            session.apply(NodeEvent::HeartbeatExpired).await,
+            Ok(NodeState::Unresponsive)
+        );
+    }
+
+    /// Silence is not death: the stream never broke, so nothing on the node's
+    /// side will make it reconnect. If it starts beating again it is live
+    /// again, and a second expiry in the meantime changes nothing.
+    #[tokio::test]
+    async fn a_node_that_starts_beating_again_is_live_again() {
+        let session = session();
+        session.apply(NodeEvent::Registered).await.unwrap();
+        session.apply(NodeEvent::Heartbeat).await.unwrap();
+        session.apply(NodeEvent::HeartbeatExpired).await.unwrap();
+
+        assert_eq!(
+            session.apply(NodeEvent::HeartbeatExpired).await,
+            Err(NodeState::Unresponsive),
+            "an already-withdrawn claim is not withdrawn twice"
+        );
+        assert_eq!(
+            session.apply(NodeEvent::Heartbeat).await,
+            Ok(NodeState::Active)
+        );
+    }
+
+    /// A session that never registered makes no claim to be live, so there is
+    /// nothing for an expiry to withdraw.
+    #[tokio::test]
+    async fn an_unregistered_session_has_no_claim_to_withdraw() {
+        let session = session();
+
+        assert_eq!(
+            session.apply(NodeEvent::HeartbeatExpired).await,
+            Err(NodeState::Connected)
         );
     }
 }

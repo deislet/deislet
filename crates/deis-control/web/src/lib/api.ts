@@ -376,7 +376,14 @@ export interface SessionSummary {
   node_role: string;
   host: string;
   ports: number[];
-  state: "Connected" | "Registered" | "Active" | "Disconnected";
+  /**
+   * `Unresponsive` is a node that is still holding its control channel open
+   * but has not been heard from within `heartbeat_timeout`. It is not the
+   * same as `Disconnected`: that node hung up and is presumably restarting,
+   * while this one is still connected and its host or its network has stopped
+   * answering.
+   */
+  state: "Connected" | "Registered" | "Active" | "Unresponsive" | "Disconnected";
   connected_at: string;
   last_heartbeat: string;
 }
@@ -492,6 +499,8 @@ export interface MetricsSummary {
     active: number;
     connected: number;
     registered: number;
+    /** Still connected, but silent past `heartbeat_timeout`. */
+    unresponsive: number;
     disconnected: number;
     by_type: { [key: string]: number };
   };

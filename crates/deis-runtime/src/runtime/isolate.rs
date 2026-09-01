@@ -5,17 +5,20 @@ use super::cache_ops::{create_cache_store, CacheStore};
 use super::fetch_policy::FetchPolicy;
 use super::loader::DbModuleLoader;
 use super::metrics::{
-    recorder, MetricsRegistry, RequestFacts, RequestOutcome, RATE_LIMIT_CUTOFFS_TOTAL,
+    now_us, recorder, InvocationKind, InvocationOutcome, InvocationTrace, MetricsRegistry,
+    RequestFacts, RequestOutcome, RATE_LIMIT_CUTOFFS_TOTAL,
 };
 use super::ops::{
-    AppId, EnvStore, ExecutionDeadline, PendingRequestBody, PendingResponseBody, ResponseStore,
-    SubrequestBudget,
+    new_trace_id, AppId, CurrentTrace, EnvStore, ExecutionDeadline, PendingRequestBody,
+    PendingResponseBody, ResponseStore, SubrequestBudget,
 };
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
 use super::rate_limit::RateLimiter;
 use super::response_headers::{count_of, fold_duplicate_names, HeaderPairs};
-use super::response_stream::{response_streams, ResponseBody, ResponseStreams};
+use super::response_stream::{
+    record_broken_body, response_streams, ResponseBody, ResponseStreams, StreamOwner,
+};
 use super::route_match::{match_routes, path_from_url};
 use super::runtime_init::{build_runtime_extensions, init_lazy_extensions};
 use super::service_call::{CallPath, ServiceBindings};
@@ -289,6 +292,20 @@ struct CutOff {
 }
 
 impl CutOff {
+    /// How an invocation this cut off ended, in the vocabulary a trace record
+    /// is written in.
+    ///
+    /// The same split the wording is: a duration cut-off usually points at
+    /// something the application was waiting for, a CPU cut-off always points
+    /// at what it was computing, and an operator sorting traces by outcome is
+    /// asking exactly that question.
+    fn verdict(&self) -> InvocationOutcome {
+        match self.kind {
+            CutOffKind::WallClock => InvocationOutcome::ExecutionTimeout,
+            CutOffKind::CpuTime => InvocationOutcome::CpuLimit,
+        }
+    }
+
     /// The clause that names the ceiling and gives both numbers. Written once
     /// so the six paths below cannot word it six ways.
     fn describe(&self, budget_ms: u64) -> String {
@@ -1130,6 +1147,19 @@ pub struct AppRuntime {
     /// beside the budgets rather than travelling in a header the application
     /// could write.
     call_path: CallPath,
+    /// The invocation running now, as the id its log lines are stamped with.
+    /// Shared with the isolate's `OpState`; see [`CurrentTrace`].
+    trace: CurrentTrace,
+    /// The trace the *next* invocation on this isolate belongs to, when it is
+    /// not one this isolate gets to choose.
+    ///
+    /// Written only by [`Self::execute_service_call`] and taken by the next
+    /// [`Self::take_or_mint_trace_id`], the way `call_path` is written and
+    /// read. A service call is not a new invocation of the platform, it is the
+    /// same one one application further in, so its callee's lines have to join
+    /// the trace the caller's request started -- otherwise the one query that
+    /// is supposed to show what a request did stops at the first hop.
+    inherited_trace_id: Option<String>,
     /// Which of the platform's answers this application gets. See
     /// [`IsolateSpec::compatibility`]: this is the one thing this isolate asks
     /// when an old answer and a better one both exist, and it is a bit test,
@@ -1320,6 +1350,7 @@ impl AppRuntime {
         let execution_deadline: ExecutionDeadline = Rc::new(Cell::new(None));
         let subrequest_budget = Rc::new(SubrequestBudget::new(max_subrequests));
         let call_path: CallPath = Rc::new(RefCell::new(Vec::new()));
+        let current_trace: CurrentTrace = Rc::new(RefCell::new(String::new()));
 
         // Resolved once, here, because a binding that follows the caller's own
         // environment depends on which environment *this* isolate is, and that
@@ -1522,6 +1553,12 @@ impl AppRuntime {
             // see `AppId`.
             state.put(AppId(app_id.clone()));
 
+            // And which invocation of that tenant, so a line an op writes can
+            // be found again by the request that caused it rather than only by
+            // the application that served it. Empty between invocations; see
+            // `CurrentTrace`.
+            state.put(current_trace.clone());
+
             // The other half of asset-first: the HTTP entry answers a request
             // for a file before an isolate is started, and this is what a
             // handler that ran anyway reaches through `env.ASSETS.fetch()`.
@@ -1607,6 +1644,8 @@ impl AppRuntime {
             execution_deadline,
             subrequest_budget,
             call_path,
+            trace: current_trace,
+            inherited_trace_id: None,
             compatibility,
             timers_swept: false,
         })
@@ -1672,12 +1711,36 @@ impl AppRuntime {
         state.try_borrow::<Rc<dyn OutboundSockets>>().cloned()
     }
 
+    /// The id the invocation about to start belongs to: the one its caller
+    /// handed over, or a new one.
+    ///
+    /// Only a service call hands one over, and that is the whole point of the
+    /// distinction: A serving a request calls B, and B's log lines have to be
+    /// findable from A's trace, because from outside the platform the two are
+    /// one request. Every other way into an isolate is the start of something,
+    /// so it mints.
+    fn take_or_mint_trace_id(&mut self) -> String {
+        self.inherited_trace_id.take().unwrap_or_else(new_trace_id)
+    }
+
+    /// The invocation running on this isolate right now, or the empty string
+    /// between invocations.
+    fn current_trace_id(&self) -> String {
+        self.trace.borrow().clone()
+    }
+
     /// Start one invocation: a request, a queue batch, a cron tick, one
     /// inbound WebSocket message, or the evaluation of the module itself.
     ///
     /// Everything an earlier invocation left behind stops belonging to this
     /// one here. Paired with [`Self::end_invocation`] on every path out.
-    fn begin_invocation(&mut self) {
+    ///
+    /// `trace_id` is what everything this invocation writes is stamped with,
+    /// and it is taken as an argument rather than minted here because two
+    /// callers already know which trace they are in: a service call continues
+    /// its caller's, and a cold start belongs to the request that paid for it.
+    fn begin_invocation(&mut self, trace_id: String) {
+        *self.trace.borrow_mut() = trace_id;
         self.timers_swept = false;
         // The outbound-call allowance belongs to one invocation, exactly as
         // the wall-clock and CPU budgets do. Reset here and not in
@@ -1699,6 +1762,12 @@ impl AppRuntime {
     /// to work. What an invocation is allowed to hold, it holds *inside* the
     /// isolate every other request to this application will run in.
     fn end_invocation(&mut self) {
+        // Before anything else that can fail: a line written after this point
+        // is the node speaking about the invocation, not the invocation
+        // speaking, and stamping it with the id would put it in a trace it is
+        // not part of. An id left behind would be worse still -- the next
+        // invocation's lines would join the previous one's trace.
+        self.trace.borrow_mut().clear();
         self.disarm_execution_budget();
         // The sweep below is script, so a termination flag left by a cut-off
         // has to go first or the sweep is what it kills.
@@ -1899,6 +1968,20 @@ impl AppRuntime {
     /// the request's, and [`Watchdog`] for why the cut-off cannot be a
     /// `tokio::spawn`ed timer the way every other one here is.
     pub async fn init_module(&mut self) -> Result<()> {
+        let trace_id = self.take_or_mint_trace_id();
+        self.init_module_in_trace(trace_id).await
+    }
+
+    /// The same evaluation, as part of an invocation that has already been
+    /// given an id.
+    ///
+    /// A cold start is not an event of its own: it happens because a request,
+    /// a batch or a tick arrived and found no module, and whatever the top
+    /// level of the bundle logs while it runs is part of *that* invocation.
+    /// Minting a second id here would split one thing an operator is looking
+    /// at into two traces, and the half holding "why the first request was
+    /// slow" would be the half with no request attached to it.
+    async fn init_module_in_trace(&mut self, trace_id: String) -> Result<()> {
         if self.module_id.is_some() {
             return Ok(());
         }
@@ -1906,7 +1989,7 @@ impl AppRuntime {
         // A flag left set by whatever ran before would fail this evaluation
         // before a line of the module was read.
         self.clear_termination();
-        self.begin_invocation();
+        self.begin_invocation(trace_id);
         let deadline = self.arm_budget(MODULE_EVALUATION_BUDGET_MS);
         // No CPU ceiling on this one; see [`CpuBudget::limit`]. Compiling a
         // bundle is CPU-bound by nature and has nothing to do with what one
@@ -2155,12 +2238,18 @@ impl AppRuntime {
     ) -> Result<()> {
         let started = Instant::now();
 
+        // Taken before anything else in the invocation, module evaluation
+        // included, so every line this request causes carries the same id --
+        // and so a service call, which put an id here before this message was
+        // sent, continues its caller's trace instead of starting one.
+        let trace_id = self.take_or_mint_trace_id();
+
         // A flag left over from the previous execution would fail this one
         // before a line of the app's code ran.
         self.clear_termination();
 
         if self.module_id.is_none() {
-            if let Err(e) = self.init_module().await {
+            if let Err(e) = self.init_module_in_trace(trace_id.clone()).await {
                 // A rate-limit cut-off can fire while the module is still
                 // being evaluated, and leaves the same flag set as a timeout.
                 self.clear_termination();
@@ -2172,6 +2261,7 @@ impl AppRuntime {
                     started.elapsed(),
                     RequestOutcome::Error,
                     RequestFacts {
+                        trace_id,
                         method: method.clone(),
                         url: url.clone(),
                         error: e.to_string(),
@@ -2184,7 +2274,7 @@ impl AppRuntime {
             }
         }
 
-        self.begin_invocation();
+        self.begin_invocation(trace_id);
         let outcome = self
             .answer_one_request(started, url, method, headers, body, response_tx)
             .await;
@@ -2220,6 +2310,7 @@ impl AppRuntime {
     ) -> Result<()> {
         let super::service_call::ServiceCall {
             path,
+            trace_id,
             binding,
             url,
             method,
@@ -2239,10 +2330,18 @@ impl AppRuntime {
             binding
         );
         self.call_path.replace(path);
+        // Handed over the same way the chain is, and for the same reason it
+        // is not a header: the callee's invocation is one hop of the caller's,
+        // so its log lines belong in the caller's trace. `execute_fetch` takes
+        // this instead of minting, and clears it either way -- an id left here
+        // would attach the next inbound request this isolate served to a trace
+        // it has nothing to do with.
+        self.inherited_trace_id = Some(trace_id);
         let outcome = self
             .execute_fetch(url, method, headers, body, response_tx)
             .await;
         self.call_path.borrow_mut().clear();
+        self.inherited_trace_id = None;
         outcome
     }
 
@@ -2285,7 +2384,17 @@ impl AppRuntime {
         // value and they are what a trace is read by: an operator looking for
         // the invocation that answered 500 has the URL and the method, and
         // nothing else about a request is stable enough to search on.
+        // Kept because `facts` is moved into the record below and the stream,
+        // which is opened afterwards, has to be able to say which request its
+        // body belongs to.
+        let stream_target = url.clone();
+
         let facts = RequestFacts {
+            // Read from the isolate rather than passed down: the invocation is
+            // already running by the time this is built, and taking it from
+            // the one place that holds it is what keeps the trace record and
+            // the log lines naming the same id.
+            trace_id: self.current_trace_id(),
             method: method.clone(),
             url: url.clone(),
             ..RequestFacts::default()
@@ -2478,7 +2587,7 @@ impl AppRuntime {
         // the answer to a HEAD, a WebSocket upgrade -- which is not the same
         // as an empty one, so nothing is invented here.
         let response_body = if response.stream {
-            match self.begin_response_stream() {
+            match self.begin_response_stream(stream_target) {
                 Ok(reader) => ResponseBody::Stream(reader),
                 Err(e) => {
                     // Nothing has reached the client yet, so this is still an
@@ -2639,9 +2748,23 @@ impl AppRuntime {
     /// moment. Published afterwards, `return new Response(upstream.body)` would
     /// have its upstream aborted at the request's deadline -- 30 seconds by
     /// default -- part-way through a body that was allowed to take minutes.
-    fn begin_response_stream(&mut self) -> Result<super::response_stream::StreamReader> {
+    fn begin_response_stream(
+        &mut self,
+        target: String,
+    ) -> Result<super::response_stream::StreamReader> {
         let deadline = Instant::now() + Duration::from_millis(self.stream_timeout_ms);
-        let (id, reader) = self.response_streams().borrow_mut().open(deadline);
+        // The tenant and the invocation are copied into the stream here, at
+        // the last moment both are known: the producer runs on from the pump
+        // after this invocation has ended, and by then the isolate has no
+        // current trace to ask. Without them, the line that says this client's
+        // body stopped short carries neither the application nor the request
+        // it belongs to.
+        let owner = StreamOwner {
+            tenant: self.app_id.clone(),
+            trace_id: self.current_trace_id(),
+            target,
+        };
+        let (id, reader) = self.response_streams().borrow_mut().open(deadline, owner);
 
         self.execution_deadline.set(Some(deadline));
 
@@ -2782,7 +2905,11 @@ impl AppRuntime {
                 // as a failure so that each client's read fails rather than
                 // succeeding on a body that simply stopped.
                 let reason = cut_off.as_error(&self.app_id, self.stream_timeout_ms);
-                self.fail_open_response_streams(&reason.to_string());
+                // Which ceiling was crossed, said the way a request cut off by
+                // the same watchdog says it: an operator reading "cpu-limit"
+                // knows to look at what the producer computes, and one reading
+                // "execution-timeout" knows to look at what it waits for.
+                self.fail_open_response_streams(&reason.to_string(), cut_off.verdict());
                 return;
             }
 
@@ -2827,7 +2954,17 @@ impl AppRuntime {
                     open,
                     reason
                 );
-                self.fail_open_response_streams(&reason);
+                self.fail_open_response_streams(
+                    &reason,
+                    if rate_limited {
+                        InvocationOutcome::RateLimited
+                    } else {
+                        // The isolate stopped producing and named no ceiling.
+                        // Whatever V8 reported, the code that was running was
+                        // the application's.
+                        InvocationOutcome::ApplicationError
+                    },
+                );
                 return;
             }
 
@@ -2858,6 +2995,7 @@ impl AppRuntime {
                 self.fail_open_response_streams(
                     "the handler stopped producing this body without ending it, and nothing in \
                      the isolate can wake it again",
+                    InvocationOutcome::ApplicationError,
                 );
                 return;
             }
@@ -2911,10 +3049,14 @@ impl AppRuntime {
             tracing::warn!(
                 target: "app",
                 app_id = %self.app_id,
+                // The request this body was answering, so the line lands in
+                // the trace an operator is already reading rather than in the
+                // application's log at large.
+                trace_id = tally.as_ref().map(|t| t.owner.trace_id.as_str()).unwrap_or_default(),
                 stream_id = id,
                 budget_ms = self.stream_timeout_ms,
-                chunks = tally.map(|t| t.chunks).unwrap_or(0),
-                bytes = tally.map(|t| t.bytes).unwrap_or(0),
+                chunks = tally.as_ref().map(|t| t.chunks).unwrap_or(0),
+                bytes = tally.as_ref().map(|t| t.bytes).unwrap_or(0),
                 "A response stream of app {} was closed after {}ms, having sent {} bytes in {} \
                  chunk(s): it is past stream_timeout_ms. The client was answered 200 long ago, \
                  so what it sees is a transfer that fails part-way rather than an error page. \
@@ -2922,24 +3064,37 @@ impl AppRuntime {
                  expected",
                 self.app_id,
                 self.stream_timeout_ms,
-                tally.map(|t| t.bytes).unwrap_or(0),
-                tally.map(|t| t.chunks).unwrap_or(0)
+                tally.as_ref().map(|t| t.bytes).unwrap_or(0),
+                tally.as_ref().map(|t| t.chunks).unwrap_or(0)
             );
+            if let Some(tally) = tally {
+                // A wall-clock ceiling the platform enforced, exactly as a
+                // request that ran past `timeout_ms` is -- the budget crossed
+                // is `stream_timeout_ms`, which the reason names.
+                record_broken_body(&tally, &reason, InvocationOutcome::ExecutionTimeout);
+            }
             self.cancel_producer(*id, &reason);
         }
 
         for id in &abandoned {
             let tally = self.response_streams().borrow_mut().close(*id);
+            // Nothing is recorded against the invocation here, and that is the
+            // difference between this arm and the one above: the client hung
+            // up. It got what it asked for or stopped wanting it, and the
+            // platform answered everything it was asked to. A verdict here
+            // would report a failure to whoever deployed the application for
+            // something a browser did.
             tracing::debug!(
                 target: "app",
                 app_id = %self.app_id,
+                trace_id = tally.as_ref().map(|t| t.owner.trace_id.as_str()).unwrap_or_default(),
                 stream_id = id,
-                chunks = tally.map(|t| t.chunks).unwrap_or(0),
-                bytes = tally.map(|t| t.bytes).unwrap_or(0),
+                chunks = tally.as_ref().map(|t| t.chunks).unwrap_or(0),
+                bytes = tally.as_ref().map(|t| t.bytes).unwrap_or(0),
                 "The client of one of app {}'s response streams went away after {} bytes; the \
                  producer is being cancelled rather than left writing into nothing",
                 self.app_id,
-                tally.map(|t| t.bytes).unwrap_or(0)
+                tally.as_ref().map(|t| t.bytes).unwrap_or(0)
             );
             self.cancel_producer(*id, "the client stopped reading this response");
         }
@@ -2949,8 +3104,8 @@ impl AppRuntime {
 
     /// End every open stream as a failure, because the isolate can no longer
     /// produce any of them.
-    fn fail_open_response_streams(&mut self, reason: &str) {
-        self.fail_open_response_streams_for_client(reason);
+    fn fail_open_response_streams(&mut self, reason: &str, outcome: InvocationOutcome) {
+        self.fail_open_response_streams_for_client(reason, outcome);
         self.release_stream_producers();
     }
 
@@ -2960,15 +3115,23 @@ impl AppRuntime {
     /// the isolate's half there would buy nothing -- the isolate and every timer
     /// in it are about to be freed together -- and running a script inside a
     /// destructor is a risk taken for no gain.
-    fn fail_open_response_streams_for_client(&mut self, reason: &str) {
+    fn fail_open_response_streams_for_client(&mut self, reason: &str, outcome: InvocationOutcome) {
         // The ids are taken out of the borrow before anything is closed:
         // holding the registry's borrow across the loop would panic on the
         // first close, which is a `borrow_mut` of the same cell.
         let open = self.response_streams().borrow().ids();
         for id in open {
-            self.response_streams()
+            let tally = self
+                .response_streams()
                 .borrow_mut()
                 .close_with_failure(id, reason.to_string());
+            // Each of these clients was answered 200 and is not going to get
+            // the rest of its body, and each one's invocation is on record as
+            // having succeeded. One record per client, because one client per
+            // stream is what this list is.
+            if let Some(tally) = tally {
+                record_broken_body(&tally, reason, outcome);
+            }
         }
     }
 
@@ -3062,18 +3225,74 @@ impl AppRuntime {
         messages: Vec<LeasedMessage>,
     ) -> Result<BatchOutcome> {
         self.clear_termination();
+        let trace_id = self.take_or_mint_trace_id();
 
         if self.module_id.is_none() {
-            if let Err(e) = self.init_module().await {
+            if let Err(e) = self.init_module_in_trace(trace_id.clone()).await {
                 self.clear_termination();
                 return Err(e);
             }
         }
 
-        self.begin_invocation();
-        let outcome = self.run_one_batch(queue, messages).await;
+        let started = Instant::now();
+        self.begin_invocation(trace_id.clone());
+        let delivered = messages.len();
+        let outcome = self.run_one_batch(queue.clone(), messages).await;
         self.end_invocation();
+        self.record_batch_invocation(&queue, trace_id, started, delivered, &outcome);
         outcome
+    }
+
+    /// File one queue batch as an invocation, so it can be found the way a
+    /// request can.
+    ///
+    /// The counters for a batch are kept by `queue_consumer.rs`, which is
+    /// where the acknowledgements are decided; this is the record that names
+    /// *one* batch and carries its id, and without it every log line a queue
+    /// handler writes carries a trace id that joins to nothing. What only this
+    /// side knows is the same thing it knows about a request: whether the
+    /// batch failed because the handler threw or because the platform cut the
+    /// isolate off, which is a distinction no redelivery count can recover.
+    fn record_batch_invocation(
+        &self,
+        queue: &str,
+        trace_id: String,
+        started: Instant,
+        delivered: usize,
+        outcome: &Result<BatchOutcome>,
+    ) {
+        let duration = started.elapsed();
+        let mut trace = InvocationTrace::new(&self.app_id, InvocationKind::QueueBatch);
+        trace.trace_id = trace_id;
+        trace.started_us = (now_us() - (duration.as_micros().min(i64::MAX as u128) as i64)).max(0);
+        trace.duration = duration;
+        trace.target = queue.to_string();
+        let failed = match outcome {
+            // The handler ran and answered for the batch. Messages it did not
+            // complete are redelivered rather than lost, so the invocation
+            // itself is not a failure -- the count is what an operator reads.
+            Ok(outcome) => {
+                trace.outcome = InvocationOutcome::Ok;
+                outcome.failed.len()
+            }
+            // The batch never ran, or was cut off part-way. A cut-off names
+            // its own ceiling; anything else is the application.
+            Err(e) => {
+                trace.outcome = self
+                    .metrics
+                    .take_cut_off(&self.app_id, duration)
+                    .unwrap_or(InvocationOutcome::ApplicationError);
+                trace.error = e.to_string();
+                delivered
+            }
+        };
+        trace
+            .attributes
+            .insert("delivered".to_string(), delivered.to_string());
+        trace
+            .attributes
+            .insert("failed".to_string(), failed.to_string());
+        self.metrics.record_invocation(trace);
     }
 
     /// One batch, split out so that the cut-off path gives back what the
@@ -3191,18 +3410,54 @@ impl AppRuntime {
     /// app lives on and stop every request on that thread.
     pub async fn execute_scheduled(&mut self, cron: String, scheduled_time_ms: i64) -> Result<()> {
         self.clear_termination();
+        let trace_id = self.take_or_mint_trace_id();
 
         if self.module_id.is_none() {
-            if let Err(e) = self.init_module().await {
+            if let Err(e) = self.init_module_in_trace(trace_id.clone()).await {
                 self.clear_termination();
                 return Err(e);
             }
         }
 
-        self.begin_invocation();
-        let outcome = self.run_one_tick(cron, scheduled_time_ms).await;
+        let started = Instant::now();
+        self.begin_invocation(trace_id.clone());
+        let outcome = self.run_one_tick(cron.clone(), scheduled_time_ms).await;
         self.end_invocation();
+        self.record_tick_invocation(&cron, trace_id, started, &outcome);
         outcome
+    }
+
+    /// File one cron tick as an invocation.
+    ///
+    /// A tick is the one kind of invocation nobody is waiting on: there is no
+    /// client to be answered and no message to be redelivered, so a tick that
+    /// failed leaves no trace anywhere else at all. This record and the lines
+    /// the handler wrote under the same id are the whole of what an operator
+    /// has to work from.
+    fn record_tick_invocation(
+        &self,
+        cron: &str,
+        trace_id: String,
+        started: Instant,
+        outcome: &Result<()>,
+    ) {
+        let duration = started.elapsed();
+        let mut trace = InvocationTrace::new(&self.app_id, InvocationKind::CronTick);
+        trace.trace_id = trace_id;
+        trace.started_us = (now_us() - (duration.as_micros().min(i64::MAX as u128) as i64)).max(0);
+        trace.duration = duration;
+        trace.target = cron.to_string();
+        match outcome {
+            Ok(()) => trace.outcome = InvocationOutcome::Ok,
+            Err(e) => {
+                trace.outcome = self
+                    .metrics
+                    .take_cut_off(&self.app_id, duration)
+                    .unwrap_or(InvocationOutcome::ApplicationError);
+                trace.error = e.to_string();
+            }
+        }
+        self.metrics.record_invocation(trace);
     }
 
     /// One tick, split out for the same reason as [`Self::run_one_batch`].
@@ -3316,7 +3571,7 @@ impl AppRuntime {
         // A flag left over from a previous cut-off would fail this message
         // before a line of the application's code ran.
         self.clear_termination();
-        self.begin_invocation();
+        self.begin_invocation(new_trace_id());
 
         let code = format!(
             r#"
@@ -3400,7 +3655,7 @@ impl AppRuntime {
             ws_id
         );
 
-        self.begin_invocation();
+        self.begin_invocation(new_trace_id());
         let deadline = self.arm_execution_budget();
         let cut_off = self.watchdog.arm(
             deadline,
@@ -3527,6 +3782,10 @@ impl Drop for AppRuntime {
             self.fail_open_response_streams_for_client(
                 "the application's isolate was taken off this node while the body was still \
                  being produced",
+                // The platform took the isolate away -- an unload, a
+                // redeployment, a thread that lost it to a panic. Nothing the
+                // application did ended these bodies.
+                InvocationOutcome::InternalError,
             );
         }
         tracing::debug!("Dropping runtime for app: {}", self.app_id);

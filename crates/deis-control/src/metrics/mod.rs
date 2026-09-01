@@ -18,6 +18,12 @@ pub struct NodesMetrics {
     pub active: usize,
     pub connected: usize,
     pub registered: usize,
+    /// Nodes holding a channel open that have not been heard from within
+    /// `heartbeat_timeout`. Counted apart from `disconnected` because the two
+    /// send an operator to different places: a disconnected node hung up and
+    /// is presumably restarting, an unresponsive one is still holding a
+    /// connection while its host or its network has stopped answering.
+    pub unresponsive: usize,
     pub disconnected: usize,
     pub by_type: std::collections::HashMap<String, usize>,
 }
@@ -68,6 +74,7 @@ impl MetricsCollector {
         let mut active = 0;
         let mut connected = 0;
         let mut registered = 0;
+        let mut unresponsive = 0;
         let mut disconnected = 0;
         let mut by_type = std::collections::HashMap::new();
 
@@ -80,6 +87,7 @@ impl MetricsCollector {
                 NodeState::Active => active += 1,
                 NodeState::Connected => connected += 1,
                 NodeState::Registered => registered += 1,
+                NodeState::Unresponsive => unresponsive += 1,
                 NodeState::Disconnected => disconnected += 1,
             }
 
@@ -96,6 +104,7 @@ impl MetricsCollector {
             active,
             connected,
             registered,
+            unresponsive,
             disconnected,
             by_type,
         }

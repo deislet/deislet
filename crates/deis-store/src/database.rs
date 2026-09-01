@@ -144,6 +144,56 @@
 //! occupy more than its own `tenant_connections` blocking threads, however
 //! many requests it sends.
 //!
+//! # What a value looks like on the wire
+//!
+//! Parameters arrive as a JSON array and rows go back as JSON objects. That
+//! JSON is not an internal encoding: it is the text an application's
+//! `JSON.stringify` wrote and the text its `JSON.parse` reads, so every value
+//! in it has to be something JavaScript can hold. It also has to be something
+//! this service will take back, because read a row, change a field, write it
+//! back is the ordinary way an application uses a database, and a form that
+//! only travels outwards makes that impossible for every table that has such
+//! a column in it.
+//!
+//! NULL, REAL and TEXT need no decision - `null`, a number and a string say
+//! them exactly. Two cases do, and both are decided here, with the same
+//! spelling read and written:
+//!
+//! * **A BLOB is an array of byte values.** `X'DEADBEEF'` comes back as
+//!   `[222, 173, 190, 239]`, and an array of whole numbers 0 to 255 binds as
+//!   a BLOB. A JSON string could not do it: a string is already TEXT, and
+//!   reading base64 out of one would turn a tenant's ordinary text into bytes
+//!   the moment it happened to look like base64.
+//! * **An INTEGER past [`MAX_SAFE_JSON_INTEGER`] is a decimal string.**
+//!   9007199254740993 comes back as `"9007199254740993"`, and a string
+//!   spelled exactly the way this service would spell such an integer binds
+//!   as INTEGER. A JSON number cannot carry it: JavaScript has one numeric
+//!   type and it is a double, so `JSON.parse` turns 9007199254740993 into
+//!   9007199254740992, and the application writes that different number back
+//!   with nothing anywhere reporting an error. Integers inside the safe range
+//!   stay JSON numbers, so an id, a count and a millisecond timestamp are
+//!   what they have always been.
+//!
+//! What this still does not preserve, because JSON has no way to say it and
+//! SQLite has no type for it either:
+//!
+//! * **A boolean** binds as INTEGER 1 or 0 and reads back as 1 or 0. SQLite
+//!   has no boolean type to remember which it was.
+//! * **A date** is whatever the application turned it into - `JSON.stringify`
+//!   renders a `Date` as an ISO-8601 string, so it is stored and returned as
+//!   TEXT and has to be parsed again on arrival.
+//! * **A REAL with no fractional part** goes out as `2.0` and comes back
+//!   through JavaScript as `2`, which binds as INTEGER; a column with REAL
+//!   affinity stores it as `2.0` again, one with no affinity keeps the
+//!   integer.
+//! * **NaN and the infinities** have no JSON spelling at all and are returned
+//!   as `null`. A bound parameter cannot produce one - they only come out of
+//!   arithmetic inside the statement.
+//! * **TEXT that is not valid UTF-8** is returned as an array of its bytes,
+//!   which is the BLOB spelling, so writing it back stores a BLOB. The bytes
+//!   survive; the storage class does not. Only SQL that bound a BLOB to a
+//!   TEXT column, or built one with `CAST`, can put such a value there.
+//!
 //! # Interactive transactions
 //!
 //! `Batch` runs several statements atomically, but the caller has to know all
@@ -655,6 +705,11 @@ fn collect_rows(
     let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
     let mut out = Vec::new();
     let mut bytes = 0usize;
+    // Cells that had to leave as decimal strings because a JSON number would
+    // have lost their low digits. Counted rather than logged one by one: a
+    // result set may hold ten thousand of them, and what an operator needs is
+    // to know this result set is one an application will see strings in.
+    let mut wide_integers = 0usize;
     while let Some(row) = rows.next()? {
         if out.len() >= limits.max_result_rows {
             return Err(limits.too_many_rows());
@@ -666,9 +721,20 @@ fn collect_rows(
             if bytes > limits.max_result_bytes {
                 return Err(limits.too_many_bytes());
             }
+            if matches!(value, ValueRef::Integer(i) if !fits_json_number(i)) {
+                wide_integers += 1;
+            }
             object.insert(name.clone(), sql_to_json(value));
         }
         out.push(JsonValue::Object(object));
+    }
+    if wide_integers > 0 {
+        tracing::debug!(
+            cells = wide_integers,
+            safe_ceiling = MAX_SAFE_JSON_INTEGER,
+            "this result set carries integers past 2^53 - 1, which go out as decimal strings; a \
+             JSON number would reach the application as a different number"
+        );
     }
     Ok(ResultSet {
         columns,
@@ -1816,11 +1882,81 @@ fn check_transaction_sql(sql: &str) -> StoreResult<String> {
     Ok(sql)
 }
 
+/// The largest integer magnitude an application can read out of JSON without
+/// losing digits off it.
+///
+/// 2^53 - 1, which is JavaScript's `Number.MAX_SAFE_INTEGER`. Every JSON
+/// number an application parses becomes an IEEE-754 double, and past this a
+/// double can no longer tell one integer from the next: 9007199254740993
+/// parses to 9007199254740992. So this is the line where [`sql_to_json`]
+/// stops writing a number and writes a decimal string, and where
+/// [`decode_params`] reads one back.
+const MAX_SAFE_JSON_INTEGER: i64 = 9_007_199_254_740_991;
+
+/// Whether an integer can travel as a JSON number without an application
+/// silently reading a different one.
+///
+/// Written as a range rather than `abs()`: `i64::MIN.abs()` overflows, and
+/// this is asked about every integer cell of every result set.
+fn fits_json_number(value: i64) -> bool {
+    (-MAX_SAFE_JSON_INTEGER..=MAX_SAFE_JSON_INTEGER).contains(&value)
+}
+
+/// Bind one JSON string, which is TEXT except for the single spelling this
+/// service uses for an integer too large for a JSON number.
+///
+/// The exception is exactly as wide as [`sql_to_json`]'s: the string has to be
+/// the digits `i64::to_string` would have produced, so a leading `+`, a
+/// leading zero, or any integer a JSON number could have carried is the TEXT
+/// it looks like. Without it a big id is a one-way value - it can be read and
+/// never written back - and with anything wider than it a tenant storing the
+/// digits of a large number as text would find them coming back as an integer.
+fn bind_string(text: String) -> SqlValue {
+    match text.parse::<i64>() {
+        Ok(value) if !fits_json_number(value) && value.to_string() == text => {
+            SqlValue::Integer(value)
+        }
+        _ => SqlValue::Text(text),
+    }
+}
+
+/// Bind one JSON array as a BLOB, one element per byte.
+///
+/// This is the shape [`sql_to_json`] hands a BLOB back in, and the reason an
+/// array is bindable at all: refusing arrays meant a row with a BLOB column
+/// could be read but never written back, which is read-modify-write - the
+/// ordinary shape of an application's database use - broken for the whole
+/// table. There is no other spelling to offer, since a JSON string is TEXT and
+/// decoding base64 out of one would turn a tenant's text into bytes.
+///
+/// Elements are required to be whole numbers in range rather than rounded or
+/// truncated into one: a byte array is content, and quietly storing 2 where
+/// the caller wrote 2.7 corrupts it in the one direction nothing downstream
+/// can detect.
+fn decode_blob(index: usize, items: Vec<JsonValue>) -> StoreResult<SqlValue> {
+    let mut bytes = Vec::with_capacity(items.len());
+    for (offset, item) in items.into_iter().enumerate() {
+        match item.as_u64() {
+            Some(byte) if byte <= u64::from(u8::MAX) => bytes.push(byte as u8),
+            _ => {
+                return Err(StoreError::InvalidArgument(format!(
+                    "params[{index}][{offset}] is {item}; an array parameter is a BLOB written one \
+                     byte at a time, so every element has to be an integer from 0 to 255"
+                )));
+            }
+        }
+    }
+    Ok(SqlValue::Blob(bytes))
+}
+
 /// Decode the JSON parameter array that storage.proto carries as a string.
 ///
-/// Only scalars are accepted: SQLite has no array or object type, and
-/// silently stringifying a nested value would store something the tenant never
-/// asked for and cannot get back.
+/// Every shape [`sql_to_json`] can produce is accepted here, because the two
+/// are the two halves of one round trip: an application reads a row, changes
+/// one field and writes the row back, and anything it cannot hand back is a
+/// column it can never update. An object is the one exception, and it is not
+/// one this service can produce: SQLite has no type to put it in, and
+/// stringifying it would store something the tenant never asked for.
 fn decode_params(params: Option<&str>) -> StoreResult<Vec<SqlValue>> {
     let Some(raw) = params else {
         return Ok(Vec::new());
@@ -1841,7 +1977,8 @@ fn decode_params(params: Option<&str>) -> StoreResult<Vec<SqlValue>> {
         .map(|(index, item)| match item {
             JsonValue::Null => Ok(SqlValue::Null),
             JsonValue::Bool(b) => Ok(SqlValue::Integer(i64::from(b))),
-            JsonValue::String(s) => Ok(SqlValue::Text(s)),
+            JsonValue::String(s) => Ok(bind_string(s)),
+            JsonValue::Array(items) => decode_blob(index, items),
             JsonValue::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     Ok(SqlValue::Integer(i))
@@ -1853,24 +1990,30 @@ fn decode_params(params: Option<&str>) -> StoreResult<Vec<SqlValue>> {
                     )))
                 }
             }
-            other => Err(StoreError::InvalidArgument(format!(
-                "params[{index}] is {}, only null, boolean, number and string are bindable",
-                match other {
-                    JsonValue::Array(_) => "an array",
-                    JsonValue::Object(_) => "an object",
-                    _ => "unsupported",
-                }
+            JsonValue::Object(_) => Err(StoreError::InvalidArgument(format!(
+                "params[{index}] is an object, and SQLite has no type to hold one; bind the fields \
+                 it is made of, or its text if the column is meant to keep JSON"
             ))),
         })
         .collect()
 }
 
-/// Map one SQLite cell to JSON. Blobs become arrays of byte values, which is
-/// the only lossless shape that survives `JSON.parse` on the runtime side.
+/// Map one SQLite cell to JSON, in a shape [`decode_params`] takes back.
+///
+/// The two spellings that are not the obvious one are the two an application
+/// could otherwise never write back: a blob becomes an array of byte values,
+/// and an integer past [`MAX_SAFE_JSON_INTEGER`] becomes a decimal string.
+/// See the wire section of the module documentation for why each is the only
+/// choice available.
 fn sql_to_json(value: ValueRef<'_>) -> JsonValue {
     match value {
         ValueRef::Null => JsonValue::Null,
-        ValueRef::Integer(i) => JsonValue::from(i),
+        ValueRef::Integer(i) if fits_json_number(i) => JsonValue::from(i),
+        // Past the last integer a double can tell from its neighbour, a JSON
+        // number would be read as a different number - with no error
+        // anywhere - and written back as that different number. The digits
+        // are exact, and decode_params reads this spelling back as INTEGER.
+        ValueRef::Integer(i) => JsonValue::String(i.to_string()),
         ValueRef::Real(f) => serde_json::Number::from_f64(f)
             .map(JsonValue::Number)
             // NaN and the infinities have no JSON spelling. They cannot be
@@ -2614,8 +2757,233 @@ mod tests {
         ));
     }
 
+    /// The one row of a successful `Query`, parsed out of the JSON string the
+    /// response carries. Going through the wire form is the point of these
+    /// tests: what an application can write back is whatever this text says,
+    /// not what the row looked like inside the store.
+    fn row_of(response: &QueryResponse) -> JsonValue {
+        assert!(response.success, "query failed: {:?}", response.error);
+        let rows: JsonValue = serde_json::from_str(&response.rows).unwrap();
+        rows.as_array().unwrap()[0].clone()
+    }
+
+    /// Read a row, change nothing, write it back. It is the ordinary shape of
+    /// an application's database use, and it has to work for every value this
+    /// service can hand out: a value that can only be read is a column an
+    /// application can never update.
+    ///
+    /// Both halves go through the wire form deliberately. The JSON string the
+    /// `Query` answers with is the JSON string the following `Execute` binds
+    /// from, which is exactly what the runtime does with it.
+    #[tokio::test]
+    async fn every_value_a_query_hands_back_can_be_written_straight_back() {
+        let (_dir, svc) = service();
+        let a = tenant("app-one.production");
+        svc.exec_statement(
+            &a,
+            "CREATE TABLE things(id INTEGER PRIMARY KEY, body BLOB, big INTEGER, note TEXT, \
+             ratio REAL, absent TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        svc.exec_statement(
+            &a,
+            "INSERT INTO things(id, body, big, note, ratio, absent) \
+             VALUES(1, X'DEADBEEF00FF', 9007199254740993, 'hello', 2.5, NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let columns = "body, big, note, ratio, absent";
+        let read = svc
+            .run_query(
+                &a,
+                &format!("SELECT {columns} FROM things WHERE id = 1"),
+                None,
+            )
+            .await
+            .unwrap();
+        let row = row_of(&read);
+
+        // The two spellings that are not the obvious one, and the reason
+        // they are not: a blob has no JSON scalar to be, and 9007199254740993
+        // read as a JSON number would reach the application as
+        // 9007199254740992.
+        assert_eq!(row["body"], serde_json::json!([222, 173, 190, 239, 0, 255]));
+        assert_eq!(row["big"], serde_json::json!("9007199254740993"));
+
+        let params = serde_json::json!([
+            row["body"],
+            row["big"],
+            row["note"],
+            row["ratio"],
+            row["absent"]
+        ])
+        .to_string();
+        let written = svc
+            .run_execute(
+                &a,
+                &format!("INSERT INTO things(id, {columns}) VALUES(2, ?1, ?2, ?3, ?4, ?5)"),
+                Some(&params),
+            )
+            .await
+            .unwrap();
+        assert!(written.success, "write back failed: {:?}", written.error);
+
+        let again = svc
+            .run_query(
+                &a,
+                &format!("SELECT {columns} FROM things WHERE id = 2"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(row_of(&again), row, "the row came back changed");
+
+        // Same bytes and same digits is most of it; the storage class has to
+        // survive too, or the next `typeof` or comparison in the tenant's own
+        // SQL answers differently than it did for the row it was copied from.
+        let types = svc
+            .run_query(
+                &a,
+                "SELECT typeof(body) AS body, typeof(big) AS big, typeof(note) AS note, \
+                 typeof(ratio) AS ratio, typeof(absent) AS absent FROM things WHERE id = 2",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row_of(&types),
+            serde_json::json!({
+                "body": "blob",
+                "big": "integer",
+                "note": "text",
+                "ratio": "real",
+                "absent": "null",
+            })
+        );
+    }
+
+    /// The integer spelling has to be the parameter's own storage class, not
+    /// something a column's affinity rescues afterwards. Bound to a bare
+    /// expression there is no column and no affinity, so this is the rule in
+    /// [`bind_string`] and nothing else.
+    #[tokio::test]
+    async fn a_wide_integer_binds_as_an_integer_with_no_column_to_help_it() {
+        let (_dir, svc) = service();
+        let a = tenant("app-one.production");
+        let out = svc
+            .run_query(
+                &a,
+                "SELECT typeof(?1) AS class, ?1 + 0 AS value",
+                Some(r#"["-9007199254740993"]"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row_of(&out),
+            serde_json::json!({ "class": "integer", "value": "-9007199254740993" })
+        );
+    }
+
+    /// Every storage class a cell can hold, out and straight back in, checked
+    /// as the pair of functions that carry it rather than through a database.
     #[test]
-    fn decodes_scalar_params_only() {
+    fn the_wire_form_of_a_cell_is_a_form_that_binds_back() {
+        let cases = [
+            (SqlValue::Null, "null"),
+            (SqlValue::Integer(0), "0"),
+            (SqlValue::Integer(-1), "-1"),
+            // The last integer a double still holds exactly, on both sides of
+            // zero: a number here, a string one step further out.
+            (SqlValue::Integer(MAX_SAFE_JSON_INTEGER), "9007199254740991"),
+            (
+                SqlValue::Integer(-MAX_SAFE_JSON_INTEGER),
+                "-9007199254740991",
+            ),
+            (
+                SqlValue::Integer(MAX_SAFE_JSON_INTEGER + 1),
+                "\"9007199254740992\"",
+            ),
+            (SqlValue::Integer(i64::MAX), "\"9223372036854775807\""),
+            (SqlValue::Integer(i64::MIN), "\"-9223372036854775808\""),
+            (SqlValue::Real(2.5), "2.5"),
+            (SqlValue::Text("hello".into()), "\"hello\""),
+            (SqlValue::Blob(Vec::new()), "[]"),
+            (SqlValue::Blob(vec![0, 127, 255]), "[0,127,255]"),
+        ];
+        for (value, expected) in cases {
+            let wire = sql_to_json(ValueRef::from(&value));
+            assert_eq!(wire.to_string(), expected, "wire form of {value:?}");
+            let back = decode_params(Some(&JsonValue::Array(vec![wire]).to_string())).unwrap();
+            assert_eq!(back, vec![value.clone()], "{value:?} did not survive");
+        }
+    }
+
+    #[test]
+    fn decodes_blobs_and_wide_integers_from_the_shapes_a_query_returns() {
+        assert_eq!(
+            decode_params(Some(r#"[[222, 173, 190, 239], [], "9007199254740992"]"#)).unwrap(),
+            vec![
+                SqlValue::Blob(vec![222, 173, 190, 239]),
+                SqlValue::Blob(Vec::new()),
+                SqlValue::Integer(9_007_199_254_740_992),
+            ]
+        );
+        // A string is TEXT unless it is exactly how this service spells an
+        // integer no JSON number can carry. Anything a number could have
+        // carried, and any other spelling of one that could not, is the text
+        // it looks like - otherwise a tenant keeping digits in a TEXT column
+        // would find them coming back as an integer.
+        for text in [
+            "12",
+            "9007199254740991",
+            "+9007199254740992",
+            "09007199254740992",
+            " 9007199254740992",
+            "9007199254740992.0",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                decode_params(Some(&serde_json::json!([text]).to_string())).unwrap(),
+                vec![SqlValue::Text(text.to_string())],
+                "{text} should bind as text"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_array_elements_that_are_not_bytes() {
+        for bad in [
+            "[[256]]",
+            "[[-1]]",
+            "[[2.7]]",
+            "[[\"ff\"]]",
+            "[[null]]",
+            "[[[1]]]",
+            "[[{}]]",
+        ] {
+            let message = match decode_params(Some(bad)) {
+                Err(StoreError::InvalidArgument(m)) => m,
+                other => panic!("{bad} should be refused, got {other:?}"),
+            };
+            // The offending element, not just the parameter: a byte array is
+            // built in a loop and "one of these is wrong" does not locate it.
+            assert!(
+                message.contains("params[0][0]"),
+                "{bad} was refused without naming the element: {message}"
+            );
+        }
+        assert!(matches!(
+            decode_params(Some(r#"[{"a": 1}]"#)),
+            Err(StoreError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn decodes_scalar_params() {
         assert!(decode_params(None).unwrap().is_empty());
         assert!(decode_params(Some("")).unwrap().is_empty());
         assert_eq!(
@@ -2628,7 +2996,7 @@ mod tests {
                 SqlValue::Integer(1),
             ]
         );
-        for bad in [r#"{"a":1}"#, "[[1]]", r#"[{"a":1}]"#, "not json"] {
+        for bad in [r#"{"a":1}"#, r#"[{"a":1}]"#, "not json"] {
             assert!(
                 matches!(
                     decode_params(Some(bad)),

@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::config::ExecutionLimits;
+    use crate::logging::{LogBuffer, RuntimeLayer};
     use crate::runtime::bindings::{ServiceDeclaration, ServiceEndpoints, ServiceWiring};
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::metrics::{
@@ -10,6 +11,7 @@ mod tests {
     use crate::runtime::queue_client::LeasedMessage;
     use crate::runtime::{ResponseBody, ServiceRouter};
     use std::collections::HashMap;
+    use std::sync::Arc;
     use tokio::sync::oneshot;
 
     /// A response body as text.
@@ -5990,5 +5992,287 @@ export default function handler(context: any): Response {
             .expect("the isolate must serve again after a message was cut off");
         let (status, _, body) = rx.await.unwrap().unwrap();
         assert_eq!(status, 200, "{:?}", text(body));
+    }
+
+    // ---------------------------------------------------------------
+    // Which invocation a line belongs to
+    // ---------------------------------------------------------------
+
+    /// Collect what this node would ship, through the real layer.
+    ///
+    /// The whole chain and not a stand-in for it: `op_log` writes a `tracing`
+    /// event, [`RuntimeLayer`] turns it into the [`LogEntry`] the shipper
+    /// sends, and it is that layer which decides whether `trace_id` becomes a
+    /// column deis-telemetry can filter on or an ordinary field that
+    /// `deis logs --trace-id` will never match. A collector of the test's own
+    /// making would prove nothing about that.
+    ///
+    /// The guard is thread-local, which is enough here and only here: these
+    /// tests drive an isolate inline on the test's own thread. A test that
+    /// puts an isolate on a runtime thread has to read the trace records
+    /// instead, which are process-wide.
+    fn app_log() -> (Arc<LogBuffer>, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::prelude::*;
+
+        let buffer = Arc::new(LogBuffer::new(256));
+        let layer = RuntimeLayer::new(buffer.clone(), "node-under-test".to_string());
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        (buffer, guard)
+    }
+
+    /// The invocations one tenant recorded, taken out of the process-wide
+    /// recorder.
+    ///
+    /// Everything else that was buffered goes back: the recorder belongs to
+    /// the whole process and these tests share it, so a test that swallowed
+    /// another test's records would make that other test's failure look like
+    /// this one's.
+    fn traces_of(tenant: &str) -> Vec<crate::runtime::metrics::InvocationTrace> {
+        let recorded = recorder().traces().drain(usize::MAX);
+        let (mine, others): (Vec<_>, Vec<_>) = recorded
+            .into_iter()
+            .partition(|trace| trace.tenant == tenant);
+        if !others.is_empty() {
+            recorder().traces().requeue(others);
+        }
+        mine
+    }
+
+    /// A handler that says something in the request and something more in the
+    /// tail that runs after the response has gone.
+    const TALKATIVE_APP: &str = r#"
+        export default async function handler(context) {
+          console.log("serving the request");
+          context.waitUntil((async () => { console.log("and then the tail"); })());
+          return new Response("ok");
+        }
+    "#;
+
+    /// The join `deis trace` and `deis logs` are documented to make.
+    ///
+    /// `trace_id` was a column on both the log entry and the invocation record
+    /// and nothing on this platform ever set it, so `deis trace --trace-id`
+    /// matched nothing and the documented "one query joins a trace to its
+    /// logs" could not work at all. What has to hold is not that an id exists
+    /// but that it is the *same* id in both places, and that everything one
+    /// invocation wrote carries it -- including the `waitUntil` tail, which
+    /// runs after the client has been answered and is the easiest half to
+    /// leave behind.
+    #[tokio::test]
+    async fn a_requests_lines_and_its_trace_record_name_one_invocation() {
+        let (log, _guard) = app_log();
+        let mut runtime = streaming_runtime("traced.production", TALKATIVE_APP).await;
+
+        let (status, _, _) = answer_to(&mut runtime, "/hello").await;
+        assert_eq!(status, 200);
+
+        let traces = traces_of("traced.production");
+        let [invocation] = traces.as_slice() else {
+            panic!("one request is one invocation record, not {}", traces.len());
+        };
+        assert!(
+            !invocation.trace_id.is_empty(),
+            "an invocation with no id cannot be joined to anything it wrote"
+        );
+
+        let lines: Vec<_> = log
+            .drain(256)
+            .into_iter()
+            .filter(|entry| entry.app_id.as_deref() == Some("traced"))
+            .collect();
+        // Both halves of the invocation: what the handler said while the
+        // client was waiting, and what the tail said after it had been
+        // answered. The tail is the easy one to lose -- it runs past the
+        // response, on the same isolate every other request shares.
+        for said in ["serving the request", "and then the tail"] {
+            let entry = lines
+                .iter()
+                .find(|entry| entry.message == said)
+                .unwrap_or_else(|| {
+                    panic!("the application's line \"{said}\" never reached the shipper")
+                });
+            assert_eq!(
+                entry.trace_id.as_deref(),
+                Some(invocation.trace_id.as_str()),
+                "\"{said}\" was written by this invocation and has to be findable from its trace"
+            );
+        }
+
+        // Nothing may claim a different invocation. Lines with no id at all
+        // are correct and expected: the node writes some of its own about an
+        // application -- what its outbound policy is, how its isolate was
+        // built -- and those belong to no request.
+        for entry in &lines {
+            if let Some(carried) = &entry.trace_id {
+                assert_eq!(
+                    carried, &invocation.trace_id,
+                    "\"{}\" was filed under an invocation that is not the one running",
+                    entry.message
+                );
+            }
+        }
+    }
+
+    /// The same id, on the kind of invocation nobody is waiting on.
+    ///
+    /// A cron tick has no client and no message to redeliver, so its log lines
+    /// and its trace record are the whole of what an operator has. It was also
+    /// recording no invocation at all: the counters knew a tick had happened
+    /// and `deis trace` did not.
+    #[tokio::test]
+    async fn a_cron_tick_is_an_invocation_with_an_id_like_any_other() {
+        let code = r#"
+            export default {
+              async scheduled(event) { console.log("tick for " + event.cron); },
+            };
+        "#;
+        let (log, _guard) = app_log();
+        let mut runtime = streaming_runtime("ticked.production", code).await;
+
+        runtime
+            .execute_scheduled("*/5 * * * *".to_string(), 1_700_000_000_000)
+            .await
+            .expect("the tick runs");
+
+        let traces = traces_of("ticked.production");
+        let [invocation] = traces.as_slice() else {
+            panic!("one tick is one invocation record, not {}", traces.len());
+        };
+        assert_eq!(invocation.target, "*/5 * * * *");
+        assert!(!invocation.trace_id.is_empty());
+
+        let line = log
+            .drain(256)
+            .into_iter()
+            .find(|entry| entry.message.starts_with("tick for"))
+            .expect("the handler's line reaches the shipper");
+        assert_eq!(line.trace_id.as_deref(), Some(invocation.trace_id.as_str()));
+    }
+
+    /// And on the kind whose failure is a redelivery rather than an answer.
+    ///
+    /// A queue batch had counters and no invocation record at all: the node
+    /// knew how many messages it had handled and `deis trace` could not name a
+    /// single batch. The count belongs on the record too -- "the batch ran and
+    /// four of its twelve messages will come back" is one fact, and reading it
+    /// out of two counters a minute apart is not the same thing.
+    #[tokio::test]
+    async fn a_queue_batch_is_an_invocation_with_an_id_like_any_other() {
+        let code = r#"
+            export default {
+              async queue(batch) {
+                console.log("batch of " + batch.messages.length + " from " + batch.queue);
+                batch.messages[0].retry();
+              },
+            };
+        "#;
+        let (log, _guard) = app_log();
+        let mut runtime = streaming_runtime("batched.production", code).await;
+
+        let outcome = runtime
+            .execute_queue_batch(
+                "orders".to_string(),
+                vec![leased("m1", "a", 1), leased("m2", "b", 1)],
+            )
+            .await
+            .expect("the batch runs");
+        assert_eq!(outcome.failed, vec!["m1".to_string()]);
+
+        let traces = traces_of("batched.production");
+        let [invocation] = traces.as_slice() else {
+            panic!("one batch is one invocation record, not {}", traces.len());
+        };
+        assert_eq!(invocation.target, "orders");
+        assert!(!invocation.trace_id.is_empty());
+        assert_eq!(
+            invocation.attributes.get("delivered").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            invocation.attributes.get("failed").map(String::as_str),
+            Some("1"),
+            "a message going back to the queue is what an operator is looking for here"
+        );
+
+        let line = log
+            .drain(256)
+            .into_iter()
+            .find(|entry| entry.message.starts_with("batch of"))
+            .expect("the handler's line reaches the shipper");
+        assert_eq!(line.trace_id.as_deref(), Some(invocation.trace_id.as_str()));
+    }
+
+    /// What an operator is told when a client was promised a body and did not
+    /// get one.
+    ///
+    /// The line saying so carried no `app_id`, so it was shipped, stored, and
+    /// invisible to `deis logs <app>` -- and the invocation was on record as
+    /// `ok`, because it was recorded the moment the head went out. Between
+    /// them the platform answered "that request succeeded" while knowing it
+    /// had not, which is worse than answering nothing.
+    #[tokio::test]
+    async fn a_body_that_stops_short_is_said_where_the_request_can_be_found() {
+        let code = r#"
+            export default async function handler(context) {
+              let n = 0;
+              const stream = new ReadableStream({
+                pull(controller) {
+                  n += 1;
+                  if (n === 3) throw new Error("the third page could not be built");
+                  controller.enqueue("part" + n + " ");
+                },
+              });
+              return new Response(stream);
+            }
+        "#;
+        let (log, _guard) = app_log();
+        let mut runtime = streaming_runtime("truncated.production", code).await;
+
+        let (status, _, body) = answer_to(&mut runtime, "/half").await;
+        assert_eq!(status, 200, "the head had already been decided");
+        let (_, failure) = drain_stream(&mut runtime, body).await;
+        assert!(failure.is_some(), "the client's read fails, as it must");
+
+        let reported = log
+            .drain(256)
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .message
+                    .contains("failed after its head had already been sent")
+            })
+            .expect("the node has to say that a client's body stopped short");
+        assert_eq!(
+            reported.app_id.as_deref(),
+            Some("truncated"),
+            "without the application, `deis logs` cannot find this line at all"
+        );
+        let trace_id = reported
+            .trace_id
+            .clone()
+            .expect("and without the invocation, the request it belongs to cannot be found");
+
+        let traces = traces_of("truncated.production");
+        let answered = traces
+            .iter()
+            .find(|trace| trace.status == 200 && trace.error.is_empty())
+            .expect("the request that answered 200 is still on record, and still true");
+        assert_eq!(answered.trace_id, trace_id);
+
+        let broken = traces.iter().find(|trace| !trace.error.is_empty()).expect(
+            "and the body that did not arrive has to be on record too, or `deis trace` \
+                 reports this request as a success",
+        );
+        assert_eq!(broken.trace_id, trace_id, "both belong to one request");
+        assert_eq!(
+            broken.outcome,
+            crate::runtime::metrics::InvocationOutcome::ApplicationError,
+            "the producer threw; no ceiling was crossed and the platform stopped nothing"
+        );
+        assert!(broken.error.contains("the third page could not be built"));
+        assert_eq!(
+            broken.attributes.get("response_body").map(String::as_str),
+            Some("truncated")
+        );
     }
 }

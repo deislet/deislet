@@ -211,3 +211,138 @@ fn a_file_past_the_ceiling_is_refused_at_build_time() {
     let err = refusal(&text);
     assert!(err.contains(&MAX_RULES.to_string()), "{err}");
 }
+
+#[test]
+fn a_name_written_twice_in_one_block_is_sent_twice() {
+    // The defect, stated as a test: a response's header list is not a map,
+    // and `Link` is one of the two names an author repeats on purpose. A
+    // table keeping one value per name preloaded the script and silently
+    // dropped the stylesheet.
+    let text = concat!(
+        "/*\n",
+        "  Link: </app.css>; rel=preload; as=style\n",
+        "  Link: </app.js>; rel=preload; as=script\n",
+    );
+    assert_eq!(
+        applied(text, "/index.html"),
+        vec![
+            (
+                "link".to_string(),
+                "</app.css>; rel=preload; as=style".to_string()
+            ),
+            (
+                "link".to_string(),
+                "</app.js>; rel=preload; as=script".to_string()
+            ),
+        ],
+        "both values survive, in the order written"
+    );
+}
+
+#[test]
+fn two_set_cookie_headers_both_reach_the_client() {
+    // The same shape with the name that makes it a login bug: a session
+    // cookie and a CSRF cookie may not be combined into one header, so
+    // keeping one of them logs the user out.
+    let text = concat!(
+        "/*\n",
+        "  Set-Cookie: session=abc; Path=/; HttpOnly\n",
+        "  Set-Cookie: csrf=xyz; Path=/\n",
+    );
+    let sent = applied(text, "/anything");
+    assert_eq!(sent.len(), 2, "got: {sent:?}");
+    assert!(sent.iter().all(|(name, _)| name == "set-cookie"));
+}
+
+#[test]
+fn a_later_block_replaces_the_whole_group_an_earlier_one_wrote() {
+    // "A later block wins a conflict" is about blocks. The per-directory
+    // block naming `Link` is correcting the site-wide block, not adding a
+    // third preload next to its two.
+    let text = concat!(
+        "/*\n",
+        "  Link: </a.css>; rel=preload; as=style\n",
+        "  Link: </b.js>; rel=preload; as=script\n",
+        "/assets/*\n",
+        "  Link: </c.woff2>; rel=preload; as=font\n",
+    );
+    assert_eq!(
+        applied(text, "/assets/x"),
+        vec![(
+            "link".to_string(),
+            "</c.woff2>; rel=preload; as=font".to_string()
+        )]
+    );
+}
+
+#[test]
+fn a_later_block_may_write_a_group_where_an_earlier_one_wrote_one_value() {
+    let text = concat!(
+        "/*\n",
+        "  Link: </a.css>; rel=preload; as=style\n",
+        "/assets/*\n",
+        "  Link: </b.js>; rel=preload; as=script\n",
+        "  Link: </c.woff2>; rel=preload; as=font\n",
+    );
+    let sent = applied(text, "/assets/x");
+    assert_eq!(sent.len(), 2, "got: {sent:?}");
+    assert_eq!(sent[0].1, "</b.js>; rel=preload; as=script");
+    assert_eq!(sent[1].1, "</c.woff2>; rel=preload; as=font");
+}
+
+#[test]
+fn a_replaced_group_keeps_the_place_the_name_first_took() {
+    // Order is what makes two responses to the same path byte-identical, so
+    // it is asserted rather than left to whatever the merge happened to do.
+    let text = concat!(
+        "/*\n",
+        "  Set-Cookie: a=1\n",
+        "  X-Frame-Options: DENY\n",
+        "/assets/*\n",
+        "  Set-Cookie: b=2\n",
+        "  Set-Cookie: c=3\n",
+    );
+    let names: Vec<String> = applied(text, "/assets/x")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["set-cookie", "set-cookie", "x-frame-options"],
+        "the group stands where `set-cookie` first stood, not appended at the end"
+    );
+}
+
+#[test]
+fn a_removal_takes_every_value_of_the_name_off() {
+    // `!` can only name a name, so it has to reach the whole group; leaving
+    // one of two cookies behind would be worse than leaving both.
+    let text = concat!(
+        "/*\n",
+        "  Set-Cookie: a=1\n",
+        "  Set-Cookie: b=2\n",
+        "/public/*\n",
+        "  ! Set-Cookie\n",
+    );
+    assert_eq!(applied(text, "/private/x").len(), 2);
+    assert!(applied(text, "/public/x").is_empty());
+}
+
+#[test]
+fn a_repeated_name_survives_the_manifest_round_trip() {
+    // The table is compiled twice - once by the build on what the author
+    // wrote, once by a node on what the manifest carries - so the second
+    // value has to survive being written out and read back, not just parsing.
+    let rules =
+        parse_headers("/*\n  Link: </a.css>; rel=preload\n  Link: </b.js>; rel=preload\n").unwrap();
+    let json = serde_json::to_string(&rules).unwrap();
+    let back: Vec<HeaderRule> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, rules);
+    assert_eq!(
+        HeaderTable::compile(&back)
+            .unwrap()
+            .apply(&decoded_segments("/index.html"))
+            .len(),
+        2
+    );
+}

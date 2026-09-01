@@ -25,6 +25,16 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 /// Ensure V8 platform is initialized only once
 static V8_INIT: Once = Once::new();
 
+// Set by `RuntimeMessage::PanicInPumpForTest`, read and cleared by the next
+// turn of the pump on this thread.
+//
+// A thread-local because that is what the thing being tested is: one runtime
+// thread's own loop. Nothing in a normal build refers to it.
+#[cfg(test)]
+thread_local! {
+    static PANIC_IN_PUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Status, headers and body of one answered request; the same triple
 /// `super::isolate` produces. The body may be bytes or a body still being
 /// produced -- see [`ResponseBody`] and its definition there. The headers are
@@ -175,8 +185,38 @@ pub enum RuntimeMessage {
     /// it.
     #[cfg(test)]
     PanicForTest { app_id: String },
+    /// Arm a panic in the *next* turn of the response-stream pump, to prove
+    /// the same thing about the half of this loop that is not a message.
+    ///
+    /// Two hooks rather than one because they panic in two different places,
+    /// and the place is the whole point: a panic while handling a message and
+    /// a panic while producing a body unwind through different frames of this
+    /// loop, and only one of them used to be caught. Nothing outside the tests
+    /// can send this either.
+    #[cfg(test)]
+    PanicInPumpForTest,
     /// Close thread
     Shutdown,
+}
+
+/// What one turn of a runtime thread's wait produced.
+///
+/// The wait has two arms and they do not answer the same thing: one takes a
+/// message off the queue, the other gives the isolate's response-stream
+/// producers a turn. Naming the outcome is what lets both arms sit inside one
+/// `catch_unwind` -- a `continue` from inside the guarded future would leave
+/// the pump outside it again.
+///
+/// The two variants are different sizes, which clippy notices. Boxing the
+/// message to even them out would put an allocation on the path every message
+/// takes, to shrink a value that lives for one `match` on the stack of a loop
+/// that was going to move the message anyway.
+#[allow(clippy::large_enum_variant)]
+enum PumpTurn {
+    /// A message arrived, or the queue closed and the thread is finished.
+    Message(Option<RuntimeMessage>),
+    /// The pump had its turn; go round again.
+    Pumped,
 }
 
 /// A runtime thread reporting that the isolate it was hosting is gone.
@@ -289,10 +329,41 @@ impl RuntimeThread {
                 .as_mut()
                 .filter(|hosted| hosted.runtime.has_open_response_streams())
             {
-                Some(hosted) => {
-                    tokio::select! {
-                        msg = rx.recv() => msg,
-                        () = hosted.runtime.pump_response_streams() => continue,
+                Some(app) => {
+                    // The guard is around the *whole* wait, not around the
+                    // message half of it. Producing a body is application
+                    // code running on this thread exactly as handling a
+                    // message is -- it is the same isolate, the same ops and
+                    // the same V8 -- but it runs from this arm rather than
+                    // from `handle_message`, so the `catch_unwind` below used
+                    // to be somewhere the unwind never passed through. A
+                    // handler that panicked mid-body took the thread with it
+                    // for good, and every later request, queue batch and cron
+                    // tick for that application answered "Runtime thread has
+                    // stopped" -- which is the failure that guard was added to
+                    // remove, arriving by the one door it did not cover.
+                    let turn = AssertUnwindSafe(async {
+                        tokio::select! {
+                            msg = rx.recv() => PumpTurn::Message(msg),
+                            () = Self::pump(&mut app.runtime) => PumpTurn::Pumped,
+                        }
+                    })
+                    .catch_unwind()
+                    .await;
+                    match turn {
+                        Ok(PumpTurn::Message(msg)) => msg,
+                        Ok(PumpTurn::Pumped) => continue,
+                        Err(panic) => {
+                            // The same recovery a panicking message gets, and
+                            // deliberately the same code: an isolate that
+                            // unwound is not one to keep serving from,
+                            // whichever half of the loop it unwound out of,
+                            // and the clients reading the bodies it was
+                            // producing have their transfers fail as the
+                            // isolate is dropped.
+                            Self::lose_isolate(thread_id, &mut hosted, panic, &faults);
+                            continue;
+                        }
                     }
                 }
                 None => rx.recv().await,
@@ -304,73 +375,16 @@ impl RuntimeThread {
             // this application's only isolate on this node, so every later
             // request, queue batch and cron tick for it answered "Runtime
             // thread has stopped" -- for good, because nothing revived it and
-            // the node went on reporting the application as running.
-            //
-            // So the panic is caught here instead, at the boundary of one
-            // message. What is thrown away is the isolate, not the thread: a
-            // panic can unwind from anywhere, including through V8, and an
-            // isolate that was halfway through something when it happened is
-            // not one to keep serving from. Dropping it here is also the only
-            // place it *may* be dropped -- an isolate belongs to the thread
-            // that built it -- and it leaves the thread idle and ready for the
-            // next application to load onto it, rather than leaking a thread
-            // slot that nothing can ever use again.
-            //
-            // The request that panicked is lost: its reply channel was moved
-            // into the message and went with the unwind, so its caller sees
-            // the thread having dropped the call. That is one failed request
-            // against an application that stays on the air.
+            // the node went on reporting the application as running. So the
+            // panic is caught at the boundary of one message; see
+            // [`Self::lose_isolate`] for what is thrown away and what is kept.
             let handled = AssertUnwindSafe(Self::handle_message(thread_id, &mut hosted, msg))
                 .catch_unwind()
                 .await;
             match handled {
                 Ok(ControlFlow::Continue(())) => {}
                 Ok(ControlFlow::Break(())) => break,
-                Err(panic) => {
-                    let panic = panic_message(panic.as_ref());
-                    // Taken before the log line so the isolate is dropped
-                    // whether or not anything was hosted, and so the fault
-                    // names the application that lost it.
-                    match hosted.take() {
-                        Some(lost) => {
-                            tracing::error!(
-                                thread_id,
-                                app_id = %lost.app_id,
-                                panic = %panic,
-                                "Runtime thread {} panicked while serving {}: {}. Its isolate is \
-                                 being dropped and the application has nothing running on this \
-                                 node until it is loaded again; the thread itself stays and is \
-                                 free for the next application",
-                                thread_id,
-                                lost.app_id,
-                                panic
-                            );
-                            let app_id = lost.app_id.clone();
-                            // Here, explicitly, and before the fault is sent:
-                            // the isolate may only be dropped on the thread
-                            // that built it, and the pool must not be told the
-                            // thread is free while it still holds one.
-                            drop(lost);
-                            // Tells the pool to stop claiming this
-                            // application is placed here. Without it the
-                            // control plane keeps being told the assignment
-                            // is satisfied and never reinstalls it.
-                            let _ = faults.send(ThreadFault {
-                                thread_id,
-                                app_id,
-                                panic,
-                            });
-                        }
-                        None => tracing::error!(
-                            thread_id,
-                            panic = %panic,
-                            "Runtime thread {} panicked with no application loaded on it: {}. \
-                             The thread stays and is free for the next application",
-                            thread_id,
-                            panic
-                        ),
-                    }
-                }
+                Err(panic) => Self::lose_isolate(thread_id, &mut hosted, panic, &faults),
             }
         }
 
@@ -385,6 +399,88 @@ impl RuntimeThread {
         }
 
         tracing::info!("Runtime thread {} stopped", thread_id);
+    }
+
+    /// Drive the open response streams one turn.
+    ///
+    /// A wrapper rather than a direct call so the test hook has somewhere to
+    /// live; in a normal build it compiles to the call itself.
+    async fn pump(runtime: &mut AppRuntime) {
+        #[cfg(test)]
+        if PANIC_IN_PUMP.with(std::cell::Cell::take) {
+            panic!("deliberate test panic while producing a response stream");
+        }
+        runtime.pump_response_streams().await
+    }
+
+    /// Give up the isolate this thread was hosting, having caught a panic out
+    /// of it, and keep the thread.
+    ///
+    /// One function and not two copies, because the two places a panic is
+    /// caught -- handling a message, and producing a response body -- have to
+    /// recover identically: the difference between them is only where the
+    /// unwind came from, and a second copy would be a second chance to forget
+    /// one of the three things below.
+    ///
+    /// What is thrown away is the isolate, not the thread. A panic can unwind
+    /// from anywhere, including through V8, and an isolate that was halfway
+    /// through something when it happened is not one to keep serving from.
+    /// Dropping it here is also the only place it *may* be dropped -- an
+    /// isolate belongs to the thread that built it -- and it leaves the thread
+    /// idle and ready for the next application, rather than leaking a thread
+    /// slot nothing can ever use again.
+    ///
+    /// Whatever was in flight is lost: a request's reply channel went with the
+    /// unwind and its caller sees the call dropped, and any body this isolate
+    /// was still producing ends without its terminating chunk, so those
+    /// clients' transfers fail rather than appearing to complete.
+    fn lose_isolate(
+        thread_id: usize,
+        hosted: &mut Option<HostedApp>,
+        panic: Box<dyn std::any::Any + Send>,
+        faults: &mpsc::UnboundedSender<ThreadFault>,
+    ) {
+        let panic = panic_message(panic.as_ref());
+        // Taken before the log line so the isolate is dropped whether or not
+        // anything was hosted, and so the fault names the application that
+        // lost it.
+        match hosted.take() {
+            Some(lost) => {
+                tracing::error!(
+                    thread_id,
+                    app_id = %lost.app_id,
+                    panic = %panic,
+                    "Runtime thread {} panicked while serving {}: {}. Its isolate is being \
+                     dropped and the application has nothing running on this node until it is \
+                     loaded again; the thread itself stays and is free for the next application",
+                    thread_id,
+                    lost.app_id,
+                    panic
+                );
+                let app_id = lost.app_id.clone();
+                // Here, explicitly, and before the fault is sent: the isolate
+                // may only be dropped on the thread that built it, and the
+                // pool must not be told the thread is free while it still
+                // holds one.
+                drop(lost);
+                // Tells the pool to stop claiming this application is placed
+                // here. Without it the control plane keeps being told the
+                // assignment is satisfied and never reinstalls it.
+                let _ = faults.send(ThreadFault {
+                    thread_id,
+                    app_id,
+                    panic,
+                });
+            }
+            None => tracing::error!(
+                thread_id,
+                panic = %panic,
+                "Runtime thread {} panicked with no application loaded on it: {}. The thread \
+                 stays and is free for the next application",
+                thread_id,
+                panic
+            ),
+        }
     }
 
     /// Handle one message, and say whether the thread should carry on.
@@ -688,6 +784,11 @@ impl RuntimeThread {
             #[cfg(test)]
             RuntimeMessage::PanicForTest { app_id } => {
                 panic!("deliberate test panic on thread {thread_id} while hosting {app_id}");
+            }
+
+            #[cfg(test)]
+            RuntimeMessage::PanicInPumpForTest => {
+                PANIC_IN_PUMP.with(|armed| armed.set(true));
             }
 
             RuntimeMessage::Shutdown => {
@@ -3206,6 +3307,191 @@ mod tests {
         pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
             .await
             .expect("the application can be loaded again after its thread panicked");
+        let (status, _, body) = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("it serves again");
+        assert_eq!(status, 200);
+        assert_eq!(body.into_bytes().as_deref(), Some(&b"alive"[..]));
+
+        let _ = pool.unload_app(app).await;
+    }
+
+    /// One inbound request that passes through two applications is one
+    /// invocation to everyone outside the platform, and has to be one trace.
+    ///
+    /// The callee's isolate is on another runtime thread with its own log
+    /// stream and its own trace records, so the id has to travel with the
+    /// call. It travels as data on the message, beside the chain and for the
+    /// same reason: an application that could write it could file its lines
+    /// under somebody else's request.
+    ///
+    /// Asserted on the trace records rather than on the log, because these
+    /// two isolates are on threads of their own and a thread-local subscriber
+    /// would see neither. The records are process-wide, which is what makes
+    /// them the right witness here.
+    #[tokio::test]
+    async fn a_service_call_continues_the_callers_trace_rather_than_starting_one() {
+        let pool = pool();
+
+        load_with_wiring(
+            &pool,
+            "trace-callee.production",
+            CALLEE_CODE,
+            service_wiring(&[], &["trace-caller"]),
+        )
+        .await
+        .expect("the callee loads");
+        load_with_wiring(
+            &pool,
+            "trace-caller.production",
+            CALLER_CODE,
+            service_wiring(&[("AUTH", "trace-callee")], &[]),
+        )
+        .await
+        .expect("the caller loads");
+
+        let (status, body) = call_through(&pool, "trace-caller.production", "AUTH").await;
+        assert_eq!(status, 201, "{body}");
+
+        let caller = one_trace_of("trace-caller.production");
+        let callee = one_trace_of("trace-callee.production");
+        assert!(
+            !caller.trace_id.is_empty(),
+            "the request that arrived from outside has to be given an id"
+        );
+        assert_eq!(
+            callee.trace_id, caller.trace_id,
+            "a callee that started its own trace would leave half of one request unfindable: \
+             `deis logs --trace-id` on the id `deis trace` printed would stop at the first hop"
+        );
+
+        let _ = pool.unload_app("trace-caller.production").await;
+        let _ = pool.unload_app("trace-callee.production").await;
+    }
+
+    /// The one invocation a tenant recorded, taken out of the process-wide
+    /// recorder with everything else put back.
+    ///
+    /// These tests share the recorder, so a test that swallowed another's
+    /// records would make that other test's failure look like this one's.
+    fn one_trace_of(tenant: &str) -> super::super::metrics::InvocationTrace {
+        let recorded = super::super::metrics::recorder().traces().drain(usize::MAX);
+        let (mut mine, others): (Vec<_>, Vec<_>) = recorded
+            .into_iter()
+            .partition(|trace| trace.tenant == tenant);
+        if !others.is_empty() {
+            super::super::metrics::recorder().traces().requeue(others);
+        }
+        assert_eq!(
+            mine.len(),
+            1,
+            "{tenant} was invoked once and must have one record"
+        );
+        mine.remove(0)
+    }
+
+    /// The other half of the same guarantee, on the other half of the loop.
+    ///
+    /// A runtime thread waits on two things: a message, and the producers of
+    /// any response body the isolate is still writing. The panic guard was put
+    /// around the first and not the second, so a handler that panicked
+    /// mid-body still ended the thread for good -- and the application it was
+    /// hosting answered "Runtime thread has stopped" to every later request,
+    /// queue batch and cron tick, exactly the failure the guard was added to
+    /// remove.
+    ///
+    /// The panic is injected rather than provoked out of V8, because the shape
+    /// under test is where the unwind passes through and not what raised it: a
+    /// panicking op reaches this loop through the same arm of the same
+    /// `select!`. What the test asserts is what an operator would see -- the
+    /// application comes back, and the thread is still there to put it on.
+    #[tokio::test]
+    async fn a_panic_while_producing_a_response_body_does_not_take_the_thread_with_it() {
+        let pool = pool();
+
+        // Endless on purpose: the stream has to still be open when the panic
+        // happens, or the thread would be waiting on messages like any other
+        // and the arm under test would never be entered. The producer parks on
+        // a full queue after two chunks, which is what leaves the thread free
+        // to take the message below.
+        let code = r#"
+            export default function handler() {
+              const stream = new ReadableStream({
+                pull(controller) { controller.enqueue("x".repeat(8)); },
+              });
+              return new Response(stream);
+            }
+        "#;
+        let app = "panicked_pump.production";
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("load");
+
+        let (status, _, body) = pool
+            .execute_request(
+                app,
+                "http://localhost/stream".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("the handler answers with a body it is still producing");
+        assert_eq!(status, 200);
+        let ResponseBody::Stream(mut reader) = body else {
+            panic!("the handler answered with a stream");
+        };
+
+        pool.dispatch(app, RuntimeMessage::PanicInPumpForTest)
+            .await
+            .expect("the thread takes the message");
+
+        // The client's read is what witnesses the panic, and it is a real
+        // condition rather than a wait: the body can only end here because the
+        // isolate producing it was dropped, and nothing else in this test
+        // closes it. Reading to the end also orders everything below after the
+        // panic has been caught and reported.
+        while std::future::poll_fn(|cx| reader.poll_chunk(cx))
+            .await
+            .is_some()
+        {}
+        assert!(
+            reader.failure().is_some(),
+            "a body cut off by a panic must fail its client's read rather than look complete"
+        );
+
+        // The distinguishing assertion. Before the fix this said "Runtime
+        // thread has stopped": the thread had unwound and its queue was
+        // closed, so nothing could ever be dispatched to it again.
+        let error = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect_err("the isolate that panicked is gone");
+        assert!(
+            error.to_string().contains("App not found"),
+            "a lost isolate must read as an application that is not here, not as a stopped \
+             thread: {error}"
+        );
+        assert!(!pool.is_hosted(app).await);
+
+        // And the thread came back into circulation.
+        let plain = r#"export default function handler() { return new Response("alive"); }"#;
+        pool.load_app(app.to_string(), plain.to_string(), IsolateSpec::default())
+            .await
+            .expect("the application can be loaded again after its pump panicked");
         let (status, _, body) = pool
             .execute_request(
                 app,

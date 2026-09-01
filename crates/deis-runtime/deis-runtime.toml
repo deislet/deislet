@@ -162,6 +162,17 @@ enabled = false
 # every entry.
 # endpoint = "http://127.0.0.1:8092"
 
+# The same string deis-telemetry's own auth_secret is set to. This node derives
+# the capability token it presents on every log, trace and metric push from it.
+#
+# Leave it unset only when deis-telemetry has no auth_secret either, which it
+# may only do with both of its listeners on loopback - it refuses to start
+# otherwise. Against any collector reachable from another host, a node without
+# this has every push refused with "unauthenticated" and retries them for as
+# long as it runs: "deis logs" and "deis trace" stay empty for every
+# application on it while the collector and the node both look healthy.
+# auth_secret = "the same value as deis-telemetry's auth_secret"
+
 # Entries held in memory before the oldest are dropped to make room.
 buffer_size = 10000
 

@@ -4,6 +4,7 @@
 //! field the CLI prints is deserialised straight off what the server
 //! returns, so an added field there does not break an older CLI.
 
+pub mod queue;
 pub mod storage;
 pub mod telemetry;
 

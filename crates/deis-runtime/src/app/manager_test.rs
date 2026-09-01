@@ -13,7 +13,53 @@ mod tests {
     };
     use once_cell::sync::Lazy;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    /// Everything `emit` writes to `tracing`, message and fields together, as
+    /// one string per event.
+    ///
+    /// A layer of its own rather than the shipper's [`crate::logging::layer`]:
+    /// that one keeps `target: "app"` events, and what has to be read here is
+    /// a line the node writes about itself. What the check needs is only
+    /// "did this text appear anywhere in what was logged", so the visitor
+    /// flattens the whole event and the assertion searches it.
+    fn logged(emit: impl FnOnce()) -> Vec<String> {
+        use std::fmt::Write as _;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Flatten(String);
+        impl tracing::field::Visit for Flatten {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                let _ = write!(self.0, " {}={}", field.name(), value);
+            }
+        }
+
+        struct Collector(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Collector {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut flat = Flatten::default();
+                event.record(&mut flat);
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(flat.0);
+            }
+        }
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collector(lines.clone()));
+        tracing::subscriber::with_default(subscriber, emit);
+        let taken = lines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        taken
+    }
 
     // Use global singleton ApplicationManager to avoid multiple RuntimePool creations
     static TEST_MANAGER: Lazy<Mutex<ApplicationManager>> =
@@ -406,5 +452,83 @@ mod tests {
             effective.rate_limit_ops_per_sec,
             manager.default_limits.rate_limit_ops_per_sec
         );
+    }
+
+    /// The inspector session token is the whole authorisation for attaching a
+    /// debugger to a tenant's isolate, and a debugger reads that tenant's
+    /// decrypted environment secrets and the bodies of requests it is serving.
+    /// It used to be written into the node's log at INFO, where it reaches the
+    /// node's stdout, the log buffer, and -- for anyone holding the telemetry
+    /// channel token -- deis-telemetry, none of which is where a credential
+    /// may be.
+    #[tokio::test]
+    async fn a_debug_session_never_writes_its_token_to_the_log() {
+        let manager = TEST_MANAGER.lock().unwrap();
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+        manager
+            .load_app(
+                key("inspect_secrecy"),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut minted = String::new();
+        let lines = logged(|| {
+            let (_, token) = manager
+                .start_inspect(key("inspect_secrecy"), 60)
+                .expect("the session starts");
+            minted = token;
+        });
+
+        assert!(!minted.is_empty(), "the session has to mint a token at all");
+        assert!(
+            !lines.is_empty(),
+            "the node has to say a debug session was started"
+        );
+        for line in &lines {
+            assert!(
+                !line.contains(&minted),
+                "the session token reached the log: {line}"
+            );
+        }
+
+        // Cleanup
+        let _ = manager.unload_app(&key("inspect_secrecy")).await;
+    }
+
+    /// A token that is not the minted one is refused however many of its
+    /// leading bytes are right.
+    #[tokio::test]
+    async fn a_debug_token_is_only_accepted_when_it_is_the_whole_token() {
+        let manager = TEST_MANAGER.lock().unwrap();
+        let code = r#"export default function handler() { return new Response("ok"); }"#;
+        manager
+            .load_app(
+                key("inspect_compare"),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_, token) = manager
+            .start_inspect(key("inspect_compare"), 60)
+            .expect("the session starts");
+
+        assert!(manager.validate_inspect_token(&key("inspect_compare"), &token));
+        assert!(!manager.validate_inspect_token(&key("inspect_compare"), &token[..token.len() - 1]));
+        assert!(!manager.validate_inspect_token(&key("inspect_compare"), &format!("{token}x")));
+        assert!(!manager.validate_inspect_token(&key("inspect_compare"), ""));
+        assert!(
+            !manager.validate_inspect_token(&key("no_such_session"), &token),
+            "a token is for one application's session, not for the node"
+        );
+
+        // Cleanup
+        let _ = manager.unload_app(&key("inspect_compare")).await;
     }
 }

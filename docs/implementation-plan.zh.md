@@ -121,7 +121,8 @@ assets/                  # 静态资产，原样保留目录结构
 - `site` 是静态站点自己带的规则，包里没有这些规则时整个键不出现。三样东西：
   `redirects` 是 `_redirects` 解析出来的表（**顺序即语义**，首条命中者胜，200 是改写、
   404 是带 404 状态返回目标）；`headers` 是 `_headers` 解析出来的表（所有命中的块叠加，
-  靠后的覆盖靠前的）；`not_found` 是 `none` / `404-page` / `single-page-app` 三选一。
+  靠后的覆盖靠前的；同一个块里重复的名字都留着，所以它是名值对的列表而不是 map——
+  `Link` 和 `Set-Cookie` 不许被合并成一条）；`not_found` 是 `none` / `404-page` / `single-page-app` 三选一。
   `_redirects` 和 `_headers` 这两个文件本身**不进 `assets/`**——内容已经在这里，再当
   文件发一份等于把站点自己的规则公开出去。格式由 `deis-bundle` 的 `site` / `redirects`
   / `headers` 三个模块唯一定义，编译器解析、节点编译成表，两边共用同一份代码。
@@ -527,9 +528,12 @@ Rust 那一半；内存截断的计数器从来没人加过，于是运维从它
 ### 清掉的历史遗留（波次 C 同一轮）
 
 - `crates/deis-build/.github/` —— 编译器还是独立仓库时留下的 workflow。嵌套的
-  `.github` 在 GitHub 上不生效，已删除。**本仓库现在没有任何 CI workflow**，要补
-  就在仓库根新建 `.github/workflows/`，并注意旧文件里那个 windows/macOS 矩阵不能
-  照搬到工作区：deis-proxy 依赖 pingora，Windows 上构不出来。
+  `.github` 在 GitHub 上不生效，已删除。仓库根后来建了 `.github/workflows/`，目前
+  只有 `checks.yml` 一个 workflow，跑的是不需要编译的检查（`check-doc-path-literals.sh`）；
+  它自己的注释写明了为什么还没有 cargo job：`deis-control` 在编译期嵌入
+  `crates/deis-control/web/dist`，CI 里要先跑 `npm ci && npm run build`，否则构出来的
+  二进制对每个面板页面都答 404。要补编译与测试的 job 时还要注意：旧文件里那个
+  windows/macOS 矩阵不能照搬到工作区，deis-proxy 依赖 pingora，Windows 上构不出来。
 - `ProjectConfig.routing` —— `caseSensitive` / `trailingSlash` / `routes` 三个字段
   一个都没人读：URL 模式来自文件树（`plan_routes`），匹配是运行时的
   （`deis_bundle::routing`）。整块删掉；老项目里留着这段配置也照样能构建，

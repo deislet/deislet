@@ -48,7 +48,10 @@ pub use fetch_ops::init_fetch_guard_extension;
 pub use fetch_policy::FetchPolicy;
 pub use isolate::IsolateSpec;
 pub use kv_client::{KvClient, KvRead};
-pub use metrics::{MetricShipper, MetricShipperConfig, MetricsRegistry};
+pub use metrics::{
+    recorder, InvocationKind, InvocationOutcome, InvocationTrace, MetricShipper,
+    MetricShipperConfig, MetricsRegistry,
+};
 pub use op_metrics::{OpMetricsSummary, OpMetricsSummaryTracker};
 pub use pool::{RuntimePool, StagedVersion};
 pub use queue_client::{AckOutcome, LeasedMessage, MessageHandle, NackOutcome, QueueClient};

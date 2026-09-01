@@ -6,7 +6,21 @@ use tracing::{info, warn};
 pub struct ControlConfig {
     pub bind_addr: String,
     pub port: u16,
+    /// How often a node is asked to beat, in seconds. Handed back to the node
+    /// in every heartbeat acknowledgement, and also the rate at which
+    /// [`crate::reaper`] reads the two clocks below.
     pub heartbeat_interval: u64,
+    /// How long a node may be silent, in seconds, before this control plane
+    /// stops reporting it as live and moves its session to `Unresponsive`.
+    ///
+    /// This has to be comfortably longer than `heartbeat_interval` - two or
+    /// three times it - because a node that is perfectly healthy is still
+    /// silent for one whole interval between beats. A value at or below the
+    /// interval makes the whole fleet flap, and is warned about at startup.
+    ///
+    /// A node is reported unresponsive between this and this plus one
+    /// interval after it goes quiet: the timeout is when the claim expires,
+    /// the interval is how long it can take to be noticed.
     pub heartbeat_timeout: u64,
     /// The credential shared with every node, in both directions: what a node
     /// presents on its gRPC control channel and on the two HTTP endpoints

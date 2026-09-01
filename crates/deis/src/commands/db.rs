@@ -17,6 +17,8 @@ use anyhow::{Result, anyhow};
 use colored::Colorize;
 
 use crate::commands::Session;
+#[cfg(test)]
+use crate::render::destructive_subject;
 use crate::render::{Output, Table, confirm_destructive};
 use crate::settings::Overrides;
 
@@ -114,11 +116,7 @@ pub async fn execute(args: ExecuteArgs, output: Output) -> Result<()> {
     })?;
     let tenant = session.namespace()?;
 
-    confirm_destructive(
-        &tenant,
-        &format!("run `{}` against the database of", args.sql),
-        args.yes,
-    )?;
+    confirm_destructive(&tenant, &execute_action(&args.sql), args.yes)?;
 
     let storage = session.storage().await?;
     let (rows_affected, last_insert_id) = storage
@@ -143,6 +141,17 @@ pub async fn execute(args: ExecuteArgs, output: Output) -> Result<()> {
         println!("  {}", format!("last insert id: {id}").dimmed());
     }
     Ok(())
+}
+
+/// What `deis db execute` is about to do, in the words the confirmation puts
+/// in front of the operator.
+///
+/// A phrase rather than a `format!` at the call site so that the sentence a
+/// person reads immediately before changing a live database is somewhere a
+/// test can read it too. It ends at "the database", because
+/// [`crate::render::confirm_destructive`] is what adds "on `<tenant>`".
+fn execute_action(sql: &str) -> String {
+    format!("run `{sql}` against the database")
 }
 
 /// One table cell, rendered for a person rather than for a machine: a bare
@@ -176,6 +185,24 @@ fn params_to_json(params: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last thing a person reads before a statement runs against a live
+    /// tenant's only database file. It read "About to run `DELETE FROM users`
+    /// against the database of on demo.production." - two prepositions, one
+    /// of them left over from a phrase that used to end differently - which
+    /// is a sentence nobody can check their own intent against.
+    #[test]
+    fn the_confirmation_is_a_sentence_a_person_can_read_back() {
+        let subject = destructive_subject(
+            &execute_action("DELETE FROM users WHERE id = 7"),
+            "demo.production",
+        );
+        assert_eq!(
+            format!("About to {subject}."),
+            "About to run `DELETE FROM users WHERE id = 7` against the database on \
+             demo.production."
+        );
+    }
 
     #[test]
     fn no_params_is_none_not_an_empty_array() {

@@ -9,6 +9,7 @@ pub mod dev;
 pub mod init;
 pub mod kv;
 pub mod logs;
+pub mod queue;
 pub mod rollback;
 pub mod secret;
 pub mod status;
@@ -22,6 +23,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::platform::Control;
+use crate::platform::queue::QueueSession;
 use crate::platform::storage::StorageSession;
 use crate::settings::{Overrides, Settings};
 
@@ -154,5 +156,26 @@ impl Session {
             credentials.token.as_deref(),
             self.binding.as_deref(),
         )
+    }
+
+    /// Open a connection to this tenant's queues.
+    ///
+    /// The credential is the same one [`Self::storage`] uses and is fetched
+    /// the same way: deis-queue checks the capability token against the same
+    /// shared secret deis-store does, so an operator who can already run
+    /// `deis kv` needs nothing further to read the dead letters.
+    ///
+    /// The *address*, though, comes from the project settings rather than
+    /// from the control plane, which is the one difference worth knowing:
+    /// the storage-token route answers with deis-store's address and says
+    /// nothing about deis-queue.
+    pub async fn queue(&self) -> Result<QueueSession> {
+        let app = self.app()?;
+        let environment = self.environment()?;
+        let tenant = self.tenant()?;
+        let endpoint = self.settings.queue_endpoint()?.to_string();
+
+        let credentials = self.control.storage_credentials(app, environment).await?;
+        QueueSession::connect(&endpoint, &tenant, credentials.token.as_deref())
     }
 }

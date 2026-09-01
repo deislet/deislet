@@ -27,6 +27,7 @@ use tracing::{debug, error, info, warn};
 use super::buffer::LogBuffer;
 use super::types::{LogEntry, LogLevel};
 use crate::config::LoggingConfig;
+use crate::telemetry::{report_posture, TelemetryCredential};
 
 /// Generated client for deis-telemetry's `LogService` (package
 /// `deis.telemetry`).
@@ -65,6 +66,12 @@ pub struct ShipperConfig {
     /// `enabled = false` does, and is refused at startup when `enabled` is on.
     pub endpoint: Option<String>,
 
+    /// The capability token this node presents on every push, derived from
+    /// `logging.auth_secret`. Absent is correct against a collector that has
+    /// no `auth_secret`, and fatal to log delivery against one that has; see
+    /// [`crate::telemetry`].
+    pub credential: TelemetryCredential,
+
     /// Seconds between flush attempts.
     pub flush_interval_secs: u64,
 
@@ -91,6 +98,7 @@ impl From<&LoggingConfig> for ShipperConfig {
     fn from(config: &LoggingConfig) -> Self {
         Self {
             endpoint: config.endpoint.clone(),
+            credential: TelemetryCredential::from_secret(config.auth_secret.as_deref()),
             flush_interval_secs: config.flush_interval_secs,
             batch_size: config.batch_size,
             max_retries: config.max_retries,
@@ -162,11 +170,12 @@ impl LogShipper {
             batch_size = self.config.batch_size,
             "Log shipper started; app logs from this node will be queryable through deis-telemetry"
         );
+        report_posture(&self.config.credential, &endpoint);
 
         let buffer = self.buffer.clone();
         let config = self.config.clone();
         tokio::spawn(async move {
-            let mut sink = TelemetrySink::new(endpoint);
+            let mut sink = TelemetrySink::new(endpoint, config.credential.clone());
             run_shipper_loop(buffer, config, &mut sink, stop_rx).await;
             let _ = finished_tx.send(());
         });
@@ -411,13 +420,18 @@ trait LogSink {
 /// A `LogService` client that redials whenever the connection lets it down.
 struct TelemetrySink {
     endpoint: String,
+    /// Stamped on every push. Held here rather than derived per call because
+    /// the derivation is an HMAC and the value never changes for the life of
+    /// the process.
+    credential: TelemetryCredential,
     client: Option<LogServiceClient<Channel>>,
 }
 
 impl TelemetrySink {
-    fn new(endpoint: String) -> Self {
+    fn new(endpoint: String, credential: TelemetryCredential) -> Self {
         Self {
             endpoint,
+            credential,
             client: None,
         }
     }
@@ -460,8 +474,12 @@ impl LogSink for TelemetrySink {
         };
 
         let result = {
+            let credential = self.credential.clone();
             let client = self.client().await?;
-            client.push_logs(tonic::Request::new(request)).await
+            // The token travels in the request's gRPC metadata, not in the
+            // message's own `metadata` map: deis-telemetry checks it in an
+            // interceptor, before the handler that would read the message.
+            client.push_logs(credential.stamp(request)).await
         };
 
         match result {
@@ -477,6 +495,23 @@ impl LogSink for TelemetrySink {
                 // Drop the channel rather than reuse one the server may have
                 // closed; the next attempt dials again.
                 self.client = None;
+                if status.code() == tonic::Code::Unauthenticated {
+                    // Its own line, at error, because it is the one failure
+                    // here that no amount of retrying fixes and that looks
+                    // exactly like a transient outage from the outside: the
+                    // collector is up and answering, and every batch this node
+                    // ever produces will be refused until an operator changes
+                    // a setting.
+                    error!(
+                        endpoint = %self.endpoint,
+                        carrying_a_token = self.credential.is_present(),
+                        "deis-telemetry refused this node's logs: {}. This is a credential \
+                         mismatch and not an outage -- retrying cannot fix it, and until it is \
+                         fixed no line from any application on this node is queryable. Set \
+                         logging.auth_secret to the same value as deis-telemetry's auth_secret",
+                        status.message()
+                    );
+                }
                 Err(anyhow::anyhow!(
                     "PushLogs to {} failed: {} ({})",
                     self.endpoint,

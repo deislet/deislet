@@ -32,7 +32,12 @@
 //! once its attempts reach the configured ceiling, where it stays for an
 //! operator instead of being retried forever - `ListDeadLetters` reads that
 //! table and `ReplayDeadLetters` puts named messages back on their queue with
-//! a fresh set of attempts, once the cause has been fixed.
+//! a fresh set of attempts, once the cause has been fixed. Each row also
+//! carries *why* it was given up on, because the two ways that happens - the
+//! consumer reported it failed, or its lease lapsed with no answer at all -
+//! need different fixes and are indistinguishable from the attempt count.
+//! Those two calls are what `deis queue dead-letters` and `deis queue replay`
+//! are; nothing else in the platform makes them.
 //!
 //! A lease is *proved*, not claimed. Every delivery carries a lease token,
 //! and `Ack` and `Nack` take it beside the id. The token is reissued on every

@@ -314,29 +314,75 @@ impl CommandExecutor {
         }
     }
 
-    /// Cleanup expired commands
-    pub async fn cleanup_expired_commands(&self) {
+    /// End every command whose deadline has passed.
+    ///
+    /// This used to walk `pending_commands` only, which meant it could not
+    /// see the two kinds of stuck command that actually happen. A command
+    /// issued through [`CommandExecutor::execute`] - the HTTP path - has no
+    /// waiter and no `tokio::time::timeout` behind it, so nothing but this
+    /// ever ends it; and a command left behind by an earlier process has no
+    /// tracker at all, because the map died with that process. Both sat at
+    /// `Sent` for ever. Nothing called this function either way.
+    ///
+    /// So the deadline is read from the database, which is where it was
+    /// written down. The tracker is dropped alongside, so an answer arriving
+    /// afterwards is refused as unknown rather than reopening a command that
+    /// has already ended.
+    ///
+    /// Answers how many it ended, for the caller's log.
+    pub async fn cleanup_expired_commands(&self) -> usize {
         let now = Utc::now();
-        let mut expired_ids = Vec::new();
-
-        for entry in self.pending_commands.iter() {
-            if entry.timeout_at < now {
-                expired_ids.push(*entry.key());
+        let overdue = match self.database.list_overdue_commands(now).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Could not read the overdue commands, so none is ended on this pass; any \
+                     command past its deadline keeps its in-flight status until a later pass \
+                     succeeds"
+                );
+                return 0;
             }
-        }
+        };
 
-        for id in expired_ids {
-            self.pending_commands.remove(&id);
-            self.database
+        let mut ended = 0;
+        for id in overdue {
+            if let Ok(uuid) = Uuid::parse_str(&id) {
+                self.pending_commands.remove(&uuid);
+            }
+
+            match self
+                .database
                 .record_command_event(
-                    &id.to_string(),
+                    &id,
                     CommandEvent::Expired,
                     None,
-                    Some("Command expired".to_string()),
+                    Some("The node did not answer before the command's deadline".to_string()),
                 )
                 .await
-                .ok();
+            {
+                // `None` means the row vanished between the query and the
+                // write, and a status that is not `Timeout` means an ending
+                // beat this one there. Neither is a problem: the first ending
+                // wins by design.
+                Ok(Some(CommandStatus::Timeout)) => {
+                    ended += 1;
+                    tracing::warn!(
+                        command_id = %id,
+                        "A command passed its deadline with no answer from the node and is \
+                         recorded as Timeout; whether the node ran it is unknown"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    command_id = %id,
+                    error = %e,
+                    "Could not end an overdue command; it keeps its in-flight status until a \
+                     later pass"
+                ),
+            }
         }
+        ended
     }
 
     /// Execute command (does not wait for response, suitable for HTTP API)
@@ -709,5 +755,110 @@ mod tests {
         // Handle non-existent command response (should return error)
         let result = executor.handle_response(command_id, response).await;
         assert!(result.is_err());
+    }
+
+    /// The stuck command. A command issued through `execute` - the HTTP path
+    /// - has no waiter and no `tokio::time::timeout` behind it, so the sweep
+    /// is the only thing that can ever end it. This one is also older than
+    /// any tracker could be, which is the second case: a command left in
+    /// flight by a process that has since exited, whose in-memory tracker
+    /// died with it. Both used to sit at `Sent` for ever.
+    #[tokio::test]
+    async fn an_overdue_command_reaches_an_ending_without_a_tracker() {
+        let db = Arc::new(Database::init(":memory:").await.unwrap());
+        let sessions = Arc::new(SessionManager::new());
+        let executor = CommandExecutor::new(sessions, Arc::clone(&db));
+
+        // `commands.node_id` is a foreign key into `nodes`, so the node has
+        // to exist before a command can be aimed at it.
+        db.save_node(&crate::session::NodeSession::new(
+            "node-alpha".to_string(),
+            crate::message::NodeInfo {
+                node_role: crate::message::NodeRole::Proxy("1.0.0".to_string()),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: vec![8080],
+            },
+        ))
+        .await
+        .unwrap();
+
+        let command_id = Uuid::new_v4().to_string();
+        db.save_command(&CommandEntry {
+            id: command_id.clone(),
+            node_id: "node-alpha".to_string(),
+            command_type: "restart".to_string(),
+            command_data: JsonValue::Null,
+            status: CommandStatus::Pending,
+            created_at: Utc::now() - chrono::Duration::seconds(600),
+            sent_at: None,
+            completed_at: None,
+            timeout_at: Some(Utc::now() - chrono::Duration::seconds(540)),
+            response_data: None,
+            error_message: None,
+        })
+        .await
+        .unwrap();
+        db.record_command_event(&command_id, CommandEvent::Delivered, None, None)
+            .await
+            .unwrap();
+
+        executor.cleanup_expired_commands().await;
+
+        let entry = db.get_command(&command_id).await.unwrap().unwrap();
+        assert_eq!(
+            entry.status,
+            CommandStatus::Timeout,
+            "a command whose deadline passed nine minutes ago must not still read {}",
+            entry.status.as_str()
+        );
+    }
+
+    /// The first ending still wins. A command that completed keeps its
+    /// answer even if its deadline has since passed and the sweep sees the
+    /// row before the query's snapshot is acted on.
+    #[tokio::test]
+    async fn the_sweep_does_not_walk_a_finished_command_back_to_timeout() {
+        let db = Arc::new(Database::init(":memory:").await.unwrap());
+        let sessions = Arc::new(SessionManager::new());
+        let executor = CommandExecutor::new(sessions, Arc::clone(&db));
+
+        db.save_node(&crate::session::NodeSession::new(
+            "node-alpha".to_string(),
+            crate::message::NodeInfo {
+                node_role: crate::message::NodeRole::Proxy("1.0.0".to_string()),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: vec![8080],
+            },
+        ))
+        .await
+        .unwrap();
+
+        let command_id = Uuid::new_v4().to_string();
+        db.save_command(&CommandEntry {
+            id: command_id.clone(),
+            node_id: "node-alpha".to_string(),
+            command_type: "get_status".to_string(),
+            command_data: JsonValue::Null,
+            status: CommandStatus::Pending,
+            created_at: Utc::now() - chrono::Duration::seconds(120),
+            sent_at: None,
+            completed_at: None,
+            timeout_at: Some(Utc::now() - chrono::Duration::seconds(60)),
+            response_data: None,
+            error_message: None,
+        })
+        .await
+        .unwrap();
+        db.record_command_event(&command_id, CommandEvent::Succeeded, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            executor.cleanup_expired_commands().await,
+            0,
+            "a command that already ended is not overdue"
+        );
+        let entry = db.get_command(&command_id).await.unwrap().unwrap();
+        assert_eq!(entry.status, CommandStatus::Completed);
     }
 }

@@ -858,6 +858,132 @@ async fn a_named_flag_takes_the_fix_without_a_date() {
     assert_eq!(cookies_from(&apps, &demo()).await.len(), 2);
 }
 
+/// The same two cookies, through the response cache: a miss stores the
+/// response and a hit serves it back.
+///
+/// `caches.default` lives in the isolate, so the second request to this
+/// handler is answered out of the entry the first one wrote.
+const TWO_COOKIES_THROUGH_THE_CACHE: &str = r#"
+const KEY = "http://localhost/cached";
+
+export default async function handler(context) {
+  const hit = await caches.default.match(KEY);
+  if (hit) {
+    hit.headers.set("x-served-from", "cache");
+    return hit;
+  }
+  const headers = new Headers({ "content-type": "text/plain" });
+  headers.append("set-cookie", "session=abc; Path=/");
+  headers.append("set-cookie", "csrf=xyz; Path=/");
+  headers.set("x-served-from", "handler");
+  const fresh = new Response("ok", { status: 200, headers });
+  await caches.default.put(KEY, fresh);
+  return fresh;
+}
+"#;
+
+/// Every `Set-Cookie` of one response, plus where the handler said it came
+/// from, so a test can tell a miss from a hit.
+async fn cookies_and_source(apps: &ApplicationManager, key: &AppKey) -> (Vec<String>, String) {
+    let (status, headers, _) = apps
+        .execute_app(
+            key,
+            "http://localhost/".to_string(),
+            "GET".to_string(),
+            HashMap::new(),
+            None,
+        )
+        .await
+        .expect("the handler answers");
+    assert_eq!(status, 200);
+    let source = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-served-from"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    let cookies = headers
+        .into_iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .map(|(_, value)| value)
+        .collect();
+    (cookies, source)
+}
+
+/// The cache must not be a second place the platform decides what a header
+/// list is.
+///
+/// The entry used to be written through `Object.fromEntries`, which keeps one
+/// value per name, so a response that was right on the miss came back with one
+/// cookie instead of two on the hit -- the same defect
+/// `runtime/response_headers.rs` exists to have caught once, reintroduced one
+/// layer in. Both requests here go to the same isolate, under a version that
+/// asked for every `Set-Cookie`, so the two answers have to be the same
+/// answer.
+#[tokio::test]
+async fn a_cached_response_keeps_every_set_cookie_it_was_stored_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle_with_compatibility(
+        "demo",
+        TWO_COOKIES_THROUGH_THE_CACHE,
+        serde_json::json!({ "flags": ["multiple_set_cookie_headers"] }),
+    );
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    deployer
+        .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .await
+        .unwrap();
+
+    let (fresh, source) = cookies_and_source(&apps, &demo()).await;
+    assert_eq!(source, "handler", "the first request has to be a miss");
+    assert_eq!(fresh, vec!["session=abc; Path=/", "csrf=xyz; Path=/"]);
+
+    let (cached, source) = cookies_and_source(&apps, &demo()).await;
+    assert_eq!(source, "cache", "the second request has to be a hit");
+    assert_eq!(
+        cached, fresh,
+        "a response served from the cache must carry the cookies it was stored with; anything \
+         less is one answer on a miss and a different one on a hit"
+    );
+}
+
+/// The other half of the same decision: the gate still runs, and it still runs
+/// once.
+///
+/// This version declared no date, so it gets the old answer -- one `Set-Cookie`
+/// -- and it has to get the *same* old answer whether the response came from
+/// the handler or from the cache. Storing the folded form in the entry would
+/// pass this test and fail the one above; folding on the way out passes both,
+/// which is what makes it one rule rather than two that agree by luck.
+#[tokio::test]
+async fn a_cached_response_is_folded_by_the_same_gate_the_fresh_one_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle("demo", TWO_COOKIES_THROUGH_THE_CACHE, &[], &[]);
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    deployer
+        .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .await
+        .unwrap();
+
+    let (fresh, source) = cookies_and_source(&apps, &demo()).await;
+    assert_eq!(source, "handler");
+    assert_eq!(fresh, vec!["csrf=xyz; Path=/"]);
+
+    let (cached, source) = cookies_and_source(&apps, &demo()).await;
+    assert_eq!(source, "cache");
+    assert_eq!(
+        cached, fresh,
+        "an undated application must get the bytes it was written against on a hit too"
+    );
+}
+
 /// A node that cannot honour what a version names refuses it, and keeps
 /// serving nothing rather than serving it wrong.
 ///

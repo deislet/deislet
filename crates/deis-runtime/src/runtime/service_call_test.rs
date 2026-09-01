@@ -75,6 +75,7 @@ fn the_table_reads_as_the_pairs_it_resolves_to() {
 #[test]
 fn the_caller_is_the_last_frame_of_the_chain() {
     let call = ServiceCall {
+        trace_id: "trace-under-test".to_string(),
         path: vec!["front.pr-1".to_string(), "mid.pr-1".to_string()],
         binding: "AUTH".to_string(),
         url: "http://localhost/x".to_string(),

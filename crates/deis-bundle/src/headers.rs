@@ -29,6 +29,22 @@
 //! headers compose (a site-wide security block plus a per-directory caching
 //! block), while a redirect is a single decision about where a request goes.
 //!
+//! **A name written twice in one block is sent twice.** A response's header
+//! list is not a map, and the two names authors repeat are exactly the two
+//! that may not be combined into one comma-joined value:
+//!
+//! ```text
+//! /*
+//!   Link: </app.css>; rel=preload; as=style
+//!   Link: </app.js>; rel=preload; as=script
+//! ```
+//!
+//! sends both `Link` headers. "A later block wins a conflict" is about blocks:
+//! a block that names `Link` again replaces the whole group an earlier block
+//! wrote, at the position the name first took. Within one block the author is
+//! listing values, not correcting themselves, so nothing is dropped. `! Name`
+//! still takes every value of that name off - a name is all it can name.
+//!
 //! ## Headers an application may not set
 //!
 //! These are refused at build time, by name, with the line number:
@@ -222,10 +238,34 @@ impl HeaderTable {
 
     /// The headers to put on a response for this path.
     ///
-    /// Blocks are applied in file order, so a later `set` replaces an earlier
-    /// value for the same name and a later `!` takes it off again. The result
-    /// keeps the order the headers were first set in, which is what makes two
-    /// responses to the same path byte-identical.
+    /// The result is a list, not a map, and the difference is the whole of
+    /// this function. A response's header list may carry the same name twice,
+    /// and for the two names authors repeat most - `Link` with several
+    /// `rel=preload` targets, and `Set-Cookie` with a session and a CSRF
+    /// cookie - it *has* to, because neither may be folded into one
+    /// comma-joined value. Keeping one value per name sent the last one and
+    /// said nothing about the rest, which is a preload that never happens or a
+    /// login that stops working.
+    ///
+    /// So the two directions are separated:
+    ///
+    ///   * Two lines with the same name *inside one block* both survive, in
+    ///     the order written. That is an author listing two values.
+    ///   * A block that sets a name replaces every value an *earlier* block
+    ///     gave it, at the position that name first took. That is the
+    ///     documented "a later block wins a conflict", and it has to stay:
+    ///     a per-directory `Cache-Control` overrules the site-wide one rather
+    ///     than adding a second, contradictory value next to it.
+    ///
+    /// `!` still takes every value of a name off, because a name is the only
+    /// thing an author can write there.
+    ///
+    /// Order is fixed rather than incidental: it is what makes two responses
+    /// to the same path byte-identical, so a diff between two nodes means
+    /// something. Names were lower-cased by [`check_name`] on the way in, so
+    /// comparing them exactly here is comparing them the way they were
+    /// normalised - unlike the isolate's response path, which sees whatever
+    /// spelling the handler wrote and has to compare without regard to case.
     pub fn apply(&self, path_segments: &[String]) -> Vec<HeaderField> {
         let mut out: Vec<HeaderField> = Vec::new();
         for rule in &self.rules {
@@ -235,9 +275,28 @@ impl HeaderTable {
             for name in &rule.remove {
                 out.retain(|field| &field.name != name);
             }
+            // Names this block has already taken over from the earlier ones,
+            // so its second `Link:` line joins its first instead of replacing
+            // the group the block itself just wrote.
+            let mut taken: Vec<&str> = Vec::with_capacity(rule.set.len());
             for field in &rule.set {
-                match out.iter_mut().find(|existing| existing.name == field.name) {
-                    Some(existing) => existing.value = field.value.clone(),
+                if taken.contains(&field.name.as_str()) {
+                    let after = out
+                        .iter()
+                        .rposition(|existing| existing.name == field.name)
+                        .map_or(out.len(), |index| index + 1);
+                    out.insert(after, field.clone());
+                    continue;
+                }
+                taken.push(&field.name);
+                match out.iter().position(|existing| existing.name == field.name) {
+                    Some(first) => {
+                        // Everything dropped sat at or after `first`, so the
+                        // list never shrinks past it and the name keeps the
+                        // place it first took.
+                        out.retain(|existing| existing.name != field.name);
+                        out.insert(first, field.clone());
+                    }
                     None => out.push(field.clone()),
                 }
             }

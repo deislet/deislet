@@ -906,12 +906,22 @@ impl ApplicationManager {
         self.inspect_sessions
             .insert(key.clone(), (token.clone(), expires_at));
 
+        // The token is deliberately absent. It is the whole authorisation for
+        // attaching a debugger to this tenant's isolate over the node's public
+        // port, and a CDP session reads that tenant's decrypted environment
+        // secrets and the bodies of the requests it is serving. This line goes
+        // to the node's stdout, into the log buffer, and on to deis-telemetry,
+        // where anyone who may read logs would then be able to attach: the
+        // credential is answered to the caller that asked for it and to nobody
+        // else, the same rule `deployment/credential.rs` and
+        // `dispatcher/auth.rs` state for theirs.
         tracing::info!(
             app_id = %key.app_id(),
             environment = %key.environment(),
-            "Started debug session for app {}: token={}, ttl={}s",
+            ttl_seconds,
+            "Started a debug session for app {}, valid for {}s. Whoever holds its token can \
+             read this tenant's secrets and its in-flight requests until it expires",
             key,
-            token,
             ttl_seconds
         );
 
@@ -919,10 +929,22 @@ impl ApplicationManager {
     }
 
     /// Validate debug token
+    ///
+    /// Compared with the platform's constant-time credential comparison rather
+    /// than with `==`, which stops at the first byte that differs: this token
+    /// is presented over the node's public port by whoever wants to attach,
+    /// and a comparison whose duration reports how many leading bytes were
+    /// right hands an attacker the token one byte at a time. It is the same
+    /// rule and the same function the node key and the storage token are
+    /// checked with; a second spelling of it here would be a second place to
+    /// get it wrong. An empty stored token never matches, which is what the
+    /// helper's own emptiness check is for.
     pub fn validate_inspect_token(&self, key: &AppKey, token: &str) -> bool {
         if let Some(entry) = self.inspect_sessions.get(key) {
             let (stored_token, expires_at) = entry.value();
-            if stored_token == token && SystemTime::now() < *expires_at {
+            if deis_wire::conventions::node_secret_matches(stored_token, token)
+                && SystemTime::now() < *expires_at
+            {
                 return true;
             }
         }

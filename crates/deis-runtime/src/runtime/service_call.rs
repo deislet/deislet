@@ -246,6 +246,16 @@ pub struct ServiceCall {
     /// `app.environment`. The caller is the last entry; the callee is not in
     /// it yet.
     pub path: Vec<String>,
+    /// The invocation this call is one hop of.
+    ///
+    /// Beside the chain, and travelling as data for the same reason: what an
+    /// application could write, an application could forge, and a caller that
+    /// could name a trace could file its own log lines under somebody else's
+    /// request. The callee runs under this id, so `deis logs --trace-id` on
+    /// the id `deis trace` printed for the inbound request answers with every
+    /// line every application in the chain wrote for it -- which is the only
+    /// reason the field is worth carrying at all.
+    pub trace_id: String,
     /// The binding name the caller used, for the callee's log line and for
     /// the error the caller gets back.
     pub binding: String,
