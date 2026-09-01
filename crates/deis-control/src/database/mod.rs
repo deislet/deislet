@@ -1,12 +1,15 @@
+pub mod command_status;
 pub mod schema;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+pub use command_status::{CommandEvent, CommandFSM, CommandStatus};
 
 use crate::message::NodeRole;
 use crate::session::{NodeSession, NodeState};
@@ -90,45 +93,6 @@ pub struct HeartbeatEntry {
     pub instance_id: String,
     pub timestamp: DateTime<Utc>,
     pub latency_ms: Option<i64>,
-}
-
-/// Command status
-#[derive(Debug, Clone)]
-pub enum CommandStatus {
-    Pending,
-    Sent,
-    Acknowledged,
-    Completed,
-    Failed,
-    Timeout,
-}
-
-impl CommandStatus {
-    pub fn as_str(&self) -> &str {
-        match self {
-            CommandStatus::Pending => "Pending",
-            CommandStatus::Sent => "Sent",
-            CommandStatus::Acknowledged => "Acknowledged",
-            CommandStatus::Completed => "Completed",
-            CommandStatus::Failed => "Failed",
-            CommandStatus::Timeout => "Timeout",
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Result<Self, DatabaseError> {
-        match s {
-            "Pending" => Ok(CommandStatus::Pending),
-            "Sent" => Ok(CommandStatus::Sent),
-            "Acknowledged" => Ok(CommandStatus::Acknowledged),
-            "Completed" => Ok(CommandStatus::Completed),
-            "Failed" => Ok(CommandStatus::Failed),
-            "Timeout" => Ok(CommandStatus::Timeout),
-            _ => Err(DatabaseError::ParseError {
-                message: format!("Invalid command status: {}", s),
-            }),
-        }
-    }
 }
 
 /// Command entry
@@ -261,7 +225,7 @@ impl Database {
         };
 
         let ports_json = serde_json::to_string(&session.ports)?;
-        let state_str = state_name(&session.get_state().await).to_string();
+        let state_str = session.get_state().await.as_str().to_string();
         let last_heartbeat = session.last_heartbeat.lock().await.to_rfc3339();
 
         let node_id = session.node_id.clone();
@@ -301,7 +265,7 @@ impl Database {
         state: NodeState,
     ) -> Result<(), DatabaseError> {
         let node_id = node_id.to_string();
-        let state_str = state_name(&state);
+        let state_str = state.as_str();
 
         self.with_connection(move |conn| {
             conn.execute(
@@ -374,24 +338,72 @@ impl Database {
         .await
     }
 
-    /// Update command status
-    pub async fn update_command_status(
+    /// Record that something happened to a command, and move its status
+    /// wherever [`CommandFSM`] says that leaves it.
+    ///
+    /// The caller names the event, never the status. Reading the stored
+    /// status and applying the event happen on the same connection, so two
+    /// racing writers cannot both read `Sent` and both decide they may
+    /// write - which is the whole reason this is not a bare `UPDATE` any
+    /// more.
+    ///
+    /// An event the stored status has no row for is dropped rather than
+    /// refused. It is late, not wrong: a node answering at the moment its
+    /// deadline passes produces both a `Succeeded` and an `Expired`, and both
+    /// describe something that really happened. The record keeps the first
+    /// ending, which is the one the API already told the caller about, and
+    /// the second is logged with both statuses so an operator reading a
+    /// `Timeout` beside a node's answer can see why.
+    ///
+    /// Returns the status the command is left in, or `None` if there is no
+    /// such command.
+    pub async fn record_command_event(
         &self,
         command_id: &str,
-        status: CommandStatus,
+        event: CommandEvent,
         response_data: Option<JsonValue>,
         error_message: Option<String>,
-    ) -> Result<(), DatabaseError> {
+    ) -> Result<Option<CommandStatus>, DatabaseError> {
         let command_id = command_id.to_string();
 
         self.with_connection(move |conn| {
-            let now = Utc::now().to_rfc3339();
-            let completed_at = match status {
-                CommandStatus::Completed | CommandStatus::Failed | CommandStatus::Timeout => {
-                    Some(now.clone())
-                }
-                _ => None,
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM commands WHERE id = ?1",
+                    params![command_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            let Some(stored) = stored else {
+                tracing::warn!(
+                    command_id = %command_id,
+                    event = %event,
+                    "No such command to record an event against; it was never saved or was \
+                     already pruned"
+                );
+                return Ok(None);
             };
+            let current = CommandStatus::from_str(&stored)?;
+
+            let Some(next) = current.apply(&event) else {
+                tracing::warn!(
+                    command_id = %command_id,
+                    stored = current.as_str(),
+                    event = %event,
+                    "Dropped a late command event: the command is already recorded as {} and \
+                     nothing follows that, so the {} that arrived afterwards changes nothing",
+                    current.as_str(),
+                    event
+                );
+                return Ok(Some(current));
+            };
+
+            // Which statuses stamp `completed_at` used to be a second
+            // hand-written list of the three endings, written out beside the
+            // UPDATE. It is the table's answer now: an ending is a status
+            // with no way out.
+            let completed_at = next.is_terminal().then(|| Utc::now().to_rfc3339());
 
             conn.execute(
                 r#"
@@ -400,7 +412,7 @@ impl Database {
                 WHERE id = ?5
                 "#,
                 params![
-                    status.as_str(),
+                    next.as_str(),
                     completed_at,
                     response_data
                         .as_ref()
@@ -410,7 +422,7 @@ impl Database {
                     command_id,
                 ],
             )?;
-            Ok(())
+            Ok(Some(next))
         })
         .await
     }
@@ -993,16 +1005,6 @@ impl Database {
     }
 }
 
-/// How a node state is spelled in the `nodes` table.
-fn state_name(state: &NodeState) -> &'static str {
-    match state {
-        NodeState::Connected => "Connected",
-        NodeState::Registered => "Registered",
-        NodeState::Active => "Active",
-        NodeState::Disconnected => "Disconnected",
-    }
-}
-
 /// Free functions, not methods: the row mappers run inside closures that are
 /// moved to a blocking thread, so anything they capture would have to be
 /// `'static` - and `&self` is not.
@@ -1163,6 +1165,114 @@ mod tests {
         let heartbeats = db.get_recent_heartbeats("node-1", 10).await.unwrap();
         assert_eq!(heartbeats.len(), 1);
         assert_eq!(heartbeats[0].latency_ms, Some(10));
+    }
+
+    /// Set up a node and one `Pending` command against it.
+    async fn command_fixture(db: &Database, command_id: &str) {
+        let node_info = crate::message::NodeInfo {
+            node_role: NodeRole::Runtime("1.0.0".to_string()),
+            listen_host: "192.168.1.1".to_string(),
+            listen_port: vec![8000],
+        };
+        let session = crate::session::NodeSession::new("node-1".to_string(), node_info);
+        db.save_node(&session).await.unwrap();
+
+        db.save_command(&CommandEntry {
+            id: command_id.to_string(),
+            node_id: "node-1".to_string(),
+            command_type: "get_status".to_string(),
+            command_data: JsonValue::Null,
+            status: CommandStatus::Pending,
+            created_at: Utc::now(),
+            sent_at: None,
+            completed_at: None,
+            timeout_at: None,
+            response_data: None,
+            error_message: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `CommandExecutor::execute_command` writes its own timeout while
+    /// `handle_response` writes the node's answer, and a node answering as
+    /// its deadline passes makes both run. The blind `UPDATE` this replaced
+    /// let the later writer win, so a command that completed could end up
+    /// stored as `Timeout` with the node's response body sitting beside it.
+    ///
+    /// Before this change the final status here was `Timeout`.
+    #[tokio::test]
+    async fn a_late_timeout_cannot_overwrite_a_completed_command() {
+        let db = Database::init(":memory:").await.unwrap();
+        command_fixture(&db, "cmd-race").await;
+
+        db.record_command_event("cmd-race", CommandEvent::Delivered, None, None)
+            .await
+            .unwrap();
+        db.record_command_event(
+            "cmd-race",
+            CommandEvent::Succeeded,
+            Some(serde_json::json!({"ok": true})),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let after = db
+            .record_command_event(
+                "cmd-race",
+                CommandEvent::Expired,
+                None,
+                Some("Command timeout".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(after, Some(CommandStatus::Completed));
+        let stored = db.get_command("cmd-race").await.unwrap().unwrap();
+        assert_eq!(stored.status, CommandStatus::Completed);
+        assert_eq!(stored.response_data, Some(serde_json::json!({"ok": true})));
+        assert_eq!(stored.error_message, None);
+        assert!(stored.completed_at.is_some());
+    }
+
+    /// The `Sent` write is issued after the message is already on the node's
+    /// stream, so a node that answers inside one database round trip has its
+    /// ending written first. The blind `UPDATE` then walked the command back
+    /// to `Sent` - and because `Sent` is not an ending, blanked
+    /// `completed_at` on the way.
+    ///
+    /// Before this change the final status here was `Sent` with no
+    /// `completed_at`.
+    #[tokio::test]
+    async fn a_late_delivery_write_cannot_walk_a_finished_command_backwards() {
+        let db = Database::init(":memory:").await.unwrap();
+        command_fixture(&db, "cmd-fast").await;
+
+        db.record_command_event("cmd-fast", CommandEvent::Succeeded, None, None)
+            .await
+            .unwrap();
+        db.record_command_event("cmd-fast", CommandEvent::Delivered, None, None)
+            .await
+            .unwrap();
+
+        let stored = db.get_command("cmd-fast").await.unwrap().unwrap();
+        assert_eq!(stored.status, CommandStatus::Completed);
+        assert!(stored.completed_at.is_some());
+    }
+
+    /// An event against a command nobody saved is not an error - the command
+    /// may simply have been pruned - but it must not report a status either.
+    #[tokio::test]
+    async fn an_event_for_an_unknown_command_records_nothing() {
+        let db = Database::init(":memory:").await.unwrap();
+
+        let outcome = db
+            .record_command_event("cmd-missing", CommandEvent::Expired, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, None);
     }
 
     #[tokio::test]

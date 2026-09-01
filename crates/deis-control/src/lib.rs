@@ -49,7 +49,7 @@ pub use metrics::{MetricsCollector, MetricsSummary, NodesMetrics, SystemMetrics}
 pub use runtime_client::RuntimeNodeManager;
 pub use scheduler::{CronKey, CronScheduler, CronTask};
 pub use server::ControlServer;
-pub use session::{NodeSession, NodeState, SendError, SessionManager};
+pub use session::{NodeEvent, NodeFSM, NodeSession, NodeState, SendError, SessionManager};
 
 pub const VERSION: &str = "0.1.0";
 
@@ -59,7 +59,7 @@ mod tests {
     use crate::config::ControlConfig;
     use crate::handler::MessageHandler;
     use crate::message::{AuthData, HeartbeatRequest, NodeInfo, NodeRole, RegisterRequest};
-    use crate::session::{NodeSession, NodeState, SessionManager};
+    use crate::session::{NodeEvent, NodeSession, NodeState, SessionManager};
 
     #[test]
     fn test_control_config_default() {
@@ -111,10 +111,10 @@ mod tests {
 
         assert_eq!(session.get_state().await, NodeState::Connected);
 
-        session.set_state(NodeState::Registered).await;
+        session.apply(NodeEvent::Registered).await.unwrap();
         assert_eq!(session.get_state().await, NodeState::Registered);
 
-        session.set_state(NodeState::Active).await;
+        session.apply(NodeEvent::Heartbeat).await.unwrap();
         assert_eq!(session.get_state().await, NodeState::Active);
     }
 

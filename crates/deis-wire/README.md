@@ -101,6 +101,38 @@ deis_runtime}`. Adding your own message type is documented in
 The protobuf definitions are in [`proto/control.proto`](proto/control.proto)
 and are compiled by `build.rs` into `deis_wire::pb`.
 
+### Instance lifecycle
+
+`InstanceStatus` — what a node's own instance is doing — is not a bare enum.
+It is the `InstanceFSM` table in
+[`src/models/instance.rs`](src/models/instance.rs), and it is the *only*
+statement of what an instance may do next: deis-proxy drives its lifecycle
+straight off it rather than keeping a second copy, which is what a second copy
+had done, and had drifted from.
+
+The picture below is generated from that table by `yasm`, and a test in this
+crate fails if the two stop agreeing. What the caller supplies is the event on
+each arrow; where it lands is the table's answer, never the caller's.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Active : Registered
+    Active --> Sunsetting : Shutdown
+    Sunsetting --> Terminated : Silenced
+    Terminated --> Pending : Startup
+    Active --> Active : Registered
+```
+
+The `Active --> Active` arrow is a proxy re-registering after the control
+plane went away and came back: it never stopped serving, so it stays active.
+
+Heartbeats are left out of the picture on purpose. `_Heartbeat` is spelled
+with a leading underscore, which is how `yasm` marks an input as not part of
+the story: a heartbeat holds `Active` at `Active` and `Sunsetting` at
+`Sunsetting`, so drawing it adds two self-loops and hides the four steps that
+are the lifecycle.
+
 ## Layout
 
 ```

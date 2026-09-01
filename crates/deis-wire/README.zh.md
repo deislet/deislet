@@ -92,6 +92,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 protobuf 定义在 [`proto/control.proto`](proto/control.proto)，由 `build.rs` 编译进
 `deis_wire::pb`。
 
+### 实例的生命周期
+
+`InstanceStatus` 说的是一个节点自己这个实例正处在哪一步，它不是一个普通的枚举。
+它是 [`src/models/instance.rs`](src/models/instance.rs) 里那张 `InstanceFSM` 表，
+而且是关于"实例下一步能去哪里"的唯一一份说法：deis-proxy 直接照着这张表走，不再
+自己另写一份。以前它确实另写过一份，两份也确实对不上了。
+
+下面这张图是 `yasm` 从那张表里生成出来的。本 crate 有一个测试，一旦图和表不再一致
+就会失败。调用方给出的是箭头上的那个事件，最终落到哪个状态由表来回答，调用方说了
+不算。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Active : Registered
+    Active --> Sunsetting : Shutdown
+    Sunsetting --> Terminated : Silenced
+    Terminated --> Pending : Startup
+    Active --> Active : Registered
+```
+
+`Active --> Active` 这条自环，说的是控制面掉线后又回来、代理重新注册的那一次：它
+中间一直在正常处理请求，所以还是 Active。
+
+心跳故意没有画进去。`_Heartbeat` 名字前面那个下划线，是 `yasm` 用来标记"这个输入
+不属于主线剧情"的写法：心跳只是把 `Active` 按在 `Active`、把 `Sunsetting` 按在
+`Sunsetting`，画出来会多两条自环，反而把真正的四步盖住。
+
 ## 目录
 
 ```

@@ -36,6 +36,7 @@ use super::challenge::ChallengeResponder;
 use super::error::AcmeError;
 use super::http::{AcmeHttp, AcmeResponse};
 use super::jose::{KeyId, base64url, sign_request};
+use super::status::{AuthorizationStatus, OrderStatus};
 
 /// How long to wait between polls when the authority does not say.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -237,30 +238,35 @@ impl AcmeClient {
 
         // The authority signs asynchronously; the order carries the
         // certificate URL only once it is `valid`.
+        //
+        // The finalize answer is where this client starts watching the
+        // order's status, not where the order started. An order is created
+        // `pending` and moves to `ready` when its authorizations all pass,
+        // and that step happens between two requests this client makes: it
+        // posts finalize without re-reading the order first, so it never sees
+        // `ready`. Seeding [`OrderStatus`] from the finalize answer is what
+        // keeps a step this client did not observe from looking like a step
+        // the authority was not allowed to make.
+        let mut status = order_status(&order, name)?;
         let mut interval = response.retry_after().unwrap_or(DEFAULT_POLL_INTERVAL);
-        loop {
-            match order.get("status").and_then(JsonValue::as_str) {
-                Some("valid") => break,
-                Some("invalid") => {
-                    return Err(AcmeError::ChallengeFailed {
-                        name: name.to_string(),
-                        detail: order_problem(&order),
-                    });
-                }
-                Some(status @ ("pending" | "processing" | "ready")) => {
-                    self.wait_before_next_poll(name, status, started, interval)
-                        .await?;
-                }
-                other => {
-                    return Err(AcmeError::protocol(
-                        format!("the order for {name}"),
-                        format!("it reports an unknown status {other:?}"),
-                    ));
-                }
-            }
+        while !status.is_settled() {
+            self.wait_before_next_poll(name, status.as_str(), started, interval)
+                .await?;
             let response = self.post_as_account(&order_url, "").await?;
             interval = response.retry_after().unwrap_or(DEFAULT_POLL_INTERVAL);
             order = expect_json(&response, &format!("the order for {name}"))?;
+
+            let reported = order_status(&order, name)?;
+            status = status.advance(reported).map_err(|step| {
+                AcmeError::protocol(format!("the order for {name}"), step.to_string())
+            })?;
+        }
+
+        if status == OrderStatus::Invalid {
+            return Err(AcmeError::ChallengeFailed {
+                name: name.to_string(),
+                detail: order_problem(&order),
+            });
         }
 
         let certificate_url = order
@@ -319,7 +325,7 @@ impl AcmeClient {
 
         // Already valid: the authority reuses a recent validation for the
         // same name, which is why renewing usually makes no challenge at all.
-        if authorization.get("status").and_then(JsonValue::as_str) == Some("valid") {
+        if authorization_status(&authorization).ok() == Some(AuthorizationStatus::Valid) {
             debug!(
                 name,
                 "the authority already holds a valid authorization for this name"
@@ -404,8 +410,12 @@ impl AcmeClient {
         }
         let mut interval = response.retry_after().unwrap_or(DEFAULT_POLL_INTERVAL);
 
+        // The challenge has just been accepted, so the authorization is
+        // pending by definition. Everything after this is the authority's
+        // answer, and the table decides which answers may follow it.
+        let mut status = AuthorizationStatus::Pending;
         loop {
-            self.wait_before_next_poll(name, "pending", started, interval)
+            self.wait_before_next_poll(name, status.as_str(), started, interval)
                 .await?;
             let response = self.post_as_account(authorization_url, "").await?;
             if response.status != 200 {
@@ -414,24 +424,32 @@ impl AcmeClient {
             interval = response.retry_after().unwrap_or(DEFAULT_POLL_INTERVAL);
             let authorization = expect_json(&response, &format!("the authorization for {name}"))?;
 
-            match authorization.get("status").and_then(JsonValue::as_str) {
-                Some("valid") => {
-                    info!(name, "the authority validated this name");
-                    return Ok(());
-                }
-                Some("pending" | "processing") => continue,
-                Some(status) => {
-                    return Err(AcmeError::ChallengeFailed {
-                        name: name.to_string(),
-                        detail: format!("{status}: {}", authorization_problem(&authorization)),
-                    });
-                }
-                None => {
-                    return Err(AcmeError::protocol(
-                        format!("the authorization for {name}"),
-                        "it carries no status",
-                    ));
-                }
+            // A status this client does not know, and a step the RFC does not
+            // allow, are both the authority saying the name will not be
+            // validated. They are reported as one thing because to whoever
+            // reads the log they are one thing: the answer names what was
+            // seen, and the problem document says why.
+            let failed = |detail: String| AcmeError::ChallengeFailed {
+                name: name.to_string(),
+                detail: format!("{detail}: {}", authorization_problem(&authorization)),
+            };
+            let reported = authorization_status(&authorization).map_err(|e| match e {
+                UnreadableStatus::Unknown(status) => failed(status),
+                UnreadableStatus::Missing => AcmeError::protocol(
+                    format!("the authorization for {name}"),
+                    "it carries no status",
+                ),
+            })?;
+            status = status
+                .advance(reported)
+                .map_err(|step| failed(step.to_string()))?;
+
+            if status == AuthorizationStatus::Valid {
+                info!(name, "the authority validated this name");
+                return Ok(());
+            }
+            if status.is_decided() {
+                return Err(failed(status.as_str().to_string()));
             }
         }
     }
@@ -648,6 +666,50 @@ fn problem(response: &AcmeResponse, context: &str) -> AcmeError {
         kind,
         detail,
     }
+}
+
+/// Read an order's `status`.
+///
+/// Both failures are protocol faults for an order: the RFC requires the
+/// member, and the five values it may hold are the five in
+/// [`OrderStatus`]. An authority sending anything else is not speaking the
+/// ACME this client implements, and there is nothing useful to be done with
+/// the order after that.
+fn order_status(order: &JsonValue, name: &str) -> Result<OrderStatus, AcmeError> {
+    let context = || format!("the order for {name}");
+    let raw = order
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| AcmeError::protocol(context(), "it carries no status"))?;
+    OrderStatus::parse(raw).ok_or_else(|| {
+        AcmeError::protocol(context(), format!("it reports an unknown status {raw:?}"))
+    })
+}
+
+/// Why an authorization's `status` could not be read.
+///
+/// Kept apart from [`AcmeError`] because the two failures mean different
+/// things for an authorization and the caller raises different errors for
+/// them: a missing member is a broken authority, while an unrecognised value
+/// is the authority telling us something about this name that this client
+/// cannot act on - which is a challenge that will not be satisfied, exactly
+/// as it was before these statuses were typed.
+enum UnreadableStatus {
+    /// No `status` member at all.
+    Missing,
+    /// A value this client has no meaning for.
+    Unknown(String),
+}
+
+/// Read an authorization's `status`.
+fn authorization_status(
+    authorization: &JsonValue,
+) -> Result<AuthorizationStatus, UnreadableStatus> {
+    let raw = authorization
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .ok_or(UnreadableStatus::Missing)?;
+    AuthorizationStatus::parse(raw).ok_or_else(|| UnreadableStatus::Unknown(raw.to_string()))
 }
 
 /// The `error` a failed challenge carries, as a sentence.

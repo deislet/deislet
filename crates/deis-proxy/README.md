@@ -139,6 +139,44 @@ certified, an email address the authority writes to when a certificate is
 about to expire, and an explicit `terms_of_service_agreed = true` — this
 process will not agree to an authority's terms on an operator's behalf.
 
+### What an order is allowed to do
+
+The status of an order belongs to the authority; this instance only watches
+it. What this instance does hold an opinion about is the *order* those
+statuses may come in, which RFC 8555 section 7.1.6 fixes. It is the
+`OrderFSM` table in `src/acme/status.rs`, and the diagram is generated from
+it — a test fails if the two stop agreeing.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Ready : ReportedReady
+    Pending --> Invalid : ReportedInvalid
+    Ready --> Processing : ReportedProcessing
+    Ready --> Invalid : ReportedInvalid
+    Processing --> Valid : ReportedValid
+    Processing --> Invalid : ReportedInvalid
+    Pending --> Pending : ReportedPending
+    Ready --> Ready : ReportedReady
+    Processing --> Processing : ReportedProcessing
+```
+
+Each arrow is the authority reporting a status, and the self-loops are what
+an ordinary poll looks like: nothing has changed yet. The steps the table
+does *not* have are the point. An authority that answers `processing` to a
+finalize request and then reports the order as `ready` again has gone
+backwards, and this instance says so on the first poll that shows it —
+naming the two statuses — instead of polling for the whole
+`order_timeout_secs` and then reporting a stall, which would blame the
+authority for being slow rather than for breaking the protocol.
+
+The polling starts from whatever the finalize answer says, not from where the
+order began. An order is created `pending` and moves to `ready` once its
+authorizations pass, and this instance posts finalize without re-reading it,
+so that step happens between two of its own requests and is never observed.
+Watching from the finalize answer is what keeps a step nobody saw from
+looking like a step nobody was allowed to make.
+
 ## Configuration
 
 See [`config.toml.example`](config.toml.example) for every key. Values are

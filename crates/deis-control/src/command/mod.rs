@@ -8,7 +8,7 @@ use tokio::sync::{RwLock, oneshot};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::database::{CommandEntry, CommandStatus, Database};
+use crate::database::{CommandEntry, CommandEvent, CommandStatus, Database};
 use crate::session::SessionManager;
 use deis_wire::pb::{
     CommandRequest as ProtoCommandRequest, ControlMessage, control_message::Payload,
@@ -66,6 +66,32 @@ struct CommandTracker {
     created_at: DateTime<Utc>,
     timeout_at: DateTime<Utc>,
     response_tx: Option<oneshot::Sender<CommandResponse>>,
+}
+
+impl CommandTracker {
+    /// Move the in-memory copy of the status through the same table the
+    /// database record goes through.
+    ///
+    /// This copy is what `get_command_status` and `get_status` answer from
+    /// while a command is still in flight, so a status the database would
+    /// refuse must not be readable here either. It used to be assigned
+    /// directly beside every database write, which is two places naming a
+    /// status and one table.
+    async fn record(&self, event: &CommandEvent) {
+        let mut status = self.status.write().await;
+        match status.apply(event) {
+            Some(next) => *status = next,
+            None => tracing::warn!(
+                command_id = %self.command_id,
+                node_id = %self.node_id,
+                stored = status.as_str(),
+                event = %event,
+                "Dropped a late command event on the in-flight tracker: it is already {} and \
+                 nothing follows that",
+                status.as_str()
+            ),
+        }
+    }
 }
 
 /// Command executor
@@ -163,14 +189,16 @@ impl CommandExecutor {
             .await
             .map_err(|e| ExecuteError::SendError(e.to_string()))?;
 
-        // Update status
+        // The message is already on the wire, so this write races the node's
+        // answer. If the answer wins, the table drops this one rather than
+        // walking a completed command back to `Sent`.
         if let Some(tracker) = self.pending_commands.get(&command_id) {
-            *tracker.status.write().await = CommandStatus::Sent;
+            tracker.record(&CommandEvent::Delivered).await;
         }
 
         // Update database
         self.database
-            .update_command_status(&command_id.to_string(), CommandStatus::Sent, None, None)
+            .record_command_event(&command_id.to_string(), CommandEvent::Delivered, None, None)
             .await
             .ok();
 
@@ -192,9 +220,9 @@ impl CommandExecutor {
                 // Channel closed
                 self.pending_commands.remove(&command_id);
                 self.database
-                    .update_command_status(
+                    .record_command_event(
                         &command_id.to_string(),
-                        CommandStatus::Failed,
+                        CommandEvent::Failed,
                         None,
                         Some("Response channel closed".to_string()),
                     )
@@ -204,12 +232,16 @@ impl CommandExecutor {
                 Err(ExecuteError::ChannelClosed)
             }
             Err(_) => {
-                // Timeout
+                // The deadline passed here, which is a different thing from
+                // the node failing: `handle_response` may be writing the
+                // node's answer at this very moment. Whichever ending reaches
+                // the database first is the one that stands, so the record
+                // agrees with what this call returns to its caller.
                 self.pending_commands.remove(&command_id);
                 self.database
-                    .update_command_status(
+                    .record_command_event(
                         &command_id.to_string(),
-                        CommandStatus::Timeout,
+                        CommandEvent::Expired,
                         None,
                         Some("Command timeout".to_string()),
                     )
@@ -233,18 +265,22 @@ impl CommandExecutor {
             .ok_or(HandleResponseError::CommandNotFound)?
             .1;
 
-        // Update status
-        let status = if response.success {
-            CommandStatus::Completed
+        // What the node said, not what the record should say. `Succeeded`
+        // and `Failed` are two different endings and the table knows which
+        // status each is; whether this one is allowed to land at all depends
+        // on whether the deadline beat it there.
+        let event = if response.success {
+            CommandEvent::Succeeded
         } else {
-            CommandStatus::Failed
+            CommandEvent::Failed
         };
+        tracker.record(&event).await;
 
         // Update database
         self.database
-            .update_command_status(
+            .record_command_event(
                 &command_id.to_string(),
-                status,
+                event,
                 response.data.clone(),
                 if response.success {
                     None
@@ -255,7 +291,10 @@ impl CommandExecutor {
             .await
             .map_err(|e| HandleResponseError::DatabaseError(e.to_string()))?;
 
-        // Send response to waiting task
+        // Send response to waiting task. Handed on whatever the record ended
+        // up saying: the caller asked the node a question and the node
+        // answered, and a deadline that expired first changes what is
+        // written down, not what came back.
         if let Some(tx) = tracker.response_tx {
             tx.send(response).ok();
         }
@@ -289,9 +328,9 @@ impl CommandExecutor {
         for id in expired_ids {
             self.pending_commands.remove(&id);
             self.database
-                .update_command_status(
+                .record_command_event(
                     &id.to_string(),
-                    CommandStatus::Timeout,
+                    CommandEvent::Expired,
                     None,
                     Some("Command expired".to_string()),
                 )
@@ -370,14 +409,15 @@ impl CommandExecutor {
             .await
             .map_err(|e| ExecuteError::SendError(e.to_string()))?;
 
-        // Update status
+        // As in `execute_command`: the message is already on the wire, so a
+        // fast node's answer may reach the record before this does.
         if let Some(tracker) = self.pending_commands.get(&command_id) {
-            *tracker.status.write().await = CommandStatus::Sent;
+            tracker.record(&CommandEvent::Delivered).await;
         }
 
         // Update database
         self.database
-            .update_command_status(&command_id.to_string(), CommandStatus::Sent, None, None)
+            .record_command_event(&command_id.to_string(), CommandEvent::Delivered, None, None)
             .await
             .ok();
 
@@ -451,12 +491,12 @@ impl CommandExecutor {
     /// Cancel command
     pub async fn cancel(&self, command_id: &Uuid) -> Result<(), ExecuteError> {
         if let Some((_, tracker)) = self.pending_commands.remove(command_id) {
-            *tracker.status.write().await = CommandStatus::Failed;
+            tracker.record(&CommandEvent::Failed).await;
 
             self.database
-                .update_command_status(
+                .record_command_event(
                     &command_id.to_string(),
-                    CommandStatus::Failed,
+                    CommandEvent::Failed,
                     None,
                     Some("Cancelled by user".to_string()),
                 )

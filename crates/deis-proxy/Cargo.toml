@@ -62,7 +62,9 @@ openssl = "0.10"
 
 # Control (deis-control) client.
 deis-wire = { path = "../deis-wire" }
-yasm = "0.5.0"
+# Drives the instance lifecycle (src/control/state.rs) off deis-wire's
+# `InstanceFSM` and the ACME order/authorization statuses (src/acme/status.rs).
+yasm = { workspace = true }
 
 [dev-dependencies]
 # In-process control the client tests register against

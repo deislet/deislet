@@ -416,6 +416,56 @@ async fn a_challenge_the_authority_polls_and_rejects_fails_the_order_by_name() {
     drop(fixture.backend);
 }
 
+/// An authority that walks an order backwards is named for what it is,
+/// straight away.
+///
+/// Before the order status became a table, this client held a list of the
+/// statuses that meant "keep polling" and `ready` was on it. An authority
+/// that answered `processing` to finalize and then `ready` on every poll
+/// therefore looked like an order still in progress: the client polled it
+/// for the whole `order_timeout` - two minutes by default - and then
+/// reported a stall, which says the authority was slow rather than that it
+/// broke the protocol. RFC 8555 section 7.1.6 has no edge from `processing`
+/// back to `ready`, so it is now refused on the first poll that shows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authority_that_moves_an_order_backwards_is_refused_at_once() {
+    let fixture = Fixture::start(
+        vec![app("shop", &[NAME])],
+        CaOptions {
+            regress_order_after_finalize: true,
+            ..Default::default()
+        },
+        30,
+    )
+    .await;
+
+    until("the illegal step is reported", || {
+        fixture
+            .proxy
+            .log_text()
+            .contains("RFC 8555 section 7.1.6 does not allow")
+    })
+    .await;
+
+    let log = fixture.proxy.log_text();
+    assert!(
+        log.contains("from processing to ready"),
+        "the log has to say which step the authority made:\n{log}"
+    );
+    assert!(
+        log.contains(NAME),
+        "the log has to name which order it was:\n{log}"
+    );
+    assert!(
+        !log.contains("was still"),
+        "this is a protocol fault, not the order timeout it used to be \
+         reported as:\n{log}"
+    );
+    assert_eq!(fixture.ca.issued_count(), 0);
+    assert!(!fixture.chain_path(NAME).exists());
+    drop(fixture.backend);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_certificate_inside_the_renewal_window_is_replaced_before_it_expires() {
     // The authority issues certificates valid for twenty days and the proxy

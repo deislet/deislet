@@ -19,4 +19,9 @@ serde_json = "1.0"
 tracing = "0.1"
 anyhow = "1.0"
 rusqlite = { version = "0.40", features = ["bundled"] }
+# The workspace's only state machine library, declared once so that every
+# crate with a lifecycle to police links the same copy and the same tables.
+# Two versions used to sit in the tree, which meant two `State` types that
+# could not be compared and two builds of the same crate.
+yasm = { version = "0.6.0", features = ["serde"] }
 deis-wire = { path = "crates/deis-wire" }

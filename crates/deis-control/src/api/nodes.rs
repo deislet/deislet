@@ -61,15 +61,6 @@ pub struct HeartbeatsQuery {
     pub limit: Option<usize>,
 }
 
-fn state_of(state: &crate::session::NodeState) -> &'static str {
-    match state {
-        crate::session::NodeState::Connected => "Connected",
-        crate::session::NodeState::Registered => "Registered",
-        crate::session::NodeState::Active => "Active",
-        crate::session::NodeState::Disconnected => "Disconnected",
-    }
-}
-
 fn role_of(role: &crate::message::NodeRole) -> String {
     match role {
         crate::message::NodeRole::Runtime(v) => format!("deis_runtime:{}", v),
@@ -84,7 +75,7 @@ async fn view_of(session: &crate::session::NodeSession) -> SessionView {
         node_role: role_of(&session.node_role),
         host: session.host.clone(),
         ports: session.ports.clone(),
-        state: state_of(&session.get_state().await).to_string(),
+        state: session.get_state().await.as_str().to_string(),
         connected_at: session.connected_at.to_rfc3339(),
         last_heartbeat: session.last_heartbeat.lock().await.to_rfc3339(),
     }

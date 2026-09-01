@@ -38,6 +38,7 @@ pub mod error;
 pub mod http;
 pub mod jose;
 pub mod names;
+pub mod status;
 pub mod store;
 
 use std::collections::HashMap;

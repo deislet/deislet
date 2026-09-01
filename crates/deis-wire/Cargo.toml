@@ -19,7 +19,7 @@ sha2 = "0.10.9"
 tokio = { version = "1.45.1", features = ["full"] }
 tracing = "0.1.41"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
-yasm = { version = "0.4.0", features = ["serde"] }
+yasm = { workspace = true }
 tonic = "0.12"
 prost = "0.13"
 tokio-stream = "0.1"

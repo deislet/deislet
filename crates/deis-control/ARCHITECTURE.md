@@ -115,6 +115,28 @@ pub struct SessionManager {
 
 `DashMap` for concurrent access, `Arc<RwLock<_>>` around mutable state.
 
+A session's own state is the `NodeFSM` table, and the diagram below is
+generated from it by `yasm` — a test in this crate fails if the two stop
+agreeing. `NodeSession::apply` takes the event on the arrow and the table
+answers with the state; there is no setter that takes a state.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Connected
+    Connected --> Registered : Registered
+    Registered --> Active : Heartbeat
+    Connected --> Disconnected : Disconnected
+    Registered --> Disconnected : Disconnected
+    Active --> Disconnected : Disconnected
+    Active --> Active : Heartbeat
+```
+
+Two rules are worth reading off it. There is no arrow from `Connected` to
+`Active`: a heartbeat from a node that never registered is acknowledged and
+then ignored, so it is not counted among the live nodes by `src/metrics/` and
+not shown as active by `/api/sessions`. And nothing leaves `Disconnected`: a
+session whose stream closed stays closed, whatever arrives after it.
+
 ### 4. Catalog (`src/catalog/`)
 
 The product model, and the reason this component exists. Applications,
@@ -195,6 +217,49 @@ pub struct CommandExecutor {
 An API call creates a tracker with a UUID, sends the command down the node's
 stream, and waits on a `oneshot`. A background task expires trackers whose
 deadline passed. History is kept in the database.
+
+The status in that history is the `CommandFSM` table in
+`src/database/command_status.rs`. The diagram is generated from it by `yasm`,
+and a test in this crate fails if the two stop agreeing.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Sent : Delivered
+    Pending --> Completed : Succeeded
+    Pending --> Failed : Failed
+    Pending --> Timeout : Expired
+    Sent --> Acknowledged : NodeAcknowledged
+    Sent --> Completed : Succeeded
+    Sent --> Failed : Failed
+    Sent --> Timeout : Expired
+    Acknowledged --> Completed : Succeeded
+    Acknowledged --> Failed : Failed
+    Acknowledged --> Timeout : Expired
+```
+
+Three things this table says that the code used to leave to whichever writer
+finished last:
+
+* **`Completed`, `Failed` and `Timeout` have no arrows out.** The first
+  ending is the one that stands. Two writers race by design — the API call
+  writes its own timeout while the response handler writes the node's answer
+  — and the record now agrees with whichever of them the caller was told
+  about.
+* **Every ending is reachable straight from `Pending`.** The `Sent` write is
+  issued *after* the message is already on the stream, so a node that answers
+  inside one database round trip is recorded as finished before it is
+  recorded as sent; the late `Sent` is then dropped rather than walking the
+  command backwards and blanking `completed_at`.
+* **`Acknowledged` has arrows out but nothing produces it.** The wire has no
+  acknowledgement message, only `CommandResponse`. The status stays because
+  it is a value an existing database may hold and has always parsed, and its
+  outgoing arrows are what let such a row still reach an ending.
+
+The status strings in the `commands.status` column are these state names
+exactly. Renaming one would make every command in an existing database
+unreadable, which is why `CommandStatus::as_str` is pinned to the state list
+by a test.
 
 ### 10. Persistence (`src/database/`)
 

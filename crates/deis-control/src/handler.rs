@@ -4,7 +4,7 @@ use crate::database::{Database, Event, EventSeverity, HeartbeatEntry};
 use crate::message::{
     AuthData, AuthResponse, HeartbeatAck, HeartbeatRequest, RegisterRequest, RegisterResponse,
 };
-use crate::session::{NodeSession, NodeState, SessionManager};
+use crate::session::{NodeEvent, NodeSession, SessionManager};
 use chrono::Utc;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -92,7 +92,16 @@ impl MessageHandler {
         request: RegisterRequest,
         session: &Arc<NodeSession>,
     ) -> RegisterResponse {
-        session.set_state(NodeState::Registered).await;
+        if let Err(state) = session.apply(NodeEvent::Registered).await {
+            tracing::warn!(
+                node_id = %request.id,
+                instance_id = %session.instance_id,
+                state = state.as_str(),
+                "A node registered on a session that is already {}; the registration is \
+                 recorded but the session keeps the state it had",
+                state.as_str()
+            );
+        }
         self.sessions.add(Arc::clone(session));
 
         tracing::info!(
@@ -137,7 +146,23 @@ impl MessageHandler {
     ) -> HeartbeatAck {
         let now = Utc::now();
         *session.last_heartbeat.lock().await = now;
-        session.set_state(NodeState::Active).await;
+        // The heartbeat is still acknowledged when the session has no row for
+        // it: the wire has no way to answer "register first", and a node that
+        // was refused would only retry. What it does not do any more is
+        // promote a session that never registered, or one whose stream has
+        // already closed, to `Active` - which is how such a node used to end
+        // up counted among the live ones by `crate::metrics` and shown as
+        // active by `/api/sessions`.
+        if let Err(state) = session.apply(NodeEvent::Heartbeat).await {
+            tracing::warn!(
+                node_id = %session.node_id,
+                instance_id = %session.instance_id,
+                state = state.as_str(),
+                "Heartbeat from a node whose session is {}; acknowledged, but it is not counted \
+                 as active until it registers on a live session",
+                state.as_str()
+            );
+        }
 
         // Save heartbeat to database if available
         if let Some(db) = &self.database {
@@ -192,7 +217,9 @@ impl MessageHandler {
 
     /// Handle node disconnection
     pub async fn handle_disconnect(&self, session: &Arc<NodeSession>, reason: &str) {
-        session.set_state(NodeState::Disconnected).await;
+        // Already disconnected is not worth a line: cleanup can run twice for
+        // one stream and the second run has nothing left to say.
+        let _ = session.apply(NodeEvent::Disconnected).await;
 
         // Save disconnection event to database
         if let Some(db) = &self.database {
@@ -223,7 +250,7 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use crate::message::{NodeInfo, NodeRole};
-    use crate::session::SessionManager;
+    use crate::session::{NodeState, SessionManager};
 
     /// Disconnecting is what the dashboard's event list is built from, so
     /// the record has to reach the database: nothing else remembers that a

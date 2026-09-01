@@ -120,6 +120,12 @@ pub struct CaOptions {
     /// Days of validity on the issued leaf. Short values are how a test
     /// makes a certificate that is already inside the renewal window.
     pub validity_days: u32,
+    /// Answer `finalize` with `processing` and then report the order as
+    /// `ready` on every poll, which RFC 8555 section 7.1.6 does not allow -
+    /// an order that has begun processing does not go back to waiting for a
+    /// finalize it has already had. A real authority does not do this; the
+    /// option exists because a client has to notice when one does.
+    pub regress_order_after_finalize: bool,
 }
 
 impl Default for CaOptions {
@@ -129,6 +135,7 @@ impl Default for CaOptions {
             refuse_orders: None,
             sabotage_validation: false,
             validity_days: 90,
+            regress_order_after_finalize: false,
         }
     }
 }
@@ -967,6 +974,24 @@ fn finalize(state: &Arc<Mutex<CaState>>, index: usize, payload: &JsonValue) -> A
         return problem_answer(&malformed("the order's authorization is not valid"), nonce);
     }
 
+    // An authority walking the order backwards. Nothing is signed and the
+    // order is parked in `processing`, from which `order_state` then reports
+    // `ready` for ever.
+    if state.lock().unwrap().options.regress_order_after_finalize {
+        if let Some(order) = state.lock().unwrap().orders.get_mut(index) {
+            order.status = "processing".to_string();
+        }
+        return json_answer(
+            200,
+            json!({
+                "status": "processing",
+                "identifiers": [{ "type": "dns", "value": identifier }],
+            }),
+            Vec::new(),
+            nonce,
+        );
+    }
+
     let Some(csr) = payload["csr"].as_str().and_then(decode) else {
         return problem_answer(&malformed("the csr is missing or not base64url"), nonce);
     };
@@ -1071,8 +1096,13 @@ fn order_state(state: &Arc<Mutex<CaState>>, index: usize) -> Answer {
         return (404, Vec::new(), b"no such order\n".to_vec());
     };
     let base = &state.base;
+    let reported = if state.options.regress_order_after_finalize && order.status == "processing" {
+        "ready"
+    } else {
+        order.status.as_str()
+    };
     let mut body = json!({
-        "status": order.status,
+        "status": reported,
         "identifiers": [{ "type": "dns", "value": order.identifier }],
         "authorizations": [format!("{base}/authz/{}", order.authorization)],
         "finalize": format!("{base}/order/{index}/finalize"),

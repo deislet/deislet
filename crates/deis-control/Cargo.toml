@@ -81,6 +81,9 @@ mime_guess = "2"
 
 # Control Wire SDK
 deis-wire = { path = "../deis-wire" }
+# Drives the node session lifecycle (src/session.rs) and the command
+# lifecycle (src/database/command_status.rs).
+yasm = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -1,16 +1,52 @@
 //! Proxy instance lifecycle state management
 //!
-//! Implementation of deis-proxy instance lifecycle management based on InstanceStatus from the deis-wire library
+//! The lifecycle itself is not defined here. It is `InstanceFSM` in
+//! deis-wire (`deis_wire::models::instance::instance_fsm`), and everything
+//! below asks that table what may happen next instead of answering for
+//! itself.
 //!
-//! State Transitions: Pending -> Active -> Sunsetting -> Terminated
-//! Supports restart cycle: Terminated -> Pending
+//! It used to answer for itself, and that is worth recording because it is
+//! the failure this module exists to not repeat. A hand-written
+//! `is_valid_transition(from, to)` sat here, matching on the *state pair*
+//! alone. yasm's table is state **plus input**, so the pair-only copy was
+//! strictly weaker: `(Active, Active)` was legal, which meant a caller could
+//! ask to move to `Active` naming the event `"shutdown"`, be told yes, and
+//! leave a history entry saying an instance shut down while it went on
+//! serving. The event reached the log and never the decision.
+//!
+//! So the event *is* the decision now. Every entry point below names an
+//! [`Input`] and the table names the destination. The five `can_handle_*`
+//! predicates, which were a third copy of the same rules, ask
+//! [`InstanceFSM::valid_inputs`].
+//!
+//! State transitions: Pending -> Active -> Sunsetting -> Terminated,
+//! plus the restart edge Terminated -> Pending.
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use yasm::StateMachine;
 
-// Directly use state definitions from the deis-wire library
+// The lifecycle definition, taken whole from the deis-wire library.
 pub use deis_wire::models::instance::InstanceStatus as State;
+use deis_wire::models::instance::instance_fsm::{Input, InstanceFSM};
+
+/// The name an event is recorded under in [`StateTransition::event`].
+///
+/// A function of the input rather than a parameter beside it: these strings
+/// go into the transition history an operator reads afterwards, and a
+/// free-form string next to the transition is a string that can describe a
+/// different event from the one that actually fired. There is now no way to
+/// write "shutdown" into the history of a transition that was not a shutdown.
+fn event_name(input: &Input) -> &'static str {
+    match input {
+        Input::Registered => "registration_complete",
+        Input::_Heartbeat => "heartbeat",
+        Input::Shutdown => "shutdown",
+        Input::Silenced => "silenced",
+        Input::Startup => "startup",
+    }
+}
 
 /// Proxy instance state manager
 ///
@@ -25,6 +61,11 @@ pub struct ProxyStateManager {
     /// Current state
     current_state: Arc<RwLock<State>>,
     /// State transition history
+    ///
+    /// Kept by hand rather than read out of a `yasm::StateMachineInstance`
+    /// because what an operator needs from it is the timestamp and the event
+    /// name, and yasm's own history is a bounded ring of `(state, input)`
+    /// pairs with no clock. The *rule* comes from yasm; the record does not.
     transition_history: Arc<RwLock<Vec<StateTransition>>>,
     /// Instance ID
     instance_id: String,
@@ -45,26 +86,30 @@ impl ProxyStateManager {
         info!("Creating state manager for instance: {}", instance_id);
 
         Self {
-            current_state: Arc::new(RwLock::new(State::Pending)),
+            current_state: Arc::new(RwLock::new(InstanceFSM::initial_state())),
             transition_history: Arc::new(RwLock::new(Vec::new())),
             instance_id,
         }
     }
 
-    /// Internal state transition method
-    async fn transition_to(&self, new_state: State, event: &str) -> Result<State, String> {
+    /// Apply one lifecycle event.
+    ///
+    /// The caller says what happened. Where that leaves the instance is
+    /// `InstanceFSM`'s answer, not the caller's, and an event the current
+    /// state has no row for changes nothing at all.
+    async fn apply(&self, input: Input) -> Result<State, String> {
         let mut current = self.current_state.write().await;
         let old_state = current.clone();
 
-        // Validate if the state transition is valid
-        if !self.is_valid_transition(&old_state, &new_state) {
+        let Some(new_state) = InstanceFSM::next_state(&old_state, &input) else {
             let error_msg = format!(
-                "Invalid state transition from {:?} to {:?} via event '{}'",
-                old_state, new_state, event
+                "Invalid state transition from {:?} via event '{}'",
+                old_state,
+                event_name(&input)
             );
             warn!("Instance {}: {}", self.instance_id, error_msg);
             return Err(error_msg);
-        }
+        };
 
         // Execute state transition
         *current = new_state.clone();
@@ -73,7 +118,7 @@ impl ProxyStateManager {
         let transition = StateTransition {
             from: old_state.clone(),
             to: new_state.clone(),
-            event: event.to_string(),
+            event: event_name(&input).to_string(),
             timestamp: chrono::Utc::now(),
         };
 
@@ -82,30 +127,18 @@ impl ProxyStateManager {
 
         info!(
             "Instance {} transition: {:?} --[{}]--> {:?}",
-            self.instance_id, old_state, event, new_state
+            self.instance_id,
+            old_state,
+            event_name(&input),
+            new_state
         );
 
         Ok(new_state)
     }
 
-    /// Validate if the state transition is valid
-    fn is_valid_transition(&self, from: &State, to: &State) -> bool {
-        use State::*;
-
-        match (from, to) {
-            // Normal lifecycle
-            (Pending, Active) => true,        // Registration completed
-            (Active, Active) => true,         // Heartbeat maintained
-            (Active, Sunsetting) => true,     // Shutdown started
-            (Sunsetting, Sunsetting) => true, // Heartbeat during sunsetting
-            (Sunsetting, Terminated) => true, // Fully closed
-
-            // Restart cycle
-            (Terminated, Pending) => true, // Restart
-
-            // Other transitions are invalid
-            _ => false,
-        }
+    /// Whether the current state has a row for this event.
+    async fn accepts(&self, input: &Input) -> bool {
+        InstanceFSM::valid_inputs(&self.current_state().await).contains(input)
     }
 
     /// Get current state
@@ -150,36 +183,26 @@ impl ProxyStateManager {
 
     /// Handle registration complete event
     ///
-    /// Transition from Pending to Active state
+    /// Activates a pending instance. Accepted again on an instance that is
+    /// already active, which is what a reconnect after a control plane
+    /// outage looks like: the instance never stopped serving, so it stays
+    /// where it is.
     pub async fn handle_registration_complete(&self) -> Result<State, String> {
         info!(
             "Instance {} registration completed, transitioning to Active",
             self.instance_id
         );
-        self.transition_to(State::Active, "registration_complete")
-            .await
+        self.apply(Input::Registered).await
     }
 
     /// Handle heartbeat event
     ///
     /// Maintain activity in Active or Sunsetting state
     pub async fn handle_heartbeat(&self) -> Result<State, String> {
-        let current = self.current_state().await;
-        match current {
-            State::Active => {
-                // In Active state, heartbeat keeps the state unchanged
-                self.transition_to(State::Active, "heartbeat").await
-            }
-            State::Sunsetting => {
-                // In Sunsetting state, heartbeat also keeps the state unchanged
-                self.transition_to(State::Sunsetting, "heartbeat").await
-            }
-            _ => {
-                let error_msg = format!("Cannot send heartbeat in state: {:?}", current);
-                warn!("Instance {}: {}", self.instance_id, error_msg);
-                Err(error_msg)
-            }
-        }
+        // Which states a heartbeat is legal in, and what it leaves them in,
+        // is `InstanceFSM`'s answer. This used to be a `match` on the
+        // current state naming `Active` and `Sunsetting` by hand.
+        self.apply(Input::_Heartbeat).await
     }
 
     /// Handle shutdown event
@@ -190,7 +213,7 @@ impl ProxyStateManager {
             "Instance {} received shutdown signal, transitioning to Sunsetting",
             self.instance_id
         );
-        self.transition_to(State::Sunsetting, "shutdown").await
+        self.apply(Input::Shutdown).await
     }
 
     /// Handle silenced event (all connections closed)
@@ -201,7 +224,7 @@ impl ProxyStateManager {
             "Instance {} all connections closed, transitioning to Terminated",
             self.instance_id
         );
-        self.transition_to(State::Terminated, "silenced").await
+        self.apply(Input::Silenced).await
     }
 
     /// Handle restart event
@@ -212,7 +235,7 @@ impl ProxyStateManager {
             "Instance {} restarting, transitioning to Pending",
             self.instance_id
         );
-        self.transition_to(State::Pending, "startup").await
+        self.apply(Input::Startup).await
     }
 
     /// Record that this instance is going down without having passed through
@@ -243,6 +266,12 @@ impl ProxyStateManager {
     }
 
     /// Force set state (emergency use only)
+    ///
+    /// The one door around the table, kept because an operator dealing with
+    /// an instance wedged in a state its events cannot leave needs one. It
+    /// names no event, which is why its history entry is prefixed
+    /// `force_set:` - so that reading the history back, a state change nobody
+    /// can account for is never mistaken for one the lifecycle allowed.
     pub async fn force_set_state(&self, new_state: State, reason: &str) -> State {
         let mut current = self.current_state.write().await;
         let old_state = current.clone();
@@ -269,33 +298,30 @@ impl ProxyStateManager {
 
     /// Check if a specific operation can be performed
     pub async fn can_handle_shutdown(&self) -> bool {
-        matches!(self.current_state().await, State::Active)
+        self.accepts(&Input::Shutdown).await
     }
 
     pub async fn can_handle_heartbeat(&self) -> bool {
-        matches!(
-            self.current_state().await,
-            State::Active | State::Sunsetting
-        )
+        self.accepts(&Input::_Heartbeat).await
     }
 
     pub async fn can_handle_registration(&self) -> bool {
-        matches!(self.current_state().await, State::Pending)
+        self.accepts(&Input::Registered).await
     }
 
     pub async fn can_handle_silenced(&self) -> bool {
-        matches!(self.current_state().await, State::Sunsetting)
+        self.accepts(&Input::Silenced).await
     }
 
     pub async fn can_handle_startup(&self) -> bool {
-        matches!(self.current_state().await, State::Terminated)
+        self.accepts(&Input::Startup).await
     }
 
     /// Reset state machine (for testing only)
     #[cfg(test)]
     pub async fn reset(&self) {
         let mut current = self.current_state.write().await;
-        *current = State::Pending;
+        *current = InstanceFSM::initial_state();
 
         let mut history = self.transition_history.write().await;
         history.clear();
@@ -388,6 +414,70 @@ mod tests {
         assert_eq!(manager.current_state().await, State::Pending);
     }
 
+    /// The failure the hand-written pair-only table could not see.
+    ///
+    /// It said `(Active, Active) => true`, so a caller could reach `Active`
+    /// from `Active` under *any* event name and leave a history entry
+    /// claiming that event happened. Here `Shutdown` from `Active` has one
+    /// destination, `Sunsetting`, so a recorded shutdown always is one.
+    ///
+    /// Before this change the assertions below read the other way: the
+    /// instance was still `Active` and the history said `shutdown`.
+    #[tokio::test]
+    async fn a_shutdown_event_can_no_longer_be_recorded_without_sunsetting() {
+        let manager = ProxyStateManager::new("test-instance".to_string());
+        manager.handle_registration_complete().await.unwrap();
+
+        manager.handle_shutdown().await.unwrap();
+
+        assert_eq!(manager.current_state().await, State::Sunsetting);
+        let history = manager.get_history().await;
+        let shutdowns: Vec<&StateTransition> =
+            history.iter().filter(|t| t.event == "shutdown").collect();
+        assert_eq!(shutdowns.len(), 1);
+        assert_eq!(shutdowns[0].from, State::Active);
+        assert_eq!(shutdowns[0].to, State::Sunsetting);
+    }
+
+    /// `Sunsetting` used to accept anything that left it in `Sunsetting`,
+    /// including a second shutdown. Only a heartbeat holds it there now.
+    #[tokio::test]
+    async fn a_second_shutdown_while_sunsetting_is_refused() {
+        let manager = ProxyStateManager::new("test-instance".to_string());
+        manager.handle_registration_complete().await.unwrap();
+        manager.handle_shutdown().await.unwrap();
+        let before = manager.history_count().await;
+
+        assert!(manager.handle_shutdown().await.is_err());
+
+        assert_eq!(manager.current_state().await, State::Sunsetting);
+        assert_eq!(
+            manager.history_count().await,
+            before,
+            "a refused event must not leave a history entry"
+        );
+    }
+
+    /// A proxy that lost its control connection registers again while still
+    /// serving. That has to be accepted, and has to leave it active.
+    ///
+    /// The second assertion is where the two hand-written copies used to
+    /// contradict each other: `can_handle_registration` matched only
+    /// `Pending` and answered no, while `is_valid_transition` matched the
+    /// pair `(Active, Active)` and let the very same registration through.
+    /// One table cannot disagree with itself.
+    #[tokio::test]
+    async fn re_registration_while_active_is_accepted() {
+        let manager = ProxyStateManager::new("test-instance".to_string());
+        manager.handle_registration_complete().await.unwrap();
+
+        let result = manager.handle_registration_complete().await;
+
+        assert_eq!(result.unwrap(), State::Active);
+        assert!(manager.is_active().await);
+        assert!(manager.can_handle_registration().await);
+    }
+
     #[tokio::test]
     async fn test_capability_checks() {
         let manager = ProxyStateManager::new("test-instance".to_string());
@@ -401,7 +491,6 @@ mod tests {
         manager.handle_registration_complete().await.unwrap();
 
         // Capabilities in Active state
-        assert!(!manager.can_handle_registration().await);
         assert!(manager.can_handle_shutdown().await);
         assert!(manager.can_handle_heartbeat().await);
         assert!(!manager.can_handle_silenced().await);
@@ -413,6 +502,45 @@ mod tests {
         assert!(!manager.can_handle_shutdown().await);
         assert!(manager.can_handle_heartbeat().await);
         assert!(manager.can_handle_silenced().await);
+    }
+
+    /// The five `can_handle_*` predicates were a hand-written copy of the
+    /// table beside the hand-written copy in `is_valid_transition`. They now
+    /// read the table, so this asserts they cannot disagree with it.
+    #[tokio::test]
+    async fn capability_checks_agree_with_the_table() {
+        let manager = ProxyStateManager::new("test-instance".to_string());
+
+        for state in InstanceFSM::states() {
+            manager.force_set_state(state.clone(), "table check").await;
+            let valid = InstanceFSM::valid_inputs(&state);
+
+            assert_eq!(
+                manager.can_handle_registration().await,
+                valid.contains(&Input::Registered),
+                "registration in {state:?}"
+            );
+            assert_eq!(
+                manager.can_handle_heartbeat().await,
+                valid.contains(&Input::_Heartbeat),
+                "heartbeat in {state:?}"
+            );
+            assert_eq!(
+                manager.can_handle_shutdown().await,
+                valid.contains(&Input::Shutdown),
+                "shutdown in {state:?}"
+            );
+            assert_eq!(
+                manager.can_handle_silenced().await,
+                valid.contains(&Input::Silenced),
+                "silenced in {state:?}"
+            );
+            assert_eq!(
+                manager.can_handle_startup().await,
+                valid.contains(&Input::Startup),
+                "startup in {state:?}"
+            );
+        }
     }
 
     #[tokio::test]
