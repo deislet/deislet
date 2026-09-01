@@ -97,7 +97,13 @@ async fn test_websocket_direct_bridging() {
 
     // Register connection (simulating what Gateway does)
     runtime
-        .register_ws_connection(ws_id.clone(), js_to_client_tx)
+        .register_ws_connection(
+            ws_id.clone(),
+            deis_runtime::runtime::WsClientSink::new(
+                js_to_client_tx,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ),
+        )
         .await
         .expect("Failed to register connection");
 

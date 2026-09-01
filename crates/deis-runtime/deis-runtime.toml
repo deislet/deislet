@@ -226,6 +226,59 @@ retry_interval_secs = 15
 # does nothing and logs nothing.
 reconcile_interval_secs = 60
 
+# This node's own management plane: the gRPC the control plane drives it
+# through.
+#
+# deis.management.RuntimeManagement and deis.trigger.Trigger between them apply
+# a deployment, unload an application, list every tenant's applications and op
+# metrics, mint an inspector session for an isolate, and fire a queue or cron
+# handler. That is administrative control of this node, so every call must
+# present a node key: one of the control plane's node_preshared_keys, in
+# "authorization: Bearer <key>". The key is [control] secret above - the same
+# value this node already needs to fetch its assignments, so a node has one
+# credential and not two.
+#
+# With no key at all this plane is shut rather than open: every call is refused
+# with UNAVAILABLE naming this setting, including the health check, so the
+# control plane lists the node as unreachable. Public application traffic is
+# unaffected. The one exception is a management plane bound to a loopback
+# address, which no other host can reach: that keeps working unauthenticated,
+# with a warning at startup, the same way deis-store does on a loopback bind
+# with no auth_secret.
+[management]
+# Address this plane binds, as ip:port. Unset - the default - shares the data
+# listener on 0.0.0.0:http_port, which is the address a control plane's
+# deis_runtime_nodes entry and this node's own registration already name, so
+# nothing on either side has to be re-addressed.
+#
+# Setting it moves both gRPC services onto their own socket; the data port stops
+# carrying them and answers those paths the way it answers any request that
+# names no application, so public application traffic and administrative control
+# no longer arrive through one door.
+#
+# The node registers the new port, so a control plane that learned this node
+# from its registration follows on its own. One that has this node written down
+# in deis_runtime_nodes does not - there the file's address wins and the
+# disagreement is only logged - so move that entry to the new port in the same
+# change. A loopback address here is reachable only by a control plane on this
+# same host. A hostname is refused: whether this address is reachable from another
+# host decides whether a node with no key may serve at all, and that must not
+# depend on what DNS answers.
+# listen = "127.0.0.1:8186"
+
+# Node keys this plane accepts in addition to [control] secret. Empty, the
+# default, is the normal case: one key, in one place.
+#
+# This list is for a rotation, because a fleet cannot change a shared secret on
+# the control plane and on every node in the same instant. Add the new key here
+# on every node and restart them, so each node answers to both; put the new key
+# first in the control plane's node_preshared_keys, so it is what the control
+# plane presents while the old one still works for the pull direction; move
+# each node's [control] secret to the new value and drop the old one from here;
+# then drop the old key from the control plane. No step of that leaves a node
+# the control plane cannot drive.
+# keys = ["the-key-being-rotated-out"]
+
 # Downloaded application bundles.
 [bundles]
 # Directory holding them. Unset means "<data_dir>/bundles".

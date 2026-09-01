@@ -221,6 +221,45 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Names of applications that were deleted, which is not the same thing
+    // as names that are free.
+    //
+    // An application's data does not live in this database. Its kv, its
+    // database, its objects and its queued messages live in deis-store and
+    // deis-queue under a tenant id built from the application and the
+    // environment (`deis_wire::conventions::tenant_id`), and neither service
+    // has anything that deletes a tenant. So deleting the rows above leaves
+    // every byte of it exactly where it was, and the next application created
+    // under the same name - by anybody, in any account - would be the same
+    // tenant and would read and overwrite it.
+    //
+    // A row here is what stops that. It is written in the same transaction
+    // that removes the application, so there is no moment in which the name is
+    // both gone and free, and `CatalogStore::create_app` refuses a name it
+    // finds here until an operator releases it deliberately. `environments`
+    // is a JSON array of the environment names the application had, so an
+    // operator can be told exactly which tenants still hold data. Who deleted
+    // it and when they did is in the audit log, which is where every other
+    // "who did this" question is answered.
+    //
+    // Releasing a name sets `released_at` rather than removing the row, and
+    // deleting the application that then takes the name adds its environments
+    // to the ones already listed. The data of every application that ever had
+    // this name is still in deis-store, so the row has to name every tenant
+    // it ever spread to - a list that shrank would send an operator to purge
+    // half of it.
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS retired_app_names (
+            app_id       TEXT PRIMARY KEY,
+            retired_at   INTEGER NOT NULL,
+            environments TEXT NOT NULL,
+            released_at  INTEGER
+        )
+        "#,
+        [],
+    )?;
+
     // Immutable versions. Rows are append-only: once written, nothing in
     // this table is ever updated. `number` counts from 1 within an app.
     conn.execute(

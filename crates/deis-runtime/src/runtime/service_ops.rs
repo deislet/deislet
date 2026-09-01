@@ -21,7 +21,12 @@
 //! * **The caller is stamped.** [`super::service_call::CALLER_HEADER`] is
 //!   written over whatever the application put in the header map, after the
 //!   application's own headers have been read, so what the callee sees is the
-//!   platform's statement and not the caller's claim.
+//!   platform's statement and not the caller's claim. The rest of the
+//!   platform's namespace goes with it: overwriting the one name that is
+//!   documented today left every other `x-deis-` header the caller invented
+//!   standing in the callee's request, which is the same forgery one door
+//!   along and would make the next platform header arrive forgeable the day
+//!   it was added. See [`crate::PLATFORM_HEADER_PREFIX`].
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -221,10 +226,57 @@ async fn op_deis_service_call(
         ));
     };
 
-    // The caller's own headers first, then the platform's over the top. The
-    // order is the point: an application that set `x-deis-caller` itself has
-    // it replaced, so what the callee reads is evidence and not a claim.
+    // The caller's own headers first, less the platform's own namespace, then
+    // the platform's over the top. The order is the point: an application that
+    // set `x-deis-caller` itself has it replaced, so what the callee reads is
+    // evidence and not a claim.
+    //
+    // The sweep is the rest of that same sentence. A caller can put any header
+    // it likes on a service call -- including `x-deis-tenant` and
+    // `x-deis-storage-token`, which authorise a storage tenant one hop
+    // further in, and including a header no component has invented yet.
+    // Replacing only `x-deis-caller` left all of those crossing into the
+    // callee as though the platform had written them.
     let mut headers = request.headers;
+    let swept: Vec<String> = headers
+        .keys()
+        .filter(|name| crate::is_platform_header(name))
+        .cloned()
+        .collect();
+    // The two routing headers are said nothing about. A caller that built its
+    // call out of the request it is serving forwards them without meaning
+    // anything by it -- they are what this node stamped on its own inbound
+    // request -- and warning about that would put a line in the log on every
+    // service call any careful application makes. Anything else under the
+    // prefix is a claim about identity or authority, and an operator wants to
+    // see one even though it has already been defeated.
+    let claimed: Vec<&str> = swept
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            !name.eq_ignore_ascii_case(crate::APP_ID_HEADER)
+                && !name.eq_ignore_ascii_case(crate::ENVIRONMENT_HEADER)
+        })
+        .collect();
+    if !claimed.is_empty() {
+        tracing::warn!(
+            target: "app",
+            app_id = %caller,
+            callee = %callee,
+            binding = %binding,
+            headers = %claimed.join(", "),
+            "{} set {} header(s) in the platform's own namespace on its call to {}: {}. They \
+             were dropped; a callee reads that namespace as this node's account of who is \
+             calling it",
+            caller,
+            claimed.len(),
+            callee,
+            claimed.join(", ")
+        );
+    }
+    for name in swept {
+        headers.remove(&name);
+    }
     headers.insert(CALLER_HEADER.to_string(), caller.clone());
 
     let call = ServiceCall {

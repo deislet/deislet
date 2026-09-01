@@ -191,6 +191,103 @@ async fn a_client_chosen_host_is_not_a_redirect_target() {
     backend.stop();
 }
 
+#[tokio::test]
+async fn the_platform_namespace_does_not_survive_the_edge() {
+    // The routing pair was being replaced and nothing else in `x-deis-` was
+    // touched, so a request the edge routed perfectly well still arrived at
+    // the node carrying whatever the client had written under that prefix.
+    // `x-deis-caller` is the one that pays: the node stamps it over a service
+    // call and the platform documents it as evidence a callee may branch on,
+    // so an outside client sending `x-deis-caller: admin-app.production`
+    // through this hop was read by a callee following that documented pattern
+    // as proof an admin application had called it. The storage three are the
+    // same shape one hop further in.
+    let backend = Backend::start().await;
+    let proxy = Proxy::launch(ProxyOptions {
+        upstream: backend.addr,
+        apps: vec![serde_json::json!({
+            "id": "shop",
+            "description": "",
+            "domains": ["shop.example"],
+            "certificates": [],
+            "enabled": true,
+            "cache": [],
+        })],
+        // With an application configured an unknown host is a 404, so a
+        // forwarded request cannot be the readiness probe.
+        wait_for_forwarding: false,
+        ..Default::default()
+    })
+    .await;
+
+    let answer = proxy
+        .request_with_headers(
+            "/",
+            "shop.example",
+            &[
+                ("x-deis-caller", "admin-app.production"),
+                ("x-deis-tenant", "victim.production"),
+                ("x-deis-storage-token", "forged"),
+                ("x-deis-binding", "HOT"),
+                // Not a header any component reads today. The rule is the
+                // prefix, so the one a future component invents is already
+                // covered rather than arriving forgeable.
+                ("x-deis-not-a-header-yet", "whatever"),
+                // An application's own header, which is not the platform's
+                // business and has to keep crossing.
+                ("x-shop-request-id", "abc123"),
+            ],
+        )
+        .await;
+    assert!(
+        answer.ends_with(BACKEND_BODY),
+        "the request is still routed and forwarded; it answered {answer:?}"
+    );
+
+    for name in [
+        "x-deis-caller",
+        "x-deis-tenant",
+        "x-deis-storage-token",
+        "x-deis-binding",
+        "x-deis-not-a-header-yet",
+    ] {
+        assert_eq!(
+            backend.last_header(name),
+            None,
+            "the node was handed {name} with a value the client wrote, and it cannot tell that \
+             from one this edge stamped; the head was:\n{:?}",
+            backend.heads().last()
+        );
+    }
+    assert_eq!(
+        backend.last_header("x-shop-request-id").as_deref(),
+        Some("abc123"),
+        "only the platform's own prefix is closed; the head was:\n{:?}",
+        backend.heads().last()
+    );
+
+    // The edge's own decision still crosses, so this is a namespace taken
+    // back rather than a hop that stopped saying anything.
+    assert_eq!(
+        backend.last_header("x-deis-app-id").as_deref(),
+        Some("shop")
+    );
+    assert_eq!(
+        backend.last_header("x-deis-environment").as_deref(),
+        Some("production")
+    );
+
+    assert!(
+        proxy
+            .log_text()
+            .contains("platform's own x-deis- namespace"),
+        "an operator has to see that someone tried to forge platform evidence, even though it \
+         never reached the node; the log said:\n{}",
+        proxy.log_tail()
+    );
+    backend.stop();
+}
+
 /// A throwaway self-signed certificate on disk, for the default certificate
 /// slot. Its subject names are what decides which hosts this edge will admit
 /// to serving over HTTPS.

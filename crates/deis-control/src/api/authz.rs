@@ -283,6 +283,29 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             Requirement::new("app.delete", Verb::Admin, named(app), Resource::Every).changes_state()
         }
 
+        // ---- names of deleted applications --------------------------------
+        //
+        // Reading the list names every application that was ever deleted on
+        // this platform, and releasing one decides that the next application
+        // of that name inherits the deleted one's stored data - so both
+        // answer to the administrator that `app.delete` answers to, and
+        // neither can be reached by a credential scoped to an application.
+        // `Resource::Every` on the release for the same reason the delete has
+        // it: what it hands over is not confined to one environment.
+        ["api", "retired-apps"] => Requirement::new(
+            "retired_app.list",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "retired-apps", app] => Requirement::new(
+            "retired_app.release",
+            Verb::Admin,
+            named(app),
+            Resource::Every,
+        )
+        .changes_state(),
+
         // A version is uploaded to the application, not to an environment:
         // it is stored and put nowhere. Whoever may deploy into any one of
         // this application's environments may upload the bundle they will
@@ -1001,6 +1024,13 @@ mod tests {
             ("POST", "/api/apps", "app.create", Verb::Deploy),
             ("GET", "/api/apps/demo", "app.get", Verb::Read),
             ("DELETE", "/api/apps/demo", "app.delete", Verb::Admin),
+            ("GET", "/api/retired-apps", "retired_app.list", Verb::Admin),
+            (
+                "DELETE",
+                "/api/retired-apps/demo",
+                "retired_app.release",
+                Verb::Admin,
+            ),
             ("GET", "/api/apps/demo/versions", "version.list", Verb::Read),
             (
                 "POST",

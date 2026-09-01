@@ -150,6 +150,91 @@ pub struct DeletedApp {
     /// reports them alongside which nodes actually dropped the app.
     #[serde(skip)]
     pub environment_names: Vec<String>,
+    /// What the same transaction wrote down about the name.
+    ///
+    /// The counted fields above are what was destroyed; this is what was
+    /// *not* - the stored data, which stays where it is, and the name, which
+    /// is held so that nothing can be deployed onto that data by accident.
+    /// Not serialized inside this struct, whose whole meaning is "removed":
+    /// the API answer carries it as a field of its own.
+    #[serde(skip)]
+    pub retired: RetiredAppName,
+}
+
+/// A name that belonged to an application which has been deleted, and which
+/// is therefore not free.
+///
+/// Deleting an application removes it from this catalog and leaves everything
+/// it stored where it was: deis-store and deis-queue key a tenant by
+/// `(application, environment)` and neither of them has an operation that
+/// drops one. So the name is retained rather than the data, and nothing can
+/// be deployed onto it until somebody says out loud that the next application
+/// of that name may have what the last one left - see
+/// `CatalogStore::release_retired_name`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RetiredAppName {
+    pub app_id: String,
+    /// When the application was deleted, Unix epoch seconds.
+    pub retired_at: i64,
+    /// The environments it had when it was deleted, in name order.
+    ///
+    /// One environment is one tenant, so this is the list of places its data
+    /// still is. It can be empty - an application deleted before it had an
+    /// environment - and the name is retained all the same: a storage token
+    /// is minted per environment on request, and an environment that was
+    /// created and used is not distinguishable here from one that was never
+    /// touched.
+    ///
+    /// A name that has been used, deleted, released and used again carries
+    /// the environments of every application that had it, because every one
+    /// of those tenants may still hold data.
+    pub environments: Vec<String>,
+    /// When an operator freed the name again, if they have.
+    ///
+    /// `None` is a name that is still held, which is the only state that
+    /// stops an application being created under it. The row survives the
+    /// release rather than being deleted, because what it records - which
+    /// tenants hold data under this name - stays true afterwards, and the
+    /// next deletion of the same name has to add to that list rather than
+    /// start a new one.
+    pub released_at: Option<i64>,
+}
+
+impl RetiredAppName {
+    /// Whether the name is still held, which is the state that refuses a
+    /// creation.
+    pub fn is_held(&self) -> bool {
+        self.released_at.is_none()
+    }
+
+    /// The tenant ids whose data is still in deis-store and deis-queue,
+    /// spelled the way those services see them.
+    pub fn tenants(&self) -> Vec<String> {
+        self.environments
+            .iter()
+            .map(|environment| deis_wire::conventions::tenant_id(&self.app_id, environment))
+            .collect()
+    }
+
+    /// One line naming what is still out there, for a log or a refusal.
+    pub fn describe_data(&self) -> String {
+        let tenants = self.tenants();
+        if tenants.is_empty() {
+            format!(
+                "no environment of {} was recorded when it was deleted, so no tenant name is \
+                 known - data stored under one that was created and removed earlier would still \
+                 be there",
+                self.app_id
+            )
+        } else {
+            format!(
+                "the kv, database, object and queue data of {} is still in deis-store and \
+                 deis-queue under tenant(s) {}",
+                self.app_id,
+                tenants.join(", ")
+            )
+        }
+    }
 }
 
 /// Current wall clock as the Unix epoch seconds stored in every

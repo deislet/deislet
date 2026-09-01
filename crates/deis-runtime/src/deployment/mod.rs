@@ -368,7 +368,15 @@ impl DeploymentManager {
 
         if let Some(current) = self.app_manager.installed_version(&key) {
             if current.version_id == order.version_id {
-                if current.env_confirmed {
+                // The version record is this node's memory of what it
+                // installed; whether an isolate is still there is a separate
+                // fact, and the two come apart when one is lost without
+                // anything being unloaded -- a panic on its runtime thread.
+                // Answering "already running" from the record alone is what
+                // made that permanent: the control plane was told the
+                // assignment was satisfied on every pass, so the one thing
+                // that could have put the application back never ran.
+                if current.env_confirmed && self.app_manager.is_hosted(&key).await {
                     debug!(
                         app_id = %key.app_id(),
                         environment = %key.environment(),
@@ -378,14 +386,27 @@ impl DeploymentManager {
                     );
                     return Ok(Applied::AlreadyRunning);
                 }
-                info!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %order.version_id,
-                    "This version was recovered from local disk and is running without the \
-                     secrets and storage addresses it declares; reloading it from the control \
-                     plane's copy so that its environment is complete"
-                );
+                if current.env_confirmed {
+                    warn!(
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        version_id = %order.version_id,
+                        "This node has version {} of {} installed but nothing running for it: \
+                         its isolate is gone. Installing it again so the application serves \
+                         here",
+                        order.version_id,
+                        key
+                    );
+                } else {
+                    info!(
+                        app_id = %key.app_id(),
+                        environment = %key.environment(),
+                        version_id = %order.version_id,
+                        "This version was recovered from local disk and is running without the \
+                         secrets and storage addresses it declares; reloading it from the \
+                         control plane's copy so that its environment is complete"
+                    );
+                }
             }
         }
 

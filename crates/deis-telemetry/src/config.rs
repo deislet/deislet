@@ -1,3 +1,25 @@
+//! Operator-facing configuration.
+//!
+//! # `listen`, `metrics_listen` and `auth_secret` are one decision, not three
+//!
+//! Whether a caller is authenticated at all is decided by `auth_secret`, and
+//! what happens when it is absent depends on where the two ports are bound:
+//!
+//! * `auth_secret` set: every gRPC call and every scrape must carry the
+//!   capability token for this service, wherever it is bound. See
+//!   [`crate::auth`].
+//! * No `auth_secret`, both ports on loopback: the service runs exactly as it
+//!   did before tokens existed - callers are believed, and what keeps one
+//!   application's logs away from an unrelated client is that the client
+//!   cannot reach the ports. This is the default single-box install and it is
+//!   supported; the service says so at startup, at `warn`.
+//! * No `auth_secret`, either port anywhere else: the service refuses to
+//!   start.
+//!
+//! Both ports count, because both hand out other people's data: the gRPC port
+//! serves logs and traces, the Prometheus port serves every application's
+//! metric series.
+
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -6,6 +28,12 @@ use std::path::PathBuf;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Address the gRPC server binds to.
+    ///
+    /// Loopback by default, because the default install configures no
+    /// `auth_secret` and then the only thing keeping one application's logs
+    /// away from an unrelated client is that the client cannot reach the
+    /// port. Binding anywhere else without an `auth_secret` is refused at
+    /// startup rather than warned about; see the module documentation.
     #[serde(default = "default_listen")]
     pub listen: String,
     /// Address the Prometheus text endpoint binds to. It is a separate port
@@ -16,6 +44,19 @@ pub struct Config {
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Shared secret this service's capability token is derived from, or
+    /// `None` to run with no caller authentication at all.
+    ///
+    /// The token is `base64(HMAC-SHA256(auth_secret, "deis-telemetry"))` and
+    /// every producer, reader and scraper must present it once this is set.
+    /// It authenticates the channel, not the application: see [`crate::auth`]
+    /// for why this service cannot derive a token per tenant the way
+    /// deis-store does, and for what that does and does not buy.
+    ///
+    /// `None` is only permitted with both ports on loopback - [`crate::auth`]
+    /// has the reasoning and the refusal.
+    #[serde(default)]
+    pub auth_secret: Option<String>,
     /// How many days of logs to keep. Logs live in one table per UTC day;
     /// the sweeper drops whole tables older than this.
     #[serde(default = "default_log_retention_days")]
@@ -36,14 +77,17 @@ pub struct Config {
     /// Seconds between retention sweeps. A sweep also runs once at startup.
     #[serde(default = "default_retention_sweep_interval_secs")]
     pub retention_sweep_interval_secs: u64,
-    /// How many entries the live fan-out buffer holds. A Tail consumer that
-    /// falls this far behind loses entries (only for that consumer - writers
-    /// are never blocked and storage is unaffected).
+    /// How many entries one open `Tail` stream may hold on its way to its
+    /// client. The buffer is per stream, and inside it each application gets
+    /// an equal share of the slots, so a consumer that falls behind loses
+    /// entries only for itself and only of the application whose volume it
+    /// could not keep up with - writers are never blocked and storage is
+    /// unaffected. See [`crate::tail`].
     #[serde(default = "default_tail_capacity")]
     pub tail_capacity: usize,
-    /// How many records the live trace fan-out buffer holds. Separate from
+    /// The same for one open `TailTraces` stream. Separate from
     /// `tail_capacity`, and larger by default, because traces arrive at one
-    /// record per invocation.
+    /// record per invocation rather than one per log line.
     #[serde(default = "default_trace_tail_capacity")]
     pub trace_tail_capacity: usize,
     /// Page size used when a query does not ask for one.
@@ -113,6 +157,7 @@ impl Default for Config {
             listen: default_listen(),
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
+            auth_secret: None,
             log_retention_days: default_log_retention_days(),
             metric_retention_days: default_metric_retention_days(),
             trace_retention_days: default_trace_retention_days(),

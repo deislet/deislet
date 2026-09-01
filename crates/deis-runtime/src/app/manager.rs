@@ -864,6 +864,31 @@ impl ApplicationManager {
         self.apps.contains_key(key)
     }
 
+    /// Throw away an environment's isolate while leaving this node's record
+    /// of the version it installed in place.
+    ///
+    /// The state a panic on a runtime thread leaves behind, arranged
+    /// deliberately: installed here as far as this node's records go, with
+    /// nothing running. It exists so a test can put the node in it, because
+    /// what has to be checked is that the node notices and puts the
+    /// application back.
+    #[cfg(test)]
+    pub async fn drop_isolate_for_test(&self, key: &AppKey) {
+        let _ = self.runtime_pool.unload_app(&key.tenant_id()).await;
+    }
+
+    /// Whether this environment has a live isolate on this node right now.
+    ///
+    /// Not the same question as [`Self::is_loaded`], which reads this node's
+    /// record of what it installed. The two disagree when an isolate was lost
+    /// without anything being unloaded -- a panic on its runtime thread is the
+    /// case that has happened -- and it is the isolate, not the record, that
+    /// answers requests. Anything deciding whether the node still satisfies an
+    /// assignment has to ask this one.
+    pub async fn is_hosted(&self, key: &AppKey) -> bool {
+        self.runtime_pool.is_hosted(&key.tenant_id()).await
+    }
+
     /// Start debug session
     pub fn start_inspect(&self, key: AppKey, ttl_seconds: u64) -> Result<(String, String)> {
         // Check if application exists
@@ -1103,7 +1128,7 @@ impl ApplicationManager {
         &self,
         key: &AppKey,
         ws_id: String,
-        js_to_client_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::WsServerMessage>,
+        js_to_client_tx: crate::runtime::WsClientSink,
     ) -> Result<()> {
         self.runtime_pool
             .register_ws_connection(&key.tenant_id(), ws_id, js_to_client_tx)

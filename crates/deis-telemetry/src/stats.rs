@@ -8,6 +8,8 @@
 //! They describe this process only. Nothing here says anything about the
 //! health of any other component.
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -33,6 +35,109 @@ impl MetricKind {
             Self::Gauge => "gauge",
         }
     }
+}
+
+/// Label value standing in for every application past [`MAX_TRACKED_APPS`].
+///
+/// The parentheses are what make it safe: an application id is
+/// `[A-Za-z0-9_-]` everywhere the platform mints one, so no real application
+/// can land on this series by accident. A producer is free to send whatever
+/// string it likes as an `app_id`, so a deliberately named one still could -
+/// that costs an operator a misattributed line in one bucket, never a wrong
+/// total.
+pub const OVERFLOW_APP: &str = "(other)";
+
+/// How many applications a per-application breakdown names individually.
+///
+/// Every named application is one more series on `/metrics`, and the id comes
+/// off the wire from whatever pushed the record, so an unbounded map is an
+/// unbounded scrape - a node shipping ten thousand distinct ids would grow
+/// this process's memory and then break the scrape for every other series on
+/// the page. Past the cap the counting continues under [`OVERFLOW_APP`], so
+/// the sum still adds up and only the attribution is lost.
+pub const MAX_TRACKED_APPS: usize = 64;
+
+/// Losses broken down by the application whose records were thrown away.
+///
+/// A single total answers "did anything go missing". Only the breakdown
+/// answers "whose, and how much" - the question an operator actually has when
+/// a follow stream skipped the lines they were watching for, and the reason
+/// this exists next to the plain counters above.
+#[derive(Debug, Default)]
+pub struct AppDrops {
+    inner: Mutex<AppDropsState>,
+}
+
+#[derive(Debug, Default)]
+struct AppDropsState {
+    /// Per-application totals, at most [`MAX_TRACKED_APPS`] entries.
+    named: BTreeMap<String, u64>,
+    /// Everything counted after the cap was reached.
+    overflow: u64,
+}
+
+impl AppDrops {
+    /// Charge `n` losses to `app_id`.
+    ///
+    /// A poisoned lock is recovered from rather than propagated: this is
+    /// accounting on the ingest path, and a panic here would take down a push
+    /// that has already been stored successfully.
+    pub fn add(&self, app_id: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut state = match self.inner.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(slot) = state.named.get_mut(app_id) {
+            *slot = slot.saturating_add(n);
+        } else if state.named.len() < MAX_TRACKED_APPS {
+            state.named.insert(app_id.to_string(), n);
+        } else {
+            state.overflow = state.overflow.saturating_add(n);
+        }
+    }
+
+    /// Every application this has counted for, in export order, with the
+    /// overflow bucket last and only when it has anything in it.
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        let state = match self.inner.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut out: Vec<(String, u64)> = state
+            .named
+            .iter()
+            .map(|(app, n)| (app.clone(), *n))
+            .collect();
+        if state.overflow > 0 {
+            out.push((OVERFLOW_APP.to_string(), state.overflow));
+        }
+        out
+    }
+
+    /// What this has counted for one application. Reporting only; the export
+    /// walks [`AppDrops::snapshot`].
+    pub fn get(&self, app_id: &str) -> u64 {
+        let state = match self.inner.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.named.get(app_id).copied().unwrap_or(0)
+    }
+}
+
+/// One exported series that carries labels, which [`SelfMetric`] cannot: its
+/// values are owned strings read off the wire rather than constants.
+#[derive(Debug, Clone)]
+pub struct LabelledMetric {
+    /// Name without the `deis_telemetry_` prefix, which the renderer adds.
+    pub name: &'static str,
+    pub kind: MetricKind,
+    pub help: &'static str,
+    pub labels: Vec<(&'static str, String)>,
+    pub value: u64,
 }
 
 /// One of this process's own numbers, ready to be written out: how it is
@@ -63,6 +168,12 @@ macro_rules! service_stats {
                 pub $field: AtomicU64,
             )+
             started_at: Instant,
+            /// Live log entries thrown away, by the application that owned
+            /// them. Exported alongside the plain total by
+            /// [`ServiceStats::labelled_snapshot`].
+            pub tail_entries_dropped_by_app: AppDrops,
+            /// The same breakdown for trace records.
+            pub trace_tail_entries_dropped_by_app: AppDrops,
         }
 
         impl ServiceStats {
@@ -70,6 +181,8 @@ macro_rules! service_stats {
                 Self {
                     $( $field: AtomicU64::new(0), )+
                     started_at: Instant::now(),
+                    tail_entries_dropped_by_app: AppDrops::default(),
+                    trace_tail_entries_dropped_by_app: AppDrops::default(),
                 }
             }
 
@@ -113,7 +226,8 @@ service_stats! {
     tail_streams_open: Gauge = "tail_streams_open", "Tail streams currently open";
     tail_entries_dropped: Counter =
         "tail_entries_dropped_total",
-        "Entries skipped for slow tail consumers; storage is unaffected";
+        "Live log entries thrown away before a follower read them, over every open stream; \
+         storage is unaffected and the entries stay queryable";
     trace_pushes: Counter = "trace_pushes_total", "PushTraces calls served";
     traces_accepted: Counter = "traces_accepted_total", "Trace records written to storage";
     traces_rejected: Counter =
@@ -134,7 +248,8 @@ service_stats! {
         "trace_tail_streams_open", "TailTraces streams currently open";
     trace_tail_entries_dropped: Counter =
         "trace_tail_entries_dropped_total",
-        "Trace records skipped for slow TailTraces consumers; storage is unaffected";
+        "Live trace records thrown away before a follower read them, over every open stream; \
+         storage is unaffected and the records stay queryable";
     metric_pushes: Counter = "metric_pushes_total", "PushMetrics calls served";
     metric_samples_accepted: Counter =
         "metric_samples_accepted_total", "Metric samples written to storage";
@@ -187,6 +302,44 @@ impl ServiceStats {
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
     }
+
+    /// Every number this process keeps that is broken down by application.
+    ///
+    /// Kept apart from [`ServiceStats::snapshot`] because these series carry a
+    /// label and an owned value, and because the set is not fixed: an
+    /// application appears here only once something of its was actually
+    /// thrown away. The totals in `snapshot` stay authoritative - they count
+    /// every loss, including the ones past [`MAX_TRACKED_APPS`] that this
+    /// breakdown can only name as [`OVERFLOW_APP`].
+    pub fn labelled_snapshot(&self) -> Vec<LabelledMetric> {
+        let families: [(&'static str, &'static str, &AppDrops); 2] = [
+            (
+                "tail_entries_dropped_by_app_total",
+                "Live log entries thrown away before a follower read them, by the application \
+                 that produced them",
+                &self.tail_entries_dropped_by_app,
+            ),
+            (
+                "trace_tail_entries_dropped_by_app_total",
+                "Live trace records thrown away before a follower read them, by the \
+                 application that produced them",
+                &self.trace_tail_entries_dropped_by_app,
+            ),
+        ];
+        let mut out = Vec::new();
+        for (name, help, drops) in families {
+            for (app_id, value) in drops.snapshot() {
+                out.push(LabelledMetric {
+                    name,
+                    kind: MetricKind::Counter,
+                    help,
+                    labels: vec![("app_id", app_id)],
+                    value,
+                });
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +380,44 @@ mod tests {
                 metric.name
             );
         }
+    }
+
+    #[test]
+    fn a_breakdown_names_applications_until_the_cap_then_counts_the_rest_together() {
+        // The id comes off the wire, so an unbounded map is an unbounded
+        // scrape and unbounded memory. Past the cap the attribution is lost
+        // on purpose - the total must not be.
+        let drops = AppDrops::default();
+        for i in 0..MAX_TRACKED_APPS {
+            drops.add(&format!("app-{i:03}"), 1);
+        }
+        drops.add("app-999", 5);
+        drops.add("app-998", 2);
+        // A cap already reached does not stop an application already named
+        // from being counted further.
+        drops.add("app-000", 3);
+
+        let snapshot = drops.snapshot();
+        assert_eq!(snapshot.len(), MAX_TRACKED_APPS + 1);
+        assert_eq!(drops.get("app-000"), 4);
+        assert_eq!(drops.get("app-999"), 0, "past the cap nothing is named");
+        assert_eq!(
+            snapshot.last(),
+            Some(&(OVERFLOW_APP.to_string(), 7)),
+            "everything past the cap still adds up in one bucket"
+        );
+        let total: u64 = snapshot.iter().map(|(_, n)| n).sum();
+        assert_eq!(total, MAX_TRACKED_APPS as u64 + 10);
+    }
+
+    #[test]
+    fn a_breakdown_starts_empty_rather_than_at_zero_for_everything() {
+        let drops = AppDrops::default();
+        drops.add("shop", 0);
+        assert!(
+            drops.snapshot().is_empty(),
+            "an application that lost nothing must not appear"
+        );
     }
 
     #[test]

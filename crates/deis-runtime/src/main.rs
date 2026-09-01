@@ -50,6 +50,10 @@ async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
     let started_at = std::time::Instant::now();
 
     let port = config.http_port;
+    // What this node registers as its address. The same port while the
+    // management plane shares the data listener, which is every installation
+    // that has not set `[management] listen`.
+    let management_port = config.management_advertised_port()?;
     let node_id = config.resolved_node_id();
 
     let log_buffer = Arc::new(LogBuffer::new(config.logging.buffer_size));
@@ -204,7 +208,11 @@ async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
         Some(endpoint) => Some(
             NodeRegistrar::new(
                 endpoint,
-                NodeRegistration::of_this_node(node_id.clone(), port),
+                // The management port, not the data port: a registration is
+                // the address the control plane dials ApplyDeployment and
+                // OnScheduled at, and `[management] listen` may have moved
+                // that plane off the public listener.
+                NodeRegistration::of_this_node(node_id.clone(), management_port),
                 request_timeout,
                 config.control.credential(),
             )
@@ -227,7 +235,10 @@ async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
     info!("====================================");
     info!("✅ Runtime Platform ready to serve!");
     info!("📡 Accepting traffic on port {}", port);
-    info!("🔧 Management API (gRPC) on same port");
+    match config.management.listen_addr()? {
+        Some(addr) => info!("🔧 Management API (gRPC) on its own listener {}", addr),
+        None => info!("🔧 Management API (gRPC) on same port"),
+    }
     info!("====================================");
 
     // Start HTTP + gRPC server (reuse same port). Returns once a shutdown
@@ -241,6 +252,8 @@ async fn run(config: RuntimeConfig, proxy: ProxyDecision) -> Result<()> {
         started_at,
         shutdown_grace: config.shutdown_grace_period(),
         max_request_body_bytes: config.max_request_body_bytes,
+        management_keys: config.management_keys(),
+        management_listen: config.management.listen_addr()?,
     })
     .await?;
 

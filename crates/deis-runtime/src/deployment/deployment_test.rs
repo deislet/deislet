@@ -435,6 +435,63 @@ async fn an_assignment_skips_an_app_already_on_that_version() {
 }
 
 #[tokio::test]
+async fn an_assignment_reinstalls_an_app_whose_isolate_is_gone() {
+    // The half of "already on that version" that used to be assumed. A
+    // runtime thread that panicked took its isolate with it and left this
+    // node's version record standing, so every reconcile from then on read
+    // the record, answered "already running", and left the application off
+    // the air for good. The record is not the isolate, and the assignment is
+    // only satisfied while both are there.
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+    let key = AppKey::production("demo");
+
+    deployer
+        .apply(order(
+            "demo",
+            "v1",
+            control.url("v1"),
+            &bundle.sha256,
+            &[("API_KEY", "from the push")],
+        ))
+        .await
+        .unwrap();
+    assert!(apps.is_hosted(&key).await);
+
+    apps.drop_isolate_for_test(&key).await;
+    assert!(
+        !apps.is_hosted(&key).await,
+        "the isolate is gone, whatever the version record says"
+    );
+
+    let as_of = deployer.change_stamp();
+    let applied = deployer
+        .apply_from_assignment(
+            order("demo", "v1", control.url("v1"), &bundle.sha256, &[]),
+            as_of,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        applied,
+        Applied::Installed {
+            reused_bundle: true
+        },
+        "the same version has to be installed again, not skipped"
+    );
+    assert!(
+        apps.is_hosted(&key).await,
+        "and the application is serving here again"
+    );
+}
+
+#[tokio::test]
 async fn an_assignment_older_than_a_push_does_not_roll_it_back() {
     // The version ids cannot settle this on their own: they are opaque, and a
     // rollback deliberately points an environment back at an older one, so

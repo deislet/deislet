@@ -39,13 +39,15 @@
 //!    conversation with no total size, not a body a node will buffer. Asking
 //!    for an upgrade is not enough; `request_body_filter` says why not.
 //! 5. A backend is picked from the shared upstream pool and the request is
-//!    forwarded. `x-deis-app-id` is set to the id deis-proxy decided on and
+//!    forwarded, and the whole `x-deis-` namespace is taken away from the
+//!    client first. Every header under that prefix is dropped, whatever it
+//!    is; then `x-deis-app-id` is set to the id deis-proxy decided on and
 //!    `x-deis-environment` to that app's configured environment (defaulting
-//!    to production when the route names none), replacing whatever the
-//!    client sent for either header; in plain reverse proxy mode, where no
-//!    application was resolved, both are removed. Either way deis-runtime
-//!    only ever sees values that passed the checks above, and never a value
-//!    the client chose.
+//!    to production when the route names none). In plain reverse proxy mode,
+//!    where no application was resolved, nothing is put back. Either way
+//!    deis-runtime only ever sees values that passed the checks above, and
+//!    never a value the client chose - not for the two headers this edge
+//!    decides, and not for the ones further in that other components stamp.
 //! 6. A request the upstream upgrades (a WebSocket handshake) becomes a
 //!    tunnel: everything after the 101 is relayed in both directions until
 //!    one end closes. The upstream read timeout is a bound on how long a
@@ -55,6 +57,28 @@
 // Re-exported so every component in the platform spells these the same
 // way; see deis_wire::conventions for why they live in one place.
 pub use deis_wire::conventions::{APP_ID_HEADER, ENVIRONMENT_HEADER};
+
+/// The prefix the platform reserves for headers it writes about itself.
+///
+/// Everything under it is one component of this platform telling another
+/// something, and a client is not part of that conversation: `x-deis-app-id`
+/// and `x-deis-environment` are this edge's routing decision, `x-deis-caller`
+/// is the node's record of which application made a service call, and
+/// `x-deis-tenant`, `x-deis-binding` and `x-deis-storage-token` name and
+/// authorise a storage tenant. They are documented as evidence a callee may
+/// branch on rather than a claim it has to verify, and that is only true for
+/// as long as nothing outside the platform can write one.
+///
+/// A prefix rather than a list of names, because a list is only right until
+/// the next header is added: the header a future component invents would
+/// arrive forgeable, and nothing would fail until something trusted it.
+///
+/// deis-bundle spells the same string as `headers::PLATFORM_PREFIX` and
+/// refuses a bundle that sets one of these on a *response*. This is that same
+/// rule on the request side of the hop. The two copies exist because
+/// deis-proxy does not otherwise depend on deis-bundle; one shared constant
+/// belongs in `deis_wire::conventions`, beside [`APP_ID_HEADER`].
+pub const PLATFORM_HEADER_PREFIX: &str = "x-deis-";
 
 pub mod access_log;
 pub mod balancer;
@@ -469,45 +493,92 @@ fn resolve_app(
     }
 }
 
-/// Set `x-deis-app-id` and `x-deis-environment` on the upstream request from
-/// what deis-proxy resolved, replacing whatever the client sent under either
-/// name (`insert_header` replaces rather than appends, and normalizes header
-/// case).
+/// Hand the node the platform's own account of this request: clear the whole
+/// [`PLATFORM_HEADER_PREFIX`] namespace of whatever the client sent, then put
+/// back the two headers deis-proxy actually decided.
 ///
-/// With no application resolved - plain reverse proxy mode, the only state
-/// that reaches here with both fields `None` - both headers are *removed*
-/// instead. Leaving the client's values in place was the same hole from the
-/// other side: pingora has already copied the downstream headers over, a
-/// node trusts these two completely and picks its storage tenant from them,
-/// and nothing downstream can tell a header the client wrote from one the
-/// edge stamped. So a request deis-proxy made no routing decision about used
-/// to arrive at the node as whichever application and environment the client
-/// asked for. An upstream that is not a deis-runtime never reads them; a
-/// deis-runtime answers 400 when they are absent, which is the honest
+/// The order is the whole rule, and it is a sweep rather than two names for a
+/// reason. pingora has already copied the downstream headers onto the
+/// upstream request by the time this runs, so anything the client wrote under
+/// `x-deis-` is sitting there addressed to a component that cannot tell it
+/// from a value this edge stamped. Overwriting only `x-deis-app-id` and
+/// `x-deis-environment` left the rest of the namespace crossing the hop
+/// untouched, and the rest of the namespace is where the evidence is.
+/// `x-deis-caller` is the header the node stamps over a service call and an
+/// application is documented as free to branch on; an outside client sent
+/// `x-deis-caller: admin-app` through this hop and a callee following that
+/// documented pattern granted it admin. `x-deis-tenant` and
+/// `x-deis-storage-token` are the same shape one hop further in.
+///
+/// So nothing under the prefix survives the edge. A client may still *ask*
+/// for an application by sending `x-deis-app-id`: that is a documented input,
+/// read and checked in `request_filter` long before this point, and what goes
+/// back on the wire here is the id this edge resolved, never the string the
+/// client typed. With no application resolved - plain reverse proxy mode, the
+/// only state that reaches here with both fields `None` - nothing is put
+/// back, because having no opinion is not the same as passing on the client's.
+/// An upstream that is not a deis-runtime never reads any of this; a
+/// deis-runtime answers 400 when the pair is absent, which is the honest
 /// outcome for a request nothing here routed.
-fn stamp_routing_headers(
+///
+/// The cost is that `x-deis-` is closed to applications on the inbound path:
+/// an application that invented a header of its own under that prefix stops
+/// receiving it and has to rename it. That is the same bargain deis-bundle
+/// already strikes on the outbound path, where a bundle setting an `x-deis-`
+/// response header is refused at build time.
+fn stamp_platform_headers(
     upstream_request: &mut RequestHeader,
     ctx: &RequestCtx,
 ) -> pingora::Result<()> {
-    match &ctx.app_id {
-        Some(app_id) => {
-            upstream_request.insert_header(APP_ID_HEADER, app_id.as_str())?;
-        }
-        None => {
-            upstream_request.remove_header(APP_ID_HEADER);
-        }
+    // Collected before anything is removed, because the map cannot be written
+    // while it is being read - and the names are wanted as owned strings for
+    // the log below in any case. `HeaderName::as_str` is always lower case, so
+    // a client spelling one `X-Deis-Caller` is caught by the same comparison.
+    let from_client: Vec<String> = upstream_request
+        .headers
+        .keys()
+        .map(|name| name.as_str())
+        .filter(|name| name.starts_with(PLATFORM_HEADER_PREFIX))
+        .map(str::to_string)
+        .collect();
+    for name in &from_client {
+        upstream_request.remove_header(name.as_str());
+    }
+
+    // A client naming the application it wants is ordinary, documented
+    // traffic, so those two are swept without comment. Everything else under
+    // the prefix has no reader on this hop and no honest sender: a client that
+    // sent one was trying to hand the node evidence about itself, and an
+    // operator wants to see that even though it has already been defeated.
+    let forged: Vec<&str> = from_client
+        .iter()
+        .map(String::as_str)
+        .filter(|name| *name != APP_ID_HEADER && *name != ENVIRONMENT_HEADER)
+        .collect();
+    if !forged.is_empty() {
+        warn!(
+            host = %ctx.host,
+            app_id = ?ctx.app_id,
+            removed = forged.len(),
+            headers = %forged.join(", "),
+            "a client sent {} header(s) in the platform's own {} namespace; all {} were removed \
+             before the hop to the node, which reads this namespace as the platform's own \
+             evidence and cannot tell a value a client wrote from one this edge stamped",
+            forged.len(),
+            PLATFORM_HEADER_PREFIX,
+            forged.len()
+        );
+    }
+
+    if let Some(app_id) = &ctx.app_id {
+        upstream_request.insert_header(APP_ID_HEADER, app_id.as_str())?;
     }
     // An app that names no environment still carries one here: see
     // AppConfig::environment's default, which guarantees this is never
     // empty once an app has been resolved, so the header on the wire is
     // never ambiguous.
-    match &ctx.environment {
-        Some(environment) => {
-            upstream_request.insert_header(ENVIRONMENT_HEADER, environment.as_str())?;
-        }
-        None => {
-            upstream_request.remove_header(ENVIRONMENT_HEADER);
-        }
+    if let Some(environment) = &ctx.environment {
+        upstream_request.insert_header(ENVIRONMENT_HEADER, environment.as_str())?;
     }
     Ok(())
 }
@@ -902,7 +973,7 @@ impl ProxyHttp for DeisProxy {
         upstream_request: &mut RequestHeader,
         ctx: &mut RequestCtx,
     ) -> pingora::Result<()> {
-        stamp_routing_headers(upstream_request, ctx)
+        stamp_platform_headers(upstream_request, ctx)
     }
 
     /// Take compression off a response the node is still producing.
@@ -1422,7 +1493,7 @@ mod tests {
             environment: Some("production".to_string()),
             ..Default::default()
         };
-        stamp_routing_headers(&mut upstream_request, &ctx).unwrap();
+        stamp_platform_headers(&mut upstream_request, &ctx).unwrap();
 
         assert_eq!(
             header_str(&upstream_request, APP_ID_HEADER).as_deref(),
@@ -1449,10 +1520,138 @@ mod tests {
             .insert_header(ENVIRONMENT_HEADER, "client-env")
             .unwrap();
 
-        stamp_routing_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
+        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
 
         assert_eq!(header_str(&upstream_request, APP_ID_HEADER), None);
         assert_eq!(header_str(&upstream_request, ENVIRONMENT_HEADER), None);
+    }
+
+    #[test]
+    fn stamp_clears_the_rest_of_the_platform_namespace_too() {
+        // The hole the two tests above did not cover. `x-deis-caller` is the
+        // header the node stamps over a service call and an application is
+        // told it may branch on; deis-proxy resolved this request perfectly
+        // well and still handed the node the client's own value, because the
+        // stamping only ever knew two names. An outside client set
+        // `x-deis-caller: admin-app` through the edge and a callee following
+        // the platform's documented pattern granted it admin. The storage
+        // three are the same shape a hop further in.
+        let mut upstream_request = empty_upstream_request();
+        for (name, value) in [
+            ("x-deis-caller", "admin-app.production"),
+            ("x-deis-tenant", "victim.production"),
+            ("x-deis-storage-token", "forged"),
+            ("x-deis-binding", "HOT"),
+            // A header no component has invented yet: the sweep is over the
+            // prefix, so it goes for the same reason the four above do.
+            ("x-deis-not-a-header-yet", "whatever"),
+        ] {
+            upstream_request.insert_header(name, value).unwrap();
+        }
+        // An ordinary application header keeps its place: this closes one
+        // namespace, it does not filter the request.
+        upstream_request
+            .insert_header("x-shop-request-id", "abc123")
+            .unwrap();
+
+        let ctx = RequestCtx {
+            app_id: Some("shop".to_string()),
+            environment: Some("production".to_string()),
+            ..Default::default()
+        };
+        stamp_platform_headers(&mut upstream_request, &ctx).unwrap();
+
+        for name in [
+            "x-deis-caller",
+            "x-deis-tenant",
+            "x-deis-storage-token",
+            "x-deis-binding",
+            "x-deis-not-a-header-yet",
+        ] {
+            assert_eq!(
+                header_str(&upstream_request, name),
+                None,
+                "{name} reached the node with a value the client chose"
+            );
+        }
+        assert_eq!(
+            header_str(&upstream_request, "x-shop-request-id").as_deref(),
+            Some("abc123"),
+            "only the platform's own prefix is closed; the application's headers still arrive"
+        );
+        // And the edge's own decision is still on the request, so the sweep
+        // did not run after the stamping.
+        assert_eq!(
+            header_str(&upstream_request, APP_ID_HEADER).as_deref(),
+            Some("shop")
+        );
+        assert_eq!(
+            header_str(&upstream_request, ENVIRONMENT_HEADER).as_deref(),
+            Some("production")
+        );
+    }
+
+    #[test]
+    fn stamp_clears_the_platform_namespace_with_nothing_resolved_either() {
+        // Plain reverse proxy mode. deis-proxy made no decision at all here,
+        // which is precisely why the client's version of the namespace may
+        // not stand in for one.
+        let mut upstream_request = empty_upstream_request();
+        upstream_request
+            .insert_header("x-deis-caller", "admin-app.production")
+            .unwrap();
+        upstream_request
+            .insert_header("x-deis-storage-token", "forged")
+            .unwrap();
+
+        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
+
+        assert_eq!(header_str(&upstream_request, "x-deis-caller"), None);
+        assert_eq!(header_str(&upstream_request, "x-deis-storage-token"), None);
+    }
+
+    #[test]
+    fn a_platform_header_the_client_spelled_in_capitals_goes_the_same_way() {
+        // The comparison is against `HeaderName::as_str`, which is lower case
+        // whatever arrived on the wire. Worth an assertion rather than a
+        // comment: a prefix test done against the sent spelling would let
+        // `X-Deis-Caller` through, and the node lower-cases before it reads.
+        let mut upstream_request = empty_upstream_request();
+        upstream_request
+            .insert_header("X-Deis-Caller", "admin-app.production")
+            .unwrap();
+
+        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
+
+        assert_eq!(header_str(&upstream_request, "x-deis-caller"), None);
+    }
+
+    #[test]
+    fn a_platform_header_sent_twice_goes_away_entirely() {
+        // A header name appears once in the map however many values it holds,
+        // so the sweep names it once and relies on the removal taking all of
+        // them. If it took only the first, a client sending `x-deis-caller`
+        // twice would have the second value delivered to the node and this
+        // whole rule would be one line of header away from doing nothing.
+        let mut upstream_request = empty_upstream_request();
+        upstream_request
+            .append_header("x-deis-caller", "first")
+            .unwrap();
+        upstream_request
+            .append_header("x-deis-caller", "second")
+            .unwrap();
+
+        stamp_platform_headers(&mut upstream_request, &RequestCtx::default()).unwrap();
+
+        assert_eq!(
+            upstream_request
+                .headers
+                .get_all("x-deis-caller")
+                .iter()
+                .count(),
+            0,
+            "one of the two values the client sent is still on its way to the node"
+        );
     }
 
     #[test]

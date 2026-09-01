@@ -31,7 +31,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 
 use crate::api::middleware::{NodeAuthConfig, node_auth};
@@ -78,6 +78,14 @@ pub fn router(state: CatalogState) -> Router {
         .route(
             "/api/apps/:app_id",
             get(apps::get_app).delete(apps::delete_app),
+        )
+        // Not under /api/apps: an application id is a slug, so any name
+        // reserved beneath that prefix would be a name nobody could use for
+        // an application.
+        .route("/api/retired-apps", get(apps::list_retired_apps))
+        .route(
+            "/api/retired-apps/:app_id",
+            delete(apps::release_retired_app),
         )
         .route(
             "/api/apps/:app_id/versions",

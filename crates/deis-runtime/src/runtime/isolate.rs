@@ -1053,6 +1053,16 @@ pub struct AppRuntime {
     /// so that it is joined before the isolate it holds a handle to is
     /// dropped; see [`Watchdog`] for why the cut-off cannot be a timer.
     watchdog: Watchdog,
+    /// The debugger session attached to this isolate, if an operator has
+    /// attached one. `None` for every isolate nobody is debugging, which is
+    /// almost all of them; see [`Self::attach_inspector`].
+    ///
+    /// Declared before `runtime` for the same reason `watchdog` is: fields are
+    /// dropped in declaration order, and this session owns V8 objects that
+    /// belong to that isolate. Dropped after it, it would be tearing down
+    /// objects whose isolate is already gone, which deno_core describes as
+    /// producing random crashes rather than an error.
+    inspector: Option<deno_core::LocalInspectorSession>,
     runtime: JsRuntime,
     app_id: String,
     module_id: Option<deno_core::ModuleId>,
@@ -1476,7 +1486,24 @@ impl AppRuntime {
             // declares anything, and it lives and dies with this isolate.
             // 10 000 responses, and ten minutes of freshness for a response
             // that named no `max-age` of its own.
-            let cache_store: CacheStore = create_cache_store(10_000, 600);
+            //
+            // The byte ceiling is a quarter of what this application asked of
+            // V8, which is the number that already says what it may cost this
+            // node. It has to be said in bytes here because this store is
+            // Rust memory beside the isolate, outside the heap `memoryMb`
+            // governs: bounded by entries alone, ten thousand one-megabyte
+            // responses were ten gigabytes held by an application whose own
+            // limit was never crossed and whose isolate reported nothing. A
+            // quarter and not more because the cache is an optimisation the
+            // application did not ask for -- every isolate has one whether it
+            // uses it or not -- so it must not be able to cost more than the
+            // heap the application did ask for.
+            let cache_bytes =
+                (memory_limit_mb.unwrap_or_else(crate::config::default_memory_limit_mb) as u64
+                    * 1024
+                    * 1024)
+                    / 4;
+            let cache_store: CacheStore = create_cache_store(10_000, cache_bytes, 600);
             state.put(cache_store);
 
             let ws_server_manager: WsServerManager = create_ws_server_manager();
@@ -1563,6 +1590,7 @@ impl AppRuntime {
 
         Ok(Self {
             watchdog,
+            inspector: None,
             runtime,
             app_id,
             module_id: None,
@@ -1983,23 +2011,75 @@ impl AppRuntime {
         Ok(mod_id)
     }
 
-    /// Connect debugger
-    pub fn connect_inspector(
+    /// Attach a debugger to this isolate, and send everything V8 says back to
+    /// it down `to_debugger`.
+    ///
+    /// The V8 inspector is built here rather than in [`Self::new`], for two
+    /// reasons that point the same way. It is a cost -- an inspector makes the
+    /// event loop poll its sessions on every turn and marks the isolate idle
+    /// or busy for the profiler -- and almost no isolate is ever attached to,
+    /// so paying it on every tenant of the node to serve the rare debugging
+    /// session is the wrong trade. And it is a capability: an isolate nobody
+    /// has attached to has no inspector at all, so there is nothing for a
+    /// later mistake to hand out. `maybe_init_inspector` is idempotent, so a
+    /// second attach to the same isolate reuses the first inspector.
+    ///
+    /// Building it late costs nothing in what a debugger can see: `V8Debugger`
+    /// enumerates the scripts already compiled when `Debugger.enable` arrives,
+    /// so a module evaluated before the attach is still listed and can still
+    /// have breakpoints set in it.
+    ///
+    /// Attaching *replaces* whatever was attached before rather than refusing.
+    /// A debugger that goes away without its detach being delivered -- a
+    /// dropped WebSocket, a killed node process on the other end -- would
+    /// otherwise make this isolate un-debuggable until it is redeployed, and
+    /// the replacement is said out loud so an operator whose session went
+    /// quiet can see why.
+    ///
+    /// # Who may do this
+    ///
+    /// Whoever holds a session token minted by this node's management API,
+    /// which is the control plane. That is deliberately the same principal
+    /// that can already call `ApplyDeployment` and replace this application's
+    /// code outright: a CDP session is `FullyTrusted` and can read and write
+    /// anything in the isolate, including the tenant's secrets, so it must not
+    /// be reachable by anyone who could not already do worse. The token is
+    /// minted per (application, environment) and expires; `deis-proxy` does
+    /// not route `_inspect:` in any mode, so it is not reachable from the
+    /// public entry. See `crate::app::ApplicationManager::start_inspect`.
+    pub fn attach_inspector(
         &mut self,
-    ) -> Result<(
-        tokio::sync::mpsc::UnboundedSender<String>,
-        tokio::sync::mpsc::UnboundedReceiver<String>,
-    )> {
-        let inspector = self.runtime.inspector();
-        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        to_debugger: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<()> {
+        if self.inspector.is_some() {
+            tracing::warn!(
+                target: "app",
+                app_id = %self.app_id,
+                "A second debugger is attaching to {}; the session that was attached is being \
+                 dropped and will stop receiving messages",
+                self.app_id
+            );
+            // Dropped before the new one is created so the isolate never holds
+            // two CDP sessions at once.
+            self.inspector = None;
+        }
 
-        // V8 -> Frontend
+        // Without this the accessor below is an `unwrap()` on `None` inside
+        // deno_core: it panicked on the runtime thread, and the panic took the
+        // application off this node until the process was restarted.
+        self.runtime.maybe_init_inspector();
+        let inspector = self.runtime.inspector();
+
+        // V8 -> debugger. The channel is unbounded because this callback is
+        // called from inside V8 with no way to wait: a bounded channel would
+        // have to drop protocol messages, and a CDP stream with a hole in it
+        // desynchronises the debugger rather than slowing it down. The reader
+        // is one WebSocket, and it goes away when the session does.
         let callback = Box::new(move |msg: deno_core::InspectorMsg| {
-            let _ = out_tx.send(msg.content);
+            let _ = to_debugger.send(msg.content);
         });
 
-        let mut session = deno_core::JsRuntimeInspector::create_local_session(
+        let session = deno_core::JsRuntimeInspector::create_local_session(
             inspector,
             callback,
             deno_core::InspectorSessionKind::NonBlocking {
@@ -2007,14 +2087,62 @@ impl AppRuntime {
             },
         );
 
-        // Frontend -> V8
-        tokio::task::spawn_local(async move {
-            while let Some(msg) = in_rx.recv().await {
-                session.dispatch(msg);
-            }
-        });
+        tracing::warn!(
+            target: "app",
+            app_id = %self.app_id,
+            "A debugger is now attached to the isolate of {}. It can read and write everything \
+             in it, including this tenant's secrets and the data its bindings reach, until it \
+             detaches",
+            self.app_id
+        );
 
-        Ok((in_tx, out_rx))
+        self.inspector = Some(session);
+        Ok(())
+    }
+
+    /// Hand one protocol message from the attached debugger to V8.
+    ///
+    /// Synchronous, and on the isolate's own thread, because that is the only
+    /// thread that may touch it: `LocalInspectorSession` is not `Send`, which
+    /// is why the debugger's messages arrive here as runtime-thread messages
+    /// rather than being pumped by a task of their own. The reply travels back
+    /// through the callback installed by [`Self::attach_inspector`], usually
+    /// before this returns.
+    ///
+    /// A message that arrives after the session was dropped is ignored: the
+    /// debugger detached, or its isolate was replaced, between the message
+    /// being posted and this thread reaching it.
+    pub fn dispatch_inspector_message(&mut self, message: String) {
+        match self.inspector.as_mut() {
+            Some(session) => session.dispatch(message),
+            None => tracing::debug!(
+                target: "app",
+                app_id = %self.app_id,
+                "Dropping a debugger message for {}: nothing is attached to this isolate",
+                self.app_id
+            ),
+        }
+    }
+
+    /// Drop the debugger session, if there is one.
+    ///
+    /// Called when the debugger's WebSocket closes. It has to happen on this
+    /// thread and while the isolate is still alive: the session owns V8
+    /// objects that belong to this isolate.
+    pub fn detach_inspector(&mut self) {
+        if self.inspector.take().is_some() {
+            tracing::info!(
+                target: "app",
+                app_id = %self.app_id,
+                "The debugger attached to {} has detached",
+                self.app_id
+            );
+        }
+    }
+
+    /// Whether a debugger is attached to this isolate right now.
+    pub fn has_inspector_attached(&self) -> bool {
+        self.inspector.is_some()
     }
 
     pub async fn execute_fetch(
@@ -3158,7 +3286,7 @@ impl AppRuntime {
     pub async fn register_ws_connection(
         &mut self,
         ws_id: String,
-        sender: tokio::sync::mpsc::UnboundedSender<super::WsServerMessage>,
+        sender: super::WsClientSink,
     ) -> Result<()> {
         let ws_manager = {
             let op_state = self.runtime.op_state();

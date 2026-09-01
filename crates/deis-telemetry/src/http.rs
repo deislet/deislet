@@ -2,17 +2,22 @@
 //!
 //! It listens on its own port, separate from gRPC, so a scraper can be given
 //! access to the exported numbers without being given access to the ingest
-//! and query RPCs.
+//! and query RPCs. Separate does not mean unguarded: the page carries every
+//! application's metric series, so the same capability check runs here, as
+//! one layer over the whole router rather than inside the handler - a second
+//! route added later must not be able to become a second unguarded door.
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
-use axum::response::IntoResponse;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use tracing::{debug, error};
 
+use crate::auth::TelemetryAuth;
 use crate::now_us;
 use crate::prom;
 use crate::stats::ServiceStats;
@@ -39,11 +44,33 @@ impl MetricsState {
     }
 }
 
-/// Build the scrape router.
-pub fn router(state: MetricsState) -> Router {
+/// Build the scrape router, behind the capability check.
+pub fn router(state: MetricsState, auth: TelemetryAuth) -> Router {
     Router::new()
         .route("/metrics", get(scrape))
+        .layer(middleware::from_fn_with_state(auth, guard))
         .with_state(state)
+}
+
+/// Refuse anything on this port that does not present the token.
+///
+/// 401 with a `WWW-Authenticate` header rather than a bare 403, because the
+/// caller is a scraper and that is the answer telling it which credential it
+/// was supposed to send. With no secret configured this passes everything
+/// through unchanged; see [`crate::auth`].
+async fn guard(State(auth): State<TelemetryAuth>, request: Request, next: Next) -> Response {
+    if auth.check_scrape(request.headers()) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (header::WWW_AUTHENTICATE, "Bearer"),
+            (header::CONTENT_TYPE, CONTENT_TYPE),
+        ],
+        "# deis-telemetry requires a capability token on this endpoint\n",
+    )
+        .into_response()
 }
 
 async fn scrape(State(state): State<MetricsState>) -> impl IntoResponse {

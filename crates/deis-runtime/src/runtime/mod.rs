@@ -68,5 +68,6 @@ pub use snapshot::load_or_create_startup_snapshot;
 pub use tenant::Tenant;
 pub use tls_ops::init_tls_ops_extension;
 pub use ws_server_ops::{
-    create_ws_server_manager, init_ws_server_extension, WsServerManager, WsServerMessage,
+    create_ws_server_manager, init_ws_server_extension, WsClientSink, WsServerManager,
+    WsServerMessage,
 };

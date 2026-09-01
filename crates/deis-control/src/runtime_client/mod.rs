@@ -25,9 +25,12 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use deis_wire::conventions::{NODE_AUTH_METADATA, node_auth_value};
 use serde::Serialize;
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::RuntimeNodeConfig;
 use proto::runtime_management_client::RuntimeManagementClient;
@@ -50,14 +53,93 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// node - running the job twice, which is worse than reporting it late.
 const TRIGGER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The node key this control plane presents on every call into a node's own
+/// management plane.
+///
+/// A node serves `ApplyDeployment`, `UnloadApp`, `GetStatus`, `StartInspect`,
+/// `PushConfig` and the two trigger RPCs only to a caller that proves it is
+/// entitled to drive it, because those RPCs between them can take an
+/// application offline, list every tenant on the node and replace one
+/// tenant's code with a bundle of the caller's choosing. The proof is one of
+/// this control plane's `node_preshared_keys` - the same value the node
+/// already holds as `[control] secret` for the other direction - and it is
+/// attached here as an interceptor rather than at each call site so that an
+/// RPC added later cannot go out anonymous.
+///
+/// `None` is a control plane with no node credential at all, which
+/// [`crate::config::ControlConfig::ensure_node_credential`] makes unreachable
+/// in the binary. Calls then go out unauthenticated and every guarded node
+/// refuses them, which is the safe end of the two.
+#[derive(Clone, Default)]
+pub struct NodeCallCredential {
+    value: Option<MetadataValue<Ascii>>,
+}
+
+impl NodeCallCredential {
+    /// Build the metadata this control plane presents, from a
+    /// `node_preshared_keys` value.
+    pub fn new(key: Option<&str>) -> Self {
+        let Some(key) = key.map(str::trim).filter(|key| !key.is_empty()) else {
+            return Self { value: None };
+        };
+        match MetadataValue::try_from(node_auth_value(key)) {
+            Ok(value) => Self { value: Some(value) },
+            Err(_) => {
+                // gRPC metadata admits only visible ASCII. A key with a
+                // newline or a non-ASCII character in it cannot be sent at
+                // all, and saying so here is the only chance an operator has
+                // to connect the fleet going quiet with the value in the file.
+                error!(
+                    "A node_preshared_keys value contains characters that cannot be sent as gRPC metadata, so this control plane presents no credential to its nodes; every deployment push and every cron fire will be refused. Use printable ASCII, for instance the output of `openssl rand -hex 32`"
+                );
+                Self { value: None }
+            }
+        }
+    }
+
+    /// Whether anything is presented. Reported at startup rather than
+    /// inferred from a fleet that has gone quiet.
+    pub fn is_present(&self) -> bool {
+        self.value.is_some()
+    }
+}
+
+/// Redacted on purpose: this is the credential that drives every node in the
+/// fleet, and a `Debug` that printed it would put it in every error context
+/// that formats the node manager.
+impl std::fmt::Debug for NodeCallCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCallCredential")
+            .field("present", &self.is_present())
+            .finish()
+    }
+}
+
+impl tonic::service::Interceptor for NodeCallCredential {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(value) = &self.value {
+            request
+                .metadata_mut()
+                .insert(NODE_AUTH_METADATA, value.clone());
+        }
+        Ok(request)
+    }
+}
+
+/// A channel to one node with this control plane's credential on every call.
+type NodeChannel = InterceptedService<Channel, NodeCallCredential>;
+
 /// Raise both message limits from the tonic default of 4 MB.
 ///
 /// Deployment metadata and status responses grow with the number of
 /// applications a node runs, and a truncated response would look like a
 /// dead node rather than an oversized message.
 fn with_message_limits(
-    client: RuntimeManagementClient<Channel>,
-) -> RuntimeManagementClient<Channel> {
+    client: RuntimeManagementClient<NodeChannel>,
+) -> RuntimeManagementClient<NodeChannel> {
     client
         .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
@@ -239,6 +321,11 @@ pub struct RuntimeNodeManager {
     health: DashMap<String, NodeHealth>,
     poll_interval: Duration,
     registration_ttl: Duration,
+    /// What this control plane proves itself with on every call into a node.
+    /// Set by [`RuntimeNodeManager::with_node_credential`] from
+    /// `node_preshared_keys`; empty until then, which is what the tests that
+    /// never dial a node use.
+    credential: NodeCallCredential,
 }
 
 impl RuntimeNodeManager {
@@ -284,7 +371,31 @@ impl RuntimeNodeManager {
             health,
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             registration_ttl: Duration::from_secs(registration_ttl_secs.max(1)),
+            credential: NodeCallCredential::default(),
         }
+    }
+
+    /// Present `key` on every call this fleet makes into a node.
+    ///
+    /// Chained onto the constructor rather than passed to it, because the
+    /// fleet is also built in places that never dial anything - the delivery
+    /// and scheduler tests, the catalog router - and making those name a
+    /// credential would say the credential matters there, which it does not.
+    /// What matters is that the two places which do serve a live fleet, the
+    /// binary and [`crate::api::start_api_server`], both call this.
+    pub fn with_node_credential(mut self, key: Option<&str>) -> Self {
+        self.credential = NodeCallCredential::new(key);
+        if self.credential.is_present() {
+            info!(
+                header = NODE_AUTH_METADATA,
+                "Calls into a node's management plane carry this control plane's node key; a node that does not accept it refuses the push and keeps serving the version it already had"
+            );
+        } else {
+            error!(
+                "This control plane has no node key to present, so every deployment push, unload and cron fire it makes will be refused by any node that is not running unauthenticated on loopback. Set node_preshared_keys"
+            );
+        }
+        self
     }
 
     /// Seed the fleet with the default registration lifetime. Kept for call
@@ -390,7 +501,10 @@ impl RuntimeNodeManager {
                         node = %id,
                         configured_addr = %entry.config.addr,
                         reported_addr = %addr,
-                        "A node in deis_runtime_nodes reported a different address; the file's                          address is kept and every management call still goes there. Update the                          file if the node has really moved, otherwise this node is reporting a                          hostname that does not route from here"
+                        "A node in deis_runtime_nodes reported a different address; the file's \
+                         address is kept and every management call still goes there. \
+                         Update the file if the node has really moved, otherwise this \
+                         node is reporting a hostname that does not route from here"
                     );
                     Registered::Refreshed
                 } else {
@@ -550,9 +664,18 @@ impl RuntimeNodeManager {
             .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))
     }
 
-    async fn connect(&self, id: &str) -> Result<RuntimeManagementClient<Channel>, NodeError> {
+    /// Wrap a channel so every call over it carries this control plane's node
+    /// key. The only way a client is built in this module, so no RPC can be
+    /// added that goes out anonymous.
+    fn authorized(&self, channel: Channel) -> NodeChannel {
+        InterceptedService::new(channel, self.credential.clone())
+    }
+
+    async fn connect(&self, id: &str) -> Result<RuntimeManagementClient<NodeChannel>, NodeError> {
         let channel = self.channel(id, RPC_TIMEOUT).await?;
-        Ok(with_message_limits(RuntimeManagementClient::new(channel)))
+        Ok(with_message_limits(RuntimeManagementClient::new(
+            self.authorized(channel),
+        )))
     }
 
     /// One health probe; updates the cache and returns the fresh state.
@@ -624,7 +747,8 @@ impl RuntimeNodeManager {
         request: proto::ApplyDeploymentRequest,
     ) -> Result<proto::ApplyDeploymentResponse, NodeError> {
         let channel = self.channel(id, APPLY_TIMEOUT).await?;
-        let mut client = with_message_limits(RuntimeManagementClient::new(channel));
+        let mut client =
+            with_message_limits(RuntimeManagementClient::new(self.authorized(channel)));
 
         let (app_id, environment, version_id) = (
             request.app_id.clone(),
@@ -689,7 +813,12 @@ impl RuntimeNodeManager {
         scheduled_time: DateTime<Utc>,
     ) -> Result<trigger::TriggerResponse, NodeError> {
         let channel = self.channel(id, TRIGGER_TIMEOUT).await?;
-        let mut client = TriggerClient::new(channel)
+        // The trigger service is guarded on the node exactly like the
+        // management one: `OnQueue` and `OnScheduled` run an application's
+        // handler with that environment's secrets, so the same credential
+        // rides the same wrapper. Fixing one service and not the other would
+        // have left the cron door open.
+        let mut client = TriggerClient::new(self.authorized(channel))
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
@@ -852,6 +981,60 @@ mod tests {
                 last_error: None,
             },
         );
+    }
+
+    #[test]
+    fn a_fleet_presents_the_node_key_on_every_call_it_makes() {
+        // The other half of the fix. The node now refuses a caller that
+        // proves nothing, so a control plane that attaches nothing would
+        // deliver no deployment and fire no cron at all.
+        let fleet = manager(&["a"]).with_node_credential(Some("node-psk"));
+        assert!(fleet.credential.is_present());
+
+        // Blank is not a credential: an empty string in the file is an
+        // operator who meant to fill it in, and sending it would be a call
+        // that looks authenticated and is refused.
+        for blank in [None, Some(""), Some("   ")] {
+            assert!(
+                !manager(&["a"])
+                    .with_node_credential(blank)
+                    .credential
+                    .is_present(),
+                "{blank:?} must not become a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn the_node_key_never_reaches_a_debug_line() {
+        // This value drives every node in the fleet; an error context that
+        // formatted it would put it in the log.
+        let credential = NodeCallCredential::new(Some("node-psk"));
+        let rendered = format!("{credential:?}");
+        assert!(!rendered.contains("node-psk"), "{rendered}");
+        assert!(rendered.contains("present"), "{rendered}");
+    }
+
+    #[test]
+    fn the_credential_goes_out_as_the_header_the_node_reads() {
+        // Both sides spell this through `deis_wire::conventions`; the point of
+        // the test is that the interceptor actually stamps it, because an RPC
+        // that quietly went out anonymous would be refused by every node and
+        // look like a fleet-wide outage.
+        use tonic::service::Interceptor;
+        let mut credential = NodeCallCredential::new(Some("node-psk"));
+        let request = Interceptor::call(&mut credential, tonic::Request::new(())).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get(NODE_AUTH_METADATA)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer node-psk")
+        );
+
+        let mut none = NodeCallCredential::new(None);
+        let request = Interceptor::call(&mut none, tonic::Request::new(())).unwrap();
+        assert!(request.metadata().get(NODE_AUTH_METADATA).is_none());
     }
 
     #[test]

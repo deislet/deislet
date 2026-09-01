@@ -1389,6 +1389,15 @@ JSON
 // It answers with what the platform told it about the call rather than with
 // anything the caller wrote: `x-deis-caller` is stamped by the node over
 // whatever the caller put there, so a callee reading it is reading a fact.
+//
+// That was only ever half of what makes it a fact, and the half that was
+// missing is the one an attacker uses. A service call overwrites the header;
+// a request arriving over HTTP used to carry the client's value straight into
+// the handler, so `curl -H 'x-deis-caller: admin-app'` was indistinguishable
+// here from a call the platform had stamped. The node now drops its own
+// `x-deis-` namespace at its entry and puts back only what it decided, so
+// this header is absent on a request from outside and present only on a call
+// the platform made. See check_a_client_cannot_forge_the_platform_s_headers.
 export default async function handler(context: any): Promise<Response> {
   const caller = context.request.headers.get("x-deis-caller");
   const note = context.request.headers.get("x-demo-note");
@@ -3332,6 +3341,46 @@ check_one_application_calls_another() {
   else
     fail_check "$title" \
       "expected the callee to answer 202 as ${CALLEE_APP_ID}.${ENV_NAME} and to see caller ${APP_ID}.${ENV_NAME}; the node answered $(http_status "$headers") and the body was $(printf '%s' "$body" | head -c 300)"
+  fi
+}
+
+# The other half of what makes `x-deis-caller` evidence: that nothing outside
+# the platform can write one.
+#
+# Addressed to the node directly, on purpose. deis-proxy sweeps the same
+# namespace at the edge, and a check that only went through the proxy would
+# pass on a node that had no rule of its own -- while every other node on the
+# network, and this very command, can reach the node without going through the
+# proxy at all.
+check_a_client_cannot_forge_the_platform_s_headers() {
+  local title="a client cannot hand a handler the platform's own headers"
+  local headers="${LOG_DIR}/verify-forged-platform-headers.headers"
+  local body
+  body=$(curl -s -D "$headers" \
+    -H "x-deis-app-id: ${CALLEE_APP_ID}" \
+    -H "x-deis-caller: admin-app.production" \
+    -H "x-deis-tenant: victim.production" \
+    -H "x-deis-storage-token: forged" \
+    -H "x-demo-note: sent by a client" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/verify" || true)
+
+  local status called_by note
+  status=$(http_status "$headers")
+  called_by=$(echo "$body" | jq -r '.calledBy // "absent"' 2>/dev/null || true)
+  note=$(echo "$body" | jq -r '.note // "absent"' 2>/dev/null || true)
+
+  # The callee is the same handler the service-call check drives, so this is
+  # the same code reading the same header: once because the platform wrote it,
+  # once because a client tried to.
+  # 202 is the callee's own answer, the same one the service-call check above
+  # reads; what is under test is what the handler was told about its caller.
+  if [ "$status" = "202" ] && [ "$called_by" = "absent" ] \
+    && [ "$note" = "sent by a client" ]; then
+    pass_check "$title" \
+      "curl sent x-deis-caller: admin-app.production, x-deis-tenant and x-deis-storage-token straight to the node; the handler saw no caller at all, while its own x-demo-note came through untouched"
+  else
+    fail_check "$title" \
+      "the node answered ${status} and the handler read calledBy=${called_by:-<nothing>}, note=${note:-<nothing>}; a forged caller reaching a handler is the whole of this check"
   fi
 }
 
@@ -5735,6 +5784,81 @@ check_a_scoped_token_cannot_unload_an_application_from_a_node() {
   fi
 }
 
+# One gRPC call at the node's own management plane, answering with the
+# grpc-status the node put in its response.
+#
+# A refusal is a trailers-only response - HTTP 200 with the status in the
+# headers and no message at all - so reading the headers is enough and nothing
+# here has to decode protobuf. An empty status means the call was served: a
+# served answer puts its status in the trailers instead.
+node_grpc_status() {
+  local path=$1 credential=$2 frame=$3
+  local args=(-s -o /dev/null -D - -X POST
+    -H "content-type: application/grpc" -H "te: trailers"
+    --data-binary "@${frame}")
+  if [ -n "$credential" ]; then
+    args+=(-H "authorization: Bearer ${credential}")
+  fi
+  curl "${args[@]}" "http://127.0.0.1:${DEIS_RUNTIME_PORT}${path}" 2>/dev/null \
+    | tr -d '\r' | awk 'tolower($1) == "grpc-status:" {print $2}' | head -n 1
+}
+
+# The check above asks the control plane to unload an application and is
+# refused there. This one goes at the node directly, the way anything that can
+# route to the node's port can.
+#
+# The node serves the control plane over gRPC on that same port:
+# ApplyDeployment, UnloadApp, GetStatus, StartInspect, PushConfig and the
+# trigger service's OnQueue and OnScheduled. Every one of them is
+# administrative control of the node rather than application traffic, and they
+# used to be dispatched with no credential checked at all - so GetStatus
+# listed every tenant's applications on the node, UnloadApp took one offline
+# and the next request to it answered 500, StartInspect minted an inspector
+# session for another tenant's isolate, and ApplyDeployment would have run a
+# bundle of the caller's choosing under that tenant's endpoint.
+#
+# The credential is the node key: one of the control plane's
+# node_preshared_keys, which is the same value this demo already puts in the
+# node's [control] secret for the assignment fetch. The last two assertions
+# are the other half - the platform still works - because the control plane's
+# own health poll rides this plane, and a node it cannot reach is reported
+# unhealthy.
+check_the_node_management_plane_needs_the_node_key() {
+  local title="a node is driven only by a caller holding the node key"
+  local frame="${LOG_DIR}/verify-grpc-empty-frame.bin"
+  # One uncompressed, zero-length message: a complete GetStatusRequest and a
+  # complete ScheduledEvent, both of which encode to nothing under proto3. The
+  # bytes come from /dev/zero because a shell variable cannot carry a NUL.
+  head -c 5 /dev/zero > "$frame"
+
+  local status_none status_wrong trigger_none status_key
+  status_none=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "" "$frame")
+  status_wrong=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "not-the-node-key" "$frame")
+  trigger_none=$(node_grpc_status "/deis.trigger.Trigger/OnScheduled" "" "$frame")
+  status_key=$(node_grpc_status "/deis.management.RuntimeManagement/GetStatus" "$SECRET" "$frame")
+
+  # Nothing above unloaded anything, so the application is still there.
+  local headers="${LOG_DIR}/verify-node-management-auth.headers"
+  app_request "$headers" "/" > /dev/null
+  local still_serving
+  still_serving=$(http_status "$headers")
+
+  local fleet healthy
+  fleet="${LOG_DIR}/verify-node-management-auth-fleet.json"
+  control_api /api/runtime > "$fleet" 2>/dev/null || true
+  healthy=$(jq -r --arg id "$NODE_ID" \
+    '.nodes[] | select(.id == $id) | .healthy' < "$fleet" 2>/dev/null || true)
+
+  if [ "$status_none" = "16" ] && [ "$status_wrong" = "16" ] && [ "$trigger_none" = "16" ] \
+    && [ -z "$status_key" ] && [ "$still_serving" = "200" ] && [ "$healthy" = "true" ]; then
+    pass_check "$title" \
+      "GetStatus at the node's own port answered grpc-status ${status_none} (UNAUTHENTICATED) with no credential and ${status_wrong} with a wrong one, and the trigger service's OnScheduled answered ${trigger_none} - so nothing that can merely reach ${APP_ID} on this node can list its tenants, unload it or fire its cron. The same call carrying the node key was served (its status is in the trailers, not the headers). ${APP_ID} still answers HTTP ${still_serving}, and the control plane reports ${NODE_ID} healthy, which is its own health poll getting through the same door"
+  else
+    fail_check "$title" \
+      "expected grpc-status 16 with no credential (got \"${status_none:-none}\"), 16 with a wrong one (got \"${status_wrong:-none}\") and 16 on OnScheduled (got \"${trigger_none:-none}\"), and the node key to be served (header status was \"${status_key:-none}\", expected none). ${APP_ID} answered ${still_serving} (expected 200) and the control plane reports ${NODE_ID} healthy=${healthy:-unknown}"
+  fi
+}
+
 check_a_wide_credential_cannot_mint_a_storage_token() {
   local title="minting a storage token needs that exact tenant written down"
   ensure_account data-team maintainer
@@ -6331,6 +6455,9 @@ verify_demo() {
   # The consent check redeploys the callee twice and puts it back the way it
   # was, so it runs after the two that need the callee as the run left it.
   check_one_application_calls_another
+  # Straight after it, because it is the same header read by the same handler:
+  # one call the platform stamped, one a client tried to stamp itself.
+  check_a_client_cannot_forge_the_platform_s_headers
   check_a_service_binding_is_not_a_hole_in_the_outbound_policy
   check_a_preview_calls_the_preview_and_not_production
   check_a_callee_decides_who_may_call_it
@@ -6379,6 +6506,7 @@ verify_demo() {
   check_a_scoped_token_reaches_one_environment_and_no_other
   check_a_credential_cannot_wire_an_app_to_one_it_cannot_see
   check_a_scoped_token_cannot_unload_an_application_from_a_node
+  check_the_node_management_plane_needs_the_node_key
   check_a_wide_credential_cannot_mint_a_storage_token
   check_a_revoked_token_stops_at_its_next_call
   check_the_audit_log_names_who_changed_what

@@ -74,10 +74,27 @@ impl DevNode {
             )
         })?;
 
+        // The node's management plane - ApplyDeployment, UnloadApp,
+        // GetStatus, StartInspect and the trigger service - is authenticated,
+        // and a dev node has no control plane to share a key with. It gets a
+        // loopback socket of its own instead: an address no other host can
+        // reach is what a node accepts in place of a key, and `deis dev` is
+        // the only thing that needs to drive this one.
+        //
+        // That also takes the plane off the data port, which the node binds
+        // on every interface so a phone on the same network can load the
+        // site. Leaving it there would put "replace this application's code"
+        // and "take it offline" on the address a developer hands out.
+        let management_port = super::free_port()?;
+
         let mut command = Command::new(binary);
         command
             .env("DEIS_RUNTIME_NODE_ID", "deis-dev")
             .env("DEIS_RUNTIME_HTTP_PORT", port.to_string())
+            .env(
+                "DEIS_RUNTIME_MANAGEMENT_LISTEN",
+                format!("127.0.0.1:{management_port}"),
+            )
             .env("DEIS_RUNTIME_DATA_DIR", &data_dir)
             // Nothing is collecting logs locally, so the node keeps them in
             // its own output where a developer can see them. Shipping them
@@ -115,7 +132,7 @@ impl DevNode {
 
         let exited = forward_output(&mut child, debug);
 
-        let client = connect(port, &mut child, binary).await?;
+        let client = connect(management_port, &mut child, binary).await?;
 
         Ok((
             Self {
@@ -314,12 +331,16 @@ fn strip_ansi(line: &str) -> String {
 }
 
 /// Wait for the node's management plane to answer.
+///
+/// Dialled on the node's own management port, not the port applications are
+/// served on: the two are separate sockets here, and this one is on loopback
+/// so the node serves it without a node key.
 async fn connect(
-    port: u16,
+    management_port: u16,
     child: &mut Child,
     binary: &Path,
 ) -> Result<RuntimeManagementClient<Channel>> {
-    let url = format!("http://127.0.0.1:{port}");
+    let url = format!("http://127.0.0.1:{management_port}");
     let deadline = Instant::now() + START_TIMEOUT;
 
     loop {
@@ -351,8 +372,8 @@ async fn connect(
         if Instant::now() >= deadline {
             let _ = child.start_kill();
             bail!(
-                "the deis-runtime at {} did not answer on port {port} within {}s. Its output \
-                 above says how far it got.",
+                "the deis-runtime at {} did not answer on its management port \
+                 {management_port} within {}s. Its output above says how far it got.",
                 binary.display(),
                 START_TIMEOUT.as_secs()
             );

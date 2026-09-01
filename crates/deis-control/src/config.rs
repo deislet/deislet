@@ -8,8 +8,12 @@ pub struct ControlConfig {
     pub port: u16,
     pub heartbeat_interval: u64,
     pub heartbeat_timeout: u64,
-    /// The credential every node presents, on its gRPC control channel and
-    /// on the two HTTP endpoints that serve nodes.
+    /// The credential shared with every node, in both directions: what a node
+    /// presents on its gRPC control channel and on the two HTTP endpoints
+    /// that serve nodes, and what this control plane presents back when it
+    /// calls into a node's own management plane. One credential per node, not
+    /// two - see [`ControlConfig::node_call_credential`] for which of these
+    /// keys goes out.
     ///
     /// It is never allowed to be empty on a running control plane: an empty
     /// list would leave `PUT /api/nodes/{id}/registration` open to anyone who
@@ -226,6 +230,29 @@ impl ControlConfig {
         Ok(toml::from_str(&content)?)
     }
 
+    /// The node key this control plane presents when it dials a node's own
+    /// management plane.
+    ///
+    /// The first configured key, because a node checks what it is handed
+    /// against the keys it accepts and there is only one value to hand it.
+    /// That makes the list ordered rather than a set: during a rotation the
+    /// key a fleet is being moved *to* goes first, and the one being retired
+    /// stays behind it so the pull direction - registration, assignments,
+    /// bundle download - keeps accepting a node that has not been rolled yet.
+    ///
+    /// `None` means this process has no node credential at all, which
+    /// [`Self::ensure_node_credential`] makes unreachable in the binary. A
+    /// caller that assembles the control plane by hand and skips it will find
+    /// every node refusing its pushes, which is the correct end of the two:
+    /// an unauthenticated push is what the node was published on before this
+    /// existed.
+    pub fn node_call_credential(&self) -> Option<&str> {
+        self.node_preshared_keys
+            .iter()
+            .map(|key| key.trim())
+            .find(|key| !key.is_empty())
+    }
+
     /// Guarantee this control plane has a node credential before it serves
     /// anything, and say where that credential came from.
     ///
@@ -264,6 +291,31 @@ impl ControlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_key_presented_to_a_node_is_the_first_usable_one() {
+        // A node checks what it is handed against the keys it accepts, and
+        // there is only one value to hand it, so the list is ordered: the key
+        // a fleet is being moved to goes first while the one being retired
+        // stays behind it for the pull direction.
+        let mut config = ControlConfig {
+            node_preshared_keys: vec![
+                "  ".to_string(),
+                "new-key".to_string(),
+                "old-key".to_string(),
+            ],
+            ..ControlConfig::default()
+        };
+        assert_eq!(config.node_call_credential(), Some("new-key"));
+
+        // A control plane with nothing configured presents nothing, and every
+        // guarded node refuses it - which is the safe end of the two. The
+        // binary never gets there.
+        config.node_preshared_keys.clear();
+        assert_eq!(config.node_call_credential(), None);
+        config.ensure_node_credential();
+        assert!(config.node_call_credential().is_some());
+    }
 
     /// The one file operators are told to copy has to deserialize into
     /// this struct. A `[tls]` section missing `cert_path`, for instance,

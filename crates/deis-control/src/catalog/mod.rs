@@ -41,8 +41,8 @@ pub use compatibility::{
 pub use deis_bundle::Manifest as BundleManifest;
 pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{
-    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, Route, SecretMeta,
-    Version,
+    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, RetiredAppName, Route,
+    SecretMeta, Version,
 };
 pub use secrets::{SecretCipher, SecretsBackend};
 pub use store::CatalogStore;

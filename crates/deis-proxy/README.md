@@ -64,16 +64,28 @@ socket handling or process model.
    load stays reachable over plain HTTP instead of being redirected to a
    handshake that cannot succeed.
 3. **Pick a backend** from the upstream pool using the configured strategy
-   and forward the request. `x-deis-app-id` is set to the id deis-proxy decided
-   on and `x-deis-environment` to that application's environment, replacing
-   whatever the client sent, so deis-runtime only sees values that passed the
-   checks above. With `https.auto_offload_https = false` the upstream leg
-   keeps TLS.
+   and forward the request, after taking the whole `x-deis-` namespace away
+   from the client. Every header under that prefix is dropped — not only the
+   two below, but `x-deis-caller`, `x-deis-tenant`, `x-deis-storage-token`
+   and anything a later component adds. Then `x-deis-app-id` is set to the id
+   deis-proxy decided on and `x-deis-environment` to that application's
+   environment, so deis-runtime only sees values that passed the checks above.
+   With `https.auto_offload_https = false` the upstream leg keeps TLS.
 
-Because the header is validated — and removed outright when nothing was
-resolved — deis-runtime's own targets such as `_inspect:<app>` and `_system`
-cannot be reached through deis-proxy in any of its modes; the inspector is
-meant to be used on deis-runtime's own port.
+   The prefix is the platform's own, in both directions: deis-bundle refuses
+   a bundle that sets an `x-deis-` header on a *response* for the same reason
+   this hop refuses to carry one on a request. The whole namespace is
+   evidence one component produced for another, and evidence a client can
+   write is not evidence. The cost is that an application cannot invent a
+   header of its own under `x-deis-` and expect it to arrive; any other
+   prefix works. A client sending one is logged at `warn` with the count and
+   the names, because nothing legitimate on this path does it.
+
+Because the header is validated — and the namespace cleared outright when
+nothing was resolved — deis-runtime's own targets such as `_inspect:<app>`
+and `_system` cannot be reached through deis-proxy in any of its modes; the
+inspector is meant to be used on deis-runtime's own port, where its
+`x-deis-inspect-token` never crosses this hop.
 
 A request body larger than `max_request_body_bytes` is refused rather than
 carried. A connection that has **completed** an upgrade is exempt, because

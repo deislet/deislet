@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::model::{
-    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, Route, SecretMeta,
-    Version, now_secs, validate_app_id, validate_environment_name, validate_host,
+    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, RetiredAppName, Route,
+    SecretMeta, Version, now_secs, validate_app_id, validate_environment_name, validate_host,
     validate_path_prefix, validate_secret_name,
 };
 use super::{CatalogError, CatalogResult};
@@ -30,6 +30,7 @@ const VERSION_COLUMNS: &str = "id, app_id, number, bundle_sha, bundle_path, mani
 const ENVIRONMENT_COLUMNS: &str = "id, app_id, name, created_at";
 const DEPLOYMENT_COLUMNS: &str = "id, app_id, env_id, version_id, created_at, note";
 const ROUTE_COLUMNS: &str = "id, app_id, env_id, host, path_prefix, priority";
+const RETIRED_NAME_COLUMNS: &str = "app_id, retired_at, environments, released_at";
 
 /// Ordering that defines "the current deployment of an environment".
 ///
@@ -120,6 +121,31 @@ impl CatalogStore {
                 if app_exists(conn, &id)? {
                     return Err(CatalogError::conflict(format!("app {id} already exists")));
                 }
+                // A name that belonged to a deleted application is not free.
+                // Its data is still in deis-store and deis-queue, keyed by
+                // (application, environment), so an application created here
+                // would be that tenant: it would read and overwrite the
+                // deleted application's kv, database, objects and queued
+                // messages, and it can belong to a different account
+                // entirely. Refused until somebody releases the name and
+                // says, on the record, that the next application of that name
+                // may have what the last one left.
+                if let Some(retired) = retired_name(conn, &id)?.filter(RetiredAppName::is_held) {
+                    warn!(
+                        app_id = %id,
+                        retired_at = retired.retired_at,
+                        tenants = ?retired.tenants(),
+                        "Refused to create an application under a retired name: {}. Creating it here would have handed one account's stored data to whoever asked for the name next",
+                        retired.describe_data()
+                    );
+                    return Err(CatalogError::conflict(format!(
+                        "app {id} was deleted and its name is retained, not free: {}. Deal with \
+                         that data first, then release the name with DELETE \
+                         /api/retired-apps/{id} - which records that the next application called \
+                         {id} inherits whatever is left",
+                        retired.describe_data()
+                    )));
+                }
                 conn.execute(
                     "INSERT INTO apps (id, created_at) VALUES (?1, ?2)",
                     params![id, created_at],
@@ -201,6 +227,42 @@ impl CatalogStore {
                 let versions =
                     tx.execute("DELETE FROM versions WHERE app_id = ?1", params![app_id])?;
                 tx.execute("DELETE FROM apps WHERE id = ?1", params![app_id])?;
+
+                // In the same transaction as the deletion, and that is the
+                // whole point: the data this application stored is not in
+                // this database and is not being deleted, so the moment its
+                // rows go the name has to stop being free. Committed
+                // together, there is no window - and a transaction that
+                // fails leaves the application whole rather than leaving its
+                // data adoptable.
+                //
+                // A name can be retired, released and used again, so an
+                // earlier retirement is merged rather than overwritten: the
+                // tenants of the first application still hold data even
+                // though the second one never had those environments.
+                let mut retained: Vec<String> = environment_names.clone();
+                if let Some(previous) = retired_name(&tx, &app_id)? {
+                    retained.extend(previous.environments);
+                }
+                retained.sort();
+                retained.dedup();
+                let retired = RetiredAppName {
+                    app_id: app_id.clone(),
+                    retired_at: now_secs(),
+                    environments: retained,
+                    released_at: None,
+                };
+                tx.execute(
+                    "INSERT OR REPLACE INTO retired_app_names \
+                     (app_id, retired_at, environments, released_at) VALUES (?1, ?2, ?3, NULL)",
+                    params![
+                        retired.app_id,
+                        retired.retired_at,
+                        serde_json::to_string(&retired.environments)
+                            .unwrap_or_else(|_| "[]".to_string())
+                    ],
+                )?;
+
                 tx.commit()?;
 
                 Ok(DeletedApp {
@@ -211,12 +273,17 @@ impl CatalogStore {
                     secrets,
                     bundle_paths,
                     environment_names,
+                    retired,
                 })
             })
             .await?;
 
         // Destroying immutable history is worth a warning even when it was
-        // asked for: nothing can bring these versions back.
+        // asked for: nothing can bring these versions back. What the same
+        // line has to say in the same breath is what was *not* destroyed -
+        // the stored data, which no part of this platform can delete - and
+        // that the name is now retained rather than free, because that is the
+        // next thing whoever ran this will ask.
         warn!(
             app_id = %id,
             versions = removed.versions,
@@ -224,9 +291,90 @@ impl CatalogStore {
             deployments = removed.deployments,
             routes = removed.routes,
             secrets = removed.secrets,
-            "App deleted from the catalog; its version history and secrets are gone. Every node must now be told to drop it: a node only ever adds what its assignment list names and never removes what has left it"
+            tenants = ?removed.retired.tenants(),
+            "App deleted from the catalog; its version history and secrets are gone, but {}. The name is retained so nothing can be deployed onto that data by accident; release it with DELETE /api/retired-apps/{id} once the data has been dealt with. Every node must now be told to drop the application: a node only ever adds what its assignment list names and never removes what has left it",
+            removed.retired.describe_data()
         );
         Ok(removed)
+    }
+
+    /// Every name that belonged to a deleted application, held or released.
+    ///
+    /// This is the only place an operator can find out what became of a
+    /// deleted application's data: the rows that named it are gone, and the
+    /// data itself is in two services that this process cannot enumerate. A
+    /// released name is still listed for that reason - the name is usable
+    /// again, and its tenants are as full as they ever were.
+    pub async fn list_retired_names(&self) -> CatalogResult<Vec<RetiredAppName>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {RETIRED_NAME_COLUMNS} FROM retired_app_names ORDER BY app_id"
+            ))?;
+            let rows = stmt.query_map([], map_retired_name)?;
+            let mut retired = Vec::new();
+            for row in rows {
+                retired.push(row?);
+            }
+            Ok(retired)
+        })
+        .await
+    }
+
+    /// Make a retired name usable again.
+    ///
+    /// The deliberate second act. Deleting an application cannot delete what
+    /// it stored, so this is where somebody with the platform's administrator
+    /// credential says that the next application of that name may have
+    /// whatever the last one left behind - after purging it, or knowing they
+    /// have not. The audit log records who did it; the returned row is what
+    /// they were told they were accepting.
+    pub async fn release_retired_name(&self, app_id: &str) -> CatalogResult<RetiredAppName> {
+        let wanted = app_id.to_string();
+        let released = self
+            .with_conn(move |conn| {
+                let released_at = now_secs();
+                match retired_name(conn, &wanted)? {
+                    Some(retired) if retired.is_held() => {
+                        // Marked, not deleted. The row is the record of which
+                        // tenants hold data under this name, and that stays
+                        // true after the name is free again - the next
+                        // deletion of it adds to this list.
+                        conn.execute(
+                            "UPDATE retired_app_names SET released_at = ?2 WHERE app_id = ?1",
+                            params![wanted, released_at],
+                        )?;
+                        Ok(RetiredAppName {
+                            released_at: Some(released_at),
+                            ..retired
+                        })
+                    }
+                    // Already free. Answered as "no such thing to release"
+                    // rather than as a success, because a caller told "ok"
+                    // for a name it misspelled would believe it had cleared
+                    // the way for a deploy that is still going to be refused.
+                    Some(retired) => Err(CatalogError::not_found(format!(
+                        "retired app name {wanted}; it was already released at {}",
+                        retired.released_at.unwrap_or_default()
+                    ))),
+                    None => Err(CatalogError::not_found(format!(
+                        "retired app name {wanted}"
+                    ))),
+                }
+            })
+            .await?;
+
+        // A warning rather than a note: nothing else on this platform hands
+        // one account's stored data to another, and this is the moment it
+        // becomes possible.
+        warn!(
+            app_id = %released.app_id,
+            retired_at = released.retired_at,
+            tenants = ?released.tenants(),
+            "Released a retired application name; it can be created again, and the next application called {} will be the same storage tenant as the deleted one - {}. Every token scoped to this application, and every storage capability token minted for those tenants, also still authorises it: a capability token is derived from the tenant name and never expires, so revoke what the deleted application's owner still holds",
+            released.app_id,
+            released.describe_data()
+        );
+        Ok(released)
     }
 
     // ----------------------------------------------------------------
@@ -1030,6 +1178,37 @@ fn app_exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(found.is_some())
 }
 
+/// The retirement of a name, if it has one.
+///
+/// Takes a plain connection so that it can be asked inside the delete
+/// transaction as well as outside it.
+fn retired_name(conn: &Connection, app_id: &str) -> CatalogResult<Option<RetiredAppName>> {
+    conn.query_row(
+        &format!("SELECT {RETIRED_NAME_COLUMNS} FROM retired_app_names WHERE app_id = ?1"),
+        params![app_id],
+        map_retired_name,
+    )
+    .optional()
+    .map_err(CatalogError::from)
+}
+
+/// A retirement row, with its environment list parsed.
+///
+/// A row whose JSON does not parse degrades to an empty list rather than
+/// failing the query: what the row is *for* is the name being taken, and a
+/// name that stopped being retired because a list could not be read would be
+/// the one failure this table exists to prevent. The name of every tenant is
+/// then unknown, which `RetiredAppName::describe_data` says out loud.
+fn map_retired_name(row: &Row<'_>) -> rusqlite::Result<RetiredAppName> {
+    let environments: String = row.get(2)?;
+    Ok(RetiredAppName {
+        app_id: row.get(0)?,
+        retired_at: row.get(1)?,
+        environments: serde_json::from_str(&environments).unwrap_or_default(),
+        released_at: row.get(3)?,
+    })
+}
+
 fn load_app(conn: &Connection, id: &str) -> CatalogResult<App> {
     conn.query_row(
         &format!("SELECT {APP_COLUMNS} FROM apps WHERE id = ?1"),
@@ -1490,5 +1669,102 @@ mod tests {
         );
 
         assert!(store.delete_app("demo").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_apps_name_is_retained_and_cannot_be_created_again() {
+        // The defect this is about: deis-store and deis-queue key a tenant by
+        // (application, environment) and nothing deletes one, so an
+        // application created under a deleted application's name used to be
+        // the same tenant - reading and overwriting its kv, database, objects
+        // and queued messages, whoever created it.
+        let store = store().await;
+        app_with_env(&store, "victim", "production").await;
+        store.create_environment("victim", "preview").await.unwrap();
+
+        let removed = store.delete_app("victim").await.unwrap();
+        assert_eq!(
+            removed.retired.environments,
+            vec!["preview".to_string(), "production".to_string()],
+            "the environments are the tenants whose data is still out there"
+        );
+        assert_eq!(
+            removed.retired.tenants(),
+            vec![
+                "victim.preview".to_string(),
+                "victim.production".to_string()
+            ]
+        );
+
+        let err = store
+            .create_app("victim")
+            .await
+            .expect_err("the name of a deleted application is not free");
+        let message = err.to_string();
+        assert!(matches!(err, CatalogError::Conflict(_)), "{message}");
+        // The refusal has to say where the data is and how to get past this
+        // deliberately, because the person reading it is looking at a failed
+        // `deis deploy` and cannot see this source.
+        assert!(message.contains("victim.production"), "{message}");
+        assert!(message.contains("/api/retired-apps/victim"), "{message}");
+
+        // An unrelated name is untouched.
+        store.create_app("newcomer").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn releasing_a_retired_name_is_what_makes_it_usable_again() {
+        let store = store().await;
+        app_with_env(&store, "victim", "production").await;
+        store.delete_app("victim").await.unwrap();
+
+        let listed = store.list_retired_names().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].app_id, "victim");
+        assert_eq!(listed[0].tenants(), vec!["victim.production".to_string()]);
+
+        let released = store.release_retired_name("victim").await.unwrap();
+        assert_eq!(released.tenants(), vec!["victim.production".to_string()]);
+        assert!(
+            released.released_at.is_some(),
+            "the row survives the release; what it records stays true"
+        );
+        let listed = store.list_retired_names().await.unwrap();
+        assert_eq!(listed.len(), 1, "the record of where the data went remains");
+        assert!(!listed[0].is_held(), "and it no longer holds the name");
+
+        store.create_app("victim").await.unwrap();
+
+        // Releasing a name nothing retired is a 404, not a silent success:
+        // a caller that got "ok" for a name it misspelled would believe it
+        // had cleared the way for a deploy that will still be refused.
+        assert!(matches!(
+            store.release_retired_name("victim").await,
+            Err(CatalogError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_second_retirement_keeps_the_first_ones_tenants() {
+        // Released, recreated with different environments, deleted again.
+        // The first application's data is still in deis-store under
+        // victim.production, so that tenant must not drop off the record
+        // because the second application never had that environment.
+        let store = store().await;
+        app_with_env(&store, "victim", "production").await;
+        store.delete_app("victim").await.unwrap();
+        store.release_retired_name("victim").await.unwrap();
+
+        app_with_env(&store, "victim", "staging").await;
+        let removed = store.delete_app("victim").await.unwrap();
+
+        assert_eq!(
+            removed.retired.tenants(),
+            vec![
+                "victim.production".to_string(),
+                "victim.staging".to_string()
+            ],
+            "a name can be retired twice and both applications' data is still there"
+        );
     }
 }

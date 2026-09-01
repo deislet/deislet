@@ -17,10 +17,10 @@
 //! symptom is a bundle that one side accepts and another rejects.
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
 
 use serde::{Deserialize, Serialize};
 
+pub mod archive;
 pub mod assets;
 pub mod bindings;
 pub mod compatibility;
@@ -31,6 +31,10 @@ pub mod redirects;
 pub mod routing;
 pub mod site;
 
+pub use archive::{
+    BundleArchive, Limit, MAX_ENTRY_BYTES, MAX_MANIFEST_BYTES, MAX_MEMBER_NAME_BYTES, MAX_MEMBERS,
+    MAX_TOTAL_BYTES,
+};
 pub use assets::{AssetIndex, AssetMatch, guess_content_type};
 pub use bindings::{
     Binding, BindingKind, CALLABLE_BY_EVERYONE, DeclaredBindings, MAX_BINDING_NAME_LEN,
@@ -85,6 +89,22 @@ pub enum BundleError {
     InvalidManifest(String),
     /// The manifest is from a schema this build does not know.
     UnsupportedSchema { found: u32, supported: u32 },
+    /// The archive, or one member of it, is past a ceiling in [`archive`].
+    ///
+    /// Its own variant rather than a [`Self::Malformed`]: nothing is wrong
+    /// with the bytes, and what the person who ran the build has to be told is
+    /// the number - which ceiling, and what it is - so that they can see
+    /// whether they hit it with a real bundle or handed the platform a bomb.
+    TooLarge {
+        /// Which ceiling was hit.
+        limit: archive::Limit,
+        /// The member the figure is about, when it is about one. A name too
+        /// long to quote whole is shortened, because the length is the fault.
+        member: Option<String>,
+        /// What was measured. `None` when the read stopped at the ceiling and
+        /// the true figure was never learned - which is the point of stopping.
+        found: Option<u64>,
+    },
 }
 
 impl std::fmt::Display for BundleError {
@@ -97,6 +117,32 @@ impl std::fmt::Display for BundleError {
                 f,
                 "bundle manifest schema {found} is not supported; this build understands schema {supported}"
             ),
+            Self::TooLarge {
+                limit,
+                member,
+                found,
+            } => {
+                let about = match member {
+                    Some(member) => format!(" in member {member:?}"),
+                    None => String::new(),
+                };
+                match found {
+                    Some(found) => write!(
+                        f,
+                        "bundle is over a format limit{about}: {} is {found}, and this platform \
+                         accepts at most {}",
+                        limit.measures(),
+                        limit.ceiling()
+                    ),
+                    None => write!(
+                        f,
+                        "bundle is over a format limit{about}: {} is past the {} this platform \
+                         accepts, and it was refused without being unpacked any further",
+                        limit.measures(),
+                        limit.ceiling()
+                    ),
+                }
+            }
         }
     }
 }
@@ -402,7 +448,7 @@ impl Manifest {
 }
 
 /// A manifest read out of an archive, together with the exact text it came
-/// from.
+/// from and the module it names.
 ///
 /// The verbatim text matters: the control plane stores it in the version row,
 /// so a field this build does not understand still survives a round trip.
@@ -410,45 +456,62 @@ impl Manifest {
 pub struct ParsedManifest {
     pub json: String,
     pub manifest: Manifest,
+    /// Source text of the module `manifest.entry` names.
+    ///
+    /// Carried here because [`read_manifest`] has to unpack it anyway - the
+    /// only honest way to hold a member to a ceiling is to read it and stop -
+    /// and whoever reads it a second time pays for the same bytes twice.
+    /// `deis-runtime` still has its own read of the same member; it is bounded
+    /// only because this one already proved the member fits in
+    /// [`MAX_ENTRY_BYTES`], and it should be taking the text from here.
+    pub entry_module: String,
 }
 
 /// Read and validate `manifest.json` out of a zip held in memory.
 ///
-/// Also confirms the declared entry point is actually present, so a bundle
-/// that would fail at load time is rejected at upload time instead.
+/// Also unpacks the declared entry point, so a bundle that would fail at load
+/// time - no such member, not text, or a member that expands past what any
+/// node will read - is refused at upload time, while the person who ran the
+/// build is still watching.
+///
+/// Every member is read through [`BundleArchive`], which holds each one to a
+/// ceiling. Nothing here reads the zip directly: an uploaded bundle is the
+/// least trusted input the platform has, and a member read without a ceiling
+/// is a few hundred kilobytes on the wire turning into gigabytes in this
+/// process and in every node that fetches the version.
 pub fn read_manifest(bytes: &[u8]) -> Result<ParsedManifest> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| BundleError::NotAnArchive(e.to_string()))?;
+    let mut archive = BundleArchive::open(bytes)?;
 
-    let json = {
-        let mut entry = archive.by_name(MANIFEST_ENTRY).map_err(|e| {
+    let json = archive
+        .read_text(MANIFEST_ENTRY, Limit::ManifestBytes)?
+        .ok_or_else(|| {
             BundleError::Malformed(format!(
-                "no {MANIFEST_ENTRY} at the archive root ({e}); it was not produced by a deislet build"
+                "no {MANIFEST_ENTRY} at the archive root; it was not produced by a deislet build"
             ))
         })?;
-        let mut text = String::new();
-        entry
-            .read_to_string(&mut text)
-            .map_err(|e| BundleError::Malformed(format!("{MANIFEST_ENTRY} is not UTF-8: {e}")))?;
-        text
-    };
 
     let manifest = Manifest::parse(&json)?;
 
-    if archive.by_name(&manifest.entry).is_err() {
-        return Err(BundleError::InvalidManifest(format!(
-            "entry {:?} is not in the archive",
-            manifest.entry
-        )));
-    }
+    let entry_module = archive
+        .read_text(&manifest.entry, Limit::EntryBytes)?
+        .ok_or_else(|| {
+            BundleError::InvalidManifest(format!(
+                "entry {:?} is not in the archive",
+                manifest.entry
+            ))
+        })?;
 
-    Ok(ParsedManifest { json, manifest })
+    Ok(ParsedManifest {
+        json,
+        manifest,
+        entry_module,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
     fn zip_with(files: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -554,6 +617,72 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(!json.contains("bindings"), "{json}");
         assert!(!json.contains("callable_by"), "{json}");
+    }
+
+    #[test]
+    fn a_manifest_that_unpacks_without_end_is_refused_before_it_is_parsed() {
+        // Half a megabyte on the wire used to become half a gigabyte in this
+        // process, and the refusal that followed was a JSON syntax error -
+        // after the whole thing had been materialised. The ceiling is the
+        // reader's now, so the bytes are never held.
+        let manifest = "a".repeat((MAX_MANIFEST_BYTES + 1) as usize);
+        let z = zip_with(&[(MANIFEST_ENTRY, &manifest), (WORKER_ENTRY, "export {}")]);
+        assert!(
+            (z.len() as u64) < MAX_MANIFEST_BYTES / 100,
+            "a bomb is small on the wire; this fixture is {} bytes",
+            z.len()
+        );
+
+        let err = read_manifest(&z).expect_err("a manifest nothing could have written");
+        assert!(
+            matches!(
+                err,
+                BundleError::TooLarge {
+                    limit: Limit::ManifestBytes,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&MAX_MANIFEST_BYTES.to_string()),
+            "the refusal has to name the ceiling: {err}"
+        );
+    }
+
+    #[test]
+    fn an_entry_module_that_unpacks_without_end_is_refused_at_upload() {
+        // This one used to be accepted here and paid for on every node that
+        // fetched the version: the control plane only checked that the member
+        // existed, and the node read it with no ceiling at all.
+        let json = r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#;
+        let module = "/".repeat((MAX_ENTRY_BYTES + 1) as usize);
+        let z = zip_with(&[(MANIFEST_ENTRY, json), (WORKER_ENTRY, &module)]);
+
+        let err = read_manifest(&z).expect_err("no node will read a module this size");
+        assert!(
+            matches!(
+                err,
+                BundleError::TooLarge {
+                    limit: Limit::EntryBytes,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains(WORKER_ENTRY), "{err}");
+    }
+
+    #[test]
+    fn the_entry_module_comes_back_with_the_manifest() {
+        // Read once, here, under a ceiling - so that nothing downstream has
+        // to unpack the same member a second time to get at it.
+        let z = zip_with(&[
+            (MANIFEST_ENTRY, MINIMAL),
+            (WORKER_ENTRY, "export default 1"),
+        ]);
+        let parsed = read_manifest(&z).unwrap();
+        assert_eq!(parsed.entry_module, "export default 1");
     }
 
     #[test]

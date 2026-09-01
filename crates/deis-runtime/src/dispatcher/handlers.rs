@@ -2,7 +2,7 @@
 
 use super::AppState;
 use crate::app::AppKey;
-use crate::{APP_ID_HEADER, ENVIRONMENT_HEADER};
+use crate::{is_platform_header, APP_ID_HEADER, ENVIRONMENT_HEADER, PLATFORM_HEADER_PREFIX};
 use axum::{
     body::{Body, Bytes},
     extract::{
@@ -268,13 +268,75 @@ pub async fn handle_request(
         url
     );
 
-    // Convert headers
+    // Convert headers, less the platform's own namespace.
+    //
+    // Everything under `x-deis-` that reaches a handler has to be something
+    // this node wrote, because that is what the platform tells applications
+    // it is: `x-deis-caller` is documented as the node's record of which
+    // application made a service call and as evidence a callee may branch on
+    // rather than a claim it has to check. Every header here arrived from
+    // outside, and the loop below used to copy all of them into the isolate
+    // one for one -- so `curl -H 'x-deis-caller: admin-app'` handed a callee
+    // exactly the value a service call would have stamped, and a callee that
+    // followed the documented pattern granted admin to anyone who could reach
+    // this node. `x-deis-tenant`, `x-deis-storage-token` and `x-deis-binding`
+    // are the same shape one hop further in.
+    //
+    // deis-proxy sweeps the same namespace at the edge. This is not that fix
+    // repeated for tidiness: a node is reachable without the proxy -- every
+    // other node on the network can reach it, and the demo talks to it
+    // directly -- so the guarantee has to be made here to be a guarantee at
+    // all.
+    //
+    // A prefix and not a list of names, for the reason a list is always one
+    // release behind: the next header some component invents would arrive
+    // forgeable and nothing would fail until something trusted it. The cost is
+    // that an application cannot receive a header of its own under `x-deis-`,
+    // which is the same bargain deis-bundle already strikes on the response
+    // side by refusing a bundle that sets one.
     let mut header_map = std::collections::HashMap::new();
-    for (key, value) in headers.iter() {
+    let mut forged: Vec<&str> = Vec::new();
+    for (name, value) in headers.iter() {
+        if is_platform_header(name.as_str()) {
+            // The two routing headers are ordinary, documented traffic on the
+            // way in; they are put back below with the values this node
+            // resolved. Anything else under the prefix has no honest sender.
+            if name.as_str() != APP_ID_HEADER && name.as_str() != ENVIRONMENT_HEADER {
+                forged.push(name.as_str());
+            }
+            continue;
+        }
         if let Ok(value_str) = value.to_str() {
-            header_map.insert(key.to_string(), value_str.to_string());
+            header_map.insert(name.to_string(), value_str.to_string());
         }
     }
+    if !forged.is_empty() {
+        tracing::warn!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            removed = forged.len(),
+            headers = %forged.join(", "),
+            "A request for {} carried {} header(s) in the platform's own {} namespace; all {} \
+             were dropped before the isolate saw them. An application reads that namespace as \
+             this node's own account of the request, so a value from outside would be read as \
+             evidence the platform had stamped",
+            key,
+            forged.len(),
+            PLATFORM_HEADER_PREFIX,
+            forged.len()
+        );
+    }
+
+    // Put back what this node decided, so an application reading either of
+    // them reads the request it is actually serving. Not the client's copy:
+    // routing takes the *first* value of a repeated header while this map
+    // keeps the last, so a client sending the environment twice used to have
+    // a handler running in one environment read the name of the other.
+    header_map.insert(APP_ID_HEADER.to_string(), key.app_id().to_string());
+    header_map.insert(
+        ENVIRONMENT_HEADER.to_string(),
+        key.environment().to_string(),
+    );
 
     // Add WebSocket upgrade flag.
     //
@@ -479,12 +541,25 @@ async fn handle_websocket_bridged(
 
     // Create bidirectional channels
     // js_to_client: JavaScript message -> client (registered in WsServerManager)
+    //
+    // The counter travels with the channel. The isolate adds to it when it
+    // queues a frame and this task subtracts once the frame has been handed to
+    // the socket, which is what bounds how far ahead of a slow client an
+    // application may run: without it the queue was Rust memory beside the
+    // isolate with no ceiling in it at all, and a handler sending faster than
+    // one client read grew the node's process without ever crossing its own
+    // memory limit. See `crate::runtime::ws_server_ops::MAX_BUFFERED_BYTES`.
     let (js_to_client_tx, mut js_to_client_rx) = tokio::sync::mpsc::unbounded_channel();
+    let buffered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Register WebSocket connection in RuntimePool
     // Note: we only need to register js_to_client_tx, as client messages are sent directly via dispatch_ws_message
     if let Err(e) = app_manager
-        .register_ws_connection(&key, ws_id.clone(), js_to_client_tx)
+        .register_ws_connection(
+            &key,
+            ws_id.clone(),
+            crate::runtime::WsClientSink::new(js_to_client_tx, buffered.clone()),
+        )
         .await
     {
         tracing::error!("Failed to register WebSocket connection {}: {}", ws_id, e);
@@ -567,6 +642,12 @@ async fn handle_websocket_bridged(
         use crate::runtime::WsServerMessage;
 
         while let Some(msg) = js_to_client_rx.recv().await {
+            // Released before the write rather than after it: what the ceiling
+            // is about is how much this node is holding, and from here the
+            // frame is the socket's problem. Counting it as queued until the
+            // write returned would charge the application for the client's own
+            // slowness twice.
+            buffered.fetch_sub(msg.queued_bytes(), std::sync::atomic::Ordering::Relaxed);
             match msg {
                 WsServerMessage::Text(text) => {
                     tracing::debug!("JS -> Client: {} (ws_id: {})", text, ws_id_clone);

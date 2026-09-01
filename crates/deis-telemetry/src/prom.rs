@@ -24,6 +24,7 @@ const SELF_PREFIX: &str = "deis_telemetry";
 pub fn render(samples: &[MetricRecord], stats: &ServiceStats) -> String {
     let mut out = String::with_capacity(1024 + samples.len() * 96);
     render_self(&mut out, stats);
+    render_self_by_app(&mut out, stats);
     render_samples(&mut out, samples);
     out
 }
@@ -38,6 +39,41 @@ fn render_self(out: &mut String, stats: &ServiceStats) {
         let _ = writeln!(out, "# HELP {SELF_PREFIX}_{name} {}", metric.help);
         let _ = writeln!(out, "# TYPE {SELF_PREFIX}_{name} {}", metric.kind.as_str());
         let _ = writeln!(out, "{SELF_PREFIX}_{name} {}", metric.value);
+    }
+}
+
+/// Write this process's own numbers that are broken down by application.
+///
+/// Separate from [`render_self`] because these carry a label, and because the
+/// set is not fixed: an application appears only once something of its was
+/// actually thrown away. The header lines are written once per family even
+/// though the series count varies, which is what the format requires.
+fn render_self_by_app(out: &mut String, stats: &ServiceStats) {
+    let metrics = stats.labelled_snapshot();
+    let mut current: Option<&str> = None;
+    for metric in &metrics {
+        if current != Some(metric.name) {
+            let _ = writeln!(out, "# HELP {SELF_PREFIX}_{} {}", metric.name, metric.help);
+            let _ = writeln!(
+                out,
+                "# TYPE {SELF_PREFIX}_{} {}",
+                metric.name,
+                metric.kind.as_str()
+            );
+            current = Some(metric.name);
+        }
+        let pairs: Vec<(String, String)> = metric
+            .labels
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect();
+        let _ = writeln!(
+            out,
+            "{SELF_PREFIX}_{}{} {}",
+            metric.name,
+            render_pairs(&pairs),
+            metric.value
+        );
     }
 }
 
@@ -392,6 +428,63 @@ mod tests {
             value,
             timestamp_us: ts,
         }
+    }
+
+    #[test]
+    fn a_live_buffer_loss_is_exported_against_the_application_that_caused_it() {
+        // The number an operator goes looking for after a follow stream
+        // skipped the lines they were watching for. The plain total says
+        // something went; only this says whose.
+        let stats = ServiceStats::new();
+        stats.tail_entries_dropped_by_app.add("noisy", 996);
+        stats.tail_entries_dropped_by_app.add("noisy", 4);
+        stats.trace_tail_entries_dropped_by_app.add("noisy", 7);
+        let text = render(&[], &stats);
+        assert!(
+            text.contains("# TYPE deis_telemetry_tail_entries_dropped_by_app_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "deis_telemetry_tail_entries_dropped_by_app_total{app_id=\"noisy\"} 1000"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "deis_telemetry_trace_tail_entries_dropped_by_app_total{app_id=\"noisy\"} 7"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_application_that_lost_nothing_is_not_exported_at_all() {
+        // One series per application that has never lost a line would be
+        // cardinality bought for nothing, and a flat zero next to a real
+        // loss reads as if the loss had been measured for both.
+        let text = render(&[], &ServiceStats::new());
+        assert!(
+            !text.contains("tail_entries_dropped_by_app_total{"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_application_id_with_a_quote_in_it_cannot_break_the_page() {
+        // The id is whatever a producer put in the record, so it reaches the
+        // export unvalidated. An unescaped quote would end the label early
+        // and make the scraper reject every series on the page, not just
+        // this one.
+        let stats = ServiceStats::new();
+        stats.tail_entries_dropped_by_app.add("we\"ird\\", 3);
+        let text = render(&[], &stats);
+        assert!(
+            text.contains(
+                "deis_telemetry_tail_entries_dropped_by_app_total{app_id=\"we\\\"ird\\\\\"} 3"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

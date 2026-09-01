@@ -54,7 +54,8 @@ mod tests {
         // Inject CacheStore
         let op_state = runtime.op_state();
         let mut state = op_state.borrow_mut();
-        let cache_store: CacheStore = create_cache_store(100, 0); // 100 entries, no TTL
+        // 100 entries, 1 MiB, no TTL.
+        let cache_store: CacheStore = create_cache_store(100, 1024 * 1024, 0);
         state.put(cache_store);
 
         runtime
@@ -225,8 +226,8 @@ mod tests {
     /// never carry the same one.
     #[test]
     fn every_store_has_an_identity_of_its_own_and_reports_the_node_s_numbers() {
-        let one = create_cache_store(10_000, 600);
-        let two = create_cache_store(10_000, 600);
+        let one = create_cache_store(10_000, 64 * 1024 * 1024, 600);
+        let two = create_cache_store(10_000, 64 * 1024 * 1024, 600);
 
         assert_eq!(one.scope().kind, "isolate");
         assert_ne!(
@@ -236,6 +237,10 @@ mod tests {
         );
         assert_eq!(one.scope().max_entries, 10_000);
         assert_eq!(one.scope().default_ttl_seconds, 600);
+        // Both ceilings are published, because an application deciding what
+        // is worth caching needs the one counted in bytes most of all.
+        assert_eq!(one.scope().max_bytes, 64 * 1024 * 1024);
+        assert_eq!(one.scope().max_entry_bytes, 16 * 1024 * 1024);
         assert!(one.scope().since > 0, "the store has to know when it began");
     }
 
@@ -563,5 +568,157 @@ mod tests {
         assert_eq!(seen["scopeHasId"], true);
         assert_eq!(seen["scopeStable"], true);
         assert_eq!(seen["maxEntries"], 10_000);
+    }
+
+    /// The ceiling that actually bounds what a tenant's cache costs the node.
+    ///
+    /// Entries alone did not: this store is Rust memory beside the isolate,
+    /// outside the V8 heap `memoryMb` governs, so ten thousand entries of a
+    /// megabyte each was ten gigabytes held by an application whose own memory
+    /// limit was never crossed and whose isolate reported nothing. Two hundred
+    /// one-megabyte responses -- two per cent of the entry ceiling -- moved
+    /// this process's resident memory by 206 MiB.
+    #[tokio::test]
+    async fn the_store_evicts_on_bytes_rather_than_growing_past_its_ceiling() {
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            extensions: vec![init_cache_extension()],
+            ..Default::default()
+        });
+        {
+            let op_state = runtime.op_state();
+            let mut state = op_state.borrow_mut();
+            // A megabyte, and an entry ceiling far above what a megabyte of
+            // these entries can reach, so what is under test is the bytes.
+            let cache_store: CacheStore = create_cache_store(1_000, 1024 * 1024, 0);
+            state.put(cache_store);
+        }
+
+        // Sixteen responses of 128 KiB: two megabytes into a one-megabyte
+        // store.
+        run(
+            &mut runtime,
+            r#"
+            (async () => {
+                const body = new Uint8Array(128 * 1024);
+                for (let i = 0; i < 16; i++) {
+                    await Deno.core.ops.op_cache_set("default", "k" + i, "{}", body, 0);
+                }
+            })()
+        "#,
+        )
+        .await;
+
+        let cache = store(&runtime);
+        let held = cache.held_bytes().await;
+        assert!(
+            held <= 1024 * 1024,
+            "the store holds {held} bytes, past its own one-megabyte ceiling"
+        );
+        assert!(
+            cache.len().await < 16,
+            "every entry survived, so nothing was evicted and the ceiling did nothing"
+        );
+    }
+
+    /// The entry ceiling survives being counted in bytes.
+    ///
+    /// One counter enforces both, by charging every entry at least its share
+    /// of the store; without that floor an application could hold millions of
+    /// empty responses inside a byte ceiling it never approached, and an entry
+    /// costs more than its body -- a key, three allocations and the store's own
+    /// bookkeeping.
+    #[tokio::test]
+    async fn tiny_entries_still_cannot_exceed_the_entry_ceiling() {
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            extensions: vec![init_cache_extension()],
+            ..Default::default()
+        });
+        {
+            let op_state = runtime.op_state();
+            let mut state = op_state.borrow_mut();
+            // Four entries, four kilobytes: an entry costs at least a
+            // kilobyte of the ceiling however small its body is.
+            let cache_store: CacheStore = create_cache_store(4, 4096, 0);
+            state.put(cache_store);
+        }
+
+        run(
+            &mut runtime,
+            r#"
+            (async () => {
+                for (let i = 0; i < 40; i++) {
+                    await Deno.core.ops.op_cache_set("default", "k" + i, "{}", bytes("x"), 0);
+                }
+            })()
+        "#,
+        )
+        .await;
+
+        let cache = store(&runtime);
+        assert!(
+            cache.len().await <= 4,
+            "{} entries survived a four-entry store",
+            cache.len().await
+        );
+    }
+
+    /// A response too large for the store is refused, and the application is
+    /// told with both numbers in the message.
+    ///
+    /// Admitting it would be worse than refusing: it could only be made room
+    /// for by evicting most of the store, so one `put` would throw away
+    /// everything the application had cached, once per call, silently.
+    #[tokio::test]
+    async fn a_response_too_large_for_the_store_is_refused_and_says_so() {
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            extensions: vec![init_cache_extension()],
+            ..Default::default()
+        });
+        {
+            let op_state = runtime.op_state();
+            let mut state = op_state.borrow_mut();
+            // A megabyte, so one entry may hold 256 KiB of it.
+            let cache_store: CacheStore = create_cache_store(1_000, 1024 * 1024, 0);
+            state.put(cache_store);
+        }
+
+        run(
+            &mut runtime,
+            r#"
+            (async () => {
+                let outcome = "the oversized response was accepted";
+                try {
+                    await Deno.core.ops.op_cache_set(
+                        "default", "big", "{}", new Uint8Array(300 * 1024), 0);
+                } catch (e) {
+                    outcome = e.message;
+                }
+                await Deno.core.ops.op_cache_set("default", "outcome", "{}", bytes(outcome), 0);
+            })()
+        "#,
+        )
+        .await;
+
+        let cache = store(&runtime);
+        let outcome = String::from_utf8(
+            cache
+                .entry("default", "outcome")
+                .await
+                .expect("the small entry beside it was stored")
+                .body,
+        )
+        .expect("the message is text");
+        assert!(
+            outcome.starts_with("cache.put: this entry is 3072")
+                && outcome.contains("262144")
+                && outcome.contains("1048576"),
+            "the refusal has to name what was sent, what one entry may hold and what the whole \
+             store holds: {outcome}"
+        );
+        assert_eq!(
+            cache.entry("default", "big").await,
+            None,
+            "the oversized response must not be in the store"
+        );
     }
 }

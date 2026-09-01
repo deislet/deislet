@@ -1,4 +1,14 @@
-//! App lifecycle: create, list, inspect, delete.
+//! App lifecycle: create, list, inspect, delete - and what becomes of the
+//! name afterwards.
+//!
+//! Deleting an application is the one operation here that cannot finish the
+//! job. Everything the application stored lives in deis-store and deis-queue
+//! under a tenant built from `(application, environment)`, and neither service
+//! has an operation that drops a tenant, so the data outlives the delete. The
+//! name is therefore retained rather than recycled: it stays in the catalog's
+//! `retired_app_names` table until somebody releases it deliberately, and
+//! until they do, nothing can be created under it and inherit that data. See
+//! [`delete_app`] and [`release_retired_app`].
 
 use axum::{
     Json,
@@ -10,7 +20,7 @@ use tracing::{info, warn};
 
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::catalog::App;
+use crate::catalog::{App, RetiredAppName};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
@@ -35,6 +45,31 @@ pub struct DeleteAppResponse {
     /// code, its secrets in memory and its queue consumers - so the caller
     /// has to see that here; nothing else will ever mention this app again.
     pub unloaded: crate::delivery::RemovalReport,
+    /// What was *not* removed: the name, and the data behind it.
+    ///
+    /// The counters in `removed` are catalog rows. This is the stored data,
+    /// which is still in deis-store and deis-queue under the tenants named
+    /// here, and the record that keeps the name from being handed to the next
+    /// application that asks for it.
+    pub retained: RetiredAppName,
+    /// What the tenants in `retained` mean, in one sentence, for a caller
+    /// that is showing this to a person rather than parsing it.
+    pub retained_note: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetiredAppsResponse {
+    pub retired: Vec<RetiredAppName>,
+    pub total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReleaseRetiredAppResponse {
+    pub app_id: String,
+    pub released: RetiredAppName,
+    /// What the caller has just accepted, spelled out: the next application
+    /// created under this name is the same storage tenant as the deleted one.
+    pub accepted: String,
 }
 
 /// POST /api/apps
@@ -76,6 +111,12 @@ pub async fn get_app(
 /// in memory, still polling its queues. A delete done to revoke access has
 /// to actually revoke it, so a node that cannot be reached is reported in
 /// the answer rather than passed over.
+///
+/// What it does *not* remove is the application's stored data. That lives in
+/// deis-store and deis-queue, keyed by `(application, environment)`, and this
+/// control plane has no call that drops a tenant there, so the answer reports
+/// the tenants that still hold it and the name is retained so that the next
+/// application of that name cannot be handed it silently.
 pub async fn delete_app(
     State(state): State<CatalogState>,
     Path(app_id): Path<String>,
@@ -129,11 +170,71 @@ pub async fn delete_app(
             "App deletion finished in the catalog only; the listed nodes were not reached and keep serving the deleted application until they are restarted"
         );
     }
+    let retained = removed.retired.clone();
     Ok(Json(DeleteAppResponse {
         app_id,
+        retained_note: format!(
+            "{}. No part of this platform deletes it. The name is retained until it is released \
+             with DELETE /api/retired-apps/{}, so nothing can be deployed onto that data by \
+             accident",
+            retained.describe_data(),
+            retained.app_id
+        ),
+        retained,
         removed,
         bundle_files_removed,
         unloaded,
+    }))
+}
+
+/// GET /api/retired-apps
+///
+/// The names of deleted applications and the tenants whose data is the reason
+/// they are held. This is the only record of what became of a deleted
+/// application's data: its catalog rows are gone, and deis-store and
+/// deis-queue cannot be asked what they still hold.
+///
+/// A row with `released_at` set is a name somebody freed again: it can be
+/// created, and what it says about the data is as true as it ever was.
+pub async fn list_retired_apps(
+    State(state): State<CatalogState>,
+) -> ApiResult<Json<RetiredAppsResponse>> {
+    let retired = state.store.list_retired_names().await?;
+    Ok(Json(RetiredAppsResponse {
+        total: retired.len(),
+        retired,
+    }))
+}
+
+/// DELETE /api/retired-apps/:app_id
+///
+/// Free the name again. Deliberately a second call, made by an administrator,
+/// rather than something the delete could have done on its own: releasing it
+/// is the decision that the next application created under this name may have
+/// whatever the deleted one left in deis-store and deis-queue. Whoever makes
+/// it is in the audit log, and so is this call when it is refused.
+///
+/// The data itself is untouched either way. An operator who wants it gone
+/// purges it - `deis kv`, `deis db`, `deis blob` against those tenants while
+/// the application still exists, or the tenant's files under deis-store's own
+/// data directory - and then releases the name.
+pub async fn release_retired_app(
+    State(state): State<CatalogState>,
+    Path(app_id): Path<String>,
+) -> ApiResult<Json<ReleaseRetiredAppResponse>> {
+    let released = state.store.release_retired_name(&app_id).await?;
+    Ok(Json(ReleaseRetiredAppResponse {
+        app_id: released.app_id.clone(),
+        accepted: format!(
+            "{} is free again. {}, and the next application created under this name is that same \
+             tenant: it will read and overwrite whatever is there. Credentials follow the name \
+             too - a token scoped to this application, or a storage capability token minted for \
+             one of those tenants, still authorises the next one, so revoke what the deleted \
+             application's owner still holds",
+            released.app_id,
+            released.describe_data()
+        ),
+        released,
     }))
 }
 
@@ -147,4 +248,150 @@ pub(super) async fn resolve_environment(
 ) -> Result<crate::catalog::Environment, ApiError> {
     state.store.get_app(app_id).await?;
     Ok(state.store.get_environment(app_id, env_name).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{
+        Harness, TEST_STORAGE_SECRET, harness_with_storage, json, storage_wiring,
+    };
+
+    use axum::http::StatusCode;
+    use serde_json::{Value, json as body};
+
+    async fn platform() -> Harness {
+        harness_with_storage(
+            true,
+            vec!["node-psk".to_string()],
+            storage_wiring(Some(TEST_STORAGE_SECRET)),
+        )
+        .await
+    }
+
+    async fn app_with_production(h: &Harness, app: &str) {
+        json(&h.router, "POST", "/api/apps", body!({ "id": app })).await;
+        json(
+            &h.router,
+            "POST",
+            &format!("/api/apps/{app}/environments"),
+            body!({ "name": "production" }),
+        )
+        .await;
+    }
+
+    async fn storage_token(h: &Harness, app: &str) -> Value {
+        let (status, token) = json(
+            &h.router,
+            "GET",
+            &format!("/api/apps/{app}/environments/production/storage-token"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{token}");
+        token
+    }
+
+    /// The defect, end to end. An application's kv, database, objects and
+    /// queued messages live in deis-store and deis-queue under
+    /// `<app>.<environment>`, and nothing here can delete them - so the next
+    /// application of that name used to be that tenant, whoever created it,
+    /// and read and overwrote data it had never been given.
+    #[tokio::test]
+    async fn the_name_of_a_deleted_application_is_not_handed_to_the_next_caller() {
+        let h = platform().await;
+        app_with_production(&h, "victim").await;
+        let before = storage_token(&h, "victim").await;
+        assert_eq!(before["tenant"], "victim.production");
+
+        let (status, deleted) = json(&h.router, "DELETE", "/api/apps/victim", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{deleted}");
+        // The answer has to say what became of the data, because nothing
+        // else ever will: the rows that named this application are gone.
+        assert_eq!(deleted["retained"]["environments"][0], "production");
+        assert!(deleted["retained"]["released_at"].is_null());
+        let note = deleted["retained_note"].as_str().unwrap();
+        assert!(note.contains("victim.production"), "{note}");
+        assert!(note.contains("/api/retired-apps/victim"), "{note}");
+
+        let (status, refused) = json(&h.router, "POST", "/api/apps", body!({"id": "victim"})).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a name whose data is still out there is not free: {refused}"
+        );
+        let message = refused["error"].as_str().unwrap();
+        assert!(message.contains("victim.production"), "{message}");
+        assert!(message.contains("/api/retired-apps/victim"), "{message}");
+    }
+
+    /// What an operator can find out afterwards, and the one call that
+    /// deliberately hands the data on.
+    #[tokio::test]
+    async fn releasing_the_name_is_a_second_act_that_says_what_it_gives_away() {
+        let h = platform().await;
+        app_with_production(&h, "victim").await;
+        let before = storage_token(&h, "victim").await;
+        json(&h.router, "DELETE", "/api/apps/victim", Value::Null).await;
+
+        let (status, listed) = json(&h.router, "GET", "/api/retired-apps", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["retired"][0]["app_id"], "victim");
+        assert_eq!(listed["retired"][0]["environments"][0], "production");
+
+        let (status, released) =
+            json(&h.router, "DELETE", "/api/retired-apps/victim", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{released}");
+        let accepted = released["accepted"].as_str().unwrap();
+        assert!(
+            accepted.contains("victim.production"),
+            "the caller has to be told which tenant they just handed over: {accepted}"
+        );
+
+        // And now, deliberately, the name works again - and it is the same
+        // storage tenant, which is exactly what the release said it would be.
+        let (status, created) = json(&h.router, "POST", "/api/apps", body!({"id": "victim"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        json(
+            &h.router,
+            "POST",
+            "/api/apps/victim/environments",
+            body!({ "name": "production" }),
+        )
+        .await;
+        let after = storage_token(&h, "victim").await;
+        assert_eq!(after["tenant"], before["tenant"]);
+        assert_eq!(
+            after["token"], before["token"],
+            "the tenant key is (application, environment) by design; releasing the name is the \
+             moment somebody accepted that"
+        );
+    }
+
+    /// A name nothing retired must not answer "released": a caller that
+    /// misspelled the name would believe it had cleared the way.
+    #[tokio::test]
+    async fn releasing_a_name_that_was_never_retired_is_a_404() {
+        let h = platform().await;
+        app_with_production(&h, "live").await;
+
+        let (status, _) = json(&h.router, "DELETE", "/api/retired-apps/live", Value::Null).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = json(
+            &h.router,
+            "DELETE",
+            "/api/retired-apps/never-existed",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Releasing twice is the same question asked again, and the second
+        // answer must not be "yes".
+        json(&h.router, "DELETE", "/api/apps/live", Value::Null).await;
+        let (first, _) = json(&h.router, "DELETE", "/api/retired-apps/live", Value::Null).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, _) = json(&h.router, "DELETE", "/api/retired-apps/live", Value::Null).await;
+        assert_eq!(second, StatusCode::NOT_FOUND);
+    }
 }

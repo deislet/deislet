@@ -801,3 +801,145 @@ mod inbound_websocket_frames {
         let _ = socket.send(Message::Close(None)).await;
     }
 }
+
+/// What an application is allowed to believe about the `x-deis-` headers on
+/// the request it is serving.
+///
+/// The platform documents that namespace as its own account of a request --
+/// `x-deis-caller` names the application that made a service call, and a
+/// callee "cannot have it forged". That was true of a service call, which
+/// overwrites it, and false of every request that arrived over HTTP: the node
+/// copied the client's headers into the isolate one for one, so `curl` could
+/// hand a handler any of them. These drive the real HTTP entry, because that
+/// is the only place the guarantee can be made.
+mod the_platform_s_own_headers_are_the_platform_s {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::any;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use crate::app::types::AppConfig;
+    use crate::app::{AppKey, ApplicationManager};
+    use crate::config::default_max_request_body_bytes;
+    use crate::dispatcher::handlers::handle_request;
+    use crate::dispatcher::AppState;
+    use crate::{APP_ID_HEADER, ENVIRONMENT_HEADER};
+
+    const APP: &str = "header-mirror";
+
+    /// An application that reports every platform header it was given, in
+    /// order, so a test can assert on absence as well as on value.
+    async fn mirror_router(environment: &str) -> Router {
+        let code = r#"
+            export default function handler(context) {
+                const seen = [];
+                for (const [name, value] of context.request.headers.entries()) {
+                    if (name.toLowerCase().startsWith("x-deis-")) {
+                        seen.push(name.toLowerCase() + "=" + value);
+                    }
+                }
+                seen.sort();
+                return new Response(seen.join("\n"), { status: 200 });
+            }
+        "#;
+        let manager = Arc::new(ApplicationManager::with_threads(Some(1)));
+        manager
+            .load_app(
+                AppKey::new(APP, environment),
+                code.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the mirror app loads");
+
+        Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(manager, default_max_request_body_bytes()))
+    }
+
+    async fn seen_by_handler(router: &Router, sent: &[(&str, &str)]) -> String {
+        let mut builder = Request::builder().method("GET").uri("/");
+        for (name, value) in sent {
+            builder = builder.header(*name, *value);
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::empty())
+                    .expect("the request is buildable"),
+            )
+            .await
+            .expect("the node answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        String::from_utf8(bytes.to_vec()).expect("the body is text")
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_hand_a_handler_the_platform_s_evidence_about_itself() {
+        let router = mirror_router("production").await;
+
+        let seen = seen_by_handler(
+            &router,
+            &[
+                (APP_ID_HEADER, APP),
+                // The one that was demonstrated: a callee branching on
+                // `x-deis-caller` granted admin to curl.
+                ("x-deis-caller", "admin-app.production"),
+                // The same shape one hop further in: these authorise a
+                // storage tenant, and an application that read them back
+                // would be reading a claim it was told was evidence.
+                ("x-deis-tenant", "victim.production"),
+                ("x-deis-storage-token", "forged"),
+                ("x-deis-binding", "HOT"),
+                // Not a header any component writes today. It must be gone
+                // too: the rule is the namespace, not a list of names, or the
+                // next header added arrives forgeable.
+                ("x-deis-not-invented-yet", "whatever"),
+                // Case is the client's choice and must not be a way through.
+                ("X-Deis-Caller", "second-try"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            seen,
+            format!("x-deis-app-id={APP}\nx-deis-environment=production"),
+            "a handler may only ever see platform headers this node wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_routing_headers_a_handler_sees_are_the_ones_that_routed_it() {
+        // The application asked for is the application that serves, so what
+        // the handler reads back has to be what this node resolved -- not the
+        // string the client typed, and not one of two values it sent.
+        let router = mirror_router("preview").await;
+
+        let seen = seen_by_handler(
+            &router,
+            &[
+                (APP_ID_HEADER, APP),
+                (ENVIRONMENT_HEADER, "preview"),
+                // A second value for a header the node routes on. The routing
+                // read takes the first; a handler reading the map used to get
+                // whichever one landed last.
+                (ENVIRONMENT_HEADER, "production"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            seen,
+            format!("x-deis-app-id={APP}\nx-deis-environment=preview"),
+            "the environment a handler reads must be the one it is running in"
+        );
+    }
+}

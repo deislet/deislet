@@ -13,7 +13,10 @@ use anyhow::Result;
 use deno_core::JsRuntime;
 
 use super::OpMetricsSummary;
+use futures_util::FutureExt;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Once};
 use std::thread;
 use std::time::Duration;
@@ -36,6 +39,22 @@ fn init_v8_platform() {
         JsRuntime::init_platform(None);
         tracing::debug!("V8 platform initialized");
     });
+}
+
+/// What a caught panic said, as text.
+///
+/// A panic payload is `&str` for `panic!("literal")` and `String` once
+/// anything is formatted into it; anything else is a payload this code never
+/// produces. Without this, a log line about a dead isolate would carry the
+/// word "Any" and nothing else.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "a panic payload that is neither a string nor a &str".to_string()
 }
 
 /// Runtime message type
@@ -111,7 +130,7 @@ pub enum RuntimeMessage {
         app_id: String,
         ws_id: String,
         /// Channel for JavaScript to send messages to the client
-        js_to_client_tx: mpsc::UnboundedSender<super::WsServerMessage>,
+        js_to_client_tx: super::WsClientSink,
         response: oneshot::Sender<Result<()>>,
     },
     /// Send WebSocket message (from Gateway to JavaScript)
@@ -132,18 +151,49 @@ pub enum RuntimeMessage {
         app_id: String,
         response: oneshot::Sender<Result<OpMetricsSummary>>,
     },
-    /// Connect debugger
-    ConnectInspector {
+    /// Attach a debugger to an app's isolate and send what V8 says back down
+    /// `to_debugger`.
+    AttachInspector {
         app_id: String,
-        response: oneshot::Sender<
-            Result<(
-                mpsc::UnboundedSender<String>,
-                mpsc::UnboundedReceiver<String>,
-            )>,
-        >,
+        to_debugger: mpsc::UnboundedSender<String>,
+        response: oneshot::Sender<Result<()>>,
     },
+    /// One protocol message from an attached debugger.
+    ///
+    /// It arrives as a message on this queue, rather than being pumped by a
+    /// task beside the isolate, because the session may only be touched on the
+    /// thread that owns the isolate -- and because a debugger must not be able
+    /// to reach into an isolate while that isolate is halfway through serving
+    /// somebody's request. Queued here, it is handled between invocations like
+    /// everything else.
+    InspectorMessage { app_id: String, message: String },
+    /// The debugger went away; drop its session while its isolate is still
+    /// alive.
+    DetachInspector { app_id: String },
+    /// Panic this thread, to prove that one panic does not take an
+    /// application off the node for good. Nothing outside the tests can send
+    /// it.
+    #[cfg(test)]
+    PanicForTest { app_id: String },
     /// Close thread
     Shutdown,
+}
+
+/// A runtime thread reporting that the isolate it was hosting is gone.
+///
+/// Sent when handling a message panicked. The thread itself survives -- see
+/// [`RuntimeThread::run_event_loop`] -- but the application it was hosting no
+/// longer has an isolate anywhere on this node, and the pool has to stop
+/// saying that it does. Until it does, the control plane is told the
+/// assignment is satisfied and never reinstalls it.
+struct ThreadFault {
+    thread_id: usize,
+    /// The tenant whose isolate was dropped. A thread that panicked while
+    /// hosting nothing has nothing to report: no placement is wrong.
+    app_id: String,
+    /// What the panic said, for the log line the pool writes when it acts on
+    /// this.
+    panic: String,
 }
 
 /// The one application a runtime thread hosts.
@@ -184,7 +234,7 @@ struct RuntimeThread {
 
 impl RuntimeThread {
     /// Create new runtime thread
-    fn new(thread_id: usize) -> Self {
+    fn new(thread_id: usize, faults: mpsc::UnboundedSender<ThreadFault>) -> Self {
         // Set channel capacity to 100, exceeding will trigger backpressure (reject requests)
         let (tx, rx) = mpsc::channel(100);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -197,7 +247,7 @@ impl RuntimeThread {
                 .expect("Failed to create tokio runtime");
 
             rt.block_on(async move {
-                Self::run_event_loop(thread_id, rx, ready_tx).await;
+                Self::run_event_loop(thread_id, rx, ready_tx, faults).await;
             });
         });
 
@@ -216,6 +266,7 @@ impl RuntimeThread {
         thread_id: usize,
         mut rx: mpsc::Receiver<RuntimeMessage>,
         ready_tx: std::sync::mpsc::Sender<()>,
+        faults: mpsc::UnboundedSender<ThreadFault>,
     ) {
         tracing::info!("Runtime thread {} started", thread_id);
 
@@ -249,273 +300,76 @@ impl RuntimeThread {
             let Some(msg) = msg else {
                 break;
             };
-            match msg {
-                RuntimeMessage::LoadApp {
-                    app_id,
-                    code,
-                    app_repo,
-                    spec,
-                    wiring,
-                    router,
-                    response,
-                } => {
-                    tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
-                    // Drop whatever this thread hosted before building the new
-                    // isolate. Two live isolates on one thread break each other
-                    // (see `HostedApp`), and the previous one must be dropped
-                    // here, on the thread that created it.
-                    if let Some(previous) = hosted.take() {
-                        tracing::warn!(
+            // One panic on a runtime thread used to end it. The thread is
+            // this application's only isolate on this node, so every later
+            // request, queue batch and cron tick for it answered "Runtime
+            // thread has stopped" -- for good, because nothing revived it and
+            // the node went on reporting the application as running.
+            //
+            // So the panic is caught here instead, at the boundary of one
+            // message. What is thrown away is the isolate, not the thread: a
+            // panic can unwind from anywhere, including through V8, and an
+            // isolate that was halfway through something when it happened is
+            // not one to keep serving from. Dropping it here is also the only
+            // place it *may* be dropped -- an isolate belongs to the thread
+            // that built it -- and it leaves the thread idle and ready for the
+            // next application to load onto it, rather than leaking a thread
+            // slot that nothing can ever use again.
+            //
+            // The request that panicked is lost: its reply channel was moved
+            // into the message and went with the unwind, so its caller sees
+            // the thread having dropped the call. That is one failed request
+            // against an application that stays on the air.
+            let handled = AssertUnwindSafe(Self::handle_message(thread_id, &mut hosted, msg))
+                .catch_unwind()
+                .await;
+            match handled {
+                Ok(ControlFlow::Continue(())) => {}
+                Ok(ControlFlow::Break(())) => break,
+                Err(panic) => {
+                    let panic = panic_message(panic.as_ref());
+                    // Taken before the log line so the isolate is dropped
+                    // whether or not anything was hosted, and so the fault
+                    // names the application that lost it.
+                    match hosted.take() {
+                        Some(lost) => {
+                            tracing::error!(
+                                thread_id,
+                                app_id = %lost.app_id,
+                                panic = %panic,
+                                "Runtime thread {} panicked while serving {}: {}. Its isolate is \
+                                 being dropped and the application has nothing running on this \
+                                 node until it is loaded again; the thread itself stays and is \
+                                 free for the next application",
+                                thread_id,
+                                lost.app_id,
+                                panic
+                            );
+                            let app_id = lost.app_id.clone();
+                            // Here, explicitly, and before the fault is sent:
+                            // the isolate may only be dropped on the thread
+                            // that built it, and the pool must not be told the
+                            // thread is free while it still holds one.
+                            drop(lost);
+                            // Tells the pool to stop claiming this
+                            // application is placed here. Without it the
+                            // control plane keeps being told the assignment
+                            // is satisfied and never reinstalls it.
+                            let _ = faults.send(ThreadFault {
+                                thread_id,
+                                app_id,
+                                panic,
+                            });
+                        }
+                        None => tracing::error!(
                             thread_id,
-                            previous = %previous.app_id,
-                            app_id = %app_id,
-                            "Runtime thread {} was still hosting {} when {} was assigned to it; \
-                             the previous isolate is being dropped, so that application stops \
-                             serving on this node until it is loaded again",
+                            panic = %panic,
+                            "Runtime thread {} panicked with no application loaded on it: {}. \
+                             The thread stays and is free for the next application",
                             thread_id,
-                            previous.app_id,
-                            app_id
-                        );
+                            panic
+                        ),
                     }
-                    let result = match AppRuntime::new(
-                        app_id.clone(),
-                        code,
-                        app_repo,
-                        *spec,
-                        &wiring,
-                        router,
-                    ) {
-                        Ok(mut runtime) => match runtime.init_module().await {
-                            Ok(()) => {
-                                hosted = Some(HostedApp {
-                                    app_id: app_id.clone(),
-                                    runtime,
-                                });
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(e),
-                    };
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::UnloadApp { app_id, response } => {
-                    tracing::debug!("Thread {}: Unloading app {}", thread_id, app_id);
-                    let result = if hosted.as_ref().is_some_and(|h| h.app_id == app_id) {
-                        // Dropped here rather than handed back to the caller:
-                        // an isolate must be dropped on the thread that
-                        // created it.
-                        hosted = None;
-                        Ok(())
-                    } else {
-                        Err(anyhow::anyhow!("App not found"))
-                    };
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::ExecuteRequest {
-                    app_id,
-                    url,
-                    method,
-                    headers,
-                    body,
-                    response,
-                } => {
-                    tracing::debug!("Thread {}: Executing request for app {}", thread_id, app_id);
-                    match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => {
-                            if let Err(e) = runtime
-                                .execute_fetch(url, method, headers, body, response)
-                                .await
-                            {
-                                tracing::error!("Error executing fetch: {}", e);
-                            }
-                        }
-                        None => {
-                            let _ = response.send(Err(anyhow::anyhow!("App not found")));
-                        }
-                    };
-                }
-
-                RuntimeMessage::ExecuteServiceCall {
-                    app_id,
-                    call,
-                    response,
-                } => {
-                    tracing::debug!(
-                        thread_id,
-                        app_id = %app_id,
-                        binding = %call.binding,
-                        caller = %call.caller_tenant(),
-                        "Thread {}: {} is calling {} through binding {}",
-                        thread_id,
-                        call.caller_tenant(),
-                        app_id,
-                        call.binding
-                    );
-                    match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => {
-                            if let Err(e) = runtime.execute_service_call(*call, response).await {
-                                tracing::error!(
-                                    app_id = %app_id,
-                                    error = %e,
-                                    "A service call into {} could not be run",
-                                    app_id
-                                );
-                            }
-                        }
-                        None => {
-                            // The thread was reassigned between the placement
-                            // read and this message being taken. The caller
-                            // gets the same answer as if the callee had never
-                            // been here, which is what it now is.
-                            let _ = response.send(Err(anyhow::anyhow!(
-                                "{app_id} is no longer loaded on this node"
-                            )));
-                        }
-                    }
-                }
-
-                RuntimeMessage::ExecuteQueueBatch {
-                    app_id,
-                    queue,
-                    messages,
-                    response,
-                } => {
-                    tracing::debug!(
-                        "Thread {}: Handling {} queue message(s) for app {} from queue {}",
-                        thread_id,
-                        messages.len(),
-                        app_id,
-                        queue
-                    );
-                    let result = match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => runtime.execute_queue_batch(queue, messages).await,
-                        None => Err(anyhow::anyhow!(
-                            "App {app_id} is not loaded on this node; its queue batch was not \
-                             handled and goes back to deis-queue"
-                        )),
-                    };
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::ExecuteScheduled {
-                    app_id,
-                    cron,
-                    scheduled_time_ms,
-                    response,
-                } => {
-                    tracing::debug!(
-                        "Thread {}: Running the scheduled handler of app {} for {}",
-                        thread_id,
-                        app_id,
-                        cron
-                    );
-                    let result = match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => runtime.execute_scheduled(cron, scheduled_time_ms).await,
-                        None => Err(anyhow::anyhow!(
-                            "App {app_id} is not loaded on this node, so its scheduled run did                              not happen here; the control plane should try another node"
-                        )),
-                    };
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::ListApps { response } => {
-                    let apps: Vec<String> = hosted.iter().map(|h| h.app_id.clone()).collect();
-                    let _ = response.send(apps);
-                }
-
-                RuntimeMessage::RegisterWsConnection {
-                    app_id,
-                    ws_id,
-                    js_to_client_tx,
-                    response,
-                } => {
-                    tracing::debug!(
-                        "Thread {}: Registering WebSocket {} for app {}",
-                        thread_id,
-                        ws_id,
-                        app_id
-                    );
-
-                    let result = match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => {
-                            // Register sender to WsServerManager, so JavaScript can send messages to the client
-                            runtime
-                                .register_ws_connection(ws_id.clone(), js_to_client_tx)
-                                .await
-                        }
-                        None => Err(anyhow::anyhow!("App not found")),
-                    };
-
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::SendWsMessage {
-                    app_id,
-                    ws_id,
-                    message,
-                    response,
-                } => {
-                    tracing::debug!(
-                        "Thread {}: Sending WebSocket message to {} for app {}",
-                        thread_id,
-                        ws_id,
-                        app_id
-                    );
-
-                    let result = match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => runtime.dispatch_ws_message(ws_id, message).await,
-                        None => Err(anyhow::anyhow!("App not found")),
-                    };
-
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::UnregisterWsConnection {
-                    app_id,
-                    ws_id,
-                    response,
-                } => {
-                    tracing::debug!(
-                        "Thread {}: Unregistering WebSocket {} for app {}",
-                        thread_id,
-                        ws_id,
-                        app_id
-                    );
-
-                    let result = match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => {
-                            runtime
-                                .close_ws_connection(ws_id, 1000, "Gateway closed".to_string())
-                                .await
-                        }
-                        None => Err(anyhow::anyhow!("App not found")),
-                    };
-
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::GetOpMetrics { app_id, response } => {
-                    let result = match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => Ok(runtime.op_metrics_summary()),
-                        None => Err(anyhow::anyhow!("App not found")),
-                    };
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::ConnectInspector { app_id, response } => {
-                    let result = match hosted_mut(&mut hosted, &app_id) {
-                        Some(runtime) => runtime.connect_inspector(),
-                        None => Err(anyhow::anyhow!("App not found")),
-                    };
-                    let _ = response.send(result);
-                }
-
-                RuntimeMessage::Shutdown => {
-                    tracing::info!("Runtime thread {} shutting down", thread_id);
-                    break;
                 }
             }
         }
@@ -531,6 +385,317 @@ impl RuntimeThread {
         }
 
         tracing::info!("Runtime thread {} stopped", thread_id);
+    }
+
+    /// Handle one message, and say whether the thread should carry on.
+    ///
+    /// A function of its own, and not the body of the loop, so that the loop
+    /// can catch a panic in it: catching one needs a future to wrap, and
+    /// wrapping the whole loop would mean losing the thread anyway. Everything
+    /// it touches is reachable from `hosted`, so a panic leaves nothing behind
+    /// that the loop cannot drop.
+    async fn handle_message(
+        thread_id: usize,
+        hosted: &mut Option<HostedApp>,
+        msg: RuntimeMessage,
+    ) -> ControlFlow<()> {
+        match msg {
+            RuntimeMessage::LoadApp {
+                app_id,
+                code,
+                app_repo,
+                spec,
+                wiring,
+                router,
+                response,
+            } => {
+                tracing::debug!("Thread {}: Loading app {}", thread_id, app_id);
+                // Drop whatever this thread hosted before building the new
+                // isolate. Two live isolates on one thread break each other
+                // (see `HostedApp`), and the previous one must be dropped
+                // here, on the thread that created it.
+                if let Some(previous) = hosted.take() {
+                    tracing::warn!(
+                        thread_id,
+                        previous = %previous.app_id,
+                        app_id = %app_id,
+                        "Runtime thread {} was still hosting {} when {} was assigned to it; \
+                         the previous isolate is being dropped, so that application stops \
+                         serving on this node until it is loaded again",
+                        thread_id,
+                        previous.app_id,
+                        app_id
+                    );
+                }
+                let result =
+                    match AppRuntime::new(app_id.clone(), code, app_repo, *spec, &wiring, router) {
+                        Ok(mut runtime) => match runtime.init_module().await {
+                            Ok(()) => {
+                                *hosted = Some(HostedApp {
+                                    app_id: app_id.clone(),
+                                    runtime,
+                                });
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    };
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::UnloadApp { app_id, response } => {
+                tracing::debug!("Thread {}: Unloading app {}", thread_id, app_id);
+                let result = if hosted.as_ref().is_some_and(|h| h.app_id == app_id) {
+                    // Dropped here rather than handed back to the caller:
+                    // an isolate must be dropped on the thread that
+                    // created it.
+                    *hosted = None;
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("App not found"))
+                };
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::ExecuteRequest {
+                app_id,
+                url,
+                method,
+                headers,
+                body,
+                response,
+            } => {
+                tracing::debug!("Thread {}: Executing request for app {}", thread_id, app_id);
+                match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => {
+                        if let Err(e) = runtime
+                            .execute_fetch(url, method, headers, body, response)
+                            .await
+                        {
+                            tracing::error!("Error executing fetch: {}", e);
+                        }
+                    }
+                    None => {
+                        let _ = response.send(Err(anyhow::anyhow!("App not found")));
+                    }
+                };
+            }
+
+            RuntimeMessage::ExecuteServiceCall {
+                app_id,
+                call,
+                response,
+            } => {
+                tracing::debug!(
+                    thread_id,
+                    app_id = %app_id,
+                    binding = %call.binding,
+                    caller = %call.caller_tenant(),
+                    "Thread {}: {} is calling {} through binding {}",
+                    thread_id,
+                    call.caller_tenant(),
+                    app_id,
+                    call.binding
+                );
+                match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => {
+                        if let Err(e) = runtime.execute_service_call(*call, response).await {
+                            tracing::error!(
+                                app_id = %app_id,
+                                error = %e,
+                                "A service call into {} could not be run",
+                                app_id
+                            );
+                        }
+                    }
+                    None => {
+                        // The thread was reassigned between the placement
+                        // read and this message being taken. The caller
+                        // gets the same answer as if the callee had never
+                        // been here, which is what it now is.
+                        let _ = response.send(Err(anyhow::anyhow!(
+                            "{app_id} is no longer loaded on this node"
+                        )));
+                    }
+                }
+            }
+
+            RuntimeMessage::ExecuteQueueBatch {
+                app_id,
+                queue,
+                messages,
+                response,
+            } => {
+                tracing::debug!(
+                    "Thread {}: Handling {} queue message(s) for app {} from queue {}",
+                    thread_id,
+                    messages.len(),
+                    app_id,
+                    queue
+                );
+                let result = match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => runtime.execute_queue_batch(queue, messages).await,
+                    None => Err(anyhow::anyhow!(
+                        "App {app_id} is not loaded on this node; its queue batch was not \
+                         handled and goes back to deis-queue"
+                    )),
+                };
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::ExecuteScheduled {
+                app_id,
+                cron,
+                scheduled_time_ms,
+                response,
+            } => {
+                tracing::debug!(
+                    "Thread {}: Running the scheduled handler of app {} for {}",
+                    thread_id,
+                    app_id,
+                    cron
+                );
+                let result = match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => runtime.execute_scheduled(cron, scheduled_time_ms).await,
+                    None => Err(anyhow::anyhow!(
+                        "App {app_id} is not loaded on this node, so its scheduled run did                              not happen here; the control plane should try another node"
+                    )),
+                };
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::ListApps { response } => {
+                let apps: Vec<String> = hosted.iter().map(|h| h.app_id.clone()).collect();
+                let _ = response.send(apps);
+            }
+
+            RuntimeMessage::RegisterWsConnection {
+                app_id,
+                ws_id,
+                js_to_client_tx,
+                response,
+            } => {
+                tracing::debug!(
+                    "Thread {}: Registering WebSocket {} for app {}",
+                    thread_id,
+                    ws_id,
+                    app_id
+                );
+
+                let result = match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => {
+                        // Register sender to WsServerManager, so JavaScript can send messages to the client
+                        runtime
+                            .register_ws_connection(ws_id.clone(), js_to_client_tx)
+                            .await
+                    }
+                    None => Err(anyhow::anyhow!("App not found")),
+                };
+
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::SendWsMessage {
+                app_id,
+                ws_id,
+                message,
+                response,
+            } => {
+                tracing::debug!(
+                    "Thread {}: Sending WebSocket message to {} for app {}",
+                    thread_id,
+                    ws_id,
+                    app_id
+                );
+
+                let result = match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => runtime.dispatch_ws_message(ws_id, message).await,
+                    None => Err(anyhow::anyhow!("App not found")),
+                };
+
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::UnregisterWsConnection {
+                app_id,
+                ws_id,
+                response,
+            } => {
+                tracing::debug!(
+                    "Thread {}: Unregistering WebSocket {} for app {}",
+                    thread_id,
+                    ws_id,
+                    app_id
+                );
+
+                let result = match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => {
+                        runtime
+                            .close_ws_connection(ws_id, 1000, "Gateway closed".to_string())
+                            .await
+                    }
+                    None => Err(anyhow::anyhow!("App not found")),
+                };
+
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::GetOpMetrics { app_id, response } => {
+                let result = match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => Ok(runtime.op_metrics_summary()),
+                    None => Err(anyhow::anyhow!("App not found")),
+                };
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::AttachInspector {
+                app_id,
+                to_debugger,
+                response,
+            } => {
+                let result = match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => runtime.attach_inspector(to_debugger),
+                    None => Err(anyhow::anyhow!("App not found")),
+                };
+                let _ = response.send(result);
+            }
+
+            RuntimeMessage::InspectorMessage { app_id, message } => {
+                match hosted_mut(hosted, &app_id) {
+                    Some(runtime) => runtime.dispatch_inspector_message(message),
+                    // The isolate was replaced or unloaded between the
+                    // debugger writing this and the thread reaching it. There
+                    // is nobody to answer, and the session goes away with the
+                    // isolate.
+                    None => tracing::debug!(
+                        thread_id,
+                        app_id = %app_id,
+                        "Thread {}: dropping a debugger message for {}, which is not hosted \
+                         here any more",
+                        thread_id,
+                        app_id
+                    ),
+                }
+            }
+
+            RuntimeMessage::DetachInspector { app_id } => {
+                if let Some(runtime) = hosted_mut(hosted, &app_id) {
+                    runtime.detach_inspector();
+                }
+            }
+
+            #[cfg(test)]
+            RuntimeMessage::PanicForTest { app_id } => {
+                panic!("deliberate test panic on thread {thread_id} while hosting {app_id}");
+            }
+
+            RuntimeMessage::Shutdown => {
+                tracing::info!("Runtime thread {} shutting down", thread_id);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     /// Send message
@@ -595,6 +760,19 @@ pub struct RuntimePool {
     /// stops being callable at its own next deployment, with nothing to
     /// redeliver to whoever named it.
     serving: RwLock<HashMap<String, ServingVersion>>,
+    /// Handed to every runtime thread so it can report that it lost its
+    /// isolate to a panic. Kept here as well because threads are started after
+    /// the pool is, when more applications are loaded than there are threads.
+    faults_tx: mpsc::UnboundedSender<ThreadFault>,
+    /// The other end of it, drained by [`Self::apply_thread_faults`].
+    ///
+    /// Read where the pool is about to act on its placement rather than by a
+    /// task of its own: a background task would have to be spawned, which ties
+    /// building a pool to being inside a tokio runtime, and it would make
+    /// "when does the node notice" depend on a scheduler rather than on the
+    /// next thing that asks. A `std` mutex and not a `tokio` one because it is
+    /// only ever held for a `try_recv` and never across an await.
+    faults: std::sync::Mutex<mpsc::UnboundedReceiver<ThreadFault>>,
     /// A handle back to this pool, for the isolates it hosts.
     ///
     /// A service call is dispatched by an op running inside one isolate into
@@ -719,8 +897,16 @@ impl RuntimePool {
             num_threads
         );
 
+        // Unbounded, and read without ever blocking a thread that writes to
+        // it: a runtime thread reports a fault from inside its own panic
+        // handling, where it has nowhere to wait, and there are at most as
+        // many unread faults as there are threads.
+        let (faults_tx, faults_rx) = mpsc::unbounded_channel();
+
         Arc::new_cyclic(|self_ref| {
-            let threads = (0..num_threads).map(RuntimeThread::new).collect();
+            let threads = (0..num_threads)
+                .map(|id| RuntimeThread::new(id, faults_tx.clone()))
+                .collect();
             Self {
                 placement: RwLock::new(Placement {
                     threads,
@@ -731,6 +917,8 @@ impl RuntimePool {
                 app_repo,
                 consumers: Mutex::new(HashMap::new()),
                 serving: RwLock::new(HashMap::new()),
+                faults_tx,
+                faults: std::sync::Mutex::new(faults_rx),
                 self_ref: self_ref.clone(),
             }
         })
@@ -814,6 +1002,12 @@ impl RuntimePool {
         tenant: &str,
         replacing: bool,
     ) -> Result<(usize, mpsc::Sender<RuntimeMessage>)> {
+        // Before the lock: a thread that lost its isolate to a panic still
+        // looks occupied until its fault is applied, so without this a load
+        // would start a new thread beside a perfectly idle one -- and a
+        // reinstall of the application that panicked would be refused with
+        // "App already exists".
+        self.apply_thread_faults().await;
         let mut placement = self.placement.write().await;
         if !replacing && placement.of_app.contains_key(tenant) {
             return Err(anyhow::anyhow!("App already exists"));
@@ -834,7 +1028,9 @@ impl RuntimePool {
                 // a thread outside the lock - is what lets two loads pick the
                 // same one.
                 let id = placement.threads.len();
-                placement.threads.push(RuntimeThread::new(id));
+                placement
+                    .threads
+                    .push(RuntimeThread::new(id, self.faults_tx.clone()));
                 tracing::info!(
                     thread_id = id,
                     app_id = tenant,
@@ -933,6 +1129,11 @@ impl RuntimePool {
     ) -> Result<FetchResult, super::service_call::ServiceCallError> {
         use super::service_call::ServiceCallError;
 
+        // So that a callee whose isolate was lost to a panic answers "not
+        // deployed here", which is what it now is, rather than the caller
+        // waiting on a thread that will never answer.
+        self.apply_thread_faults().await;
+
         let binding = call.binding.clone();
         let caller_app = call.caller_app().to_string();
 
@@ -1017,8 +1218,96 @@ impl RuntimePool {
         }
     }
 
+    /// Act on every runtime thread that lost its isolate to a panic since the
+    /// last time anybody looked.
+    ///
+    /// A thread that panicked drops the isolate it was hosting and carries on
+    /// (see [`RuntimeThread::run_event_loop`]). What it cannot do is edit this
+    /// pool, so until this runs the pool still says the application is placed
+    /// on that thread -- and that claim is what the node answers with when the
+    /// control plane asks whether the assignment is satisfied. Left standing,
+    /// the application is never reinstalled and never serves again.
+    ///
+    /// Called wherever the pool is about to answer a question about placement
+    /// or act on it, so the answer is never older than the last panic.
+    async fn apply_thread_faults(&self) {
+        // Never blocks: if another caller is already draining, that caller
+        // handles these faults, and this one is not made to wait on the
+        // request path for something that is being done anyway.
+        let faults: Vec<ThreadFault> = {
+            let Ok(mut receiver) = self.faults.try_lock() else {
+                return;
+            };
+            let mut faults = Vec::new();
+            while let Ok(fault) = receiver.try_recv() {
+                faults.push(fault);
+            }
+            faults
+        };
+
+        for ThreadFault {
+            thread_id,
+            app_id,
+            panic,
+        } in faults
+        {
+            // Only if it is still placed *there*. A version change that moved
+            // the application to another thread between the panic and now has
+            // already given it a live isolate, and forgetting it here would
+            // take a working application off the node.
+            let placed_here = self
+                .placement
+                .read()
+                .await
+                .of_app
+                .get(&app_id)
+                .is_some_and(|id| *id == thread_id);
+            if !placed_here {
+                tracing::info!(
+                    thread_id,
+                    app_id = %app_id,
+                    panic = %panic,
+                    "Runtime thread {} panicked while hosting {}, which has since moved to \
+                     another thread; nothing to forget",
+                    thread_id,
+                    app_id
+                );
+                continue;
+            }
+
+            tracing::error!(
+                thread_id,
+                app_id = %app_id,
+                panic = %panic,
+                "Forgetting the placement of {}: the isolate it was serving from on thread {} \
+                 was lost to a panic ({}). This node now answers requests for it with \
+                 \"App not found\" instead of a stopped thread, and reports it as not running, \
+                 so the control plane reinstalls it on the next reconcile",
+                app_id,
+                thread_id,
+                panic
+            );
+
+            // Before the placement goes, so no batch is leased for an
+            // application that has no isolate to hand it to.
+            self.stop_consumers(&app_id).await;
+            self.release(&app_id).await;
+        }
+    }
+
+    /// Whether an application has an isolate on this node right now.
+    ///
+    /// The honest answer to "is it running here", as opposed to "was it
+    /// installed here": a version record survives its isolate, and the two
+    /// disagree exactly when something went wrong.
+    pub async fn is_hosted(&self, app_id: &str) -> bool {
+        self.apply_thread_faults().await;
+        self.placement.read().await.of_app.contains_key(app_id)
+    }
+
     /// Post a message to the thread hosting `app_id`.
     async fn dispatch(&self, app_id: &str, message: RuntimeMessage) -> Result<()> {
+        self.apply_thread_faults().await;
         let placement = self.placement.read().await;
         let id = *placement
             .of_app
@@ -1474,6 +1763,7 @@ impl RuntimePool {
 
     /// Get statistics
     pub async fn get_stats(&self) -> HashMap<String, usize> {
+        self.apply_thread_faults().await;
         let placement = self.placement.read().await;
 
         let mut thread_apps: HashMap<String, usize> = HashMap::new();
@@ -1507,7 +1797,7 @@ impl RuntimePool {
         &self,
         app_id: &str,
         ws_id: String,
-        js_to_client_tx: mpsc::UnboundedSender<super::WsServerMessage>,
+        js_to_client_tx: super::WsClientSink,
     ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.dispatch(
@@ -1652,7 +1942,22 @@ impl RuntimePool {
             .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
     }
 
-    /// Connect debugger
+    /// Attach a debugger to an application's isolate.
+    ///
+    /// Answers the two ends of one CDP session: write the debugger's messages
+    /// into the sender, read V8's out of the receiver. Dropping the sender is
+    /// how a session ends -- the isolate is told to drop its half, which it
+    /// must do while it is still alive.
+    ///
+    /// The debugger's messages are relayed by a task here rather than being
+    /// pumped beside the isolate, because the session may only be touched on
+    /// the thread that owns the isolate, and that thread's only inbox is its
+    /// message queue. Relaying them onto that queue also means a debugger
+    /// cannot reach into an isolate that is halfway through serving a request:
+    /// its messages are handled between invocations, like every other message.
+    ///
+    /// See [`super::isolate::AppRuntime::attach_inspector`] for who is allowed
+    /// to do this and why that is the line.
     pub async fn connect_inspector(
         &self,
         app_id: &str,
@@ -1660,18 +1965,63 @@ impl RuntimePool {
         mpsc::UnboundedSender<String>,
         mpsc::UnboundedReceiver<String>,
     )> {
+        let (to_debugger, from_v8) = mpsc::unbounded_channel();
+        let (to_v8, mut from_debugger) = mpsc::unbounded_channel::<String>();
+
         let (tx, rx) = oneshot::channel();
         self.dispatch(
             app_id,
-            RuntimeMessage::ConnectInspector {
+            RuntimeMessage::AttachInspector {
                 app_id: app_id.to_string(),
+                to_debugger,
                 response: tx,
             },
         )
         .await?;
-
         rx.await
-            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))??;
+
+        // Taken once, here: the relay must keep posting to the thread the
+        // session was created on. If the application moves to another thread,
+        // this sender starts failing and the relay stops, which is right --
+        // the session belongs to an isolate that no longer exists.
+        let sender = {
+            let placement = self.placement.read().await;
+            match placement.of_app.get(app_id) {
+                Some(id) => placement.threads[*id].sender.clone(),
+                None => return Err(anyhow::anyhow!("App not found")),
+            }
+        };
+
+        let tenant = app_id.to_string();
+        tokio::spawn(async move {
+            while let Some(message) = from_debugger.recv().await {
+                if sender
+                    .send(RuntimeMessage::InspectorMessage {
+                        app_id: tenant.clone(),
+                        message,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::info!(
+                        app_id = %tenant,
+                        "The runtime thread of {} stopped taking debugger messages; the session \
+                         ends here",
+                        tenant
+                    );
+                    return;
+                }
+            }
+            // The debugger's end went away. The isolate has to be told, and on
+            // its own thread: the session it holds owns V8 objects that must
+            // be torn down before the isolate is.
+            let _ = sender
+                .send(RuntimeMessage::DetachInspector { app_id: tenant })
+                .await;
+        });
+
+        Ok((to_v8, from_v8))
     }
 }
 
@@ -2715,5 +3065,227 @@ mod tests {
         // Verify application deleted
         let apps = pool.list_apps().await;
         assert!(!apps.contains(&"unload_test_app".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_debugger_attaches_to_a_running_isolate_and_it_keeps_serving() {
+        // The whole feature, end to end. It had never run: the isolate was
+        // built with no inspector, so the one call this path makes was an
+        // `unwrap()` on `None` inside deno_core -- it panicked on the runtime
+        // thread, and that thread was the application's only isolate on this
+        // node.
+        let pool = pool();
+
+        let code = r#"export default function handler() { return new Response("serving"); }"#;
+        let app = "inspected_app.production";
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("load");
+
+        let (to_v8, mut from_v8) = pool
+            .connect_inspector(app)
+            .await
+            .expect("a debugger can attach");
+
+        to_v8
+            .send(
+                r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"6*7","returnByValue":true}}"#
+                    .to_string(),
+            )
+            .expect("the session takes the message");
+
+        // Read until the answer to this call arrives: a session may send
+        // notifications of its own, and which of them appear is V8's business,
+        // not this test's.
+        let reply = loop {
+            let message = tokio::time::timeout(Duration::from_secs(10), from_v8.recv())
+                .await
+                .expect("V8 answers the debugger")
+                .expect("the session is still open");
+            if message.contains("\"id\":1") {
+                break message;
+            }
+        };
+        assert!(
+            reply.contains("\"value\":42"),
+            "the debugger must be talking to the real isolate: {reply}"
+        );
+
+        // And the application it is attached to is still an application.
+        let (status, _, body) = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("the application still serves while a debugger is attached");
+        assert_eq!(status, 200);
+        assert_eq!(body.into_bytes().as_deref(), Some(&b"serving"[..]));
+
+        // Dropping the debugger's end is what ends a session; the isolate is
+        // told, and must still be alive to be told.
+        drop(to_v8);
+        let (status, _, _) = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("the application still serves after the debugger leaves");
+        assert_eq!(status, 200);
+
+        let _ = pool.unload_app(app).await;
+    }
+
+    #[tokio::test]
+    async fn a_panic_on_a_runtime_thread_does_not_take_the_application_off_the_node() {
+        // What used to happen: the thread unwound and was gone, its channel
+        // closed, and every later request, queue batch and cron tick for that
+        // application answered "Runtime thread has stopped" -- indefinitely,
+        // because the node went on reporting the application as running and so
+        // nothing reinstalled it.
+        let pool = pool();
+
+        let code = r#"export default function handler() { return new Response("alive"); }"#;
+        let app = "panicked_thread.production";
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("load");
+        let (status, _, _) = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("it serves before the panic");
+        assert_eq!(status, 200);
+
+        pool.dispatch(
+            app,
+            RuntimeMessage::PanicForTest {
+                app_id: app.to_string(),
+            },
+        )
+        .await
+        .expect("the thread takes the message");
+
+        // No polling and no waiting: a runtime thread runs its messages in
+        // order, so by the time this one is answered the panic before it has
+        // been caught and reported.
+        let error = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect_err("the isolate that panicked is gone");
+        assert!(
+            error.to_string().contains("App not found"),
+            "a lost isolate must read as an application that is not here, not as a stopped \
+             thread: {error}"
+        );
+
+        // The node no longer claims to be running it, which is what makes the
+        // control plane reinstall it instead of leaving it dead.
+        assert!(!pool.is_hosted(app).await);
+
+        // And the thread came back into circulation: loading the application
+        // again works, and it serves.
+        pool.load_app(app.to_string(), code.to_string(), IsolateSpec::default())
+            .await
+            .expect("the application can be loaded again after its thread panicked");
+        let (status, _, body) = pool
+            .execute_request(
+                app,
+                "http://localhost/".to_string(),
+                "GET".to_string(),
+                HashMap::new(),
+                None,
+            )
+            .await
+            .expect("it serves again");
+        assert_eq!(status, 200);
+        assert_eq!(body.into_bytes().as_deref(), Some(&b"alive"[..]));
+
+        let _ = pool.unload_app(app).await;
+    }
+
+    #[tokio::test]
+    async fn a_caller_cannot_dress_a_service_call_in_the_platform_s_own_headers() {
+        // `x-deis-caller` was written over the caller's value and the rest of
+        // the namespace was not, so a caller could hand its callee
+        // `x-deis-tenant` and `x-deis-storage-token` -- the pair that names
+        // and authorises a storage tenant one hop further in -- and they
+        // arrived looking exactly like something this node had stamped.
+        let pool = pool();
+
+        let mirror = r#"
+            export default function handler(context) {
+                const seen = [];
+                for (const [name, value] of context.request.headers.entries()) {
+                    const lower = name.toLowerCase();
+                    if (lower.startsWith("x-deis-") || lower.startsWith("x-shop-")) {
+                        seen.push(lower + "=" + value);
+                    }
+                }
+                seen.sort();
+                return new Response(seen.join("\n"), { status: 200 });
+            }
+        "#;
+        let forger = r#"
+            export default async function handler(context) {
+                const answer = await context.bindings.AUTH.fetch("/probe", {
+                    headers: {
+                        "x-deis-caller": "admin-app.production",
+                        "x-deis-tenant": "victim.production",
+                        "x-deis-storage-token": "forged",
+                        "x-deis-not-invented-yet": "whatever",
+                        "X-Deis-Caller-Mixed-Case": "second-try",
+                        "x-shop-request-id": "abc123",
+                    },
+                });
+                return new Response(await answer.text(), { status: answer.status });
+            }
+        "#;
+
+        load_with_wiring(
+            &pool,
+            "hdr-callee.production",
+            mirror,
+            service_wiring(&[], &["hdr-caller"]),
+        )
+        .await
+        .expect("the callee loads");
+        load_with_wiring(
+            &pool,
+            "hdr-caller.production",
+            forger,
+            service_wiring(&[("AUTH", "hdr-callee")], &[]),
+        )
+        .await
+        .expect("the caller loads");
+
+        let (status, body) = call_through(&pool, "hdr-caller.production", "AUTH").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body, "x-deis-caller=hdr-caller.production\nx-shop-request-id=abc123",
+            "the only platform header a callee may see is the one this node wrote, and a \
+             header of the application's own must still cross"
+        );
+
+        let _ = pool.unload_app("hdr-caller.production").await;
+        let _ = pool.unload_app("hdr-callee.production").await;
     }
 }

@@ -578,11 +578,18 @@ pub async fn start_api_server(
     }
     let config = Arc::new(config);
     let tls_config = config.tls.clone();
-    let deis_runtime_manager = Arc::new(crate::runtime_client::RuntimeNodeManager::new_with_ttl(
-        config.deis_runtime_nodes.clone(),
-        config.deis_runtime_poll_interval,
-        config.node_registration_ttl_secs,
-    ));
+    let deis_runtime_manager = Arc::new(
+        crate::runtime_client::RuntimeNodeManager::new_with_ttl(
+            config.deis_runtime_nodes.clone(),
+            config.deis_runtime_poll_interval,
+            config.node_registration_ttl_secs,
+        )
+        // A node's management plane can unload an application, list every
+        // tenant on the node and replace one tenant's code, so it is served
+        // only to a caller that presents a node key. The same list the node
+        // endpoints already authenticate against.
+        .with_node_credential(config.node_call_credential()),
+    );
     // One stop signal for the server and the health poller, so the poller
     // stops probing at the same moment the listener stops accepting rather
     // than being cut off mid-probe by an abort.

@@ -62,7 +62,9 @@
 //! in the cache was served back as mojibake with nothing reporting an error.
 //! Buffers in and out, the way `blob_ops.rs` carries bytes.
 
+use super::ops::AppId;
 use deno_core::{extension, op2, JsBuffer, OpState, ToJsBuffer};
+use deno_error::JsErrorBox;
 use moka::future::Cache;
 use moka::Expiry;
 use serde::Serialize;
@@ -137,6 +139,19 @@ pub struct CacheScope {
     /// otherwise guessing at them.
     pub max_entries: u64,
     pub default_ttl_seconds: u64,
+    /// Bytes this store holds before the least useful are evicted.
+    ///
+    /// The ceiling that actually bounds what this cache costs the node: an
+    /// entry count says nothing about size, and a response body is whatever
+    /// the application put in it. Published for the same reason the entry
+    /// count is -- an application deciding what is worth caching is otherwise
+    /// guessing -- and it is derived from the isolate's own memory limit, so
+    /// an application that asked for more heap gets a larger cache with it.
+    pub max_bytes: u64,
+    /// The largest single response this store will accept. A `put` of
+    /// anything above it is refused rather than admitted, because admitting
+    /// it would evict most of the store to make room for one entry.
+    pub max_entry_bytes: u64,
 }
 
 /// The Cache API's store for one isolate: the entries plus the identity of
@@ -144,6 +159,28 @@ pub struct CacheScope {
 pub struct IsolateCache {
     entries: Cache<String, CacheEntry>,
     scope: CacheScope,
+}
+
+/// What one entry costs the store, in the units its ceiling is counted in.
+///
+/// The bytes it holds, plus a floor of one entry's share of the whole store.
+/// The floor is what keeps the entry ceiling meaningful once the ceiling is
+/// counted in bytes: without it, an application could hold millions of empty
+/// responses, and the cost of an entry is not only its body -- it is a key
+/// string, three allocations and moka's own bookkeeping, none of which the
+/// body's length describes. With it, a store of `max_bytes` can hold at most
+/// `max_entries` of anything, and at most `max_bytes` worth of bodies.
+///
+/// `u32` because that is what moka weighs in. Nothing this large can be
+/// stored anyway: a single entry is refused far below it (see
+/// [`CacheScope::max_entry_bytes`]), and a body arrives from an isolate whose
+/// whole heap is smaller than 4 GiB.
+fn entry_weight(key: &str, entry: &CacheEntry, min_weight: u32) -> u32 {
+    let held = key
+        .len()
+        .saturating_add(entry.meta.len())
+        .saturating_add(entry.body.len());
+    u32::try_from(held).unwrap_or(u32::MAX).max(min_weight)
 }
 
 impl IsolateCache {
@@ -167,6 +204,16 @@ impl IsolateCache {
     pub(crate) async fn len(&self) -> u64 {
         self.entries.run_pending_tasks().await;
         self.entries.entry_count()
+    }
+
+    /// What this store is holding, in the units its ceiling is counted in.
+    ///
+    /// Tests only, and it is the number the ceiling is about: entries say
+    /// nothing about what a store costs the node.
+    #[cfg(test)]
+    pub(crate) async fn held_bytes(&self) -> u64 {
+        self.entries.run_pending_tasks().await;
+        self.entries.weighted_size()
     }
 }
 
@@ -266,12 +313,19 @@ async fn op_cache_set(
     #[string] meta: String,
     #[buffer] body: JsBuffer,
     ttl_seconds: u32,
-) {
-    let cache = {
+) -> Result<(), JsErrorBox> {
+    let (cache, app_id) = {
         let state_borrow = state.borrow();
-        state_borrow.borrow::<CacheStore>().clone()
+        (
+            state_borrow.borrow::<CacheStore>().clone(),
+            state_borrow
+                .try_borrow::<AppId>()
+                .map(|id| id.0.clone())
+                .unwrap_or_default(),
+        )
     };
 
+    let composed = namespaced(&name, &key);
     let entry = CacheEntry {
         meta,
         body: body.to_vec(),
@@ -282,7 +336,36 @@ async fn op_cache_set(
         },
     };
 
-    cache.entries.insert(namespaced(&name, &key), entry).await;
+    // Refused, not admitted and then paid for by everything else in the
+    // store. Checked on the bytes this entry actually holds rather than on the
+    // weight, because the weight has a floor and would make a small entry
+    // read as large in the message the application is given.
+    let held = (composed.len() + entry.meta.len() + entry.body.len()) as u64;
+    let ceiling = cache.scope.max_entry_bytes;
+    if held > ceiling {
+        tracing::debug!(
+            target: "app",
+            app_id = %app_id,
+            cache = %name,
+            entry_bytes = held,
+            max_entry_bytes = ceiling,
+            "Refusing to cache a {} byte response for {}: one entry may hold at most {} bytes \
+             of this store's {} byte ceiling",
+            held,
+            app_id,
+            ceiling,
+            cache.scope.max_bytes
+        );
+        return Err(JsErrorBox::type_error(format!(
+            "cache.put: this entry is {held} bytes of body, headers and key, and one entry of \
+             this cache may hold at most {ceiling} bytes (the whole cache holds {}); it was not \
+             stored",
+            cache.scope.max_bytes
+        )));
+    }
+
+    cache.entries.insert(composed, entry).await;
+    Ok(())
 }
 
 /// Drop a cached response.
@@ -372,28 +455,64 @@ pub fn init_cache_extension() -> deno_core::Extension {
     deis_runtime_cache_ops::init()
 }
 
+/// How much of a store one entry may take before a `put` is refused rather
+/// than admitted.
+///
+/// A quarter. An entry above it could only be admitted by evicting at least
+/// three quarters of everything else, which is not caching -- it is one
+/// response taking the store away from all the others, once per `put`. The
+/// application is told instead, with both numbers in the message, because
+/// "your response is too big for this cache" is something it can act on and a
+/// silent mass eviction is not.
+const ENTRY_SHARE_OF_STORE: u64 = 4;
+
 /// Create a `CacheStore`.
 ///
 /// # Parameters
-/// - `max_capacity`: entries kept before the least useful are evicted.
+/// - `max_entries`: entries kept before the least useful are evicted.
+/// - `max_bytes`: bytes kept before the least useful are evicted. Both
+///   ceilings hold at once; see [`entry_weight`] for how one counter enforces
+///   the pair.
 /// - `default_ttl_secs`: how long an entry whose response named no `max-age`
 ///   stays fresh. Zero means such entries only ever leave by eviction or by
 ///   `delete()`.
+///
+/// # Why there is a byte ceiling at all
+///
+/// This store is Rust memory beside the isolate, not inside the V8 heap that
+/// `memoryMb` governs, and an entry count says nothing about size. Bounded by
+/// entries alone, one tenant could hold `max_entries` responses of any size
+/// each -- ten thousand one-megabyte responses is ten gigabytes -- and grow
+/// the whole node's process without ever coming near its own memory limit or
+/// anything reporting a fault. The caller derives `max_bytes` from that same
+/// memory limit, so what an application costs this node stays one number an
+/// operator can multiply by the number of tenants.
 ///
 /// The identity in [`CacheScope`] is minted here, which is what makes it mean
 /// "this store": a new one is created exactly when an isolate is, so a
 /// deployment, a restart or a request served by another node all produce a
 /// value the application has not seen before.
-pub fn create_cache_store(max_capacity: u64, default_ttl_secs: u64) -> CacheStore {
+pub fn create_cache_store(max_entries: u64, max_bytes: u64, default_ttl_secs: u64) -> CacheStore {
     let default_ttl = if default_ttl_secs > 0 {
         Some(Duration::from_secs(default_ttl_secs))
     } else {
         None
     };
 
+    // One entry's share of the store, and the least any entry may cost. See
+    // [`entry_weight`]: it is what keeps `max_entries` true once the ceiling
+    // is counted in bytes.
+    let min_weight = u32::try_from(max_bytes / max_entries.max(1))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let max_entry_bytes = max_bytes / ENTRY_SHARE_OF_STORE;
+
     Arc::new(IsolateCache {
         entries: Cache::builder()
-            .max_capacity(max_capacity)
+            // Counted in the units `entry_weight` answers in, which are
+            // bytes, not entries.
+            .max_capacity(max_bytes)
+            .weigher(move |key: &String, entry: &CacheEntry| entry_weight(key, entry, min_weight))
             .expire_after(ResponseFreshness { default_ttl })
             .build(),
         scope: CacheScope {
@@ -403,8 +522,10 @@ pub fn create_cache_store(max_capacity: u64, default_ttl_secs: u64) -> CacheStor
                 .duration_since(UNIX_EPOCH)
                 .map(|since| since.as_millis() as u64)
                 .unwrap_or(0),
-            max_entries: max_capacity,
+            max_entries,
             default_ttl_seconds: default_ttl_secs,
+            max_bytes,
+            max_entry_bytes,
         },
     })
 }

@@ -115,7 +115,10 @@ mod tests {
             let state = op_state.borrow();
             state.borrow::<crate::runtime::WsServerManager>().clone()
         };
-        manager.write().await.insert("bound-ws".to_string(), tx);
+        manager.write().await.insert(
+            "bound-ws".to_string(),
+            crate::runtime::WsClientSink::new(tx, std::sync::Arc::new(0.into())),
+        );
 
         let code = r#"
             (async () => {
@@ -219,5 +222,124 @@ mod tests {
         let (status, _headers, body) = rx.await.unwrap().unwrap();
         assert_eq!(status, 200, "{body:?}");
         assert_eq!(body.into_bytes().as_deref(), Some(&b"ok"[..]));
+    }
+
+    /// What a handler that outruns its client costs the node.
+    ///
+    /// The queue between the isolate and one client's socket is Rust memory
+    /// beside the isolate, outside the V8 heap `memoryMb` governs, and it had
+    /// no ceiling of any kind: `send()` handed the frame over and returned, so
+    /// a handler sending faster than one client reads grew the node's process
+    /// without ever crossing its own memory limit -- the same shape the Cache
+    /// API had. The outbound `WebSocket` client already answered this one; the
+    /// server side now gives the same answer.
+    #[tokio::test]
+    async fn a_client_that_is_behind_is_told_rather_than_buffered_without_end() {
+        use crate::runtime::{WsClientSink, WsServerMessage};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut runtime = setup_test_runtime();
+
+        let (frames, mut bridge) = tokio::sync::mpsc::unbounded_channel();
+        let buffered = Arc::new(AtomicUsize::new(0));
+        let (reports, mut report) = tokio::sync::mpsc::unbounded_channel();
+        let manager = {
+            let op_state = runtime.op_state();
+            let state = op_state.borrow();
+            state.borrow::<crate::runtime::WsServerManager>().clone()
+        };
+        {
+            let mut connections = manager.write().await;
+            connections.insert(
+                "slow-client".to_string(),
+                WsClientSink::new(frames, buffered.clone()),
+            );
+            // A second connection, so the outcome of the first can be read
+            // back without a v8 scope. Its own counter, because the ceiling
+            // is per client.
+            connections.insert(
+                "report".to_string(),
+                WsClientSink::new(reports, Arc::new(AtomicUsize::new(0))),
+            );
+        }
+
+        // A mebibyte at a time into a client that never reads.
+        let send_until_refused = r#"
+            (async () => {
+                const frame = "x".repeat(1024 * 1024);
+                let sent = 0;
+                let refusal = "nothing was refused";
+                for (let i = 0; i < 8; i++) {
+                    const result = await Deno.core.ops.op_ws_server_send("slow-client", frame);
+                    if (result.success) { sent++; continue; }
+                    refusal = result.error;
+                    break;
+                }
+                await Deno.core.ops.op_ws_server_send("report", sent + "|" + refusal);
+            })()
+        "#;
+        let script = runtime
+            .execute_script("<test>", send_until_refused)
+            .unwrap();
+        let settled = runtime.resolve(script);
+        runtime
+            .with_event_loop_promise(settled, PollEventLoopOptions::default())
+            .await
+            .unwrap();
+
+        let outcome = match report.recv().await.expect("the outcome was reported") {
+            WsServerMessage::Text(text) => text,
+            other => panic!("the outcome arrived as {other:?}"),
+        };
+        let (sent, refusal) = outcome.split_once('|').expect("sent count and refusal");
+        assert_eq!(
+            sent, "2",
+            "two mebibytes fit under the ceiling and the third must not: {refusal}"
+        );
+        assert!(
+            refusal.contains("2097152") && refusal.contains("behind"),
+            "the refusal has to say what happened and name the limit: {refusal}"
+        );
+        assert!(
+            buffered.load(Ordering::Relaxed) <= 2 * 1024 * 1024,
+            "the node is holding {} bytes for one client",
+            buffered.load(Ordering::Relaxed)
+        );
+
+        // The bridge does its half: once a frame has been handed to the
+        // socket, its bytes stop counting and the application may send again.
+        // Without that the ceiling would be a one-way door.
+        for _ in 0..2 {
+            let frame = bridge.recv().await.expect("the bridge has the frames");
+            buffered.fetch_sub(frame.queued_bytes(), Ordering::Relaxed);
+        }
+
+        let send_once_more = r#"
+            (async () => {
+                const result = await Deno.core.ops.op_ws_server_send(
+                    "slow-client", "x".repeat(1024 * 1024));
+                await Deno.core.ops.op_ws_server_send(
+                    "report", result.success ? "sent" : ("still refused: " + result.error));
+            })()
+        "#;
+        let script = runtime.execute_script("<test>", send_once_more).unwrap();
+        let settled = runtime.resolve(script);
+        runtime
+            .with_event_loop_promise(settled, PollEventLoopOptions::default())
+            .await
+            .unwrap();
+
+        match report
+            .recv()
+            .await
+            .expect("the second outcome was reported")
+        {
+            WsServerMessage::Text(text) => assert_eq!(
+                text, "sent",
+                "a client that caught up must be sendable to again"
+            ),
+            other => panic!("the outcome arrived as {other:?}"),
+        }
     }
 }

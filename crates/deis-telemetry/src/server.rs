@@ -2,6 +2,16 @@
 //!
 //! Both the binary and the integration tests come through here, so what the
 //! tests exercise is the same assembly the binary runs.
+//!
+//! # There is one door per surface, not four
+//!
+//! The capability token is checked by an interceptor applied in [`guarded`],
+//! which is the only way a gRPC service is handed to the server below, and by
+//! one layer over the scrape router in [`crate::http`]. A handler therefore
+//! cannot forget the check, and a fourth service registered later cannot
+//! become a fourth unguarded entrance without deleting the call. The health
+//! service is registered without it on purpose - it names no application and
+//! reads no data. See [`crate::auth`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,9 +24,11 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
+use crate::auth::TelemetryAuth;
 use crate::config::Config;
 use crate::http::{self, MetricsState};
 use crate::proto::log_service_server::LogServiceServer;
@@ -27,6 +39,16 @@ use crate::stats::ServiceStats;
 use crate::store::TelemetryStore;
 use crate::tail::{TailHub, TraceHub};
 use crate::{MAX_GRPC_MESSAGE_BYTES, now_us};
+
+/// Put a service behind the capability check.
+///
+/// Every service that can read or write telemetry goes through here, so the
+/// check is spelled once and applies to all of them - including any added
+/// later, which is the point of the helper existing rather than three copies
+/// of the same wrapping.
+fn guarded<S>(service: S, auth: &TelemetryAuth) -> InterceptedService<S, TelemetryAuth> {
+    InterceptedService::new(service, auth.clone())
+}
 
 /// A started service: both listeners are already bound, so `grpc_addr` and
 /// `metrics_addr` are the real addresses even when the configuration asked
@@ -156,6 +178,15 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         .local_addr()
         .context("cannot read the Prometheus listener address")?;
 
+    // Both addresses, and only now: `listen` may name a hostname, and it is
+    // what the sockets actually resolved to that decides who can reach them.
+    // A refusal here happens before either listener is served, so a service
+    // that must not run unauthenticated never answers a single call.
+    let auth = TelemetryAuth::for_listeners(config, grpc_addr, metrics_addr)?;
+    // Read off before the interceptor copies are handed to the tasks, so the
+    // startup line below can say which regime is in force.
+    let enforcing = auth.is_enforcing();
+
     let (shutdown, _) = watch::channel(false);
 
     // The standard grpc.health.v1 service is the only liveness surface this
@@ -188,6 +219,13 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
 
+    // Wrapped here rather than at `add_service`, so the three services reach
+    // the server already behind the check and no registration below can be
+    // written without it.
+    let log_service = guarded(log_service, &auth);
+    let trace_service = guarded(trace_service, &auth);
+    let metric_service = guarded(metric_service, &auth);
+
     let grpc_shutdown = subscribe(&shutdown);
     let grpc = tokio::spawn(async move {
         let result = Server::builder()
@@ -205,11 +243,14 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         }
     });
 
-    let metrics_app = http::router(MetricsState::new(
-        store.clone(),
-        Arc::clone(&stats),
-        config.metrics_export_window_secs,
-    ));
+    let metrics_app = http::router(
+        MetricsState::new(
+            store.clone(),
+            Arc::clone(&stats),
+            config.metrics_export_window_secs,
+        ),
+        auth,
+    );
     let metrics_shutdown = subscribe(&shutdown);
     let metrics = tokio::spawn(async move {
         let result = axum::serve(metrics_listener, metrics_app)
@@ -238,6 +279,7 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
     info!(
         %grpc_addr,
         %metrics_addr,
+        authenticated = enforcing,
         data_dir = %config.data_dir.display(),
         log_retention_days = config.log_retention_days,
         metric_retention_days = config.metric_retention_days,

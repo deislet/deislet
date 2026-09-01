@@ -127,11 +127,18 @@ async fn main() -> Result<(), anyhow::Error> {
     // themselves at `PUT /api/nodes/{id}/registration` and are added as they
     // call in, which is what lets a machine join without this file being
     // edited. A registration expires after this lifetime without a refresh.
-    let deis_runtime_manager = Arc::new(deis_control::RuntimeNodeManager::new_with_ttl(
-        api_config.deis_runtime_nodes.clone(),
-        api_config.deis_runtime_poll_interval,
-        api_config.node_registration_ttl_secs,
-    ));
+    let deis_runtime_manager = Arc::new(
+        deis_control::RuntimeNodeManager::new_with_ttl(
+            api_config.deis_runtime_nodes.clone(),
+            api_config.deis_runtime_poll_interval,
+            api_config.node_registration_ttl_secs,
+        )
+        // A node's management plane can unload an application, list every
+        // tenant on the node and replace one tenant's code, so it is served
+        // only to a caller that presents a node key. The same list the node
+        // endpoints already authenticate against.
+        .with_node_credential(api_config.node_call_credential()),
+    );
     let runtime_poll_task =
         tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop(shutdown.clone()));
 

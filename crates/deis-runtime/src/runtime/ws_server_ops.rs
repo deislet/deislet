@@ -13,8 +13,26 @@ use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+
+/// How many bytes an application may have queued for one client but not yet
+/// written to its socket.
+///
+/// `send()` hands the frame to the bridge and returns, which is what the
+/// specification says it does. Without a ceiling, a handler that sends faster
+/// than one client reads is an unbounded allocation in the node process: this
+/// queue is Rust memory beside the isolate, outside the V8 heap `memoryMb`
+/// governs, so the application never meets its own limit and nothing reports
+/// a fault -- the same shape the Cache API had before it was bounded by bytes.
+/// Past this the send is refused with the limit named, exactly as an outbound
+/// `WebSocket` refuses one (`ws_client_ops::MAX_BUFFERED_BYTES`), and it is
+/// the same two megabytes: a frame is in the isolate's heap before it is
+/// queued, so what this adds is bounded by what the application already paid
+/// for, and a client that has fallen two megabytes behind is not a client the
+/// node should keep buffering for.
+pub const MAX_BUFFERED_BYTES: usize = 2 * 1024 * 1024;
 
 /// WebSocket server connection ID
 pub type WsConnectionId = String;
@@ -30,10 +48,69 @@ pub enum WsServerMessage {
     Close { code: u16, reason: String },
 }
 
+impl WsServerMessage {
+    /// What this frame costs the queue while it waits for the socket.
+    ///
+    /// The payload only. A close carries a reason short enough not to matter
+    /// and is the last thing on the connection in any case.
+    pub fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Binary(bytes) => bytes.len(),
+            Self::Close { .. } => 0,
+        }
+    }
+}
+
+/// One client connection, as the isolate holds it: somewhere to put a frame,
+/// and how many bytes are already waiting there.
+///
+/// The two travel together because neither is any use alone. The channel is
+/// unbounded -- a bounded one would make `send()` either block a runtime
+/// thread on a client that has stopped reading, or drop a frame out of the
+/// middle of a stream -- so the byte counter is the whole of the bound, and it
+/// is only true while both ends maintain it: this side adds when a frame is
+/// queued, and the bridge in `dispatcher/handlers.rs` subtracts once that
+/// frame has been handed to the socket.
+#[derive(Clone)]
+pub struct WsClientSink {
+    frames: mpsc::UnboundedSender<WsServerMessage>,
+    buffered: Arc<AtomicUsize>,
+}
+
+impl WsClientSink {
+    /// Pair a channel to the bridge with the counter the bridge decrements.
+    pub fn new(frames: mpsc::UnboundedSender<WsServerMessage>, buffered: Arc<AtomicUsize>) -> Self {
+        Self { frames, buffered }
+    }
+
+    /// Queue one frame for this client, or say why not.
+    ///
+    /// `Err` is a sentence for the application: `js/runtime.js` throws it out
+    /// of `send()`, so a handler that outruns its client is told which of the
+    /// two things happened -- the client is gone, or the client is behind --
+    /// rather than watching frames vanish.
+    fn queue(&self, message: WsServerMessage) -> Result<(), String> {
+        let queued = message.queued_bytes();
+        let waiting = self.buffered.load(Ordering::Relaxed);
+        if waiting + queued > MAX_BUFFERED_BYTES {
+            return Err(format!(
+                "this client is behind: {waiting} byte(s) are already queued for it, this frame \
+                 is {queued} more, and the limit is {MAX_BUFFERED_BYTES}. The frame was not sent"
+            ));
+        }
+        self.buffered.fetch_add(queued, Ordering::Relaxed);
+        if self.frames.send(message).is_err() {
+            self.buffered.fetch_sub(queued, Ordering::Relaxed);
+            return Err("Connection closed".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// WebSocket server connection manager
-/// Stores send channels for each connection
-pub type WsServerManager =
-    Arc<RwLock<HashMap<WsConnectionId, mpsc::UnboundedSender<WsServerMessage>>>>;
+/// Stores the sink for each connection
+pub type WsServerManager = Arc<RwLock<HashMap<WsConnectionId, WsClientSink>>>;
 
 /// Create WebSocket server manager
 pub fn create_ws_server_manager() -> WsServerManager {
@@ -94,17 +171,10 @@ async fn op_ws_server_send(
     // Find connection
     let manager = ws_manager.read().await;
     match manager.get(&ws_id) {
-        Some(tx) => {
-            if tx.send(WsServerMessage::Text(message)).is_err() {
-                return serde_json::json!({
-                    "success": false,
-                    "error": "Connection closed"
-                });
-            }
-            serde_json::json!({
-                "success": true
-            })
-        }
+        Some(sink) => match sink.queue(WsServerMessage::Text(message)) {
+            Ok(()) => serde_json::json!({ "success": true }),
+            Err(error) => serde_json::json!({ "success": false, "error": error }),
+        },
         None => serde_json::json!({
             "success": false,
             "error": "WebSocket connection not found"
@@ -151,17 +221,10 @@ async fn op_ws_server_send_binary(
 
     let manager = ws_manager.read().await;
     match manager.get(&ws_id) {
-        Some(tx) => {
-            if tx.send(WsServerMessage::Binary(data.to_vec())).is_err() {
-                return serde_json::json!({
-                    "success": false,
-                    "error": "Connection closed"
-                });
-            }
-            serde_json::json!({
-                "success": true
-            })
-        }
+        Some(sink) => match sink.queue(WsServerMessage::Binary(data.to_vec())) {
+            Ok(()) => serde_json::json!({ "success": true }),
+            Err(error) => serde_json::json!({ "success": false, "error": error }),
+        },
         None => serde_json::json!({
             "success": false,
             "error": "WebSocket connection not found"
@@ -225,8 +288,12 @@ async fn op_ws_server_close(
     // Find connection and send close message
     let manager = ws_manager.read().await;
     match manager.get(&request.ws_id) {
-        Some(tx) => {
-            let _ = tx.send(close_msg);
+        Some(sink) => {
+            // A close carries no payload worth counting and is the last thing
+            // on this connection, so it is queued whatever is still waiting:
+            // refusing it because the client is behind would leave the socket
+            // open with nobody meaning to hold it.
+            let _ = sink.queue(close_msg);
             serde_json::json!({
                 "success": true
             })
