@@ -208,7 +208,7 @@ impl HostPort {
         let Some(mine) = self.addr else {
             return false;
         };
-        if mine != addr {
+        if !reaches_the_same_socket(mine, addr) {
             return false;
         }
         match (self.port, port) {
@@ -976,6 +976,52 @@ impl deno_runtime::deno_fetch::dns::Resolve for PolicyResolver {
             }
             Ok(kept.into_iter())
         })
+    }
+}
+
+/// Would a connection to `theirs` land on a socket bound at `mine`?
+///
+/// The platform's endpoints are configured by one spelling of an address,
+/// and a machine has several spellings for itself. A service bound at
+/// `127.0.0.1` is reached by `::ffff:127.0.0.1`; one bound at the
+/// unspecified address is reached by every address the machine has, loopback
+/// included; and a name that resolves to both loopback addresses - which is
+/// what `localhost` does on any host with IPv6 - offers `::1` beside
+/// `127.0.0.1`. Comparing addresses byte for byte let the second spelling
+/// through: the first run of the CI workflow, on a dual-stack runner, saw
+/// the resolver drop `127.0.0.1` from an allowlisted name and hand back
+/// `[::1]`, the same machine by another name. So loopback is judged as a
+/// class, the unspecified address as every address, and the IPv4-in-IPv6
+/// forms as the IPv4 address they carry.
+fn reaches_the_same_socket(mine: IpAddr, theirs: IpAddr) -> bool {
+    let mine = as_ipv4_when_it_is_one(mine);
+    let theirs = as_ipv4_when_it_is_one(theirs);
+    if mine == theirs {
+        return true;
+    }
+    if mine.is_unspecified() {
+        // Bound on every interface: any address this machine answers at
+        // reaches it. Public addresses of the machine itself are not known
+        // here, so this is the loopback half of that promise; the blocked
+        // ranges below refuse the private half for names the operator did
+        // not open, and an operator who allowlists the node's own public
+        // address has said what they meant.
+        return theirs.is_loopback();
+    }
+    mine.is_loopback() && theirs.is_loopback()
+}
+
+/// `::ffff:a.b.c.d` and the deprecated `::a.b.c.d` as `a.b.c.d`; `::1` and
+/// `::` stay themselves, because `to_ipv4` would read them as `0.0.0.1` and
+/// `0.0.0.0`.
+fn as_ipv4_when_it_is_one(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unspecified() => v6
+            .to_ipv4_mapped()
+            .or_else(|| v6.to_ipv4())
+            .map(IpAddr::V4)
+            .unwrap_or(addr),
+        _ => addr,
     }
 }
 

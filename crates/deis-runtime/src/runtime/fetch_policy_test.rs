@@ -407,13 +407,49 @@ mod tests {
         // the socket is opened -- a DNS rebind -- the allowlist must not carry
         // it through: "no allowlist entry can reach them" holds for the
         // connect-time answer too. `localhost` stands in for the rebound name;
-        // it resolves to the loopback address every platform endpoint shares.
+        // it resolves to the loopback address every platform endpoint shares -
+        // and on a dual-stack host to `::1` beside it, which is the same
+        // machine and must be dropped with it.
         let policy = FetchPolicy::new(["localhost"], ["127.0.0.1:8091"]).unwrap();
         let error = PolicyResolver::new(policy, "store-reader.production")
             .resolve(name("localhost"))
             .await
             .expect_err("a platform address is refused even to an allowlisted name");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn a_platform_endpoint_is_reached_by_every_spelling_of_its_machine() {
+        // A dual-stack resolver offers `::1` beside `127.0.0.1` for the same
+        // name, the IPv4-mapped form reaches the same socket as the IPv4
+        // address, and a service bound on the unspecified address answers at
+        // every loopback address. Each of those is the platform's own
+        // endpoint by another name, and an allowlisted name that resolves to
+        // one of them at connect time is a rebind.
+        let bound_v4 = FetchPolicy::new(["example.test"], ["127.0.0.1:8091"]).unwrap();
+        for spelling in ["::1", "::ffff:127.0.0.1", "127.0.0.2"] {
+            let addr: IpAddr = spelling.parse().unwrap();
+            assert!(
+                bound_v4.is_a_platform_service_address(addr, Some(8091)),
+                "{spelling} reaches a service bound at 127.0.0.1"
+            );
+        }
+        assert!(
+            !bound_v4.is_a_platform_service_address("10.0.0.1".parse().unwrap(), Some(8091)),
+            "a private address is another machine, and the allowlist may open it"
+        );
+        assert!(
+            !bound_v4.is_a_platform_service_address("::1".parse().unwrap(), Some(9000)),
+            "the port still has to match"
+        );
+
+        let bound_v6 = FetchPolicy::new(["example.test"], ["[::1]:8091"]).unwrap();
+        assert!(bound_v6.is_a_platform_service_address("127.0.0.1".parse().unwrap(), Some(8091)));
+
+        let bound_everywhere = FetchPolicy::new(["example.test"], ["0.0.0.0:8085"]).unwrap();
+        assert!(bound_everywhere.is_a_platform_service_address("::1".parse().unwrap(), Some(8085)));
+        assert!(bound_everywhere
+            .is_a_platform_service_address("127.0.0.1".parse().unwrap(), Some(8085)));
     }
 
     #[test]

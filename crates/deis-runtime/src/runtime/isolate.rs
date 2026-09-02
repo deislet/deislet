@@ -1134,6 +1134,10 @@ pub struct AppRuntime {
     /// dispatch and says nothing this side can catch, so without this the
     /// application would be told only that V8 unwound.
     rate_limit_ops_per_sec: f64,
+    /// Set by the op rate limiter when it terminates this isolate, cleared by
+    /// the code that next explains a failure. Whichever stretch the cut-off
+    /// fired in, the producers it killed are explained by it.
+    op_ceiling_fired: Arc<std::sync::atomic::AtomicBool>,
     /// Where this isolate's request, error, execution-time and cut-off
     /// counters go. See `super::metrics`.
     metrics: Arc<MetricsRegistry>,
@@ -1295,6 +1299,15 @@ impl AppRuntime {
         let limiter = Arc::new(Mutex::new(RateLimiter::new(rate_limit_ops_per_sec)));
         let metrics = recorder().clone();
         let metrics_for_limiter = metrics.clone();
+        // Raised by the limiter the moment it terminates the isolate, read
+        // and lowered by whoever next has to explain a failure. A flag rather
+        // than a difference of the counter: the counter's baseline was read at
+        // the start of each stretch, and a cut-off that fired in the stretch
+        // *before* the one that saw the producers die - the request that
+        // opened the stream, on a slow machine - moved the counter before the
+        // baseline was taken and was invisible to it.
+        let op_ceiling_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let op_ceiling_fired_for_limiter = op_ceiling_fired.clone();
         let isolate_handle_cell = Arc::new(OnceCell::<deno_core::v8::IsolateHandle>::new());
         let isolate_handle_cell_clone = isolate_handle_cell.clone();
         let app_id_clone = app_id.clone();
@@ -1307,6 +1320,7 @@ impl AppRuntime {
             let handle_cell = isolate_handle_cell_clone.clone();
             let app_id = app_id_clone.clone();
             let metrics = metrics_for_limiter.clone();
+            let op_ceiling_fired = op_ceiling_fired_for_limiter.clone();
             let op_name = decl.name.to_string();
             // One op is not the application's work and is not charged to it.
             //
@@ -1337,6 +1351,7 @@ impl AppRuntime {
                     let mut limiter = limiter.lock().unwrap();
                     if !limiter.check() {
                         metrics.record_rate_limit_cutoff(&app_id);
+                        op_ceiling_fired.store(true, std::sync::atomic::Ordering::Release);
                         tracing::warn!(
                             target: "app",
                             app_id = %app_id,
@@ -1681,6 +1696,7 @@ impl AppRuntime {
             stream_timeout_ms,
             cpu_time_limit_ms,
             rate_limit_ops_per_sec,
+            op_ceiling_fired,
             metrics,
             execution_deadline,
             subrequest_budget,
@@ -2969,8 +2985,10 @@ impl AppRuntime {
             let sinks = self.response_streams().borrow().sinks();
             // Read before the drive, not after a failure: the rate limiter
             // terminates the isolate without going through the watchdog, so
-            // this counter moving is the only thing that tells the two kinds
-            // of failure apart.
+            // this counter moving - or the flag it raises - is what tells the
+            // two kinds of failure apart. The flag covers a cut-off that fired
+            // before this stretch began; the counter is kept as the second
+            // reading for one that fires inside it.
             let rate_limit_cutoffs = self.metrics.value(RATE_LIMIT_CUTOFFS_TOTAL, &self.app_id);
 
             // Published so an outbound `fetch` a producer starts from here on
@@ -3035,8 +3053,10 @@ impl AppRuntime {
             // One chunk costs one op dispatch, so this is a ceiling a stream
             // can plausibly meet: it is what an application writing very small
             // chunks reaches long before it reaches any byte rate.
-            let rate_limited =
-                self.metrics.value(RATE_LIMIT_CUTOFFS_TOTAL, &self.app_id) > rate_limit_cutoffs;
+            let rate_limited = self
+                .op_ceiling_fired
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+                || self.metrics.value(RATE_LIMIT_CUTOFFS_TOTAL, &self.app_id) > rate_limit_cutoffs;
             if rate_limited || terminated.is_some() {
                 let reason = if rate_limited {
                     format!(
