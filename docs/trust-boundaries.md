@@ -192,10 +192,11 @@ what it already has when the control plane is unreachable.
 **If a value may have leaked, the rotation above is not enough on its own.**
 Whoever held it has had the assignment list, which means every secret in every
 environment. Rotate the application secrets too, and assume any bundle on the
-platform was readable. Before step 2, read `GET /api/runtime` and
-`DELETE /api/nodes/{id}/registration` any address you do not recognise; the
-rotation stops such an address from acquiring the new value, it does not stop
-it from having had everything the old one opened.
+platform was readable. Before step 2, read `GET /api/runtime` and deregister
+any address you do not recognise with a `DELETE` on its registration route
+(`deis_wire::conventions::NODE_REGISTRATION_ROUTE`); the rotation stops such
+an address from acquiring the new value, it does not stop it from having had
+everything the old one opened.
 
 ## What is not implemented
 

@@ -103,6 +103,12 @@ jobs:
           npm ci
           npm run build
 
+      # deis-wire's build script compiles the protobuf definitions with
+      # `protoc`, which the runner image does not carry. The first run of
+      # this workflow failed here, before a line of Rust was checked.
+      - name: Install protoc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
@@ -169,6 +175,11 @@ jobs:
           tar -xzf grpcurl.tar.gz grpcurl
           sudo install -m 0755 grpcurl /usr/local/bin/grpcurl
           grpcurl --version
+
+      # Same reason as in the workspace job: `demo.sh start` builds the
+      # binaries, and deis-wire's build script needs `protoc`.
+      - name: Install protoc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
       - name: Start the demo
         run: ./scripts/demo.sh start
