@@ -388,6 +388,95 @@ mod tests {
         std::fs::create_dir_all(data_dir.join("blob").join("app-one")).unwrap();
     }
 
+    /// The whole-node outage this pair of checks caused, driven end to end
+    /// through the same calls a runtime makes.
+    ///
+    /// A call carrying `x-deis-binding` is stored under
+    /// `<tenant>@<BINDING>`, so the first application on a node to use a
+    /// named db or blob binding left `db/shop.production@MEDIA.sqlite` and
+    /// `blob/shop.production@MEDIA/` behind. The next start of the same
+    /// binary on the same data directory then refused - not for that tenant,
+    /// for the process - and KV, SQL and blob went down for every tenant on
+    /// the node, with "point data_dir at an empty directory" as the only
+    /// remedy the message offered.
+    #[tokio::test]
+    async fn a_data_directory_holding_a_named_binding_opens_again() {
+        let dir = TempDir::new().unwrap();
+        let config = config_for(&dir);
+        let media = TenantId::of_binding("shop.production", Some("MEDIA")).unwrap();
+        assert_eq!(media.as_str(), "shop.production@MEDIA");
+
+        {
+            let stores = Stores::open(&config).await.unwrap();
+            stores
+                .database
+                .exec_statement(&media, "CREATE TABLE t (a INTEGER)", &[])
+                .await
+                .unwrap();
+            stores
+                .kv
+                .set(&media, "k", b"v".to_vec(), None, None)
+                .await
+                .unwrap();
+            stores
+                .blob
+                .store_object(
+                    &media,
+                    "object",
+                    None,
+                    None,
+                    Box::pin(tokio_stream::iter(vec![Ok(b"bytes".to_vec())])),
+                )
+                .await
+                .unwrap();
+        }
+
+        // The names the binding actually put on disk, so this test keeps
+        // meaning what it says if the layout is ever changed.
+        assert!(
+            dir.path()
+                .join("db")
+                .join("shop.production@MEDIA.sqlite")
+                .is_file()
+        );
+        assert!(
+            dir.path()
+                .join("blob")
+                .join("shop.production@MEDIA")
+                .is_dir()
+        );
+
+        let stores = Stores::open(&config)
+            .await
+            .expect("a data directory holding a named binding must open again");
+        // And the data is still the binding's own, not the tenant's unnamed
+        // namespace: a check that "fixed" the refusal by rewriting the name
+        // would pass the line above and fail here.
+        assert_eq!(
+            stores.kv.get(&media, "k").await.unwrap().map(|e| e.value),
+            Some(b"v".to_vec())
+        );
+        assert!(stores.blob.head(&media, "object").await.unwrap().is_some());
+    }
+
+    /// A file this service never wrote must not be able to stop it. The
+    /// refusal takes every tenant on the node offline, so it is reserved for
+    /// evidence of pre-tenant data and never spent on a stray name.
+    #[tokio::test]
+    async fn a_stray_file_in_the_data_directory_does_not_stop_the_node() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("db")).unwrap();
+        std::fs::create_dir_all(dir.path().join("blob")).unwrap();
+        std::fs::write(dir.path().join("db").join(".DS_Store"), b"").unwrap();
+        std::fs::write(dir.path().join("db").join("app-one.sqlite.bak"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("blob").join("lost+found")).unwrap();
+        std::fs::write(dir.path().join("blob").join("README"), b"").unwrap();
+
+        Stores::open(&config_for(&dir))
+            .await
+            .expect("a stray name is not evidence that any tenant's data is unreachable");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_sweeper_reclaims_expired_entries() {
         let dir = TempDir::new().unwrap();

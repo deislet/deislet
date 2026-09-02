@@ -743,6 +743,33 @@ mod tests {
              incident is worse than saying nothing: {body}"
         );
 
+        // And the same reason on the response head, spelled as the request
+        // header carried it in. The edge's health validator is handed the
+        // head and never the body (`deis_proxy::config::system::health`
+        // reads `x-deis-node-reason` there), so a reason that lived only in
+        // the body left the edge logging a cause it invented - "cannot reach
+        // its control plane" - for every degraded node, whatever the node
+        // actually said.
+        let (_, answer_headers, _) = apps
+            .execute_app(
+                &key,
+                "http://node.invalid/health".to_string(),
+                "GET".to_string(),
+                vec![
+                    (READINESS_HEADER.to_string(), "degraded".to_string()),
+                    (SERVING_APPS_HEADER.to_string(), "3".to_string()),
+                    (REASON_HEADER.to_string(), header_safe_reason(reason)),
+                ],
+                None,
+            )
+            .await
+            .expect("the probe reaches the handler");
+        assert_eq!(
+            crate::runtime::header_list::first_value(&answer_headers, REASON_HEADER),
+            Some(header_safe_reason(reason).as_str()),
+            "the edge reads the reason off the response head, so it has to be there"
+        );
+
         let _ = apps.unload_app(&key).await;
     }
 

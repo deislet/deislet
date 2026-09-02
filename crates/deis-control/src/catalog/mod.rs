@@ -29,6 +29,7 @@
 
 pub mod bundle;
 pub mod compatibility;
+pub mod domains;
 pub mod limits;
 pub mod model;
 pub mod secrets;
@@ -39,6 +40,7 @@ pub use compatibility::{
     CompatibilityProfile, DeclaredCompatibility, declared_compatibility, describe_version,
 };
 pub use deis_bundle::Manifest as BundleManifest;
+pub use domains::{ClaimRefusal, DomainGrant, GrantPattern, HostClaim};
 pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{
     App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, RetiredAppName, Route,
@@ -65,6 +67,14 @@ pub enum CatalogError {
 
     #[error("{0}")]
     Invalid(String),
+
+    /// The caller is who they say they are and is not entitled to what they
+    /// asked for. Distinct from `Invalid`, which is a request nobody could
+    /// make: this one is a request somebody else could. The only thing that
+    /// raises it today is a hostname claim reaching past what the
+    /// installation granted; see [`domains`].
+    #[error("{0}")]
+    Forbidden(String),
 
     #[error("bundle storage failed: {0}")]
     BundleStorage(String),
@@ -94,6 +104,10 @@ impl CatalogError {
 
     pub fn invalid(what: impl Into<String>) -> Self {
         CatalogError::Invalid(what.into())
+    }
+
+    pub fn forbidden(what: impl Into<String>) -> Self {
+        CatalogError::Forbidden(what.into())
     }
 }
 

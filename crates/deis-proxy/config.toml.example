@@ -136,6 +136,17 @@ auto_offload_https = true
 
 # Backends shared by all applications. Hostnames are resolved on every
 # refresh; each resolved address becomes a backend.
+#
+# ADDING A SECOND MACHINE TAKES TWO STEPS, AND THIS IS THE SECOND ONE.
+# A deis-runtime node that registers itself with the control plane does not
+# become an upstream of any proxy. Registration tells deis-control how to
+# *manage* the node - it reports its management gRPC address, not the port
+# traffic arrives on - and no edge is told anything. So a new machine is
+# managed, healthy and deployed to while taking no traffic at all, until its
+# data address is listed below in the configuration of every proxy that should
+# send it requests and each of those is reloaded (`deis-proxy -s reload`).
+# The list here is the only source of upstreams there is; deis-proxy logs it
+# at startup for the same reason this paragraph exists.
 [[upstreams]]
 host = "127.0.0.1"
 port = 8001
@@ -170,6 +181,13 @@ unhealthy_after = 2
 #                        header.
 #   ignored            - the status code alone decides. For an upstream that
 #                        is not a deis-runtime node.
+#
+# Why a node is degraded is the node's to say, in `x-deis-node-reason` beside
+# the readiness. deis-proxy repeats that header and never guesses in its
+# place: a node that sends none is logged as one that did not say. `degraded`
+# has several causes - a control plane nobody can reach, a bundle that would
+# not load, an environment that would not stop - and a log line that names the
+# wrong one sends you to the component that is working.
 readiness = "reported"
 
 [compression]

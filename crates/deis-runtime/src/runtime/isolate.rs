@@ -1,7 +1,7 @@
 // V8 Runtime Isolate wrapper
 
 use super::bindings::{AppServices, ServiceWiring};
-use super::cache_ops::{create_cache_store, CacheStore};
+use super::cache_ops::{create_cache_store, CacheStore, InvocationCounter};
 use super::fetch_policy::FetchPolicy;
 use super::header_list::{combine_cookie_fields, count_of, fold_duplicate_names, HeaderPairs};
 use super::loader::DbModuleLoader;
@@ -1147,6 +1147,18 @@ pub struct AppRuntime {
     /// [`Self::begin_invocation`]; see [`SubrequestBudget`] for why fan-out
     /// needs a ceiling none of the other budgets provides.
     subrequest_budget: Rc<SubrequestBudget>,
+    /// How many stretches of application code this isolate has begun or
+    /// finished, shared with the isolate's `OpState`.
+    ///
+    /// Stepped at both ends of every invocation by [`Self::begin_invocation`]
+    /// and [`Self::end_invocation`], which is what makes it a name for one
+    /// stretch: no two stretches this node started separately ever read the
+    /// same number, and the number between two of them belongs to neither.
+    /// `js/runtime.js` stamps what it states about the request being answered
+    /// with it, so a runner that states nothing cannot inherit the last
+    /// request this isolate served. See [`InvocationCounter`] for the
+    /// disclosure that shape of state produced.
+    invocations: InvocationCounter,
     /// The chain of applications that led to the invocation currently running,
     /// shared with the isolate's `OpState`.
     ///
@@ -1296,6 +1308,21 @@ impl AppRuntime {
             let app_id = app_id_clone.clone();
             let metrics = metrics_for_limiter.clone();
             let op_name = decl.name.to_string();
+            // One op is not the application's work and is not charged to it.
+            //
+            // `op_cache_invocation` reads a counter this node keeps of its own
+            // invocation boundaries, so that `js/runtime.js` can tell one
+            // stretch of application code from the next; see
+            // `runtime/cache_ops.rs::InvocationCounter`. It reads a `Cell` and
+            // returns, makes this node do nothing, and is dispatched by the
+            // runtime rather than by anything an application can reach --
+            // `js/runtime.js` deletes `globalThis.Deno` before any application
+            // code exists, so no application can dispatch an op at all except
+            // through the platform's own calls. Spending the allowance meant to
+            // bound what an application costs on the bookkeeping that makes it
+            // safe is the wrong way round: it took a streaming response over a
+            // 50 op/s ceiling before its producer had written a byte.
+            let charged = op_name != "op_cache_invocation";
 
             let callback = move |ctx: &_,
                                  event: deno_core::OpMetricsEvent,
@@ -1306,7 +1333,7 @@ impl AppRuntime {
                 }
 
                 // Only check Dispatched events
-                if event == deno_core::OpMetricsEvent::Dispatched {
+                if charged && event == deno_core::OpMetricsEvent::Dispatched {
                     let mut limiter = limiter.lock().unwrap();
                     if !limiter.check() {
                         metrics.record_rate_limit_cutoff(&app_id);
@@ -1358,6 +1385,7 @@ impl AppRuntime {
 
         let execution_deadline: ExecutionDeadline = Rc::new(Cell::new(None));
         let subrequest_budget = Rc::new(SubrequestBudget::new(max_subrequests));
+        let invocations = InvocationCounter::default();
         let call_path: CallPath = Rc::new(RefCell::new(Vec::new()));
         let current_trace: CurrentTrace = Rc::new(RefCell::new(String::new()));
 
@@ -1545,6 +1573,10 @@ impl AppRuntime {
                     / 4;
             let cache_store: CacheStore = create_cache_store(10_000, cache_bytes, 600);
             state.put(cache_store);
+            // Beside the store because the cache is what reads it: `Cache.put`
+            // is the one call whose answer depends on which stretch of
+            // application code is making it. See [`InvocationCounter`].
+            state.put(invocations.clone());
 
             let ws_server_manager: WsServerManager = create_ws_server_manager();
             state.put(ws_server_manager);
@@ -1652,6 +1684,7 @@ impl AppRuntime {
             metrics,
             execution_deadline,
             subrequest_budget,
+            invocations,
             call_path,
             trace: current_trace,
             inherited_trace_id: None,
@@ -1751,6 +1784,15 @@ impl AppRuntime {
     fn begin_invocation(&mut self, trace_id: String) {
         *self.trace.borrow_mut() = trace_id;
         self.timers_swept = false;
+        // A name for the stretch about to run, so that what `js/runtime.js`
+        // states about the request being answered is readable only inside it.
+        // Stepped here and again in `end_invocation`, which is what makes the
+        // gap between two invocations a stretch of its own: a timer, a
+        // response-stream producer or a WebSocket message that runs there
+        // reads a number no statement was ever stamped with, and is told it
+        // does not know what it is answering rather than being handed the last
+        // request this isolate served. See [`InvocationCounter`].
+        self.invocations.step();
         // An allowance of its own for the invocation about to start, and the
         // one the last invocation was spending left alone. This used to reset
         // a single counter the whole isolate shared, which gave the producer
@@ -1773,6 +1815,11 @@ impl AppRuntime {
     /// to work. What an invocation is allowed to hold, it holds *inside* the
     /// isolate every other request to this application will run in.
     fn end_invocation(&mut self) {
+        // First, and before anything below that runs script: from this point
+        // on nothing that runs in this isolate is this invocation, so nothing
+        // that runs in it may read what this invocation said it was answering.
+        // The step is what ends that statement; see [`Self::begin_invocation`].
+        self.invocations.step();
         // Before anything else that can fail: a line written after this point
         // is the node speaking about the invocation, not the invocation
         // speaking, and stamping it with the id would put it in a trace it is
@@ -2080,6 +2127,13 @@ impl AppRuntime {
         let glue_code = format!(
             r#"
             (async () => {{
+                // The top level of a bundle is application code that answers
+                // no request, and it has to say so: `Cache.put` refuses a call
+                // it cannot attribute rather than guessing, and a module that
+                // said nothing would be one of the stretches that cannot tell
+                // this platform what it is answering. See
+                // `runtime/cache_ops.rs::InvocationCounter`.
+                globalThis.__deis_runtime_answers_no_request();
                 const mod = await import("{}");
                 globalThis.user_module = {{ default: mod.default }};
                 if (mod.fetch) {{
@@ -2286,12 +2340,37 @@ impl AppRuntime {
         }
 
         self.begin_invocation(trace_id);
+        // The channel is lent rather than given, so that leaving
+        // `answer_one_request` and answering the request are one thing. Three
+        // paths through it -- the script that failed or was cut off, the
+        // handler that left no response behind, and the response that would
+        // not parse -- returned through `?` with the channel untouched: the
+        // sender was dropped, and what reached the client was the caller's
+        // guess for a dropped channel, "Runtime thread dropped", in place of
+        // the reason. Whatever path is taken, the request is answered below.
+        let mut answer = Some(response_tx);
         let outcome = self
-            .answer_one_request(started, url, method, headers, body, response_tx)
+            .answer_one_request(started, url, method, headers, body, &mut answer)
             .await;
         // On the path where the request answered, the tail below has already
         // done most of this; on the path where it was cut off, nothing has.
         self.end_invocation();
+        if let Some(response_tx) = answer.take() {
+            // `anyhow::Error` cannot be cloned and the outcome is the caller's
+            // to log, so the client is given the same sentence rather than the
+            // same value.
+            let reported = match &outcome {
+                Err(e) => anyhow::anyhow!("{e}"),
+                // Not reachable today: every path that succeeds has answered.
+                // Said out loud rather than left as an empty channel, which is
+                // the failure this arrangement exists to remove.
+                Ok(()) => anyhow::anyhow!(
+                    "app {} finished this request without answering it",
+                    self.app_id
+                ),
+            };
+            let _ = response_tx.send(Err(reported));
+        }
         outcome
     }
 
@@ -2368,7 +2447,7 @@ impl AppRuntime {
         method: String,
         mut headers: HeaderPairs,
         body: Option<Vec<u8>>,
-        response_tx: oneshot::Sender<Result<FetchResult>>,
+        response_tx: &mut Option<oneshot::Sender<Result<FetchResult>>>,
     ) -> Result<()> {
         // The one header whose repeats are not joined with a comma. Done here
         // rather than at either caller because this is the single place a
@@ -2626,7 +2705,9 @@ impl AppRuntime {
                         self.app_id,
                         e
                     );
-                    let _ = response_tx.send(Err(e));
+                    if let Some(response_tx) = response_tx.take() {
+                        let _ = response_tx.send(Err(e));
+                    }
                     return Ok(());
                 }
             }
@@ -2687,7 +2768,9 @@ impl AppRuntime {
             folded
         };
 
-        let _ = response_tx.send(Ok((response.status, headers, response_body)));
+        if let Some(response_tx) = response_tx.take() {
+            let _ = response_tx.send(Ok((response.status, headers, response_body)));
+        }
 
         // The response is gone; what the handler handed to `waitUntil` runs
         // from here, under the tail's own budget. A failure past this point
@@ -3647,6 +3730,25 @@ impl AppRuntime {
             Some(cut_off) => Err(cut_off.as_error(&self.app_id, self.timeout_ms)),
             None => outcome,
         }
+    }
+
+    /// Run one script the way a runner that has not been taught to say what it
+    /// is answering would: in a stretch of its own, with no statement in it.
+    ///
+    /// This is not a runner and there is no product path to it. It exists so
+    /// the default can be witnessed: every runner this platform has today says
+    /// what it answers, so the branch that refuses a `Cache.put` made by code
+    /// that said nothing is unreachable from an application -- and an
+    /// unreachable safety net is one nobody notices has stopped working. The
+    /// thing it protects against is the *next* runner, added without the
+    /// statement, which is exactly what this is a stand-in for.
+    #[cfg(test)]
+    pub(crate) async fn run_unstated_stretch(&mut self, source: String) -> Result<()> {
+        self.clear_termination();
+        self.begin_invocation(new_trace_id());
+        let outcome = self.settle_script("<unstated>", source).await;
+        self.end_invocation();
+        outcome
     }
 
     /// Tell the application one of its WebSocket clients has gone.

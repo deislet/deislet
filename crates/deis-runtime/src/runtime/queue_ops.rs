@@ -39,6 +39,8 @@ const MAX_BATCH_BYTES: usize = crate::MAX_GRPC_MESSAGE_BYTES - 64 * 1024;
 /// It names the consequence rather than only the condition: the application
 /// is holding a rejected promise and has to know that the message is not
 /// queued anywhere and will not be delivered later.
+use super::ops::escape_control;
+
 fn queue_unavailable(queue_name: &str) -> JsErrorBox {
     JsErrorBox::generic(format!(
         "queue service is not available to this app: the message for queue {queue_name:?} was \
@@ -81,14 +83,18 @@ async fn op_queue_send(
         // Attributed like every other line an app's own code causes, so it
         // reaches deis-telemetry under the tenant that tried to send; see
         // `AppId`.
+        // The name is the application's own string and this line lands in
+        // the node's log file, where a newline ends the line and starts one
+        // the application wrote in full - the same forgery `emit_app_log`
+        // escapes against, escaped by the same rule.
         tracing::warn!(
             target: "app",
             app_id,
-            queue = %queue_name,
+            queue = %escape_control(&queue_name),
             "Refused a send to queue {}: no deis-queue is bound to this app, so the message was \
              not enqueued and the app was told so. Declare \"queue\" in the manifest and give the \
              deployment a queue address",
-            queue_name
+            escape_control(&queue_name)
         );
         return Err(queue_unavailable(&queue_name));
     };
@@ -140,16 +146,17 @@ async fn op_queue_send_batch(
     };
 
     let Some(client) = client_opt else {
+        // Escaped for the same reason as the single-send refusal above.
         tracing::warn!(
             target: "app",
             app_id,
-            queue = %queue_name,
+            queue = %escape_control(&queue_name),
             messages = lengths.len(),
             "Refused a batch of {} message(s) to queue {}: no deis-queue is bound to this app, \
              so none of them was enqueued and the app was told so. Declare \"queue\" in the \
              manifest and give the deployment a queue address",
             lengths.len(),
-            queue_name
+            escape_control(&queue_name)
         );
         return Err(queue_unavailable(&queue_name));
     };
@@ -168,7 +175,7 @@ async fn op_queue_send_batch(
         tracing::warn!(
             target: "app",
             app_id,
-            queue = %queue_name,
+            queue = %escape_control(&queue_name),
             messages = lengths.len(),
             bytes = total,
             limit = MAX_BATCH_BYTES,
@@ -176,7 +183,7 @@ async fn op_queue_send_batch(
              gRPC message may carry {}. Nothing was enqueued; send the batch in smaller pieces \
              or put the payloads in blob storage and queue their keys",
             lengths.len(),
-            queue_name,
+            escape_control(&queue_name),
             total,
             MAX_BATCH_BYTES
         );
@@ -210,12 +217,12 @@ async fn op_queue_send_batch(
     tracing::debug!(
         target: "app",
         app_id,
-        queue = %queue_name,
+        queue = %escape_control(&queue_name),
         messages = ids.len(),
         bytes = total,
         "Enqueued {} message(s) to queue {} as one transaction",
         ids.len(),
-        queue_name
+        escape_control(&queue_name)
     );
     Ok(())
 }

@@ -28,11 +28,17 @@
 //! Data layout under the configured data directory:
 //!
 //! ```text
-//! kv.sqlite                          every tenant's keys, by tenant
-//! blob.sqlite                        object metadata, by tenant
-//! db/<tenant>.sqlite                 one SQL database per tenant
-//! blob/<tenant>/<aa>/<bb>/<sha256>   object content, addressed by digest
+//! kv.sqlite                             every namespace's keys, by namespace
+//! blob.sqlite                           object metadata, by namespace
+//! db/<namespace>.sqlite                 one SQL database per namespace
+//! blob/<namespace>/<aa>/<bb>/<sha256>   object content, addressed by digest
 //! ```
+//!
+//! `<namespace>` is the tenant - `demo.production` - for a call that names no
+//! binding, and `demo.production@MEDIA` for one that names `MEDIA`. Both are
+//! ordinary names on disk here; see [`tenant`] for why a binding cannot widen
+//! which tenant is addressed, and [`legacy`] for the startup check that has
+//! to know both forms.
 //!
 //! This directory is the only copy of every tenant's data, and it cannot be
 //! backed up by copying it: SQLite runs in WAL mode here, so a plain `cp -r`

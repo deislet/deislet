@@ -8,6 +8,10 @@
 //! symptom of forgetting would be a handshake failure on a name that routes
 //! perfectly well.
 //!
+//! When more names want certificates than the ceiling allows, the ceiling is
+//! shared rather than taken first-come; see [`desired_names`] for the policy
+//! and for why alphabetical truncation was a hole.
+//!
 //! Three kinds of name are left out, each for a reason worth stating:
 //!
 //! * a wildcard (`*.example.com`) cannot be had over `http-01` at all -
@@ -19,7 +23,7 @@
 //!   single label, a name with a character DNS does not carry - because no
 //!   authority will issue for it and every attempt spends a rate limit.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tracing::warn;
 
@@ -79,57 +83,151 @@ pub fn is_certifiable_name(name: &str) -> bool {
 /// is off by default. `max` is the ceiling that keeps a route table which
 /// suddenly grew from turning into an order per name against the authority's
 /// weekly limit.
+///
+/// # Who gets the ceiling when it is not enough for everybody
+///
+/// This used to be one alphabetical list, truncated. On a platform where
+/// tenants create their own routes that is a hole with a shape: thirty routes
+/// named `a001..a030.flood.example` sort before everything and take the whole
+/// ceiling, and every real domain on the platform silently drops out of
+/// certificate renewal and answers plain HTTP. Nobody has to break in to do
+/// it - it is what the ordering does to whoever names things late in the
+/// alphabet.
+///
+/// So the ceiling is shared, in two steps, and the order of the two is the
+/// policy:
+///
+/// 1. **The operator's own file first.** Names from this instance's
+///    configuration are the operator's decision and no tenant can add to that
+///    file, so they are not in competition with anybody. They take what they
+///    need, in order.
+/// 2. **Then one name per application, round after round**, applications in a
+///    stable order, until the ceiling is reached. Every application gets its
+///    first name before any application gets its second, so an application
+///    with thirty names cannot displace an application with one. Inside an
+///    application the order is alphabetical, which only decides which of
+///    *its own* names it gets - a cost it pays itself.
+///
+/// The ceiling is still a ceiling: on a platform that wants more names than
+/// it, somebody goes without, and the log says who. What changed is that the
+/// somebody is no longer decided by an attacker's choice of hostname.
 pub fn desired_names(
     routes: &RouteTable,
     catalog: &CatalogRoutes,
     include_preview: bool,
     max: usize,
 ) -> Vec<String> {
-    // A set, because the same name reaching this from both tables is the
-    // normal case - the control plane publishes a route for a domain an
-    // application here also lists - and ordering it twice would be two
-    // certificates for one name.
-    let mut wanted: BTreeSet<String> = BTreeSet::new();
+    // The operator's own file wins twice over: a name they already placed a
+    // certificate for is dropped entirely (ordering over it would spend a
+    // rate limit on a certificate the handshake never selects, since a
+    // configured certificate is what the SNI callback finds first), and what
+    // is left takes the ceiling before any tenant's name does.
+    let wanted =
+        |name: &String| is_certifiable_name(name) && !routes.has_configured_certificate_for(name);
 
-    for name in routes.served_names() {
-        wanted.insert(name);
-    }
-    for name in catalog.route_hosts() {
-        wanted.insert(name);
-    }
+    let configured: BTreeSet<String> = routes.served_names().into_iter().filter(wanted).collect();
+
+    // A set per application, because the same name reaching this from two of
+    // an application's routes is the normal case and ordering it twice would
+    // be two certificates for one name.
+    let mut by_app: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let add = |by_app: &mut BTreeMap<String, BTreeSet<String>>,
+               source: BTreeMap<String, BTreeSet<String>>| {
+        for (app, hosts) in source {
+            let entry = by_app.entry(app).or_default();
+            for host in hosts {
+                // Already taken by the operator's own file: not this
+                // application's to be charged for, and not to be ordered twice.
+                if wanted(&host) && !configured.contains(&host) {
+                    entry.insert(host);
+                }
+            }
+        }
+    };
+    add(&mut by_app, catalog.route_hosts_by_app());
     if include_preview {
-        for name in catalog.preview_hosts() {
-            wanted.insert(name);
+        add(&mut by_app, catalog.preview_hosts_by_app());
+    }
+
+    let mut chosen: BTreeSet<String> = BTreeSet::new();
+    let mut dropped: BTreeMap<String, usize> = BTreeMap::new();
+
+    for name in &configured {
+        if chosen.len() < max {
+            chosen.insert(name.clone());
+        } else {
+            *dropped
+                .entry("this instance's own configuration".to_string())
+                .or_default() += 1;
         }
     }
 
-    let mut chosen: Vec<String> = wanted
+    // One name per application, round after round. Each application keeps its
+    // remaining names in order and an index into them; a round that hands out
+    // nothing means every application is finished.
+    let mut queues: Vec<(String, Vec<String>, usize)> = by_app
         .into_iter()
-        .filter(|name| is_certifiable_name(name))
-        // The operator's own file wins. Ordering a certificate for a name
-        // they already placed one for would spend a rate limit on a
-        // certificate that is never selected, since a configured
-        // certificate is what the SNI callback finds first.
-        .filter(|name| !routes.has_configured_certificate_for(name))
+        .map(|(app, hosts)| (app, hosts.into_iter().collect(), 0usize))
         .collect();
-
-    if chosen.len() > max {
-        let dropped = chosen.len() - max;
-        warn!(
-            wanted = chosen.len(),
-            max,
-            dropped,
-            first_dropped = %chosen[max],
-            "more names want automatic certificates than tls.acme.max_names allows, so the last \
-             ones in alphabetical order get none and will only answer plain HTTP. The ceiling is \
-             there because a certificate authority counts new certificates per registered domain \
-             per week and refuses every name under the domain once that is spent, production \
-             included. Raise max_names deliberately, or give the extra names one certificate \
-             placed by hand"
-        );
-        chosen.truncate(max);
+    'rounds: loop {
+        let mut handed_out = false;
+        for (_, queue, taken) in queues.iter_mut() {
+            // A host two applications both route on is one certificate, and
+            // whichever of them reaches it first has paid for it. Skipping it
+            // here rather than letting the set swallow it is what keeps the
+            // second application's turn from being spent on nothing.
+            while *taken < queue.len() && chosen.contains(&queue[*taken]) {
+                *taken += 1;
+            }
+            if *taken >= queue.len() {
+                continue;
+            }
+            if chosen.len() >= max {
+                break 'rounds;
+            }
+            chosen.insert(queue[*taken].clone());
+            *taken += 1;
+            handed_out = true;
+        }
+        if !handed_out {
+            break;
+        }
     }
-    chosen
+
+    for (app, queue, taken) in queues {
+        let left = queue[taken.min(queue.len())..]
+            .iter()
+            .filter(|name| !chosen.contains(*name))
+            .count();
+        if left > 0 {
+            *dropped.entry(app).or_default() += left;
+        }
+    }
+
+    if !dropped.is_empty() {
+        let total: usize = dropped.values().sum();
+        let detail = dropped
+            .iter()
+            .map(|(owner, count)| format!("{owner}: {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            wanted = chosen.len() + total,
+            max,
+            dropped = total,
+            per_owner = %detail,
+            "more names want automatic certificates than tls.acme.max_names allows. The ceiling \
+             is shared: this instance's own configured names are taken first, and what is left \
+             goes round the applications one name each, so no single application can push the \
+             others out. The names that did not fit answer plain HTTP until the ceiling is \
+             raised. The ceiling is there because a certificate authority counts new certificates \
+             per registered domain per week and refuses every name under the domain once that is \
+             spent, production included. Raise max_names deliberately, or give the extra names one \
+             certificate placed by hand"
+        );
+    }
+
+    chosen.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -323,6 +421,108 @@ mod tests {
         assert_eq!(chosen.len(), 5);
         assert_eq!(chosen[0], "host00.example.com");
         assert_eq!(chosen[4], "host04.example.com");
+    }
+
+    /// The hole this policy exists to close. One application creates thirty
+    /// routes named so that they sort first; under alphabetical truncation
+    /// every other application's single name fell off the end of the ceiling
+    /// and answered plain HTTP for as long as the flood stayed.
+    #[test]
+    fn one_application_cannot_crowd_every_other_one_out_of_the_ceiling() {
+        let flood: String = (0..30)
+            .map(|n| {
+                format!(
+                    r#"{{"app_id":"flood","environment":"production","host":"a{n:03}.flood.example","path_prefix":"/","priority":0}}"#
+                )
+            })
+            .chain(["shop", "blog", "bank"].iter().map(|app| {
+                format!(
+                    r#"{{"app_id":"{app}","environment":"production","host":"{app}.example.com","path_prefix":"/","priority":0}}"#
+                )
+            }))
+            .collect::<Vec<_>>()
+            .join(",");
+        let catalog = catalog(&format!("[{flood}]"), "[]", None);
+        let table = routes(&[], None);
+
+        let chosen = desired_names(&table, &catalog, false, 5);
+        assert_eq!(chosen.len(), 5);
+        for real in ["bank.example.com", "blog.example.com", "shop.example.com"] {
+            assert!(
+                chosen.contains(&real.to_string()),
+                "{real} was pushed out of the ceiling by one tenant's flood: {chosen:?}"
+            );
+        }
+        assert_eq!(
+            chosen
+                .iter()
+                .filter(|name| name.ends_with(".flood.example"))
+                .count(),
+            2,
+            "the flooding application gets its share of the ceiling and no more: {chosen:?}"
+        );
+    }
+
+    /// The share is a share, not a cap of one: with room to spare, an
+    /// application with several names gets all of them.
+    #[test]
+    fn a_ceiling_nobody_is_pressing_against_hands_out_every_name() {
+        let catalog = catalog(
+            r#"[{"app_id":"shop","environment":"production","host":"a.example.com","path_prefix":"/"},
+                {"app_id":"shop","environment":"production","host":"b.example.com","path_prefix":"/"},
+                {"app_id":"blog","environment":"production","host":"c.example.com","path_prefix":"/"}]"#,
+            "[]",
+            None,
+        );
+        assert_eq!(
+            desired_names(&routes(&[], None), &catalog, false, 20),
+            vec![
+                "a.example.com".to_string(),
+                "b.example.com".to_string(),
+                "c.example.com".to_string(),
+            ]
+        );
+    }
+
+    /// Step one of the policy: this instance's own configuration is the
+    /// operator's decision and no tenant can add to it, so it is not in
+    /// competition with the catalog for the ceiling.
+    #[test]
+    fn the_operators_own_file_takes_the_ceiling_before_any_tenant_does() {
+        let table = routes(&[app("mine", &["operator.example.com"], &[])], None);
+        let catalog = catalog(
+            r#"[{"app_id":"tenant","environment":"production","host":"aaa.example.com","path_prefix":"/"},
+                {"app_id":"tenant","environment":"production","host":"bbb.example.com","path_prefix":"/"}]"#,
+            "[]",
+            None,
+        );
+        // Room for one name only, and `aaa.example.com` sorts first.
+        assert_eq!(
+            desired_names(&table, &catalog, false, 1),
+            vec!["operator.example.com".to_string()],
+            "a tenant name that sorts earlier must not displace the operator's own"
+        );
+    }
+
+    /// A host two applications both route on is one certificate, and taking
+    /// it must not spend the second application's turn.
+    #[test]
+    fn a_host_two_applications_share_costs_one_turn_between_them() {
+        let catalog = catalog(
+            r#"[{"app_id":"one","environment":"production","host":"shared.example.com","path_prefix":"/"},
+                {"app_id":"two","environment":"production","host":"shared.example.com","path_prefix":"/api"},
+                {"app_id":"two","environment":"production","host":"own.example.com","path_prefix":"/"}]"#,
+            "[]",
+            None,
+        );
+        assert_eq!(
+            desired_names(&routes(&[], None), &catalog, false, 2),
+            vec![
+                "own.example.com".to_string(),
+                "shared.example.com".to_string()
+            ],
+            "the shared name is ordered once and `two` still gets its own name"
+        );
     }
 
     #[test]

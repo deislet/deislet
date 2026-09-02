@@ -1,0 +1,179 @@
+//! No target is exempt from "the artifact has to be loadable".
+//!
+//! Three of the four vendors go through
+//! `deis_build_core::bundler::BuildBundler`, which resolves every specifier
+//! and refuses a bundle that still imports something nothing carries. One line
+//! in the compiler - `if vendor != "deno"` - put the fourth outside all of it,
+//! so this repository's own `crates/deis-build/examples/hello-world`, a single
+//! handler whose first line is `import { v4 as uuidv4 } from 'uuid'`, built
+//! green for deno and failed for tencent on exactly the same source. What the
+//! deno build produced was a program Deno refuses to load: a bare specifier is
+//! not a path, and the generated `deno.json` maps nothing to it, so the module
+//! throws as it is evaluated and the whole application serves nothing.
+//!
+//! The deno check is not the bundler's rule copied over - the two resolve
+//! differently on purpose, and a second copy of an allow-list is how two
+//! targets come to disagree. It reads the import map this build generated.
+
+use std::fs;
+use std::path::Path;
+
+use deis_build::{Compiler, CompilerOptions};
+
+fn stage(dir: &Path, vendor: &str, handler: &str) {
+    fs::create_dir_all(dir.join("functions")).expect("create the function root");
+    fs::write(dir.join("functions/index.ts"), handler).expect("write the handler");
+    fs::write(
+        dir.join(".config.json"),
+        format!(
+            r#"{{
+              "version": "1.0.0",
+              "name": "imports",
+              "runtime": "standard-v1",
+              "language": "typescript",
+              "functionRoot": "./functions",
+              "compatibilityDate": "2026-09-01",
+              "vendors": {{ "{vendor}": {{ "enabled": true }} }},
+              "build": {{ "outDir": "./dist" }}
+            }}"#
+        ),
+    )
+    .expect("write the project config");
+}
+
+async fn build(dir: &Path, vendor: &str) -> anyhow::Result<deis_build::CompilationResult> {
+    let compiler = Compiler::with_options(CompilerOptions {
+        project_dir: dir.to_string_lossy().to_string(),
+        ..Default::default()
+    });
+    compiler.compile(dir, vec![vendor.to_string()], false).await
+}
+
+/// The handler from `examples/hello-world`, reduced to the line that matters.
+const IMPORTS_A_BARE_NAME: &str = "import { v4 as uuidv4 } from 'uuid';\n\
+     export default async function handler(_c: any) { return new Response(uuidv4()); }\n";
+
+/// The same dependency written the way Deno resolves it with no map entry,
+/// which is what the deno adapter's own documentation tells an author to do.
+const IMPORTS_AN_NPM_SPECIFIER: &str = "import { v4 as uuidv4 } from 'npm:uuid@^9';\n\
+     export default async function handler(_c: any) { return new Response(uuidv4()); }\n";
+
+#[tokio::test]
+async fn a_bare_specifier_stops_the_deno_build_the_way_it_stops_the_others() {
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage(project.path(), "deno", IMPORTS_A_BARE_NAME);
+
+    let error = build(project.path(), "deno")
+        .await
+        .expect_err("a program Deno cannot load must not build")
+        .to_string();
+
+    assert!(error.contains("uuid"), "name the specifier: {error}");
+    assert!(
+        error.contains("index.ts"),
+        "and the author's own file: {error}"
+    );
+    assert!(
+        error.contains("whole application"),
+        "and what it costs, which is everything: {error}"
+    );
+
+    // Nothing runnable was left behind. `deno.json` is what `deno task start`
+    // reads and `_deis_internal/router.ts` is what it runs; neither may exist
+    // for a build that stopped.
+    let output = project.path().join("dist/deno");
+    assert!(
+        !output.join("deno.json").exists(),
+        "a build that could not produce a loadable program must not leave one behind"
+    );
+    assert!(!output.join("_deis_internal/router.ts").exists());
+}
+
+/// The claim the whole file exists for: the four targets now agree about the
+/// same source. Before this, one of these two built and the other did not.
+#[tokio::test]
+async fn the_bundled_targets_and_deno_agree_about_the_same_source() {
+    for vendor in ["deno", "tencent"] {
+        let project = tempfile::tempdir().expect("a temporary project");
+        stage(project.path(), vendor, IMPORTS_A_BARE_NAME);
+
+        // Matched rather than `expect_err`: a `CompilationResult` is not
+        // `Debug`-cheap to print and, more to the point, the assertion has to
+        // name the vendor that let it through - "one of these two built" is
+        // the entire defect.
+        if build(project.path(), vendor).await.is_ok() {
+            panic!(
+                "{vendor} built a handler importing a bare \"uuid\"; every target has to refuse \
+                 it, or the same source deploys on one and fails to load on another"
+            );
+        }
+    }
+}
+
+/// The check must not be in the way of the spelling the deno adapter tells
+/// authors to use. `npm:` needs no import-map entry and Deno resolves it
+/// itself, so a build carrying one is correct and has to stay green.
+#[tokio::test]
+async fn an_npm_specifier_still_builds_for_deno() {
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage(project.path(), "deno", IMPORTS_AN_NPM_SPECIFIER);
+
+    let result = build(project.path(), "deno")
+        .await
+        .expect("`npm:` is how the deno adapter says to name a dependency");
+    assert!(result.success);
+    assert!(project.path().join("dist/deno/deno.json").exists());
+}
+
+/// A relative import is Deno's own business and must not be caught by the bare
+/// specifier rule - the staged tree is where it resolves, and `deno check`
+/// reads it when deno is installed.
+#[tokio::test]
+async fn a_relative_import_between_handlers_still_builds_for_deno() {
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage(
+        project.path(),
+        "deno",
+        "import body from './body.ts';\n\
+         export default async function handler(_c: any) { return body(_c); }\n",
+    );
+    fs::write(
+        project.path().join("functions/body.ts"),
+        "export default function body(_c: any): Response { return new Response(\"b\"); }\n",
+    )
+    .expect("write the neighbour");
+
+    build(project.path(), "deno")
+        .await
+        .expect("a relative import is not a bare specifier");
+}
+
+/// A check that could not run is not a check that passed.
+///
+/// EdgeOne has no local dry-run, so a tencent artifact has only this
+/// compiler's own checks behind it. That used to be invisible: the arm did not
+/// exist, `verify_artifacts` fell into `_ => {}`, and the build reported the
+/// same clean result a verified one does. It is now carried in the build's
+/// warnings, which is what `deis build` counts in its summary.
+#[tokio::test]
+async fn a_target_with_no_vendor_tool_says_so_in_the_build() {
+    let project = tempfile::tempdir().expect("a temporary project");
+    stage(
+        project.path(),
+        "tencent",
+        "export default async function handler(_c: any) { return new Response(\"t\"); }\n",
+    );
+
+    let result = build(project.path(), "tencent")
+        .await
+        .expect("this project is correct");
+    let build = result.builds.get("tencent").expect("tencent was built");
+    assert!(
+        build
+            .warnings
+            .iter()
+            .any(|w| w.contains("not verified") && w.contains("EdgeOne")),
+        "the build has to carry the fact that nothing checked it: {:?}",
+        build.warnings
+    );
+}

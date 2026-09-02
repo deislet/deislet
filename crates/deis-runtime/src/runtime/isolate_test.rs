@@ -2284,9 +2284,17 @@ export default function handler(context: any): Response {
             elapsed < std::time::Duration::from_secs(10),
             "the 300ms budget did not stop a synchronous loop; it ran for {elapsed:?}"
         );
+        // The channel carries the reason. It used to be dropped instead, so
+        // the caller had nothing but its own guess for a dropped channel --
+        // "Runtime thread dropped" -- and that is what the client was shown in
+        // place of the cut-off. See `AppRuntime::execute_fetch`: every path out
+        // of one request now answers it.
+        let answered = rx
+            .await
+            .expect("the response channel must carry the reason rather than be dropped");
         assert!(
-            rx.await.is_err(),
-            "the response channel must be closed rather than left open forever"
+            answered.is_err(),
+            "a handler that was cut off must not look like an answer"
         );
 
         // The same isolate goes back to serving. A cut-off that left the
@@ -2421,7 +2429,15 @@ export default function handler(context: any): Response {
             )
             .await;
         let spun = started.elapsed();
-        assert!(rx.await.is_err(), "a cut-off request answers nobody");
+        // Answered, and answered with the failure: what the caller must not be
+        // given is a dropped channel it can say nothing about. See
+        // `a_handler_that_never_yields_is_still_cut_off`.
+        assert!(
+            rx.await
+                .expect("a cut-off request is still answered, with why")
+                .is_err(),
+            "a cut-off request must not look like an answer"
+        );
 
         let error = outcome
             .expect_err("a spinning handler must be cut off")

@@ -222,6 +222,24 @@ bundle_dir = "/var/lib/deis-control/bundles"
 # example.com/api/* and example.com/* can serve different applications and
 # different environments of the same one.
 #
+# A hostname is the one namespace on this platform that is global: an app id
+# belongs to whoever made the app and an environment name belongs to its app,
+# so a scope (deploy:<app>/<env>) can spell both, and nothing in that grammar
+# can say who owns example.com. So ownership is a table, not a scope, and it
+# is written through the API rather than through this file - one control
+# plane can feed several edges and outlive any file on this machine:
+#
+#   POST /api/domains {"pattern": "*.example.com", "app_id": "shop"}
+#
+# A route claiming a name no grant covers is refused, for everybody. That is
+# deliberate: without it, a credential scoped to one preview environment
+# could post any hostname on the internet into its own environment's route
+# list and take delivery of every request to it. On the first start after an
+# upgrade, every host this installation already routes becomes a grant to the
+# application that routes it, so nothing that already works stops working;
+# only a new name needs a decision. GET /api/domains is then the list of who
+# holds what.
+#
 # deis-proxy reads the whole table from GET /api/routing-table, with a
 # node_preshared_keys value, and swaps it in as one piece. There is nothing
 # to configure here: the polling interval belongs to the edge, in

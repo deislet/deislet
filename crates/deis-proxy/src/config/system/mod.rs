@@ -21,8 +21,9 @@ pub use balancing::BalancingStrategy;
 pub use cache::CacheConfig;
 pub use compression::{CompressionAlgo, CompressionConfig};
 pub use health::{
-    HealthCheckConfig, HealthCheckMode, NODE_READINESS_HEADER, READINESS_DEGRADED, READINESS_READY,
-    READINESS_STARTING, ReadinessPolicy, ReadinessVerdict, judge_readiness,
+    HealthCheckConfig, HealthCheckMode, NODE_READINESS_HEADER, NODE_REASON_HEADER,
+    READINESS_DEGRADED, READINESS_READY, READINESS_STARTING, ReadinessPolicy, ReadinessVerdict,
+    judge_readiness, node_reason,
 };
 pub use https::HttpsConfig;
 pub use log::*;
@@ -407,6 +408,31 @@ impl Validatable for SystemConfig {
                 message: "listen_ports must not contain 0".to_string(),
             });
         }
+        // The other way to end up with no listener, and the quiet one. An
+        // empty `listen_ports`, an empty `listen_addr`, or the two of them
+        // multiplying out to nothing produces a process that starts, logs
+        // that it is running, answers the control plane's heartbeats and
+        // serves not one request, because it never bound anything. There is
+        // no line anywhere else that says so.
+        //
+        // Refused rather than warned about, and it is safe to refuse: this
+        // runs while the process is still just a process, long before the
+        // readiness byte, so a replacement that fails here leaves the running
+        // one holding every listener. An HTTPS-only instance is unaffected -
+        // `tls.ports` counts as much as `listen_ports` does.
+        if self.listen_addresses().is_empty() {
+            return Err(ConfigError::ValidationError {
+                message: format!(
+                    "this configuration listens on nothing: listen_addr {:?} and listen_ports \
+                     {:?} with tls.ports {:?} produce no address at all, so the process would \
+                     start, report itself healthy and never serve a request. Name at least one \
+                     address and one port, in listen_ports or in tls.ports",
+                    self.listen_addrs(),
+                    self.listen_ports(),
+                    self.tls_ports(),
+                ),
+            });
+        }
         if let Some(threads) = self.worker_threads
             && threads == 0
         {
@@ -564,6 +590,48 @@ ports = [443]
         )
         .unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_configuration_that_listens_on_nothing_is_refused() {
+        // The quietest way to configure a proxy that serves nothing: not a
+        // port that fails to bind, but no port at all. The process starts,
+        // reports itself healthy to the control plane and answers no
+        // request, and nothing in the log says why.
+        for source in [
+            "listen_ports = []\n",
+            "listen_addr = []\n",
+            "listen_addr = []\nlisten_ports = [80]\n",
+        ] {
+            let config: SystemConfig = toml::from_str(source).unwrap();
+            let message = (SystemConfig::baseline() + config)
+                .validate()
+                .expect_err(&format!(
+                    "{source:?} listens on nothing and must be refused"
+                ))
+                .to_string();
+            assert!(
+                message.contains("listens on nothing"),
+                "the error has to name the rule: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_https_only_instance_is_not_refused_for_having_no_plain_ports() {
+        // The legitimate shape the rule above must not catch: an edge that
+        // terminates TLS and offers no plain HTTP at all.
+        let config: SystemConfig = toml::from_str(
+            r#"
+listen_ports = []
+[tls]
+ports = [443]
+"#,
+        )
+        .unwrap();
+        let merged = SystemConfig::baseline() + config;
+        assert_eq!(merged.listen_addresses(), vec!["0.0.0.0:443".to_string()]);
+        merged.validate().expect("HTTPS only is a real deployment");
     }
 
     #[test]

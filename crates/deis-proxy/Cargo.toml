@@ -20,7 +20,19 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0"
 regex = "1.11.1"
-nix = { version = "0.30.1", features = ["fs", "process", "signal", "user"] }
+# "socket" is what `proxy::inherited` asks the kernel with: getsockname,
+# SO_TYPE and SO_ACCEPTCONN, the three questions that separate a real
+# listening socket from whatever else a descriptor number might be. Named
+# here rather than left to feature unification with another crate in the
+# workspace, which would take it away the day that crate changed.
+nix = { version = "0.30.1", features = [
+    "fs",
+    "net",
+    "process",
+    "signal",
+    "socket",
+    "user",
+] }
 futures = "0.3"
 
 # Data plane: HTTP proxying, load balancing, TLS termination and

@@ -13,7 +13,7 @@
 use anyhow::Result;
 use colored::Colorize;
 
-use crate::commands::Session;
+use crate::commands::{Session, escaped};
 use crate::render::{Output, Table, age, timestamp};
 use crate::settings::Overrides;
 
@@ -122,15 +122,20 @@ pub async fn list(account: Option<String>, include_revoked: bool, output: Output
         "STATE",
     ]);
     for token in &response.tokens {
+        // Name, origin and scope list are strings the control plane stored
+        // as they arrived. A credential able to mint a token is able to
+        // choose all three, and this table is what an operator reads when
+        // deciding which credential to revoke - the worst place for a cell
+        // that can be made to read as a different row.
         table.row(vec![
-            token.id.clone(),
-            token.account.clone(),
-            token.name.clone(),
-            token.origin.clone(),
+            escaped(&token.id),
+            escaped(&token.account),
+            escaped(&token.name),
+            escaped(&token.origin),
             if token.unscoped {
                 "unscoped (full authority)".red().to_string()
             } else {
-                token.scopes.clone()
+                escaped(&token.scopes)
             },
             match token.last_used_at {
                 Some(at) => age(at),

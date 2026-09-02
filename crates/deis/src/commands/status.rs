@@ -11,7 +11,7 @@
 use anyhow::Result;
 use colored::Colorize;
 
-use crate::commands::Session;
+use crate::commands::{Session, escape_control, escaped};
 use crate::platform::EnvironmentView;
 use crate::platform::{Node, NodeAppStatus};
 use crate::render::{Output, Table, age, short_digest, timestamp};
@@ -139,22 +139,31 @@ fn print_environments(deployed: &[(String, EnvironmentView)]) {
         "AGE",
         "NOTE",
     ]);
+    // An environment name is checked on the way *in* by
+    // `deis_wire::conventions`, but this list came back from the control
+    // plane rather than from this process's argv, and a renderer that trusts
+    // a name because some other component was supposed to have checked it is
+    // the shape that put the other cells of this table on this list.
     for (name, current) in deployed {
         match current {
             EnvironmentView::Running(deployment) => table.row(vec![
-                name.clone(),
+                escaped(name),
                 deployment.version.number.to_string(),
-                short_digest(&deployment.version.bundle_sha),
+                escaped(&short_digest(&deployment.version.bundle_sha)),
                 timestamp(deployment.deployment.created_at),
                 age(deployment.deployment.created_at),
+                // A deploy note is free text somebody typed at `deis deploy
+                // -m`, stored by the control plane and read back here on
+                // every operator's terminal.
                 deployment
                     .deployment
                     .note
-                    .clone()
+                    .as_deref()
+                    .map(escaped)
                     .unwrap_or_else(|| "-".to_string()),
             ]),
             EnvironmentView::NeverDeployed => table.row(vec![
-                name.clone(),
+                escaped(name),
                 "-".to_string(),
                 "-".to_string(),
                 "never deployed".to_string(),
@@ -165,7 +174,7 @@ fn print_environments(deployed: &[(String, EnvironmentView)]) {
             // something, and what is missing is the authority to look. The
             // row is kept so the reader can see the environment exists.
             EnvironmentView::NotPermitted => table.row(vec![
-                name.clone(),
+                escaped(name),
                 "-".to_string(),
                 "-".to_string(),
                 "not visible to this credential".to_string(),
@@ -209,14 +218,19 @@ fn print_nodes(app: &str, reports: &[NodeReport]) {
 
         let Some(apps) = &report.apps else {
             table.row(vec![
-                report.node.id.clone(),
-                report.node.addr.clone(),
+                // A node's id, address and last error are what that node told
+                // the control plane about itself. A node is a peer, not a
+                // trusted half of this CLI, and `last_error` in particular is
+                // whatever string the failure carried.
+                escaped(&report.node.id),
+                escaped(&report.node.addr),
                 health,
                 "unknown".to_string(),
                 report
                     .node
                     .last_error
-                    .clone()
+                    .as_deref()
+                    .map(escaped)
                     .unwrap_or_else(|| "could not be asked".to_string()),
                 "-".to_string(),
                 "-".to_string(),
@@ -227,8 +241,8 @@ fn print_nodes(app: &str, reports: &[NodeReport]) {
         let mine: Vec<&NodeAppStatus> = apps.iter().filter(|s| s.app_id == app).collect();
         if mine.is_empty() {
             table.row(vec![
-                report.node.id.clone(),
-                report.node.addr.clone(),
+                escaped(&report.node.id),
+                escaped(&report.node.addr),
                 health,
                 "-".to_string(),
                 format!("not serving {app}"),
@@ -240,14 +254,20 @@ fn print_nodes(app: &str, reports: &[NodeReport]) {
 
         for status in mine {
             table.row(vec![
-                report.node.id.clone(),
-                report.node.addr.clone(),
+                escaped(&report.node.id),
+                escaped(&report.node.addr),
                 health.clone(),
-                status.environment.clone(),
+                escaped(&status.environment),
+                // `error_message` is the failure a node reports for one app -
+                // frequently the application's own thrown error, relayed.
                 if status.error_message.is_empty() {
-                    status.state.clone()
+                    escaped(&status.state)
                 } else {
-                    format!("{}: {}", status.state, status.error_message)
+                    format!(
+                        "{}: {}",
+                        escape_control(&status.state),
+                        escape_control(&status.error_message)
+                    )
                 },
                 status.request_count.to_string(),
                 status.error_count.to_string(),

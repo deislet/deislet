@@ -274,6 +274,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
     }
 
+    /// Hand one application every hostname. A route claim is refused unless
+    /// the platform granted the name (see `catalog::domains`), and these
+    /// tests are about the shape of the table rather than about who owns
+    /// what.
+    async fn grant_everything(router: &axum::Router, app: &str) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/domains")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"pattern":"*","app_id":"{app}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
     async fn create_route(router: &axum::Router, app: &str, env: &str, body: &str) {
         let response = router
             .clone()
@@ -296,6 +316,7 @@ mod tests {
         create_app(&harness.router, "shop").await;
         create_environment(&harness.router, "shop", "production").await;
         create_environment(&harness.router, "shop", "pr-42").await;
+        grant_everything(&harness.router, "shop").await;
         create_route(
             &harness.router,
             "shop",
@@ -340,6 +361,8 @@ mod tests {
         create_app(&harness.router, "shop").await;
         create_environment(&harness.router, "shop", "production").await;
 
+        grant_everything(&harness.router, "shop").await;
+
         let (_, first) = get_table(&harness.router, Some(TEST_NODE_KEY)).await;
         let (_, again) = get_table(&harness.router, Some(TEST_NODE_KEY)).await;
         assert_eq!(
@@ -376,6 +399,7 @@ mod tests {
         let harness = harness(true).await;
         create_app(&harness.router, "shop").await;
         create_environment(&harness.router, "shop", "production").await;
+        grant_everything(&harness.router, "shop").await;
         create_route(
             &harness.router,
             "shop",

@@ -113,6 +113,8 @@ Everything below is on the single configured port.
 | `/api/apps/:app_id/environments/:env/secrets` | GET | Names and times only — no endpoint returns a value |
 | `/api/apps/:app_id/environments/:env/secrets/:name` | PUT, DELETE | |
 | `/api/routes` | GET | Every route in the catalog, keyed by `env_id`. The human-facing view; the data plane reads a different one, see below |
+| `/api/domains` | GET, POST | Who may claim which hostname. A hostname is the one global namespace here and no scope can spell one, so a route claim is refused unless a grant covers it. `admin:*/*` |
+| `/api/domains/:pattern` | DELETE | Withdraw a grant. The routes created under it keep serving; the claim can no longer be re-made |
 | `/api/apps/:app_id/environments/:env/storage-token` | GET | A capability token for this tenant, the store address, and the tenant name. What `deis kv` / `deis db` / `deis blob` call so nobody has to mint a token by hand. 409 when no `store_endpoint` is configured |
 
 An upload whose bytes are identical to an existing version reuses that version

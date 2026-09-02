@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use colored::Colorize;
 
-use crate::commands::Session;
+use crate::commands::{Session, escape_control, escaped};
 use crate::render::{
     BytesForDisplay, Output, Table, age, base64_encode, bytes_for_display, confirm_destructive,
     timestamp,
@@ -99,6 +99,18 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
         // Nothing asked to keep it on disk: the value itself is the whole of
         // stdout when it is text, so `deis kv get key > out.txt` captures
         // exactly the value and nothing else.
+        //
+        // Deliberately *not* escaped, and the only place in this command tree
+        // that is. Here the value is the payload rather than a line of a
+        // report: escaping it would mean `deis kv get` could no longer be
+        // used to fetch a value, which is the whole of what it is for. The
+        // rule this tree follows is that text is escaped when it is rendered
+        // *within* something - a table cell, a log line, a listing - and left
+        // alone when it is the entirety of stdout and a redirect is the
+        // expected use. `--file` writes it without it passing a terminal at
+        // all, and is what to reach for with a value of unknown provenance.
+        // `deis queue dead-letters` shows a body inside a report and
+        // therefore escapes it (`body_preview`); this does not.
         None => match bytes_for_display(&value.value) {
             BytesForDisplay::Text(text) => println!("{text}"),
             BytesForDisplay::Binary { len, preview_hex } => println!(
@@ -112,7 +124,13 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
         },
     }
     if let Some(metadata) = &value.metadata {
-        eprintln!("{}", format!("metadata: {metadata}").dimmed());
+        // A report line about the value, not the value: escaped, unlike the
+        // payload above. It is also on stderr, so it is not part of what a
+        // redirect captures and cannot be anything but a thing read.
+        eprintln!(
+            "{}",
+            format!("metadata: {}", escape_control(metadata)).dimmed()
+        );
     }
     if let Some(expires_at) = value.expires_at {
         eprintln!(
@@ -271,9 +289,17 @@ pub async fn list(args: ListArgs, output: Output) -> Result<()> {
     }
     let mut table = Table::new(&["KEY", "METADATA", "EXPIRES"]);
     for entry in &page.entries {
+        // A KV key and its metadata are whatever the application wrote; an
+        // application can put an escape sequence in a key it never intends to
+        // read back, purely so that the next operator to list the namespace
+        // reads a screen the application composed.
         table.row(vec![
-            entry.key.clone(),
-            entry.metadata.clone().unwrap_or_else(|| "-".to_string()),
+            escaped(&entry.key),
+            entry
+                .metadata
+                .as_deref()
+                .map(escaped)
+                .unwrap_or_else(|| "-".to_string()),
             entry
                 .expires_at
                 .map(timestamp)
@@ -285,7 +311,11 @@ pub async fn list(args: ListArgs, output: Output) -> Result<()> {
     if let Some(cursor) = &page.next_cursor {
         println!(
             "\n  {}",
-            format!("more keys exist; continue with --cursor {cursor}").dimmed()
+            format!(
+                "more keys exist; continue with --cursor {}",
+                escape_control(cursor)
+            )
+            .dimmed()
         );
     }
     Ok(())

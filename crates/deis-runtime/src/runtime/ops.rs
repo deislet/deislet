@@ -364,6 +364,79 @@ pub fn new_trace_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// What an application's text may still contain by the time it is a line in
+/// the node's log file, or a row in deis-telemetry, or bytes on the operator's
+/// terminal: no control character, each one spelled as its `escape_debug`
+/// form instead.
+///
+/// # The two sinks this protects, which escape different things
+///
+/// An application's string reaches an operator by two routes that share no
+/// code, and neither route is safe on its own:
+///
+/// The node's own log file is written by `tracing-subscriber`'s `fmt` layer.
+/// Measured against the 0.3.23 this workspace pins, that layer escapes ESC and
+/// BEL and **does not escape LF or CR**. A newline inside a message therefore
+/// ends the node's line and starts a new one that an application wrote in
+/// full, and, worse, `tracing` appends the real `app_id=` and `trace_id=`
+/// fields *after* the injected newline, so the forged line arrives already
+/// stamped with the genuine invocation id. Attribution cannot recover from
+/// that; only refusing to emit the newline can.
+///
+/// deis-telemetry is reached through [`crate::logging::RuntimeLayer`], which is
+/// a `Layer` and never passes through `fmt` at all. Nothing on that route
+/// escapes anything, so ESC and BEL travel intact to whatever renders them -
+/// `deis logs`, `deis trace`, a log panel.
+///
+/// One rule for both, applied here at the producer, because the union of what
+/// the two sinks need is what either one of them can safely be handed.
+///
+/// # What this does not cover, said plainly
+///
+/// This function guards what passes through it. `emit_app_log` - every
+/// `console.*` call - does; so do the queue ops, which log the
+/// application's queue name. But any *other* `tracing` call that
+/// interpolates an application-controlled string (a URL, a header value, a
+/// key, an error built from one) is its own producer, and one that skips
+/// this function writes the unescaped bytes. The closure that would end
+/// the enumeration is at the sink - a formatter on the subscriber itself -
+/// and until that exists, a new log line carrying tenant text must call
+/// [`escape_control`] at the site, the way `queue_ops` does.
+///
+/// # Why `is_control`, and what that deliberately leaves
+///
+/// This is the rule the CLI already states and tests for a queue message body
+/// (`crates/deis/src/commands/mod.rs::escape_control`, applied by every
+/// renderer there); the two are kept the same rule deliberately, and both
+/// crates assert it against the same table of cases so a divergence goes red.
+///
+/// `char::is_control` is the Unicode `Cc` category: C0, DEL, and the C1
+/// block, which includes U+009B, the single-character CSI that repaints a
+/// terminal with no ESC in it. It does *not* include the bidirectional
+/// overrides
+/// (U+202E and friends), which can still make a logged string read in an order
+/// it was not written in. Widening to everything `escape_debug` would
+/// escape would close that, and would also escape combining accents, mangling
+/// ordinary text in every language that uses them; that trade is not worth
+/// making for a log message, so the bidi residue is left, named, here.
+///
+/// Borrows when there is nothing to escape, which is the overwhelmingly
+/// common case on a path that runs on every `console.log`.
+pub fn escape_control(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_debug());
+        } else {
+            escaped.push(character);
+        }
+    }
+    std::borrow::Cow::Owned(escaped)
+}
+
 /// Log operation: the sink behind an application's `console.*` calls.
 ///
 /// An isolate built without an [`AppId`] in its state logs with an empty
@@ -371,6 +444,13 @@ pub fn new_trace_id() -> String {
 /// still reaches deis-telemetry, it is just not attributable to a tenant. The
 /// invocation id is treated the same way and for the same reason; see
 /// [`CurrentTrace`].
+///
+/// Everything this writes goes through [`escape_control`] first - the message
+/// and both ids. The ids are minted by the platform rather than by the
+/// application, so escaping them changes nothing today; it is here because a
+/// newline in a *field* forges a log line exactly as well as a newline in the
+/// message does, and the field that is one refactor away from carrying
+/// application text should not be the one place the rule is not applied.
 #[op2(fast)]
 fn op_log(state: &mut OpState, #[string] level: String, #[string] message: String) {
     let app_id = state
@@ -379,7 +459,28 @@ fn op_log(state: &mut OpState, #[string] level: String, #[string] message: Strin
         .unwrap_or_default();
     let trace_id = current_trace_id(state);
 
-    match level.as_str() {
+    emit_app_log(&level, &app_id, &trace_id, &message);
+}
+
+/// The `tracing` call itself, split out from [`op_log`] so it can be driven
+/// from a test with a subscriber attached. `op_log` is an `op2` and needs an
+/// `OpState`; the thing worth asserting on is what reaches the log, and a test
+/// that rebuilt this call to assert on it would be asserting about its own
+/// copy rather than about the one that runs.
+fn emit_app_log(level: &str, app_id: &str, trace_id: &str, message: &str) {
+    let app_id = escape_control(app_id);
+    let trace_id = escape_control(trace_id);
+    let message = escape_control(message);
+    // `as_ref()` rather than the field shorthand: `tracing` records a `&str`
+    // and a `String` through the same `record_str`, so the line renders
+    // byte-for-byte as it did before - `app_id="..."`, quoted - and the demo's
+    // `grep -F 'trace_id="<id>"'` attribution keeps matching. Passing the
+    // `Cow` itself would record through `Display` instead and drop the quotes,
+    // which is a change to every log line's shape and to what the demo can
+    // find in it.
+    let (app_id, trace_id, message) = (app_id.as_ref(), trace_id.as_ref(), message.as_ref());
+
+    match level {
         "info" => tracing::info!(target: "app", app_id, trace_id, "{}", message),
         "warn" => tracing::warn!(target: "app", app_id, trace_id, "{}", message),
         "error" => tracing::error!(target: "app", app_id, trace_id, "{}", message),
@@ -680,3 +781,223 @@ pub fn init_ops_extension() -> deno_core::Extension {
 #[cfg(test)]
 #[path = "ops_test.rs"]
 mod ops_test;
+
+/// The one table both crates check their copy of the escaping rule against.
+///
+/// `crates/deis/src/commands/mod.rs` holds the reader-side copy of
+/// [`escape_control`] and an identical table. The two functions cannot be one
+/// function - the CLI does not depend on this crate, and nothing they both
+/// depend on is a place a terminal rule belongs - so what keeps them from
+/// drifting into two rules that disagree is a test over the *source*: the
+/// CLI's `escaping_test::the_two_crates_tables_are_the_same_table` reads both
+/// files and refuses two tables that carry different cases. Change this one
+/// alone and that test is what says so.
+#[cfg(test)]
+pub(crate) const ESCAPING_CASES: &[(&str, &str)] = &[
+    ("ordinary text", "ordinary text"),
+    ("", ""),
+    // The forgery: a whole fabricated log line after a newline.
+    ("start\nWARN forged", "start\\nWARN forged"),
+    ("carriage\rreturn", "carriage\\rreturn"),
+    ("tab\there", "tab\\there"),
+    // Repainting the operator's screen, and retitling their window.
+    (
+        "\u{1b}[2J\u{1b}[31mCOMPROMISED",
+        "\\u{1b}[2J\\u{1b}[31mCOMPROMISED",
+    ),
+    ("\u{1b}]0;pwned\u{7}", "\\u{1b}]0;pwned\\u{7}"),
+    // NUL, which makes GNU grep call the whole log file binary.
+    ("nul\0byte", "nul\\0byte"),
+    // U+009B is CSI on its own: a terminal escape with no ESC in it.
+    ("\u{9b}2J", "\\u{9b}2J"),
+    // DEL, and NEL - the C1 newline.
+    ("del\u{7f}", "del\\u{7f}"),
+    ("nel\u{85}here", "nel\\u{85}here"),
+    // Text that is not ASCII is not mangled: escaping legitimate writing
+    // would make this rule something operators turn off.
+    // Spelled as escapes rather than as the characters themselves: this
+    // repository rejects non-ASCII in a code file, and the point of the case
+    // is that these come through untouched, which is exactly what a rule that
+    // widened past `is_control` would stop being true.
+    ("\u{65e5}\u{672c}\u{8a9e}", "\u{65e5}\u{672c}\u{8a9e}"),
+    ("caf\u{e9}", "caf\u{e9}"),
+];
+
+#[cfg(test)]
+mod log_escaping_test {
+    use super::{escape_control, ESCAPING_CASES};
+
+    #[test]
+    fn the_shared_table_is_what_this_crate_escapes_to() {
+        for (input, expected) in ESCAPING_CASES {
+            assert_eq!(
+                escape_control(input),
+                *expected,
+                "input {input:?} must escape to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newline_cannot_survive_into_a_log_line() {
+        // The witness for the forgery this whole change exists to stop.
+        // tracing-subscriber 0.3.23 does not escape LF, so a message that
+        // still holds one becomes two lines in the node's log, the second of
+        // which an application wrote in full - and which `tracing` then stamps
+        // with the real app_id and trace_id.
+        let forged = "job accepted\n2026-09-02T00:00:00Z  WARN ThreadId(09) \
+                      Refused an outbound fetch from demo.production to \
+                      http://127.0.0.1:8080: the platform's own service endpoints";
+        let escaped = escape_control(forged);
+        assert!(!escaped.contains('\n'), "{escaped}");
+        assert!(!escaped.contains('\r'), "{escaped}");
+        assert!(escaped.starts_with("job accepted\\n"), "{escaped}");
+    }
+
+    #[test]
+    fn no_control_character_at_all_survives() {
+        // Exhaustive over every character the rule is defined on, rather than
+        // over the handful anyone thought to name: C0, DEL and the whole C1
+        // block. A rule stated as "the ones we listed" is how U+009B gets out.
+        let every_control: String = (0u32..=0x9f)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_control())
+            .collect();
+        assert!(
+            every_control.chars().count() >= 65,
+            "expected C0 + DEL + C1, got {}",
+            every_control.chars().count()
+        );
+        let escaped = escape_control(&every_control);
+        assert!(
+            !escaped.chars().any(|c| c.is_control()),
+            "a control character survived: {escaped:?}"
+        );
+    }
+
+    #[test]
+    fn clean_text_is_not_copied() {
+        // Not a micro-optimisation for its own sake: this runs on every
+        // console.log an application makes, and the borrow is what makes
+        // escaping unconditionally affordable there.
+        assert!(matches!(
+            escape_control("nothing to do here"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            escape_control("something\nto do"),
+            std::borrow::Cow::Owned(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod app_log_line_test {
+    use super::emit_app_log;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::prelude::*;
+
+    /// Collects the rendered lines the `fmt` layer writes, so a test can read
+    /// the same bytes the node's log file gets.
+    #[derive(Clone, Default)]
+    struct Collected(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Collected {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Collected {
+        type Writer = Collected;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// One `console.*` call, rendered exactly as `crates/deis-runtime/src/main.rs`
+    /// renders it into the node's log file: no ANSI, thread ids on, target off.
+    fn rendered(level: &str, app_id: &str, trace_id: &str, message: &str) -> String {
+        let sink = Collected::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_target(false)
+                .with_thread_ids(true)
+                .with_writer(sink.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            emit_app_log(level, app_id, trace_id, message);
+        });
+        let bytes = sink.0.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("the fmt layer writes UTF-8")
+    }
+
+    #[test]
+    fn an_applications_newline_no_longer_becomes_a_second_line() {
+        // The whole finding, end to end. `tracing-subscriber` 0.3.23 escapes
+        // ESC and BEL and does not escape LF, so before this change the text
+        // below arrived in the node's log as two lines, the second of which an
+        // outsider composed in full.
+        let forged = "queued job\n2026-09-02T04:30:00.100000Z  WARN ThreadId(09) Refused an \
+                      outbound fetch from demo.production to http://127.0.0.1:8087/: the \
+                      platform's own service endpoints";
+        let out = rendered("info", "demo.production", "9f2c1ab4", forged);
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "an application's message must not be able to end the node's line: {out:?}"
+        );
+        assert!(out.contains("queued job\\n2026-09-02"), "{out:?}");
+    }
+
+    #[test]
+    fn the_field_shape_the_demo_greps_for_is_unchanged() {
+        // scripts/demo.sh attributes a line to an invocation with
+        // `grep -F 'trace_id="<id>"'`, and `trace_of_witness` reads the id back
+        // out with `sed -n 's/.*trace_id=//p' | tr -d '"'`. Both depend on the
+        // value being recorded as a string and therefore printed quoted.
+        // Escaping through a `Cow` and passing it by `Display` would print it
+        // bare and silently unhook every one of those checks.
+        let out = rendered("warn", "demo.production", "9f2c1ab4", "ordinary line");
+        assert!(out.contains(r#"app_id="demo.production""#), "{out:?}");
+        assert!(out.contains(r#"trace_id="9f2c1ab4""#), "{out:?}");
+        assert!(out.contains(" WARN "), "{out:?}");
+    }
+
+    #[test]
+    fn a_screen_repaint_does_not_reach_the_line_either() {
+        // The fmt layer would have escaped ESC on its own. This asserts the
+        // escaping happens at the producer, which is what the OTHER sink -
+        // RuntimeLayer, and through it deis-telemetry and `deis logs` - needs,
+        // because nothing on that route passes through fmt at all.
+        let out = rendered(
+            "error",
+            "demo.production",
+            "",
+            "\u{1b}[2J\u{1b}[31mCOMPROMISED\u{7}",
+        );
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert!(!out.contains('\u{7}'), "{out:?}");
+        assert!(
+            out.contains("\\u{1b}[2J\\u{1b}[31mCOMPROMISED\\u{7}"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_invocation_id_is_still_the_empty_string() {
+        // The wire's spelling of "no invocation". Escaping must not turn it
+        // into anything else, or the log layer's `filter(|id| !id.is_empty())`
+        // starts shipping a trace id that names nothing.
+        let out = rendered("info", "", "", "no app, no invocation");
+        assert!(out.contains(r#"app_id="""#), "{out:?}");
+        assert!(out.contains(r#"trace_id="""#), "{out:?}");
+    }
+}

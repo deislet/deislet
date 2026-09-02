@@ -27,6 +27,90 @@ use crate::platform::queue::QueueSession;
 use crate::platform::storage::StorageSession;
 use crate::settings::{Overrides, Settings};
 
+/// What a string that arrived over the wire may still contain by the time it
+/// is bytes on the operator's terminal: no control character, each one spelled
+/// as its `escape_debug` form instead.
+///
+/// # Why this is at the reader and not only at the writer
+///
+/// `crates/deis-runtime/src/runtime/ops.rs::op_log` applies the same rule to
+/// an application's `console.*` text before it becomes a `tracing` event, and
+/// that is the fix for the node's own log file. It is not enough here. Every
+/// string this CLI prints came back from deis-control, deis-telemetry,
+/// deis-store or deis-queue, and those services log and store text from
+/// producers this CLI has no say over: a queue message body, an audit entry's
+/// peer address, a node's `last_error`, a blob key, a log entry written by a
+/// node running an older build than the one that escapes. Escaping only at
+/// the writer means every one of those is a hole the day a new writer appears.
+///
+/// # What a terminal does with what is not escaped
+///
+/// `\x1b[2J\x1b[H` clears the screen and homes the cursor, so an application
+/// can make `deis logs` print a report that is entirely its own; `\x1b]0;...\x07`
+/// retitles the operator's window; a bare `\n` splits one entry into what
+/// reads as two; `\r` overwrites the line just printed. None of this needs a
+/// TTY on the far end - it is bytes in a pipe until something renders them,
+/// which is why "stdout is redirected" is not a defence.
+///
+/// # One rule, in two crates, kept one rule
+///
+/// `escape_control` in `crates/deis-runtime/src/runtime/ops.rs` is the same
+/// function. They cannot be one function - this crate does not depend on
+/// deis-runtime, and neither belongs in `deis-wire`, which is the wire format
+/// rather than a rendering rule - so what stops them becoming two rules that
+/// disagree is `escaping_test::the_two_crates_tables_are_the_same_table`
+/// below, which reads both source files and refuses two tables that carry
+/// different cases. Each crate then asserts its own `escape_control` against
+/// its own copy, which closes the loop: same cases, and each function held
+/// to them.
+///
+/// `char::is_control` is Unicode `Cc`: C0, DEL, and the C1 block, which
+/// includes U+009B - CSI as a single character, a terminal escape containing
+/// no ESC to grep for. Bidirectional overrides (U+202E) are `Cf`, not `Cc`,
+/// and are deliberately left: escaping everything `escape_debug` escapes would
+/// also escape combining accents and mangle ordinary text in most of the
+/// languages that are not English.
+///
+/// Borrows when there is nothing to escape, which is nearly every string.
+pub fn escape_control(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        push_escaped(&mut out, character);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The whole of the decision [`escape_control`] is made of, for one character,
+/// and the number of characters it appended.
+///
+/// Split out so that a renderer with a length ceiling to keep -
+/// `queue::body_preview` is the one - can hold the ceiling against what the
+/// terminal will actually see without owning a second opinion about what a
+/// character escapes to. One character escaping to six is exactly why that
+/// renderer needs the count, and a second copy of the escaping to get it is
+/// exactly how two renderers end up disagreeing about what is safe.
+pub fn push_escaped(out: &mut String, character: char) -> usize {
+    if !character.is_control() {
+        out.push(character);
+        return 1;
+    }
+    let mut appended = 0usize;
+    for escaped in character.escape_debug() {
+        out.push(escaped);
+        appended += 1;
+    }
+    appended
+}
+
+/// [`escape_control`] for a value that is about to be handed to something
+/// wanting an owned `String` - a table cell, mostly.
+pub fn escaped(text: &str) -> String {
+    escape_control(text).into_owned()
+}
+
 /// The project directory a command works in: wherever it was run.
 ///
 /// Deliberately not a search up the tree. `deis build` has always used the
@@ -177,5 +261,107 @@ impl Session {
 
         let credentials = self.control.storage_credentials(app, environment).await?;
         QueueSession::connect(&endpoint, &tenant, credentials.token.as_deref())
+    }
+}
+
+/// `--json` output is deliberately *not* escaped by these: `serde_json`
+/// already escapes every control character on its way into a JSON string, and
+/// escaping first would show an operator `\\n` where their data has a
+/// newline. The rule is for the human renderer only.
+#[cfg(test)]
+pub(crate) const ESCAPING_CASES: &[(&str, &str)] = &[
+    ("ordinary text", "ordinary text"),
+    ("", ""),
+    ("start\nWARN forged", "start\\nWARN forged"),
+    ("carriage\rreturn", "carriage\\rreturn"),
+    ("tab\there", "tab\\there"),
+    (
+        "\u{1b}[2J\u{1b}[31mCOMPROMISED",
+        "\\u{1b}[2J\\u{1b}[31mCOMPROMISED",
+    ),
+    ("\u{1b}]0;pwned\u{7}", "\\u{1b}]0;pwned\\u{7}"),
+    ("nul\0byte", "nul\\0byte"),
+    ("\u{9b}2J", "\\u{9b}2J"),
+    ("del\u{7f}", "del\\u{7f}"),
+    ("nel\u{85}here", "nel\\u{85}here"),
+    ("\u{65e5}\u{672c}\u{8a9e}", "\u{65e5}\u{672c}\u{8a9e}"),
+    ("caf\u{e9}", "caf\u{e9}"),
+];
+
+#[cfg(test)]
+mod escaping_test {
+    use super::{ESCAPING_CASES, escape_control, escaped};
+
+    /// The module header's claim - one rule, in two crates, kept one rule -
+    /// enforced rather than remembered. The two copies of `ESCAPING_CASES`
+    /// cannot reference each other (the crates do not depend on each other),
+    /// so this reads both source files and compares the tables' cases with
+    /// each file's own comments and whitespace stripped. Change one table
+    /// alone and this is the test that says so.
+    #[test]
+    fn the_two_crates_tables_are_the_same_table() {
+        fn cases_of(source: &str, file: &str) -> String {
+            let marker = "ESCAPING_CASES: &[(&str, &str)] = &[";
+            let start = source
+                .find(marker)
+                .unwrap_or_else(|| panic!("{file} no longer declares ESCAPING_CASES"));
+            let rest = &source[start + marker.len()..];
+            let end = rest
+                .find("];")
+                .unwrap_or_else(|| panic!("{file}: the table never closes"));
+            rest[..end]
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or("").trim())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .concat()
+        }
+        let own = cases_of(include_str!("mod.rs"), "deis/src/commands/mod.rs");
+        let sibling_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../deis-runtime/src/runtime/ops.rs"
+        );
+        let sibling = std::fs::read_to_string(sibling_path)
+            .expect("the sibling table's file is in this workspace");
+        assert_eq!(
+            own,
+            cases_of(&sibling, "deis-runtime/src/runtime/ops.rs"),
+            "the two ESCAPING_CASES tables have drifted apart; whichever case changed, \
+             change it in both files or the two renderers disagree about what an operator sees"
+        );
+    }
+
+    #[test]
+    fn the_shared_table_is_what_this_crate_escapes_to() {
+        // The runtime asserts its own copy of the table against its own
+        // `escape_control`; `the_two_crates_tables_are_the_same_table` above
+        // is what holds the two copies to the same cases.
+        for (input, expected) in ESCAPING_CASES {
+            assert_eq!(
+                escape_control(input),
+                *expected,
+                "input {input:?} must escape to {expected:?}"
+            );
+            assert_eq!(escaped(input), *expected);
+        }
+    }
+
+    #[test]
+    fn no_control_character_at_all_survives() {
+        let every_control: String = (0u32..=0x9f)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_control())
+            .collect();
+        assert!(every_control.chars().count() >= 65);
+        let rendered = escape_control(&every_control);
+        assert!(!rendered.chars().any(|c| c.is_control()), "{rendered:?}");
+    }
+
+    #[test]
+    fn clean_text_is_not_copied() {
+        assert!(matches!(
+            escape_control("nothing to do"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

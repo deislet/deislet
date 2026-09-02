@@ -55,15 +55,32 @@
 //! one parameter; see [`narrowing_query_value`] for why it narrows the demand
 //! only for a spelling that can mean one environment and nothing else.
 //!
-//! # The body is read for exactly two routes
+//! # The body is read for exactly four routes
 //!
 //! `POST /api/apps` and `POST /api/apps/:app/environments` name the thing
 //! they create in the request body, not in the path, and `deis deploy` calls
 //! both of them for a CI credential that is scoped to one environment. So the
-//! gate peeks at those two bodies - and only those two, capped at
-//! [`MAX_BODY_PEEK_BYTES`], with the body handed on to the handler unchanged.
-//! No route that carries a secret is on that list, which is what keeps a
-//! value out of the audit log by construction rather than by care.
+//! gate peeks at those two bodies and narrows the demand to the name it finds.
+//!
+//! The two route writes - `POST` and `PUT` on
+//! `/api/apps/:app/environments/:env/routes` - are read for a different
+//! reason, and it is worth being exact about which. Their body names a
+//! **hostname**, and a hostname is global: `deploy:<app>/<env>` has no
+//! spelling for one, so there is nothing here for the demand to become. What
+//! decides whether this application may claim that name is the platform's
+//! grant registry, read in `catalog::store::CatalogStore::create_route`
+//! inside the same database call that writes the row - one rule, in one
+//! place. What the gate takes from the body is the *record*: the host, the
+//! path prefix and the priority go into the audit line's target, on the
+//! refusals as well as on the successes. Before that, the three rows a
+//! hostname hijack left in the log were byte-identical with `"target": null`,
+//! and the one record that could have found the abuse afterwards did not
+//! contain the hostname.
+//!
+//! Four bodies, and only those four, capped at [`MAX_BODY_PEEK_BYTES`], with
+//! the body handed on to the handler unchanged. No route that carries a
+//! secret is on that list, which is what keeps a value out of the audit log
+//! by construction rather than by care.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -136,11 +153,27 @@ const CROSS_ORIGIN_DETAIL: &str = "This control plane requires no credential \
 /// two together.
 const UNGATED_PATHS: [&str; 1] = ["/health"];
 
-/// Which component of the resource a route names in its body.
+/// What a route names in its request body rather than in its URL, and what
+/// the gate does about it.
+///
+/// Two of these narrow the *demand* - the caller must hold a scope for the
+/// application or environment they are creating. The third narrows nothing,
+/// because no scope can spell a hostname: it fills in the audit line's
+/// target so the record of a route write says which address was claimed. The
+/// claim itself is authorised against the platform's grant registry, in
+/// `catalog::store::CatalogStore::create_route`, inside the same database
+/// call that writes the row. Splitting that between here and there would be
+/// two rules that can disagree, and this one would be the copy that went
+/// stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyComponent {
+pub enum BodyClaim {
+    /// The application being created, named by `id`.
     App,
+    /// The environment being created, named by `name`.
     Environment,
+    /// The address a route claims: `host`, `path_prefix`, `priority`. Read
+    /// for the record, not for the demand.
+    RouteAddress,
 }
 
 /// One component of what a request is about, before the body has been read.
@@ -199,9 +232,8 @@ pub struct Requirement {
     /// route id, a token id. Never a value.
     pub target: Option<String>,
     pub audit: AuditWhen,
-    /// The component this route names in its body instead of in its path,
-    /// and the JSON field that holds it.
-    pub from_body: Option<(BodyComponent, &'static str)>,
+    /// What this route names in its body instead of in its path.
+    pub from_body: Option<BodyClaim>,
 }
 
 impl Requirement {
@@ -227,8 +259,8 @@ impl Requirement {
         self
     }
 
-    fn named_in_body(mut self, component: BodyComponent, field: &'static str) -> Self {
-        self.from_body = Some((component, field));
+    fn named_in_body(mut self, claim: BodyClaim) -> Self {
+        self.from_body = Some(claim);
         self
     }
 }
@@ -307,7 +339,7 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             Resource::Any,
             Resource::Any,
         )
-        .named_in_body(BodyComponent::App, "id")
+        .named_in_body(BodyClaim::App)
         .changes_state(),
 
         ["api", "apps", app] if !writing => {
@@ -367,7 +399,7 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
             named(app),
             Resource::Any,
         )
-        .named_in_body(BodyComponent::Environment, "name")
+        .named_in_body(BodyClaim::Environment)
         .changes_state(),
 
         ["api", "apps", app, "environments", env] => {
@@ -390,8 +422,16 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         ["api", "apps", app, "environments", env, "routes"] if !writing => {
             Requirement::new("route.list", Verb::Read, named(app), named(env))
         }
+        // The two calls that claim a hostname. The demand is the caller's own
+        // application and environment, because that is all a scope can say;
+        // the address being claimed is read out of the body so the audit line
+        // names it, and is authorised against the platform's grant registry
+        // in `catalog::store`. Three byte-identical `"target": null` rows
+        // were what the log had of the hijack that prompted this.
         ["api", "apps", app, "environments", env, "routes"] => {
-            Requirement::new("route.create", Verb::Deploy, named(app), named(env)).changes_state()
+            Requirement::new("route.create", Verb::Deploy, named(app), named(env))
+                .named_in_body(BodyClaim::RouteAddress)
+                .changes_state()
         }
         ["api", "apps", app, "environments", env, "routes", route] if method == Method::DELETE => {
             Requirement::new("route.delete", Verb::Deploy, named(app), named(env))
@@ -401,6 +441,7 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         ["api", "apps", app, "environments", env, "routes", route] => {
             Requirement::new("route.update", Verb::Deploy, named(app), named(env))
                 .about(route)
+                .named_in_body(BodyClaim::RouteAddress)
                 .changes_state()
         }
 
@@ -479,6 +520,37 @@ pub fn classify(method: &Method, path: &str, query: Option<&str>) -> Requirement
         ["api", "audit"] => {
             Requirement::new("audit.read", Verb::Admin, Resource::Every, Resource::Every)
         }
+
+        // ---- who may claim which hostname ---------------------------------
+        //
+        // `Resource::Every` on all three, and `Verb::Admin`, because a grant
+        // decides which tenant receives somebody else's cookies. It is a
+        // statement about the whole platform, exactly like an account or a
+        // token, and it names an application that is deliberately *not* the
+        // caller's - `named(app)` here would mean an application could grant
+        // itself the name it wanted, which is the hole this registry exists
+        // to close.
+        ["api", "domains"] if !writing => Requirement::new(
+            "domain_grant.list",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        ),
+        ["api", "domains"] => Requirement::new(
+            "domain_grant.create",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state(),
+        ["api", "domains", pattern] => Requirement::new(
+            "domain_grant.delete",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(pattern)
+        .changes_state(),
 
         // ---- the platform itself -----------------------------------------
         ["api", "routes"] => Requirement::new(
@@ -694,20 +766,13 @@ pub async fn authorize(State(state): State<AuthzState>, request: Request, next: 
 
     let mut requirement = classify(&method, &path, query.as_deref());
 
-    // The two routes that name their resource in the body. Everything else
-    // keeps its body untouched and unread.
+    // The four routes that name something in the body. Everything else keeps
+    // its body untouched and unread.
     let request = match requirement.from_body {
         None => request,
-        Some((component, field)) => match peek_body_field(request, field).await {
-            Ok((request, value)) => {
-                if let Some(value) = value {
-                    match component {
-                        BodyComponent::App => requirement.app = Resource::Named(value),
-                        BodyComponent::Environment => {
-                            requirement.environment = Resource::Named(value)
-                        }
-                    }
-                }
+        Some(claim) => match peek_body(request).await {
+            Ok((request, body)) => {
+                apply_body_claim(&mut requirement, claim, body.as_ref());
                 request
             }
             Err(response) => return response,
@@ -1028,14 +1093,11 @@ async fn resolve(
     Err(refusal)
 }
 
-/// Read one field out of a JSON body and hand the body on untouched.
+/// Read a JSON body and hand it on untouched.
 ///
-/// Applied to exactly two routes; see the module header for why, and for why
-/// no route carrying a secret is among them.
-async fn peek_body_field(
-    request: Request,
-    field: &str,
-) -> Result<(Request, Option<String>), Response> {
+/// Applied to exactly four routes; see the module header for why, and for
+/// why no route carrying a secret is among them.
+async fn peek_body(request: Request) -> Result<(Request, Option<serde_json::Value>), Response> {
     let (parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY_PEEK_BYTES).await {
         Ok(bytes) => bytes,
@@ -1043,7 +1105,7 @@ async fn peek_body_field(
             warn!(
                 path = %parts.uri.path(),
                 limit = MAX_BODY_PEEK_BYTES,
-                "Refused a call because its body is larger than the gate will read; this route creates one named thing and its body is a small JSON object"
+                "Refused a call because its body is larger than the gate will read; these routes take a small JSON object naming one thing"
             );
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1058,33 +1120,100 @@ async fn peek_body_field(
         }
     };
 
-    // Trimmed, because the handler trims: `catalog::apps::create_app` stores
-    // `request.id.trim()` and `catalog::environments::create_environment`
-    // stores `request.name.trim()`. Judging the untrimmed spelling would mean
-    // checking one name and creating another - and since no scope can spell a
-    // name with a space in it (`identity::scope::Component`), a credential
-    // that holds exactly `deploy:myapp/*` would be refused its own
-    // application over a stray newline, and told to go and ask for
-    // `deploy: myapp\n/*`, which is not a scope anyone can be granted.
-    let value = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|body| {
-            body.get(field)
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(|s| s.to_string())
-        });
-
-    // A body that is not JSON, or names nothing, is not this gate's problem:
-    // the handler answers 400 for it - `CatalogStore::create_app` and
-    // `create_environment` both refuse an empty name. What matters here is
-    // that the resource stays unnamed, which leaves the requirement at "any",
-    // and the handler then refuses the request on its own terms.
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
     Ok((
         Request::from_parts(parts, axum::body::Body::from(bytes)),
         value,
     ))
+}
+
+/// One JSON field, trimmed, or `None` when it is absent or empty.
+///
+/// Trimmed, because the handler trims: `catalog::apps::create_app` stores
+/// `request.id.trim()` and `catalog::environments::create_environment`
+/// stores `request.name.trim()`. Judging the untrimmed spelling would mean
+/// checking one name and creating another - and since no scope can spell a
+/// name with a space in it (`identity::scope::Component`), a credential that
+/// holds exactly `deploy:myapp/*` would be refused its own application over
+/// a stray newline, and told to go and ask for `deploy: myapp\n/*`, which is
+/// not a scope anyone can be granted.
+fn body_field(body: Option<&serde_json::Value>, field: &str) -> Option<String> {
+    body?
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Fold what the body names into the requirement.
+///
+/// A body that is not JSON, or names nothing, is not this gate's problem:
+/// the handler answers 400 for it - `CatalogStore::create_app` and
+/// `create_environment` both refuse an empty name. What matters here is that
+/// the resource stays unnamed, which leaves the requirement at "any", and the
+/// handler then refuses the request on its own terms.
+fn apply_body_claim(
+    requirement: &mut Requirement,
+    claim: BodyClaim,
+    body: Option<&serde_json::Value>,
+) {
+    match claim {
+        BodyClaim::App => {
+            if let Some(name) = body_field(body, "id") {
+                requirement.app = Resource::Named(name);
+            }
+        }
+        BodyClaim::Environment => {
+            if let Some(name) = body_field(body, "name") {
+                requirement.environment = Resource::Named(name);
+            }
+        }
+        // Nothing about the demand changes: no scope can name a hostname, and
+        // pretending one could would be a second authorisation rule beside
+        // the grant registry that actually decides. What this fills in is the
+        // audit line's target, so that the record of a route write says which
+        // address was claimed - including on the refusals, which is where the
+        // hijack attempts show up.
+        //
+        // Appended to what `.about()` already put there, never in its place:
+        // a route *update* names the route id in the path and the address in
+        // the body, and an audit row that dropped the id for the address
+        // could no longer say which route was rewritten. And a body this gate
+        // could not read is recorded as exactly that - `describe_route_address`
+        // on a `None` body would spell out "(every host)", which is the
+        // widest claim there is, positively recorded for a request that
+        // named nothing. The handler answers 400 to such a body; the row
+        // has to match.
+        BodyClaim::RouteAddress => {
+            let address = match body {
+                Some(_) => describe_route_address(body),
+                None => "(unreadable body: no address was named)".to_string(),
+            };
+            requirement.target = Some(match requirement.target.take() {
+                Some(route) => format!("{route} {address}"),
+                None => address,
+            });
+        }
+    }
+}
+
+/// The address a route body claims, in one line, for the audit log.
+///
+/// Every field is named even when it is absent, because "no host" is the
+/// *widest* claim a route can make - it answers for every name no other
+/// route claims - and a target that simply omitted it would read like a
+/// narrower call than it is. Nothing here is a value: a route body carries
+/// an address, and addresses are already public to anyone who can make a
+/// request through the edge.
+fn describe_route_address(body: Option<&serde_json::Value>) -> String {
+    let host = body_field(body, "host").unwrap_or_else(|| "(every host)".to_string());
+    let path_prefix = body_field(body, "path_prefix").unwrap_or_else(|| "(none)".to_string());
+    let priority = body
+        .and_then(|body| body.get("priority"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    format!("host={host} path_prefix={path_prefix} priority={priority}")
 }
 
 fn unauthenticated(detail: &str) -> Response {
@@ -1355,12 +1484,320 @@ mod tests {
             ("GET", "/api/tokens", "token.list", Verb::Admin),
             ("DELETE", "/api/tokens/abcd", "token.revoke", Verb::Admin),
             ("GET", "/api/audit", "audit.read", Verb::Admin),
+            ("GET", "/api/domains", "domain_grant.list", Verb::Admin),
+            ("POST", "/api/domains", "domain_grant.create", Verb::Admin),
+            (
+                "DELETE",
+                "/api/domains/example.com",
+                "domain_grant.delete",
+                Verb::Admin,
+            ),
         ];
         for (method, path, action, verb) in routes {
             let requirement = requirement(method, path);
             assert_eq!(requirement.action, action, "{method} {path}");
             assert_eq!(requirement.verb, verb, "{method} {path}");
         }
+    }
+
+    /// What every state-changing route's **body** may name that its URL does
+    /// not, and what answers for it.
+    ///
+    /// This is the question the hostname hijack came out of.
+    /// `crate::api::authz` judges a caller against the application and
+    /// environment in the *URL*; a body that names something else is a claim
+    /// nothing in this table has looked at. There were two such routes and
+    /// nobody had written down which. So they are written down here, all of
+    /// them, and each says what closes it - a line that has to be added,
+    /// deliberately, when a new write route is mounted.
+    #[test]
+    fn every_write_route_says_what_its_body_may_name_outside_the_url() {
+        /// What a route's body can reach past its own URL.
+        enum BodyReach {
+            /// Nothing: the body carries values, or names something already
+            /// inside the application the URL names.
+            NothingTheUrlDoesNotAlreadyName,
+            /// A name in a global namespace, and the gate reads it so the
+            /// demand is about the thing being created.
+            NamedInBodyAndDemanded(BodyClaim),
+            /// A name in a global namespace that no scope can spell. The gate
+            /// records it; something else authorises it, and that something
+            /// is named here.
+            AuthorisedElsewhere { claim: BodyClaim, by: &'static str },
+            /// The route answers to `admin:*/*`, so a caller who can reach it
+            /// at all already holds everything the body could name.
+            AdministratorsAlready,
+        }
+        use BodyReach::*;
+
+        let routes = [
+            ("POST", "/api/apps", NamedInBodyAndDemanded(BodyClaim::App)),
+            (
+                "POST",
+                "/api/apps/demo/environments",
+                NamedInBodyAndDemanded(BodyClaim::Environment),
+            ),
+            // The two that were open. A hostname is global and no scope can
+            // spell one, so there is nothing here for the demand to become;
+            // `catalog::domains` is what says whether this application may
+            // claim this name, and the gate's job is to get the address into
+            // the audit line.
+            (
+                "POST",
+                "/api/apps/demo/environments/production/routes",
+                AuthorisedElsewhere {
+                    claim: BodyClaim::RouteAddress,
+                    by: "catalog::store::CatalogStore::create_route, against catalog::domains",
+                },
+            ),
+            (
+                "PUT",
+                "/api/apps/demo/environments/production/routes/r1",
+                AuthorisedElsewhere {
+                    claim: BodyClaim::RouteAddress,
+                    by: "catalog::store::CatalogStore::update_route, against catalog::domains",
+                },
+            ),
+            // A bundle's manifest names other applications, in its service
+            // bindings. That is a claim on somebody else's application and it
+            // is refused by `crate::api::bindings::check_service_bindings`,
+            // in the handler, against the same principal - the body is a zip
+            // and cannot be read here.
+            (
+                "POST",
+                "/api/apps/demo/versions",
+                AuthorisedElsewhere {
+                    claim: BodyClaim::App,
+                    by: "api::bindings::check_service_bindings",
+                },
+            ),
+            // A deploy names a version by id or number, and
+            // `api::catalog::deployments::resolve_version` looks it up
+            // *within* the application in the URL, so it cannot reach
+            // another's.
+            (
+                "POST",
+                "/api/apps/demo/environments/production/deployments",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/rollback",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            // The body is a secret's value. The name is in the path, and this
+            // body is never read here - see
+            // `a_secret_write_names_the_secret_and_reads_no_body`.
+            (
+                "PUT",
+                "/api/apps/demo/environments/production/secrets/TOKEN",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            ("DELETE", "/api/apps/demo", NothingTheUrlDoesNotAlreadyName),
+            (
+                "DELETE",
+                "/api/apps/demo/environments/production/routes/r1",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            (
+                "DELETE",
+                "/api/apps/demo/environments/production/secrets/TOKEN",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            (
+                "DELETE",
+                "/api/runtime/node-1/apps/demo",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            // No body at all: the application is in the path, and the demand
+            // is `admin` over that application and every environment of it.
+            (
+                "DELETE",
+                "/api/retired-apps/demo",
+                NothingTheUrlDoesNotAlreadyName,
+            ),
+            // Everything below names something global in its body - an
+            // account, a scope list, a node id, a hostname pattern - and
+            // every one of them answers to `admin:*/*`, which is authority
+            // over all of it already.
+            ("POST", "/api/accounts", AdministratorsAlready),
+            ("PATCH", "/api/accounts/alice", AdministratorsAlready),
+            ("POST", "/api/accounts/alice/tokens", AdministratorsAlready),
+            ("DELETE", "/api/tokens/abcd", AdministratorsAlready),
+            ("POST", "/api/configs/node-1", AdministratorsAlready),
+            ("DELETE", "/api/configs/node-1/key", AdministratorsAlready),
+            (
+                "POST",
+                "/api/commands/execute/node-1",
+                AdministratorsAlready,
+            ),
+            ("POST", "/api/domains", AdministratorsAlready),
+            ("DELETE", "/api/domains/example.com", AdministratorsAlready),
+        ];
+
+        for (method, path, reach) in routes {
+            let requirement = requirement(method, path);
+            assert_eq!(
+                requirement.audit,
+                AuditWhen::Always,
+                "{method} {path} changes state and must be recorded whatever the outcome"
+            );
+            match reach {
+                NothingTheUrlDoesNotAlreadyName => assert!(
+                    requirement.from_body.is_none(),
+                    "{method} {path} reaches nothing past its URL, so the gate has no reason to \
+                     read its body"
+                ),
+                NamedInBodyAndDemanded(claim) => {
+                    assert_eq!(
+                        requirement.from_body,
+                        Some(claim),
+                        "{method} {path} names what it creates in its body and the demand has to \
+                         become that name"
+                    );
+                }
+                AuthorisedElsewhere { claim, by } => {
+                    assert!(
+                        !by.is_empty(),
+                        "{method} {path} carries a claim its URL does not cover, so something has \
+                         to authorise it and this line has to say what"
+                    );
+                    if claim == BodyClaim::RouteAddress {
+                        assert_eq!(
+                            requirement.from_body,
+                            Some(claim),
+                            "{method} {path} claims a hostname; the gate reads it so the audit \
+                             line names the address, whatever the outcome"
+                        );
+                    }
+                }
+                AdministratorsAlready => {
+                    assert_eq!(
+                        requirement.verb,
+                        Verb::Admin,
+                        "{method} {path} names something global in its body and is only safe \
+                         because nothing short of an administrator can reach it"
+                    );
+                    assert_eq!(requirement.app, Resource::Every, "{method} {path}");
+                    assert_eq!(requirement.environment, Resource::Every, "{method} {path}");
+                }
+            }
+        }
+    }
+
+    /// The hostname registry is an administrator's, and it names an
+    /// application that is deliberately not the caller's. `named(app)` here
+    /// would have meant an application could grant itself the name it wanted,
+    /// which is the hole the registry exists to close.
+    #[test]
+    fn the_hostname_registry_answers_to_nothing_short_of_an_administrator() {
+        let ci = Principal {
+            kind: crate::identity::PrincipalKind::Account,
+            account: Some("ci".to_string()),
+            role: Some(crate::identity::Role::Maintainer),
+            credential_id: Some("0011223344556677".to_string()),
+            authority: crate::identity::Authority::Scoped(
+                crate::identity::Scope::parse_list("deploy:attacker/* secrets:attacker/*").unwrap(),
+            ),
+        };
+        for (method, path) in [
+            ("GET", "/api/domains"),
+            ("POST", "/api/domains"),
+            ("DELETE", "/api/domains/victim.example.com"),
+        ] {
+            let requirement = requirement(method, path);
+            let demand = Demand {
+                verb: requirement.verb,
+                app: requirement.app.selector(),
+                environment: requirement.environment.selector(),
+            };
+            assert!(
+                ci.permits(&demand).is_err(),
+                "{method} {path} must not be reachable by a credential scoped to one application"
+            );
+        }
+    }
+
+    /// The audit line of a route write names the address that was claimed.
+    ///
+    /// The three rows the hijack left in the log were byte-identical with
+    /// `"target": null`; the one record that could have found the abuse
+    /// afterwards did not contain the hostname.
+    #[test]
+    fn a_route_write_records_the_address_it_claimed() {
+        let body = serde_json::json!({
+            "host": "victim.example.com",
+            "path_prefix": "/",
+            "priority": 9223372036854775807i64,
+        });
+        let mut requirement =
+            requirement("POST", "/api/apps/attacker/environments/production/routes");
+        let claim = requirement.from_body.expect("a route write reads its body");
+        apply_body_claim(&mut requirement, claim, Some(&body));
+        assert_eq!(
+            requirement.target.as_deref(),
+            Some("host=victim.example.com path_prefix=/ priority=9223372036854775807"),
+        );
+        // The demand is untouched: no scope can spell a hostname, and
+        // pretending one could would be a second authorisation rule beside
+        // the grant registry that actually decides.
+        assert_eq!(requirement.app, Resource::Named("attacker".to_string()));
+        assert_eq!(
+            requirement.environment,
+            Resource::Named("production".to_string())
+        );
+
+        // A route with no host is the *widest* claim there is, so the record
+        // has to say so rather than leaving the field out and reading like a
+        // narrower call than it was.
+        let mut catch_all = classify(
+            &Method::POST,
+            "/api/apps/attacker/environments/production/routes",
+            None,
+        );
+        apply_body_claim(
+            &mut catch_all,
+            BodyClaim::RouteAddress,
+            Some(&serde_json::json!({"path_prefix": "/"})),
+        );
+        assert_eq!(
+            catch_all.target.as_deref(),
+            Some("host=(every host) path_prefix=/ priority=0")
+        );
+
+        // An *update* names the route in the path and the address in the
+        // body, and the record needs both: an address in place of the id
+        // could not say which route was rewritten.
+        let mut update = classify(
+            &Method::PUT,
+            "/api/apps/attacker/environments/production/routes/r42",
+            None,
+        );
+        let claim = update.from_body.expect("a route update reads its body");
+        apply_body_claim(
+            &mut update,
+            claim,
+            Some(&serde_json::json!({"host": "victim.example.com", "path_prefix": "/"})),
+        );
+        assert_eq!(
+            update.target.as_deref(),
+            Some("r42 host=victim.example.com path_prefix=/ priority=0"),
+        );
+
+        // A body this gate could not read is recorded as unreadable - not as
+        // "(every host)", which would positively record the widest claim
+        // there is for a request that named nothing. The handler answers 400
+        // to such a body; the row has to match.
+        let mut unreadable = classify(
+            &Method::POST,
+            "/api/apps/attacker/environments/production/routes",
+            None,
+        );
+        apply_body_claim(&mut unreadable, BodyClaim::RouteAddress, None);
+        assert_eq!(
+            unreadable.target.as_deref(),
+            Some("(unreadable body: no address was named)"),
+        );
     }
 
     /// A route nobody wrote a line for must be an administrator's, not
@@ -1431,14 +1868,23 @@ mod tests {
             write.from_body.is_none(),
             "the gate must never read the body of a route that carries a value"
         );
-        // And the only two routes it does read carry a name, not a value.
+        // And the only four routes it does read carry a name or an address,
+        // never a value.
         assert_eq!(
             requirement("POST", "/api/apps").from_body,
-            Some((BodyComponent::App, "id"))
+            Some(BodyClaim::App)
         );
         assert_eq!(
             requirement("POST", "/api/apps/demo/environments").from_body,
-            Some((BodyComponent::Environment, "name"))
+            Some(BodyClaim::Environment)
+        );
+        assert_eq!(
+            requirement("POST", "/api/apps/demo/environments/production/routes").from_body,
+            Some(BodyClaim::RouteAddress)
+        );
+        assert_eq!(
+            requirement("PUT", "/api/apps/demo/environments/production/routes/r1").from_body,
+            Some(BodyClaim::RouteAddress)
         );
     }
 
@@ -1806,6 +2252,7 @@ mod gate_tests {
                 "/api/apps/:app/environments/:env/secrets/:name",
                 put(created),
             )
+            .route("/api/apps/:app/environments/:env/routes", post(created))
             .route("/api/apps/:app/environments/:env/storage-token", get(ok))
             .route("/api/runtime/:node/apps/:app", delete(ok))
             .route("/api/audit", get(ok))
@@ -2252,6 +2699,76 @@ mod gate_tests {
     /// With `api_auth_enabled` off, the human API is as open as it always
     /// was - and the audit log still records every change, so an operator who
     /// has not turned authentication on still gets a history.
+    /// The audit line of a hostname claim names the hostname - on the
+    /// refusal as much as on the success, because the refusal is where the
+    /// attempt shows up.
+    ///
+    /// This is the third finding of the same defect. The three rows the
+    /// hijack left in this table were byte-identical, with `"target": null`;
+    /// the one record that could have found the abuse afterwards did not
+    /// contain the name that was seized.
+    #[tokio::test]
+    async fn a_hostname_claim_is_recorded_with_the_hostname() {
+        let gate = gate(true, vec![]).await;
+        gate.state
+            .identity
+            .create_account("ci", Role::Deployer)
+            .await
+            .unwrap();
+        let (_, secret) = gate
+            .state
+            .identity
+            .create_token(
+                "ci",
+                "pipeline",
+                Authority::Scoped(Scope::parse_list("deploy:attacker/production").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        // Allowed by the gate - it is this credential's own environment -
+        // and refused by the grant registry in the store, which this router
+        // does not have. What matters here is the line that was written.
+        call_with_body(
+            &gate,
+            "POST",
+            "/api/apps/attacker/environments/production/routes",
+            Some(&secret),
+            r#"{"host":"victim.example.com","path_prefix":"/","priority":7}"#,
+        )
+        .await;
+
+        // And one the gate itself refuses, for an application this
+        // credential has nothing over.
+        call_with_body(
+            &gate,
+            "POST",
+            "/api/apps/victim/environments/production/routes",
+            Some(&secret),
+            r#"{"host":"victim.example.com","path_prefix":"/","priority":7}"#,
+        )
+        .await;
+
+        let lines = lines(&gate).await;
+        let claims: Vec<&crate::audit::AuditEntry> = lines
+            .iter()
+            .filter(|line| line.action == "route.create")
+            .collect();
+        assert_eq!(claims.len(), 2, "both attempts are recorded: {lines:?}");
+        for line in &claims {
+            assert_eq!(
+                line.target.as_deref(),
+                Some("host=victim.example.com path_prefix=/ priority=7"),
+                "a route write with no hostname in its record is the abuse nobody can find \
+                 afterwards"
+            );
+        }
+        assert!(
+            claims.iter().any(|line| line.outcome == Outcome::Refused),
+            "the claim on another application's route list is a refusal and says so: {claims:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_unauthenticated_control_plane_is_still_audited() {
         let gate = gate(false, vec![]).await;

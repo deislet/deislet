@@ -1354,9 +1354,19 @@ impl DatabaseService {
         if let Some(pool) = pools.get(tenant) {
             return pool.clone();
         }
-        // A tenant id carries one dot, between its two halves, and neither
-        // half may contain a dot or a path separator - so the whole value is
-        // a single path component and cannot resolve outside `root`.
+        // What is joined here is a *namespace*, not a bare tenant: it is
+        // `app.environment`, or `app.environment@BINDING` when the call named
+        // a binding. That it is a single path component is still a property
+        // of the validator rather than of this line - `TenantId` exists only
+        // via `split_namespace`, so each of the two or three parts satisfied
+        // `is_valid_tenant_part` / `is_valid_binding_name`, whose character
+        // set is ASCII letters, digits, `_` and `-`. No part can hold a `.`,
+        // a `/` or a `\`, the only separators are the one `.` and the at most
+        // one `@` the split put there, and the whole thing is at most 194
+        // bytes, so it cannot spell `.`, `..`, an absolute path or anything
+        // that resolves outside `root`. 194 plus `.sqlite` is 201, and
+        // SQLite's longest companion suffix adds a dozen more, so a binding
+        // cannot push a name past the 255-byte limit either.
         let path = self.root.join(format!("{tenant}.sqlite"));
         tracing::info!(
             tenant = %tenant,

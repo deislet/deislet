@@ -140,6 +140,15 @@ export default async function handler(context) {
             // the body: pingora hands its health-check validator the response
             // head and never the body.
             [READINESS_HEADER]: readiness,
+            // And the reason has to travel the same way, for the same
+            // reader: a reason that lives only in the body is a reason the
+            // edge's validator never sees, and what the edge logged instead
+            // was a cause it invented ("cannot reach its control plane") for
+            // every degraded node. Only stamped when the node stated one -
+            // absence and "did not say" are different facts. The value went
+            // through header_safe_reason on the node before it reached this
+            // file, so it is one bounded line of header-legal text.
+            ...(reason === null ? {} : { [REASON_HEADER]: reason }),
             // A probe answer describes this instant. A cache between the edge
             // and the node that replayed a 200 would put an unhealthy node
             // back into rotation for as long as it held the entry.

@@ -20,7 +20,7 @@ use deis_store::proto::storage::{
     PrepareRequest, QueryPreparedRequest, QueryRequest, SetRequest,
     database_client::DatabaseClient, kv_store_client::KvStoreClient,
 };
-use deis_store::tenant::TENANT_HEADER;
+use deis_store::tenant::{BINDING_HEADER, TENANT_HEADER};
 use deis_store::{MAX_GRPC_MESSAGE_BYTES, server};
 use deis_wire::conventions::{APP_ID_HEADER, STORAGE_TOKEN_HEADER, storage_token, tenant_id};
 use tempfile::TempDir;
@@ -30,7 +30,9 @@ use tonic::transport::Channel;
 
 /// A running server plus the temp directory holding its data.
 struct Harness {
-    _data: TempDir,
+    /// `None` when the caller owns the data directory, which is how a test
+    /// runs two servers over the same one.
+    _data: Option<TempDir>,
     endpoint: String,
     shutdown: Option<oneshot::Sender<()>>,
 }
@@ -49,11 +51,26 @@ impl Harness {
         Self::start_with(Some(secret.to_string())).await
     }
 
+    /// A server over a data directory the caller keeps, so the same one can
+    /// be served twice.
+    async fn start_on(data_dir: &std::path::Path) -> Self {
+        Self::start_over(None, data_dir.to_path_buf(), None).await
+    }
+
     async fn start_with(auth_secret: Option<String>) -> Self {
         let data = TempDir::new().unwrap();
+        let data_dir = data.path().to_path_buf();
+        Self::start_over(Some(data), data_dir, auth_secret).await
+    }
+
+    async fn start_over(
+        owned: Option<TempDir>,
+        data_dir: std::path::PathBuf,
+        auth_secret: Option<String>,
+    ) -> Self {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
-            data_dir: data.path().to_path_buf(),
+            data_dir,
             // Small enough that the size limit is reachable in a test, large
             // enough for the multi-chunk object below.
             max_object_bytes: 8 * 1024 * 1024,
@@ -73,7 +90,7 @@ impl Harness {
             .unwrap();
         });
         Self {
-            _data: data,
+            _data: owned,
             endpoint: format!("http://{addr}"),
             shutdown: Some(shutdown),
         }
@@ -120,6 +137,20 @@ fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     request
         .metadata_mut()
         .insert(TENANT_HEADER, tenant.parse().unwrap());
+    request
+}
+
+/// Stamp the tenant *and* the binding, the way deis-runtime does for a
+/// declared `db`, `kv` or `blob` binding.
+///
+/// The two are separate headers because they are separate facts: the tenant
+/// is what the capability token authorises, and the binding only says which
+/// namespace *inside* it the call wants.
+fn as_binding<T>(tenant: &str, binding: &str, message: T) -> Request<T> {
+    let mut request = as_tenant(tenant, message);
+    request
+        .metadata_mut()
+        .insert(BINDING_HEADER, binding.parse().unwrap());
     request
 }
 
@@ -1494,5 +1525,146 @@ async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
     assert!(
         format!("{error:#}").contains("auth_secret"),
         "the refusal must name the missing setting: {error:#}"
+    );
+}
+
+/// The whole-node outage a named binding caused, driven over the wire and
+/// then restarted the way the process is.
+///
+/// A call carrying `x-deis-binding` is stored under `<tenant>@<BINDING>`, so
+/// the first application on a node with a `db` or `blob` binding leaves
+/// `db/shop.production@MEDIA.sqlite` and `blob/shop.production@MEDIA/` behind.
+/// The startup scan then had to open over them and refused, so the process
+/// exited and KV, SQL and blob were down for *every* tenant on the node -
+/// with "point data_dir at an empty directory" as the only remedy offered.
+///
+/// The names are asserted from what the server wrote in response to the
+/// headers alone, so this cannot pass by agreeing with a name the test
+/// invented.
+#[tokio::test]
+async fn a_named_binding_written_over_the_wire_survives_a_restart() {
+    let data = TempDir::new().unwrap();
+
+    {
+        let harness = Harness::start_on(data.path()).await;
+        harness
+            .kv()
+            .await
+            .set(as_binding(
+                "shop.production",
+                "MEDIA",
+                SetRequest {
+                    key: "greeting".to_string(),
+                    value: b"in the binding".to_vec(),
+                    ttl_seconds: None,
+                    metadata: None,
+                },
+            ))
+            .await
+            .unwrap();
+        harness
+            .database()
+            .await
+            .execute(as_binding(
+                "shop.production",
+                "MEDIA",
+                ExecuteRequest {
+                    sql: "CREATE TABLE t(a TEXT)".to_string(),
+                    params: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let stored = harness
+            .blob()
+            .await
+            .put(as_binding(
+                "shop.production",
+                "MEDIA",
+                tokio_stream::iter(vec![
+                    PutRequest {
+                        payload: Some(put_request::Payload::Header(PutHeader {
+                            key: "photo".to_string(),
+                            precondition: None,
+                            content_type: None,
+                        })),
+                    },
+                    PutRequest {
+                        payload: Some(put_request::Payload::Chunk(b"bytes".to_vec())),
+                    },
+                ]),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stored.success, "{:?}", stored.error);
+    }
+
+    // What the binding actually put on disk, in the server's own spelling.
+    assert!(
+        data.path()
+            .join("db")
+            .join("shop.production@MEDIA.sqlite")
+            .is_file(),
+        "a database binding is stored under the namespace, not the tenant: {:?}",
+        std::fs::read_dir(data.path().join("db"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        data.path()
+            .join("blob")
+            .join("shop.production@MEDIA")
+            .is_dir()
+    );
+
+    // The restart itself: exactly the call `server::serve` makes before it
+    // accepts anything, which is where the refusal was.
+    let reopened = server::Stores::open(&Config {
+        data_dir: data.path().to_path_buf(),
+        ..Config::default()
+    })
+    .await;
+    assert!(
+        reopened.is_ok(),
+        "a data directory holding a named binding must open again, or every tenant on the node \
+         loses KV, SQL and blob: {:?}",
+        reopened.err()
+    );
+    drop(reopened);
+
+    // And the data is the binding's own, not the tenant's unnamed namespace.
+    let harness = Harness::start_on(data.path()).await;
+    let got = harness
+        .kv()
+        .await
+        .get(as_binding(
+            "shop.production",
+            "MEDIA",
+            GetRequest {
+                key: "greeting".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.value.as_deref(), Some(&b"in the binding"[..]));
+
+    let unnamed = harness
+        .kv()
+        .await
+        .get(as_tenant(
+            "shop.production",
+            GetRequest {
+                key: "greeting".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        unnamed.value, None,
+        "the tenant's unnamed namespace never held this key"
     );
 }

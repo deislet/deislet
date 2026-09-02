@@ -22,7 +22,7 @@ use deis_proxy::config::system::LogLevel;
 use deis_proxy::config::system::acme::{LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING};
 use deis_proxy::config::{ConfigManager, SystemConfig};
 use deis_proxy::control::{ControlService, ProxyControlClient};
-use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic};
+use deis_proxy::proxy::{AccessLog, Balancer, DeisProxy, ExitOnPanic, InheritedListeners};
 use deis_proxy::restart::{
     ProcessControl, RelaunchArgs, announce_ready, check_upgrade_socket_path, executable_path,
     prove_listeners_bindable, prove_pid_file_writable, prove_upgrade_socket_bindable,
@@ -479,7 +479,22 @@ fn main() -> Result<()> {
     }
     // A listener that cannot be bound must take the process down, not leave
     // a daemon running without one.
-    server.add_service(ExitOnPanic::new(service));
+    //
+    // Two wrappers, outside in. `InheritedListeners` is the only place the
+    // table of descriptors handed over by the process being replaced can be
+    // reached - pingora passes it to `Service::start_service` and nowhere
+    // else - and it has to run before the listeners below it are built, which
+    // is the call that consumes the table. It is given the same
+    // `listen_addresses` that spelled the `add_tcp`/`add_tls_with_settings`
+    // calls above and that the running process is told to expect, so there is
+    // one list of addresses in this process and not three.
+    //
+    // `ExitOnPanic` is outermost so a panic in either half is a logged exit
+    // rather than a daemon with no listener.
+    server.add_service(ExitOnPanic::new(InheritedListeners::new(
+        service,
+        system.listen_addresses(),
+    )));
     server.add_services(vec![balancer_service]);
 
     // Owned by the server like every other background task, so a

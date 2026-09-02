@@ -26,6 +26,36 @@
 //!    is the honest answer: a `503` that says "nothing answered" beats
 //!    forwarding into a node whose own error the client cannot act on.
 //!
+//! # Where the pool comes from, and where it does not
+//!
+//! [`ConfigDiscovery`] resolves `system.upstreams` and nothing else. That is
+//! the whole of it, and it has a consequence worth stating plainly because
+//! nothing about installing a second machine hints at it:
+//!
+//! **A node that registers itself with the control plane does not become an
+//! upstream of any proxy.** Registration reaches deis-control, which records
+//! the node so it can *manage* it - push deployments, ask it for status -
+//! and the edge is not told. Adding a machine to a fleet therefore takes two
+//! separate acts: start the node so the control plane can manage it, and add
+//! an `[[upstreams]]` entry naming its data address to the configuration of
+//! every proxy that should send it traffic, then reload each of them. Miss
+//! the second and the new machine is managed, healthy, deployed to, and
+//! serving nothing.
+//!
+//! This is documented rather than wired, and the reason is not effort. What
+//! a node registers is its **management** gRPC address
+//! (`deis_control::api::registration::RegisterRequest::address`, which the
+//! node reports precisely because it is *not* the port traffic arrives on).
+//! The control plane never learns the address the edge would have to proxy
+//! to, so there is no fact in the control plane today that this discovery
+//! could read. Wiring it means the node reporting a data address, the wire
+//! crate carrying it, the control plane storing and serving it, and this
+//! discovery merging it with the configured list - four crates, and a new
+//! decision about what happens when the two sources disagree. Until that
+//! exists, the honest answer is the sentence above, said here, in
+//! `config.toml.example` beside `[[upstreams]]`, and in a line this process
+//! logs at startup so an operator meets it without reading either.
+//!
 //! [`health_check_interval`]: crate::config::SystemConfig::health_check_interval
 
 use std::collections::{BTreeSet, HashMap};
@@ -48,8 +78,8 @@ use pingora::services::background::background_service;
 use tracing::{debug, error, info, warn};
 
 use crate::config::system::{
-    BalancingStrategy, HealthCheckMode, NODE_READINESS_HEADER, ReadinessPolicy, ReadinessVerdict,
-    judge_readiness,
+    BalancingStrategy, HealthCheckMode, NODE_READINESS_HEADER, NODE_REASON_HEADER, ReadinessPolicy,
+    ReadinessVerdict, judge_readiness,
 };
 use crate::config::{ConfigManager, SystemConfig};
 use crate::proxy::APP_ID_HEADER;
@@ -136,6 +166,25 @@ impl Balancer {
     /// server.
     pub fn build(config: Arc<ConfigManager>) -> (Balancer, Box<dyn ServiceWithDependents>) {
         let system = config.get_system_config();
+        // Said once, at startup, because there is no other moment an operator
+        // finds it out. See "Where the pool comes from, and where it does
+        // not" in the module documentation.
+        let configured = system.upstreams.as_ref().map_or(0, |list| list.len());
+        info!(
+            upstreams = configured,
+            addresses = ?system
+                .upstreams
+                .iter()
+                .flatten()
+                .map(|upstream| upstream.address())
+                .collect::<Vec<_>>(),
+            "these are the only upstreams this proxy will ever have. A deis-runtime node that \
+             registers itself with the control plane does NOT appear here: the control plane \
+             learns a node's management address and never its data address, so adding a machine \
+             to the fleet needs an [[upstreams]] entry in this proxy's configuration and a \
+             reload, at this edge and at every other one. Without that, the new machine is \
+             managed and deployed to and takes no traffic"
+        );
         let discovery = Box::new(ConfigDiscovery {
             config: Arc::clone(&config),
         });
@@ -357,8 +406,10 @@ const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Pingora's validator is handed the response header and nothing else - not
 /// the backend, not the check - so this cannot be per node and the message
 /// does not pretend to name one. What it can say, and what an operator needs
-/// first, is that some node in this pool is serving from its own disk because
-/// it cannot reach the control plane.
+/// first, is that some node in this pool is serving something other than what
+/// it was assigned, together with whatever that node said about why. The
+/// cause is not stated here: `degraded` has several, and this comment used to
+/// name the one the edge happened to have guessed.
 struct DegradedNotice {
     started: Instant,
     /// Seconds since `started` at the last warning, or `u64::MAX` for none.
@@ -483,13 +534,27 @@ fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Syn
                     .headers
                     .get(NODE_READINESS_HEADER)
                     .and_then(|value| value.to_str().ok());
-                match judge_readiness(status, reported, policy) {
+                // Why, in the node's own words, when the node sent it.
+                // Read off the head because that is all pingora hands a
+                // validator - and today no deis-runtime node puts it there:
+                // `dispatcher/system_app.js` stamps the readiness on the
+                // response head and the reason only into the response body,
+                // which a health check never reads. So this is `None` against
+                // the current fleet and the verdict says the node did not say
+                // why, which is true. What it no longer does is invent one.
+                // The startup line below tells the operator the same thing.
+                let reason = resp
+                    .headers
+                    .get(NODE_REASON_HEADER)
+                    .and_then(|value| value.to_str().ok());
+                match judge_readiness(status, reported, reason, policy) {
                     ReadinessVerdict::InRotation => Ok(()),
                     ReadinessVerdict::InRotationWithWarning(why) => {
                         if degraded.due() {
                             warn!(
                                 status,
                                 reported = ?reported,
+                                reason = ?reason,
                                 readiness = %policy,
                                 interval_secs = DEGRADED_LOG_INTERVAL.as_secs(),
                                 "{why}. Repeated at most once every {} seconds while it lasts",
@@ -526,12 +591,15 @@ fn build_health_check(system: &SystemConfig) -> Box<dyn HealthCheck + Send + Syn
             match policy {
                 ReadinessPolicy::Reported => info!(
                     readiness_header = NODE_READINESS_HEADER,
+                    reason_header = NODE_REASON_HEADER,
                     "a node that states its own readiness is believed: `starting` takes it out \
                      of rotation, `degraded` keeps its share because every node goes degraded at \
                      once when the control plane does. A node that states nothing is judged on \
                      the 200 alone, which only proves it ran an isolate - so until deis-runtime \
                      sends this header, a node whose assignments failed to load still counts as \
-                     healthy here"
+                     healthy here. Why a node is degraded is repeated from the reason header \
+                     when it sends one; a node that sends none is reported as one that did not \
+                     say, and this edge never states a cause on the node's behalf"
                 ),
                 ReadinessPolicy::Required => warn!(
                     readiness_header = NODE_READINESS_HEADER,

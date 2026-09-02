@@ -19,7 +19,7 @@
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 
-use crate::commands::project_dir;
+use crate::commands::{escaped, project_dir};
 use crate::render::{Output, Table};
 use crate::settings::{
     self, CredentialEntry, DefaultsSection, EndpointSection, Overrides, PROJECT_FILE, Settings,
@@ -370,12 +370,20 @@ pub fn list(output: Output) -> Result<()> {
     println!("\n{}", "Configuration".bold());
     let mut table = Table::new(&["SETTING", "VALUE", "FROM", "OVERRIDE WITH"]);
     for (key, value, source) in &rows {
+        // Not from the wire, and on this list for that reason: these values
+        // are read out of a project file, and running `deis config` in a
+        // checkout somebody else wrote is the ordinary way to meet one. The
+        // key and the variable name are literals this binary owns; the value
+        // and the source are not.
         table.row(vec![
             (*key).to_string(),
-            value.clone().unwrap_or_else(|| "-".to_string()),
+            value
+                .as_deref()
+                .map(escaped)
+                .unwrap_or_else(|| "-".to_string()),
             source
                 .as_ref()
-                .map(|s| s.to_string())
+                .map(|s| escaped(&s.to_string()))
                 .unwrap_or_else(|| "not set".to_string()),
             variable_for(key).unwrap_or("-").to_string(),
         ]);

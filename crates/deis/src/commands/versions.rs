@@ -16,7 +16,7 @@
 use anyhow::Result;
 use colored::Colorize;
 
-use crate::commands::Session;
+use crate::commands::{Session, escaped};
 use crate::render::{Output, Table, age, compatibility_cell, short_digest, timestamp};
 use crate::settings::Overrides;
 
@@ -97,14 +97,19 @@ pub async fn execute(app: Option<String>, limit: usize, output: Output) -> Resul
         let environments = environments_of(&running, &version.id);
         table.row(vec![
             version.number.to_string(),
-            short_digest(&version.bundle_sha),
+            escaped(&short_digest(&version.bundle_sha)),
             timestamp(version.created_at),
             age(version.created_at),
             compatibility_cell(version.compatibility.as_ref()),
             if environments.is_empty() {
                 "-".to_string()
             } else {
-                environments.join(", ")
+                // Environment names, as the control plane listed them.
+                environments
+                    .iter()
+                    .map(|e| escaped(e))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             },
         ]);
     }

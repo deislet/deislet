@@ -19,6 +19,7 @@
 pub mod apps;
 pub mod assignments;
 pub mod deployments;
+pub mod domains;
 pub mod environments;
 pub mod routes;
 pub mod routing_table;
@@ -142,6 +143,15 @@ pub fn router(state: CatalogState) -> Router {
             put(secrets::put_secret).delete(secrets::delete_secret),
         )
         .route("/api/routes", get(routes::list_all_routes))
+        // Who may claim which hostname. Not under `/api/apps`, because a
+        // hostname is not a name inside an application - it is the one
+        // namespace on this platform that is global, which is the whole
+        // reason it needs a registry of its own. See `catalog::domains`.
+        .route(
+            "/api/domains",
+            get(domains::list_grants).post(domains::create_grant),
+        )
+        .route("/api/domains/:pattern", delete(domains::delete_grant))
         .with_state(state)
 }
 
@@ -772,6 +782,254 @@ pub(crate) mod tests {
         assert_eq!(downloaded.as_ref(), bytes.as_slice());
     }
 
+    /// The reproduction, through the router, end to end.
+    ///
+    /// Two applications on one platform. `attacker` posts the victim's
+    /// hostname to its **own** environment's route list - a call
+    /// `crate::api::authz` authorises against `attacker/production`, which is
+    /// exactly what the credential is entitled to - and used to be answered
+    /// 201. Every request to `victim.example.com` then reached the attacker's
+    /// isolate with its cookies, its `Authorization` header and its POST
+    /// bodies, and the edge would order a certificate for a name the operator
+    /// does not own.
+    #[tokio::test]
+    async fn one_applications_route_list_cannot_claim_another_applications_hostname() {
+        let h = harness(true).await;
+        let router = &h.router;
+
+        for app in ["victim", "attacker"] {
+            json(router, "POST", "/api/apps", serde_json::json!({"id": app})).await;
+            json(
+                router,
+                "POST",
+                &format!("/api/apps/{app}/environments"),
+                serde_json::json!({"name": "production"}),
+            )
+            .await;
+        }
+        let (status, _) = json(
+            router,
+            "POST",
+            "/api/domains",
+            serde_json::json!({"pattern": "victim.example.com", "app_id": "victim"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The three bodies the reproduction sent, in order.
+        for body in [
+            serde_json::json!({"host": "victim.example.com", "priority": 9223372036854775807i64, "path_prefix": "/"}),
+            serde_json::json!({"host": "victim.example.com", "path_prefix": "/"}),
+            serde_json::json!({"host": "*.deislet.test", "path_prefix": "/"}),
+            serde_json::json!({"path_prefix": "/"}),
+        ] {
+            let (status, answer) = json(
+                router,
+                "POST",
+                "/api/apps/attacker/environments/production/routes",
+                body.clone(),
+            )
+            .await;
+            assert!(
+                status == StatusCode::FORBIDDEN || status == StatusCode::BAD_REQUEST,
+                "{body} was answered {status}: {answer}"
+            );
+        }
+
+        let (_, table) = json(router, "GET", "/api/routes", Value::Null).await;
+        assert_eq!(
+            table["total"], 0,
+            "not one of those claims may reach the routing table: {table}"
+        );
+
+        // And the application the name was granted to gets it.
+        let (status, _) = json(
+            router,
+            "POST",
+            "/api/apps/victim/environments/production/routes",
+            serde_json::json!({"host": "victim.example.com", "path_prefix": "/"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    /// The registry through its own endpoints, including the shapes that a
+    /// URL path could mangle: a wildcard pattern carries a `*` and a `.`, and
+    /// the widest grant of all is the single character `*`.
+    #[tokio::test]
+    async fn the_registry_is_written_listed_and_withdrawn_over_http() {
+        let h = harness(true).await;
+        let router = &h.router;
+        json(
+            router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "shop"}),
+        )
+        .await;
+
+        for pattern in ["*", "*.example.com", "shop.example.com"] {
+            let (status, body) = json(
+                router,
+                "POST",
+                "/api/domains",
+                serde_json::json!({"pattern": pattern, "app_id": "shop"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{pattern}: {body}");
+        }
+
+        let (status, listed) = json(router, "GET", "/api/domains", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["total"], 3, "{listed}");
+
+        // A pattern can be held by more than one application, so a delete
+        // that does not say which one it means is a bad request rather than a
+        // guess.
+        let (status, _) = json(router, "DELETE", "/api/domains/*", Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        for pattern in ["*", "*.example.com", "shop.example.com"] {
+            let (status, body) = json(
+                router,
+                "DELETE",
+                &format!("/api/domains/{pattern}?app_id=shop"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{pattern}: {body}");
+        }
+        let (_, listed) = json(router, "GET", "/api/domains", Value::Null).await;
+        assert_eq!(listed["total"], 0, "{listed}");
+
+        // Withdrawing something nobody holds is a 404, not a quiet success:
+        // a caller told "ok" for a pattern they misspelled would believe they
+        // had closed a hole that is still open.
+        let (status, _) = json(
+            router,
+            "DELETE",
+            "/api/domains/shop.example.com?app_id=shop",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A grant is not a licence to take an address somebody is already
+    /// serving on.
+    #[tokio::test]
+    async fn two_applications_granted_one_zone_still_cannot_hold_one_address() {
+        let h = harness(true).await;
+        let router = &h.router;
+
+        for app in ["one", "two"] {
+            json(router, "POST", "/api/apps", serde_json::json!({"id": app})).await;
+            json(
+                router,
+                "POST",
+                &format!("/api/apps/{app}/environments"),
+                serde_json::json!({"name": "production"}),
+            )
+            .await;
+            json(
+                router,
+                "POST",
+                "/api/domains",
+                serde_json::json!({"pattern": "*.example.com", "app_id": app}),
+            )
+            .await;
+        }
+
+        let (status, _) = json(
+            router,
+            "POST",
+            "/api/apps/one/environments/production/routes",
+            serde_json::json!({"host": "shared.example.com", "path_prefix": "/"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = json(
+            router,
+            "POST",
+            "/api/apps/two/environments/production/routes",
+            serde_json::json!({"host": "shared.example.com", "path_prefix": "/"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        // A different prefix on the same host is a different address, which
+        // is the arrangement the demo relies on.
+        let (status, _) = json(
+            router,
+            "POST",
+            "/api/apps/two/environments/production/routes",
+            serde_json::json!({"host": "shared.example.com", "path_prefix": "/api"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    /// A host has one spelling here, because the edge lower-cases it and
+    /// strips its port before matching: a row it would read as a different
+    /// string is a row that was checked as one name and matched as another.
+    #[tokio::test]
+    async fn a_host_the_edge_would_read_differently_is_refused_rather_than_rewritten() {
+        let h = harness(true).await;
+        let router = &h.router;
+        json(
+            router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        json(
+            router,
+            "POST",
+            "/api/apps/demo/environments",
+            serde_json::json!({"name": "production"}),
+        )
+        .await;
+        json(
+            router,
+            "POST",
+            "/api/domains",
+            serde_json::json!({"pattern": "*", "app_id": "demo"}),
+        )
+        .await;
+
+        for host in [
+            "Demo.Example.com",
+            "demo.example.com:8443",
+            "demo.example.com.",
+            "demo..example.com",
+        ] {
+            let (status, body) = json(
+                router,
+                "POST",
+                "/api/apps/demo/environments/production/routes",
+                serde_json::json!({"host": host, "path_prefix": "/"}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{host} was accepted: {body}"
+            );
+        }
+
+        // The trailing slash is the same problem in the other field.
+        let (status, body) = json(
+            router,
+            "POST",
+            "/api/apps/demo/environments/production/routes",
+            serde_json::json!({"host": "demo.example.com", "path_prefix": "/api/"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
     #[tokio::test]
     async fn routes_and_secrets_round_trip() {
         let h = harness(true).await;
@@ -791,6 +1049,17 @@ pub(crate) mod tests {
             serde_json::json!({"name": "production"}),
         )
         .await;
+
+        // A hostname is global: the platform has to have granted it before
+        // any application can claim it. See `catalog::domains`.
+        let (status, body) = json(
+            router,
+            "POST",
+            "/api/domains",
+            serde_json::json!({"pattern": "*", "app_id": "demo"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
 
         let (status, body) = json(
             router,

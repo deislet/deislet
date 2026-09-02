@@ -125,6 +125,22 @@ pub const BINDING_SEPARATOR: char = '@';
 /// case-insensitively where a manifest is validated, because two names that
 /// differ only in case would be one directory on a case-insensitive
 /// filesystem.
+///
+/// This function, together with [`is_valid_tenant_part`], is what carries the
+/// path-safety argument for the *composed* form. A namespace id is at most
+/// three of these parts joined by the two separators, and no part may hold a
+/// `.`, a `/`, a `\` or a NUL, so `app.environment@BINDING`:
+///
+/// * is a single path component - the separators are not path separators, and
+///   nothing inside a part can become one;
+/// * can never spell `.` or `..`, since every part is non-empty and holds no
+///   `.` of its own;
+/// * can never be absolute, since no part may begin with `/`;
+/// * is at most 194 bytes, so appending a suffix such as `.sqlite-journal`
+///   still leaves it inside the 255-byte name limit.
+///
+/// A binding therefore widens what a tenant may address inside its own
+/// directory and never where that directory is.
 pub fn is_valid_binding_name(name: &str) -> bool {
     is_valid_tenant_part(name)
 }

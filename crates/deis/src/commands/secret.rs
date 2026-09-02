@@ -19,8 +19,8 @@ use std::io::Read;
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 
-use crate::commands::Session;
 use crate::commands::deploy::{fail_on_incomplete_delivery, print_delivery};
+use crate::commands::{Session, escaped};
 use crate::render::{Output, Table, age, timestamp};
 use crate::settings::Overrides;
 
@@ -125,8 +125,11 @@ pub async fn list(app: Option<String>, environment: Option<String>, output: Outp
 
     let mut table = Table::new(&["NAME", "UPDATED", "AGE"]);
     for secret in &secrets {
+        // A secret's *name* - never its value, which this command cannot
+        // read back at all. The name was chosen by whoever set it, which for
+        // a scoped credential is not necessarily the operator reading this.
         table.row(vec![
-            secret.name.clone(),
+            escaped(&secret.name),
             timestamp(secret.updated_at),
             age(secret.updated_at),
         ]);

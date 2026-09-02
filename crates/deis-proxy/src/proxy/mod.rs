@@ -96,6 +96,7 @@ pub const PLATFORM_HEADER_PREFIX: &str = "x-deis-";
 
 pub mod access_log;
 pub mod balancer;
+pub mod inherited;
 pub mod service;
 
 use std::sync::Arc;
@@ -120,6 +121,7 @@ use crate::config::{AppConfig, ConfigManager, SystemConfig};
 
 pub use access_log::AccessLog;
 pub use balancer::Balancer;
+pub use inherited::InheritedListeners;
 pub use service::ExitOnPanic;
 
 pub struct DeisProxy {

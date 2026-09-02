@@ -7,9 +7,18 @@ use rolldown::{
 };
 use rolldown_common::Output;
 
+/// The targets whose artefact is a single bundled module.
+///
+/// There is deliberately no `Deno` variant. The deno target ships the
+/// generated router and the author's handlers as they were written, with a
+/// `deno.json` beside them - Deno resolves and type-checks them itself, and
+/// its runtime reads `npm:` and `jsr:` specifiers this bundler cannot. A
+/// variant existed and nothing ever constructed it, which read as "deno can be
+/// bundled" while `deis_build::compiler` sent that target somewhere else
+/// entirely. What stands behind a deno artefact instead is
+/// `Compiler::refuse_specifiers_deno_cannot_resolve` and `deno check`.
 pub enum TargetPlatform {
     Cloudflare,
-    Deno,
     EdgeOne,
     /// deis-runtime: a deno_core isolate with Web APIs and no Node built-ins,
     /// loading one ESM entry point.
@@ -22,13 +31,12 @@ pub struct BuildBundler {
 
 impl BuildBundler {
     pub fn new(entry: &str, platform: TargetPlatform) -> Self {
+        // Every target left here is a browser-like isolate loading one ESM
+        // module: a Worker, an EdgeOne function, a deis-runtime isolate. None
+        // has Node built-ins.
         let (platform_opt, format) = match platform {
             TargetPlatform::Cloudflare | TargetPlatform::EdgeOne | TargetPlatform::Deislet => {
                 (Some(Platform::Browser), Some(OutputFormat::Esm))
-            }
-            TargetPlatform::Deno => {
-                // Deno supports Node-style resolution but runs in a browser-like environment
-                (Some(Platform::Node), Some(OutputFormat::Esm))
             }
         };
 
@@ -102,11 +110,21 @@ impl BuildBundler {
     /// wherever the build was launched from. Taking the string and letting the
     /// caller do the writing is the same output with nothing left behind, and
     /// it is what lets Memory mode keep its promise.
-    pub async fn generate(&self) -> Result<String> {
+    /// Returns the module and whatever the bundler had to say that was not
+    /// fatal - a circular import, an unused external.
+    ///
+    /// Those used to be printed here and dropped, so they reached a terminal
+    /// and nothing else: the build's own warning list did not have them, and
+    /// `deis build`'s summary line counts that list. The decision *not* to
+    /// fail on them stands and is argued in [`Self::refuse_broken_references`];
+    /// what changes is that they are now carried back with everything else the
+    /// build wants to tell the author, instead of being the one advisory that
+    /// only exists in scrollback.
+    pub async fn generate(&self) -> Result<(String, Vec<String>)> {
         let mut bundler = Bundler::new(self.options.clone())?;
         let result = bundler.generate().await?;
-        Self::refuse_broken_references(&result.warnings)?;
-        Self::single_js_chunk(result.assets)
+        let advisories = Self::refuse_broken_references(&result.warnings)?;
+        Ok((Self::single_js_chunk(result.assets)?, advisories))
     }
 
     /// Stop on a warning that says the emitted module names something that is
@@ -135,20 +153,23 @@ impl BuildBundler {
     /// worth an author's attention and is not a module that fails to
     /// evaluate, and turning every warning into an error here would make a
     /// bundler upgrade able to fail builds that are correct.
-    fn refuse_broken_references(warnings: &[rolldown_error::BuildDiagnostic]) -> Result<()> {
+    fn refuse_broken_references(
+        warnings: &[rolldown_error::BuildDiagnostic],
+    ) -> Result<Vec<String>> {
         use rolldown_error::EventKind;
 
         let mut fatal: Vec<String> = Vec::new();
+        let mut advisories: Vec<String> = Vec::new();
         for warning in warnings {
             let message = warning.to_diagnostic().to_string();
             match warning.kind() {
                 EventKind::ImportIsUndefined | EventKind::MissingExportError => fatal.push(message),
-                _ => eprintln!("  ⚠ {message}"),
+                _ => advisories.push(message),
             }
         }
 
         if fatal.is_empty() {
-            return Ok(());
+            return Ok(advisories);
         }
         bail!(
             "the bundled entry module refers to {} binding(s) that nothing defines ({}); an ESM \

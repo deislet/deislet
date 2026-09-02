@@ -25,7 +25,7 @@
 use anyhow::Result;
 use colored::Colorize;
 
-use crate::commands::Session;
+use crate::commands::{Session, escape_control, escaped, push_escaped};
 use crate::platform::queue::DeadLetter;
 use crate::render::{BytesForDisplay, Output, age, base64_encode, bytes_for_display, timestamp};
 use crate::settings::Overrides;
@@ -112,7 +112,7 @@ pub async fn dead_letters(args: DeadLettersArgs, output: Output) -> Result<()> {
         "\n{} {}",
         "Dead letters in".bold(),
         match &args.queue {
-            Some(queue) => format!("{tenant}, queue {queue}"),
+            Some(queue) => format!("{tenant}, queue {}", escape_control(queue)),
             None => tenant.clone(),
         }
         .cyan()
@@ -127,7 +127,14 @@ pub async fn dead_letters(args: DeadLettersArgs, output: Output) -> Result<()> {
     // the body is whatever the producer sent, and neither fits a column that
     // every other message has to share.
     for message in &messages {
-        println!("\n  {}  {}", message.queue.cyan(), message.id.bold());
+        // The queue name is whatever the producer enqueued to and the id is
+        // whatever deis-queue recorded; neither is checked against a shape on
+        // the way to this line.
+        println!(
+            "\n  {}  {}",
+            escape_control(&message.queue).cyan(),
+            escape_control(&message.id).bold()
+        );
         println!(
             "    {}",
             format!(
@@ -158,8 +165,9 @@ pub async fn dead_letters(args: DeadLettersArgs, output: Output) -> Result<()> {
         Some(cursor) => println!(
             "  {}",
             format!(
-                "{} shown, more to come. Continue with --cursor {cursor}, or ask for --all.",
-                messages.len()
+                "{} shown, more to come. Continue with --cursor {}, or ask for --all.",
+                messages.len(),
+                escape_control(cursor)
             )
             .dimmed()
         ),
@@ -176,7 +184,7 @@ pub async fn dead_letters(args: DeadLettersArgs, output: Output) -> Result<()> {
         format!(
             "Put chosen messages back with `deis queue replay --queue {} <id>...` once the cause \
              is fixed.",
-            one_queue(&messages).unwrap_or("<queue>")
+            escape_control(one_queue(&messages).unwrap_or("<queue>"))
         )
         .dimmed()
     );
@@ -295,7 +303,11 @@ pub async fn replay(args: ReplayArgs, output: Output) -> Result<()> {
 /// the message died for no reason at all.
 fn why(message: &DeadLetter) -> String {
     match &message.reason {
-        Some(reason) => reason.clone(),
+        // A reason is usually the consumer's own thrown error, so it carries
+        // application text as directly as the body two lines below does. The
+        // body has been escaped since this report was written; the reason
+        // sitting next to it was not, which is the same hole one column over.
+        Some(reason) => escaped(reason),
         None => "no reason was recorded; this message was given up on by a queue that did not \
                  keep one"
             .to_string(),
@@ -329,15 +341,10 @@ fn body_preview(data: &[u8]) -> String {
                 if shown >= BODY_PREVIEW_CHARS {
                     break;
                 }
-                if character.is_control() {
-                    for escaped in character.escape_debug() {
-                        preview.push(escaped);
-                        shown += 1;
-                    }
-                } else {
-                    preview.push(character);
-                    shown += 1;
-                }
+                // The escaping decision itself is `commands::push_escaped`,
+                // which is what every other renderer in this tree uses through
+                // `escape_control`. This loop owns only the ceiling.
+                shown += push_escaped(&mut preview, character);
                 taken += 1;
             }
             let cut = text.chars().count() > taken;
@@ -380,6 +387,23 @@ mod tests {
         // the one thing that cannot have happened.
         let rendered = why(&dead(None));
         assert!(rendered.contains("no reason was recorded"), "{rendered}");
+    }
+
+    #[test]
+    fn the_reason_cannot_repaint_the_screen_the_way_the_body_never_could() {
+        // The sibling one column over. `body_preview` has escaped the body
+        // since this report was written; the reason printed on the line above
+        // it did not, and a reason is usually the consumer's own thrown error,
+        // which is application text as directly as the body is.
+        let rendered = why(&dead(Some("threw: \u{1b}[2J\u{1b}[31mCOMPROMISED")));
+        assert!(!rendered.contains('\u{1b}'), "{rendered}");
+        assert!(rendered.contains("\\u{1b}[2J"), "{rendered}");
+    }
+
+    #[test]
+    fn a_reason_cannot_break_the_report_into_pieces_either() {
+        let rendered = why(&dead(Some("gave up\nafter 5 attempts")));
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
     }
 
     #[test]

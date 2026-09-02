@@ -425,6 +425,88 @@ order.
 `PUT` replaces every field, so an omitted `host` clears it back to "any
 domain".
 
+Four things are checked before a route is written, and all four inside the
+one database call that writes it:
+
+* **The host has one spelling.** Capitals, a port and a trailing dot are
+  refused rather than rewritten (`400`). The edge lower-cases the host and
+  strips the port before it matches, so a row spelled any other way would be
+  checked here as one name and matched out there as another. The same goes
+  for a `path_prefix` with a trailing slash: the edge trims it, so `/api/` and
+  `/api` would be one claim stored as two rows.
+* **The name has to have been granted** to this application and environment
+  (`403`) — see *Hostname grants* below.
+* **Nobody else already holds that `host` + `path_prefix`** (`409`). One
+  address is served by one application.
+* **The environment and the application are under their route ceilings**
+  (`409`): 20 routes per environment, 100 per application.
+
+`priority` is bounded to `-1000..=1000` (`400` outside it). It breaks ties
+between routes that match the same request; it is not a place in a global
+queue.
+
+### Hostname grants
+
+```http
+GET    /api/domains
+POST   /api/domains
+DELETE /api/domains/{pattern}?app_id={app}&environment={env}
+```
+
+A hostname is the only namespace on this platform that is **global**. An
+application id belongs to whoever created the application and an environment
+name belongs to its application, so `deploy:<app>/<env>` can spell both;
+`shop.example.com` belongs to whoever registered the domain, and no scope can
+say that. Until this registry existed, a credential scoped to one preview
+environment could post any hostname on the internet into its own
+environment's route list and be answered `201`, taking delivery of every
+request to that name.
+
+So the platform writes the names down, and a claim no grant covers is refused
+— **for everybody, including an owner**. There is one rule, and an owner who
+wants a name creates the grant first.
+
+```json
+POST /api/domains
+{ "pattern": "*.example.com", "app_id": "shop", "environment": "production",
+  "note": "the shop team's zone" }
+```
+
+`pattern` is one of:
+
+| Pattern | Covers |
+|---|---|
+| `shop.example.com` | that one name |
+| `*.example.com` | every name *strictly* under the zone — `a.example.com`, `a.b.example.com`, and the wildcard route `*.example.com` itself. **Not** `example.com`: the apex is its own name and gets its own grant, because that is exactly what a wildcard route matches at the edge |
+| `*` | every name, including a route that names no host at all — which is the widest claim there is, since it answers for every name no other route claims |
+
+`environment` may be omitted, which means every environment of that
+application.
+
+Grants overlap on purpose, and the **narrowest** grant covering a name is the
+one that decides. Granting `*.example.com` to `team-a` and `b.example.com` to
+`team-b` means `team-a` cannot claim `b.example.com`. Two applications may
+hold the same pattern — an operator can say that deliberately — and then
+either may claim inside it, with the `(host, path_prefix)` uniqueness above
+deciding who actually holds a given address.
+
+All four calls demand `admin:*/*`, the same as accounts and tokens: handing
+out a hostname decides which tenant receives somebody else's cookies.
+
+Withdrawing a grant does **not** delete the routes created under it. They keep
+serving — one mistyped `DELETE` must not take an application off the internet
+— but the claim can no longer be re-made, and the log names what is left
+stranded. Releasing a retired application name (`DELETE /api/retired-apps/{app}`)
+*does* withdraw that application's grants, because the next application of
+that name is somebody else.
+
+**Upgrading an existing installation.** On the first start after this
+control plane learns to record hostname ownership, every host a route already
+claims becomes a grant to the application that claims it. The platform keeps
+serving exactly what it served, `GET /api/domains` is then the list of who
+holds what, and only a *new* name is a decision somebody has to make. The
+adoption runs once, not on every start.
+
 ### Secrets
 
 ```http

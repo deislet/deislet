@@ -13,8 +13,8 @@
 use anyhow::Result;
 use colored::Colorize;
 
-use crate::commands::Session;
-use crate::platform::AuditFilter;
+use crate::commands::{Session, escape_control, escaped};
+use crate::platform::{AuditEntry, AuditFilter};
 use crate::render::{Output, Table, timestamp};
 use crate::settings::Overrides;
 
@@ -76,31 +76,38 @@ pub async fn execute(
 
     let mut table = Table::new(&["WHEN", "WHO", "ACTION", "TARGET", "FROM", "OUTCOME"]);
     for entry in &entries {
-        let who = match (&entry.actor_account, &entry.actor_credential) {
-            (Some(account), Some(credential)) => format!("{account} ({credential})"),
-            (Some(account), None) => account.clone(),
-            (None, Some(credential)) => format!("key {credential}"),
-            (None, None) => "anonymous".to_string(),
-        };
-        let target = match (&entry.app_id, &entry.environment, &entry.target) {
-            (Some(app), Some(env), Some(name)) => format!("{app}/{env} {name}"),
-            (Some(app), Some(env), None) => format!("{app}/{env}"),
-            (Some(app), None, Some(name)) => format!("{app} {name}"),
-            (Some(app), None, None) => app.clone(),
-            (None, _, Some(name)) => name.clone(),
-            (None, _, None) => "-".to_string(),
-        };
+        // Every cell of this table is a string deis-control recorded off a
+        // request. The audit log's whole job is to hold what *refused*
+        // callers did, so it is the one table in this CLI guaranteed to
+        // contain text chosen by someone who was trying to get somewhere they
+        // were not allowed - which makes an unescaped cell here the highest
+        // value one in the tree, not the lowest.
+        let who = who_cell(entry);
+        let target = target_cell(entry);
         let outcome = match entry.outcome.as_str() {
             "accepted" => entry.outcome.green().to_string(),
             "refused" => format!("{} ({})", entry.outcome.red(), entry.status),
-            _ => format!("{} ({})", entry.outcome.yellow(), entry.status),
+            // The arm a value this CLI does not know about lands in, so it is
+            // the arm that prints the string as sent rather than one of two
+            // literals.
+            _ => format!(
+                "{} ({})",
+                escape_control(&entry.outcome).yellow(),
+                entry.status
+            ),
         };
         table.row(vec![
             timestamp(entry.at),
             who,
-            entry.action.clone(),
+            escaped(&entry.action),
             target,
-            entry.peer.clone().unwrap_or_else(|| "-".to_string()),
+            // The peer address, as deis-control read it off the connection or
+            // out of a forwarding header.
+            entry
+                .peer
+                .as_deref()
+                .map(escaped)
+                .unwrap_or_else(|| "-".to_string()),
             outcome,
         ]);
     }
@@ -111,13 +118,151 @@ pub async fn execute(
     // point of the line, so it is printed underneath.
     for entry in entries.iter().filter(|e| e.outcome == "refused") {
         if let Some(detail) = &entry.detail {
+            // The refusal's own sentence, printed full width under the
+            // table: the longest attacker-influenced string this command
+            // shows, and the one with no column to be cut by.
             println!(
                 "  {} {}",
-                format!("{}:", entry.action).dimmed(),
-                detail.dimmed()
+                format!("{}:", escape_control(&entry.action)).dimmed(),
+                escape_control(detail).dimmed()
             );
         }
     }
     println!();
     Ok(())
+}
+
+/// Who did it, as one cell.
+///
+/// Both halves come off a request deis-control refused or accepted: an
+/// account name, or the name of the credential presented. The audit log's
+/// whole job is to hold what refused callers did, so it is the one table in
+/// this CLI guaranteed to contain text chosen by someone trying to get
+/// somewhere they were not allowed - which makes an unescaped cell here the
+/// highest-value one in the tree, not the lowest.
+fn who_cell(entry: &AuditEntry) -> String {
+    match (&entry.actor_account, &entry.actor_credential) {
+        (Some(account), Some(credential)) => format!(
+            "{} ({})",
+            escape_control(account),
+            escape_control(credential)
+        ),
+        (Some(account), None) => escaped(account),
+        (None, Some(credential)) => format!("key {}", escape_control(credential)),
+        (None, None) => "anonymous".to_string(),
+    }
+}
+
+/// What it was done to, as one cell. Same provenance, same rule.
+fn target_cell(entry: &AuditEntry) -> String {
+    match (&entry.app_id, &entry.environment, &entry.target) {
+        (Some(app), Some(env), Some(name)) => format!(
+            "{}/{} {}",
+            escape_control(app),
+            escape_control(env),
+            escape_control(name)
+        ),
+        (Some(app), Some(env), None) => {
+            format!("{}/{}", escape_control(app), escape_control(env))
+        }
+        (Some(app), None, Some(name)) => {
+            format!("{} {}", escape_control(app), escape_control(name))
+        }
+        (Some(app), None, None) => escaped(app),
+        (None, _, Some(name)) => escaped(name),
+        (None, _, None) => "-".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod terminal_safety_test {
+    use super::*;
+
+    fn entry() -> AuditEntry {
+        AuditEntry {
+            id: 1,
+            at: 1_700_000_000,
+            actor_kind: "token".to_string(),
+            actor_account: None,
+            actor_credential: None,
+            action: "app.deploy".to_string(),
+            app_id: None,
+            environment: None,
+            target: None,
+            method: "POST".to_string(),
+            path: "/api/apps".to_string(),
+            peer: None,
+            outcome: "refused".to_string(),
+            status: 403,
+            detail: None,
+        }
+    }
+
+    /// Every arm of both cells, not the one an attacker happened to use
+    /// first. A cell that is safe only when the fields it prefers are present
+    /// is the shape that produces the next finding.
+    #[test]
+    fn no_arm_of_the_who_cell_lets_an_escape_sequence_through() {
+        let paint = "\u{1b}[2J\u{1b}[31mADMIN";
+        let mut both = entry();
+        both.actor_account = Some(paint.to_string());
+        both.actor_credential = Some(paint.to_string());
+        let mut account_only = entry();
+        account_only.actor_account = Some(paint.to_string());
+        let mut credential_only = entry();
+        credential_only.actor_credential = Some(paint.to_string());
+
+        for (name, entry) in [
+            ("account and credential", both),
+            ("account only", account_only),
+            ("credential only", credential_only),
+        ] {
+            let rendered = who_cell(&entry);
+            assert!(!rendered.contains('\u{1b}'), "{name}: {rendered:?}");
+            assert_eq!(rendered.lines().count(), 1, "{name}: {rendered:?}");
+        }
+        assert_eq!(who_cell(&entry()), "anonymous");
+    }
+
+    #[test]
+    fn no_arm_of_the_target_cell_lets_a_newline_through() {
+        let forged = "demo\n2026-09-02  ACCEPTED  someone-else";
+        let mut all = entry();
+        all.app_id = Some(forged.to_string());
+        all.environment = Some(forged.to_string());
+        all.target = Some(forged.to_string());
+        let mut app_env = entry();
+        app_env.app_id = Some(forged.to_string());
+        app_env.environment = Some(forged.to_string());
+        let mut app_target = entry();
+        app_target.app_id = Some(forged.to_string());
+        app_target.target = Some(forged.to_string());
+        let mut app_only = entry();
+        app_only.app_id = Some(forged.to_string());
+        let mut target_only = entry();
+        target_only.target = Some(forged.to_string());
+
+        for (name, entry) in [
+            ("app, env and target", all),
+            ("app and env", app_env),
+            ("app and target", app_target),
+            ("app only", app_only),
+            ("target only", target_only),
+        ] {
+            let rendered = target_cell(&entry);
+            assert_eq!(rendered.lines().count(), 1, "{name}: {rendered:?}");
+            assert!(rendered.contains("demo\\n2026"), "{name}: {rendered:?}");
+        }
+        assert_eq!(target_cell(&entry()), "-");
+    }
+
+    #[test]
+    fn an_ordinary_row_reads_as_it_did() {
+        let mut entry = entry();
+        entry.actor_account = Some("alice".to_string());
+        entry.app_id = Some("demo".to_string());
+        entry.environment = Some("production".to_string());
+        assert_eq!(who_cell(&entry), "alice");
+        assert_eq!(target_cell(&entry), "demo/production");
+    }
 }

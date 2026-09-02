@@ -221,9 +221,14 @@ impl BlobService {
 
     /// Where a tenant's content lives.
     fn tenant_root(&self, tenant: &TenantId) -> PathBuf {
-        // A tenant id carries one dot, between its two halves, and neither
-        // half may contain a dot or a path separator - so it is a single path
-        // component and this stays inside `root` by construction.
+        // A namespace, not a bare tenant: `app.environment`, or
+        // `app.environment@BINDING` when the call named a binding. Either way
+        // it is one path component, and that is `TenantId`'s guarantee rather
+        // than this line's - it is only constructible through
+        // `split_namespace`, so every part passed `is_valid_tenant_part` /
+        // `is_valid_binding_name` and holds nothing but ASCII letters,
+        // digits, `_` and `-`. With no `.`, `/` or `\` inside any part, the
+        // value cannot be `.`, `..`, or a path that leaves `root`.
         self.root.join(tenant.as_str())
     }
 

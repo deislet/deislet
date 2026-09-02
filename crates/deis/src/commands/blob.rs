@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use colored::Colorize;
 
-use crate::commands::Session;
+use crate::commands::{Session, escape_control, escaped};
 use crate::platform::storage::{BlobCondition, BlobRange, Conditional, DEFAULT_MAX_BLOB_BYTES};
 use crate::render::{
     BytesForDisplay, Output, base64_encode, bytes_for_display, confirm_destructive, timestamp,
@@ -228,6 +228,9 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
             blob.data.len(),
             path.display().to_string().cyan()
         ),
+        // The payload, not a report line: left unescaped for the same reason
+        // `deis kv get` leaves it, and with the same `--file` escape hatch.
+        // See the note there for the rule that draws the line.
         None => match bytes_for_display(&blob.data) {
             BytesForDisplay::Text(text) => println!("{text}"),
             BytesForDisplay::Binary { len, preview_hex } => println!(
@@ -256,7 +259,12 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
         );
     }
     if let Some(content_type) = &blob.info.content_type {
-        eprintln!("{}", format!("content-type: {content_type}").dimmed());
+        // The content type is whatever the application set when it stored
+        // the object; nothing on the write path constrains it to a media type.
+        eprintln!(
+            "{}",
+            format!("content-type: {}", escape_control(content_type)).dimmed()
+        );
     }
     eprintln!(
         "{}",
@@ -470,13 +478,21 @@ pub async fn head(args: HeadArgs, output: Output) -> Result<()> {
             "created_at": info.created_at,
         }));
     }
-    println!("\n  {} in {}\n", info.key.cyan(), tenant.cyan());
+    // The object key is application-chosen and arbitrary bytes of UTF-8.
+    println!(
+        "\n  {} in {}\n",
+        escape_control(&info.key).cyan(),
+        tenant.cyan()
+    );
     println!("  {:<14}{}", "size".dimmed(), info.size);
     println!("  {:<14}{}", "sha256".dimmed(), info.sha256);
     println!(
         "  {:<14}{}",
         "content-type".dimmed(),
-        info.content_type.as_deref().unwrap_or("-")
+        info.content_type
+            .as_deref()
+            .map(escaped)
+            .unwrap_or_else(|| "-".to_string())
     );
     println!("  {:<14}{}", "stored".dimmed(), timestamp(info.created_at));
     Ok(())
@@ -564,13 +580,18 @@ pub async fn list(args: ListArgs, output: Output) -> Result<()> {
 
     println!();
     for prefix in &prefixes {
-        println!("  {:>10}  {}", "<folder>".dimmed(), prefix.cyan());
+        // A "folder" is only the leading segment of application-chosen keys.
+        println!(
+            "  {:>10}  {}",
+            "<folder>".dimmed(),
+            escape_control(prefix).cyan()
+        );
     }
     for object in &objects {
         println!(
             "  {:>10}  {}  {}",
             object.size,
-            object.key.cyan(),
+            escape_control(&object.key).cyan(),
             format!(
                 "{} {}",
                 &object.sha256[..object.sha256.len().min(12)],
@@ -587,8 +608,9 @@ pub async fn list(args: ListArgs, output: Output) -> Result<()> {
         Some(cursor) => println!(
             "\n  {}",
             format!(
-                "{counted} shown, more to come. Continue with --cursor {cursor} , or ask for \
-                 --all"
+                "{counted} shown, more to come. Continue with --cursor {} , or ask for \
+                 --all",
+                escape_control(cursor)
             )
             .dimmed()
         ),

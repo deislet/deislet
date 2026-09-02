@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 
-use crate::commands::resolve;
+use crate::commands::{escape_control, escaped, resolve};
 use crate::platform::telemetry::{self, LogEntry, LogLevel, QueryRequest, TailRequest, Telemetry};
 use crate::render::{Output, parse_since, timestamp_micros};
 use crate::settings::{Overrides, Settings};
@@ -334,10 +334,17 @@ fn format_entry(entry: &LogEntry) -> String {
         _ => format!("{level:<5}").dimmed().to_string(),
     };
 
-    let mut source = entry.component.clone();
+    // Every one of these came off the wire, and the message came from an
+    // application verbatim: `console.log("\u{1b}[2J\u{1b}[31mCOMPROMISED")` is
+    // a repainted terminal for whoever reads that application's logs, and a
+    // `\n` in it is one entry printing as two. The component and the fields
+    // are escaped for the same reason and not because they are as reachable:
+    // a rule applied to the field this quarter's attacker used is how the next
+    // field becomes next quarter's finding.
+    let mut source = escaped(&entry.component);
     if let Some(environment) = entry.fields.get(telemetry::ENVIRONMENT_FIELD) {
         source.push('/');
-        source.push_str(environment);
+        source.push_str(&escape_control(environment));
     }
 
     let mut line = format!(
@@ -345,7 +352,7 @@ fn format_entry(entry: &LogEntry) -> String {
         timestamp_micros(entry.timestamp_us).dimmed(),
         painted,
         source.cyan(),
-        entry.message
+        escape_control(&entry.message)
     );
 
     let extra = extra_fields(&entry.fields);
@@ -355,7 +362,11 @@ fn format_entry(entry: &LogEntry) -> String {
     }
     if !entry.trace_id.is_empty() {
         line.push(' ');
-        line.push_str(&format!("trace={}", entry.trace_id).dimmed().to_string());
+        line.push_str(
+            &format!("trace={}", escape_control(&entry.trace_id))
+                .dimmed()
+                .to_string(),
+        );
     }
     line
 }
@@ -366,7 +377,11 @@ fn extra_fields(fields: &HashMap<String, String>) -> String {
     let mut pairs: Vec<String> = fields
         .iter()
         .filter(|(key, _)| key.as_str() != telemetry::ENVIRONMENT_FIELD)
-        .map(|(key, value)| format!("{key}={value}"))
+        // The key as well as the value: a node is free to record a field
+        // under any name, and an application that reaches a code path which
+        // records one of its own strings as a field name gets the same
+        // terminal for free if only values are escaped.
+        .map(|(key, value)| format!("{}={}", escape_control(key), escape_control(value)))
         .collect();
     pairs.sort();
     pairs.join(" ")
@@ -447,5 +462,121 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["level"], "ERROR");
         assert_eq!(parsed["environment"], "production");
+    }
+}
+
+/// What an application can put on the operator's terminal through `deis logs`.
+///
+/// Separate from `mod tests` above because these need colour forced off:
+/// `format_entry` paints the level and the source, and a test asserting "no
+/// escape sequence reached the line" would otherwise be asserting about
+/// `colored`'s own escapes rather than about the tenant's.
+#[cfg(test)]
+mod terminal_safety_test {
+    use super::*;
+
+    fn plain(entry: &LogEntry) -> String {
+        colored::control::set_override(false);
+        let rendered = format_entry(entry);
+        colored::control::unset_override();
+        rendered
+    }
+
+    fn entry_saying(message: &str) -> LogEntry {
+        LogEntry {
+            timestamp_us: 1_787_998_800_000_000,
+            level: LogLevel::Info as i32,
+            component: "deis-runtime".to_string(),
+            app_id: "demo".to_string(),
+            message: message.to_string(),
+            fields: HashMap::new(),
+            trace_id: String::new(),
+            span_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_application_cannot_repaint_the_screen_through_its_own_log_line() {
+        // Reproduced against a real deis-telemetry before this was closed:
+        // `console.log("\u{1b}[2J\u{1b}[H\u{1b}[31mCOMPROMISED")` reached
+        // stdout unchanged, with stdout not a TTY. The message travels to the
+        // CLI through the shipper, which never passes through the `fmt` layer
+        // that would have escaped the ESC, so nothing between the isolate and
+        // this line escapes anything.
+        let rendered = plain(&entry_saying("\u{1b}[2J\u{1b}[H\u{1b}[31mCOMPROMISED"));
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(rendered.contains("\\u{1b}[2J"), "{rendered:?}");
+    }
+
+    #[test]
+    fn an_application_cannot_retitle_the_operators_window() {
+        let rendered = plain(&entry_saying("\u{1b}]0;pwned\u{7}"));
+        assert!(!rendered.contains('\u{7}'), "{rendered:?}");
+        assert!(rendered.contains("\\u{1b}]0;pwned\\u{7}"), "{rendered:?}");
+    }
+
+    #[test]
+    fn one_entry_cannot_print_as_two() {
+        // A newline in the message would make one entry look like two, the
+        // second of which carries no timestamp, no level and no source - and
+        // therefore reads as a continuation of whatever the operator was
+        // looking at rather than as something an application said.
+        let rendered = plain(&entry_saying("first\nsecond"));
+        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
+        assert!(rendered.contains("first\\nsecond"), "{rendered:?}");
+    }
+
+    #[test]
+    fn the_source_column_is_escaped_too() {
+        // `component` and the environment are the source column. Neither is
+        // checked against a shape on the way in, and both are joined into one
+        // painted cell.
+        let mut entry = entry_saying("ordinary");
+        entry.component = "deis-runtime\u{1b}[31m".to_string();
+        entry.fields.insert(
+            telemetry::ENVIRONMENT_FIELD.to_string(),
+            "production\nWARN forged".to_string(),
+        );
+        let rendered = plain(&entry);
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
+    }
+
+    #[test]
+    fn a_structured_fields_name_is_escaped_as_well_as_its_value() {
+        // Both halves: a node records fields under names it chooses, and the
+        // renderer prints `name=value` with neither half constrained.
+        let mut entry = entry_saying("ordinary");
+        entry
+            .fields
+            .insert("key\u{1b}[31m".to_string(), "value\nforged".to_string());
+        let rendered = plain(&entry);
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
+        assert!(
+            rendered.contains("key\\u{1b}[31m=value\\nforged"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn the_invocation_id_is_escaped() {
+        let mut entry = entry_saying("ordinary");
+        entry.trace_id = "abc\u{1b}[2J".to_string();
+        let rendered = plain(&entry);
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+    }
+
+    #[test]
+    fn an_ordinary_line_is_left_exactly_as_it_was_written() {
+        // The other half of the rule: escaping that mangles legitimate text is
+        // escaping an operator turns off.
+        let rendered = plain(&entry_saying(
+            "served 200 in 4ms - \u{65e5}\u{672c}\u{8a9e} - caf\u{e9}",
+        ));
+        assert!(
+            rendered.contains("served 200 in 4ms - \u{65e5}\u{672c}\u{8a9e} - caf\u{e9}"),
+            "{rendered:?}"
+        );
     }
 }

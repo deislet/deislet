@@ -1,5 +1,13 @@
 //! Route endpoints. A route binds `host + path prefix` to one environment
 //! of one app; the edge reads these to decide which app serves a request.
+//!
+//! The host in the body is **not** covered by the authorisation
+//! `crate::api::authz` did on the way in: that judges the caller against the
+//! application and environment named in the URL, which are the caller's own,
+//! and a hostname belongs to whoever registered the domain. What decides
+//! whether this application may claim this name is the grant registry, read
+//! by `catalog::store::CatalogStore::create_route` inside the same database
+//! call that writes the row. See `catalog::domains`.
 
 use axum::{
     Json,
@@ -14,11 +22,14 @@ use crate::catalog::Route;
 
 #[derive(Debug, Deserialize)]
 pub struct RouteRequest {
-    /// Omit or null to match any domain.
+    /// Omit or null to match any domain - which is the *widest* claim on
+    /// this platform, not the mildest, and needs the widest grant.
     #[serde(default)]
     pub host: Option<String>,
     pub path_prefix: String,
-    /// Higher wins when several routes match. Defaults to 0.
+    /// Higher wins when several routes match. Defaults to 0, and is bounded
+    /// (`catalog::model::MAX_ROUTE_PRIORITY`) because it is a caller-supplied
+    /// integer that becomes an ordering key at the edge.
     #[serde(default)]
     pub priority: i64,
 }
@@ -89,7 +100,7 @@ pub async fn update_route(
     let route = state
         .store
         .update_route(
-            &env.id,
+            &env,
             &route_id,
             request.host,
             &request.path_prefix,

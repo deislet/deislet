@@ -17,6 +17,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use deis_wire::conventions::{STORAGE_TOKEN_HEADER, storage_token};
+use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
 /// Generated client for `deis.telemetry`, compiled from the proto in
@@ -94,15 +96,166 @@ pub fn entry_matches_environment(fields: &HashMap<String, String>, environment: 
     }
 }
 
+/// What the capability token for deis-telemetry is derived over.
+///
+/// The subject is the only thing separating this token from a storage token
+/// minted from the same secret, so it has to be the string the collector
+/// itself uses: `deis_telemetry::auth::TELEMETRY_CHANNEL`. Copied rather than
+/// imported because this CLI does not depend on that crate - doing so would
+/// link the collector's server, its database and its HTTP stack into a
+/// developer tool - and `the_channel_subject_is_the_collectors_own` at the
+/// bottom of this file, which does depend on it as a test-only dependency, is
+/// what stops the two drifting apart. `deis_runtime::telemetry` holds a third
+/// copy for the same reason and is pinned the same way.
+const TELEMETRY_CHANNEL: &str = "deis-telemetry";
+
+/// The token this CLI presents on every telemetry call, or nothing when no
+/// secret is configured.
+///
+/// Derived from a configured secret rather than fetched from the control
+/// plane, which is where `deis kv` and `deis queue` get theirs: the control
+/// plane's storage-token route mints a *tenant* credential from deis-store's
+/// secret, and this token names the channel rather than a tenant, so there is
+/// no route that could hand it out. The one other holder of this credential -
+/// a node, in `deis_runtime::telemetry::TelemetryCredential` - reads the same
+/// string from its own configuration and derives it the same way.
+///
+/// Until 2026-09-02 there was no credential here at all. `deis logs`, `deis
+/// tail` and `deis trace` built a bare channel, so against any deis-telemetry
+/// with an `auth_secret` - which it must have as soon as either of its
+/// listeners is not on loopback - every one of them answered "refused the
+/// query: a valid x-deis-storage-token is required", and there was no setting
+/// that could have fixed it. kv, db, blob and queue all obtained and presented
+/// a token; this was the one consumer that never got one.
+#[derive(Clone, Default)]
+pub struct TelemetryCredential {
+    /// Parsed once, when the client is built, so a secret that cannot be sent
+    /// as gRPC metadata is one complaint rather than one per call.
+    token: Option<MetadataValue<Ascii>>,
+    /// Where the secret was found, for a refusal that can say which file or
+    /// variable to edit. Never the value.
+    source: Option<String>,
+}
+
+impl TelemetryCredential {
+    /// Find the secret for `endpoint` and derive the token.
+    ///
+    /// Resolved from the endpoint inside `connect` rather than passed in by
+    /// each command: there are four `connect` call sites across `deis logs`,
+    /// `deis tail` and `deis trace`, and a credential handed in as an argument
+    /// is a credential one of the four forgets. That is the shape of the
+    /// defect this replaces.
+    fn resolve(endpoint: &str) -> Result<Self> {
+        let Some(setting) = crate::settings::telemetry_auth_secret(endpoint)? else {
+            return Ok(Self::default());
+        };
+        // A blank secret is already filtered out by the resolver, so anything
+        // arriving here is a real value.
+        let derived = storage_token(&setting.value, TELEMETRY_CHANNEL);
+        let token = derived.parse::<MetadataValue<Ascii>>().map_err(|_| {
+            // The derivation is base64 of an HMAC, so no secret of any shape
+            // produces this. Said out loud rather than silently dropped,
+            // because shipping without the token means every read is refused.
+            anyhow::anyhow!(
+                "the deis-telemetry capability token derived from the secret in {} cannot be sent \
+                 as a gRPC header, so this command has no way to authenticate",
+                setting.source
+            )
+        })?;
+        Ok(Self {
+            token: Some(token),
+            source: Some(setting.source.to_string()),
+        })
+    }
+
+    /// Wrap one message in a request carrying the token.
+    ///
+    /// Stamped here rather than at each call for the reason
+    /// `platform::queue::Identity::stamp` gives: a call that forgot it would
+    /// be refused, and nothing about the failure would say which call it was.
+    fn stamp<T>(&self, message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        if let Some(token) = &self.token {
+            request
+                .metadata_mut()
+                .insert(STORAGE_TOKEN_HEADER, token.clone());
+        }
+        request
+    }
+}
+
+/// Never derived: a derived `Debug` would put the token into any panic message
+/// or log line that formats a client, which is exactly where a credential must
+/// never appear. The same reasoning as `platform::storage::Identity`.
+impl std::fmt::Debug for TelemetryCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryCredential")
+            .field(
+                "token",
+                &if self.token.is_some() {
+                    "<present>"
+                } else {
+                    "<absent>"
+                },
+            )
+            .field("source", &self.source.as_deref().unwrap_or("<none>"))
+            .finish()
+    }
+}
+
+/// A gRPC failure as a sentence, with the hint that is worth attaching.
+///
+/// `Unauthenticated` is the failure an operator actually hits, and the cause is
+/// never in the status text - deis-telemetry does not say which secret it
+/// checked against, because saying so would leak how the token is derived. So
+/// this side says what it presented and where the value came from, which is
+/// the half the operator can act on.
+fn refusal(
+    credential: &TelemetryCredential,
+    endpoint: &str,
+    doing: &str,
+    status: &tonic::Status,
+) -> anyhow::Error {
+    let message = status.message().to_string();
+    if status.code() != tonic::Code::Unauthenticated {
+        return anyhow::anyhow!("deis-telemetry at {endpoint} refused {doing}: {message}");
+    }
+    match &credential.source {
+        Some(source) => anyhow::anyhow!(
+            "deis-telemetry at {endpoint} refused {doing}: {message}\nThis command presented the \
+             token derived from the secret in {source}. deis-telemetry derives what it expects \
+             from its own `auth_secret`; when the two are not the same string every node's log, \
+             trace and metric push is being refused as well."
+        ),
+        None => anyhow::anyhow!(
+            "deis-telemetry at {endpoint} refused {doing}: {message}\nThis command presented no \
+             credential, because none is configured. Set the same string deis-telemetry's \
+             `auth_secret` is set to:\n\n  {}=<secret>\n\nor put it in {} under\n\n  \
+             [telemetry.\"{endpoint}\"]\n  auth_secret = \"<secret>\"",
+            crate::settings::ENV_TELEMETRY_AUTH_SECRET,
+            crate::settings::credentials_path().display()
+        ),
+    }
+}
+
 /// A client for one deis-telemetry.
 pub struct Telemetry {
     client: LogServiceClient<Channel>,
     endpoint: String,
+    credential: TelemetryCredential,
 }
 
 impl Telemetry {
+    /// Dial deis-telemetry, carrying whatever credential is configured for
+    /// that address.
+    ///
+    /// The credential is resolved here rather than taken as an argument: see
+    /// [`TelemetryCredential::resolve`]. The signature is unchanged for the
+    /// same reason - every existing caller gets the token without being edited,
+    /// and a caller added later cannot forget it.
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let url = normalise_endpoint(endpoint);
+        let credential = TelemetryCredential::resolve(&url)?;
         let channel = Endpoint::from_shared(url.clone())
             .with_context(|| format!("{endpoint} is not a usable address for deis-telemetry"))?
             .connect_timeout(CONNECT_TIMEOUT)
@@ -120,6 +273,7 @@ impl Telemetry {
         Ok(Self {
             client,
             endpoint: url,
+            credential,
         })
     }
 
@@ -129,15 +283,13 @@ impl Telemetry {
 
     /// One page of stored entries, newest first.
     pub async fn query(&mut self, request: QueryRequest) -> Result<QueryResponse> {
-        let mut request = tonic::Request::new(request);
+        let mut request = self.credential.stamp(request);
         request.set_timeout(QUERY_TIMEOUT);
-        let response = self.client.query(request).await.map_err(|e| {
-            anyhow::anyhow!(
-                "deis-telemetry at {} refused the query: {}",
-                self.endpoint,
-                e.message()
-            )
-        })?;
+        let response = self
+            .client
+            .query(request)
+            .await
+            .map_err(|e| refusal(&self.credential, &self.endpoint, "the query", &e))?;
         Ok(response.into_inner())
     }
 
@@ -146,15 +298,9 @@ impl Telemetry {
     pub async fn tail(&mut self, request: TailRequest) -> Result<tonic::Streaming<LogEntry>> {
         let response = self
             .client
-            .tail(tonic::Request::new(request))
+            .tail(self.credential.stamp(request))
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "deis-telemetry at {} refused to open a tail: {}",
-                    self.endpoint,
-                    e.message()
-                )
-            })?;
+            .map_err(|e| refusal(&self.credential, &self.endpoint, "a tail", &e))?;
         Ok(response.into_inner())
     }
 }
@@ -167,11 +313,17 @@ impl Telemetry {
 pub struct Traces {
     client: TraceServiceClient<Channel>,
     endpoint: String,
+    credential: TelemetryCredential,
 }
 
 impl Traces {
+    /// Dial deis-telemetry's trace service, carrying the same credential
+    /// [`Telemetry::connect`] carries - one collector, one `auth_secret`, one
+    /// token. Two derivations would be two places for the subject to be
+    /// spelled wrong.
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let url = normalise_endpoint(endpoint);
+        let credential = TelemetryCredential::resolve(&url)?;
         let channel = Endpoint::from_shared(url.clone())
             .with_context(|| format!("{endpoint} is not a usable address for deis-telemetry"))?
             .connect_timeout(CONNECT_TIMEOUT)
@@ -189,6 +341,7 @@ impl Traces {
         Ok(Self {
             client,
             endpoint: url,
+            credential,
         })
     }
 
@@ -198,15 +351,13 @@ impl Traces {
 
     /// One page of stored records, newest invocation first.
     pub async fn query(&mut self, request: QueryTracesRequest) -> Result<QueryTracesResponse> {
-        let mut request = tonic::Request::new(request);
+        let mut request = self.credential.stamp(request);
         request.set_timeout(QUERY_TIMEOUT);
-        let response = self.client.query_traces(request).await.map_err(|e| {
-            anyhow::anyhow!(
-                "deis-telemetry at {} refused the trace query: {}",
-                self.endpoint,
-                e.message()
-            )
-        })?;
+        let response = self
+            .client
+            .query_traces(request)
+            .await
+            .map_err(|e| refusal(&self.credential, &self.endpoint, "the trace query", &e))?;
         Ok(response.into_inner())
     }
 
@@ -218,15 +369,9 @@ impl Traces {
     ) -> Result<tonic::Streaming<TraceRecord>> {
         let response = self
             .client
-            .tail_traces(tonic::Request::new(request))
+            .tail_traces(self.credential.stamp(request))
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "deis-telemetry at {} refused to open a trace stream: {}",
-                    self.endpoint,
-                    e.message()
-                )
-            })?;
+            .map_err(|e| refusal(&self.credential, &self.endpoint, "a trace stream", &e))?;
         Ok(response.into_inner())
     }
 }
@@ -374,6 +519,194 @@ fn normalise_endpoint(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::settings::{
+        Credentials, ENV_CONFIG_HOME, ENV_TELEMETRY_AUTH_SECRET, TelemetryEntry, clear_env,
+        env_lock, save_credentials, set_env,
+    };
+
+    /// The subject has to be the collector's own, or the two derive different
+    /// tokens from the same secret and every read is refused.
+    ///
+    /// This is the whole reason `deis-telemetry` is a dev-dependency of this
+    /// crate: the constant is copied rather than imported, and a copy with
+    /// nothing pinning it is a copy that drifts.
+    #[test]
+    fn the_channel_subject_is_the_collectors_own() {
+        assert_eq!(TELEMETRY_CHANNEL, deis_telemetry::auth::TELEMETRY_CHANNEL);
+    }
+
+    /// A credential must not be printable, in a panic or anywhere else.
+    #[test]
+    fn the_token_never_reaches_a_debug_line() {
+        let secret = "shared-secret";
+        let credential = TelemetryCredential {
+            token: Some(
+                storage_token(secret, TELEMETRY_CHANNEL)
+                    .parse()
+                    .expect("an HMAC in base64 is a legal header value"),
+            ),
+            source: Some("credentials.toml".to_string()),
+        };
+        let rendered = format!("{credential:?}");
+        assert!(rendered.contains("<present>"), "{rendered}");
+        assert!(
+            !rendered.contains(&storage_token(secret, TELEMETRY_CHANNEL)),
+            "the derived token is the whole authority to read every application's telemetry: \
+             {rendered}"
+        );
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+
+    /// Start a real collector that requires a token. Both listeners are on
+    /// loopback port 0, so this never collides with a running install.
+    async fn collector(secret: &str) -> (deis_telemetry::server::RunningServer, tempfile::TempDir) {
+        let data = tempfile::tempdir().expect("a directory for the database");
+        let config = deis_telemetry::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            metrics_listen: "127.0.0.1:0".to_string(),
+            data_dir: data.path().to_path_buf(),
+            auth_secret: Some(secret.to_string()),
+            ..deis_telemetry::config::Config::default()
+        };
+        let running = deis_telemetry::server::start(&config)
+            .await
+            .expect("deis-telemetry starts");
+        (running, data)
+    }
+
+    /// Point this process's credentials file at a fresh directory holding one
+    /// secret for `endpoint`.
+    fn configure(home: &std::path::Path, endpoint: &str, secret: Option<&str>) {
+        set_env(ENV_CONFIG_HOME, &home.to_string_lossy());
+        let mut credentials = Credentials::default();
+        if let Some(secret) = secret {
+            credentials.telemetry.insert(
+                endpoint.to_string(),
+                TelemetryEntry {
+                    auth_secret: secret.to_string(),
+                },
+            );
+        }
+        save_credentials(&credentials).expect("write the credentials file");
+    }
+
+    /// The read half of observability, against a collector that authenticates.
+    ///
+    /// Until 2026-09-02 `Telemetry::connect` and `Traces::connect` built a bare
+    /// `Channel` and stamped nothing, so all four of these calls answered
+    /// "a valid x-deis-storage-token is required" and no setting could have
+    /// fixed it - while kv, db, blob and queue all obtained and presented a
+    /// token. Four calls in one test on purpose: they are four separate call
+    /// sites, and giving one of them a credential is exactly the mistake being
+    /// repaired.
+    ///
+    /// One test rather than four because it moves the process environment, and
+    /// `env_lock` is held from the first line to the last.
+    // The environment lock is deliberately held across every await here: what
+    // is under test is behaviour that depends on the process environment, so
+    // releasing it between calls would let a sibling test change the variables
+    // half way through. It cannot deadlock - this test's runtime is
+    // single-threaded and nothing on it takes the lock, and the synchronous
+    // tests that want it simply block on another thread, which is the point.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn every_telemetry_read_presents_the_token_and_says_so_when_it_cannot() {
+        const SECRET: &str = "the same string on both sides";
+        let _guard = env_lock();
+        clear_env();
+
+        let (server, _data) = collector(SECRET).await;
+        let endpoint = format!("http://{}", server.grpc_addr);
+
+        // 1. Configured with the collector's own secret: every read works.
+        let home = tempfile::tempdir().expect("a config home");
+        configure(home.path(), &endpoint, Some(SECRET));
+
+        let mut logs = Telemetry::connect(&endpoint).await.expect("dialling works");
+        logs.query(QueryRequest {
+            limit: 5,
+            ..Default::default()
+        })
+        .await
+        .expect("`deis logs` has to be able to read a collector it holds the secret for");
+        logs.tail(TailRequest::default())
+            .await
+            .expect("and `deis tail` has to open a stream");
+
+        let mut traces = Traces::connect(&endpoint).await.expect("dialling works");
+        traces
+            .query(QueryTracesRequest {
+                limit: 5,
+                ..Default::default()
+            })
+            .await
+            .expect("`deis trace` reads the other service on the same credential");
+        traces
+            .tail(TailTracesRequest::default())
+            .await
+            .expect("and follows it");
+
+        // 2. Nothing configured: the refusal has to say what to set, because
+        //    the collector's own message never can - it will not name the
+        //    secret it checked against.
+        let empty = tempfile::tempdir().expect("a second config home");
+        configure(empty.path(), &endpoint, None);
+
+        let mut logs = Telemetry::connect(&endpoint).await.expect("dialling works");
+        let error = logs
+            .query(QueryRequest::default())
+            .await
+            .expect_err("a collector with an auth_secret refuses an unauthenticated read")
+            .to_string();
+        assert!(
+            error.contains(ENV_TELEMETRY_AUTH_SECRET),
+            "the message has to name the variable to set: {error}"
+        );
+        assert!(
+            error.contains("auth_secret"),
+            "and the file entry that is the other way: {error}"
+        );
+        assert!(
+            error.contains("no credential"),
+            "and that this end presented nothing, which is the half the collector cannot say: \
+             {error}"
+        );
+
+        // 3. Configured with the wrong secret: a different situation and a
+        //    different sentence - there is nothing to *add*, something has to
+        //    be corrected, and the message says where the value came from.
+        let wrong = tempfile::tempdir().expect("a third config home");
+        configure(wrong.path(), &endpoint, Some("not the collector's secret"));
+
+        let mut logs = Telemetry::connect(&endpoint).await.expect("dialling works");
+        let error = logs
+            .query(QueryRequest::default())
+            .await
+            .expect_err("a token derived from the wrong secret is refused")
+            .to_string();
+        assert!(
+            error.contains("credentials.toml"),
+            "the message has to say where the secret it used came from: {error}"
+        );
+        assert!(
+            !error.contains("not the collector's secret"),
+            "and must never print the secret itself: {error}"
+        );
+
+        // 4. The environment variable is the other way to say it, and it wins.
+        set_env(ENV_TELEMETRY_AUTH_SECRET, SECRET);
+        let mut logs = Telemetry::connect(&endpoint).await.expect("dialling works");
+        logs.query(QueryRequest {
+            limit: 5,
+            ..Default::default()
+        })
+        .await
+        .expect("$DEIS_TELEMETRY_AUTH_SECRET beats the wrong value in the file");
+
+        clear_env();
+        server.shutdown().await.expect("the collector stops");
+    }
 
     #[test]
     fn a_bare_host_and_port_becomes_a_url() {

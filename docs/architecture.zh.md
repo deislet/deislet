@@ -963,7 +963,7 @@ SSR。
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
 | KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本。读写删之外还有四样：`put` 可带 `expirationTtl`（从写入起算的相对秒数）与一段不透明的 `metadata`；`get` 可以按 `type: text / json / arrayBuffer` 取；`getWithMetadata` 一次把值、metadata 和到期时刻取回来（它们本来就是同一行的三列）；`list({ prefix, limit, cursor })` 按游标翻页，每条自带 metadata 与到期时刻。服务端另有一个 `Has`，**目前没有任何调用方**——op 表、JS 绑定和命令行都够不到它，只有 `KvClient` 自己的测试在调 |
 | Cache API | 成立 | 标准入口是 `context.services.cache`，`globalThis.caches.default` 指向同一个实例；`caches.open(name)` 另开一个互不串门的命名空间（键在 Rust 侧按名字长度前缀合成，两个名字不可能撞在一起）；`caches.scope` 把这个 store 的身份和起始时刻交给应用，好让它分清「这一条被淘汰了」和「整个 store 换了一个」——后者才是发版那天会让应用重做已经做过的事的那一种。后端是 moka 进程内缓存，`Cache-Control` 的 `max-age` / `s-maxage` 决定过期。语义上是单 Isolate 缓存：换节点、换版本都读不到。**此前这一格是有保留的**：body 过边界是字符串，写入前先当 UTF-8 解码，`0x80..=0xff` 的字节一律变成 `ef bf bd`——`caches.default` 是每个 Isolate 自带的，一张放进去的图片会在读出来时静默损坏，没有任何报错。现已改成按字节走（`op_cache_set` 收 `#[buffer] JsBuffer`，`op_cache_get` 答 `ToJsBuffer`），status/headers 仍是文本，因为那部分确实是文本 |
-| 生命周期 `waitUntil` | 成立 | `runtime.js` 的 `__deis_runtime_wait_until_all` |
+| 生命周期 `waitUntil` | 成立，有一处例外 | `runtime.js` 的 `__deis_runtime_wait_until_all`。例外：WebSocket 消息处理器里登记的 `waitUntil` 会被**丢弃**（附带一条应用可见的 warn），不是延后执行——那条派发路径（`isolate.rs` 的 `dispatch_ws_message`）没有收尾步骤，而收进别的调用去等，等于把别人的预算和 trace 记在它头上。此前它们会被下一个恰好走到收尾的调用捎带着跑掉，账记错但确实跑了；现在不跑了，这是一个明知的取舍 |
 | 结构化日志 | 成立 | 环形缓冲 + `LogShipper` → deis-telemetry，`Query` 能查回来 |
 | Web 标准 | 成立（8.1 节的部分） | 见下方「Web 标准这一格的实情」 |
 | 出网 `fetch` | 成立，且受策略约束 | 见下方「出网这一格」 |

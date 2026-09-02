@@ -20,7 +20,7 @@
 //! beats `/` at equal priority and an operator can still override that with
 //! `priority`. The first candidate whose prefix matches wins.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use deis_wire::conventions::{APP_ID_HEADER, DEFAULT_ENVIRONMENT};
 use tracing::warn;
@@ -321,7 +321,8 @@ impl CatalogRoutes {
         self.preview.len()
     }
 
-    /// Every exact host an operator created a route for.
+    /// Every exact host an operator created a route for, grouped by the
+    /// application whose route named it.
     ///
     /// Wildcard routes and the catch-all are left out on purpose: a
     /// certificate for `*.example.com` cannot be had over `http-01`, and a
@@ -329,22 +330,45 @@ impl CatalogRoutes {
     /// renewal task in [`crate::acme`] reads this so a domain added through
     /// the control plane gets a certificate without anyone editing a file on
     /// this machine.
-    pub fn route_hosts(&self) -> Vec<String> {
-        let mut hosts: Vec<String> = self.by_host.keys().cloned().collect();
-        hosts.sort();
-        hosts
+    ///
+    /// Grouped, and not a flat list, because of what happens when the
+    /// certificate ceiling bites. A flat alphabetical list truncated at
+    /// `max_names` lets one tenant with thirty names - `a001..a030` - push
+    /// every other tenant's single name off the end and out of certificate
+    /// renewal. Who asked for a name has to survive as far as the code that
+    /// decides which names fit; see [`crate::acme::names::desired_names`].
+    ///
+    /// A host two applications both route on belongs to both of them here,
+    /// which is what makes it certifiable on either one's turn.
+    pub fn route_hosts_by_app(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut by_app: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (host, candidates) in &self.by_host {
+            for route in candidates {
+                by_app
+                    .entry(route.target.app_id.clone())
+                    .or_default()
+                    .insert(host.clone());
+            }
+        }
+        by_app
     }
 
-    /// The automatic per-environment addresses, when a preview zone is set.
+    /// The automatic per-environment addresses, when a preview zone is set,
+    /// grouped by application for the same reason.
     ///
-    /// Kept apart from [`CatalogRoutes::route_hosts`] because they are
+    /// Kept apart from [`CatalogRoutes::route_hosts_by_app`] because they are
     /// treated differently: one wildcard certificate covers the whole zone,
     /// and certifying each address on its own spends one of the authority's
     /// weekly certificates per environment. See `tls.acme`.
-    pub fn preview_hosts(&self) -> Vec<String> {
-        let mut hosts: Vec<String> = self.preview.keys().cloned().collect();
-        hosts.sort();
-        hosts
+    pub fn preview_hosts_by_app(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut by_app: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (host, target) in &self.preview {
+            by_app
+                .entry(target.app_id.clone())
+                .or_default()
+                .insert(host.clone());
+        }
+        by_app
     }
 
     /// Which application and environment serves `host` + `path`.
@@ -517,6 +541,52 @@ mod tests {
             None,
         );
         assert_eq!(hit(&table, "h.test", "/a/b/c"), "short/production");
+    }
+
+    /// The half of the hostname contract this crate owns.
+    ///
+    /// The control plane stores exactly one spelling of a host
+    /// (`deis_control::catalog::domains::HostClaim`) and refuses every other
+    /// one, so that the string it checks ownership of is the string matched
+    /// here. That only holds if a spelling it accepts survives this crate's
+    /// normalisation unchanged - a *fixed point*. If it did not, a row would
+    /// be checked as one name and matched as another, which is the shape the
+    /// hostname hijack had.
+    ///
+    /// The two crates do not depend on one another, so nothing type-checks
+    /// this. These literals are the same ones
+    /// `catalog::domains::only_the_spelling_the_edge_matches_is_stored` pins
+    /// over there: loosen either side and one of the two fails.
+    #[test]
+    fn a_host_the_control_plane_stores_is_matched_as_the_string_it_stored() {
+        for stored in [
+            "shop.example.com",
+            "a-b.example.co.uk",
+            "pr-42--shop.preview.example.com",
+            "xn--80ak6aa92e.com",
+            "deislet-edge",
+            "10.0.0.1",
+        ] {
+            assert_eq!(
+                normalize_host(stored),
+                stored,
+                "{stored} is a spelling the control plane will store, and this crate reads it as \
+                 something else"
+            );
+        }
+        // And the wildcard, whose `*.` prefix this crate strips itself after
+        // normalising the rest.
+        assert_eq!(normalize_host("*.example.com"), "*.example.com");
+
+        // The spellings the control plane refuses are exactly the ones that
+        // would not have been fixed points.
+        for rewritten in ["Shop.Example.com", "shop.example.com:8443", "[::1]:443"] {
+            assert_ne!(
+                normalize_host(rewritten),
+                rewritten,
+                "{rewritten} is refused up there precisely because it is read differently here"
+            );
+        }
     }
 
     #[test]

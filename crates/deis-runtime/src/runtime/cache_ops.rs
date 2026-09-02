@@ -105,6 +105,34 @@
 //! look at. Every refusal names itself and names the fix, because a `put` that
 //! quietly does nothing leaves the application believing it has a cache.
 //!
+//! ### How a refusal reaches the application
+//!
+//! `put` **throws** when the call is not one this API accepts, and **answers**
+//! `{ stored: false, reason }` when the call is fine but this response may not
+//! be kept. The line between them is not a matter of severity; it is whether
+//! the application can fix it by editing a line:
+//!
+//! * an options bag that is not an object, an option this cache will not
+//!   honour, a `forCaller` that is not a non-empty string, a key that is not a
+//!   `Request`/`URL`/string, a key whose method is not GET -- all the same on
+//!   every request, all a mistake in the source, all thrown;
+//! * everything read off the response or off who is asking -- `Vary: *`, a
+//!   206, `private`, a `Set-Cookie`, a caller carrying a header nothing files
+//!   the entry under, an entry larger than the store -- answered.
+//!
+//! The second list is the *ordinary* outcome, which is why it may not be an
+//! exception. After question 3 below, any handler serving a browser that sends
+//! a session cookie is refused unless it says whose answer it is; while those
+//! threw, an uncaught one killed the invocation, so a `put` made after the
+//! handler had already computed its answer threw that answer away and the
+//! client got a 500. This platform's own example did exactly that, and the
+//! thing that exercised it sent no cookies, so nothing saw it. A failed cache
+//! write is not a reason to fail the request the cache was there to speed up.
+//!
+//! Nothing is silent either way: a refusal is written to the application's log
+//! at warn as well as answered, so a `put` whose report is ignored is still
+//! visible in `deis tail`.
+//!
 //! ### 1. What an entry is an answer to
 //!
 //! One GET, and nothing else. The Cache API's key is a `Request`, and a
@@ -245,6 +273,7 @@ use deno_error::JsErrorBox;
 use moka::future::Cache;
 use moka::Expiry;
 use serde::Serialize;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -586,10 +615,13 @@ async fn op_cache_set(
             ceiling,
             cache.scope.max_bytes
         );
+        // The reason alone: `js/runtime.js` names the call and says that
+        // nothing was stored, for this refusal and for the dozen it states
+        // itself. Two halves of one sentence written in two places is how they
+        // come to disagree.
         return Err(JsErrorBox::type_error(format!(
-            "cache.put: this entry is {held} bytes of body, headers and key, and one entry of \
-             this cache may hold at most {ceiling} bytes (the whole cache holds {}); it was not \
-             stored",
+            "this entry is {held} bytes of body, headers and key, and one entry of this cache \
+             may hold at most {ceiling} bytes (the whole cache holds {})",
             cache.scope.max_bytes
         )));
     }
@@ -669,6 +701,80 @@ fn op_cache_scope(state: &mut OpState) -> CacheScope {
     state.borrow::<CacheStore>().scope().clone()
 }
 
+/// How many stretches of application code this isolate has begun or finished.
+///
+/// `runtime/isolate.rs` steps it at both ends of every invocation --
+/// `begin_invocation` and `end_invocation`, which every runner on this
+/// platform passes through -- so the number identifies one stretch and the
+/// number between two stretches belongs to neither of them.
+///
+/// # Why the cache is the thing that needs a counter
+///
+/// `Cache.put` is the one call on this platform whose answer depends on *what
+/// the code making it is answering*: a handler serving a caller who sent a
+/// session cookie may produce anything from that cookie, whatever key it then
+/// writes the answer under, so the request being answered is read alongside
+/// the key. `js/runtime.js` used to keep that request in a module-level
+/// variable, set when a request invocation built its context and cleared at
+/// the top of the three invocation entry points. Nothing cleared it when an
+/// invocation *ended*, and four runners never set it at all, so every stretch
+/// of application code that runs between invocations -- a WebSocket
+/// `onmessage`, a response-stream producer, a timer -- read the last request
+/// this isolate happened to serve. Which request that was decided whether a
+/// `put` was refused or stored, so the same handler was refused when nothing
+/// had run in between and stored after one unrelated anonymous `GET`, and the
+/// entry it then stored was handed to every later anonymous caller.
+///
+/// A clear at the end of each runner would have been a fifth entry in a list
+/// that was already missing four. This is the other shape: what the runtime
+/// states about the request being answered is stamped with this number, a
+/// statement whose number is not the current one is not readable at all, and
+/// a runner that states nothing therefore cannot inherit a request -- it is
+/// told it does not know, which `Cache.put` refuses rather than guesses at.
+/// Nothing has to remember to clear anything.
+///
+/// Held as an `Rc<Cell<u64>>` so `runtime/isolate.rs` can step it without
+/// borrowing the whole op state; the isolate keeps one handle and the op state
+/// keeps the other.
+#[derive(Clone, Default)]
+pub(crate) struct InvocationCounter(Rc<Cell<u64>>);
+
+impl InvocationCounter {
+    /// One more stretch has begun or ended. Called from both ends of every
+    /// invocation, so the count is of boundaries rather than of invocations.
+    pub(crate) fn step(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+
+    /// Which stretch is running now.
+    fn now(&self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// The number of the stretch of application code that is running.
+///
+/// Read by `js/runtime.js` whenever it states, or reads back, which request
+/// the code now running is answering. See [`InvocationCounter`] for why that
+/// question needs a number at all.
+///
+/// Answered as a `f64` because that is what a JavaScript number is. It is
+/// exact to 2^53, which is more invocations than an isolate that lived for the
+/// age of the universe could serve, and the value is only ever compared for
+/// equality with one read moments earlier.
+#[op2(fast)]
+fn op_cache_invocation(state: &mut OpState) -> f64 {
+    state
+        .try_borrow::<InvocationCounter>()
+        .map(|counter| counter.now() as f64)
+        // An isolate built without the counter would otherwise report the same
+        // number for every stretch, which is the inheritance this exists to
+        // prevent. `f64::NAN` is not equal to itself, so a statement made
+        // under it can never be read back: the cache falls to "nothing here
+        // says what this is answering", which is refused rather than guessed.
+        .unwrap_or(f64::NAN)
+}
+
 // Define cache extension
 extension!(
     deis_runtime_cache_ops,
@@ -679,6 +785,7 @@ extension!(
         op_cache_delete,
         op_cache_clear,
         op_cache_scope,
+        op_cache_invocation,
     ],
 );
 

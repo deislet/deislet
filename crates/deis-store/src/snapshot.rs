@@ -808,6 +808,90 @@ mod tests {
         );
     }
 
+    /// A named binding is stored under `<tenant>@<BINDING>`, which is a
+    /// namespace and not a tenant. Both readers of a stored name in this
+    /// module have to accept it: `tenant_database_files`, which picks the
+    /// per-namespace SQL files out of `db/`, and `copy_content_of`, which
+    /// turns the `tenant` column of `blob.sqlite` back into a content path.
+    ///
+    /// The restore is reopened through the ordinary services, so this also
+    /// witnesses that the startup scan in [`crate::legacy`] accepts a
+    /// directory a restore just wrote.
+    #[tokio::test]
+    async fn a_named_binding_survives_a_snapshot_and_a_restore() {
+        let source = TempDir::new().unwrap();
+        let media = TenantId::of_binding("app-one.production", Some("MEDIA")).unwrap();
+        assert_eq!(media.as_str(), "app-one.production@MEDIA");
+        let plain = tenant("app-one.production");
+
+        let kv = KvService::open(source.path(), 4).await.unwrap();
+        kv.set(&media, "greeting", b"in the binding".to_vec(), None, None)
+            .await
+            .unwrap();
+        kv.set(&plain, "greeting", b"unnamed".to_vec(), None, None)
+            .await
+            .unwrap();
+        let db = crate::database::DatabaseService::open(source.path(), 2).unwrap();
+        db.exec_statement(&media, "CREATE TABLE t(a TEXT)", &[])
+            .await
+            .unwrap();
+        db.exec_statement(&media, "INSERT INTO t(a) VALUES('kept')", &[])
+            .await
+            .unwrap();
+        let blob = BlobService::open(source.path(), 4, limits()).await.unwrap();
+        blob.store_object(
+            &media,
+            "photo",
+            None,
+            None,
+            chunks(vec![b"binding bytes".to_vec()]),
+        )
+        .await
+        .unwrap();
+
+        let held = TempDir::new().unwrap();
+        let snapshot = held.path().join("snap");
+        let manifest = take(source.path(), &snapshot).unwrap();
+        assert!(
+            manifest
+                .databases
+                .contains(&"db/app-one.production@MEDIA.sqlite".to_string()),
+            "the binding's SQL database must be in the snapshot: {:?}",
+            manifest.databases
+        );
+        assert_eq!(manifest.objects, 1);
+
+        let target = TempDir::new().unwrap();
+        let restored = target.path().join("data");
+        restore(&snapshot, &restored).unwrap();
+
+        let kv = KvService::open(&restored, 4).await.unwrap();
+        assert_eq!(
+            kv.get(&media, "greeting").await.unwrap().unwrap().value,
+            b"in the binding"
+        );
+        // And still its own namespace, not folded into the tenant's unnamed
+        // one on the way through.
+        assert_eq!(
+            kv.get(&plain, "greeting").await.unwrap().unwrap().value,
+            b"unnamed"
+        );
+        let db = crate::database::DatabaseService::open(&restored, 2).unwrap();
+        assert_eq!(
+            db.fetch_rows(&media, "SELECT a FROM t", &[])
+                .await
+                .unwrap()
+                .rows
+                .to_string(),
+            r#"[{"a":"kept"}]"#
+        );
+        let blob = BlobService::open(&restored, 4, limits()).await.unwrap();
+        assert_eq!(
+            blob.get_all(&media, "photo").await.unwrap().unwrap(),
+            b"binding bytes"
+        );
+    }
+
     /// The race a live snapshot actually has: an object is deleted after its
     /// metadata was copied but before its bytes were. The snapshot must not
     /// keep a row pointing at bytes it does not carry, because that restores

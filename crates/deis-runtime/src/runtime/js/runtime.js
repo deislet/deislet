@@ -532,6 +532,18 @@ class WebSocketServer extends PlatformEventTarget {
     this.readyState = 0; // CONNECTING
     this._accepted = false;
     this._closeDispatched = false;
+    // What this socket is a continuation of.
+    //
+    // A `WebSocketPair` is built inside the handler answering the upgrade, so
+    // that request is what everything this socket ever does is for: a frame
+    // arriving on it two minutes later is still that caller's, and whatever
+    // the application answers it with is that caller's answer. The node runs
+    // `_handleMessage` and `_handleClose` from outside any invocation of their
+    // own, and before this they read whichever request this isolate had served
+    // most recently -- which made a `Cache.put` from a message handler refused
+    // when nothing had run in between, and stored when an unrelated anonymous
+    // `GET` had. Read once, here, where the answer is still true.
+    this._answering = whatIsAnswered();
     // Register global reference for Rust ops to find
     globalThis.__deis_runtime_ws_servers[ws_id] = this;
   }
@@ -562,6 +574,9 @@ class WebSocketServer extends PlatformEventTarget {
   // sends reaches this branch, because the bridge stamps every frame it
   // forwards.
   _handleMessage(message) {
+    // The node calls this from a stretch of its own, so the socket says what
+    // that stretch is answering; see the constructor.
+    nowAnswering(this._answering);
     const payload = String(message);
     const kind = payload.charAt(0);
     let data;
@@ -583,6 +598,12 @@ class WebSocketServer extends PlatformEventTarget {
 
   // Called by Rust when connection closed
   _handleClose(code, reason) {
+    // As in `_handleMessage`: this runs from the node, in a stretch of its own.
+    // `_dispatchClose` deliberately does not do this -- it is also reached from
+    // `close()`, which an application may call from a handler answering a
+    // different request, and that handler's own statement must not be
+    // overwritten by a socket it happens to be closing.
+    nowAnswering(this._answering);
     this.readyState = 3; // CLOSED
     // 1006 is the code a connection that ended without a close frame is
     // reported under, and it is the one case that is not a clean shutdown.
@@ -1174,16 +1195,134 @@ function readableHeaders(request) {
   return headers && typeof headers.get === "function" ? headers : null;
 }
 
-// The `Request` this invocation is answering, or null when it is not answering
-// one -- a queue batch, a cron tick, or a `Cache.put` from the module's own
-// top-level code.
+// ---------------------------------------------------------
+// What the code running right now is answering
+// ---------------------------------------------------------
 //
-// Written by `createContext` and cleared at the top of every invocation, so it
-// is never the previous request's. Nothing else reads it: it exists for the
-// one question `Cache.put` cannot otherwise answer, which is whether a key
-// carrying none of a response's varying headers is telling the truth. See
-// `Cache.put`.
-let servedRequest = null;
+// `Cache.put` is the one call on this platform whose answer depends on what
+// the code making it is answering, and not only on its arguments: a handler
+// serving a caller who sent a session cookie may produce anything from that
+// cookie, whatever key it then writes the answer under. So the request being
+// answered is read alongside the key, and something has to say what it is.
+//
+// The shape this replaces was one module-level variable, `servedRequest`, set
+// when a request invocation built its context and cleared at the top of the
+// three invocation entry points. Nothing cleared it when an invocation
+// *ended*, and four runners that execute application code never set it at all,
+// so every stretch that runs between invocations -- a WebSocket `onmessage`, a
+// response-stream producer, a timer, a `waitUntil` left over from a cut-off --
+// read the last request this isolate happened to serve. Which request that was
+// decided whether a `put` was refused or stored: the same handler was refused
+// when nothing had run in between, and stored after one unrelated anonymous
+// `GET` -- and the entry it stored was then handed to every later anonymous
+// caller.
+//
+// A clear at the end of each runner would have been a fifth entry in a list
+// that was already missing four, which is the shape that failed. So what a
+// runner states is stamped with the number `runtime/isolate.rs` gives the
+// stretch it is running in (`InvocationCounter`, stepped at both ends of every
+// invocation). A statement stamped with any other number is not readable at
+// all, so:
+//
+//   * a runner that states nothing cannot inherit the last request. It reads
+//     UNATTRIBUTED, which `Cache.put` refuses rather than guesses at;
+//   * a runner that answers no request -- a queue batch, a cron tick, the
+//     module's own top level -- says so, and gets the ordinary treatment;
+//   * a runner that continues an earlier invocation's work -- a WebSocket
+//     message on a socket opened by a request, the producer of a streaming
+//     body -- carries that request with it explicitly, rather than finding it
+//     left behind. The producer's is *derived* rather than stated; see
+//     `streamBeingProduced` for why a statement does not survive the await its
+//     own code runs inside.
+//
+// Nothing has to remember to clear anything, which is the whole point.
+//
+// # What this does not answer
+//
+// A stretch is a stretch of the *node's* work, not of one piece of application
+// code. A promise an application leaves pending in one invocation and resolves
+// from another -- `new Promise(r => stash = r)` in one handler, `stash()` in
+// the next -- continues inside the second invocation's stretch and is read as
+// answering the second invocation's request. That is not the previous defect
+// coming back: nothing stale is inherited, and the request it is credited to is
+// one that is genuinely being served right now. But it is not the request the
+// continuation was written for either, and telling those apart needs the
+// continuation itself to carry the context, which is what a host promise hook
+// would give and this runtime does not have yet. The application is on both
+// sides of it -- it is its own code resuming its own code -- so what is at
+// stake is which of its own callers an entry is judged against, and the two
+// statements on the call (`forCaller`, `forAnyCaller`) are how an application
+// that does this says which.
+
+// Nothing has said what this stretch of code is answering. The default, and
+// what every statement made in another stretch collapses to.
+const UNATTRIBUTED = null;
+
+// The runner said it answers no request at all.
+const NO_REQUEST = ObjectFreeze({ request: null });
+
+// The statement in force, and the stretch it was made in. `-1` is a number
+// `op_cache_invocation` never answers, so nothing is in force before the first
+// statement is made.
+let statedAnswer = UNATTRIBUTED;
+let statedIn = -1;
+
+// Which stretch of application code is running, as the node counts them.
+//
+// Read rather than remembered: the whole mechanism is that this side cannot
+// tell one stretch from another on its own, which is exactly how the variable
+// this replaces came to be read by four runners that never wrote it.
+function stretchNow() {
+  return DenoCore.ops.op_cache_invocation();
+}
+
+// State what the stretch now running is answering: `NO_REQUEST`, a record
+// holding the `Request`, or a statement carried over from the stretch that
+// created a socket or a response stream.
+function nowAnswering(answer) {
+  statedAnswer = answer;
+  statedIn = stretchNow();
+}
+
+// A statement that this code answers the given `Request`.
+function answerTo(request) {
+  return ObjectFreeze({ request });
+}
+
+// What the code now running is answering: `NO_REQUEST`, a record holding the
+// `Request`, or `UNATTRIBUTED` when nothing in this stretch has said.
+//
+// A statement made in another stretch is dropped here rather than merely
+// ignored, so that it cannot be read by anything later either.
+function whatIsAnswered() {
+  if (statedIn !== stretchNow()) {
+    statedAnswer = UNATTRIBUTED;
+    statedIn = -1;
+  }
+  return statedAnswer;
+}
+
+// The one name the Rust side calls to say that a stretch answers no request.
+// `runtime/isolate.rs` calls it at the top of the module-evaluation glue,
+// because the top level of a bundle is application code like any other and has
+// to be able to use the cache. Sealed with the rest of the runtime's names at
+// the foot of this file.
+//
+// One-shot, because sealing is a floor and not a ceiling (`js/bootstrap.js`
+// on `__deis_runtime_stream_scope` is this same lesson, already learned once):
+// a sealed function is still a callable one, and a fetch handler that could
+// call this mid-request would be stating "no request is being answered" while
+// holding the request in its hands -- one line, and every check that reads
+// `whatIsAnswered()` is waived for the rest of the stretch. The glue runs
+// before a single line of application code has, so the only call that can be
+// first is the glue's own; every later call, which can only be an
+// application's, states nothing.
+let noRequestClaimed = false;
+globalThis.__deis_runtime_answers_no_request = function() {
+  if (noRequestClaimed) return;
+  noRequestClaimed = true;
+  nowAnswering(NO_REQUEST);
+};
 
 // The headers a response varies on whose value the key does not carry.
 //
@@ -1266,8 +1405,12 @@ function notACompleteAnswer(response) {
 // identify, or null when it would be.
 //
 // This is the whole of the rule, and it is asked of two requests rather than
-// one. The key says what the entry will be filed under. The request this
-// invocation is answering says what the response could have been *about*: a
+// one. `served` is the request the code making this call is answering, or null
+// when it answers none -- it is passed in rather than read from a variable
+// here, because the one thing this rule may not do is read a request that
+// belongs to some other stretch of code; see "What the code running right now
+// is answering". The key says what the entry will be filed under. The request
+// this invocation is answering says what the response could have been *about*: a
 // handler serving a caller who sent a session cookie may produce anything from
 // that cookie, whatever key the application then writes the answer under. So
 // both are read, and every name on either of them that this platform does not
@@ -1286,10 +1429,10 @@ function notACompleteAnswer(response) {
 // not a permission, and the only statements that mean "this answer is not one
 // caller's" are made on the call, where no upstream and no copied header can
 // produce one by accident.
-function notSafeForAStranger(request, vary) {
+function notSafeForAStranger(request, vary, served) {
   const alsoServed =
-    servedRequest !== null && servedRequest !== request
-      ? headersThatCouldNameTheCaller(servedRequest)
+    served !== null && served !== request
+      ? headersThatCouldNameTheCaller(served)
       : [];
   const names = headersThatCouldNameTheCaller(request);
   for (const name of alsoServed) {
@@ -1317,8 +1460,8 @@ function notSafeForAStranger(request, vary) {
       "caller at all";
   }
 
-  if (servedRequest === null || servedRequest === request) return null;
-  const servedHeaders = readableHeaders(servedRequest);
+  if (served === null || served === request) return null;
+  const servedHeaders = readableHeaders(served);
   if (servedHeaders === null) return null;
   const keyHeaders = readableHeaders(request);
   const mismatched = names.filter(
@@ -1471,6 +1614,54 @@ function cacheCallOptions(verb, options, understood) {
   return said;
 }
 
+// What a `put` did, and why it did not.
+//
+// # Why a refusal is an answer here rather than an exception
+//
+// A `put` is refused for two different kinds of reason, and they want two
+// different kinds of report.
+//
+// One is that the call itself is not one this API accepts: the options bag is
+// not an object, it names an option this cache will not honour, `forCaller` is
+// not a non-empty string, the key is not a `Request`, a `URL` or a string, or
+// the key's method is not GET. Every one of those is a mistake in the source
+// that is the same on every request, and it throws -- the application has to
+// change a line.
+//
+// The other is that *this* response may not be kept in a store every later
+// caller reads: it varies on something the key cannot vouch for, it carries a
+// `Set-Cookie`, it says `private`, it is one range of a body, it is larger
+// than the store, or the caller being served carries a header that could name
+// them and nothing files the entry under it. None of those is a mistake in the
+// source. They depend on what an upstream said and on who is asking, so the
+// same line of code is fine for one caller and refused for the next -- and
+// they are the *ordinary* outcome: after the rule that closed the last round,
+// any handler serving a browser that sends a session cookie is refused unless
+// it says whose answer it is.
+//
+// Those threw too, and the platform's own example did not catch it, because
+// the thing that exercised it sent no cookies. What a browser got was a 500:
+// an uncaught rejection kills the invocation, so a `put` the handler made
+// after it had already computed its answer threw that answer away. A cache
+// write failing is not a reason to fail the request it was meant to speed up,
+// so those resolve, and the report says what happened:
+//
+//   const kept = await cache.put(request, response);
+//   if (!kept.stored) context.log.warn(kept.reason);
+//
+// Nothing is silent either way: every refusal is written to this application's
+// log at warn as well, because a `put` that quietly did nothing leaves an
+// application believing it has a cache.
+const STORED = ObjectFreeze({ stored: true, reason: null });
+
+function notStored(why) {
+  const reason = "cache.put: " + why + ". It was not stored";
+  // The application's own log, so this reaches `deis tail` and the log panel
+  // beside everything else this invocation said.
+  platformConsole.warn(reason);
+  return ObjectFreeze({ stored: false, reason });
+}
+
 class Cache {
   // `name` is the namespace this instance reads and writes; see
   // `runtime/cache_ops.rs`. `caches.default` and `ctx.services.cache` are the
@@ -1480,6 +1671,11 @@ class Cache {
   constructor(name) {
     this.name = name;
   }
+  // What one `put` did.
+  //
+  // `stored: true`, or `stored: false` with the sentence saying why not. See
+  // the note above `Cache.put` for why the second one is an answer rather than
+  // an exception.
   async put(request, response, options) {
     const said = cacheCallOptions("put", options, PUT_OPTIONS);
     const key = cacheKeyOf(request);
@@ -1489,6 +1685,10 @@ class Cache {
     // to a POST is the result of an action rather than a representation of
     // anything, and it was stored under the URL alone and then handed to every
     // later GET of it.
+    //
+    // This one throws, because the key is an argument of the call and its
+    // method is part of what it *is*: a `put` keyed by a POST is a call this
+    // API does not accept, whatever the response turns out to be.
     const method = cacheKeyMethod(request);
     if (method !== "GET") {
       throw new TypeError(
@@ -1500,14 +1700,23 @@ class Cache {
       );
     }
 
+    // What this call is answering, read once and passed to every rule below
+    // that needs it. See "What the code running right now is answering": this
+    // is `NO_REQUEST` for a queue batch, a cron tick or the module's own top
+    // level, a record holding the `Request` for a handler and for the code
+    // that continues one, and `UNATTRIBUTED` when nothing has said -- which is
+    // its own refusal further down.
+    const producing = streamBeingProduced();
+    const answering =
+      producing === undefined ? whatIsAnswered() : producing.answering;
+    const served = answering === UNATTRIBUTED ? null : answering.request;
+
     // Question two, first half: is this a whole answer that a GET could be
     // given. A range, a "you already have this", or a status no response may
     // carry is not one; see `notACompleteAnswer`.
     const incomplete = notACompleteAnswer(response);
     if (incomplete) {
-      throw new TypeError(
-        "cache.put: this response carries " + incomplete + ". It was not stored"
-      );
+      return notStored("this response carries " + incomplete);
     }
 
     // A response that declares itself unusable by a cache like this one is not
@@ -1519,10 +1728,7 @@ class Cache {
     const directives = cacheControlOf(response);
     const lifetime = lifetimeOf(response, directives);
     if (lifetime.refusal) {
-      throw new TypeError(
-        "cache.put: this response carries " + lifetime.refusal +
-          ". It was not stored"
-      );
+      return notStored("this response carries " + lifetime.refusal);
     }
 
     // What the response says its body depends on. `Vary: *` is the response
@@ -1533,9 +1739,9 @@ class Cache {
     // request may reuse this" includes that caller's later requests.
     const vary = varyNames(response);
     if (vary.indexOf("*") !== -1) {
-      throw new TypeError(
-        "cache.put: this response carries Vary: *, which means no later " +
-          "request may reuse it. It was not stored"
+      return notStored(
+        "this response carries Vary: *, which means no later request may " +
+          "reuse it"
       );
     }
     // What variant this entry would be filed under, which is the question the
@@ -1551,6 +1757,54 @@ class Cache {
     // one do not arise; the statement is on the call, which no header an
     // upstream sets can produce.
     if (said.forCaller === "") {
+      if (!said.forAnyCaller) {
+        // Nothing in this stretch of code said what it is answering, so this
+        // platform does not know what the response could have been *about*.
+        // That is not the same as knowing it answers nothing: a WebSocket
+        // message handler, a response-stream producer and a timer callback all
+        // run outside any invocation of their own, and the variable this
+        // replaces handed each of them whichever request this isolate served
+        // last. Refused rather than read, because the reading was wrong in
+        // both directions -- too strict when the last request carried a
+        // credential, and a disclosure when it did not.
+        if (answering === UNATTRIBUTED) {
+          return notStored(
+            "nothing here says what request this code is answering. A cache " +
+              "entry is served whole to a later caller, and what decides " +
+              "whether that is safe is what the handler making it was " +
+              "answering -- so a call from a timer, from the producer of a " +
+              "streaming body whose request has finished, or from anywhere " +
+              "else that runs between invocations cannot be judged at all. " +
+              "Say whose answer it is on the call: { forCaller: <the caller " +
+              "this answer is for> } stores it for that caller alone, and " +
+              "{ forAnyCaller: true } states that the answer does not depend " +
+              "on the caller at all"
+          );
+        }
+
+        // And the same question about the *other* request, which is the one
+        // this platform reads and the key does not name: the entry would be
+        // filed under a GET of this URL, so if the handler is answering
+        // something else, a later GET is handed the result of an action it
+        // never asked for. `cache_ops.rs` states this rule for the key; this
+        // is the half of it that reads the request being answered, and without
+        // it a handler answering `POST /answer` from its body and caching
+        // under the URL collapsed two callers' answers into one entry.
+        const servedMethod = served === null ? null : cacheKeyMethod(served);
+        if (servedMethod !== null && servedMethod !== "GET") {
+          return notStored(
+            "the request this handler is answering is a " + servedMethod +
+              ", and the entry would be filed under a GET of " + key + ". The " +
+              "answer to a " + servedMethod + " is the result of an action " +
+              "rather than a representation of anything, so a later GET of " +
+              "that URL would be handed one caller's result. Say whose answer " +
+              "it is with { forCaller: <the caller this answer is for> }, or " +
+              "state that it does not depend on the caller at all with " +
+              "{ forAnyCaller: true }"
+          );
+        }
+      }
+
       if (vary.length > 0 && !readableHeaders(request)) {
         // The key was a URL or a string, so there is nothing to read the
         // varying headers off, and an entry whose selector is unknown is
@@ -1558,16 +1812,15 @@ class Cache {
         // same string would be answered with it whoever asked. Refused rather
         // than stored, with the fix named in the message, because this is the
         // shape that serves one user's page to another.
-        throw new TypeError(
-          "cache.put: this response varies on " + vary.join(", ") +
+        return notStored(
+          "this response varies on " + vary.join(", ") +
             ", and the key given for " + key + " was not a Request, so there is " +
             "nothing to read those headers from and no way to tell one caller's " +
-            "copy from another's. Pass the Request itself as the key. It was " +
-            "not stored"
+            "copy from another's. Pass the Request itself as the key"
         );
       }
       const unvouched =
-        vary.length > 0 && request !== servedRequest
+        vary.length > 0 && request !== served
           ? varyNamesTheKeyDoesNotCarry(selector)
           : [];
       if (unvouched.length > 0) {
@@ -1595,14 +1848,14 @@ class Cache {
         // and stays ordinary. Any other key has to bring the values with it --
         // which `cache.put(context.request, ...)` does for free, and which
         // caching an upstream answer under the request that fetched it does too.
-        throw new TypeError(
-          "cache.put: this response varies on " + vary.join(", ") +
+        return notStored(
+          "this response varies on " + vary.join(", ") +
             ", and the key given for " + key + " carries no value for " +
             unvouched.join(", ") + " while not being the request this handler " +
             "is answering. Stored, it would be filed as the variant for a " +
             "caller who sends none of those, and handed to every such caller " +
             "afterwards. Pass the Request this handler was given, or a key that " +
-            "carries the same values for those headers. It was not stored"
+            "carries the same values for those headers"
         );
       }
 
@@ -1613,9 +1866,9 @@ class Cache {
       // knows cannot name a caller, or one the entry is filed under". See
       // `notSafeForAStranger`.
       if (!said.forAnyCaller) {
-        const unsafe = notSafeForAStranger(request, vary);
+        const unsafe = notSafeForAStranger(request, vary, served);
         if (unsafe) {
-          throw new TypeError("cache.put: " + unsafe + ". It was not stored");
+          return notStored(unsafe);
         }
       }
 
@@ -1627,8 +1880,8 @@ class Cache {
       // other, and the safe reading of a contradiction is to refuse it.
       const replayed = headersAStrangerMayNotReceive(response);
       if (replayed.length > 0) {
-        throw new TypeError(
-          "cache.put: this response carries " + replayed.join(", ") + ", which " +
+        return notStored(
+          "this response carries " + replayed.join(", ") + ", which " +
             "this platform will not replay to a later caller. A stored response " +
             "may carry only what describes the representation, how long it is " +
             "good for, or a policy that is the same for every caller of the " +
@@ -1637,7 +1890,7 @@ class Cache {
             "next, which for a Set-Cookie means every later caller shares one " +
             "caller's session. Store a copy carrying the headers you mean to " +
             "serve, or say whose answer it is with { forCaller: <the caller " +
-            "this answer is for> }. It was not stored"
+            "this answer is for> }"
         );
       }
     }
@@ -1678,14 +1931,24 @@ class Cache {
     // variant per key, therefore -- a second `put` for the same URL replaces
     // it -- which costs a hit and never costs a wrong answer.
     if (vary.length > 0) meta.vary = selector;
-    await DenoCore.ops.op_cache_set(
-      this.name,
-      said.forCaller,
-      key,
-      JSON.stringify(meta),
-      body,
-      lifetime.seconds
-    );
+    try {
+      await DenoCore.ops.op_cache_set(
+        this.name,
+        said.forCaller,
+        key,
+        JSON.stringify(meta),
+        body,
+        lifetime.seconds
+      );
+    } catch (e) {
+      // The store's own refusal -- today, an entry so large that admitting it
+      // would empty the cache; see `runtime/cache_ops.rs`. It is a statement
+      // about this response rather than about the call, so it is reported the
+      // way every other one is instead of arriving as an exception from one
+      // rule out of a dozen.
+      return notStored(e && e.message ? String(e.message) : String(e));
+    }
+    return STORED;
   }
   async match(request, options) {
     const said = cacheCallOptions("match", options, READ_OPTIONS);
@@ -3303,9 +3566,19 @@ function createServiceContext() {
       warn: (...args) => platformConsole.warn(...args),
       error: (...args) => platformConsole.error(...args),
     },
+    // Work the invocation wants finished after its answer has gone out.
+    //
+    // Stamped with the stretch of code that handed it over, because the tail
+    // that runs these is not started until that invocation is ending and one
+    // that never reached its tail -- a request that was cut off, a WebSocket
+    // message, which has no tail at all -- used to leave its promises here for
+    // whichever invocation ran a tail next. That one then awaited another
+    // invocation's work on its own budget, under its own trace, and with its
+    // own statement about the request being answered in force. See
+    // `__deis_runtime_wait_until_all`.
     waitUntil: (promise) => {
       if (!globalThis.__pending_wait_until) globalThis.__pending_wait_until = [];
-      globalThis.__pending_wait_until.push(promise);
+      globalThis.__pending_wait_until.push({ stretch: stretchNow(), promise });
     }
   };
 }
@@ -3322,15 +3595,20 @@ function createServiceContext() {
 // looks like and what `new Request` wants to be told.
 function createContext(requestData) {
   const body = DenoCore.ops.op_deis_take_request_body();
-  // Kept as well as handed over: `Cache.put` has to be able to tell the
-  // request this handler is answering from a stand-in built to look like it.
-  servedRequest = new Request(requestData.url, {
+  const request = new Request(requestData.url, {
     method: requestData.method,
     headers: requestData.headers,
     body: body ?? null
   });
+  // Stated as well as handed over: `Cache.put` has to be able to tell the
+  // request this handler is answering from a stand-in built to look like it,
+  // and it has to be able to tell "this code answers that request" from "this
+  // code answers nothing" and from "nothing here said". The statement lasts as
+  // long as this stretch of code does and no longer; see "What the code
+  // running right now is answering".
+  nowAnswering(answerTo(request));
   return Object.assign(createServiceContext(), {
-    request: servedRequest,
+    request,
     // Own members only: a `params` an application had planted on
     // `Object.prototype` would otherwise be handed to the next request as if
     // the router had captured it. The object itself is an ordinary one --
@@ -3344,8 +3622,40 @@ globalThis.__deis_runtime_wait_until_all = async function() {
   // invocation left open: what it starts is swept below, with the invocation.
   StreamScope.leave();
   if (globalThis.__pending_wait_until && globalThis.__pending_wait_until.length > 0) {
-    const promises = globalThis.__pending_wait_until;
+    const queued = globalThis.__pending_wait_until;
     globalThis.__pending_wait_until = [];
+    // This invocation's tail is this invocation's work. Anything handed over
+    // by a stretch of code that has since ended is dropped rather than awaited
+    // here: awaiting it would spend this invocation's budget on another one's
+    // work, stamp its log lines with this trace, and run it with this
+    // invocation's statement about the request being answered in force -- so a
+    // `Cache.put` from a request that was cut off would have been judged
+    // against the queue batch that happened to run next.
+    //
+    // Reached by an invocation that did not get to its tail (a cut-off), and by
+    // one that has none at all: a WebSocket message handler can call
+    // `waitUntil` through a context it captured at the upgrade, and nothing
+    // runs a tail for it.
+    const now = stretchNow();
+    const promises = [];
+    let orphaned = 0;
+    // The array is `globalThis.__pending_wait_until` and an application can
+    // write anything into it, so nothing here trusts its shape.
+    for (const item of Array.isArray(queued) ? queued : []) {
+      if (item && typeof item === "object" && item.stretch === now) {
+        promises.push(item.promise);
+      } else {
+        orphaned++;
+      }
+    }
+    if (orphaned > 0) {
+      platformConsole.warn(
+        orphaned + " waitUntil promise(s) were handed over by work that has since ended -- an " +
+        "invocation that was cut off, or a WebSocket message handler, which has no tail to run " +
+        "them in -- and were dropped rather than awaited inside this invocation, whose budget " +
+        "and whose trace they are not part of"
+      );
+    }
     try {
         await Promise.all(promises);
     } catch (e) {
@@ -3432,8 +3742,9 @@ globalThis.__deis_runtime_invoke_queue = async function(payload) {
   // `__deis_runtime_invoke` has always done this; the queue and cron paths are
   // invocations in exactly the same sense and had been left out of it.
   StreamScope.leave();
-  // A queue batch answers no request, so nothing here may be mistaken for one.
-  servedRequest = null;
+  // A queue batch answers no request, and says so: the alternative is not
+  // "answers none" but "nothing said", which `Cache.put` refuses.
+  nowAnswering(NO_REQUEST);
   const messages = (payload && payload.messages) || [];
   const allIds = messages.map((m) => m.id);
 
@@ -3536,8 +3847,8 @@ globalThis.__deis_runtime_invoke_scheduled = async function(payload) {
   // `__deis_runtime_invoke` has always done this; the queue and cron paths are
   // invocations in exactly the same sense and had been left out of it.
   StreamScope.leave();
-  // A cron tick answers no request, so nothing here may be mistaken for one.
-  servedRequest = null;
+  // A cron tick answers no request, and says so; see the queue path above.
+  nowAnswering(NO_REQUEST);
   let handler = globalThis.user_module && globalThis.user_module.scheduled;
   if (typeof handler !== "function") {
     const dflt = globalThis.user_module && globalThis.user_module.default;
@@ -3721,14 +4032,44 @@ const isArrayBufferView = ArrayBuffer.isView;
 // different doors: `__deis_runtime_invoke` answers with the status and the
 // headers, `runtime/isolate.rs` sends those to the client, and only then --
 // once there is somewhere for the bytes to go -- does it call
-// `__deis_runtime_stream_begin`. Cleared at the start of every invocation, so
-// a stream that was never begun cannot become the next request's body.
+// `__deis_runtime_stream_begin`.
+//
+// Stamped with the stretch of code that filled it, and read back only by that
+// same stretch -- the node opens the queue and asks for the producer before
+// the invocation ends, so the two are always one stretch apart from nothing.
+// A body left here by an invocation that answered `{ stream: true }` and never
+// got its queue is therefore not something a later request can be handed; see
+// "What the code running right now is answering" for why that is a stamp
+// rather than a clear at the top of each entry point.
 let pendingStreamBody = null;
+let pendingStreamBodyStretch = -1;
 
 // The streams this isolate is producing right now, by the id the node gave
 // them. Several at once is ordinary: an application serving server-sent events
 // has one per connected browser.
 const openStreams = new NativeMap();
+
+// The stream whose body the code now running is producing, or undefined when
+// it is not producing one.
+//
+// Derived rather than stated, and that is the point. A producer's own code
+// runs *inside* the `await entry.reader.read()` in `pumpStream`, and that await
+// spans whatever the isolate does next -- so a statement made before the read
+// is not one the producer can be relied on to still be inside. What survives
+// that await is the ownership machinery, because it is what an outbound `fetch`
+// and a timer are already filed against: `StreamScope.scope()` answers the id
+// of the stream whose owner is in force, and 0 for the invocation's own. So
+// this asks the same question the fetch guard asks, and gets the same answer.
+//
+// `Cache.put` reads it to find what the producer is answering: a stream is
+// producing the body of the request whose head has already gone out, and
+// everything it caches is that caller's. Before this the producer read a
+// module-level variable holding whichever request the isolate had served most
+// recently, which between two chunks of one body can be any number of others.
+function streamBeingProduced() {
+  const id = StreamScope.scope();
+  return id === 0 ? undefined : openStreams.get(id);
+}
 
 // One chunk as bytes, or null if it is not something a body can carry.
 //
@@ -3785,6 +4126,11 @@ function finishStream(id, entry) {
 function abandonStream(id, entry, why) {
   if (!retireStream(id, entry)) return;
   try {
+    // `cancel` runs the application's own `cancel` hook. By this point the
+    // stream is off the books and its owner has been released, so a
+    // `Cache.put` from that hook is code with nothing saying what it answers,
+    // and is refused. That is the right answer here rather than a gap: this
+    // stream is over, and the request it was producing for is long gone.
     entry.reader.cancel(new Error(why));
   } catch (_) {
     // A reader that refuses to be cancelled must not become a second failure;
@@ -3800,6 +4146,8 @@ function abandonStream(id, entry, why) {
 function failStream(id, entry, message) {
   if (!retireStream(id, entry)) return;
   try {
+    // As in `abandonStream`: the `cancel` hook runs with the stream already
+    // off the books, so a `Cache.put` from it is refused.
     entry.reader.cancel(new Error(message));
   } catch (_) {
     // As above.
@@ -3879,8 +4227,9 @@ globalThis.__deis_runtime_stream_begin = function(id) {
     return;
   }
 
-  const source = pendingStreamBody;
+  const source = pendingStreamBodyStretch === stretchNow() ? pendingStreamBody : null;
   pendingStreamBody = null;
+  pendingStreamBodyStretch = -1;
 
   if (source === null || source === undefined) {
     DenoCore.ops.op_deis_stream_fail(
@@ -3922,7 +4271,11 @@ globalThis.__deis_runtime_stream_begin = function(id) {
     return;
   }
 
-  const entry = { reader, owner, closed: false };
+  // What this stream is producing the body of. Read here, while the invocation
+  // that produced the head is still the stretch in force -- the node asks for
+  // the producer before that invocation ends -- because from the first chunk
+  // onwards there is nothing left to read it from.
+  const entry = { reader, owner, closed: false, answering: whatIsAnswered() };
   openStreams.set(id, entry);
   // Nothing in the loop should reach this catch -- every step it takes has one
   // of its own -- but an unhandled rejection inside an isolate is not a local
@@ -3998,14 +4351,21 @@ globalThis.__deis_runtime_stream_release_all = function() {
 };
 
 globalThis.__deis_runtime_invoke = async function(requestPayload) {
-  // A stream the previous invocation stashed and never began would otherwise
-  // become this request's body. Ownership goes back to the invocation for the
-  // same reason: what this handler opens is this handler's, and is swept when
-  // it ends. The request being answered is cleared here and set again by
-  // `createContext`, so that a `Cache.put` made before there is one cannot be
-  // credited with the last one.
+  // The reference to a stream the previous invocation stashed and never began
+  // is dropped here. It could not become this request's body -- the slot
+  // records which stretch of code filled it and `__deis_runtime_stream_begin`
+  // reads it only for that one -- but a `ReadableStream` nobody will ever read
+  // should not be held until the next request happens to arrive.
+  //
+  // Ownership goes back to the invocation because what this handler opens is
+  // this handler's, and is swept when it ends.
+  //
+  // Nothing clears the request being answered, and nothing has to: this is a
+  // new stretch of application code, so whatever the last one stated is
+  // already unreadable, and `createContext` states this request below. See
+  // "What the code running right now is answering".
   pendingStreamBody = null;
-  servedRequest = null;
+  pendingStreamBodyStretch = -1;
   StreamScope.leave();
   try {
     let handler;
@@ -4068,6 +4428,7 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
     // for its heap.
     if (!webSocketId && resp.body && !bufferedBodies.has(resp)) {
       pendingStreamBody = resp.body;
+      pendingStreamBodyStretch = stretchNow();
       return { status: resp.status, headers: headerPairs(headers), stream: true };
     }
 
@@ -4185,6 +4546,12 @@ for (const name of [
   "__deis_runtime_wait_until_all",
   "__deis_runtime_set_response",
   "__deis_runtime_ws_servers",
+  // What the module-evaluation glue calls to say that the top level of a
+  // bundle answers no request. Sealed for the same reason the rest are: an
+  // application that could replace it could make every stretch of its own code
+  // claim to answer nothing, which is the permissive reading of the question
+  // `Cache.put` asks.
+  "__deis_runtime_answers_no_request",
 ]) {
   Object.defineProperty(globalThis, name, {
     value: globalThis[name],

@@ -336,6 +336,14 @@ pub fn validate_secret_name(name: &str) -> Result<(), CatalogError> {
 /// Route path prefixes are matched literally against the request path, so
 /// they must be absolute and free of the traversal segments that would let
 /// one environment shadow another.
+///
+/// One spelling only, for the same reason [`super::domains::HostClaim`] has
+/// one: the edge trims a trailing `/` before it compares
+/// (`deis_proxy::catalog::table::CompiledRoute::covers`), so `/api` and
+/// `/api/` are one rule written two ways - two rows that the uniqueness
+/// index in `database::schema` would happily hold side by side while the
+/// edge treated them as the same claim. The trailing slash is refused rather
+/// than trimmed, so there is nothing to trim inconsistently later.
 pub fn validate_path_prefix(prefix: &str) -> Result<(), CatalogError> {
     if !prefix.starts_with('/') {
         return Err(CatalogError::invalid(format!(
@@ -357,39 +365,59 @@ pub fn validate_path_prefix(prefix: &str) -> Result<(), CatalogError> {
             "route path_prefix must not contain whitespace or control characters",
         ));
     }
+    if prefix.contains("//") {
+        return Err(CatalogError::invalid(format!(
+            "route path_prefix {prefix:?} has an empty segment; the edge matches whole path \
+             segments, so '//' is a prefix nothing can arrive on"
+        )));
+    }
+    if prefix.len() > 1 && prefix.ends_with('/') {
+        return Err(CatalogError::invalid(format!(
+            "route path_prefix {prefix:?} ends with '/'. The edge trims that before it compares, \
+             so this and {:?} are the same claim written two ways and only one of them can be \
+             held. Write it without the trailing slash",
+            prefix.trim_end_matches('/')
+        )));
+    }
     Ok(())
 }
 
-/// Route hosts are compared against the request `Host` header. Only the
-/// characters a hostname can legally carry are accepted, plus a leading
-/// `*.` for a wildcard domain.
-pub fn validate_host(host: &str) -> Result<(), CatalogError> {
-    if host.is_empty() {
-        return Err(CatalogError::invalid(
-            "route host must not be empty; omit it to match any domain",
-        ));
-    }
-    if host.len() > 253 {
-        return Err(CatalogError::invalid(
-            "route host is longer than 253 characters",
-        ));
-    }
-    let body = host.strip_prefix("*.").unwrap_or(host);
-    if body.is_empty() {
+/// Widest and narrowest ordering hint a route may carry.
+///
+/// `priority` is a caller-supplied integer that becomes an ordering key in
+/// the edge's match (`deis_proxy::catalog::table::candidate_order`, highest
+/// first). Unbounded, it is a "go first" button: `i64::MAX` put an
+/// attacker's route ahead of every other route on the same host, and ahead
+/// of every other tenant's in the wildcard and catch-all buckets, which is
+/// where routes from different applications do share an ordering. A hint has
+/// a range; this is it, and a caller outside it is told so rather than
+/// silently clamped, because a clamp is a second value nobody wrote down.
+pub const MIN_ROUTE_PRIORITY: i64 = -1_000;
+pub const MAX_ROUTE_PRIORITY: i64 = 1_000;
+
+pub fn validate_route_priority(priority: i64) -> Result<(), CatalogError> {
+    if !(MIN_ROUTE_PRIORITY..=MAX_ROUTE_PRIORITY).contains(&priority) {
         return Err(CatalogError::invalid(format!(
-            "route host {host:?} is not a hostname"
-        )));
-    }
-    let valid = body
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b':');
-    if !valid {
-        return Err(CatalogError::invalid(format!(
-            "route host may only contain letters, digits, '-', '.', ':' and an optional leading '*.', got {host:?}"
+            "route priority {priority} is outside {MIN_ROUTE_PRIORITY}..={MAX_ROUTE_PRIORITY}. \
+             Priority breaks ties between routes that match the same request; it is a small hint, \
+             not a place in a global queue"
         )));
     }
     Ok(())
 }
+
+/// How many routes one environment, and one application, may hold.
+///
+/// Ownership of a name is not the whole story. An application granted a zone
+/// can still create a route per name inside it, and every one of those names
+/// goes to the edge's certificate pass, where a public authority counts new
+/// certificates per registered domain per week. Thirty routes named
+/// `a001..a030` under a granted zone spend that allowance and the renewal
+/// ceiling, which is why the ceiling is shared fairly
+/// (`deis_proxy::acme::names`) *and* why the number of claims one tenant can
+/// make is bounded here.
+pub const MAX_ROUTES_PER_ENVIRONMENT: usize = 20;
+pub const MAX_ROUTES_PER_APP: usize = 100;
 
 #[cfg(test)]
 mod tests {
@@ -451,12 +479,26 @@ mod tests {
         assert!(validate_path_prefix("/a b").is_err());
     }
 
+    /// The trailing slash and the empty segment are the two spellings the
+    /// edge would treat as a claim this control plane had stored under a
+    /// different string.
     #[test]
-    fn host_rules() {
-        assert!(validate_host("example.com").is_ok());
-        assert!(validate_host("*.example.com").is_ok());
-        assert!(validate_host("localhost:8080").is_ok());
-        assert!(validate_host("").is_err());
-        assert!(validate_host("bad host").is_err());
+    fn a_path_prefix_has_one_spelling() {
+        assert!(
+            validate_path_prefix("/").is_ok(),
+            "the root is its own case"
+        );
+        assert!(validate_path_prefix("/api/").is_err());
+        assert!(validate_path_prefix("/api//v2").is_err());
+    }
+
+    #[test]
+    fn a_priority_is_a_hint_and_not_a_place_in_a_global_queue() {
+        assert!(validate_route_priority(0).is_ok());
+        assert!(validate_route_priority(MAX_ROUTE_PRIORITY).is_ok());
+        assert!(validate_route_priority(MIN_ROUTE_PRIORITY).is_ok());
+        assert!(validate_route_priority(i64::MAX).is_err());
+        assert!(validate_route_priority(i64::MIN).is_err());
+        assert!(validate_route_priority(MAX_ROUTE_PRIORITY + 1).is_err());
     }
 }

@@ -24,6 +24,13 @@
 //         swallowed: a `put` that quietly does nothing leaves a handler
 //         believing it has a cache, and this handler would rather say it has
 //         none.
+//
+// The refusal arrives as `put`'s own answer - `{ stored, reason }` - rather
+// than as an exception, because it is the ordinary outcome and not a mistake
+// in this file: whether it happens depends on what the caller sent. The
+// try/catch is still here, for the other kind of refusal, the kind that is a
+// mistake in this file and is the same on every request: an option this cache
+// does not honour, a key that is not a GET.
 export default async function handler(context: any): Promise<Response> {
   const request = context.request;
   const url = new URL(request.url);
@@ -69,8 +76,9 @@ export default async function handler(context: any): Promise<Response> {
   let stored = false;
   let refused: string | null = null;
   try {
-    await cache.put(request, new Response(answer, { headers }));
-    stored = true;
+    const kept = await cache.put(request, new Response(answer, { headers }));
+    stored = kept.stored;
+    refused = kept.stored ? null : kept.reason;
   } catch (e: any) {
     refused = e && e.message ? String(e.message) : String(e);
   }

@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 
-use crate::commands::resolve;
+use crate::commands::{escape_control, escaped, resolve};
 use crate::platform::telemetry::{
     self, Kind, OutcomeSelector, QueryTracesRequest, TailTracesRequest, TraceRecord, Traces,
     expand_outcomes,
@@ -463,16 +463,23 @@ fn format_record(record: &TraceRecord) -> String {
         target_cell(record)
     );
 
-    let mut trailer = format!("node={}", record.node);
+    // The node id and the invocation id arrive over the wire like everything
+    // else on this line; neither is checked against a shape on the way in.
+    let mut trailer = format!("node={}", escape_control(&record.node));
     if !record.trace_id.is_empty() {
-        trailer.push_str(&format!(" trace={}", record.trace_id));
+        trailer.push_str(&format!(" trace={}", escape_control(&record.trace_id)));
     }
     line.push_str("  ");
     line.push_str(&trailer.dimmed().to_string());
 
     if !record.error.is_empty() {
+        // `first_line` already stops at the first newline, so the split into
+        // rows is safe - but every other control character is still in the
+        // part it keeps, and this is the field an application's own thrown
+        // error lands in verbatim. `\u{1b}[2J` in a rejected promise is the
+        // operator's screen cleared by the tenant they were investigating.
         let (first, more) = first_line(&record.error);
-        let mut error = format!("    {first}");
+        let mut error = format!("    {}", escape_control(first));
         if more {
             error.push_str(" [...] (--json has the whole message)");
         }
@@ -507,11 +514,18 @@ fn duration_cell(duration_us: i64) -> String {
 /// there is one. Empty for neither is possible - a record with no target is
 /// still worth a row - so this can be blank.
 fn target_cell(record: &TraceRecord) -> String {
+    // The target is the request path an application was asked for, which is
+    // whatever an unauthenticated caller put in the URL, and the method is
+    // whatever they put on the request line. Both reach here as sent.
     match (record.method.is_empty(), record.target.is_empty()) {
         (true, true) => String::new(),
-        (true, false) => record.target.clone(),
-        (false, true) => record.method.clone(),
-        (false, false) => format!("{} {}", record.method, record.target),
+        (true, false) => escaped(&record.target),
+        (false, true) => escaped(&record.method),
+        (false, false) => format!(
+            "{} {}",
+            escape_control(&record.method),
+            escape_control(&record.target)
+        ),
     }
 }
 
@@ -746,5 +760,105 @@ mod tests {
             record(InvocationOutcome::ApplicationError, 500),
         ];
         assert_eq!(summary(&records), "3 invocation(s): 2 ok, 1 app-error");
+    }
+}
+
+/// What an unauthenticated caller can put on the operator's terminal through
+/// `deis trace`.
+///
+/// The request path and the method are whatever was on the request line, and
+/// the error is whatever the handler threw - so three of the five strings this
+/// row is built from are chosen by whoever made the request, not by the
+/// application's author and not by the platform.
+#[cfg(test)]
+mod terminal_safety_test {
+    use super::*;
+    use crate::platform::telemetry::{InvocationKind, InvocationOutcome};
+
+    fn record() -> TraceRecord {
+        TraceRecord {
+            trace_id: "t-1".to_string(),
+            started_us: 1_787_998_800_000_000,
+            duration_us: 12_400,
+            app_id: "demo".to_string(),
+            environment: "production".to_string(),
+            node: "deis-runtime-demo-01".to_string(),
+            kind: InvocationKind::HttpRequest as i32,
+            outcome: InvocationOutcome::Ok as i32,
+            target: "/api/hello".to_string(),
+            method: "GET".to_string(),
+            status: 200,
+            error: String::new(),
+            attributes: Default::default(),
+        }
+    }
+
+    fn plain(record: &TraceRecord) -> String {
+        colored::control::set_override(false);
+        let rendered = format_record(record);
+        colored::control::unset_override();
+        rendered
+    }
+
+    #[test]
+    fn a_request_path_cannot_repaint_the_screen() {
+        // `GET /%1b%5b2J%1b%5b31mCOMPROMISED` from anyone who can reach the
+        // node. The path is recorded as sent and is a column of this row.
+        let mut record = record();
+        record.target = "/\u{1b}[2J\u{1b}[31mCOMPROMISED".to_string();
+        let rendered = plain(&record);
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(rendered.contains("GET /\\u{1b}[2J"), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_request_path_alone_is_escaped_when_there_is_no_method() {
+        // The other three arms of `target_cell`. A cell that is safe only when
+        // both halves are present is the shape that produces the next finding.
+        let mut record = record();
+        record.method = String::new();
+        record.target = "/\u{1b}[2J".to_string();
+        assert!(!plain(&record).contains('\u{1b}'));
+
+        let mut record = self::record();
+        record.target = String::new();
+        record.method = "GE\u{1b}[2JT".to_string();
+        assert!(!plain(&record).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_thrown_error_cannot_repaint_the_screen() {
+        // The application's own rejected promise, relayed. `first_line`
+        // already stopped a newline from splitting the row; every other
+        // control character was still in the half it kept.
+        let mut record = record();
+        record.outcome = InvocationOutcome::ApplicationError as i32;
+        record.error = "TypeError: \u{1b}[2J\u{1b}[31mCOMPROMISED".to_string();
+        let rendered = plain(&record);
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert_eq!(
+            rendered.lines().count(),
+            2,
+            "one row, one error line: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn the_node_id_and_the_invocation_id_are_escaped() {
+        let mut record = record();
+        record.node = "node\u{1b}[2J".to_string();
+        record.trace_id = "t\u{1b}[31m1".to_string();
+        assert!(!plain(&record).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn an_ordinary_row_is_unchanged() {
+        let rendered = plain(&record());
+        assert!(rendered.contains("GET /api/hello"), "{rendered:?}");
+        assert!(
+            rendered.contains("node=deis-runtime-demo-01"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("trace=t-1"), "{rendered:?}");
     }
 }

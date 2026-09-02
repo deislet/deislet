@@ -1,40 +1,8 @@
+//! The lock, the clearing list and the setter live in the parent module: the
+//! telemetry client's tests set the same variables from the same test binary,
+//! and two locks would guard nothing.
+
 use super::*;
-
-use std::sync::{Mutex, MutexGuard, OnceLock};
-
-/// The process environment is shared by every test in this binary, and these
-/// tests both read and write it. They take this lock so one test's variables
-/// are never visible to another.
-fn env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Clears every variable this module reads, so a test starts from a known
-/// state whatever the developer has exported.
-fn clear_env() {
-    for name in [
-        ENV_CONTROL_ENDPOINT,
-        ENV_CONTROL_TOKEN,
-        ENV_TELEMETRY_ENDPOINT,
-        ENV_QUEUE_ENDPOINT,
-        ENV_APP,
-        ENV_ENVIRONMENT,
-        ENV_CONFIG_HOME,
-        "XDG_CONFIG_HOME",
-    ] {
-        // SAFETY: every test that touches the environment holds `env_lock`,
-        // so no other thread in this binary is reading it concurrently.
-        unsafe { std::env::remove_var(name) };
-    }
-}
-
-fn set_env(name: &str, value: &str) {
-    // SAFETY: as above - the caller holds `env_lock`.
-    unsafe { std::env::set_var(name, value) };
-}
 
 fn project(dir: &Path, contents: &str) {
     fs::write(dir.join(PROJECT_FILE), contents).unwrap();
@@ -233,6 +201,39 @@ fn a_token_in_the_project_file_is_refused_and_the_message_says_what_to_do() {
         .to_string();
     assert!(error.contains("rotate"), "{error}");
     assert!(error.contains("deis config set control.token"), "{error}");
+}
+
+/// Every section, not only `[control]`.
+///
+/// All three are the same `EndpointSection`, so all three could always hold a
+/// `token = ...` line, and until 2026-09-02 only the first was checked. A
+/// credential pasted under `[telemetry]` or `[queue]` was therefore read,
+/// ignored and committed - and "ignored" is the worse half, because the person
+/// who put it there believes the service is configured.
+#[test]
+fn a_token_under_any_section_of_the_project_file_is_refused() {
+    let _guard = env_lock();
+    for section in ["control", "telemetry", "queue"] {
+        clear_env();
+        let dir = tempfile::tempdir().unwrap();
+        project(
+            dir.path(),
+            &format!("[{section}]\nendpoint = \"http://example:8085\"\ntoken = \"oops\"\n"),
+        );
+
+        let Err(error) = Settings::load(dir.path(), &Overrides::default()) else {
+            panic!(
+                "a token under [{section}] was accepted; it sits in a committed file and nothing \
+                 reads it, so the person who put it there believes the service is configured"
+            );
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains(section),
+            "the message names the section: {error}"
+        );
+        assert!(error.contains("rotate"), "{error}");
+    }
 }
 
 #[test]

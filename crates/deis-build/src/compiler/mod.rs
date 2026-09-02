@@ -163,27 +163,64 @@ impl Compiler {
         };
 
         let mut builds = HashMap::new();
+        let mut rejected: Vec<String> = Vec::new();
 
         for vendor in target_vendors {
-            let build = self
+            let mut build = self
                 .build_for_vendor(project_dir, &vendor, &config, minify)
                 .await?;
-            let output_dir = Path::new(&build.output_path);
+            let output_dir = Path::new(&build.output_path).to_path_buf();
 
             // Verify artifacts (Smoke Test). Memory mode leaves the output
             // directory empty on purpose, so there is nothing on disk to hand
             // wrangler or deno; verifying anyway would report a missing
             // directory as a failed build.
             if self.options.output_mode != OutputMode::Memory {
-                if let Err(e) = self.verify_artifacts(&vendor, output_dir) {
-                    println!(
-                        "{}",
-                        format!("  ⚠ Verification failed for {}: {}", vendor, e).yellow()
-                    );
+                match self.verify_artifacts(&vendor, &output_dir) {
+                    Ok(Verification::Ran(note)) => {
+                        println!("{}", format!("  ✓ {note}").green());
+                    }
+                    // A check that did not run is carried out of the build
+                    // rather than printed and dropped. `deis build` counts
+                    // `VendorBuild::warnings`, so "verified" and "not checked
+                    // at all" stop looking the same in the summary - which is
+                    // the only place most people read.
+                    Ok(Verification::Skipped(reason)) => {
+                        println!("{}", format!("  ⚠ {reason}").yellow());
+                        build.warnings.push(reason);
+                    }
+                    Err(e) => {
+                        println!(
+                            "{}",
+                            format!("  ✗ Verification failed for {vendor}: {e}").red()
+                        );
+                        rejected.push(format!("{vendor}: {e}"));
+                    }
                 }
             }
 
             builds.insert(vendor, build);
+        }
+
+        // An artifact the vendor's own tooling just rejected is not a build
+        // that succeeded.
+        //
+        // This used to print a yellow line and fall through to
+        // `success: true`, so `deis build` exited 0 over a Worker wrangler had
+        // refused and a script reading the exit status shipped it. Returned as
+        // an error rather than as `success: false` because `success` is not
+        // the only path out of here: `deis deploy` reaches this through
+        // `commands::build::deislet_bundle`, which never looks at the flag and
+        // goes straight on to read `bundle.zip` off disk and upload it. An
+        // `Err` is the one answer both callers already handle.
+        if !rejected.is_empty() {
+            return Err(anyhow::anyhow!(
+                "the build produced {} artifact(s) the target's own tooling refused, so nothing \
+                 here is deployable:\n  {}\n\nThe output directory still holds what was built, \
+                 for inspection - it must not be uploaded.",
+                rejected.len(),
+                rejected.join("\n  ")
+            ));
         }
 
         Ok(CompilationResult {
@@ -193,9 +230,20 @@ impl Compiler {
         })
     }
 
-    fn verify_artifacts(&self, vendor: &str, output_dir: &Path) -> anyhow::Result<()> {
+    /// Hand the finished artifact to the target's own tooling and report what
+    /// that tooling said.
+    ///
+    /// Three answers, not two, and the caller acts on each of them: a check
+    /// that ran, a check that could not run and why, and a refusal. The middle
+    /// one exists because "not checked" used to be indistinguishable from
+    /// "checked and fine" - both were a dimmed line and a `success: true`.
+    ///
+    /// Every vendor this compiler builds for has an arm, including the one
+    /// that has no tool to run: falling into a catch-all is how a target
+    /// quietly acquires an exemption from a check its siblings get.
+    fn verify_artifacts(&self, vendor: &str, output_dir: &Path) -> anyhow::Result<Verification> {
         match vendor {
-            "cloudflare" => {
+            deis_build_adapter_cloudflare::VENDOR => {
                 use std::process::Command;
                 // Check for wrangler
                 if Command::new("wrangler").arg("--version").output().is_ok() {
@@ -228,36 +276,85 @@ impl Compiler {
                         .status()?;
 
                     if !status.success() {
-                        return Err(anyhow::anyhow!("Wrangler verification failed"));
+                        return Err(anyhow::anyhow!(
+                            "wrangler refused this Worker (`wrangler deploy --dry-run` exited \
+                             {}); its output above says why. Cloudflare would refuse the same \
+                             upload",
+                            status.code().unwrap_or(-1)
+                        ));
                     }
+                    Ok(Verification::Ran(
+                        "wrangler accepted the Worker (deploy --dry-run)".to_string(),
+                    ))
                 } else {
-                    println!(
-                        "{}",
-                        "  ⚠ Skipping verification: 'wrangler' not found".dimmed()
-                    );
+                    Ok(Verification::Skipped(
+                        "the cloudflare target was not verified: 'wrangler' is not on PATH, so \
+                         nothing checked that this Worker deploys. Install wrangler to have the \
+                         build refuse an artifact Cloudflare would reject"
+                            .to_string(),
+                    ))
                 }
             }
-            "deno" => {
+            deis_build_adapter_deno::VENDOR => {
                 use std::process::Command;
                 // Check for deno
                 if Command::new("deno").arg("--version").output().is_ok() {
                     println!("{}", "  Create smoke test (deno check)...".dimmed());
                     let entry_point = output_dir.join("_deis_internal/router.ts");
-                    if entry_point.exists() {
-                        let status = Command::new("deno")
-                            .args(["check", entry_point.to_str().unwrap()])
-                            .current_dir(output_dir)
-                            .status()?;
-
-                        if !status.success() {
-                            return Err(anyhow::anyhow!("Deno verification failed"));
-                        }
+                    // An entry point that is not there is a failure, not a
+                    // skip. This arm used to say nothing at all in that case,
+                    // so a deno build that had written no router - the exact
+                    // outcome worth catching - passed verification in silence.
+                    if !entry_point.exists() {
+                        return Err(anyhow::anyhow!(
+                            "the deno target has no entry point at {}, so there is nothing for \
+                             `deno check` to read and nothing for Deno Deploy to run",
+                            entry_point.display()
+                        ));
                     }
+                    let status = Command::new("deno")
+                        .args(["check", entry_point.to_str().unwrap()])
+                        .current_dir(output_dir)
+                        .status()?;
+
+                    if !status.success() {
+                        return Err(anyhow::anyhow!(
+                            "`deno check` refused this program (exit {}); its output above says \
+                             why. Deno Deploy would fail to load the same files",
+                            status.code().unwrap_or(-1)
+                        ));
+                    }
+                    Ok(Verification::Ran(
+                        "deno check accepted the program".to_string(),
+                    ))
                 } else {
-                    println!("{}", "  ⚠ Skipping verification: 'deno' not found".dimmed());
+                    Ok(Verification::Skipped(
+                        "the deno target was not verified: 'deno' is not on PATH, so nothing \
+                         type-checked this program. Install deno to have the build refuse a \
+                         program Deno Deploy would reject"
+                            .to_string(),
+                    ))
                 }
             }
-            "deislet" => {
+            deis_build_adapter_tencent::VENDOR => {
+                // Said out loud rather than left to a catch-all arm.
+                //
+                // EdgeOne has no local dry-run this build can run, so the only
+                // things standing behind a tencent artifact are the checks the
+                // compiler does itself - the bundler's refusal of an
+                // unresolved import or a free binding, and the per-handler
+                // default-export check. That is a real difference from the
+                // other three targets and a person deploying one should know
+                // it, so it is carried out of the build as a warning instead
+                // of being invisible.
+                Ok(Verification::Skipped(
+                    "the tencent target was not verified against EdgeOne: there is no local \
+                     dry-run for it, so only this compiler's own checks stand behind the \
+                     artifact"
+                        .to_string(),
+                ))
+            }
+            deis_build_adapter_deislet::VENDOR => {
                 // Read the archive back the way the control plane will, with
                 // the shared reader. A bundle that this rejects would be
                 // rejected at upload instead, a long way from the build that
@@ -280,22 +377,24 @@ impl Compiler {
                 let parsed = deis_bundle::read_manifest(&bytes).map_err(|e| {
                     anyhow::anyhow!("the bundle this build produced is not loadable: {e}")
                 })?;
-                println!(
-                    "{}",
-                    format!(
-                        "  ✓ Bundle manifest reads back: app {}, entry {}, {} route(s), \
-                         {} asset(s)",
-                        parsed.manifest.app,
-                        parsed.manifest.entry,
-                        parsed.manifest.routes.len(),
-                        parsed.manifest.assets.len()
-                    )
-                    .green()
-                );
+                Ok(Verification::Ran(format!(
+                    "Bundle manifest reads back: app {}, entry {}, {} route(s), {} asset(s)",
+                    parsed.manifest.app,
+                    parsed.manifest.entry,
+                    parsed.manifest.routes.len(),
+                    parsed.manifest.assets.len()
+                )))
             }
-            _ => {}
+            // Unreachable through `compile`, which builds only what
+            // `build_for_vendor` accepts, and that function rejects an unknown
+            // vendor by name. Refused rather than passed over so that adding a
+            // target and forgetting this table fails loudly instead of
+            // granting the new target a silent exemption.
+            other => Err(anyhow::anyhow!(
+                "{other} has no verification step in this compiler; a target with nothing \
+                 standing behind its artifact must not report a successful build"
+            )),
         }
-        Ok(())
     }
 
     fn load_config(&self, project_dir: &Path) -> anyhow::Result<ProjectConfig> {
@@ -479,14 +578,24 @@ impl Compiler {
         vendor: &str,
         features: &[Feature],
     ) -> anyhow::Result<Vec<String>> {
+        // Matched on each adapter's own `VENDOR` constant, like every other
+        // vendor table in this file. A literal here would let an adapter be
+        // renamed while this table went on compiling and silently skipping
+        // that target's capability check.
         let platform = match vendor {
-            "cloudflare" => Platform::Cloudflare,
-            "deno" => Platform::Deno,
-            "tencent" => Platform::Tencent,
-            "deislet" => Platform::Deislet,
-            _ => {
-                // Unknown platform, skip validation
-                return Ok(Vec::new());
+            deis_build_adapter_cloudflare::VENDOR => Platform::Cloudflare,
+            deis_build_adapter_deno::VENDOR => Platform::Deno,
+            deis_build_adapter_tencent::VENDOR => Platform::Tencent,
+            deis_build_adapter_deislet::VENDOR => Platform::Deislet,
+            // Unreachable: `build_for_vendor` rejects an unknown vendor by
+            // name before this runs. Left as a refusal rather than a silent
+            // `Ok(Vec::new())`, which would have granted a target added later
+            // an exemption from every capability check.
+            other => {
+                return Err(anyhow::anyhow!(
+                    "{other} has no platform capability table, so nothing would check whether \
+                     this project's declared features exist there"
+                ));
             }
         };
 
@@ -562,7 +671,7 @@ impl Compiler {
         // receives it as a path. Memory mode has no directory to hand a path
         // from, so refuse rather than pack an archive into a scratch directory
         // that is deleted on the way out.
-        if vendor == "deislet" && !keeps_output {
+        if vendor == deis_build_adapter_deislet::VENDOR && !keeps_output {
             return Err(anyhow::anyhow!(
                 "the deislet target produces a bundle archive on disk and cannot be built in \
                  Memory output mode; build it in Files or Both"
@@ -619,6 +728,12 @@ impl Compiler {
         let mut routes = Vec::new();
         let mut files = Vec::new();
         let mut total_size = 0;
+        // Every module specifier each handler writes, kept against the
+        // author's own path. The deno target is the only reader: it is the one
+        // target whose modules are shipped unbundled, so nothing else ever
+        // looks at what they import. See
+        // `refuse_specifiers_deno_cannot_resolve`.
+        let mut handler_specifiers: Vec<(String, Vec<String>)> = Vec::new();
 
         // Copy files (User Code) to dist/vendor/src/
         for handler_path in handlers {
@@ -639,7 +754,14 @@ impl Compiler {
             }
 
             let code = fs::read_to_string(&handler_path)?;
-            Self::refuse_a_handler_with_no_default_export(&self.parser, &handler_path, &code)?;
+            // Parsed once. The default-export check and the deno specifier
+            // check both read this, and a second parse would be a second
+            // reading of the same file that could disagree with the first.
+            let parsed = self.parser.parse(&code, &handler_path).ok();
+            Self::refuse_a_handler_with_no_default_export(&handler_path, parsed.as_ref())?;
+            if let Some(info) = &parsed {
+                handler_specifiers.push((handler_path.clone(), info.imports.clone()));
+            }
             let transformed = self
                 .transformer
                 .transform(&code, &handler_path, vendor, config)?;
@@ -763,6 +885,25 @@ impl Compiler {
             _ => return Err(anyhow::anyhow!("Unknown vendor: {vendor}")),
         };
 
+        // The deno target's own resolution check, run against the import map
+        // this build just generated.
+        //
+        // Here rather than beside the bundler call below, because the deno
+        // target does not reach the bundler at all - that is the hole this
+        // closes. Run before `deno.json`, the router and the adapters are
+        // written, so a project Deno could not load leaves no runnable program
+        // behind - only the staged copies of the author's own sources, which
+        // every target writes before this point because the bundler resolves
+        // them off disk.
+        if vendor == deis_build_adapter_deno::VENDOR {
+            let deno_json = artifacts
+                .config_files
+                .iter()
+                .find(|(name, _)| name == "deno.json")
+                .map(|(_, content)| content.as_str());
+            Self::refuse_specifiers_deno_cannot_resolve(deno_json, &handler_specifiers)?;
+        }
+
         // Write Config Files
         for (name, content) in artifacts.config_files {
             let mut content = content;
@@ -816,12 +957,23 @@ impl Compiler {
         }
 
         // Handle Code (Bundle or Skip)
-        let (entry_code, entry_filename) = if vendor != "deno" {
-            // Bundle
+        let (entry_code, entry_filename) = if vendor != deis_build_adapter_deno::VENDOR {
+            // Bundle.
+            //
+            // Exhaustive rather than `_ => Cloudflare`: the catch-all made a
+            // vendor nobody had thought about build as a Worker, quietly, and
+            // deno was the target it had been silently mapping until the
+            // `!=` above stopped sending it here at all.
             let platform = match vendor {
-                "tencent" => TargetPlatform::EdgeOne,
-                "deislet" => TargetPlatform::Deislet,
-                _ => TargetPlatform::Cloudflare,
+                deis_build_adapter_cloudflare::VENDOR => TargetPlatform::Cloudflare,
+                deis_build_adapter_tencent::VENDOR => TargetPlatform::EdgeOne,
+                deis_build_adapter_deislet::VENDOR => TargetPlatform::Deislet,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "{other} has no bundler target, so there is no telling what the module \
+                         this build produced would be loaded by"
+                    ));
+                }
             };
 
             let router_path = system_dir.join("router.ts");
@@ -835,7 +987,7 @@ impl Compiler {
             // where the build was launched from. Pinning the bundler's working
             // directory to the project makes the module paths it writes into
             // the output relative to the project root and nothing else.
-            if vendor == "deislet" {
+            if vendor == deis_build_adapter_deislet::VENDOR {
                 bundler = bundler.with_cwd(project_dir.to_path_buf());
             }
 
@@ -852,15 +1004,24 @@ impl Compiler {
             let bundled = bundler.generate().await;
 
             match bundled {
-                Ok(bundled_code) => {
+                Ok((bundled_code, advisories)) => {
+                    // What the bundler said that was not fatal. Printed and
+                    // carried, like every other advisory this build produces -
+                    // these used to reach a terminal and nothing else.
+                    for advisory in advisories {
+                        println!("{}", format!("  ⚠ {advisory}").yellow());
+                        warnings.push(advisory);
+                    }
                     let filename = match vendor {
-                        "tencent" => "edge-functions/index.js".to_string(),
-                        "deislet" => deis_build_adapter_deislet::WORKER_ENTRY.to_string(),
+                        deis_build_adapter_tencent::VENDOR => "edge-functions/index.js".to_string(),
+                        deis_build_adapter_deislet::VENDOR => {
+                            deis_build_adapter_deislet::WORKER_ENTRY.to_string()
+                        }
                         _ => "index.js".to_string(),
                     };
 
-                    if keeps_output && vendor != "deislet" {
-                        let output_file = if vendor == "tencent" {
+                    if keeps_output && vendor != deis_build_adapter_deislet::VENDOR {
+                        let output_file = if vendor == deis_build_adapter_tencent::VENDOR {
                             let ef_dir = build_dir.join("edge-functions");
                             if !ef_dir.exists() {
                                 let _ = fs::create_dir_all(&ef_dir);
@@ -897,7 +1058,7 @@ impl Compiler {
         };
 
         // Cleanup for Bundled targets (CF, EO, Runtime)
-        if vendor != "deno" && keeps_output {
+        if vendor != deis_build_adapter_deno::VENDOR && keeps_output {
             // Delete _deis_internal
             let system_dir = build_dir.join("_deis_internal");
             if system_dir.exists() {
@@ -906,7 +1067,7 @@ impl Compiler {
 
             // Cleanup source files in src/ but keep assets
             let src_dir = build_dir.join("src");
-            if vendor == "deislet" && src_dir.exists() {
+            if vendor == deis_build_adapter_deislet::VENDOR && src_dir.exists() {
                 // Nothing loose survives a deislet build: the archive carries
                 // the whole app, and a leftover copy of the sources next to it
                 // is stale the moment the next build runs.
@@ -978,7 +1139,7 @@ impl Compiler {
         }
 
         // Pack the deislet target's real artefact.
-        if vendor == "deislet" {
+        if vendor == deis_build_adapter_deislet::VENDOR {
             let bundle = self.emit_bundle(project_dir, &build_dir, config, &entry_code, &routes)?;
             total_size = bundle.size;
             files.push(bundle.path.to_string_lossy().to_string());
@@ -1036,11 +1197,10 @@ impl Compiler {
     /// the bundler speak for itself - it refuses the same module a moment
     /// later, from its own reading of it.
     fn refuse_a_handler_with_no_default_export(
-        parser: &TypeScriptParser,
         handler_path: &str,
-        code: &str,
+        info: Option<&HandlerInfo>,
     ) -> anyhow::Result<()> {
-        let Ok(info) = parser.parse(code, handler_path) else {
+        let Some(info) = info else {
             return Ok(());
         };
         if info.has_default_export {
@@ -1063,6 +1223,119 @@ impl Compiler {
              not just this route. Add `export default async function handler(context)`, or move \
              the file out of the function root if it is a helper rather than a handler"
         ))
+    }
+
+    /// Stop a deno build whose handlers name a module Deno cannot resolve.
+    ///
+    /// The deno target is the one target whose modules are shipped as they
+    /// were written: three of the four go through
+    /// [`deis_build_core::bundler::BuildBundler`], which resolves every
+    /// specifier and refuses a bundle that still imports something nothing
+    /// carries. `if vendor != "deno"` put this target outside that, so the
+    /// repository's own `examples/hello-world` - one handler, one
+    /// `import { v4 } from "uuid"` - built green here and failed for tencent
+    /// on exactly the same source. What deployed was a program Deno refuses to
+    /// load at all: a bare specifier is not a path, and without a map entry
+    /// there is nothing to resolve it to, so the whole application is down
+    /// rather than the one route.
+    ///
+    /// Not the bundler's rule copied over. The two resolve differently on
+    /// purpose - Deno reads `npm:` and `jsr:` specifiers the bundler cannot,
+    /// and the bundler reads `node_modules` Deno Deploy has no copy of - so
+    /// this is the deno rule, checked against the import map **this build
+    /// actually generated**. It is handed `deno.json` rather than a list
+    /// written out here, so an adapter that starts mapping a name does not
+    /// leave a second copy of the allow-list disagreeing with it.
+    ///
+    /// Only bare specifiers. A relative or absolute path is Deno's own
+    /// resolution against the staged tree and is left to `deno check`, which
+    /// this build runs when deno is installed.
+    ///
+    /// A handler swc could not parse contributes no specifiers and is passed
+    /// over here, the same tolerance `refuse_a_handler_with_no_default_export`
+    /// has and for the same reason: swc and Deno are two different parsers,
+    /// and failing a build on source Deno would have accepted is the worse
+    /// trade. `deno check` is what speaks for those files.
+    fn refuse_specifiers_deno_cannot_resolve(
+        deno_json: Option<&str>,
+        handlers: &[(String, Vec<String>)],
+    ) -> anyhow::Result<()> {
+        let mapped = Self::import_map_keys(deno_json);
+        let mut unresolvable: Vec<String> = Vec::new();
+
+        for (handler, specifiers) in handlers {
+            for specifier in specifiers {
+                if !Self::is_bare_specifier(specifier) {
+                    continue;
+                }
+                let covered = mapped.iter().any(|key| {
+                    if let Some(prefix) = key.strip_suffix('/') {
+                        specifier.starts_with(prefix) && specifier.len() > prefix.len()
+                    } else {
+                        specifier == key
+                    }
+                });
+                if !covered {
+                    unresolvable.push(format!("{handler} imports {specifier:?}"));
+                }
+            }
+        }
+
+        if unresolvable.is_empty() {
+            return Ok(());
+        }
+        unresolvable.sort();
+        unresolvable.dedup();
+        Err(anyhow::anyhow!(
+            "the deno target would ship {} import(s) Deno cannot resolve:\n  {}\n\nA bare \
+             specifier is not a path and this build's deno.json maps nothing to it, so Deno \
+             refuses the module as it loads - the whole application, not the route the import is \
+             in. Write the dependency as a `npm:` specifier (`import {{ v4 }} from \
+             \"npm:uuid@^9\"`) or a URL, or vendor the file into the project and import it by \
+             path.",
+            unresolvable.len(),
+            unresolvable.join("\n  ")
+        ))
+    }
+
+    /// The keys of the import map in a generated `deno.json`.
+    ///
+    /// A key ending in `/` is a prefix in Deno's import-map rules, and the
+    /// caller applies it as one. An unreadable or absent file gives an empty
+    /// map rather than an error: the adapter always writes one, so the only
+    /// way here is a target that has stopped writing it, and then *nothing* is
+    /// mapped - which is what an empty set says.
+    fn import_map_keys(deno_json: Option<&str>) -> Vec<String> {
+        let Some(text) = deno_json else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return Vec::new();
+        };
+        value
+            .get("imports")
+            .and_then(|imports| imports.as_object())
+            .map(|imports| imports.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether a specifier is a bare name rather than a path or a URL.
+    ///
+    /// The scheme list is Deno's: these are the ones its resolver handles with
+    /// no map entry. Anything else with a `:` in it - `foo:bar` - is a scheme
+    /// Deno does not know and is treated as bare, which is the safe way round:
+    /// it is refused with a message rather than shipped.
+    fn is_bare_specifier(specifier: &str) -> bool {
+        const RESOLVED_BY_DENO: [&str; 7] = [
+            "npm:", "jsr:", "node:", "http://", "https://", "data:", "file://",
+        ];
+        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
+        {
+            return false;
+        }
+        !RESOLVED_BY_DENO
+            .iter()
+            .any(|scheme| specifier.starts_with(scheme))
     }
 
     /// Where this project's static files live.
@@ -1245,6 +1518,22 @@ impl Drop for ScratchDir {
             }
         }
     }
+}
+
+/// What the target's own tooling said about a finished artifact.
+///
+/// Three answers rather than a `Result<()>`, because "the check could not run"
+/// is neither success nor failure and used to be reported as the first. A
+/// skipped check is carried back to the caller as text so it can become a
+/// build warning instead of a dimmed line that scrolls past.
+enum Verification {
+    /// The check ran and the artifact was accepted; the string says what was
+    /// actually checked, so a reader can tell a manifest read-back from a
+    /// vendor dry-run.
+    Ran(String),
+    /// The check did not run. The string says which target, why, and what
+    /// would make it run.
+    Skipped(String),
 }
 
 /// What packing a deislet bundle produced.

@@ -1846,8 +1846,18 @@ impl RuntimePool {
         )
         .await?;
 
-        rx.await
-            .map_err(|_| anyhow::anyhow!("Runtime thread dropped"))?
+        rx.await.map_err(|_| {
+            // Reached only when the runtime thread ended without answering --
+            // it panicked mid-request, or the isolate was dropped underneath
+            // it. Every ordinary failure of the invocation now travels down
+            // this channel as itself; see `AppRuntime::execute_fetch`, where
+            // three paths used to return through `?` with the channel dropped,
+            // so a handler that threw was reported to the client as this
+            // sentence rather than as its own error.
+            anyhow::anyhow!(
+                "the runtime thread serving app {app_id} ended this request without answering it;                  the node's log has what happened to it"
+            )
+        })?
     }
 
     /// List all applications

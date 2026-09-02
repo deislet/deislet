@@ -59,3 +59,9 @@ tempfile = "3"
 # proto but talks past the running service - is only visible over a socket.
 # The server, not a stub, for that reason.
 deis-queue = { path = "../deis-queue" }
+# A real deis-telemetry for the log and trace readers to authenticate against.
+# `deis logs`, `deis tail` and `deis trace` derive a capability token over a
+# subject and the collector recomputes it over its own; nothing but a query
+# against the running service proves the two strings agree. Test-only - this
+# CLI does not link the collector's server, its database or its HTTP stack.
+deis-telemetry = { path = "../deis-telemetry" }

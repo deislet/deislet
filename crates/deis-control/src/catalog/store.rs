@@ -21,10 +21,12 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::domains::{DomainGrant, EVERY_ENVIRONMENT, GrantPattern, HostClaim, grant_allows};
 use super::model::{
-    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, RetiredAppName, Route,
-    SecretMeta, Version, now_secs, validate_app_id, validate_environment_name, validate_host,
-    validate_path_prefix, validate_secret_name,
+    App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, MAX_ROUTES_PER_APP,
+    MAX_ROUTES_PER_ENVIRONMENT, RetiredAppName, Route, SecretMeta, Version, now_secs,
+    validate_app_id, validate_environment_name, validate_path_prefix, validate_route_priority,
+    validate_secret_name,
 };
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
@@ -35,6 +37,7 @@ const ENVIRONMENT_COLUMNS: &str = "id, app_id, name, created_at";
 const DEPLOYMENT_COLUMNS: &str = "id, app_id, env_id, version_id, created_at, note";
 const ROUTE_COLUMNS: &str = "id, app_id, env_id, host, path_prefix, priority";
 const RETIRED_NAME_COLUMNS: &str = "app_id, retired_at, environments, released_at";
+const DOMAIN_GRANT_COLUMNS: &str = "pattern, app_id, environment, created_at, note";
 
 /// Ordering that defines "the current deployment of an environment".
 ///
@@ -344,6 +347,13 @@ impl CatalogStore {
     /// whatever the last one left behind - after purging it, or knowing they
     /// have not. The audit log records who did it; the returned row is what
     /// they were told they were accepting.
+    /// Every hostname grant that named the released application is withdrawn
+    /// with it. That is the whole reason this is not just a flag flip: the
+    /// grants are a statement about *that* application, and the next
+    /// application of the name is somebody else. Leaving them would mean the
+    /// next `demo` inherited `demo.example.com` without anyone deciding so,
+    /// which is the hijack this registry exists to stop, arriving through a
+    /// door marked "administrator convenience".
     pub async fn release_retired_name(&self, app_id: &str) -> CatalogResult<RetiredAppName> {
         let wanted = app_id.to_string();
         let released = self
@@ -359,6 +369,17 @@ impl CatalogStore {
                             "UPDATE retired_app_names SET released_at = ?2 WHERE app_id = ?1",
                             params![wanted, released_at],
                         )?;
+                        let withdrawn = conn.execute(
+                            "DELETE FROM domain_grants WHERE app_id = ?1",
+                            params![wanted],
+                        )?;
+                        if withdrawn > 0 {
+                            warn!(
+                                app_id = %wanted,
+                                grants = withdrawn,
+                                "Withdrew {withdrawn} hostname grant(s) with the released name. The next application called {wanted} is somebody else and does not inherit the names the last one was given; grant them again deliberately if that is what is meant",
+                            );
+                        }
                         Ok(RetiredAppName {
                             released_at: Some(released_at),
                             ..retired
@@ -821,6 +842,32 @@ impl CatalogStore {
     // Routes
     // ----------------------------------------------------------------
 
+    /// Bind a hostname and path prefix to one environment.
+    ///
+    /// Four things have to be true, and all four are settled inside the one
+    /// database call that inserts the row, so nothing can change underneath
+    /// between the check and the write:
+    ///
+    /// 1. the host is spelled the single way this platform stores a host
+    ///    ([`HostClaim`]), so the string checked is the string the edge
+    ///    matches;
+    /// 2. the installation has **granted** that name to this application and
+    ///    environment ([`super::domains`]). This is the check the route
+    ///    endpoint did not have: `crate::api::authz` authorises the caller
+    ///    against the application and environment *in the URL*, which are
+    ///    the caller's own, while the host is in the body and belongs to
+    ///    whoever registered the domain. A credential scoped to
+    ///    `deploy:attacker/production` was answered 201 for
+    ///    `{"host": "victim.example.com"}`;
+    /// 3. nobody else already holds that `(host, path_prefix)`;
+    /// 4. this application and environment are under their route ceilings.
+    ///
+    /// The grant check lives here rather than in the gate on purpose. The
+    /// gate judges a credential against a scope, and no scope can spell a
+    /// hostname; this is a fact about the platform's name registry, which is
+    /// a table two rows away from the one being written. Splitting it would
+    /// be two rules that can disagree, and the second one would be the one
+    /// nobody updated.
     pub async fn create_route(
         &self,
         env: &Environment,
@@ -828,22 +875,28 @@ impl CatalogStore {
         path_prefix: &str,
         priority: i64,
     ) -> CatalogResult<Route> {
-        if let Some(host) = host.as_deref() {
-            validate_host(host)?;
-        }
+        let claim = HostClaim::parse(host.as_deref())?;
         validate_path_prefix(path_prefix)?;
+        validate_route_priority(priority)?;
 
         let route = Route {
             id: Uuid::new_v4().to_string(),
             app_id: env.app_id.clone(),
             env_id: env.id.clone(),
-            host,
+            host: claim.stored(),
             path_prefix: path_prefix.to_string(),
             priority,
         };
         let stored = route.clone();
+        let app_id = env.app_id.clone();
+        let env_id = env.id.clone();
+        let env_name = env.name.clone();
+        let described = claim.describe();
 
         self.with_conn(move |conn| {
+            authorise_claim(conn, &claim, &app_id, &env_name)?;
+            claim_is_free(conn, stored.host.as_deref(), &stored.path_prefix, None)?;
+            within_route_ceilings(conn, &app_id, &env_id, &env_name)?;
             conn.execute(
                 &format!("INSERT INTO routes ({ROUTE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"),
                 params![
@@ -863,7 +916,7 @@ impl CatalogStore {
             app_id = %route.app_id,
             env_id = %route.env_id,
             route_id = %route.id,
-            host = route.host.as_deref().unwrap_or("*"),
+            host = %described,
             path_prefix = %route.path_prefix,
             priority = route.priority,
             "Route bound; traffic matching it reaches this environment once the edge reloads its route table"
@@ -903,26 +956,41 @@ impl CatalogStore {
             .await
     }
 
+    /// Replace a route's host, path prefix and priority.
+    ///
+    /// The same four rules as [`CatalogStore::create_route`], because this is
+    /// the same claim being made: an update that moved the host from a name
+    /// the application was granted to one it was not would be the identical
+    /// hijack with one more HTTP request in front of it. The route is loaded
+    /// by `(env_id, route_id)`, so a caller cannot reach another
+    /// environment's row, and the uniqueness check excludes this row so
+    /// re-writing a route with the same address is not a collision with
+    /// itself.
     pub async fn update_route(
         &self,
-        env_id: &str,
+        env: &Environment,
         route_id: &str,
         host: Option<String>,
         path_prefix: &str,
         priority: i64,
     ) -> CatalogResult<Route> {
-        if let Some(host) = host.as_deref() {
-            validate_host(host)?;
-        }
+        let claim = HostClaim::parse(host.as_deref())?;
         validate_path_prefix(path_prefix)?;
+        validate_route_priority(priority)?;
 
-        let env_id = env_id.to_string();
+        let env_id = env.id.clone();
+        let app_id = env.app_id.clone();
+        let env_name = env.name.clone();
         let route_id = route_id.to_string();
         let path_prefix = path_prefix.to_string();
+        let host = claim.stored();
+        let described = claim.describe();
 
         let route = self
             .with_conn(move |conn| {
                 let existing = load_route(conn, &env_id, &route_id)?;
+                authorise_claim(conn, &claim, &app_id, &env_name)?;
+                claim_is_free(conn, host.as_deref(), &path_prefix, Some(&route_id))?;
                 conn.execute(
                     "UPDATE routes SET host = ?1, path_prefix = ?2, priority = ?3 WHERE id = ?4",
                     params![host, path_prefix, priority, route_id],
@@ -939,7 +1007,7 @@ impl CatalogStore {
         info!(
             route_id = %route.id,
             env_id = %route.env_id,
-            host = route.host.as_deref().unwrap_or("*"),
+            host = %described,
             path_prefix = %route.path_prefix,
             priority = route.priority,
             "Route updated; requests that used to match the old prefix may now fall through to another route"
@@ -962,6 +1030,174 @@ impl CatalogStore {
             env_id = %env_id,
             "Route removed; traffic that matched it now falls through to a lower-priority route or gets no app at all"
         );
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Domain grants: who may claim which hostname
+    // ----------------------------------------------------------------
+
+    /// Record that one application may claim names matching `pattern`.
+    ///
+    /// An administrator's call (`crate::api::authz` demands `admin:*/*` for
+    /// it), because a hostname is global and handing one out is a decision
+    /// about the whole platform rather than about one application.
+    ///
+    /// The application does not have to exist yet. A grant is a statement
+    /// about a name, and an operator setting a platform up writes the
+    /// registry before the applications; whether the application is real is
+    /// settled when a route is created, which is the only thing that reads
+    /// this.
+    pub async fn create_domain_grant(
+        &self,
+        pattern: &str,
+        app_id: &str,
+        environment: &str,
+        note: Option<String>,
+    ) -> CatalogResult<DomainGrant> {
+        let pattern = GrantPattern::parse(pattern)?.as_text();
+        validate_app_id(app_id)?;
+        if environment != EVERY_ENVIRONMENT {
+            validate_environment_name(environment)?;
+        }
+
+        let grant = DomainGrant {
+            pattern,
+            app_id: app_id.to_string(),
+            environment: environment.to_string(),
+            created_at: now_secs(),
+            note,
+        };
+        let stored = grant.clone();
+
+        self.with_conn(move |conn| {
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM domain_grants
+                         WHERE pattern = ?1 AND app_id = ?2 AND environment = ?3",
+                    params![stored.pattern, stored.app_id, stored.environment],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Err(CatalogError::conflict(format!(
+                    "{} is already granted to {}/{}",
+                    stored.pattern, stored.app_id, stored.environment
+                )));
+            }
+            conn.execute(
+                &format!(
+                    "INSERT INTO domain_grants ({DOMAIN_GRANT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5)"
+                ),
+                params![
+                    stored.pattern,
+                    stored.app_id,
+                    stored.environment,
+                    stored.created_at,
+                    stored.note,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?;
+
+        info!(
+            pattern = %grant.pattern,
+            app_id = %grant.app_id,
+            environment = %grant.environment,
+            "Hostname granted; this application can now claim routes for names matching it, and no other application can claim a name this grant is the closest match for"
+        );
+        Ok(grant)
+    }
+
+    /// The whole registry, in a stable order.
+    pub async fn list_domain_grants(&self) -> CatalogResult<Vec<DomainGrant>> {
+        self.with_conn(load_domain_grants_ordered).await
+    }
+
+    /// Withdraw a grant.
+    ///
+    /// Routes that were created under it are **not** deleted. Removing a
+    /// grant is a statement about what may be claimed from now on; taking
+    /// live traffic off an address is a separate decision an operator makes
+    /// by deleting the route, and folding the two together would mean one
+    /// mistyped `DELETE /api/domains` took an application off the internet.
+    /// What the routes left behind get instead is a line in the log naming
+    /// them, because they can no longer be edited or re-created.
+    pub async fn delete_domain_grant(
+        &self,
+        pattern: &str,
+        app_id: &str,
+        environment: &str,
+    ) -> CatalogResult<()> {
+        let pattern_text = GrantPattern::parse(pattern)?.as_text();
+        let owned = (
+            pattern_text.clone(),
+            app_id.to_string(),
+            environment.to_string(),
+        );
+
+        let orphaned = self
+            .with_conn(move |conn| {
+                let (pattern, app_id, environment) = owned;
+                let removed = conn.execute(
+                    "DELETE FROM domain_grants
+                         WHERE pattern = ?1 AND app_id = ?2 AND environment = ?3",
+                    params![pattern, app_id, environment],
+                )?;
+                if removed == 0 {
+                    return Err(CatalogError::not_found(format!(
+                        "grant of {pattern} to {app_id}/{environment}"
+                    )));
+                }
+                // What is still routed under it, read after the delete so
+                // that what remains in the registry is what decides.
+                let grants = load_domain_grants(conn)?;
+                let mut orphaned = Vec::new();
+                let mut stmt = conn.prepare(
+                    "SELECT r.host, r.path_prefix, r.app_id, e.name
+                         FROM routes r JOIN environments e ON e.id = r.env_id
+                         WHERE r.app_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![app_id], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (host, prefix, route_app, route_env) = row?;
+                    let Ok(claim) = HostClaim::parse(host.as_deref()) else {
+                        continue;
+                    };
+                    if grant_allows(&grants, &claim, &route_app, &route_env).is_err() {
+                        orphaned.push(format!("{}{prefix}", claim.describe()));
+                    }
+                }
+                Ok(orphaned)
+            })
+            .await?;
+
+        if orphaned.is_empty() {
+            info!(
+                pattern = %pattern_text,
+                app_id = %app_id,
+                environment = %environment,
+                "Hostname grant withdrawn; nothing this application routes depended on it"
+            );
+        } else {
+            warn!(
+                pattern = %pattern_text,
+                app_id = %app_id,
+                environment = %environment,
+                routes = orphaned.len(),
+                claims = %orphaned.join(", "),
+                "Hostname grant withdrawn while {} route(s) of this application still claim names nothing now grants it. They keep serving traffic - withdrawing a grant must not be a way to take an application off the internet by accident - but they cannot be edited or re-created. Delete them, or grant the names back",
+                orphaned.len()
+            );
+        }
         Ok(())
     }
 
@@ -1287,6 +1523,16 @@ fn map_route(row: &Row<'_>) -> rusqlite::Result<Route> {
     })
 }
 
+fn map_domain_grant(row: &Row<'_>) -> rusqlite::Result<DomainGrant> {
+    Ok(DomainGrant {
+        pattern: row.get(0)?,
+        app_id: row.get(1)?,
+        environment: row.get(2)?,
+        created_at: row.get(3)?,
+        note: row.get(4)?,
+    })
+}
+
 fn app_exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     let found: Option<String> = conn
         .query_row("SELECT id FROM apps WHERE id = ?1", params![id], |row| {
@@ -1367,6 +1613,141 @@ fn load_route(conn: &Connection, env_id: &str, route_id: &str) -> CatalogResult<
     .ok_or_else(|| CatalogError::not_found(format!("route {route_id} in environment {env_id}")))
 }
 
+fn load_domain_grants(conn: &Connection) -> CatalogResult<Vec<DomainGrant>> {
+    // Every grant, not only this application's. Working out whether a claim
+    // is allowed means knowing who holds the *closest* pattern covering it,
+    // and that holder is usually somebody else - which is what makes a
+    // delegation inside a zone binding on the zone's own holder.
+    let mut stmt = conn.prepare(&format!("SELECT {DOMAIN_GRANT_COLUMNS} FROM domain_grants"))?;
+    let rows = stmt.query_map([], map_domain_grant)?;
+    let mut grants = Vec::new();
+    for row in rows {
+        grants.push(row?);
+    }
+    Ok(grants)
+}
+
+fn load_domain_grants_ordered(conn: &Connection) -> CatalogResult<Vec<DomainGrant>> {
+    let mut grants = load_domain_grants(conn)?;
+    grants.sort_by(|a, b| {
+        a.pattern
+            .cmp(&b.pattern)
+            .then_with(|| a.app_id.cmp(&b.app_id))
+            .then_with(|| a.environment.cmp(&b.environment))
+    });
+    Ok(grants)
+}
+
+/// The one gate a hostname claim passes. See [`super::domains`].
+fn authorise_claim(
+    conn: &Connection,
+    claim: &HostClaim,
+    app_id: &str,
+    environment: &str,
+) -> CatalogResult<()> {
+    let grants = load_domain_grants(conn)?;
+    match grant_allows(&grants, claim, app_id, environment) {
+        Ok(()) => Ok(()),
+        Err(refusal) => {
+            let held = if refusal.held_by.is_empty() {
+                "nobody".to_string()
+            } else {
+                refusal.held_by.join(", ")
+            };
+            warn!(
+                app_id = %app_id,
+                environment = %environment,
+                claim = %refusal.claim,
+                held_by = %held,
+                "Refused a hostname claim: a host name is global on this platform and this application was not granted that one. Nothing was written. This is the check that stops one environment's deploy credential taking delivery of another tenant's traffic, so a refusal here is worth reading rather than working around"
+            );
+            Err(CatalogError::forbidden(refusal.to_string()))
+        }
+    }
+}
+
+/// Whether `(host, path_prefix)` is unclaimed, read exactly as the edge reads
+/// it - host in lower case, path prefix without its trailing slash - so that
+/// two spellings of one address cannot both be held. This is the key
+/// `idx_routes_claim` is built on; see `database::schema`.
+fn claim_is_free(
+    conn: &Connection,
+    host: Option<&str>,
+    path_prefix: &str,
+    excluding: Option<&str>,
+) -> CatalogResult<()> {
+    let key_host = host.unwrap_or("").to_ascii_lowercase();
+    let key_prefix = path_prefix.trim_end_matches('/');
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT r.id, r.app_id FROM routes r
+                 WHERE lower(ifnull(r.host, '')) = ?1
+                   AND rtrim(r.path_prefix, '/') = ?2
+                   AND (?3 IS NULL OR r.id != ?3)
+                 LIMIT 1",
+            params![key_host, key_prefix, excluding],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match existing {
+        None => Ok(()),
+        Some((route_id, holder)) => {
+            let address = if key_host.is_empty() {
+                format!("every host at {path_prefix}")
+            } else {
+                format!("{key_host}{path_prefix}")
+            };
+            Err(CatalogError::conflict(format!(
+                "{address} is already routed to {holder} (route {route_id}). One address is \
+                 served by one application: two rows for it would be decided by priority and a \
+                 tie-break rather than by anybody's intent. Delete that route, or claim a \
+                 different path prefix"
+            )))
+        }
+    }
+}
+
+/// How many routes one tenant may hold.
+///
+/// Owning a name is not the whole story: an application granted a zone can
+/// create a route per name inside it, and every one of those names reaches
+/// the edge's certificate pass, where a public authority counts new
+/// certificates per registered domain per week. The ceiling there is shared
+/// fairly (`deis_proxy::acme::names`); this is the other half, which bounds
+/// how much of it one tenant can ask for in the first place.
+fn within_route_ceilings(
+    conn: &Connection,
+    app_id: &str,
+    env_id: &str,
+    env_name: &str,
+) -> CatalogResult<()> {
+    let per_environment: i64 = conn.query_row(
+        "SELECT count(*) FROM routes WHERE env_id = ?1",
+        params![env_id],
+        |row| row.get(0),
+    )?;
+    if per_environment >= MAX_ROUTES_PER_ENVIRONMENT as i64 {
+        return Err(CatalogError::conflict(format!(
+            "{app_id}/{env_name} already holds {per_environment} routes, which is the ceiling of \
+             {MAX_ROUTES_PER_ENVIRONMENT} for one environment. Every route is a name the edge \
+             tries to hold a certificate for, and a certificate authority counts new certificates \
+             per registered domain per week. Delete a route this environment no longer needs"
+        )));
+    }
+    let per_app: i64 = conn.query_row(
+        "SELECT count(*) FROM routes WHERE app_id = ?1",
+        params![app_id],
+        |row| row.get(0),
+    )?;
+    if per_app >= MAX_ROUTES_PER_APP as i64 {
+        return Err(CatalogError::conflict(format!(
+            "{app_id} already holds {per_app} routes across its environments, which is the \
+             ceiling of {MAX_ROUTES_PER_APP} for one application"
+        )));
+    }
+    Ok(())
+}
+
 fn current_deployment(conn: &Connection, env_id: &str) -> CatalogResult<Option<Deployment>> {
     let deployment = conn
         .query_row(
@@ -1394,6 +1775,19 @@ mod tests {
     async fn app_with_env(store: &CatalogStore, app_id: &str, env: &str) -> Environment {
         store.create_app(app_id).await.unwrap();
         store.create_environment(app_id, env).await.unwrap()
+    }
+
+    /// Hand one application every name, for tests that are about something
+    /// other than who owns a hostname. Written out rather than hidden inside
+    /// `app_with_env`, so that a test which needs the registry to be empty
+    /// gets an empty one and no test is silently exempt from the rule.
+    use super::super::model::MAX_ROUTE_PRIORITY;
+
+    async fn grant_everything(store: &CatalogStore, app_id: &str) {
+        store
+            .create_domain_grant("*", app_id, EVERY_ENVIRONMENT, None)
+            .await
+            .unwrap();
     }
 
     async fn version(store: &CatalogStore, app_id: &str, sha: &str) -> Version {
@@ -1718,6 +2112,7 @@ mod tests {
     async fn routes_are_created_updated_and_deleted() {
         let store = store().await;
         let env = app_with_env(&store, "demo", "production").await;
+        grant_everything(&store, "demo").await;
 
         let route = store
             .create_route(&env, Some("example.com".to_string()), "/api", 10)
@@ -1726,7 +2121,7 @@ mod tests {
         assert_eq!(store.list_routes(None, None).await.unwrap().len(), 1);
 
         let updated = store
-            .update_route(&env.id, &route.id, None, "/", 0)
+            .update_route(&env, &route.id, None, "/", 0)
             .await
             .unwrap();
         assert!(updated.host.is_none());
@@ -1749,13 +2144,318 @@ mod tests {
         assert!(store.delete_route(&env.id, &route.id).await.is_err());
     }
 
+    /// The reproduction, at the layer that decides it.
+    ///
+    /// A credential scoped to `deploy:attacker/production` is refused
+    /// `GET /api/apps/victim` with 403 and was then answered **201** for
+    /// `{"host":"victim.example.com"}` posted to its own environment's route
+    /// list, because the route call is authorised against the application and
+    /// environment in the URL - the caller's own - and the host was checked
+    /// for nothing but its shape.
+    #[tokio::test]
+    async fn one_tenants_deploy_credential_cannot_claim_another_tenants_hostname() {
+        let store = store().await;
+        let victim = app_with_env(&store, "victim", "production").await;
+        let attacker = app_with_env(&store, "attacker", "production").await;
+        store
+            .create_domain_grant("victim.example.com", "victim", EVERY_ENVIRONMENT, None)
+            .await
+            .unwrap();
+
+        // The body the reproduction sent, in full. The maximum priority is
+        // refused first and on its own terms - an ordering key with no range
+        // is its own defect - so the claim is then made again with an
+        // ordinary priority, which is where the hostname rule has to answer.
+        let refusal = store
+            .create_route(
+                &attacker,
+                Some("victim.example.com".to_string()),
+                "/",
+                i64::MAX,
+            )
+            .await
+            .expect_err("a place at the front of every queue is not a priority");
+        assert!(matches!(refusal, CatalogError::Invalid(_)), "{refusal:?}");
+
+        let refusal = store
+            .create_route(&attacker, Some("victim.example.com".to_string()), "/", 0)
+            .await
+            .expect_err("the attacker was granted nothing");
+        assert!(
+            matches!(refusal, CatalogError::Forbidden(_)),
+            "a claim on somebody else's name is a refusal, not a bad request: {refusal:?}"
+        );
+        assert!(
+            store.list_routes(None, None).await.unwrap().is_empty(),
+            "nothing may be written by a refused claim"
+        );
+
+        // And the application that was granted the name still gets it.
+        store
+            .create_route(&victim, Some("victim.example.com".to_string()), "/", 0)
+            .await
+            .expect("the grant names this application");
+    }
+
+    /// The widest claim there is - a route with no host answers for every
+    /// name no other route claims - went through the identical hole, and
+    /// looks the most innocent of the three in a request body.
+    #[tokio::test]
+    async fn the_route_that_names_no_host_is_the_widest_claim_and_is_gated_too() {
+        let store = store().await;
+        let attacker = app_with_env(&store, "attacker", "production").await;
+        store
+            .create_domain_grant("*.attacker.example", "attacker", EVERY_ENVIRONMENT, None)
+            .await
+            .unwrap();
+
+        let refusal = store
+            .create_route(&attacker, None, "/", 0)
+            .await
+            .expect_err("a zone grant is not a grant over every name there is");
+        assert!(matches!(refusal, CatalogError::Forbidden(_)), "{refusal:?}");
+
+        // Nor is a wildcard route on somebody else's zone.
+        let refusal = store
+            .create_route(&attacker, Some("*.example.com".to_string()), "/", 0)
+            .await
+            .expect_err("*.example.com is not inside *.attacker.example");
+        assert!(matches!(refusal, CatalogError::Forbidden(_)), "{refusal:?}");
+
+        store
+            .create_route(&attacker, Some("a.attacker.example".to_string()), "/", 0)
+            .await
+            .expect("a name inside the granted zone");
+    }
+
+    /// The sibling: an update carries the same body as a create and makes the
+    /// same claim. Closing only the create would have left the hijack behind
+    /// one extra HTTP request.
+    #[tokio::test]
+    async fn an_update_cannot_move_a_route_onto_a_name_nobody_granted_it() {
+        let store = store().await;
+        let attacker = app_with_env(&store, "attacker", "production").await;
+        store
+            .create_domain_grant("attacker.example", "attacker", EVERY_ENVIRONMENT, None)
+            .await
+            .unwrap();
+        let route = store
+            .create_route(&attacker, Some("attacker.example".to_string()), "/", 0)
+            .await
+            .unwrap();
+
+        let refusal = store
+            .update_route(
+                &attacker,
+                &route.id,
+                Some("victim.example.com".to_string()),
+                "/",
+                0,
+            )
+            .await
+            .expect_err("an update is a claim");
+        assert!(matches!(refusal, CatalogError::Forbidden(_)), "{refusal:?}");
+        assert_eq!(
+            store
+                .get_route(&attacker.id, &route.id)
+                .await
+                .unwrap()
+                .host
+                .as_deref(),
+            Some("attacker.example"),
+            "a refused update must leave the row exactly as it was"
+        );
+    }
+
+    /// One address, one application. Two rows for it are decided by priority
+    /// and a tie-break rather than by anybody's intent, which is a coin toss
+    /// over whose traffic arrives where.
+    #[tokio::test]
+    async fn two_applications_cannot_hold_the_same_address() {
+        let store = store().await;
+        let one = app_with_env(&store, "one", "production").await;
+        let two = app_with_env(&store, "two", "production").await;
+        // Both were granted the name - an operator can do that deliberately -
+        // and it is still one address.
+        for app in ["one", "two"] {
+            store
+                .create_domain_grant("shared.example.com", app, EVERY_ENVIRONMENT, None)
+                .await
+                .unwrap();
+        }
+
+        store
+            .create_route(&one, Some("shared.example.com".to_string()), "/", 0)
+            .await
+            .unwrap();
+        let clash = store
+            .create_route(&two, Some("shared.example.com".to_string()), "/", 0)
+            .await
+            .expect_err("the address is already held");
+        assert!(matches!(clash, CatalogError::Conflict(_)), "{clash:?}");
+
+        // The same address written another way is the same address: the edge
+        // lower-cases the host and trims the prefix's trailing slash before
+        // it compares, so two spellings must not both be storable.
+        let clash = store
+            .create_route(&two, Some("shared.example.com".to_string()), "/", 5)
+            .await
+            .expect_err("priority does not make it a different address");
+        assert!(matches!(clash, CatalogError::Conflict(_)), "{clash:?}");
+
+        // A different path prefix on the same host is a different address,
+        // and that is the arrangement the demo uses.
+        store
+            .create_route(&two, Some("shared.example.com".to_string()), "/api", 0)
+            .await
+            .expect("host plus prefix is the address, and this one is free");
+    }
+
+    /// The second half of the hostname problem: owning a name is not the
+    /// whole story, because a tenant granted a zone can still ask for a
+    /// certificate per name inside it until the edge's ceiling is spent.
+    #[tokio::test]
+    async fn one_environment_cannot_claim_an_unbounded_number_of_routes() {
+        let store = store().await;
+        let env = app_with_env(&store, "flood", "production").await;
+        store
+            .create_domain_grant("*.flood.example", "flood", EVERY_ENVIRONMENT, None)
+            .await
+            .unwrap();
+
+        for n in 0..MAX_ROUTES_PER_ENVIRONMENT {
+            store
+                .create_route(&env, Some(format!("a{n:03}.flood.example")), "/", 0)
+                .await
+                .unwrap_or_else(|e| panic!("route {n} is inside the ceiling: {e}"));
+        }
+        let refusal = store
+            .create_route(&env, Some("one-too-many.flood.example".to_string()), "/", 0)
+            .await
+            .expect_err("the ceiling has to be a ceiling");
+        assert!(matches!(refusal, CatalogError::Conflict(_)), "{refusal:?}");
+    }
+
+    /// A caller-supplied integer that becomes an ordering key is a "go first"
+    /// button unless it has a range. `i64::MAX` put a route ahead of every
+    /// other route it shared a bucket with.
+    #[tokio::test]
+    async fn a_priority_outside_the_hint_range_is_refused() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        grant_everything(&store, "demo").await;
+
+        for absurd in [i64::MAX, i64::MIN, MAX_ROUTE_PRIORITY + 1] {
+            let refusal = store
+                .create_route(&env, Some("demo.example.com".to_string()), "/", absurd)
+                .await
+                .expect_err("priority is a hint with a range");
+            assert!(matches!(refusal, CatalogError::Invalid(_)), "{refusal:?}");
+        }
+        store
+            .create_route(
+                &env,
+                Some("demo.example.com".to_string()),
+                "/",
+                MAX_ROUTE_PRIORITY,
+            )
+            .await
+            .expect("the top of the range is inside it");
+    }
+
+    /// Releasing a retired name hands it to whoever creates it next. The
+    /// hostnames the last application was given do not travel with it.
+    #[tokio::test]
+    async fn releasing_a_name_withdraws_the_hostname_grants_that_went_with_it() {
+        let store = store().await;
+        app_with_env(&store, "demo", "production").await;
+        store
+            .create_domain_grant("demo.example.com", "demo", EVERY_ENVIRONMENT, None)
+            .await
+            .unwrap();
+        store.delete_app("demo").await.unwrap();
+        assert_eq!(
+            store.list_domain_grants().await.unwrap().len(),
+            1,
+            "a deletion alone retires the name and hands it to nobody, so the grant stands"
+        );
+
+        store.release_retired_name("demo").await.unwrap();
+        assert!(
+            store.list_domain_grants().await.unwrap().is_empty(),
+            "the next application called demo is somebody else and inherits no hostname"
+        );
+    }
+
+    /// A grant is written down, listed and withdrawn, and withdrawing it
+    /// leaves the route that was created under it serving traffic.
+    #[tokio::test]
+    async fn a_grant_is_written_listed_and_withdrawn_without_taking_traffic_down() {
+        let store = store().await;
+        let env = app_with_env(&store, "demo", "production").await;
+        store
+            .create_domain_grant(
+                "*.example.com",
+                "demo",
+                "production",
+                Some("the team's zone".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .create_domain_grant("*.example.com", "demo", "production", None)
+                .await
+                .is_err(),
+            "the same grant twice is a conflict, not a silent second row"
+        );
+
+        let listed = store.list_domain_grants().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].pattern, "*.example.com");
+        assert_eq!(listed[0].environment, "production");
+
+        let route = store
+            .create_route(&env, Some("a.example.com".to_string()), "/", 0)
+            .await
+            .unwrap();
+
+        store
+            .delete_domain_grant("*.example.com", "demo", "production")
+            .await
+            .unwrap();
+        assert!(store.list_domain_grants().await.unwrap().is_empty());
+        assert!(
+            store.get_route(&env.id, &route.id).await.is_ok(),
+            "withdrawing a grant must not be a way to take an application off the internet"
+        );
+        assert!(
+            store
+                .update_route(&env, &route.id, Some("a.example.com".to_string()), "/", 1)
+                .await
+                .is_err(),
+            "but the claim can no longer be re-made"
+        );
+    }
+
     #[tokio::test]
     async fn routes_can_be_narrowed_by_app_and_environment() {
         let store = store().await;
         let production = app_with_env(&store, "demo", "production").await;
         let preview = store.create_environment("demo", "pr-42").await.unwrap();
-        store.create_route(&production, None, "/", 1).await.unwrap();
-        store.create_route(&preview, None, "/", 5).await.unwrap();
+        grant_everything(&store, "demo").await;
+        // Two different addresses on purpose. Both environments claiming the
+        // bare catch-all used to be accepted here, and it is the same claim
+        // twice: which environment answered depended on priority and a
+        // tie-break rather than on anybody saying so.
+        store
+            .create_route(&production, Some("demo.example.com".to_string()), "/", 1)
+            .await
+            .unwrap();
+        store
+            .create_route(&preview, Some("pr-42.example.com".to_string()), "/", 5)
+            .await
+            .unwrap();
 
         assert_eq!(store.list_routes(None, None).await.unwrap().len(), 2);
         assert_eq!(
@@ -1835,6 +2535,7 @@ mod tests {
         let v1 = version(&store, "demo", "sha-1").await;
         version(&store, "demo", "sha-2").await;
         store.deploy(&env, &v1.id, None).await.unwrap();
+        grant_everything(&store, "demo").await;
         store.create_route(&env, None, "/", 0).await.unwrap();
         store
             .put_secret(&env, "API_KEY", b"ciphertext".to_vec())

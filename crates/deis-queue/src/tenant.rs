@@ -5,8 +5,13 @@
 //! service the value is one opaque key: it is never taken apart, never
 //! interpreted, and nothing here knows or cares what its parts mean.
 //!
-//! The rules are character-for-character the ones deis-store applies, because
-//! both call [`deis_wire::conventions::split_tenant`]. The queue keeps
+//! The rules are character-for-character the ones deis-store applies to the
+//! bare tenant form: this service calls
+//! [`deis_wire::conventions::split_tenant`], and deis-store's
+//! `TenantId::parse` goes through `split_namespace`, whose bare half is that
+//! same function. (The store also accepts the namespaced `app.env@BINDING`
+//! form for its named bindings; no binding reaches this service, so the bare
+//! form is the whole of what a queue tenant can be.) The queue keeps
 //! everything in one SQLite file, so a tenant id never names a path here and
 //! traversal is not the danger it is there - but a value deis-store refuses
 //! and this service accepts would mean a tenant could own a queue it can

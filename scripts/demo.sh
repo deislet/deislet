@@ -496,6 +496,10 @@ APP_V2_ID=${APP_V2_ID:-}
 APP_V1_NUMBER=${APP_V1_NUMBER:-}
 APP_V2_NUMBER=${APP_V2_NUMBER:-}
 DEMO_SECRET_VALUE=$DEMO_SECRET_VALUE
+DEMO_APP_DEPLOY_FROM=${DEMO_APP_DEPLOY_FROM:-0}
+DEMO_APP_DEPLOY_TO=${DEMO_APP_DEPLOY_TO:-0}
+DEMO_PREVIEW_DEPLOY_FROM=${DEMO_PREVIEW_DEPLOY_FROM:-0}
+DEMO_PREVIEW_DEPLOY_TO=${DEMO_PREVIEW_DEPLOY_TO:-0}
 EOF
 }
 
@@ -1552,7 +1556,12 @@ deploy_example_app() {
   # One command: build, create the application, create the environment,
   # upload the version, point production at it, and wait for the nodes to
   # say they took it.
+  # Either side of the deploy, so that the checks reading what this deploy
+  # made the node say can read those lines and no others. See
+  # `node_log_window`.
+  DEMO_APP_DEPLOY_FROM=$(node_log_mark)
   cli_deploy "$src_v1" "$ENV_NAME" cli-deploy-v1 || return 1
+  DEMO_APP_DEPLOY_TO=$(node_log_mark)
   APP_V1_ID=$(report_field cli-deploy-v1 '.version.id')
   APP_V1_NUMBER=$(report_field cli-deploy-v1 '.version.number')
   echo "   ✓ deis deploy: version ${APP_V1_NUMBER} (${APP_V1_ID}) is serving ${ENV_NAME} on $(report_field cli-deploy-v1 '.delivery.delivered | length') node(s)"
@@ -1596,7 +1605,9 @@ deploy_example_app() {
 
   local src_v2
   src_v2=$(prepare_app_source v2) || return 1
+  DEMO_PREVIEW_DEPLOY_FROM=$(node_log_mark)
   cli_deploy "$src_v2" "$PREVIEW_ENV_NAME" cli-deploy-v2-preview || return 1
+  DEMO_PREVIEW_DEPLOY_TO=$(node_log_mark)
   APP_V2_ID=$(report_field cli-deploy-v2-preview '.version.id')
   APP_V2_NUMBER=$(report_field cli-deploy-v2-preview '.version.number')
   echo "   ✓ deis deploy -e ${PREVIEW_ENV_NAME}: version ${APP_V2_NUMBER} (${APP_V2_ID}) is serving ${PREVIEW_ENV_NAME}"
@@ -2281,12 +2292,21 @@ http_status() {
 # here, because everything else in this file came out of a Rust String and is
 # therefore valid UTF-8.
 #
-# What this cannot repair is a line an application *forged*. The same request
-# can put a newline and a complete fabricated `WARN` line into this file, and
-# once it is a line, nothing downstream can tell it from one the node wrote.
-# Closing that belongs where an application's message enters the operator's
-# log - crates/deis-runtime/src/logging - by escaping the control characters
-# out of it there.
+# The newline half of this is now closed at the producer.
+# `crates/deis-runtime/src/runtime/ops.rs::escape_control` escapes every
+# control character out of an application's message before `op_log` hands it
+# to `tracing`, so one request can no longer end the node's line and begin a
+# whole line of its own. Measured before it was: `tracing-subscriber` 0.3.23
+# escapes ESC and BEL and does not escape LF or CR, and `tracing` appends the
+# real `app_id=` and `trace_id=` fields *after* an injected newline - so the
+# forged line arrived already carrying the genuine invocation id, which is why
+# attribution alone could never have caught it.
+#
+# What is still true, and is why the checks below narrow what they read: an
+# application's line lands in this file, and one line of the node's exact
+# wording needs no control character at all. So a check that matches on
+# wording is still matching text anything reaching this node can have written
+# here. See `node_log_before_verify`, `node_log_since` and `node_log_window`.
 node_log() {
   LC_ALL=C tr -d '\000' < "${LOG_DIR}/deis-runtime.log" \
     | sed 's/\x1b\[[0-9;]*m//g'
@@ -2337,13 +2357,21 @@ log_message() {
 # script and the node.
 #
 # What this does not close, said plainly: anyone who can *read* the log file
-# can read the id out of it and then write a line carrying it, and an
-# application can still put a newline and a whole fabricated line into this
-# file at all. Closing the second belongs where an application's message
-# enters the operator's log - crates/deis-runtime/src/logging - by escaping
-# the control characters out of it there. This makes the evidence
-# unforgeable by someone who only has HTTP, which is what the demo hands to
-# the world; it does not make the log a trustworthy channel.
+# can read the id out of it and then write a line carrying it.
+#
+# One thing it did not close when it was written, and now does. An
+# application could put a newline and a whole fabricated line into this file,
+# and `tracing` appended the real `app_id=` and `trace_id=` fields after the
+# injected newline - so the forged line carried the genuine invocation id of
+# the request that forged it, and matched a `trace_id="<id>"` filter exactly.
+# The sentence above about an outsider needing to know the tag was therefore
+# not true of an outsider who could reach a handler that logs what they sent.
+# `escape_control` in crates/deis-runtime/src/runtime/ops.rs is what makes it
+# true: no message reaching this file can contain a newline any more.
+#
+# This makes the evidence unforgeable by someone who only has HTTP, which is
+# what the demo hands to the world; it does not make the log a trustworthy
+# channel.
 #
 # Answers nothing when the marker was never logged, which every caller
 # reports as a failure rather than treating as zero matching lines.
@@ -2353,6 +2381,117 @@ trace_of_witness() {
   # word matches the earlier one, and the field tracing appended is the last.
   node_log | grep -F -- "$marker" | sed -n 's/.*trace_id=//p' | tr -d '"' \
     | awk '{ print $1 }' | grep -x '[0-9a-f]\{8,\}' | tail -n 1 || true
+}
+
+# ----------------------------------------------------------------------
+# Which part of the log a check may read
+# ----------------------------------------------------------------------
+#
+# `trace_of_witness` asks the right question - "did the node write this about
+# the invocation I started" - and can only be asked of a line that carries a
+# `trace_id`. Most of the lines these checks read carry none, and cannot: a
+# ceiling applied when a version was deployed, a consumer's line as it was
+# spawned, a header dropped for an application with no compatibility date.
+# There is no invocation to file those under, because there was none.
+#
+# What is still true about them is *when* they were written. A log file is
+# appended to and nothing else, so a line that was already in it before this
+# verification phase began cannot have been put there by anything the
+# verification phase provoked - which is every request an outsider could make
+# while these checks run, and every application line echoing one back.
+# `node_log_before_verify` is that prefix, and it is the window deployment and
+# startup evidence belongs in.
+#
+# `node_log_since` is the other half, for a line the node writes *while* a
+# check runs: take a mark immediately before acting, read only what the file
+# gained after it. It does not name an invocation the way a trace id does -
+# anything else reaching the node inside that window is in the window too -
+# but it excludes every line already in the file, and a forgery planted
+# earlier in the run is exactly a line already in the file.
+#
+# Neither replaces the strongest form, which is a value this script invented a
+# moment ago and the node then wrote back: the `probe=` nonce
+# `check_app_fetch_refused` puts in the address it asks a handler to call. A
+# line naming that address is a line about this call and no other, and nothing
+# that cannot read this script's memory can compose one.
+#
+# Worth saying plainly, because the alternative is a check that reads stronger
+# than it is: none of the three makes the log a trustworthy channel. An
+# application's message still lands in this file, and while it can no longer
+# carry a newline out of it - `escape_control` in
+# crates/deis-runtime/src/runtime/ops.rs stops that at the producer - it can
+# still contain the node's exact wording on one line. What these three do is
+# make *when* and *about what* part of the assertion, so that repeating the
+# node's wording is no longer enough on its own.
+
+# Set once, at the top of the verification phase. Zero means "not taken", and
+# `node_log_before_verify` then reads the whole file rather than nothing:
+# reading too much makes a check weaker, reading nothing makes every check
+# that uses it fail with a sentence about the node saying nothing, which is
+# the wrong sentence and sends someone looking in the wrong place.
+DEMO_VERIFY_LOG_MARK=0
+
+# How many lines are in the node's log right now.
+node_log_mark() {
+  local log="${LOG_DIR}/deis-runtime.log"
+  if [ ! -f "$log" ]; then
+    echo 0
+    return 0
+  fi
+  wc -l < "$log" | tr -d ' '
+}
+
+# The node's log as it stood when verification started: deployment and startup
+# evidence, with everything this phase provoked excluded.
+node_log_before_verify() {
+  if [ "${DEMO_VERIFY_LOG_MARK:-0}" -le 0 ]; then
+    node_log
+    return 0
+  fi
+  node_log | head -n "${DEMO_VERIFY_LOG_MARK}"
+}
+
+# Only what the log gained after `$1`, which a caller takes with
+# `node_log_mark` immediately before the request it is about to judge.
+node_log_since() {
+  local mark=${1:-0}
+  node_log | tail -n "+$((mark + 1))"
+}
+
+# The lines one deployment wrote, between two marks the start phase took
+# either side of it.
+#
+# This is the strong form of `node_log_before_verify`, and it exists because
+# the weak form was not enough for the one check that has nothing else. "The
+# file as it stood before verification began" is a window minutes wide with
+# the node listening on an unauthenticated port for all of it; "the lines
+# `deis deploy` produced" is a window a few hundred milliseconds wide, and to
+# put a line in it something would have to already be running and be watching
+# for the deploy.
+#
+# Falls back to the wide window when the marks are absent, which is what a
+# state file written by an older copy of this script has. Failing instead
+# would report a clamp that was never tested rather than one tested less
+# tightly, and that is the wrong sentence: it sends someone to look at the
+# node when what changed is the shape of a file on disk.
+node_log_window() {
+  local from=${1:-0} to=${2:-0}
+  if [ "$to" -gt "$from" ]; then
+    node_log | sed -n "$((from + 1)),${to}p"
+    return 0
+  fi
+  node_log_before_verify
+}
+
+# How a check should describe the window it just read, so that the evidence
+# says which of the two it got rather than implying the tight one.
+node_log_window_named() {
+  local from=${1:-0} to=${2:-0} what=$3
+  if [ "$to" -gt "$from" ]; then
+    printf 'lines %s-%s of the node log, which is %s and nothing else' "$from" "$to" "$what"
+  else
+    printf 'the node log as it stood before verification began - this run recorded no narrower window for %s' "$what"
+  fi
 }
 
 # base64(HMAC-SHA256(STORAGE_AUTH_SECRET, tenant)) - the identical
@@ -2562,10 +2701,14 @@ check_assets_binding_is_not_shadowable() {
   # The node's own account of what it did with the key, which is the half a
   # response cannot show: an application that never declared ASSETS would
   # produce the same JSON above.
+  # Deployment evidence: the node dropped the key while it was building the
+  # env map for this version, which was before this phase made a request. Read
+  # from the prefix that existed then, so a line an application echoed back
+  # while these checks ran cannot stand in for it.
   local dropped
-  dropped=$(node_log \
-    | grep -m 1 'named like reserved platform keys' \
-    | grep 'ASSETS' || true)
+  dropped=$(node_log_window "${DEMO_APP_DEPLOY_FROM:-0}" "${DEMO_APP_DEPLOY_TO:-0}" \
+    | grep -m 1 -F 'named like reserved platform keys' \
+    | grep -F 'ASSETS' || true)
 
   if [ "$kind" = "object" ] && [ "$callable" = "true" ] && [ -z "$leaked" ] \
     && [ -n "$dropped" ]; then
@@ -2626,6 +2769,26 @@ ROUTED_HOST="${ROUTED_HOST:-deislet-edge}"
 ROUTED_PREFIX="/verify"
 ROUTED_NEAR_MISS="/verifyx"
 
+# Grant one application the right to claim a hostname, unless the registry
+# already says so.
+#
+# A hostname is global on this platform: a route claiming one is refused
+# unless a domain grant covers it, whoever the caller is (the refusal itself
+# is exercised by deis-control's own API tests, which drive the hijack
+# reproduction end to end). So this demo grants exactly the one name its
+# routing checks claim, to exactly the two applications that claim it, and
+# nothing wider. Both grants are equal-specificity peers on one name; the
+# (host, path prefix) uniqueness rule is what keeps their two routes apart.
+ensure_domain_grant() {
+  local pattern=$1 app=$2
+  local existing
+  existing=$(curl -s -H "Authorization: Bearer ${API_KEY}" "$(control_url)/api/domains"     | jq -r --arg pattern "$pattern" --arg app "$app"       '[.grants[] | select(.pattern == $pattern and .app_id == $app)] | length'     2>/dev/null || echo 0)
+  if [ "${existing:-0}" -ge 1 ]; then
+    return 0
+  fi
+  curl -s -o /dev/null -w '%{http_code}' -X POST     -H "Authorization: Bearer ${API_KEY}" -H 'content-type: application/json'     -d "{\"pattern\":\"${pattern}\",\"app_id\":\"${app}\"}"     "$(control_url)/api/domains" || true
+}
+
 # Create one route unless the catalog already has it.
 #
 # `verify` can be run twice against one demo and the catalog accepts duplicate
@@ -2662,6 +2825,16 @@ check_the_proxy_routes_by_host_and_path_prefix() {
   local title="deis-proxy picks the application by host and path prefix, not by host alone"
   local created_root created_prefix
 
+  local granted_root granted_prefix
+  granted_root=$(ensure_domain_grant "$ROUTED_HOST" "$APP_ID")
+  granted_prefix=$(ensure_domain_grant "$ROUTED_HOST" "$CALLEE_APP_ID")
+  case "${granted_root}${granted_prefix}" in
+    *4[0-9][0-9]*|*5[0-9][0-9]*)
+      fail_check "$title" \
+        "granting ${ROUTED_HOST} to the demo applications failed (${granted_root}/${granted_prefix}), so their routes cannot be claimed"
+      return
+      ;;
+  esac
   created_root=$(ensure_catalog_route "$APP_ID" "$ENV_NAME" "$ROUTED_HOST" "/")
   created_prefix=$(ensure_catalog_route "$CALLEE_APP_ID" "$ENV_NAME" "$ROUTED_HOST" "$ROUTED_PREFIX")
   case "${created_root}${created_prefix}" in
@@ -3949,7 +4122,13 @@ check_a_service_binding_is_not_a_hole_in_the_outbound_policy() {
   # loopback address. This is what the outbound policy says about that -- so
   # the successful call above is not the fetch below with a shorter name, it
   # is a different mechanism with no address in it at all.
-  local target="http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/call"
+  # A value this run invented, carried in the address so that the node writes
+  # it back in its refusal line. The egress policy judges scheme, host and
+  # port; a query string cannot change what it decides.
+  local probe="service-egress-$$-${RANDOM}"
+  local target="http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/call?probe=${probe}"
+  local mark
+  mark=$(node_log_mark)
   local body
   body=$(app_fetch service-egress "$target")
   answered_json "$title" service-egress "$body" || return 0
@@ -3973,8 +4152,13 @@ check_a_service_binding_is_not_a_hole_in_the_outbound_policy() {
   # The node said so about the address, not about a binding: the two
   # mechanisms do not share a decision point, which is why one cannot be
   # widened into the other.
+  # The nonce is what ties this line to this call. Without it the match was
+  # "some line, anywhere in the file, saying an outbound fetch to something
+  # containing 127.0.0.1 was refused" - which check_app_fetch_refused's own
+  # line satisfies, and which one echoed request can write outright.
   local logged
-  logged=$(node_log 2>/dev/null | grep -m 1 "Refused an outbound fetch" | grep "127.0.0.1" || true)
+  logged=$(node_log_since "$mark" 2>/dev/null \
+    | grep -m 1 -F "Refused an outbound fetch" | grep -F "${probe}" || true)
 
   if [ -n "$logged" ]; then
     pass_check "$title" \
@@ -4769,6 +4953,11 @@ check_queue_send_batch() {
   done
   jobs="${jobs}]"
 
+  # Taken before the request, so that the line read below is one this request
+  # could have written and nothing earlier can be.
+  local mark
+  mark=$(node_log_mark)
+
   local sent
   sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
     -H 'content-type: application/json' -d "$jobs" \
@@ -4798,8 +4987,13 @@ check_queue_send_batch() {
 
   # Written by the handler only on the `sendBatch` path; /api/enqueue logs one
   # line per message and never this one.
+  # Written by the handler on the `sendBatch` path of the request this check
+  # made a moment ago, so only the part of the log that request could have
+  # written is read. The wording alone is a fact about the file: this check
+  # runs more than once across runs against a long-lived node, and anything
+  # that can reach /api/enqueue can put the sentence there directly.
   local batch_line
-  batch_line=$(node_log | grep -m 1 "queued ${size} job(s) in one batch" || true)
+  batch_line=$(node_log_since "$mark" | grep -m 1 -F "queued ${size} job(s) in one batch" || true)
 
   if [ "$queued" = "$size" ] && [ -z "$missing" ] && [ -n "$batch_line" ]; then
     pass_check "$title" \
@@ -4828,8 +5022,12 @@ check_queue_consumer_concurrency() {
     2>/dev/null || true)
   [ -n "$declared" ] || declared=2
 
+  # Startup evidence: written once, by the consumer task as it was spawned,
+  # long before this phase began. The prefix that existed then is where it is,
+  # and is a window nothing this phase provokes can reach into.
   local line applied
-  line=$(node_log | grep -m 1 "Consuming queue jobs for app ${APP_ID}.${ENV_NAME}:" || true)
+  line=$(node_log_before_verify \
+    | grep -m 1 -F "Consuming queue jobs for app ${APP_ID}.${ENV_NAME}:" || true)
   applied=$(echo "$line" | sed -n 's/.*at most \([0-9]*\) batch(es).*/\1/p')
 
   # The line above is written once, by the consumer task as it is spawned, and
@@ -5120,21 +5318,31 @@ check_app_limits_narrowed() {
   local over=$((APP_TIMEOUT_MS * 2))
   local under=$((APP_TIMEOUT_MS / 5))
 
+  # Before the two requests, so that the cut-off line read below is one of
+  # these two requests' and not a line already sitting in the file.
+  local mark
+  mark=$(node_log_mark)
+
   local overran within
   overran=$(timed_slow_request "$ENV_NAME" "$over")
   within=$(timed_slow_request "$ENV_NAME" "$under")
 
   # The node's own account of the ceiling it installed, so the numbers below
-  # are the node's rather than this script's idea of them.
+  # are the node's rather than this script's idea of them. Written when this
+  # version was deployed, which is before this phase started, so it is read
+  # from the prefix that existed then: the wording on its own is text anything
+  # reaching this node can have an application echo into the same file.
   local applied_line node_default applied
-  applied_line=$(node_log \
-    | grep -m 1 "App ${APP_ID}.${ENV_NAME} narrows the default execution timeout" || true)
+  applied_line=$(node_log_window "${DEMO_APP_DEPLOY_FROM:-0}" "${DEMO_APP_DEPLOY_TO:-0}" \
+    | grep -m 1 -F "App ${APP_ID}.${ENV_NAME} narrows the default execution timeout" || true)
   applied=$(echo "$applied_line" | sed -n 's/.*timeout: \([0-9]*\)ms.*/\1/p')
   node_default=$(echo "$applied_line" | sed -n 's/.*platform default \([0-9]*\)ms.*/\1/p')
 
+  # The other half is about one of the two requests just made, so it is read
+  # from what the file gained since the mark above.
   local cut_off_line
-  cut_off_line=$(node_log \
-    | grep -m 1 "App ${APP_ID}.${ENV_NAME} was cut off on one request" || true)
+  cut_off_line=$(node_log_since "$mark" \
+    | grep -m 1 -F "App ${APP_ID}.${ENV_NAME} was cut off on one request" || true)
 
   local over_status over_seconds within_status
   over_status=${overran%% *}
@@ -5169,28 +5377,55 @@ check_app_limits_narrowed() {
 check_app_limits_clamped() {
   local title="an application asking for more than the node allows is held to the node's value"
 
+  # All three lines are about a deployment, and every deployment this demo
+  # makes happened before this phase began. So all three are read from the
+  # prefix the log had then, and not from the whole file.
+  #
+  # This is a security check and it had wording as its only evidence, which
+  # made it the cheapest one here to turn green falsely: the sentences below
+  # contain no value this script invented, so an application asked to log the
+  # right sentence - which one unauthenticated request is enough to arrange,
+  # because the demo handler logs a job key verbatim - satisfied both of the
+  # two that have to be present. The clamp was then reported from a line
+  # nobody had clamped anything to write.
+  #
+  # A window is not as strong as a nonce. It cannot be one here: there is no
+  # request to put a nonce in, because the evidence is about a deploy that
+  # already happened. So the window is made as small as the thing it is about
+  # - the lines `deis deploy -e preview` itself produced, bracketed by two
+  # marks the start phase took either side of that one command. Reading the
+  # whole file, or even the whole of it before verification, leaves minutes in
+  # which the node was listening on an unauthenticated port; this leaves the
+  # duration of one deploy.
+  local window
+  window=$(node_log_window_named "${DEMO_PREVIEW_DEPLOY_FROM:-0}" \
+    "${DEMO_PREVIEW_DEPLOY_TO:-0}" "the deploy of ${APP_ID}.${PREVIEW_ENV_NAME}")
+
   local asked_line clamp_line applied narrowed
-  asked_line=$(node_log \
-    | grep -m 1 "timeout_ms=Some(${GREEDY_TIMEOUT_MS})" || true)
-  clamp_line=$(node_log \
-    | grep -m 1 "App ${APP_ID}.${PREVIEW_ENV_NAME} asks for a ${GREEDY_TIMEOUT_MS}ms execution timeout" || true)
+  asked_line=$(node_log_window "${DEMO_PREVIEW_DEPLOY_FROM:-0}" "${DEMO_PREVIEW_DEPLOY_TO:-0}" \
+    | grep -m 1 -F "timeout_ms=Some(${GREEDY_TIMEOUT_MS})" || true)
+  clamp_line=$(node_log_window "${DEMO_PREVIEW_DEPLOY_FROM:-0}" "${DEMO_PREVIEW_DEPLOY_TO:-0}" \
+    | grep -m 1 -F "App ${APP_ID}.${PREVIEW_ENV_NAME} asks for a ${GREEDY_TIMEOUT_MS}ms execution timeout" || true)
   applied=$(echo "$clamp_line" | sed -n "s/.*above this node's \([0-9]*\)ms ceiling.*/\1/p")
 
   # The line that must *not* exist: "narrows" is what the node writes when it
   # takes an application's number, so the greedy version producing one would
-  # mean the clamp had let it through.
-  narrowed=$(node_log \
-    | grep -m 1 "App ${APP_ID}.${PREVIEW_ENV_NAME} narrows the default execution timeout: ${GREEDY_TIMEOUT_MS}ms" || true)
+  # mean the clamp had let it through. Read from the same window as the other
+  # two, and for a second reason: an absence is only meaningful over the range
+  # the presences were read from. Over the whole file, one line from a later
+  # deploy - or one an application echoed - would report the clamp broken.
+  narrowed=$(node_log_window "${DEMO_PREVIEW_DEPLOY_FROM:-0}" "${DEMO_PREVIEW_DEPLOY_TO:-0}" \
+    | grep -m 1 -F "App ${APP_ID}.${PREVIEW_ENV_NAME} narrows the default execution timeout: ${GREEDY_TIMEOUT_MS}ms" || true)
 
   if [ -n "$asked_line" ] && [ -n "$applied" ] \
     && [ "$applied" != "$GREEDY_TIMEOUT_MS" ] && [ -z "$narrowed" ]; then
     pass_check "$title" \
-      "the ${PREVIEW_ENV_NAME} version's manifest reached the node asking for timeout_ms=${GREEDY_TIMEOUT_MS}, and the node answered \"$(echo "$clamp_line" | log_message | sed 's/\. An invocation.*//')\". ${applied}ms is the number in force; no line says this environment narrowed anything, because it did not"
+      "the ${PREVIEW_ENV_NAME} version's manifest reached the node asking for timeout_ms=${GREEDY_TIMEOUT_MS}, and the node answered \"$(echo "$clamp_line" | log_message | sed 's/\. An invocation.*//')\". ${applied}ms is the number in force; no line says this environment narrowed anything, because it did not. All three readings are of ${window}"
     return
   fi
 
   fail_check "$title" \
-    "expected the node to log that ${APP_ID}.${PREVIEW_ENV_NAME} asked for ${GREEDY_TIMEOUT_MS}ms and was held to its own ceiling; the deployment line was $(if [ -n "$asked_line" ]; then echo "present"; else echo "absent"; fi), the clamp reports applying '${applied:-<none>}ms', and a \"narrows\" line for ${GREEDY_TIMEOUT_MS}ms was $(if [ -n "$narrowed" ]; then echo "written, so the request was granted"; else echo "absent"; fi)"
+    "expected the node to log that ${APP_ID}.${PREVIEW_ENV_NAME} asked for ${GREEDY_TIMEOUT_MS}ms and was held to its own ceiling, in ${window}; the deployment line was $(if [ -n "$asked_line" ]; then echo "present"; else echo "absent"; fi), the clamp reports applying '${applied:-<none>}ms', and a \"narrows\" line for ${GREEDY_TIMEOUT_MS}ms was $(if [ -n "$narrowed" ]; then echo "written, so the request was granted"; else echo "absent"; fi)"
 }
 
 # The ceiling on fan-out, which none of the other limits reaches.
@@ -5222,6 +5457,11 @@ check_subrequest_ceiling() {
   local under=$((declared - 2))
   local over=$((declared + 3))
 
+  # Before the fan-out, so the refusal line below is one this check's own
+  # second request provoked.
+  local mark
+  mark=$(node_log_mark)
+
   local within beyond within_done beyond_done refusal
   within=$(app_request "$headers" "/api/fanout?n=${under}&url=${target}")
   if [ "$(http_status "$headers")" != "200" ]; then
@@ -5237,12 +5477,14 @@ check_subrequest_ceiling() {
 
   # The node's own two lines: the one that says which number it applied, and
   # the one that says it refused a call. The numbers quoted below are the
-  # node's rather than this script's idea of them.
+  # node's rather than this script's idea of them - and each is read from the
+  # window it can have been written in. The narrowing is a deployment fact and
+  # predates this phase; the refusal is about the fan-out two lines up.
   local narrowed_line refused_line
-  narrowed_line=$(node_log \
-    | grep -m 1 "App ${APP_ID}.${ENV_NAME} narrows the default subrequest ceiling" || true)
-  refused_line=$(node_log \
-    | grep -m 1 "this invocation has already made ${declared} outbound call(s)" || true)
+  narrowed_line=$(node_log_window "${DEMO_APP_DEPLOY_FROM:-0}" "${DEMO_APP_DEPLOY_TO:-0}" \
+    | grep -m 1 -F "App ${APP_ID}.${ENV_NAME} narrows the default subrequest ceiling" || true)
+  refused_line=$(node_log_since "$mark" \
+    | grep -m 1 -F "this invocation has already made ${declared} outbound call(s)" || true)
 
   if [ "$within_done" = "$under" ] && [ "$beyond_done" = "$declared" ] \
     && [ -n "$narrowed_line" ] && [ -n "$refused_line" ] \
@@ -5384,14 +5626,20 @@ check_every_set_cookie_reaches_a_dated_application() {
 # second, from the same handler source.
 check_an_undated_application_keeps_the_old_answer() {
   local title="an application with no compatibility date still gets the answer it was written against"
+  # Before the request, because the drop this reads is that request's.
+  local mark
+  mark=$(node_log_mark)
+
   local count
   count=$(set_cookie_count "$PREVIEW_ENV_NAME")
 
   # The node's own account of what it dropped and why, so this quotes the
-  # node rather than this script's idea of it.
+  # node rather than this script's idea of it - and out of the lines the
+  # request just made added, so the sentence cannot be one left behind by an
+  # earlier run against the same node or written into the file from outside.
   local dropped
-  dropped=$(node_log \
-    | grep -m 1 "App ${APP_ID}.${PREVIEW_ENV_NAME} set 2 Set-Cookie headers" || true)
+  dropped=$(node_log_since "$mark" \
+    | grep -m 1 -F "App ${APP_ID}.${PREVIEW_ENV_NAME} set 2 Set-Cookie headers" || true)
 
   if [ "$count" = "1" ] && [ -n "$dropped" ]; then
     pass_check "$title" \
@@ -5726,7 +5974,22 @@ check_app_fetch_allowed() {
 # this script's opinion rather than something anybody had observed.
 check_app_fetch_refused() {
   local title="a handler's fetch to deis-store is refused"
-  local target="http://127.0.0.1:${DEIS_STORE_PORT}/"
+  # The address carries a value this run invented, which is the whole of what
+  # makes the node's line about it evidence rather than wording. The egress
+  # policy judges scheme, host and port, so a query string cannot change the
+  # verdict; `fetch_policy::loggable` strips credentials and keeps everything
+  # else, so the node writes the nonce back out in the line below.
+  #
+  # Without it this check read `grep "Refused an outbound fetch from demo.production to
+  # http://127.0.0.1:8087/:"`, which is a *wording* match on a file anything
+  # that can reach this node's unauthenticated routes can append to. One
+  # `POST /api/enqueue` whose job key is that sentence put a line in the file
+  # that satisfied it, and the check reported an egress policy it had not
+  # seen. A nonce cannot be echoed by someone who has not read it.
+  local probe="fetch-refused-$$-${RANDOM}"
+  local target="http://127.0.0.1:${DEIS_STORE_PORT}/?probe=${probe}"
+  local mark
+  mark=$(node_log_mark)
   local body
   body=$(app_fetch fetch-refused "$target")
   answered_json "$title" fetch-refused "$body" || return 0
@@ -5754,9 +6017,13 @@ check_app_fetch_refused() {
   # The node's own account of the decision, naming this destination and the
   # rule that stopped it. A DNS failure or a dead port produces a line here
   # too, and it says something else - which is the whole reason to read it.
+  # Two narrowings, not one. `-F` because the address is matched as the text
+  # it is rather than as a pattern whose dots match anything, and the window
+  # because a line that was already in the file when this check took its mark
+  # is not a line about the call this check just made.
   local refused_line
-  refused_line=$(node_log 2>/dev/null \
-    | grep -m 1 "Refused an outbound fetch from ${APP_ID}.${ENV_NAME} to ${target}:" || true)
+  refused_line=$(node_log_since "$mark" 2>/dev/null \
+    | grep -m 1 -F "Refused an outbound fetch from ${APP_ID}.${ENV_NAME} to ${target}:" || true)
   case "$refused_line" in
     *"the platform's own service endpoints"*) ;;
     *)
@@ -5767,7 +6034,7 @@ check_app_fetch_refused() {
   esac
 
   pass_check "$title" \
-    "the handler asked for ${target} and the platform did not make the call: ${error}. The node says why, at warn: \"$(printf '%s' "$refused_line" | log_message | head -c 200)\" - so what stopped it is the policy, not the network it sits on with the origin this same handler reaches freely"
+    "the handler asked for ${target} and the platform did not make the call: ${error}. The node says why, at warn, in a line naming the probe=${probe} this run invented for this one call and written after this check began: \"$(printf '%s' "$refused_line" | log_message | head -c 200)\" - so what stopped it is the policy, not the network it sits on with the origin this same handler reaches freely"
 }
 
 # The security half of what a redirect chain costs.
@@ -5820,6 +6087,17 @@ check_a_redirect_hop_to_a_refused_host_is_stopped() {
   # the file says now.
   local allow_list
   allow_list=$(sed -n 's/^allow = //p' "${DEIS_RUNTIME_CONFIG}" | head -n 1)
+
+  # Before the refused hop, so the node's line about it is read out of what
+  # this pair of calls added rather than out of the whole file. There is no
+  # nonce to use here: the address is the control plane's own, and it is
+  # named that way on purpose so that this check and check_app_fetch_refused
+  # leave one line each. Putting a query on it would work the same way it does
+  # there, but the address travels through the origin's /redirect-to as an
+  # encoded parameter and comes back as a Location header, and this check
+  # cannot verify what that round trip does to it.
+  local mark
+  mark=$(node_log_mark)
 
   local refused_body allowed_body
   refused_body=$(app_fetch redirect-hop-refused "${origin}${refused_encoded}")
@@ -5875,8 +6153,8 @@ check_a_redirect_hop_to_a_refused_host_is_stopped() {
   # And the node's own line about it, which is where an operator watching for
   # applications probing the platform sees this happen.
   local logged
-  logged=$(node_log 2>/dev/null \
-    | grep -m 1 "Refused an outbound fetch from ${APP_ID}.${ENV_NAME} to ${refused_hop}:" || true)
+  logged=$(node_log_since "$mark" 2>/dev/null \
+    | grep -m 1 -F "Refused an outbound fetch from ${APP_ID}.${ENV_NAME} to ${refused_hop}:" || true)
   if [ -z "$logged" ]; then
     fail_check "$title" \
       "the hop was refused to the handler, but the node wrote no line naming ${refused_hop} as a destination it refused, so nothing an operator reads records that an application was redirected onto the platform's own API"
@@ -7766,8 +8044,14 @@ check_memory_cutoff() {
     return
   fi
 
+  # A deployment fact, read from the prefix that existed before this phase
+  # began. Unlike every other log read in these checks this one decides
+  # nothing - the number lands in the pass sentence and in no condition - so
+  # a forged line here misreports a ceiling rather than turning a check green.
+  # It is narrowed anyway: a number an operator reads as the node's should be
+  # the node's.
   local ceiling after
-  ceiling=$(node_log \
+  ceiling=$(node_log_window "${DEMO_APP_DEPLOY_FROM:-0}" "${DEMO_APP_DEPLOY_TO:-0}" \
     | sed -n "s/.*App ${APP_ID}.${ENV_NAME} narrows the default heap ceiling: \([0-9]*\)MB.*/\1/p" \
     | head -n 1)
 
@@ -7903,6 +8187,12 @@ verify_demo() {
   set -E
   trap 'on_verify_error "$LINENO" "$BASH_COMMAND" "$?"' ERR
   trap on_verify_exit EXIT
+
+  # Everything already in the node's log is deployment and startup evidence:
+  # it was written before this phase made a single request, so no line an
+  # outsider provokes from here on can be inside it. See
+  # `node_log_before_verify`, which is what reads it.
+  DEMO_VERIFY_LOG_MARK=$(node_log_mark)
 
   echo "🔎 Verifying the demo end to end"
   echo

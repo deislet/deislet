@@ -368,6 +368,51 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Who may claim which hostname. A hostname is the one namespace on this
+    // platform that is global - `deploy:<app>/<env>` cannot spell one - so
+    // the registry that says who owns what is a table rather than a scope.
+    // See `catalog::domains` for the rule this feeds.
+    //
+    // The key is the pattern *and* its grantee: two applications share a zone
+    // legitimately, and an installation upgrading into this rule has existing
+    // routes on shared hosts that have to keep working.
+    //
+    // Whether the table was there already is the one fact the adoption below
+    // needs, and it has to be read before the table is created. Adoption is a
+    // migration and must run exactly once: an operator who withdraws a grant
+    // and leaves the route serving (which is deliberate - see
+    // `CatalogStore::delete_domain_grant`) must not find it granted again at
+    // the next restart, and a row written behind the store's back must not
+    // become its own permission.
+    let registry_is_new = !table_exists(conn, "domain_grants")?;
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS domain_grants (
+            pattern     TEXT NOT NULL,
+            app_id      TEXT NOT NULL,
+            environment TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            note        TEXT,
+            PRIMARY KEY (pattern, app_id, environment)
+        )
+        "#,
+        [],
+    )?;
+
+    // Deliberately no foreign key to `apps`. A grant is a statement about a
+    // name, and an operator setting a platform up writes it before the
+    // application exists; whether the application is real is settled when a
+    // route is created, which is the only thing that reads this.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_domain_grants_app ON domain_grants(app_id)",
+        [],
+    )?;
+
+    if registry_is_new {
+        adopt_existing_route_claims(conn)?;
+    }
+    enforce_one_holder_per_claim(conn)?;
+
     // Secrets are per environment and always stored as AES-256-GCM
     // ciphertext with the nonce prefixed. The master key lives in the file
     // named by `secret_key_file` and never touches this database.
@@ -495,6 +540,243 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let found: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(found > 0)
+}
+
+/// Write down, once, what this installation is already serving.
+///
+/// `catalog::domains` fails closed: a hostname nobody has been granted may be
+/// claimed by nobody. Applied to a platform that has been routing traffic for
+/// a year with no registry at all, that rule would refuse the next edit of
+/// every route it already holds. So on the first start after the upgrade,
+/// every host a route already claims becomes a grant to the application that
+/// claims it - the platform keeps serving exactly what it served, and only a
+/// *new* name is a decision somebody has to make.
+///
+/// This is not a blessing of what is there. It is a record of it, which is
+/// the point: after this runs, `GET /api/domains` is the list of who holds
+/// what, and an operator looking at a platform they inherited can read it. A
+/// row that should not be there is one `DELETE /api/domains` away, and the
+/// route it justified can then no longer be re-created.
+fn adopt_existing_route_claims(conn: &Connection) -> Result<()> {
+    // A host two applications hold at the same path prefix is the one case
+    // this must not decide. Without uniqueness there was nothing to stop a
+    // second tenant claiming an address the first was already serving, and
+    // that is exactly what the hostname hijack looks like in the table
+    // afterwards. Adopting both would write the seizure down as ownership;
+    // adopting one would pick a winner by row order. So neither is adopted,
+    // the collision is named at `error` by `enforce_one_holder_per_claim`
+    // just below, and until an operator deletes one of the rows the name can
+    // be claimed by nobody - which is the same fail-closed answer the rest of
+    // this registry gives.
+    let contested: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT lower(ifnull(host, '')) FROM routes
+                 GROUP BY lower(ifnull(host, '')), rtrim(path_prefix, '/')
+                 HAVING count(*) > 1",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<_>>()?
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT r.host, r.app_id, e.name
+             FROM routes r JOIN environments e ON e.id = r.env_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    // The catalog's own clock, so every timestamp in these tables is read
+    // from one place.
+    let now = crate::catalog::model::now_secs();
+
+    let mut adopted = 0usize;
+    let mut unreadable = Vec::new();
+    let mut withheld = Vec::new();
+    for row in rows {
+        let (host, app_id, environment) = row?;
+        if contested.contains(&host.as_deref().unwrap_or("").to_ascii_lowercase()) {
+            withheld.push(format!(
+                "{}/{} claims {}",
+                app_id,
+                environment,
+                host.as_deref().unwrap_or("(every host)")
+            ));
+            continue;
+        }
+        let Some(pattern) = existing_claim_pattern(host.as_deref()) else {
+            unreadable.push(format!(
+                "{}/{} claims {:?}",
+                app_id,
+                environment,
+                host.unwrap_or_default()
+            ));
+            continue;
+        };
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO domain_grants (pattern, app_id, environment, created_at, note)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                pattern,
+                app_id,
+                environment,
+                now,
+                "adopted from a route that already existed when this control plane learned to \
+                 record who owns a hostname"
+            ],
+        )?;
+        adopted += changed;
+    }
+
+    if adopted > 0 {
+        info!(
+            adopted,
+            "Recorded {adopted} hostname grant(s) from routes this platform was already serving, \
+             so every existing route keeps working and every name it holds is now written down \
+             under GET /api/domains. A new name is from here on a grant somebody has to make \
+             first; a grant recorded here that should not exist can be withdrawn with DELETE \
+             /api/domains"
+        );
+    }
+    if !withheld.is_empty() {
+        tracing::error!(
+            routes = withheld.len(),
+            claims = %withheld.join("; "),
+            "More than one application already routes these host names, so this control plane \
+             cannot say who owns them and has recorded no grant for any of them. That state is \
+             what a seized hostname looks like after the fact: whichever route wins is decided by \
+             priority and a tie-break, not by anybody's intent. The routes are untouched and \
+             still serving - deciding which of them should not be is an operator's call, not a \
+             migration's - but none of these names can be claimed again until one route is \
+             deleted and this control plane restarted"
+        );
+    }
+    if !unreadable.is_empty() {
+        tracing::error!(
+            routes = unreadable.len(),
+            claims = %unreadable.join("; "),
+            "These existing routes claim a host this control plane can no longer spell - a port, \
+             capital letters or a trailing dot, all of which the edge strips or lower-cases \
+             before it matches, so the row was never the name traffic arrives on. No grant was \
+             recorded for them: they keep routing exactly as they did, and they cannot be edited \
+             until they are re-created with the host written the way the edge reads it"
+        );
+    }
+    Ok(())
+}
+
+/// The grant pattern for a host a route already holds.
+///
+/// This is the *only* place a non-canonical host is read, and it exists
+/// because rows written before the single-spelling rule are still in the
+/// table. It reads them the way the edge does - lower case, no port - so the
+/// grant recorded covers the name traffic actually arrives on rather than the
+/// string somebody typed. Every new write goes through
+/// `catalog::domains::HostClaim::parse`, which refuses those spellings
+/// outright instead of rewriting them.
+fn existing_claim_pattern(host: Option<&str>) -> Option<String> {
+    let Some(host) = host else {
+        // A route with no host answers only for names no more specific route
+        // claims, so what its holder is adopted into is permission to hold
+        // *that* -- not the `*` grant, which would let them claim any
+        // hostname on the platform. Adoption records what a tenant had, and
+        // what a catch-all's holder had was the fallback, not the namespace:
+        // mapping it to `*` re-opened the hijack this registry exists to
+        // stop, on exactly the installations the migration serves.
+        return Some(crate::catalog::domains::NO_HOST_PATTERN.to_string());
+    };
+    let host = host.trim().trim_end_matches('.');
+    let without_port = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if host.matches(':').count() == 1 {
+        host.split(':').next().unwrap_or(host)
+    } else {
+        host
+    };
+    let lowered = without_port.to_ascii_lowercase();
+    crate::catalog::domains::GrantPattern::parse(&lowered)
+        .ok()
+        .map(|pattern| pattern.as_text())
+}
+
+/// One holder per `(host, path_prefix)`, in the database and not only in the
+/// code that writes it.
+///
+/// The store checks this too, inside the same connection call that inserts
+/// the row, and that check is the one a caller gets a readable answer from.
+/// The index is here because a check is a statement about the code that runs
+/// and an index is a statement about the table: the day somebody adds a
+/// second writer, or a repair script, the table still cannot hold two tenants
+/// on one address.
+///
+/// The key is the claim as the *edge* reads it - host lower-cased, path
+/// prefix without its trailing slash - because that is the pair that decides
+/// which application a request reaches. Two rows differing only in case were
+/// two rows here and one claim out there.
+///
+/// A platform that already holds duplicates cannot have this index, and
+/// refusing to start over it would be worse than the duplicates: the control
+/// plane is what an operator needs in order to delete one of them. So the
+/// collisions are named at `error`, the index is left uncreated, and the
+/// store's own check still keeps new ones from appearing.
+fn enforce_one_holder_per_claim(conn: &Connection) -> Result<()> {
+    const CLAIM_KEY: &str = "lower(ifnull(host, '')), rtrim(path_prefix, '/')";
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT lower(ifnull(host, '')), rtrim(path_prefix, '/'), count(*),
+                group_concat(app_id, ', ')
+             FROM routes GROUP BY {CLAIM_KEY} HAVING count(*) > 1"
+    ))?;
+    let duplicates: Vec<String> = stmt
+        .query_map([], |row| {
+            let host: String = row.get(0)?;
+            let prefix: String = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            let apps: String = row.get(3)?;
+            Ok(format!(
+                "{}{} is claimed {count} times, by {apps}",
+                if host.is_empty() {
+                    "(every host)"
+                } else {
+                    &host
+                },
+                if prefix.is_empty() { "/" } else { &prefix }
+            ))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+
+    if !duplicates.is_empty() {
+        tracing::error!(
+            collisions = duplicates.len(),
+            detail = %duplicates.join("; "),
+            "This routing table already holds more than one route for the same host and path \
+             prefix, so which application answers there is decided by priority and then by a \
+             tie-break - not by anybody's intent. The uniqueness index was therefore not created \
+             and these rows are untouched; new duplicates are still refused. Delete the route \
+             that should not be there (DELETE /api/apps/<app>/environments/<env>/routes/<id>) and \
+             restart to get the index"
+        );
+        return Ok(());
+    }
+
+    conn.execute(
+        &format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_routes_claim ON routes({CLAIM_KEY})"),
+        [],
+    )?;
+    Ok(())
+}
+
 /// Take `power_reserve` off a database created before it was removed.
 ///
 /// The column never held a measurement. The wire's `Heartbeat` message
@@ -552,6 +834,221 @@ fn drop_power_reserve(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
+
+    /// A platform that has been routing traffic without a registry, meeting
+    /// the rule that says a hostname nobody granted may be claimed by nobody.
+    ///
+    /// Without this step the upgrade refuses the next edit of every route the
+    /// installation already holds - which is not "fail closed", it is
+    /// "fail on the operator". What the installation already serves becomes a
+    /// grant; only a *new* name is a decision somebody has to make.
+    fn platform_with_routes_and_no_registry() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        // Back to what the database looked like before this control plane
+        // recorded who owns a hostname: no registry, and no uniqueness on the
+        // address a route claims.
+        conn.execute("DROP TABLE domain_grants", []).unwrap();
+        conn.execute("DROP INDEX IF EXISTS idx_routes_claim", [])
+            .unwrap();
+
+        conn.execute("INSERT INTO apps (id, created_at) VALUES ('shop', 1)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO environments (id, app_id, name, created_at)
+                 VALUES ('e1', 'shop', 'production', 1)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn add_route(conn: &Connection, id: &str, host: Option<&str>, prefix: &str) {
+        conn.execute(
+            "INSERT INTO routes (id, app_id, env_id, host, path_prefix, priority)
+                 VALUES (?1, 'shop', 'e1', ?2, ?3, 0)",
+            rusqlite::params![id, host, prefix],
+        )
+        .unwrap();
+    }
+
+    fn grants(conn: &Connection) -> Vec<(String, String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT pattern, app_id, environment FROM domain_grants ORDER BY pattern")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn what_a_platform_already_serves_becomes_a_grant_on_the_first_start() {
+        let conn = platform_with_routes_and_no_registry();
+        add_route(&conn, "r1", Some("shop.example.com"), "/");
+        add_route(&conn, "r2", Some("*.shop.example.com"), "/");
+        // A route with no host answers only for names no more specific
+        // route claims. Its adoption must record that, not the `*` grant:
+        // `*` would let this tenant claim any hostname on the platform,
+        // which is not what holding a fallback ever meant.
+        add_route(&conn, "r3", None, "/fallback");
+        // Written before the single-spelling rule, and matched by the edge as
+        // `legacy.example.com`. The grant has to cover the name traffic
+        // actually arrives on, not the string somebody typed.
+        add_route(&conn, "r4", Some("LEGACY.example.com:8443"), "/legacy");
+
+        create_tables(&conn).unwrap();
+
+        assert_eq!(
+            grants(&conn),
+            vec![
+                (
+                    "(no-host)".to_string(),
+                    "shop".to_string(),
+                    "production".to_string()
+                ),
+                (
+                    "*.shop.example.com".to_string(),
+                    "shop".to_string(),
+                    "production".to_string()
+                ),
+                (
+                    "legacy.example.com".to_string(),
+                    "shop".to_string(),
+                    "production".to_string()
+                ),
+                (
+                    "shop.example.com".to_string(),
+                    "shop".to_string(),
+                    "production".to_string()
+                ),
+            ]
+        );
+
+        // And it is a migration, not a rule that keeps running: a route added
+        // afterwards does not quietly grant itself.
+        add_route(&conn, "r5", Some("new.example.com"), "/");
+        create_tables(&conn).unwrap();
+        assert!(
+            !grants(&conn)
+                .iter()
+                .any(|(pattern, _, _)| pattern == "new.example.com"),
+            "adoption runs against what a route write cannot reach; a row inserted behind the \
+             store's back must not become its own permission on the next restart"
+        );
+    }
+
+    /// A name two applications already hold is the one thing adoption must
+    /// not decide. It is what a seized hostname looks like in the table
+    /// afterwards, and writing a grant for either party would record the
+    /// seizure as ownership.
+    #[test]
+    fn a_name_two_applications_already_hold_is_granted_to_neither() {
+        let conn = platform_with_routes_and_no_registry();
+        conn.execute(
+            "INSERT INTO apps (id, created_at) VALUES ('attacker', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO environments (id, app_id, name, created_at)
+                 VALUES ('e2', 'attacker', 'production', 1)",
+            [],
+        )
+        .unwrap();
+        add_route(&conn, "r1", Some("victim.example.com"), "/");
+        conn.execute(
+            "INSERT INTO routes (id, app_id, env_id, host, path_prefix, priority)
+                 VALUES ('r2', 'attacker', 'e2', 'victim.example.com', '/', 9223372036854775807)",
+            [],
+        )
+        .unwrap();
+        // A name only one of them holds is adopted as usual.
+        add_route(&conn, "r3", Some("uncontested.example.com"), "/");
+
+        create_tables(&conn).unwrap();
+
+        assert_eq!(
+            grants(&conn),
+            vec![(
+                "uncontested.example.com".to_string(),
+                "shop".to_string(),
+                "production".to_string()
+            )],
+            "the contested name belongs to neither of them until an operator says so"
+        );
+    }
+
+    /// One address, one application - in the table, not only in the code that
+    /// writes to it.
+    #[test]
+    fn the_table_itself_refuses_a_second_holder_of_one_address() {
+        let conn = platform_with_routes_and_no_registry();
+        add_route(&conn, "r1", Some("shop.example.com"), "/api");
+        create_tables(&conn).unwrap();
+
+        for (id, host, prefix) in [
+            ("r2", Some("shop.example.com"), "/api"),
+            // The same address written the way the edge reads it: it
+            // lower-cases the host and trims the prefix's trailing slash.
+            ("r3", Some("SHOP.example.com"), "/api"),
+            ("r4", Some("shop.example.com"), "/api/"),
+        ] {
+            let clash = conn.execute(
+                "INSERT INTO routes (id, app_id, env_id, host, path_prefix, priority)
+                     VALUES (?1, 'other', 'e1', ?2, ?3, 0)",
+                rusqlite::params![id, host, prefix],
+            );
+            assert!(
+                clash.is_err(),
+                "{id} claims an address that is already held and the index let it in"
+            );
+        }
+    }
+
+    /// An installation that already holds duplicates cannot have the index,
+    /// and refusing to start over it would be worse than the duplicates: this
+    /// control plane is what an operator needs in order to delete one of them.
+    #[test]
+    fn a_table_that_already_holds_duplicates_still_starts() {
+        let conn = platform_with_routes_and_no_registry();
+        add_route(&conn, "r1", Some("shop.example.com"), "/");
+        add_route(&conn, "r2", Some("shop.example.com"), "/");
+
+        create_tables(&conn).expect("duplicates must not stop a control plane from starting");
+
+        let index: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_routes_claim'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            index.is_none(),
+            "the index cannot exist over duplicate rows; the collision is named in the log instead"
+        );
+
+        // And once the operator has deleted one of them, the next start gets
+        // the index.
+        conn.execute("DELETE FROM routes WHERE id = 'r2'", [])
+            .unwrap();
+        create_tables(&conn).unwrap();
+        let index: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_routes_claim'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            index.is_some(),
+            "with the duplicate gone the index is created"
+        );
+    }
 
     /// The catalog tables must appear next to the node-management tables,
     /// and re-running the migration must stay a no-op.
@@ -586,6 +1083,7 @@ mod tests {
             "accounts",
             "api_tokens",
             "audit_log",
+            "domain_grants",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),

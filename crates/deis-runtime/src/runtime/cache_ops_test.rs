@@ -753,8 +753,13 @@ mod tests {
                 .body,
         )
         .expect("the message is text");
+        // The reason alone. Naming the call and saying that nothing was
+        // stored is `js/runtime.js`'s half of the sentence, and it does it for
+        // every refusal rather than for this one -- see `notStored` there, and
+        // `a_refusal_this_platform_judges_does_not_kill_the_invocation` below
+        // for what an application receives.
         assert!(
-            outcome.starts_with("cache.put: this entry is 3072")
+            outcome.starts_with("this entry is 3072")
                 && outcome.contains("262144")
                 && outcome.contains("1048576"),
             "the refusal has to name what was sent, what one entry may hold and what the whole \
@@ -917,10 +922,11 @@ mod what_the_cache_refuses_to_store {
             export default async function handler(context) {
                 let refused = null;
                 try {
-                    await caches.default.put(
+                    const kept = await caches.default.put(
                         "https://example.invalid/account",
                         new Response("page", { headers: { vary: "authorization" } })
                     );
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -975,7 +981,8 @@ mod what_the_cache_refuses_to_store {
                 });
                 let refused = null;
                 try {
-                    await caches.default.put(new Request(KEY), fresh.clone());
+                    const kept = await caches.default.put(new Request(KEY), fresh.clone());
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1037,10 +1044,11 @@ mod what_the_cache_refuses_to_store {
             export default async function handler(context) {
                 let refused = null;
                 try {
-                    await caches.default.put(
+                    const kept = await caches.default.put(
                         context.request,
                         new Response("page", { headers: { vary: "*" } })
                     );
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1098,9 +1106,10 @@ mod what_the_cache_refuses_to_store {
                 const key = "https://example.invalid/" + which;
                 let refused = null;
                 try {
-                    await caches.default.put(key, new Response("secret", {
+                    const kept = await caches.default.put(key, new Response("secret", {
                         headers: { "cache-control": directive },
                     }));
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1147,10 +1156,11 @@ mod what_the_cache_refuses_to_store {
             if (request.method !== "GET") {
                 let refused = null;
                 try {
-                    await caches.default.put(
+                    const kept = await caches.default.put(
                         request,
                         new Response("answer-to:" + request.method),
                     );
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1260,7 +1270,8 @@ mod what_the_cache_refuses_to_store {
                 });
                 let refused = null;
                 try {
-                    await caches.default.put(key(), fresh.clone());
+                    const kept = await caches.default.put(key(), fresh.clone());
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1326,11 +1337,12 @@ mod what_the_cache_refuses_to_store {
                 const forCaller = url.searchParams.get("forCaller");
                 let refused = null;
                 try {
-                    await caches.default.put(
+                    const kept = await caches.default.put(
                         request,
                         new Response("page-for:" + who, { headers }),
                         forCaller ? { forCaller } : undefined,
                     );
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1432,10 +1444,11 @@ mod what_the_cache_refuses_to_store {
                 const body = status === 304 ? null : "01234";
                 let refused = null;
                 try {
-                    await caches.default.put(
+                    const kept = await caches.default.put(
                         context.request,
                         new Response(body, { status, headers }),
                     );
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1529,10 +1542,11 @@ mod what_the_cache_refuses_to_store {
             const headers = directive ? { "cache-control": directive } : {};
             let refused = null;
             try {
-                await caches.default.put(
+                const kept = await caches.default.put(
                     request,
                     new Response("dashboard-for:" + who, { headers }),
                 );
+                if (!kept.stored) refused = kept.reason;
             } catch (e) {
                 refused = e.message;
             }
@@ -1640,7 +1654,8 @@ mod what_the_cache_refuses_to_store {
                 if (directive) headers["cache-control"] = directive;
                 let refused = null;
                 try {
-                    await caches.default.put(request, new Response("page", { headers }));
+                    const kept = await caches.default.put(request, new Response("page", { headers }));
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1723,7 +1738,8 @@ mod what_the_cache_refuses_to_store {
                 }
                 let refused = null;
                 try {
-                    await caches.default.put(request, new Response("page", { headers }));
+                    const kept = await caches.default.put(request, new Response("page", { headers }));
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1944,11 +1960,12 @@ mod what_the_cache_refuses_to_store {
                 if (hit) return new Response(JSON.stringify({ served: await hit.text() }));
                 let refused = null;
                 try {
-                    await caches.default.put(
+                    const kept = await caches.default.put(
                         KEY,
                         new Response("dashboard-for:" + (caller ?? "nobody")),
                         options,
                     );
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -2004,11 +2021,12 @@ mod what_the_cache_refuses_to_store {
                 if (hit) return new Response(JSON.stringify({ served: await hit.text() }));
                 let refused = null;
                 try {
-                    await caches.default.put(
+                    const kept = await caches.default.put(
                         KEY,
                         new Response("shared-config"),
                         { forAnyCaller: true },
                     );
+                    if (!kept.stored) refused = kept.reason;
                 } catch (e) {
                     refused = e.message;
                 }
@@ -2027,5 +2045,762 @@ mod what_the_cache_refuses_to_store {
             second["served"], "shared-config",
             "the entry the application stated was everyone's was not served: {second}"
         );
+    }
+}
+
+/// What a `Cache.put` is judged against: the request the code making it is
+/// answering, and nothing that some other stretch of code was answering.
+///
+/// The rule that reads that request was added a round before this module, and
+/// it read one module-level variable in `js/runtime.js` that was set when a
+/// request built its context and cleared at the top of three entry points.
+/// Nothing cleared it when an invocation ended, and four runners that execute
+/// application code never set it: a WebSocket message handler, a
+/// response-stream producer, a timer, a `waitUntil` left over from an
+/// invocation that was cut off. Each of them read whichever request the isolate
+/// had served most recently -- so the same `put` was refused when nothing had
+/// run in between and *stored* after one unrelated anonymous `GET`, and what it
+/// stored was then handed to every later anonymous caller.
+///
+/// Every test here is a witness for one runner. What they have in common is the
+/// shape of the check: run the same application code twice with something
+/// different in between, and require the same answer both times.
+#[cfg(test)]
+mod what_the_cache_is_answering {
+    use crate::runtime::isolate::{AppRuntime, IsolateSpec};
+    use crate::runtime::queue_client::LeasedMessage;
+    use crate::runtime::{ServiceRouter, ServiceWiring};
+
+    async fn runtime(app: &str, code: &str) -> AppRuntime {
+        let mut runtime = AppRuntime::new(
+            app.to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec::default(),
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .expect("the app builds");
+        runtime.init_module().await.expect("the module loads");
+        runtime
+    }
+
+    /// One request, and the status it answered with.
+    ///
+    /// The status is returned rather than asserted, because one of the tests
+    /// here is about a handler that used to answer 500 and now answers its own
+    /// response.
+    async fn ask_at(
+        runtime: &mut AppRuntime,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+    ) -> (u16, String) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        runtime
+            .execute_fetch(
+                format!("http://localhost{path}"),
+                method.to_string(),
+                headers,
+                body,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (status, _headers, body) = rx.await.expect("an answer").expect("an answer");
+        let body = String::from_utf8(body.into_bytes().unwrap_or_default()).expect("text");
+        (status, body)
+    }
+
+    async fn ask(runtime: &mut AppRuntime, path: &str, headers: &[(&str, &str)]) -> String {
+        let (status, body) = ask_at(runtime, "GET", path, headers, None).await;
+        assert_eq!(status, 200, "the handler failed: {body}");
+        body
+    }
+
+    async fn ask_json(
+        runtime: &mut AppRuntime,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> serde_json::Value {
+        let answered = ask(runtime, path, headers).await;
+        serde_json::from_str(&answered).unwrap_or_else(|e| panic!("json ({e}): {answered}"))
+    }
+
+    /// A socket opened by one caller stays that caller's, whatever the isolate
+    /// does between two of its frames.
+    ///
+    /// This is the reproduction the round named, run three ways. A handler that
+    /// caches from a WebSocket `onmessage`:
+    ///
+    ///   * with nothing in between -- refused, because the caller who opened
+    ///     the socket sent a cookie;
+    ///   * with one unrelated anonymous `GET` in between -- refused for the
+    ///     same reason, which is the assertion that used to fail. The message
+    ///     handler read the anonymous request, judged the answer against *it*,
+    ///     stored the entry, and every later anonymous caller was handed it;
+    ///   * on a socket an anonymous caller opened -- stored, because that
+    ///     socket really is anonymous. Without this last one the test would
+    ///     pass against a platform that had simply stopped caching from
+    ///     WebSocket handlers at all.
+    #[tokio::test]
+    async fn a_websocket_message_is_judged_against_the_socket_it_arrived_on() {
+        let code = r#"
+            let pending = null;
+            let outcome = null;
+            const KEY = "https://example.invalid/from-the-socket";
+
+            export default async function handler(context) {
+                const path = new URL(context.request.url).pathname;
+                if (path === "/report") {
+                    // The put itself is made inside the message handler; only
+                    // the recording of what it answered is awaited here, so
+                    // that this request cannot be what the put was judged
+                    // against.
+                    if (pending) { await pending; pending = null; }
+                    const hit = await caches.default.match(KEY);
+                    return new Response(JSON.stringify({
+                        outcome,
+                        stored: hit === undefined ? null : await hit.text(),
+                    }));
+                }
+                if (path === "/unrelated") {
+                    return new Response("nothing to do with the socket");
+                }
+                const pair = new WebSocketPair();
+                const socket = pair[1];
+                socket.addEventListener("message", (event) => {
+                    pending = caches.default
+                        .put(KEY, new Response("answer-for:" + String(event.data)))
+                        .then((kept) => { outcome = kept.stored ? "stored" : kept.reason; });
+                });
+                return new Response(JSON.stringify({ id: socket.ws_id }));
+            }
+        "#;
+        let mut runtime = runtime("cache_ws_socket.production", code).await;
+        let alice = &[("cookie", "session=alice")][..];
+
+        // One: a socket opened by a caller who sent a cookie, and a frame on it
+        // with nothing in between.
+        let opened = ask_json(&mut runtime, "/open", alice).await;
+        let first = opened["id"].as_str().expect("a socket id").to_string();
+        runtime
+            .dispatch_ws_message(first, "one".to_string())
+            .await
+            .expect("the frame is delivered");
+        let straight_away = ask_json(&mut runtime, "/report", &[]).await;
+        let refusal = straight_away["outcome"].as_str().unwrap_or_default();
+        assert!(
+            refusal.contains("cookie"),
+            "a frame on a socket a cookie-carrying caller opened has to be judged against that \
+             caller: {straight_away}"
+        );
+
+        // Two: the same thing, with one unrelated anonymous request in between.
+        // This is the one that used to differ.
+        let opened = ask_json(&mut runtime, "/open", alice).await;
+        let second = opened["id"].as_str().expect("a socket id").to_string();
+        let _ = ask(&mut runtime, "/unrelated", &[]).await;
+        runtime
+            .dispatch_ws_message(second, "two".to_string())
+            .await
+            .expect("the frame is delivered");
+        let after_a_stranger = ask_json(&mut runtime, "/report", &[]).await;
+        assert_eq!(
+            after_a_stranger["outcome"].as_str().unwrap_or_default(),
+            refusal,
+            "one unrelated anonymous request changed what the socket's own frame was judged \
+             against: {after_a_stranger}"
+        );
+        assert_eq!(
+            after_a_stranger["stored"],
+            serde_json::Value::Null,
+            "the credentialed caller's answer was stored where every later anonymous caller \
+             would be handed it: {after_a_stranger}"
+        );
+
+        // Three: a socket that really was opened anonymously. Its frames may
+        // cache, or the two assertions above would hold on a platform that had
+        // stopped caching from WebSocket handlers altogether.
+        let opened = ask_json(&mut runtime, "/open", &[]).await;
+        let third = opened["id"].as_str().expect("a socket id").to_string();
+        runtime
+            .dispatch_ws_message(third, "three".to_string())
+            .await
+            .expect("the frame is delivered");
+        let anonymous = ask_json(&mut runtime, "/report", &[]).await;
+        assert_eq!(
+            anonymous["outcome"], "stored",
+            "a frame on a socket nobody identified themselves to open may still be cached: \
+             {anonymous}"
+        );
+        assert_eq!(anonymous["stored"], "answer-for:three");
+    }
+
+    /// The method of the request being answered, which the key does not name.
+    ///
+    /// `cache_ops.rs` already states the rule for the key: an entry is the
+    /// answer to one GET. The other half was missing -- a handler answering a
+    /// POST from its body, caching the answer under the URL, filed one caller's
+    /// result where every later GET of that URL matched it.
+    #[tokio::test]
+    async fn an_answer_to_a_post_is_not_filed_under_a_get_of_the_same_url() {
+        let code = r#"
+            const KEY = "https://example.invalid/answer";
+            export default async function handler(context) {
+                const request = context.request;
+                if (request.method === "GET") {
+                    const hit = await caches.default.match(KEY);
+                    return new Response(hit ? "HIT:" + (await hit.text()) : "MISS");
+                }
+                const who = await request.text();
+                const answer = "answer-for-" + who;
+                const kept = await caches.default.put(KEY, new Response(answer));
+                return new Response(JSON.stringify({
+                    answer,
+                    refused: kept.stored ? null : kept.reason,
+                }));
+            }
+        "#;
+        let mut runtime = runtime("cache_post_answer.production", code).await;
+
+        let (status, body) = ask_at(
+            &mut runtime,
+            "POST",
+            "/answer",
+            &[],
+            Some(b"alice".to_vec()),
+        )
+        .await;
+        assert_eq!(status, 200, "the handler failed: {body}");
+        let posted: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let refused = posted["refused"].as_str().unwrap_or_default();
+        assert!(
+            refused.contains("is a POST"),
+            "the refusal has to name the method of the request being answered: {posted}"
+        );
+
+        // The consequence, which is the whole reason for the rule: the next
+        // caller asks the same address with a GET and is answered afresh.
+        let bob = ask(&mut runtime, "/answer", &[]).await;
+        assert_eq!(
+            bob, "MISS",
+            "a GET of the URL was handed the result of somebody else's POST"
+        );
+    }
+
+    /// A `put` this platform will not keep does not throw away the answer the
+    /// handler had already computed.
+    ///
+    /// The rule that closed the previous round makes a refusal the ordinary
+    /// outcome: any handler serving a browser that sends a session cookie is
+    /// refused unless it says whose answer it is. While that threw, an
+    /// application that did not catch it answered 500 -- and this platform's
+    /// own example did not catch it, because the thing that exercised it sent
+    /// no cookies.
+    #[tokio::test]
+    async fn a_refusal_this_platform_judges_does_not_kill_the_invocation() {
+        let code = r#"
+            export default async function handler(context) {
+                if (new URL(context.request.url).pathname === "/read") {
+                    const hit = await caches.default.match("https://example.invalid/page");
+                    return new Response(hit === undefined ? "MISS" : "HIT");
+                }
+                const answer = "the-handlers-own-answer";
+                // No try/catch, which is what the platform's own example looked
+                // like: an ordinary put of an ordinary response.
+                await caches.default.put(
+                    "https://example.invalid/page",
+                    new Response(answer),
+                );
+                return new Response(answer);
+            }
+        "#;
+        let mut runtime = runtime("cache_uncaught_refusal.production", code).await;
+
+        let (status, body) = ask_at(
+            &mut runtime,
+            "GET",
+            "/page",
+            &[("cookie", "session=alice")],
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a cache write this platform would not keep failed the request the cache was there \
+             to make faster: {body}"
+        );
+        assert_eq!(body, "the-handlers-own-answer");
+
+        // And it really was refused: the entry a later anonymous caller would
+        // have been handed is not there. Surviving the refusal must not mean
+        // the refusal stopped happening.
+        assert_eq!(
+            ask(&mut runtime, "/read", &[]).await,
+            "MISS",
+            "the credentialed caller's answer was stored after all"
+        );
+    }
+
+    /// The other half of the same decision: a call this API does not accept is
+    /// still an exception, because it is a mistake in the source and is the
+    /// same on every request.
+    #[tokio::test]
+    async fn a_call_this_api_does_not_accept_still_throws() {
+        let code = r#"
+            export default async function handler(context) {
+                let threwForTheKey = null;
+                try {
+                    await caches.default.put(
+                        new Request("https://example.invalid/orders", { method: "POST" }),
+                        new Response("x"),
+                    );
+                } catch (e) { threwForTheKey = e.message; }
+
+                let threwForTheOptions = null;
+                try {
+                    await caches.default.put(
+                        "https://example.invalid/page",
+                        new Response("x"),
+                        { ignoreVary: true },
+                    );
+                } catch (e) { threwForTheOptions = e.message; }
+
+                // And one that is judged rather than rejected, in the same
+                // handler, so the two are told apart by this test and not by
+                // two tests that could drift.
+                const kept = await caches.default.put(
+                    "https://example.invalid/page",
+                    new Response("x", { headers: { "set-cookie": "session=alice" } }),
+                );
+                return new Response(JSON.stringify({
+                    threwForTheKey,
+                    threwForTheOptions,
+                    answered: kept.stored ? null : kept.reason,
+                }));
+            }
+        "#;
+        let mut runtime = runtime("cache_throws_vs_answers.production", code).await;
+        let seen = ask_json(&mut runtime, "/page", &[]).await;
+        assert!(
+            seen["threwForTheKey"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("whose method is POST"),
+            "a key that is not a GET is a mistake in the source and has to throw: {seen}"
+        );
+        assert!(
+            seen["threwForTheOptions"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ignoreVary"),
+            "an option this cache will not honour has to throw: {seen}"
+        );
+        assert!(
+            seen["answered"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("set-cookie"),
+            "a response this platform will not keep is answered, not thrown: {seen}"
+        );
+    }
+
+    /// Code in a stretch that never said what it was answering is refused.
+    ///
+    /// Every runner this platform has today says something, so there is no
+    /// application path here -- which is the point. The branch is the default
+    /// the whole arrangement rests on: the *next* runner, written without the
+    /// statement, inherits nothing and is refused rather than being handed
+    /// whichever request the isolate served last. `run_unstated_stretch` is
+    /// that runner, standing in for one nobody has written yet.
+    #[tokio::test]
+    async fn code_that_never_said_what_it_answers_is_refused() {
+        let code = r#"
+            globalThis.__test_outcome = null;
+            globalThis.__test_put = async function() {
+                const kept = await caches.default.put(
+                    "https://example.invalid/unattributed",
+                    new Response("from-nowhere"),
+                );
+                globalThis.__test_outcome = kept.stored ? "stored" : kept.reason;
+            };
+            export default async function handler(context) {
+                return new Response(String(globalThis.__test_outcome));
+            }
+        "#;
+        let mut runtime = runtime("cache_unattributed.production", code).await;
+
+        runtime
+            .run_unstated_stretch("globalThis.__test_put()".to_string())
+            .await
+            .expect("the script runs");
+        let outcome = ask(&mut runtime, "/report", &[]).await;
+        assert!(
+            outcome.contains("nothing here says what request this code is answering"),
+            "a stretch that stated nothing was allowed to cache: {outcome}"
+        );
+    }
+
+    /// The statement "this code answers no request" is the glue's to make,
+    /// once, and never an application's.
+    ///
+    /// The name is sealed, but sealing protects a name and a value, not what
+    /// calling the value does -- and one call from a fetch handler would waive
+    /// the disclosure rule for the rest of the stretch: a put judged with no
+    /// served request reads only the key's headers, never the credentialed
+    /// request actually being answered. So the function burns out on the
+    /// module-evaluation call, which runs before a line of application code
+    /// has, and a handler's call states nothing.
+    #[tokio::test]
+    async fn an_application_cannot_state_that_it_answers_no_request() {
+        let code = r#"
+            export default async function handler(context) {
+                globalThis.__deis_runtime_answers_no_request();
+                const kept = await caches.default.put(
+                    "https://example.invalid/private",
+                    new Response("alices-private-page"),
+                );
+                const back = await caches.default.match("https://example.invalid/private");
+                return new Response(JSON.stringify({
+                    stored: kept.stored,
+                    reason: kept.reason,
+                    readBack: back === undefined ? null : await back.text(),
+                }));
+            }
+        "#;
+        let mut runtime = runtime("cache_no_request_claim.production", code).await;
+
+        // A credentialed request. The handler's call to the sealed global must
+        // not stop the put being judged against it.
+        let with_cookie = ask(&mut runtime, "/private", &[("cookie", "session=alice")]).await;
+        let seen: serde_json::Value = serde_json::from_str(&with_cookie).expect("json");
+        assert_eq!(
+            seen["stored"], false,
+            "a handler that called the no-request statement cached a credentialed answer: {seen}"
+        );
+        assert!(
+            seen["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cookie"),
+            "the refusal names the header that carried the identity: {seen}"
+        );
+        assert_eq!(
+            seen["readBack"],
+            serde_json::Value::Null,
+            "an entry was filed under the bare URL for the next caller: {seen}"
+        );
+    }
+
+    /// A runner that answers no request says so, and may still cache.
+    ///
+    /// The refusal above must not become "nothing outside a request may use the
+    /// cache": warming a cache from a cron tick, or from a queue batch, is the
+    /// ordinary reason those runners touch it at all.
+    #[tokio::test]
+    async fn a_queue_batch_and_a_cron_tick_may_still_cache() {
+        let code = r#"
+            async function keep(what) {
+                const kept = await caches.default.put(
+                    "https://example.invalid/" + what,
+                    new Response("warmed-by-" + what),
+                );
+                return kept.stored ? "stored" : kept.reason;
+            }
+            export async function queue(batch, env, context) {
+                globalThis.__from_queue = await keep("queue");
+            }
+            export async function scheduled(event, env, context) {
+                globalThis.__from_cron = await keep("cron");
+            }
+            export default async function handler(context) {
+                const q = await caches.default.match("https://example.invalid/queue");
+                const c = await caches.default.match("https://example.invalid/cron");
+                return new Response(JSON.stringify({
+                    fromQueue: globalThis.__from_queue ?? null,
+                    fromCron: globalThis.__from_cron ?? null,
+                    queueEntry: q === undefined ? null : await q.text(),
+                    cronEntry: c === undefined ? null : await c.text(),
+                }));
+            }
+        "#;
+        let mut runtime = runtime("cache_no_request_runners.production", code).await;
+
+        runtime
+            .execute_queue_batch(
+                "jobs".to_string(),
+                vec![LeasedMessage {
+                    id: "m1".to_string(),
+                    body: b"{}".to_vec(),
+                    attempts: 1,
+                    lease_expires_at: 0,
+                    created_at: 1_700_000_000,
+                    lease_token: "lease-of-m1".to_string(),
+                }],
+            )
+            .await
+            .expect("the batch runs");
+        runtime
+            .execute_scheduled("* * * * *".to_string(), 1_700_000_000_000)
+            .await
+            .expect("the tick runs");
+
+        let seen = ask_json(&mut runtime, "/report", &[]).await;
+        assert_eq!(seen["fromQueue"], "stored", "{seen}");
+        assert_eq!(seen["fromCron"], "stored", "{seen}");
+        assert_eq!(seen["queueEntry"], "warmed-by-queue", "{seen}");
+        assert_eq!(seen["cronEntry"], "warmed-by-cron", "{seen}");
+    }
+
+    /// The producer of a streaming body is still answering the request whose
+    /// head has already gone out.
+    ///
+    /// It runs from the node's pump, between invocations, so before this it
+    /// read whichever request the isolate had served most recently -- and
+    /// between two chunks of one body that can be any number of other requests.
+    /// The two callers here differ only in the credential they carry, and each
+    /// one's producer has to be judged against its own.
+    #[tokio::test]
+    async fn a_response_stream_producer_is_still_answering_its_own_request() {
+        let code = r#"
+            globalThis.__marker = 0;
+            globalThis.__from_producer = null;
+            globalThis.__seen_marker = null;
+            export default async function handler(context) {
+                const path = new URL(context.request.url).pathname;
+                if (path === "/report") {
+                    return new Response(JSON.stringify({
+                        outcome: globalThis.__from_producer,
+                        markerWhenItRan: globalThis.__seen_marker,
+                    }));
+                }
+                if (path === "/unrelated") {
+                    globalThis.__marker = 1;
+                    return new Response("nothing to do with that body");
+                }
+                globalThis.__marker = 0;
+                globalThis.__from_producer = null;
+                globalThis.__seen_marker = null;
+                let sent = 0;
+                const body = new ReadableStream({
+                    async pull(controller) {
+                        // Five chunks that touch nothing. The node's queue
+                        // holds two, and a read pulls the next chunk before the
+                        // write of the last one, so this is comfortably more
+                        // than the invocation that produced the head can get
+                        // through before the producer parks in a blocked write.
+                        // What happens after that really is happening from the
+                        // node's pump, which is what this test is about.
+                        if (sent < 5) { sent++; controller.enqueue("x"); return; }
+                        // Read before the await, so it says which stretch this
+                        // producer ran in rather than which one it finished in.
+                        globalThis.__seen_marker = globalThis.__marker;
+                        const kept = await caches.default.put(
+                            "https://example.invalid/streamed",
+                            new Response("produced"),
+                        );
+                        globalThis.__from_producer = kept.stored ? "stored" : kept.reason;
+                        controller.close();
+                    },
+                });
+                return new Response(body);
+            }
+        "#;
+        let mut runtime = runtime("cache_stream_producer.production", code).await;
+
+        // A credentialed caller. Its producer's put is that caller's answer,
+        // and nothing files it under them.
+        let seen = drive_one_stream(&mut runtime, &[("cookie", "session=alice")]).await;
+        assert_eq!(
+            seen["markerWhenItRan"], 1,
+            "this test proves nothing unless the producer really did run after the unrelated \
+             request, from the node's pump: {seen}"
+        );
+        assert!(
+            seen["outcome"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cookie"),
+            "the producer of a credentialed caller's body was not judged against that caller: \
+             {seen}"
+        );
+
+        // An anonymous one, whose producer may cache. Both readings have to be
+        // reachable, or the assertion above would hold on a platform that
+        // refused every producer.
+        let seen = drive_one_stream(&mut runtime, &[]).await;
+        assert_eq!(seen["markerWhenItRan"], 1, "{seen}");
+        assert_eq!(
+            seen["outcome"], "stored",
+            "an anonymous caller's producer may cache what it produced: {seen}"
+        );
+    }
+
+    /// One streaming request, driven the way a client drives one: take the
+    /// head, run something else, then start reading the body so the producer
+    /// gets past the chunks the node's queue was holding.
+    async fn drive_one_stream(
+        runtime: &mut AppRuntime,
+        headers: &[(&str, &str)],
+    ) -> serde_json::Value {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        runtime
+            .execute_fetch(
+                "http://localhost/stream".to_string(),
+                "GET".to_string(),
+                headers,
+                None,
+                tx,
+            )
+            .await
+            .expect("the request runs");
+        let (status, _headers, body) = rx.await.expect("a head").expect("a head");
+        assert_eq!(status, 200);
+        let mut reader = match body {
+            crate::runtime::ResponseBody::Stream(reader) => reader,
+            other => panic!("the handler did not answer with a stream: {other:?}"),
+        };
+
+        // One unrelated anonymous request between the head and the body, which
+        // is the whole point: the pump runs between invocations, and what a
+        // producer used to read there was whichever request the isolate had
+        // served most recently.
+        let _ = ask(runtime, "/unrelated", &[]).await;
+
+        // Read what the queue is holding, so the write the producer is parked
+        // in can complete, and keep reading until the body ends. Reading and
+        // pumping together, the way the node does it: nothing else drives this
+        // producer.
+        for _ in 0..24 {
+            let pumping = runtime.pump_response_streams();
+            let reading = std::future::poll_fn(|cx| reader.poll_chunk(cx));
+            let ended = tokio::select! {
+                () = pumping => true,
+                chunk = reading => chunk.is_none(),
+            };
+            if ended {
+                break;
+            }
+        }
+        runtime.pump_response_streams().await;
+
+        ask_json(runtime, "/report", &[]).await
+    }
+
+    /// Every way out of one request answers it.
+    ///
+    /// Not about the cache, and here because it is the other half of the same
+    /// defect: an uncaught refusal used to kill the invocation, and the path a
+    /// killed invocation takes out of `execute_fetch` returned through `?` with
+    /// the channel it was given untouched. What the caller then reported was
+    /// its own guess for a dropped channel -- "Runtime thread dropped" -- in
+    /// place of the reason, on this path and on the two beside it.
+    #[tokio::test]
+    async fn an_invocation_that_was_cut_off_still_answers_the_request() {
+        let code = r#"
+            export default async function handler(context) {
+                for (;;) {}
+            }
+        "#;
+        let mut runtime = AppRuntime::new(
+            "cache_cut_off.production".to_string(),
+            code.to_string(),
+            None,
+            IsolateSpec {
+                limits: crate::config::ExecutionLimits {
+                    timeout_ms: 200,
+                    ..crate::config::ExecutionLimits::default()
+                },
+                ..IsolateSpec::default()
+            },
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .expect("the app builds");
+        runtime.init_module().await.expect("the module loads");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = runtime
+            .execute_fetch(
+                "http://localhost/spin".to_string(),
+                "GET".to_string(),
+                Vec::new(),
+                None,
+                tx,
+            )
+            .await;
+        // The channel carried something. Before this it was dropped, and the
+        // caller could only say that it had been.
+        let answered = rx.await.expect("the request was answered, not abandoned");
+        let error = answered.expect_err("a handler that never returns cannot succeed");
+        let said = error.to_string();
+        assert!(
+            said.contains("200ms") || said.to_lowercase().contains("time"),
+            "the reason the request failed has to reach the client: {said}"
+        );
+    }
+
+    /// Work handed to `waitUntil` by a stretch that has since ended does not
+    /// run inside another invocation's tail.
+    ///
+    /// `__pending_wait_until` is the same shape of state as the request being
+    /// answered: written by one invocation, read by whichever one next reaches
+    /// its tail. A WebSocket message handler has no tail at all, so a
+    /// `waitUntil` from one used to be awaited inside the next request -- on
+    /// that request's budget, in its trace, and with its statement about the
+    /// request being answered in force.
+    #[tokio::test]
+    async fn wait_until_work_from_a_stretch_that_ended_does_not_run_inside_another() {
+        let code = r#"
+            let held = null;
+            globalThis.__ran = 0;
+            export default async function handler(context) {
+                const path = new URL(context.request.url).pathname;
+                if (path === "/report") {
+                    return new Response(String(globalThis.__ran));
+                }
+                const pair = new WebSocketPair();
+                const socket = pair[1];
+                held = context.waitUntil;
+                socket.addEventListener("message", () => {
+                    // A thenable rather than a promise, because a promise
+                    // started when it was created and would run whether or not
+                    // a tail ever awaited it. This runs when, and only when,
+                    // something awaits it -- which is exactly the question.
+                    held({ then(onFulfilled) { globalThis.__ran++; onFulfilled(); } });
+                });
+                return new Response(JSON.stringify({ id: socket.ws_id }));
+            }
+        "#;
+        let mut runtime = runtime("cache_wait_until_orphan.production", code).await;
+
+        let opened = ask_json(&mut runtime, "/open", &[]).await;
+        let id = opened["id"].as_str().expect("a socket id").to_string();
+        runtime
+            .dispatch_ws_message(id, "go".to_string())
+            .await
+            .expect("the frame is delivered");
+
+        // A later request, whose tail is the one that used to pick the orphan
+        // up. Two of them, because the first request's own tail is where it
+        // would have been awaited and the second proves it was not simply
+        // deferred.
+        let ran = ask(&mut runtime, "/report", &[]).await;
+        assert_eq!(
+            ran, "0",
+            "a WebSocket message handler's waitUntil work was awaited inside a later request"
+        );
+        let ran = ask(&mut runtime, "/report", &[]).await;
+        assert_eq!(ran, "0", "and it was not merely deferred by one request");
     }
 }

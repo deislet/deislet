@@ -79,6 +79,7 @@ impl From<crate::catalog::CatalogError> for ApiError {
             CatalogError::NotFound(_) => ApiError::NotFound(message),
             CatalogError::Conflict(_) => ApiError::Conflict(message),
             CatalogError::Invalid(_) => ApiError::BadRequest(message),
+            CatalogError::Forbidden(_) => ApiError::Forbidden(message),
             CatalogError::BundleStorage(_) => ApiError::InternalError(message),
             CatalogError::SecretsUnavailable(_) => ApiError::ServiceUnavailable(message),
             CatalogError::Database(_) | CatalogError::Backend(_) => {

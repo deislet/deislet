@@ -13,7 +13,7 @@
 use anyhow::Result;
 use colored::Colorize;
 
-use crate::commands::Session;
+use crate::commands::{Session, escaped};
 use crate::render::{Output, Table, timestamp};
 use crate::settings::Overrides;
 
@@ -47,9 +47,11 @@ pub async fn list(output: Output) -> Result<()> {
 
     let mut table = Table::new(&["NAME", "ROLE", "STATE", "CREATED"]);
     for account in &accounts {
+        // Same reasoning as the token table: this is the list an operator
+        // reads before deciding who to disable.
         table.row(vec![
-            account.name.clone(),
-            account.role.clone(),
+            escaped(&account.name),
+            escaped(&account.role),
             match account.disabled_at {
                 Some(_) => "disabled".red().to_string(),
                 None => "active".to_string(),
