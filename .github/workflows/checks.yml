@@ -37,6 +37,13 @@ env:
   # target directory or a restored cache, so incremental compilation buys
   # nothing and costs cache size.
   CARGO_INCREMENTAL: 0
+  # No debug info in CI builds. The second run of this workflow filled the
+  # runner's disk before `demo.sh start` had finished compiling: a debug
+  # build of this workspace with full debug info (V8, deno, pingora, tonic)
+  # is tens of gigabytes, and the runner starts with about fourteen free.
+  # Nothing here reads a debugger; a panic's backtrace still names functions.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   document-path-literals:
@@ -75,7 +82,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The version rust-toolchain.toml pins, spelled here as well because
+      # the action installs what it is told and this file must not silently
+      # test a different compiler from the one developers run.
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy, rustfmt
 
@@ -85,15 +95,28 @@ jobs:
           cache: npm
           cache-dependency-path: crates/deis-control/web/package-lock.json
 
-      - name: Cache cargo registry and build
+      # The runner image ships toolchains this workspace never uses; the
+      # space they take is the space the build needs. Same step in the demo
+      # job, for the same reason.
+      - name: Free disk space
+        run: |
+          set -eu
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h / | tail -1
+
+      # The registry and git checkouts only. `target` is not cached: with
+      # this workspace it is larger than the cache's per-entry ceiling, so a
+      # cached `target` was a slow way of restoring nothing.
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-workspace-
+          key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-registry-
 
       # Before anything cargo does. deis-control embeds this directory, and a
       # build without it is a build of a control plane whose dashboard is 404.
@@ -130,7 +153,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
 
       - uses: actions/setup-node@v4
         with:
@@ -138,15 +161,22 @@ jobs:
           cache: npm
           cache-dependency-path: crates/deis-control/web/package-lock.json
 
-      - name: Cache cargo registry and build
+      - name: Free disk space
+        run: |
+          set -eu
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-demo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-demo-
+          key: cargo-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-registry-
 
       - name: Build the web console deis-control embeds
         working-directory: crates/deis-control/web

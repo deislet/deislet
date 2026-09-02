@@ -1,0 +1,10 @@
+# One compiler for everybody, so a lint that appears in a newer clippy does
+# not appear first on the CI runner and nowhere else. The second run of
+# .github/workflows/checks.yml failed exactly that way: the runner's stable
+# was two minor versions ahead of the workstation the evidence is quoted from,
+# and its clippy refused tonic-generated code that 1.96's clippy accepts.
+# Bumping this file is how the toolchain moves, and the bump is what the
+# newly appearing lints get fixed against.
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]
