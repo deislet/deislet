@@ -19,16 +19,20 @@ Every number in this document comes from a run on one workstation:
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo audit` | 0 advisories, 4 recorded judgements in `.cargo/audit.toml` |
 
-Continuous integration: **not yet observed**. `.github/workflows/checks.yml`
-runs four jobs on every push and pull request - the document-path check, the
-demo witness tests, the workspace job (fmt, clippy, build, test, with the
-dashboard built first) and the demo job (start, verify, stop). No run of
-that file has happened yet: it exists only on the branch that carries this
-tag. The first run on `ubuntu-latest` should be treated as calibration - the
-runner has neither `wrangler` nor `deno`, which the compiler-target check now
-states in its evidence line instead of passing over, and the demo job's
-timing is untested there. Until a run is green, "CI runs X" anywhere in
-these documents describes a file, not a run.
+Continuous integration: **observed green once, on the commit this tag
+points at.** `.github/workflows/checks.yml` runs four jobs on every push and
+pull request - the document-path check, the demo witness tests, the
+workspace job (fmt, clippy, build, test, with the dashboard built first) and
+the demo job (start, verify, stop). Its first four runs are worth knowing
+about, because they changed the code: the runner had no `protoc`; its stable
+Rust was two minor versions ahead of the workstation and its clippy refused
+tonic-generated code (the toolchain is pinned in `rust-toolchain.toml` now);
+a debug build with full debug info filled the runner's disk (CI builds carry
+none); and on the runner's dual-stack `localhost` the outbound policy let
+`::1` through where it dropped `127.0.0.1` - a real defect, fixed in
+`6671657` together with a diagnostic that named the wrong reason for a
+stream cut off by the op ceiling. One green run is one run: the numbers
+above were reproduced on `ubuntu-latest`, not established there.
 
 ## Known defects
 
