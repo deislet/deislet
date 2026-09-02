@@ -184,8 +184,9 @@ async fn main() -> Result<(), anyhow::Error> {
         // A node's management plane can unload an application, list every
         // tenant on the node and replace one tenant's code, so it is served
         // only to a caller that presents a node key. The same list the node
-        // endpoints already authenticate against.
-        .with_node_credential(api_config.node_call_credential()),
+        // endpoints authenticate against, so a node is driven with the very
+        // value it proved when it registered.
+        .with_node_keys(&api_config.node_preshared_keys),
     );
     let runtime_poll_task =
         tokio::spawn(Arc::clone(&deis_runtime_manager).poll_loop(shutdown.clone()));

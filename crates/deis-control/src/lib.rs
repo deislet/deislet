@@ -14,6 +14,7 @@ pub mod handler;
 pub mod identity;
 pub mod message;
 pub mod metrics;
+pub mod node_key;
 pub mod reaper;
 pub mod runtime_client;
 pub mod scheduler;

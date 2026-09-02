@@ -122,4 +122,93 @@ mod tests {
         );
         assert_eq!(field(Some("say \"hi\"".to_string())), "\"say \\\"hi\\\"\"");
     }
+    /// The one rule `record` adds on top of `format`: whatever a field holds,
+    /// the file gains exactly one line, and a control character in a field is
+    /// spelled out rather than written.
+    ///
+    /// This drives `record` itself, through a real `Session` read off an
+    /// in-memory stream, because the escape sits in `record` and not in
+    /// `format` - a test of `format` alone would stay green with the escape
+    /// removed. That was measured: with line 44 replaced by a borrow of the
+    /// unescaped text, `cargo test -p deis-proxy --lib -- access_log` passed.
+    ///
+    /// What each byte stands for. A header value reaches `format` through
+    /// `HeaderValue::to_str`, which admits visible ASCII and HTAB and nothing
+    /// else, so a tab in User-Agent is the control character a client can
+    /// put on this line today, and it is put there here the way a client
+    /// would - in the request bytes. `ctx.host` and the other `String` fields
+    /// are filled in by this crate from the same headers, so no producer hands
+    /// them a newline or a U+009B today; the rule is about the line, not
+    /// about which producer is trusted, so the forged second line and the CSI
+    /// byte are given to the field a future producer is most likely to feed
+    /// from bytes it did not check.
+    #[tokio::test]
+    async fn a_field_cannot_write_a_second_line_or_repaint_a_terminal() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut session = Session::new_h1(Box::new(server));
+        client
+            .write_all(
+                b"GET /hello HTTP/1.1\r\nHost: shop.example\r\n\
+                  User-Agent: Mozilla/5.0\t(tab)\r\n\r\n",
+            )
+            .await
+            .expect("the request bytes are written");
+        assert!(
+            session.read_request().await.expect("a request is parsed"),
+            "the in-memory stream carried one request"
+        );
+
+        let forged = "shop.example\n2026-09-02T00:00:00Z 10.0.0.1 forged GET /admin 200\u{9b}31m";
+        let ctx = RequestCtx {
+            host: forged.to_string(),
+            app_id: Some("shop".to_string()),
+            ..Default::default()
+        };
+
+        let dir = tempfile::tempdir().expect("a directory for the log");
+        let path = dir.path().join("access.log");
+        let config = AccessLogConfig {
+            format: crate::config::system::AccessLogKeys::new(vec![
+                AccessLogK::Host,
+                AccessLogK::AppId,
+                AccessLogK::Method,
+                AccessLogK::Uri,
+                AccessLogK::UserAgent,
+            ]),
+            path: path.to_string_lossy().into_owned(),
+        };
+        let log = AccessLog::open(&config).expect("the log opens");
+        log.record(&session, &ctx);
+        drop(log);
+
+        let written = std::fs::read_to_string(&path).expect("the log is readable");
+        assert_eq!(
+            written.matches('\n').count(),
+            1,
+            "one request must be one line; the file holds:\n{written}"
+        );
+        let line = written.trim_end_matches('\n');
+        assert!(
+            !line.chars().any(char::is_control),
+            "no control character may reach the file: {line:?}"
+        );
+        assert!(
+            line.contains("shop.example\\n2026-09-02T00:00:00Z 10.0.0.1 forged GET /admin 200"),
+            "the newline is spelled out and the forged line stays inside the field: {line}"
+        );
+        assert!(
+            line.contains("200\\u{9b}31m"),
+            "the CSI byte is spelled out rather than written: {line}"
+        );
+        assert!(
+            line.contains("Mozilla/5.0\\t(tab)"),
+            "the tab a client can put in a header is spelled out: {line}"
+        );
+        assert!(
+            line.contains(" shop GET /hello "),
+            "the fields around the client's bytes are still the ones asked for: {line}"
+        );
+    }
 }

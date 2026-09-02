@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 use deis_runtime::app::ApplicationManager;
 use deis_runtime::app_repo::AppRepo;
@@ -50,6 +51,21 @@ struct Cli {
     /// the built-in defaults.
     #[arg(short, long)]
     config: Option<PathBuf>,
+}
+
+/// The log level filter for this node: `RUST_LOG` when it is set, `info`
+/// otherwise.
+///
+/// `info` and not the crate's own default so a fresh node is not drowned by
+/// the TRACE its dependencies emit; an operator raises it with
+/// `RUST_LOG=debug` or narrows it with `RUST_LOG=info,deis_runtime=debug`, the
+/// same lever `deis-control` and `deis-proxy` give. `try_from_default_env`
+/// returns the fallback when the variable is absent; `EnvFilter`'s own parsing
+/// is lenient about the directives inside a value that is present, so a
+/// malformed one is dropped rather than failing the node's start -- logging
+/// must not be the thing that keeps a node from serving.
+fn log_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
 /// Everything that has to happen while this process is still single-threaded.
@@ -107,6 +123,14 @@ async fn run(
     let log_buffer = Arc::new(LogBuffer::new(config.logging.buffer_size));
 
     tracing_subscriber::registry()
+        // Without this the fmt layer ran unfiltered: every crate logged at
+        // TRACE to stdout -- the mio and h2 pollers alone put out roughly a
+        // megabyte a minute on an idle node -- and `RUST_LOG` did nothing, so
+        // an operator had no lever to lower it. The other services install the
+        // same filter (see `deis-control` init_logging and `deis-proxy`); it
+        // reads `RUST_LOG` and falls back to `info` when the variable is unset
+        // or unparseable. The LineSafe writer and ANSI-off below are unchanged.
+        .with(log_filter())
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
@@ -345,4 +369,35 @@ async fn run(
     info!("👋 Runtime Platform stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter;
+
+    /// A `RUST_LOG` directive parses into a filter, and an unset or unparseable
+    /// one falls back to `info` rather than leaving the node unfiltered or
+    /// refusing to start.
+    ///
+    /// The environment is process-wide, so this one test walks all three cases
+    /// in sequence rather than racing three that each set it.
+    #[test]
+    fn the_filter_reads_rust_log_and_defaults_to_info() {
+        // Unset: the default is info, which is what keeps an idle node from
+        // logging its dependencies' TRACE to stdout.
+        std::env::remove_var("RUST_LOG");
+        assert_eq!(log_filter().to_string(), "info");
+
+        // A directive an operator would write is honoured. The filter may
+        // reorder the directives it holds, so this checks both are present
+        // rather than the exact spelling.
+        std::env::set_var("RUST_LOG", "warn,deis_runtime=debug");
+        let parsed = log_filter().to_string();
+        assert!(
+            parsed.contains("deis_runtime=debug") && parsed.contains("warn"),
+            "a valid RUST_LOG directive has to be honoured: {parsed}"
+        );
+
+        std::env::remove_var("RUST_LOG");
+    }
 }

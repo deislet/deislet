@@ -21,6 +21,24 @@
 //! unsynchronised they lose data - the delete counts zero before the store's
 //! row lands, unlinks the file, and the new key is left pointing at nothing.
 //! [`ContentLocks`] holds those two sections apart, per tenant and digest.
+//!
+//! # Content without a row is removed, twice over
+//!
+//! The content file is renamed into place before its row is written, so that
+//! a reader can never find a row pointing at a file that is not there yet.
+//! The price is the other order of failure: the rename succeeded and the row
+//! did not - a full disk refusing the commit is the usual way - and a
+//! full-size file nobody points at is left behind, on the very disk that had
+//! no room. Two things now catch that. In the request, a `Put` whose row write
+//! fails removes the file it had just placed, under the same content lock, so
+//! a failed call leaves nothing. Across a crash between the rename and the
+//! insert, [`BlobService::sweep_orphans`] walks the content tree after every
+//! start and finds any file no row of that tenant references, taking the
+//! content lock per file so it can never race a `Put` that has placed a file
+//! and is about to record it. Whether it removes what it finds is the
+//! operator's switch (`remove_orphaned_blob_content`, off by default), because
+//! the same shape - content with no row - is what a metadata snapshot
+//! restored from before the newest writes makes of every newer object.
 
 use crate::error::{StoreError, StoreResult};
 use crate::proto::blob::{
@@ -33,7 +51,7 @@ use crate::tenant::{TenantId, tenant_of};
 use crate::unix_seconds;
 // Body slice size for `Get`, and the size clients are expected to use for
 // `Put`; see deis_wire::conventions for why it lives in one place.
-use deis_wire::conventions::STREAM_CHUNK_BYTES;
+use deis_wire::conventions::{MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -91,6 +109,16 @@ pub struct BlobLimits {
     /// which lets one stalled client hold a task, a file descriptor and a
     /// temporary file for the life of the process.
     pub upload_idle_timeout: Option<Duration>,
+    /// Whether the start-up sweep may *remove* content files no metadata row
+    /// references, or only count and report them. Off by default, because
+    /// the sweep cannot tell a crash's leftover from the content of a row
+    /// that is missing for another reason: a metadata snapshot restored from
+    /// before the newest objects were written references none of them, and
+    /// a sweep that removed them would turn a recoverable restore into a
+    /// loss before the operator could restore the newer snapshot. On, the
+    /// sweep removes what it finds; off, it logs the count at warn and names
+    /// this switch.
+    pub remove_orphans_on_start: bool,
     /// Longest a `Get` may wait for the client to take the chunk it is
     /// holding. `None` waits forever, which lets one client that opened a
     /// download and stopped reading hold a task and an open file until the
@@ -167,6 +195,17 @@ impl BlobService {
             dedup_pause: None,
         };
         service.discard_incoming();
+        // The orphan sweep runs after `open` returns rather than inside it:
+        // it costs one query per stored object and the service can serve
+        // while it runs. It never touches a file a row points at, and the
+        // content lock keeps it clear of uploads in flight. Whether it may
+        // remove anything is the operator's call (`remove_orphans_on_start`);
+        // by default it only reports.
+        let sweeper = service.clone();
+        let remove = limits.remove_orphans_on_start;
+        tokio::spawn(async move {
+            sweeper.sweep_orphans(remove).await;
+        });
         tracing::info!(
             root = %service.root.display(),
             max_object_bytes = limits.max_object_bytes,
@@ -217,6 +256,129 @@ impl BlobService {
                 "cleared upload temporaries left by an earlier shutdown"
             );
         }
+    }
+
+    /// Remove every content file no metadata row points at.
+    ///
+    /// The belt under the in-request cleanup: a process that died between
+    /// renaming a body into place and committing its row leaves a file with
+    /// no row, and nothing in normal operation ever looks at that file again.
+    /// This walks `<root>/<tenant>/<xx>/<yy>/<sha>` and asks the metadata
+    /// table about each file, taking the content lock for that digest first,
+    /// so a `Put` that has placed a file and is about to record it either
+    /// finishes first (the row is found, the file stays) or starts after (the
+    /// file is gone, and it writes it again from its temporary).
+    ///
+    /// One indexed query per content file, on a background task, so a store
+    /// with a million objects pays for it after start rather than before
+    /// serving. Returns how many unreferenced files were found; with `remove`
+    /// they are deleted as they are found, without it they are counted and
+    /// reported once at warn, naming the switch that would delete them. A
+    /// file that cannot be checked is left in place either way, because
+    /// leaving an orphan costs disk while removing content by mistake loses
+    /// data - and that asymmetry is also why `remove` is not the default:
+    /// a metadata snapshot restored from before the newest writes references
+    /// none of their content, and a sweep that deleted it would destroy what
+    /// the newer snapshot could still have brought back.
+    pub async fn sweep_orphans(&self, remove: bool) -> usize {
+        let Ok(tenants) = std::fs::read_dir(&self.root) else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        let mut reported = 0usize;
+        let mut kept_unchecked = 0usize;
+        for tenant_dir in tenants.flatten() {
+            let name = tenant_dir.file_name().to_string_lossy().into_owned();
+            let Ok(tenant) = TenantId::parse(&name) else {
+                // Not a namespace this build wrote; `open` has already
+                // refused to start over a pre-tenant layout, so this is at
+                // most a stray directory an operator put here.
+                continue;
+            };
+            for sha256 in content_digests_under(&tenant_dir.path()) {
+                let _content = self.content_locks.acquire(&tenant, &sha256).await;
+                let tenant_id = tenant.as_str().to_string();
+                let sha = sha256.clone();
+                let referenced = self
+                    .pool
+                    .with_conn(move |conn| {
+                        let count: i64 = conn.query_row(
+                            "SELECT count(*) FROM blob WHERE tenant = ?1 AND sha256 = ?2",
+                            rusqlite::params![tenant_id, sha],
+                            |row| row.get(0),
+                        )?;
+                        Ok(count)
+                    })
+                    .await;
+                match referenced {
+                    Ok(0) if !remove => {
+                        reported += 1;
+                        tracing::debug!(
+                            tenant = %tenant,
+                            sha256 = %sha256,
+                            "content file no object references, left in place"
+                        );
+                    }
+                    Ok(0) => {
+                        let path = self.content_path(&tenant, &sha256);
+                        match tokio::fs::remove_file(&path).await {
+                            Ok(()) => {
+                                removed += 1;
+                                tracing::warn!(
+                                    tenant = %tenant,
+                                    sha256 = %sha256,
+                                    "removed a content file no object referenced; it was left by \
+                                     a write whose metadata never committed"
+                                );
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                kept_unchecked += 1;
+                                tracing::warn!(
+                                    tenant = %tenant,
+                                    path = %path.display(),
+                                    error = %e,
+                                    "could not remove an unreferenced content file; it stays on \
+                                     disk until an operator removes it"
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        kept_unchecked += 1;
+                        tracing::warn!(
+                            tenant = %tenant,
+                            sha256 = %sha256,
+                            error = %e,
+                            "could not check whether a content file is referenced; it is left in \
+                             place, which costs disk but never loses data"
+                        );
+                    }
+                }
+            }
+        }
+        if reported > 0 {
+            tracing::warn!(
+                unreferenced = reported,
+                kept_unchecked,
+                "content files no metadata row references were found and left in place. If \
+                 this metadata is the newest copy they are leftovers of interrupted writes and \
+                 cost only disk; if it was restored from an older snapshot they are the content \
+                 of every object written since, and removing them would lose it. Set \
+                 remove_orphaned_blob_content = true for one start to delete them"
+            );
+        } else if removed > 0 || kept_unchecked > 0 {
+            tracing::info!(
+                removed,
+                kept_unchecked,
+                "orphan content sweep finished; removed files had no metadata row and were \
+                 unreachable by any key"
+            );
+        } else {
+            tracing::debug!("orphan content sweep found nothing to remove");
+        }
+        removed + reported
     }
 
     /// Where a tenant's content lives.
@@ -314,11 +476,18 @@ impl BlobService {
         // the tenant is a separate `WHERE` term taken from request metadata,
         // never from here - so the worst a forged one can do is start the scan
         // somewhere else inside the caller's own data. Even that is refused
-        // when it points outside the prefix: honouring it would widen the scan
-        // to keys the caller did not ask for, which is how a paging bug turns
-        // into a listing of unrelated keys.
+        // when it points outside the prefix, on either side: below it,
+        // honouring it would widen the scan to keys the caller did not ask
+        // for, which is how a paging bug turns into a listing of unrelated
+        // keys; above it, the scan would find nothing and answer an empty
+        // page with no cursor, which reads as "the bucket is empty" to a
+        // caller that mixed up its cursors. Both restart at the prefix, which
+        // is what blob.proto promises.
+        let upper = crate::prefix_upper_bound(&prefix);
+        let inside_prefix =
+            |key: &str| key >= prefix.as_str() && upper.as_deref().is_none_or(|u| key < u);
         let start = match cursor.as_deref().map(ListCursor::decode) {
-            Some(Some(cursor)) if cursor.key >= prefix => cursor,
+            Some(Some(cursor)) if inside_prefix(&cursor.key) => cursor,
             Some(other) => {
                 tracing::debug!(
                     tenant = %tenant,
@@ -331,7 +500,6 @@ impl BlobService {
             }
             None => ListCursor::at(prefix.clone()),
         };
-        let upper = crate::prefix_upper_bound(&prefix);
 
         let scan_prefix = prefix.clone();
         self.pool
@@ -345,8 +513,13 @@ impl BlobService {
                     if remaining == 0 {
                         // The page is full. There may or may not be more
                         // behind it, and the cursor says so either way; see
-                        // ListResponse.next_cursor.
-                        page.next_cursor = Some(bound.encode());
+                        // ListResponse.next_cursor. Unless the position has
+                        // already left the prefix - a folder that rolled up
+                        // to the end of it seeks there - in which case the
+                        // scan is finished, and handing that position out
+                        // would send the caller back to the first page.
+                        let finished = upper.as_deref().is_some_and(|u| bound.key.as_str() >= u);
+                        page.next_cursor = (!finished).then(|| bound.encode());
                         break;
                     }
                     let sql = format!(
@@ -487,7 +660,7 @@ impl BlobService {
         // the same digest; see the module docs.
         let outcome = {
             let _content = self.content_locks.acquire(tenant, &sha256).await;
-            if tokio::fs::metadata(&destination).await.is_ok() {
+            let placed_here = if tokio::fs::metadata(&destination).await.is_ok() {
                 // Same bytes already stored under this digest, for this or
                 // another key. Keep what is there and let the temporary file
                 // go: dropping it is what deletes it, so this branch must not
@@ -503,14 +676,32 @@ impl BlobService {
                      upload's temporary file is removed"
                 );
                 drop(temp);
+                false
             } else {
                 tokio::fs::rename(temp.path(), &destination).await?;
                 // Only now is the file reachable under its digest, so only
                 // now may the temporary stop being tracked. A rename that
                 // failed leaves `temp` armed and its file is removed on drop.
                 temp.forget();
+                true
+            };
+            match self.record(tenant, &meta, precondition.as_ref()).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // The row never landed, so nothing points at the file this
+                    // call placed - the lock held since the existence check
+                    // above means no other upload of the same bytes can have
+                    // recorded a row against it meanwhile. Left there it would
+                    // be a full-size orphan on a disk that, in the usual case
+                    // of this failure, has just run out of room. A file that
+                    // was already present belongs to whoever put it there and
+                    // is left alone.
+                    if placed_here {
+                        remove_placed_content(tenant, &meta, &destination, &e).await;
+                    }
+                    return Err(e);
+                }
             }
-            self.record(tenant, &meta, precondition.as_ref()).await?
         };
 
         let replaced = match outcome {
@@ -1268,6 +1459,75 @@ impl Drop for TempFile {
     }
 }
 
+/// Remove a content file this call placed and then failed to record.
+///
+/// Reported at `warn` with the row error beside it, because the two go
+/// together: the usual cause is a disk with no room for the commit, and an
+/// operator reading the failure should also see that the bytes did not stay.
+async fn remove_placed_content(
+    tenant: &TenantId,
+    meta: &ObjectMeta,
+    destination: &Path,
+    cause: &StoreError,
+) {
+    match tokio::fs::remove_file(destination).await {
+        Ok(()) => tracing::warn!(
+            tenant = %tenant,
+            key = %meta.key,
+            sha256 = %meta.sha256,
+            size = meta.size,
+            error = %cause,
+            "the metadata row for an upload could not be written; the content file placed for it \
+             was removed again, so nothing of this upload remains and the caller must retry"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::error!(
+            tenant = %tenant,
+            key = %meta.key,
+            path = %destination.display(),
+            row_error = %cause,
+            error = %e,
+            "the metadata row for an upload could not be written and its content file could not \
+             be removed either; the file is an orphan until the next start sweeps it"
+        ),
+    }
+}
+
+/// The digests of every content file under one tenant's root, read from the
+/// two-level shard layout. Anything that is not a 64-character lowercase hex
+/// name in the right place is not content this service wrote and is skipped;
+/// the `incoming` directory has already been cleared by then.
+fn content_digests_under(tenant_root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(shards) = std::fs::read_dir(tenant_root) else {
+        return found;
+    };
+    for shard in shards.flatten() {
+        if shard.file_name() == INCOMING_DIR {
+            continue;
+        }
+        let Ok(subshards) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for subshard in subshards.flatten() {
+            let Ok(files) = std::fs::read_dir(subshard.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                let is_digest = name.len() == 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                if is_digest && file.path().is_file() {
+                    found.push(name);
+                }
+            }
+        }
+    }
+    found
+}
+
 /// One `tokio::Mutex` per `(tenant, digest)`, created on demand and dropped
 /// when the last holder lets go.
 ///
@@ -1906,6 +2166,30 @@ fn inbound_chunks(
                     return;
                 }
                 Ok(None) => return,
+                // tonic refuses to decode a message over the service ceiling
+                // with OutOfRange, before this code sees a byte of it. That is
+                // the caller breaking the protocol - blob.proto says 1 MiB
+                // chunks - not the store breaking, so it is reported as the
+                // caller's fault, naming the ceiling and the chunk size to
+                // use, rather than folded into an I/O error and answered
+                // Internal.
+                Err(e) if e.code() == tonic::Code::OutOfRange => {
+                    tracing::warn!(
+                        error = %e,
+                        ceiling = MAX_GRPC_MESSAGE_BYTES,
+                        chunk_bytes = STREAM_CHUNK_BYTES,
+                        "a Put chunk exceeded the message ceiling; nothing is stored under this \
+                         key, the caller has to send smaller chunks"
+                    );
+                    let _ = tx
+                        .send(Err(StoreError::InvalidArgument(format!(
+                            "a Put chunk exceeded the {MAX_GRPC_MESSAGE_BYTES} byte message \
+                             ceiling; send the body in chunks of {STREAM_CHUNK_BYTES} bytes \
+                             ({e})"
+                        ))))
+                        .await;
+                    return;
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -1945,6 +2229,7 @@ mod tests {
             max_object_bytes,
             upload_idle_timeout: Some(Duration::from_secs(60)),
             download_idle_timeout: Some(Duration::from_secs(60)),
+            remove_orphans_on_start: true,
         }
     }
 
@@ -2693,6 +2978,7 @@ mod tests {
                 max_object_bytes: TEST_LIMIT,
                 upload_idle_timeout: Some(Duration::from_secs(60)),
                 download_idle_timeout: Some(Duration::from_secs(60)),
+                remove_orphans_on_start: true,
             },
         )
         .await
@@ -2735,6 +3021,7 @@ mod tests {
                 max_object_bytes: TEST_LIMIT,
                 upload_idle_timeout: None,
                 download_idle_timeout: None,
+                remove_orphans_on_start: true,
             },
         )
         .await
@@ -3121,5 +3408,185 @@ mod tests {
     #[test]
     fn hex_is_lowercase_and_padded() {
         assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
+    }
+
+    /// Make every metadata write fail the way a full disk or a corrupt file
+    /// does: the `blob` table is moved out from under the service, so the
+    /// row insert errors while everything on the filesystem still works.
+    fn break_metadata_writes(dir: &TempDir) {
+        let conn = rusqlite::Connection::open(dir.path().join("blob.sqlite")).unwrap();
+        conn.execute_batch("ALTER TABLE blob RENAME TO blob_broken;")
+            .unwrap();
+    }
+
+    /// Every content file under one tenant's root, by digest.
+    fn content_files(dir: &TempDir, tenant: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let root = dir.path().join("blob").join(tenant);
+        let Ok(shards) = std::fs::read_dir(&root) else {
+            return found;
+        };
+        for shard in shards.flatten() {
+            if shard.file_name() == INCOMING_DIR || !shard.path().is_dir() {
+                continue;
+            }
+            for sub in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                for file in std::fs::read_dir(sub.path()).unwrap().flatten() {
+                    found.push(file.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[tokio::test]
+    async fn a_failed_metadata_write_leaves_no_content_file_behind() {
+        // The body was renamed under its digest before the row was written.
+        // When the row cannot be written - a full disk is the usual way - the
+        // caller gets an error and, before this was fixed, a full-size file
+        // no row pointed at stayed on disk for good, making the full disk
+        // fuller on every attempt with fresh bytes.
+        let (dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        put(&svc, &a, "kept", b"a row points at this").await;
+
+        break_metadata_writes(&dir);
+        let err = svc
+            .store_object(
+                &a,
+                "lost",
+                None,
+                None,
+                chunks(vec![b"nobody will find this".to_vec()]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)), "{err}");
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"nobody will find this");
+        let orphan = hex(&hasher.finalize());
+        assert!(
+            !svc.content_path(&a, &orphan).exists(),
+            "a write whose row never landed must not leave its content behind"
+        );
+        assert_eq!(incoming_count(&dir, "app-one.production"), 0);
+        assert_eq!(
+            content_files(&dir, "app-one.production").len(),
+            1,
+            "only the object that has a row keeps its file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_past_the_prefix_restarts_the_scan_as_documented() {
+        // blob.proto promises that a cursor pointing outside `prefix` is
+        // ignored. `_M` sorts after every key under `L/`, so it is outside
+        // the prefix; honouring it answered an empty page and no cursor,
+        // which reads as "the bucket is empty".
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        for key in ["L/a", "L/b", "M"] {
+            put(&svc, &a, key, key.as_bytes()).await;
+        }
+
+        let page = svc
+            .list(&a, "L/", None, None, Some("_M".to_string()))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["L/a", "L/b"],
+            "a cursor outside the prefix is ignored and the scan restarts at the prefix"
+        );
+        assert!(page.next_cursor.is_none());
+
+        // A cursor inside the prefix is still honoured.
+        let page = svc
+            .list(&a, "L/", None, None, Some(".L/a".to_string()))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, vec!["L/b"]);
+    }
+
+    #[tokio::test]
+    async fn a_page_that_fills_at_the_end_of_the_prefix_hands_out_no_cursor_outside_it() {
+        // A folder whose remainder is the last possible character rolls up
+        // to a seek position equal to the prefix's upper bound - outside the
+        // prefix. A page that fills exactly there used to hand that position
+        // back as a cursor; now that an outside cursor restarts the scan,
+        // handing one out would send a client round in a circle.
+        let (_dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        let last = char::MAX;
+        put(&svc, &a, &format!("L/{last}{last}"), b"x").await;
+
+        let page = svc
+            .list(&a, "L/", Some(&last.to_string()), Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(page.prefixes, vec![format!("L/{last}")]);
+        assert!(
+            page.next_cursor.is_none(),
+            "nothing can sort after this folder inside the prefix, so the scan is finished: {:?}",
+            page.next_cursor
+        );
+    }
+
+    #[tokio::test]
+    async fn the_orphan_sweep_removes_content_no_row_points_at_and_nothing_else() {
+        // A crash between the rename and the row insert leaves exactly this:
+        // a file under its digest and no row. Nothing in normal operation
+        // ever reads that file again, so the sweep after start is the only
+        // thing that can reclaim it - and it must not touch a file a row
+        // does point at, nor anything that is not content this service wrote.
+        let (dir, svc) = service().await;
+        let a = tenant("app-one.production");
+        let kept = put(&svc, &a, "kept", b"a row points at this").await;
+
+        let orphan = "ab".repeat(32);
+        let orphan_path = svc.content_path(&a, &orphan);
+        std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        std::fs::write(&orphan_path, b"nobody points at this").unwrap();
+        // A stray file with a name that is not a digest is not ours to remove.
+        let stray = orphan_path.parent().unwrap().join("notes.txt");
+        std::fs::write(&stray, b"operator's note").unwrap();
+
+        // Without leave to remove, the sweep counts and keeps: the same file
+        // is what a restored older metadata snapshot makes of every newer
+        // object, and that is not the sweep's to destroy.
+        assert_eq!(svc.sweep_orphans(false).await, 1);
+        assert!(
+            orphan_path.exists(),
+            "a sweep not given leave to remove must leave the file where it is"
+        );
+
+        assert_eq!(svc.sweep_orphans(true).await, 1);
+        assert!(!orphan_path.exists(), "the orphan must be gone");
+        assert!(
+            svc.content_path(&a, &kept).exists(),
+            "referenced content stays"
+        );
+        assert!(stray.exists(), "files that are not content are left alone");
+        assert_eq!(
+            svc.get_all(&a, "kept").await.unwrap().unwrap(),
+            b"a row points at this"
+        );
+
+        // Reopening the same directory runs the sweep on its own; a second
+        // orphan planted before that is gone once it has run.
+        drop(svc);
+        std::fs::write(&orphan_path, b"planted again").unwrap();
+        let reopened = BlobService::open(dir.path(), 4, limits(TEST_LIMIT))
+            .await
+            .unwrap();
+        // The startup sweep is a background task; calling it directly is the
+        // deterministic way to wait for the same work.
+        reopened.sweep_orphans(true).await;
+        assert!(!orphan_path.exists());
+        assert!(reopened.content_path(&a, &kept).exists());
     }
 }

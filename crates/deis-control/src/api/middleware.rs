@@ -45,6 +45,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::config::ControlConfig;
+use crate::node_key::{NodeKeyFingerprint, ProvedNodeKey};
 
 /// What the configuration file says about the human API's credential.
 ///
@@ -82,7 +83,11 @@ impl AuthConfig {
 /// startup when the file names none.
 #[derive(Clone)]
 pub struct NodeAuthConfig {
-    keys: Arc<Vec<String>>,
+    /// Each configured key with its fingerprint, computed once: the
+    /// fingerprint is what a registration records about the key it proved,
+    /// so that the control plane later drives that node with the same value
+    /// and not with whichever one happens to be first in the list.
+    keys: Arc<Vec<(String, NodeKeyFingerprint)>>,
 }
 
 impl NodeAuthConfig {
@@ -90,9 +95,19 @@ impl NodeAuthConfig {
         Self::new(config.node_preshared_keys.clone())
     }
 
+    /// Blank entries are dropped and the rest are trimmed, which is the same
+    /// reading [`crate::runtime_client::RuntimeNodeManager::with_node_keys`]
+    /// gives the list, so a key proved here is a key that can be presented
+    /// back.
     pub fn new(keys: Vec<String>) -> Self {
         Self {
-            keys: Arc::new(keys.into_iter().filter(|k| !k.trim().is_empty()).collect()),
+            keys: Arc::new(
+                keys.iter()
+                    .map(|k| k.trim())
+                    .filter(|k| !k.is_empty())
+                    .map(|k| (k.to_string(), NodeKeyFingerprint::of(k)))
+                    .collect(),
+            ),
         }
     }
 
@@ -105,7 +120,22 @@ impl NodeAuthConfig {
 
     /// Whether this credential is one of the configured node keys.
     pub fn accepts(&self, presented: &str) -> bool {
-        self.keys.iter().any(|key| secret_eq(key, presented))
+        self.accepted(presented).is_some()
+    }
+
+    /// Which configured key this credential is, if any.
+    ///
+    /// The whole list is walked whatever matches, so the time taken says
+    /// nothing about which entry, if any, was the right one.
+    pub fn accepted(&self, presented: &str) -> Option<NodeKeyFingerprint> {
+        let presented = presented.trim();
+        let mut found = None;
+        for (key, fingerprint) in self.keys.iter() {
+            if secret_eq(key, presented) && found.is_none() {
+                found = Some(fingerprint.clone());
+            }
+        }
+        found
     }
 }
 
@@ -154,10 +184,17 @@ pub(crate) fn presented_credentials(headers: &HeaderMap) -> Vec<&str> {
 /// would mean anyone who can reach this port can register a node - and a node
 /// on the fleet list is a delivery target that is handed every environment's
 /// decrypted secrets on its first assignment fetch.
+///
+/// The key the caller proved travels on to the handler as a
+/// [`ProvedNodeKey`] extension - its fingerprint, never the value. The
+/// registration handler records it, so that this control plane afterwards
+/// drives the registered address with the credential it actually held: during
+/// a rotation the list carries two values, and an address that proved the
+/// retiring one must not be handed its replacement.
 pub async fn node_auth(
     node_auth: axum::extract::State<NodeAuthConfig>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if node_auth.key_count() == 0 {
@@ -175,10 +212,11 @@ pub async fn node_auth(
             .into_response();
     }
 
-    if presented_credentials(&headers)
+    if let Some(proved) = presented_credentials(&headers)
         .into_iter()
-        .any(|credential| node_auth.accepts(credential))
+        .find_map(|credential| node_auth.accepted(credential))
     {
+        request.extensions_mut().insert(ProvedNodeKey(proved));
         return next.run(request).await;
     }
 
@@ -354,6 +392,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The handler behind this layer records which key the caller proved,
+    /// so the layer has to say which one it was - by fingerprint, and the
+    /// right one when the list carries two values at once.
+    #[test]
+    fn the_accepted_key_is_named_by_its_fingerprint() {
+        let config = NodeAuthConfig::new(vec!["new-key".to_string(), " old-key ".to_string()]);
+        assert_eq!(config.key_count(), 2);
+        assert_eq!(
+            config.accepted("old-key"),
+            Some(NodeKeyFingerprint::of("old-key")),
+            "the second value is proved as itself, not as the first"
+        );
+        assert_eq!(
+            config.accepted("new-key"),
+            Some(NodeKeyFingerprint::of("new-key"))
+        );
+        assert_eq!(config.accepted("other"), None);
+        assert!(!config.accepts(""));
+    }
+
+    /// The proved key reaches the handler as an extension, and only when
+    /// something was proved: a refused request runs no handler at all.
+    #[tokio::test]
+    async fn the_proved_key_travels_to_the_handler() {
+        use axum::{Extension, Router, routing::get};
+
+        async fn which(Extension(proved): Extension<ProvedNodeKey>) -> String {
+            proved.0.short()
+        }
+
+        let app = Router::new()
+            .route("/api/nodes/a/registration", get(which))
+            .layer(axum::middleware::from_fn_with_state(
+                NodeAuthConfig::new(vec!["new-key".to_string(), "old-key".to_string()]),
+                node_auth,
+            ));
+
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/nodes/a/registration")
+                    .header("Authorization", "Bearer old-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            NodeKeyFingerprint::of("old-key").short()
+        );
     }
 
     #[test]

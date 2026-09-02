@@ -1826,6 +1826,7 @@ mod tests {
                 "http://127.0.0.1:1",
                 None,
                 Utc::now() - chrono::Duration::hours(1),
+                crate::node_key::NodeKeyFingerprint::of("node-psk"),
             )
             .unwrap();
         assert_eq!(nodes.expire_stale_registrations(Utc::now()), ["node-b"]);
@@ -1840,19 +1841,31 @@ mod tests {
         let nodes = Arc::new(RuntimeNodeManager::new_with_ttl(Vec::new(), 15, 60));
         let now = Utc::now();
         nodes
-            .register_claim_with("node-a", "http://127.0.0.1:1", None, now, |_| async {
-                None
-            })
+            .register_claim_with(
+                "node-a",
+                "http://127.0.0.1:1",
+                None,
+                now,
+                crate::node_key::NodeKeyFingerprint::of("node-psk"),
+                |_| async { None },
+            )
             .await
             .unwrap();
         nodes
-            .register_claim_with("node-a", "http://127.0.0.2:1", None, now, |_| async {
-                Some(crate::runtime_client::NodeIdentity {
-                    node_id: "node-a".to_string(),
-                    hostname: "box-one".to_string(),
-                    uptime_seconds: 4_212,
-                })
-            })
+            .register_claim_with(
+                "node-a",
+                "http://127.0.0.2:1",
+                None,
+                now,
+                crate::node_key::NodeKeyFingerprint::of("node-psk"),
+                |_| async {
+                    Some(crate::runtime_client::NodeIdentity {
+                        node_id: "node-a".to_string(),
+                        hostname: "box-one".to_string(),
+                        uptime_seconds: 4_212,
+                    })
+                },
+            )
             .await
             .unwrap_err();
         assert_eq!(nodes.ids(), ["node-a".to_string()], "one id, two machines");
@@ -1976,7 +1989,13 @@ mod tests {
         );
 
         nodes
-            .register("node-b", "http://127.0.0.1:1", None, Utc::now())
+            .register(
+                "node-b",
+                "http://127.0.0.1:1",
+                None,
+                Utc::now(),
+                crate::node_key::NodeKeyFingerprint::of("node-psk"),
+            )
             .unwrap();
         assert!(nodes.departed().is_empty());
 

@@ -19,6 +19,15 @@
 //! Tasks are therefore derived state, keyed by `(app_id, environment)`,
 //! rebuilt from the catalog on every tick and never persisted: the catalog
 //! already is the record.
+//!
+//! One process fires. Two control planes on one database each derive the
+//! same task list, so without a rule each would fire every occurrence; the
+//! rule is a lease row in that database ([`lease`]), held by whichever
+//! process took it first and refreshed every tick. The others keep their
+//! task lists current and fire nothing until the holder stops refreshing or
+//! releases the row on shutdown.
+
+pub mod lease;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -198,6 +207,12 @@ pub enum RunOutcome {
     /// No node ran it at all. Every node that was tried said it could not,
     /// or could not be reached.
     NoNodeRan,
+    /// This control plane did not fire it because another control plane on
+    /// the same database holds the scheduler lease; that one fired it, or
+    /// will report what became of it. Recorded so this process's task list
+    /// moves past the occurrence and does not fire a backlog when it takes
+    /// over.
+    HeldElsewhere { holder: String },
 }
 
 impl RunOutcome {
@@ -207,7 +222,7 @@ impl RunOutcome {
             RunOutcome::Ran { node }
             | RunOutcome::HandlerFailed { node, .. }
             | RunOutcome::Unknown { node, .. } => Some(node),
-            RunOutcome::NoNodeRan => None,
+            RunOutcome::NoNodeRan | RunOutcome::HeldElsewhere { .. } => None,
         }
     }
 }
@@ -237,6 +252,17 @@ pub struct CronScheduler {
     /// Rotates which node is tried first, so repeated fires spread over
     /// the fleet instead of always loading the same node.
     rotation: AtomicUsize,
+    /// This process's name on the scheduler lease: process id plus a random
+    /// suffix, so two instances on one machine are told apart in the log.
+    holder_id: String,
+    /// How long the lease stays with a holder that has stopped refreshing
+    /// it. Three ticks: one tick of ordinary lateness must not hand the
+    /// schedule to another process, and a holder that has been gone for
+    /// three is gone.
+    lease_ttl: Duration,
+    /// Whether this process held the lease at the last tick, so the log
+    /// says so on the change and not on every tick. `None` before the first.
+    held_lease: std::sync::Mutex<Option<bool>>,
 }
 
 impl CronScheduler {
@@ -245,15 +271,103 @@ impl CronScheduler {
         nodes: Arc<RuntimeNodeManager>,
         tick_interval_secs: u64,
     ) -> Self {
+        // A cron expression has minute resolution, so ticking faster
+        // than once a minute only costs work; ticking slower would
+        // start to skip occurrences.
+        let tick_interval = Duration::from_secs(tick_interval_secs.clamp(1, 60));
         Self {
             store,
             nodes,
             tasks: Arc::new(DashMap::new()),
-            // A cron expression has minute resolution, so ticking faster
-            // than once a minute only costs work; ticking slower would
-            // start to skip occurrences.
-            tick_interval: Duration::from_secs(tick_interval_secs.clamp(1, 60)),
+            tick_interval,
             rotation: AtomicUsize::new(0),
+            holder_id: format!(
+                "pid{}-{}",
+                std::process::id(),
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ),
+            lease_ttl: tick_interval * 3,
+            held_lease: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// This process's name on the scheduler lease.
+    pub fn holder_id(&self) -> &str {
+        &self.holder_id
+    }
+
+    /// Whether this process fires at `now`, by taking or refreshing the
+    /// scheduler lease.
+    ///
+    /// `None` means the database could not say, which is reported and read
+    /// as "not this tick": nothing is fired and nothing is advanced, so the
+    /// occurrences stay due and fire on the next tick that can read the row.
+    /// Firing anyway would be the double fire this lease exists to prevent,
+    /// on exactly the day two processes share a struggling database.
+    async fn holds_lease(&self, now: DateTime<Utc>) -> Option<lease::LeaseState> {
+        let state = match lease::claim(
+            &self.store.database(),
+            &self.holder_id,
+            now.timestamp(),
+            self.lease_ttl.as_secs() as i64,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not read or write the scheduler lease, so this tick fires nothing; the occurrences that are due stay due and fire on the next tick that can reach the database"
+                );
+                return None;
+            }
+        };
+
+        let holds = state == lease::LeaseState::Held;
+        let previous = self
+            .held_lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(holds);
+        if previous != Some(holds) {
+            match &state {
+                lease::LeaseState::Held => info!(
+                    holder = %self.holder_id,
+                    lease_ttl_secs = self.lease_ttl.as_secs(),
+                    "This control plane holds the cron scheduler lease and fires scheduled occurrences; another control plane on the same database would take over {}s after this one stops refreshing it, or at once when this one stops cleanly",
+                    self.lease_ttl.as_secs()
+                ),
+                lease::LeaseState::HeldElsewhere {
+                    holder,
+                    refreshed_secs_ago,
+                } => warn!(
+                    holder = %holder,
+                    refreshed_secs_ago,
+                    this_instance = %self.holder_id,
+                    lease_ttl_secs = self.lease_ttl.as_secs(),
+                    "Another control plane holds the cron scheduler lease, so this instance fires no scheduled occurrence: it keeps its task list current and takes over {}s after that instance stops refreshing the lease. Two control planes on one database is the only way to get here; if it is not intended, stop one of them",
+                    self.lease_ttl.as_secs()
+                ),
+            }
+        }
+        Some(state)
+    }
+
+    /// Give the lease up on the way out, so a second control plane takes
+    /// over on its next tick rather than after the ttl.
+    async fn release_lease(&self) {
+        match lease::release(&self.store.database(), &self.holder_id).await {
+            Ok(true) => info!(
+                holder = %self.holder_id,
+                "Released the cron scheduler lease; another control plane on this database fires from its next tick"
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(
+                error = %e,
+                lease_ttl_secs = self.lease_ttl.as_secs(),
+                "Could not release the cron scheduler lease; another control plane on this database takes over {}s after this one's last refresh instead of at once",
+                self.lease_ttl.as_secs()
+            ),
         }
     }
 
@@ -286,6 +400,7 @@ impl CronScheduler {
                             tasks = scheduler.task_count(),
                             "Cron scheduler stopped for shutdown; no occurrence fires from this instance any more, and an occurrence that comes due while nothing is running is skipped rather than made up later"
                         );
+                        scheduler.release_lease().await;
                         return;
                     }
                     _ = ticker.tick() => {}
@@ -464,13 +579,23 @@ impl CronScheduler {
         }
     }
 
-    /// Fire everything that came due, one node per occurrence.
+    /// Fire everything that came due, one node per occurrence - if this
+    /// process holds the scheduler lease.
     ///
     /// `shutdown` is checked between occurrences, not inside one: a trigger
     /// that is already in flight is seen through to its answer so the run is
     /// recorded, while the occurrences behind it are left for the next
     /// instance to find due.
     async fn fire_due(&self, now: DateTime<Utc>, shutdown: &crate::shutdown::Shutdown) {
+        // Decided before anything is collected, and on every tick even when
+        // nothing is due: the claim is also the refresh that keeps the lease
+        // from expiring under a holder with an empty schedule.
+        let elsewhere = match self.holds_lease(now).await {
+            Some(lease::LeaseState::Held) => None,
+            Some(lease::LeaseState::HeldElsewhere { holder, .. }) => Some(holder),
+            None => return,
+        };
+
         // Collect first, then call. Holding a DashMap guard across an await
         // would block every other reader of the shard for the length of a
         // gRPC call.
@@ -500,6 +625,27 @@ impl CronScheduler {
             .collect();
 
         if due.is_empty() {
+            return;
+        }
+
+        if let Some(holder) = elsewhere {
+            // Not fired here, and not left due either: a task left in the
+            // past would fire the moment this process took the lease over,
+            // as a backlog of every occurrence the other process already ran.
+            debug!(
+                occurrences = due.len(),
+                holder = %holder,
+                "Occurrences came due while another control plane holds the scheduler lease; they are recorded as fired elsewhere and this instance moves past them"
+            );
+            for item in due {
+                self.record_run(
+                    &item,
+                    now,
+                    RunOutcome::HeldElsewhere {
+                        holder: holder.clone(),
+                    },
+                );
+            }
             return;
         }
 
@@ -812,6 +958,13 @@ mod tests {
     /// parameter - they only have to exist so that `call_order` returns them.
     async fn scheduler_with_nodes(ids: &[&str]) -> (Arc<CronScheduler>, Arc<CatalogStore>) {
         let database = Arc::new(Database::init(":memory:").await.unwrap());
+        scheduler_over(database, ids)
+    }
+
+    fn scheduler_over(
+        database: Arc<Database>,
+        ids: &[&str],
+    ) -> (Arc<CronScheduler>, Arc<CatalogStore>) {
         let store = Arc::new(CatalogStore::new(database));
         let nodes = Arc::new(RuntimeNodeManager::new(
             ids.iter()
@@ -908,6 +1061,98 @@ mod tests {
         deploy(&store, Some(env), &[]).await;
         scheduler.refresh().await;
         assert_eq!(scheduler.task_count(), 0);
+    }
+
+    /// The r9 finding: two control planes on one database each fired every
+    /// occurrence. Now one holds the lease and fires; the other keeps its
+    /// list current, records the occurrence as fired elsewhere, and fires
+    /// only once the holder releases the lease or stops refreshing it.
+    #[tokio::test]
+    async fn two_control_planes_on_one_database_fire_each_occurrence_once() {
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        // No nodes: a fired occurrence is recorded as `NoNodeRan`, which is
+        // enough to tell "this instance fired" from "this instance stood
+        // aside" without dialling anything.
+        let (first, store) = scheduler_over(Arc::clone(&database), &[]);
+        let (second, _) = scheduler_over(Arc::clone(&database), &[]);
+        deploy(&store, None, &["* * * * *"]).await;
+        first.refresh().await;
+        second.refresh().await;
+        let shutdown = crate::shutdown::Shutdown::new();
+
+        let outcome = |scheduler: &CronScheduler| {
+            scheduler.tasks_for("demo", "production")[0]
+                .last_outcome
+                .clone()
+        };
+        let due = |scheduler: &CronScheduler| scheduler.tasks_for("demo", "production")[0].next_run;
+
+        // Both tick on the same due occurrence. The first to claim fires.
+        let t1 = due(&first).unwrap() + chrono::Duration::seconds(1);
+        first.fire_due(t1, &shutdown).await;
+        second.fire_due(t1, &shutdown).await;
+        assert_eq!(outcome(&first), Some(RunOutcome::NoNodeRan));
+        assert_eq!(
+            outcome(&second),
+            Some(RunOutcome::HeldElsewhere {
+                holder: first.holder_id().to_string()
+            })
+        );
+        assert!(
+            due(&second).unwrap() > t1,
+            "the stand-aside instance moves past the occurrence rather than keeping it due"
+        );
+
+        // The holder keeps the lease tick after tick, and the other keeps
+        // standing aside - for longer than the ttl, because the holder
+        // refreshes.
+        let mut t = t1;
+        for _ in 0..5 {
+            t = due(&first).unwrap() + chrono::Duration::seconds(1);
+            first.fire_due(t, &shutdown).await;
+            second.fire_due(t, &shutdown).await;
+            assert_eq!(outcome(&first), Some(RunOutcome::NoNodeRan));
+            assert!(matches!(
+                outcome(&second),
+                Some(RunOutcome::HeldElsewhere { .. })
+            ));
+        }
+        assert!(
+            t - t1 > chrono::Duration::from_std(first.lease_ttl).unwrap(),
+            "the run outlasted the ttl and the holder kept the lease by refreshing it"
+        );
+
+        // The holder stops refreshing without releasing - crashed, or cut
+        // off. Inside the ttl the other still stands aside; past it, it
+        // takes over.
+        let t_inside = due(&second).unwrap() + chrono::Duration::seconds(1);
+        second.fire_due(t_inside, &shutdown).await;
+        assert!(matches!(
+            outcome(&second),
+            Some(RunOutcome::HeldElsewhere { .. })
+        ));
+        let t_past = t
+            + chrono::Duration::from_std(first.lease_ttl).unwrap()
+            + chrono::Duration::seconds(61);
+        second.fire_due(t_past, &shutdown).await;
+        assert_eq!(
+            outcome(&second),
+            Some(RunOutcome::NoNodeRan),
+            "the lease passed to the instance that is still ticking"
+        );
+        // And the old holder, if it comes back, is the one standing aside.
+        let t_back = due(&first).unwrap().max(t_past) + chrono::Duration::seconds(1);
+        first.fire_due(t_back, &shutdown).await;
+        assert!(matches!(
+            outcome(&first),
+            Some(RunOutcome::HeldElsewhere { ref holder }) if holder == second.holder_id()
+        ));
+
+        // A clean stop hands over at once.
+        second.release_lease().await;
+        let t_after = due(&first).unwrap().max(t_back) + chrono::Duration::seconds(1);
+        first.fire_due(t_after, &shutdown).await;
+        assert_eq!(outcome(&first), Some(RunOutcome::NoNodeRan));
     }
 
     #[tokio::test]

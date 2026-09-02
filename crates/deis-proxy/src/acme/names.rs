@@ -25,10 +25,34 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tracing::warn;
-
 use crate::catalog::table::CatalogRoutes;
 use crate::config::routes::RouteTable;
+
+/// A name that wanted a certificate and did not fit under the ceiling, with
+/// whose it is.
+///
+/// Returned by name rather than summed, because a count tells an operator
+/// that something is uncovered and not what: the name a tenant just added
+/// is one answer, the production domain that has quietly stopped renewing
+/// is another, and the log line for each pass has to be able to say which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedName {
+    pub name: String,
+    /// The application it came from, or this instance's own configuration.
+    pub owner: String,
+}
+
+/// What one pass will and will not hold certificates for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NameSelection {
+    /// The names the pass covers, in a stable order.
+    pub wanted: Vec<String>,
+    /// The names that wanted a certificate and did not fit, in a stable order.
+    pub dropped: Vec<DroppedName>,
+}
+
+/// The owner label for names out of this instance's own configuration.
+pub const OWN_CONFIGURATION: &str = "this instance's own configuration";
 
 /// Longest a DNS name can be, counting the dots (RFC 1035).
 const MAX_NAME_LEN: usize = 253;
@@ -117,6 +141,21 @@ pub fn desired_names(
     include_preview: bool,
     max: usize,
 ) -> Vec<String> {
+    select_names(routes, catalog, include_preview, max).wanted
+}
+
+/// [`desired_names`], plus every name that did not fit and whose it was.
+///
+/// The renewal pass logs the dropped names on every pass, not once: a name
+/// pushed out of the ceiling that already holds a certificate keeps being
+/// served until that certificate expires, and the day it does is weeks after
+/// the one warning at startup scrolled away.
+pub fn select_names(
+    routes: &RouteTable,
+    catalog: &CatalogRoutes,
+    include_preview: bool,
+    max: usize,
+) -> NameSelection {
     // The operator's own file wins twice over: a name they already placed a
     // certificate for is dropped entirely (ordering over it would spend a
     // rate limit on a certificate the handshake never selects, since a
@@ -150,15 +189,16 @@ pub fn desired_names(
     }
 
     let mut chosen: BTreeSet<String> = BTreeSet::new();
-    let mut dropped: BTreeMap<String, usize> = BTreeMap::new();
+    let mut dropped: Vec<DroppedName> = Vec::new();
 
     for name in &configured {
         if chosen.len() < max {
             chosen.insert(name.clone());
         } else {
-            *dropped
-                .entry("this instance's own configuration".to_string())
-                .or_default() += 1;
+            dropped.push(DroppedName {
+                name: name.clone(),
+                owner: OWN_CONFIGURATION.to_string(),
+            });
         }
     }
 
@@ -195,39 +235,20 @@ pub fn desired_names(
     }
 
     for (app, queue, taken) in queues {
-        let left = queue[taken.min(queue.len())..]
-            .iter()
-            .filter(|name| !chosen.contains(*name))
-            .count();
-        if left > 0 {
-            *dropped.entry(app).or_default() += left;
+        for name in &queue[taken.min(queue.len())..] {
+            if !chosen.contains(name) {
+                dropped.push(DroppedName {
+                    name: name.clone(),
+                    owner: app.clone(),
+                });
+            }
         }
     }
 
-    if !dropped.is_empty() {
-        let total: usize = dropped.values().sum();
-        let detail = dropped
-            .iter()
-            .map(|(owner, count)| format!("{owner}: {count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        warn!(
-            wanted = chosen.len() + total,
-            max,
-            dropped = total,
-            per_owner = %detail,
-            "more names want automatic certificates than tls.acme.max_names allows. The ceiling \
-             is shared: this instance's own configured names are taken first, and what is left \
-             goes round the applications one name each, so no single application can push the \
-             others out. The names that did not fit answer plain HTTP until the ceiling is \
-             raised. The ceiling is there because a certificate authority counts new certificates \
-             per registered domain per week and refuses every name under the domain once that is \
-             spent, production included. Raise max_names deliberately, or give the extra names one \
-             certificate placed by hand"
-        );
+    NameSelection {
+        wanted: chosen.into_iter().collect(),
+        dropped,
     }
-
-    chosen.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -460,6 +481,51 @@ mod tests {
                 .count(),
             2,
             "the flooding application gets its share of the ceiling and no more: {chosen:?}"
+        );
+    }
+
+    /// Every name that did not fit is handed back by name, with its owner,
+    /// so the pass can say on every pass which names it is not covering.
+    /// A count alone let a production domain drop out of renewal behind a
+    /// number that looked like a tenant's overflow.
+    #[test]
+    fn the_names_that_did_not_fit_are_reported_by_name_and_owner() {
+        let table = routes(
+            &[app(
+                "mine",
+                &["operator-a.example.com", "operator-b.example.com"],
+                &[],
+            )],
+            None,
+        );
+        let catalog = catalog(
+            r#"[{"app_id":"tenant","environment":"production","host":"aaa.example.com","path_prefix":"/"},
+                {"app_id":"tenant","environment":"production","host":"bbb.example.com","path_prefix":"/"}]"#,
+            "[]",
+            None,
+        );
+        let selection = select_names(&table, &catalog, false, 1);
+        assert_eq!(selection.wanted, vec!["operator-a.example.com".to_string()]);
+        assert_eq!(
+            selection.dropped,
+            vec![
+                DroppedName {
+                    name: "operator-b.example.com".to_string(),
+                    owner: OWN_CONFIGURATION.to_string(),
+                },
+                DroppedName {
+                    name: "aaa.example.com".to_string(),
+                    owner: "tenant".to_string(),
+                },
+                DroppedName {
+                    name: "bbb.example.com".to_string(),
+                    owner: "tenant".to_string(),
+                },
+            ]
+        );
+        assert!(
+            select_names(&table, &catalog, false, 20).dropped.is_empty(),
+            "a ceiling nobody presses against drops nothing"
         );
     }
 

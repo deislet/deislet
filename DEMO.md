@@ -215,8 +215,8 @@ API key 能不能从控制面领到那张令牌。
 
 ## verify 检查什么
 
-`./scripts/demo.sh verify` 分二十一组跑九十三项，每项打印它据以判断的证据。最后一行
-既是计数也是点名：`93 passed, 0 failed, 93 of the 93 checks this file lists`。后半句
+`./scripts/demo.sh verify` 分二十一组跑九十五项，每项打印它据以判断的证据。最后一行
+既是计数也是点名：`95 passed, 0 failed, 95 of the 95 checks this file lists`。后半句
 是必须的——前半句报不了「没跑的那一项」：从清单里删掉一次调用，绿色的一轮只是变短了
 一点，输出里没有任何一句话提到这件事。那个被对照的数字是 `scripts/demo.sh` 里的
 `VERIFY_EXPECTED_CHECKS`，加检查就得改它。
@@ -389,9 +389,11 @@ bash scripts/test-demo-witnesses.sh
 `demo.sh` 来跑（`bash scripts/test-demo-witnesses.sh <路径>`），所以「这以前是会挂的」
 是谁都能自己重跑一遍的事，不是提交信息里的一句声称。
 
-CI 会跑：`.github/workflows/checks.yml` 里除了文档路径那一项，还有这套用例、整个
+CI 按文件写的会跑：`.github/workflows/checks.yml` 里除了文档路径那一项，还有这套用例、整个
 workspace 的 fmt / clippy / build / test，以及一次完整的 `start` → `verify` → `stop`。
-先前这个文件里只有文档路径那一项，别的全靠谁记得在自己机器上跑一遍。
+先前这个文件里只有文档路径那一项，别的全靠谁记得在自己机器上跑一遍。带这几项作业的
+版本还没有推上去，所以还没有人见过它跑一次；在见到第一次运行之前，它说明的是「会查什么」，
+本文引用的数字都来自本机运行。
 
 ## verify 看不见什么
 
@@ -412,7 +414,7 @@ workspace 的 fmt / clippy / build / test，以及一次完整的 `start` → `v
 - **这台机器以外的平台**。一台主机、处处环回、一个桩 CA、一个 `python3` 起的上游冒充
   整个互联网。
 
-一轮绿色的 `verify` 该这么读：这九十三条主张，各自在那个布置下被验过一次。这比「能编
+一轮绿色的 `verify` 该这么读：这九十五条主张，各自在那个布置下被验过一次。这比「能编
 译」多得多，也不是上面任何一条的结论。
 
 ## 验证日志链路（手工）

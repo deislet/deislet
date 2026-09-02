@@ -4,6 +4,9 @@ use std::time::Duration;
 const DEFAULT_HEARTBEAT_INTERVAL: u64 = 30; // seconds
 const DEFAULT_REQUEST_TIMEOUT: u64 = 10; // seconds
 const DEFAULT_RETRY_COUNT: u32 = 3; // max 5
+/// Below this many characters a secret is accepted with a warning; see
+/// [`ControlConfig::secret_advisory`].
+pub const SECRET_ADVISORY_LEN: usize = 32;
 
 /// Control connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -48,23 +51,24 @@ impl ControlConfig {
         Duration::from_secs(self.request_timeout)
     }
 
-    /// Validate configuration
+    /// Validate configuration.
+    ///
+    /// The secret is refused only when it is blank. It used to have to be
+    /// exactly 64 hex characters, which is the shape of a generated key and
+    /// nothing else: deis-control accepts any non-blank value in
+    /// `node_preshared_keys`, and so does every runtime node, so a fleet
+    /// rotated to a value of another shape completed everywhere and then took
+    /// deis-proxy down at config load. The one side that refused was the
+    /// internet-facing one. What a short value costs is said by
+    /// [`Self::secret_advisory`], for the caller to log; it is not a reason to
+    /// refuse to start a process the rest of the fleet already agrees with.
     pub fn validate(&self) -> Result<(), String> {
         if self.associated_id.is_empty() {
             return Err("associated_id cannot be empty".to_string());
         }
 
-        if self.secret.is_empty() {
+        if self.secret.trim().is_empty() {
             return Err("secret cannot be empty".to_string());
-        }
-
-        // Secret should be a 64-character hexadecimal string
-        if self.secret.len() != 64 {
-            return Err("secret must be exactly 64 characters long".to_string());
-        }
-
-        if !self.secret.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err("secret must contain only hexadecimal characters".to_string());
         }
 
         if self.addr.is_empty() {
@@ -76,6 +80,22 @@ impl ControlConfig {
         }
 
         Ok(())
+    }
+
+    /// A warning about the secret's shape, when it deserves one.
+    ///
+    /// Anything shorter than [`SECRET_ADVISORY_LEN`] characters is accepted
+    /// and flagged: the control plane compares it in constant time and has no
+    /// lockout, so a short value is one an unauthenticated caller can guess
+    /// at the node endpoints. The documented way to make one is
+    /// `openssl rand -hex 32`, which is 64 characters.
+    pub fn secret_advisory(&self) -> Option<String> {
+        let len = self.secret.trim().chars().count();
+        (len < SECRET_ADVISORY_LEN).then(|| {
+            format!(
+                "the control secret is {len} characters long; it is accepted, but a value this short can be guessed at the control plane's node endpoints, which have no lockout - generate one with `openssl rand -hex 32` and set it on the control plane, every node and this proxy"
+            )
+        })
     }
 
     /// Build gRPC endpoint URL
@@ -200,39 +220,58 @@ mod tests {
         assert_eq!(result.unwrap_err(), "secret cannot be empty");
     }
 
+    /// The proxy accepts what the control plane accepts. deis-control takes
+    /// any non-blank `node_preshared_keys` value and its own deployment
+    /// guide shows a phrase, not hex; a proxy that refused that value was the
+    /// one process in the fleet that would not start on a rotation the rest
+    /// had already completed.
     #[test]
-    fn test_validation_invalid_secret_length() {
-        let config = ControlConfig::new(
+    fn a_secret_of_any_non_blank_shape_is_accepted() {
+        for secret in [
+            "your-random-key-here-change-me-in-production",
+            "g1h2i3j4k5l6m7n8o9p0q1r2s3t4u5v6w7x8y9z0a1b2c3d4e5f6g7h8i9j0k1l2",
+            VALID_SECRET,
+            "r9nodekey",
+        ] {
+            let config = ControlConfig::new(
+                "test-id".to_string(),
+                secret.to_string(),
+                "http://localhost:8080".to_string(),
+            );
+            assert_eq!(config.validate(), Ok(()), "{secret:?} must be accepted");
+        }
+
+        let blank = ControlConfig::new(
             "test-id".to_string(),
-            "short".to_string(),
+            "   ".to_string(),
             "http://localhost:8080".to_string(),
         );
-
-        let result = config.validate();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "secret must be exactly 64 characters long"
-        );
+        assert_eq!(blank.validate(), Err("secret cannot be empty".to_string()));
     }
 
+    /// A short value starts the process and is said out loud; a generated
+    /// one is not remarked on.
     #[test]
-    fn test_validation_invalid_secret_characters() {
-        let invalid_secret = "g1h2i3j4k5l6m7n8o9p0q1r2s3t4u5v6w7x8y9z0a1b2c3d4e5f6g7h8i9j0k1l2";
-        assert_eq!(invalid_secret.len(), 64);
-
-        let config = ControlConfig::new(
+    fn a_short_secret_is_flagged_and_a_generated_one_is_not() {
+        let short = ControlConfig::new(
             "test-id".to_string(),
-            invalid_secret.to_string(),
+            "r9nodekey".to_string(),
             "http://localhost:8080".to_string(),
         );
-
-        let result = config.validate();
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "secret must contain only hexadecimal characters"
+        let advisory = short.secret_advisory().expect("nine characters is short");
+        assert!(advisory.contains("9 characters"), "{advisory}");
+        assert!(advisory.contains("openssl rand -hex 32"), "{advisory}");
+        assert!(
+            !advisory.contains("r9nodekey"),
+            "the value itself is never in the log line"
         );
+
+        let generated = ControlConfig::new(
+            "test-id".to_string(),
+            VALID_SECRET.to_string(),
+            "http://localhost:8080".to_string(),
+        );
+        assert_eq!(generated.secret_advisory(), None);
     }
 
     #[test]

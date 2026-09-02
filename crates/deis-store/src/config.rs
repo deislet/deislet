@@ -119,6 +119,17 @@ pub struct Config {
     /// backups is not.
     #[serde(default = "default_snapshot_retention")]
     pub snapshot_retention: usize,
+    /// Whether the blob store's start-up sweep may delete content files no
+    /// metadata row references. Off by default: such a file is usually the
+    /// leftover of a crash between placing content and committing its row,
+    /// but it is also exactly what every object written after a metadata
+    /// snapshot looks like once that older snapshot is restored, and the
+    /// sweep cannot tell the two apart. Off, the sweep counts them and logs
+    /// the count at warn with this switch's name; turn it on for one start
+    /// after confirming the metadata is the newest copy, and turn it off
+    /// again.
+    #[serde(default)]
+    pub remove_orphaned_blob_content: bool,
 }
 
 fn default_listen() -> String {
@@ -198,6 +209,7 @@ impl Default for Config {
             snapshot_dir: None,
             snapshot_interval_secs: default_snapshot_interval_secs(),
             snapshot_retention: default_snapshot_retention(),
+            remove_orphaned_blob_content: false,
         }
     }
 }
@@ -212,6 +224,7 @@ impl Config {
             // on to stalled transfers.
             upload_idle_timeout: optional_seconds(self.upload_idle_timeout_secs),
             download_idle_timeout: optional_seconds(self.download_idle_timeout_secs),
+            remove_orphans_on_start: self.remove_orphaned_blob_content,
         }
     }
 

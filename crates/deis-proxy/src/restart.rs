@@ -484,6 +484,23 @@ pub async fn graceful_upgrade(args: &RelaunchArgs) -> Result<()> {
     let pid = child.id();
     match await_ready(ready).await {
         Ok(true) => {
+            // Give the control plane this instance's node id back first, so
+            // the replacement's registration is accepted instead of refused
+            // for an id whose holder the control plane still hears from. The
+            // sockets are the hand-over that matters, so a channel that will
+            // not close in time is noted and not waited for: the control
+            // plane gives it up after its heartbeat timeout either way.
+            let patience = std::time::Duration::from_secs(5);
+            if crate::control::client::release_control_channel_for_handover(patience).await {
+                info!(pid, "control channel released for the replacement process");
+            } else {
+                warn!(
+                    pid,
+                    "the control channel was not released within {}s; the replacement will be \
+                     refused registration until the control plane gives this channel up",
+                    patience.as_secs()
+                );
+            }
             info!(
                 pid,
                 "replacement process is ready; handing over listening sockets"

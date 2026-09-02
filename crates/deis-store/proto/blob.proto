@@ -50,6 +50,17 @@ service BlobStore {
   //
   // With `header.precondition` set the write happens only if the object is in
   // the state the caller requires; see Precondition.
+  //
+  // A single chunk over the service message ceiling (16 MiB) cannot be
+  // decoded at all; the call is answered with `success` false and an `error`
+  // naming the ceiling and the chunk size to use, and nothing is stored. That
+  // is the caller's protocol error, not a store fault, so it is not a status.
+  //
+  // A body is renamed into place under its digest before its metadata row is
+  // written. If the row write fails - a full disk refusing the commit is the
+  // usual way - the call fails and the content it placed is removed again, so
+  // a failed Put leaves nothing behind; a crash between the two is cleaned up
+  // by a sweep after the next start.
   rpc Put(stream PutRequest) returns (PutResponse);
 
   // Delete an object. Deleting a key that is already absent succeeds, unless

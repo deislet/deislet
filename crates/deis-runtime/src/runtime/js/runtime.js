@@ -1237,35 +1237,63 @@ function readableHeaders(request) {
 //
 // Nothing has to remember to clear anything, which is the whole point.
 //
-// # What this does not answer
+// # A continuation carries the statement it was written under
 //
 // A stretch is a stretch of the *node's* work, not of one piece of application
-// code. A promise an application leaves pending in one invocation and resolves
-// from another -- `new Promise(r => stash = r)` in one handler, `stash()` in
-// the next -- continues inside the second invocation's stretch and is read as
-// answering the second invocation's request. That is not the previous defect
-// coming back: nothing stale is inherited, and the request it is credited to is
-// one that is genuinely being served right now. But it is not the request the
-// continuation was written for either, and telling those apart needs the
-// continuation itself to carry the context, which is what a host promise hook
-// would give and this runtime does not have yet. The application is on both
-// sides of it -- it is its own code resuming its own code -- so what is at
-// stake is which of its own callers an entry is judged against, and the two
-// statements on the call (`forCaller`, `forAnyCaller`) are how an application
-// that does this says which.
+// code, and application code crosses stretches whenever it leaves a promise
+// pending: a service call fired and not awaited, a storage read whose answer
+// arrived after the handler returned, a WebSocket message listener that awaits
+// anything at all (its stretch ends when the listener's first synchronous run
+// does), `new Promise(r => stash = r)` in one handler and `stash()` in the
+// next. Every one of those resumes inside whichever invocation next pumps this
+// isolate's event loop, and reading the stretch alone credited it to *that*
+// invocation's request: nothing stale was inherited, the request was
+// genuinely being served -- and it was not the request the continuation was
+// written for. Measured: a handler answering a cookie-bearing request fired a
+// service call, cached its answer in the `.then`, and the entry was judged
+// against the anonymous request that happened to be running when the call came
+// back, stored, and served to that caller.
+//
+// So the statement travels with the code. V8's promise hooks
+// (`DenoCore.setPromiseHooks`, installed below) see every promise this isolate
+// creates and every reaction it runs: a promise remembers the statement in
+// force when it was made, and a reaction runs under the statement its promise
+// remembers, then puts back what was there before. An `await` is a promise
+// reaction too, so an async function resumes under the statement it suspended
+// under. The stretch number stays on the statement, and a statement is still
+// readable only inside the stretch it was made in -- what changed is which
+// statement a continuation reads. Alice's continuation inside Bob's invocation
+// reads Alice's statement, finds it stamped with a stretch that has ended, and
+// is told so; Bob's own code, running under Bob's statement in the same
+// stretch, is unaffected.
+//
+// What is deliberately *not* done is to honour a carried statement across
+// stretches -- to let Alice's continuation store an entry for Alice's request
+// from inside Bob's invocation. The work would run on Bob's budget and under
+// Bob's trace, which is the situation the sweep in `js/bootstrap.js` exists to
+// end rather than to license. The answer to "I need this to finish after the
+// response has gone out" is `context.waitUntil`, whose tail runs inside the
+// invocation that handed the work over.
+//
+// The hooks cost a WeakMap write per promise and a read per reaction, paid by
+// the application whose code creates them.
 
-// Nothing has said what this stretch of code is answering. The default, and
-// what every statement made in another stretch collapses to.
+// Nothing has said what this code is answering. The default, and what every
+// statement made in another stretch collapses to.
 const UNATTRIBUTED = null;
 
 // The runner said it answers no request at all.
 const NO_REQUEST = ObjectFreeze({ request: null });
 
-// The statement in force, and the stretch it was made in. `-1` is a number
-// `op_cache_invocation` never answers, so nothing is in force before the first
-// statement is made.
-let statedAnswer = UNATTRIBUTED;
-let statedIn = -1;
+// One statement: what was said, and the stretch it was said in. `-1` is a
+// number `op_cache_invocation` never answers, so `NOTHING_SAID` is readable in
+// no stretch at all.
+const NOTHING_SAID = ObjectFreeze({ answer: UNATTRIBUTED, stretch: -1 });
+
+// The statement in force for the code running right now: the one the entry
+// point of this stretch made, or the one the promise reaction now running
+// carried in with it.
+let inForce = NOTHING_SAID;
 
 // Which stretch of application code is running, as the node counts them.
 //
@@ -1280,8 +1308,7 @@ function stretchNow() {
 // holding the `Request`, or a statement carried over from the stretch that
 // created a socket or a response stream.
 function nowAnswering(answer) {
-  statedAnswer = answer;
-  statedIn = stretchNow();
+  inForce = ObjectFreeze({ answer, stretch: stretchNow() });
 }
 
 // A statement that this code answers the given `Request`.
@@ -1290,17 +1317,76 @@ function answerTo(request) {
 }
 
 // What the code now running is answering: `NO_REQUEST`, a record holding the
-// `Request`, or `UNATTRIBUTED` when nothing in this stretch has said.
-//
-// A statement made in another stretch is dropped here rather than merely
-// ignored, so that it cannot be read by anything later either.
+// `Request`, or `UNATTRIBUTED` when the statement in force was made in a
+// stretch that has ended, or nothing has said.
 function whatIsAnswered() {
-  if (statedIn !== stretchNow()) {
-    statedAnswer = UNATTRIBUTED;
-    statedIn = -1;
-  }
-  return statedAnswer;
+  return inForce.stretch === stretchNow() ? inForce.answer : UNATTRIBUTED;
 }
+
+// The statement in force when it cannot be read *and* the code running now is
+// a promise reaction that carried it in from a stretch that has ended. Null
+// otherwise: when the statement is this stretch's own, when nothing was ever
+// said, or when this is a stretch's top-level code rather than a continuation.
+//
+// The reaction test (`suspendedDepth > 0`) is what tells a real continuation
+// from a fresh stretch that merely inherited the module variable: `inForce`
+// is not cleared between stretches, so top-level code in a runner that stated
+// nothing would otherwise read the previous invocation's leftover statement
+// as though a continuation had carried it. A promise reaction runs between
+// the `before` and `after` hooks, which is exactly when `suspendedDepth` is
+// above zero.
+//
+// Only for saying why. Nothing decides anything on what comes back except the
+// wording of the refusal, which names the request the continuation was really
+// written for so its author can find the call that outlived its invocation.
+function statementCarriedIn() {
+  if (suspendedDepth === 0) return null;
+  if (inForce === NOTHING_SAID || inForce.stretch === stretchNow()) return null;
+  return inForce;
+}
+
+// The promise hooks that make a statement travel with the code written under
+// it; see the section header.
+//
+// `init` runs when a promise is created and files the statement in force
+// against it. `before` runs as a reaction job for that promise is about to
+// start, and puts the filed statement in force for the job; `after` restores
+// what was there. Reaction jobs do not nest -- one runs to completion before
+// the next starts -- so the stack below is one deep in practice, and it is a
+// stack only so that a job V8 terminates without running `after` cannot leave
+// the restore reading the wrong entry.
+//
+// A `WeakMap`, and one held in this closure, rather than a property on the
+// promise: a property is reachable through `Object.getOwnPropertySymbols`, and
+// an application that could write a statement onto a promise of its own
+// could make any continuation claim to answer nothing. The map's methods are
+// captured now for the reason every other native is in this file.
+const NativeWeakMap = WeakMap;
+const WeakMapPrototypeGet = WeakMap.prototype.get;
+const WeakMapPrototypeSet = WeakMap.prototype.set;
+const statementOfPromise = new NativeWeakMap();
+// Indexed by hand rather than through `push`/`pop`: those are looked up on
+// `Array.prototype`, which an application may replace, and these hooks run
+// inside V8's own promise machinery, where nothing of this file's may throw.
+const suspendedStatements = [];
+let suspendedDepth = 0;
+DenoCore.setPromiseHooks(
+  function statementOnInit(promise) {
+    WeakMapPrototypeSet.call(statementOfPromise, promise, inForce);
+  },
+  function statementOnBefore(promise) {
+    suspendedStatements[suspendedDepth++] = inForce;
+    const carried = WeakMapPrototypeGet.call(statementOfPromise, promise);
+    if (carried !== undefined) inForce = carried;
+  },
+  function statementOnAfter() {
+    if (suspendedDepth > 0) {
+      inForce = suspendedStatements[--suspendedDepth];
+      suspendedStatements[suspendedDepth] = undefined;
+    }
+  },
+  undefined
+);
 
 // The one name the Rust side calls to say that a stretch answers no request.
 // `runtime/isolate.rs` calls it at the top of the module-evaluation glue,
@@ -1768,6 +1854,31 @@ class Cache {
         // both directions -- too strict when the last request carried a
         // credential, and a disclosure when it did not.
         if (answering === UNATTRIBUTED) {
+          // The statement in force may be one a continuation carried in from
+          // an invocation that has ended: a service call or a storage read
+          // the handler did not await, a WebSocket listener's own awaits, a
+          // promise resolved from a later request. It is stale rather than
+          // absent, and the refusal says so and names the request it was
+          // really for, because the fix is at the call that outlived its
+          // invocation and not at this `put`.
+          const carried = statementCarriedIn();
+          if (carried !== null) {
+            const request = carried.answer === NO_REQUEST ? null : carried.answer.request;
+            const wrote = request === null
+              ? "code that answered no request (a queue batch, a cron tick, or the module's own top level)"
+              : "the handler answering " + cacheKeyMethod(request) + " " + request.url;
+            return notStored(
+              "this code continues an invocation that has already ended. It was " +
+                "written by " + wrote + " in stretch " + carried.stretch + " of this " +
+                "isolate's work, and it is running inside stretch " + stretchNow() +
+                ", which is answering something else; the statement it carries is " +
+                "stale, and an entry it stored here could not be judged against the " +
+                "request it was really for. A service call, a storage read or any " +
+                "other promise left pending when the handler returned resumes this " +
+                "way. Await the call, or hand it to context.waitUntil, so it " +
+                "finishes inside its own invocation"
+            );
+          }
           return notStored(
             "nothing here says what request this code is answering. A cache " +
               "entry is served whole to a later caller, and what decides " +
@@ -3432,21 +3543,32 @@ class ServiceBinding {
     // suspend, and the answer has to be which stretch is making the call *now*
     // rather than which one was running when the body started being collected.
     const body = await serviceBodyOf(this.#name, init, request);
-    const answer = await DenoCore.ops.op_deis_service_call(
-      this.#name,
-      {
-        method:
-          (init && init.method) ||
-          (request && typeof request.method === "string" ? request.method : "GET"),
-        url: serviceTargetOf(this.#name, input),
-        headers: serviceHeadersOf(init, request)
-      },
-      body,
-      // A service call spends the same allowance an outbound fetch does, so it
-      // has to say the same thing about whose allowance it is: the invocation's,
-      // or the response stream whose producer is making the call. See
-      // `runtime/ops.rs`.
-      StreamScope.scope()
+    const name = this.#name;
+    const call = {
+      method:
+        (init && init.method) ||
+        (request && typeof request.method === "string" ? request.method : "GET"),
+      url: serviceTargetOf(name, input),
+      headers: serviceHeadersOf(init, request)
+    };
+    // Under the guard an outbound fetch gets, so that a call the handler fired
+    // and never awaited ends with the stretch that made it -- at the end of
+    // the invocation, or of the response stream whose producer made it --
+    // instead of settling inside whichever invocation next runs in this
+    // isolate. See `bound` in `js/bootstrap.js`, and "A continuation carries
+    // the statement it was written under" above for what its continuation
+    // used to read when it did.
+    const answer = await StreamScope.bound(() =>
+      DenoCore.ops.op_deis_service_call(
+        name,
+        call,
+        body,
+        // A service call spends the same allowance an outbound fetch does, so
+        // it has to say the same thing about whose allowance it is: the
+        // invocation's, or the response stream whose producer is making the
+        // call. See `runtime/ops.rs`.
+        StreamScope.scope()
+      )
     );
     return new ResponseCtor(answer.body, {
       status: answer.status,

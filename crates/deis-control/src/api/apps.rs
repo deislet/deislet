@@ -44,6 +44,10 @@ fn node_error_response(e: &NodeError) -> (StatusCode, Json<serde_json::Value>) {
         NodeError::UnknownNode => StatusCode::NOT_FOUND,
         NodeError::Transport(_) => StatusCode::BAD_GATEWAY,
         NodeError::Rpc { .. } => StatusCode::BAD_GATEWAY,
+        // Nothing was dialled: the node is on the list but the key it
+        // proved is no longer one this control plane holds. Not the caller's
+        // fault and not a gateway failure - the node has to register again.
+        NodeError::KeyRetired { .. } => StatusCode::CONFLICT,
     };
     (status, Json(json!({ "error": e.to_string() })))
 }

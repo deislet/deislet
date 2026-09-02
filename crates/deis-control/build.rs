@@ -21,13 +21,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The deis-runtime protos are the single source of truth and live in the
-    // deis-runtime crate; only the client side is generated here.
+    // deis-runtime crate. The client side is what this binary uses.
     //
     // Two services are dialled from the control plane: management (deployment
     // delivery, status, health) and trigger (cron fires a scheduled event on
     // one chosen node).
+    //
+    // The server side is generated too, and nothing outside `#[cfg(test)]`
+    // touches it: the tests that check which credential this control plane
+    // presents to a node need a node that records what it was handed, and a
+    // stand-in built from the same proto is the only one whose answer means
+    // anything.
     tonic_build::configure()
-        .build_server(false)
+        .build_server(true)
         .build_client(true)
         .compile_protos(
             &[

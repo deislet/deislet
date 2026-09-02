@@ -31,7 +31,7 @@ node.
 the platform: an upstream for the example app's `fetch` to reach, and a
 loopback certificate authority for the ACME checks. It deploys an application
 with `deis deploy` — the same command a person would run, not a `curl` against
-the REST API — and then runs ninety-three checks in twenty-one groups,
+the REST API — and then runs ninety-five checks in twenty-one groups,
 printing the evidence for each. What they prove, by group — a few rows stand for two
 consecutive checks:
 
@@ -238,12 +238,13 @@ in, so the console asks for a key before it shows anything: paste the
 opens straight to the dashboard, because a caller on its own machine needs no
 credential there and there is none to ask for.
 
-The last line of a `verify` run is a tally and a roll call: `93 passed, 0
-failed, 93 of the 93 checks this file lists`. The second half is there because
+The last line of a `verify` run is a tally and a roll call: `95 passed, 0
+failed, 95 of the 95 checks this file lists`. The second half is there because
 the first half cannot report a check that did not run - a call deleted from
 the list turns a green run into a slightly shorter green run, and nothing in
 the output says so. The number the run is held to is `VERIFY_EXPECTED_CHECKS`
-in `scripts/demo.sh`, and adding a check means changing it.
+in `scripts/demo.sh` - that constant, not this paragraph, is where the count
+lives, and adding a check means changing it (and then this sentence).
 
 ### What a green `verify` is evidence of, and what it is not
 
@@ -274,19 +275,22 @@ construction, answer several other questions:
   everywhere, a stub certificate authority, and a `python3` origin standing
   in for the internet.
 
-Read a green run as: these ninety-three claims were each checked, once, in
+Read a green run as: these ninety-five claims were each checked, once, in
 that arrangement. It is a good deal more than a build that compiles, and it
 is not a statement about anything above.
 
 ### What runs without anyone remembering to
 
-`.github/workflows/checks.yml`, on every push to `main` and every pull
-request: the document-path check, the witness tests below, `cargo fmt
---check`, `cargo clippy -D warnings`, `cargo build --workspace`, `cargo test
---workspace`, and a full `start` → `verify` → `stop`. Until it grew those
+`.github/workflows/checks.yml` is written to run, on every push to `main` and
+every pull request: the document-path check, the witness tests below, `cargo
+fmt --check`, `cargo clippy -D warnings`, `cargo build --workspace`, `cargo
+test --workspace`, and a full `start` → `verify` → `stop`. Until it grew those
 jobs it held the document-path check alone, and nothing automatic had ever
 compiled this workspace, run its tests, or run the verification the project's
-claims are quoted from.
+claims are quoted from. Read that as a description of the file until a run of
+it has been seen: the version with those jobs has not yet been pushed, so no
+run has been observed, and every number quoted in this document is from a
+local run. The first push that carries it is the one to watch.
 
 ```bash
 bash scripts/test-demo-witnesses.sh    # unit tests for verify itself; no demo needed

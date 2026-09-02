@@ -33,6 +33,14 @@ pub const LETS_ENCRYPT_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/
 
 /// Directory holding the account key and the issued certificates, relative
 /// to the directory deis-proxy was started from unless it is absolute.
+///
+/// Two processes may point at one directory - the two halves of a
+/// zero-downtime upgrade do - and the renewal pass holds a lock in it while
+/// it runs, so only one of them orders at a time; the other skips its pass
+/// and finds the result on disk. The directory has to be writable by this
+/// process for a name to be ordered at all: the pass checks that before it
+/// asks the authority for anything, because an order is counted against the
+/// domain's weekly allowance whether or not its result can be kept.
 pub const DEFAULT_ACME_STORAGE_DIR: &str = "acme";
 /// Renew once a certificate has less than this many days left. Thirty days
 /// on a ninety day certificate leaves room for a month of failed attempts
@@ -58,6 +66,12 @@ pub const DEFAULT_MAX_RETRY_BACKOFF_SECS: u64 = 6 * 60 * 60;
 /// plane fault, a preview zone that ran away - must not turn into hundreds
 /// of orders, because exhausting that limit stops issuance for *every* name
 /// under the domain, production included, for a week.
+///
+/// A name that does not fit is neither obtained nor renewed. Whatever
+/// certificate it already holds is served until it expires, and from then
+/// on the name answers plain HTTP with no redirect; every renewal pass names
+/// each such host at warn, so the day the ceiling was hit is not the last
+/// time the log mentions it.
 pub const DEFAULT_MAX_NAMES: usize = 20;
 /// Ceiling on one HTTP exchange with the authority.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;

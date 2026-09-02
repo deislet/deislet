@@ -22,14 +22,39 @@
 //! [`super::challenge`], and is not. During a zero-downtime upgrade two
 //! processes are alive at once and the outgoing one still owns the listening
 //! sockets, so the authority's fetch can land on the process that did not
-//! create the order. Both read this directory, so either can answer.
+//! create the order. Both read this directory, so either can answer. Each
+//! answer file records the name it was published for on its first line, so
+//! the process answering can refuse a fetch that arrives under another host.
+//!
+//! # Two processes on one store
+//!
+//! Two processes *reading* one store is the upgrade case above and is
+//! supported. Two processes *writing* one store - two proxies pointed at the
+//! same `storage_dir`, or the outgoing and incoming halves of an upgrade
+//! both running a renewal pass - is held to one writer at a time by two
+//! advisory locks, both released by the kernel if the holder dies:
+//!
+//! * `renewal.lock` at the authority level is taken for the whole of a
+//!   renewal pass, without waiting. A pass that finds it held skips, says so,
+//!   and re-reads the store later: whatever the other writer ordered is then
+//!   found on disk and not ordered again.
+//! * `.lock` beside each certificate pair is held while the key and the chain
+//!   are renamed into place, and taken shared by every reader of the pair, so
+//!   a reader never sees one writer's key beside another writer's chain.
+//!
+//! A key beside a chain it does not match is still possible after a crash
+//! between the two renames; it is caught when the pair is read
+//! ([`super::stored_certificate`] checks that the key matches) and the pair
+//! is ordered again.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use nix::fcntl::{Flock, FlockArg};
 use tracing::{debug, warn};
 
 use super::account::AccountKey;
@@ -43,6 +68,25 @@ const CERTIFICATES_DIR: &str = "certificates";
 const CHALLENGES_DIR: &str = "challenges";
 const CHAIN_FILE: &str = "fullchain.pem";
 const KEY_FILE: &str = "privkey.pem";
+/// Held while a pair is written, shared while it is read. Beside the pair
+/// rather than inside it, and dot-prefixed so it never reads as a name.
+const PAIR_LOCK_FILE: &str = ".lock";
+/// Held by the one process running a renewal pass on this authority's store.
+const RENEWAL_LOCK_FILE: &str = "renewal.lock";
+
+/// A lock a renewal pass holds while it runs. Dropping it releases the
+/// store to the next writer; so does the process dying.
+pub struct RenewalLock {
+    _file: Flock<File>,
+}
+
+/// A published `http-01` answer as the store records it: the name the
+/// order was for, and the value the authority expects to read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedChallenge {
+    pub name: String,
+    pub key_authorization: String,
+}
 
 /// The files one authority's certificates live in.
 pub struct AcmeStore {
@@ -147,19 +191,93 @@ impl AcmeStore {
     /// first: a chain with no key beside it is refused when it is loaded and
     /// simply reissued, while a key with no chain would be a private key
     /// lying around for a certificate that does not exist.
+    ///
+    /// The pair lock is held from before the first rename to after the
+    /// second, and [`read_certificate_pair`] takes it shared, so a reader in
+    /// any process sees the old pair or the new pair and never a key from one
+    /// beside a chain from the other.
     pub fn save_certificate(
         &self,
         name: &str,
         chain_pem: &[u8],
         key_pem: &[u8],
     ) -> Result<(), AcmeError> {
+        self.save_certificate_observed(name, chain_pem, key_pem, || {})
+    }
+
+    /// [`Self::save_certificate`] with a hook called between the two
+    /// renames, while the pair lock is held. The hook is how a test proves
+    /// the lock really spans both files; production passes a no-op.
+    fn save_certificate_observed(
+        &self,
+        name: &str,
+        chain_pem: &[u8],
+        key_pem: &[u8],
+        between_renames: impl FnOnce(),
+    ) -> Result<(), AcmeError> {
         let dir = self.certificate_dir(name);
         fs::create_dir_all(&dir)
             .map_err(|e| AcmeError::Storage(format!("creating {}: {e}", dir.display())))?;
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        let lock = lock_pair(&dir, FlockArg::LockExclusive)?;
         write_atomic(&dir.join(KEY_FILE), key_pem, 0o600)?;
+        between_renames();
         write_atomic(&dir.join(CHAIN_FILE), chain_pem, 0o644)?;
+        drop(lock);
         Ok(())
+    }
+
+    /// Whether a certificate for `name` could be written right now.
+    ///
+    /// Asked before an order is placed, because the order is the expensive
+    /// half: the authority counts a certificate against the domain's weekly
+    /// allowance the moment it signs it, and a store that cannot take the
+    /// result turns every retry into one more certificate spent for nothing.
+    /// The probe writes and removes a file in the directory the pair would
+    /// land in, and checks that neither target is something a rename cannot
+    /// replace, which is what a directory left in a file's place is.
+    pub fn probe_writable(&self, name: &str) -> Result<(), AcmeError> {
+        let dir = self.certificate_dir(name);
+        fs::create_dir_all(&dir)
+            .map_err(|e| AcmeError::Storage(format!("creating {}: {e}", dir.display())))?;
+        for target in [dir.join(KEY_FILE), dir.join(CHAIN_FILE)] {
+            if target.exists() && !target.is_file() {
+                return Err(AcmeError::Storage(format!(
+                    "{} exists and is not a file, so a certificate cannot be renamed over it",
+                    target.display()
+                )));
+            }
+        }
+        let probe = temporary_path(&dir.join(".probe"));
+        fs::write(&probe, b"probe")
+            .map_err(|e| AcmeError::Storage(format!("writing {}: {e}", probe.display())))?;
+        fs::remove_file(&probe)
+            .map_err(|e| AcmeError::Storage(format!("removing {}: {e}", probe.display())))?;
+        Ok(())
+    }
+
+    /// Take the store's renewal lock, or learn that another process holds it.
+    ///
+    /// `Ok(None)` is the other-process answer and is not an error: the caller
+    /// skips its pass and re-reads the store later. Anything else that stops
+    /// the lock being taken is a storage fault and is returned as one.
+    pub fn try_renewal_lock(&self) -> Result<Option<RenewalLock>, AcmeError> {
+        let path = self.root.join(RENEWAL_LOCK_FILE);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| AcmeError::Storage(format!("opening {}: {e}", path.display())))?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(file) => Ok(Some(RenewalLock { _file: file })),
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+            Err((_, e)) => Err(AcmeError::Storage(format!(
+                "locking {}: {e}",
+                path.display()
+            ))),
+        }
     }
 
     /// Every name this store holds a complete pair of files for.
@@ -214,15 +332,22 @@ impl AcmeStore {
     }
 
     /// Publish an answer where any process serving these sockets can find it.
-    pub fn publish_challenge(&self, token: &str, key_authorization: &str) -> Result<(), AcmeError> {
+    ///
+    /// The file carries the name first and the answer second, one per line.
+    /// The name is what lets the process that answers refuse a fetch for the
+    /// same token under a different host; a file with no name line is not
+    /// one this code wrote and is not answered.
+    pub fn publish_challenge(
+        &self,
+        name: &str,
+        token: &str,
+        key_authorization: &str,
+    ) -> Result<(), AcmeError> {
         let dir = self.root.join(CHALLENGES_DIR);
         fs::create_dir_all(&dir)
             .map_err(|e| AcmeError::Storage(format!("creating {}: {e}", dir.display())))?;
-        write_atomic(
-            &self.challenge_path(token),
-            key_authorization.as_bytes(),
-            0o644,
-        )
+        let contents = format!("{name}\n{key_authorization}");
+        write_atomic(&self.challenge_path(token), contents.as_bytes(), 0o644)
     }
 
     /// The published answer for a token, if this token was published here.
@@ -231,11 +356,26 @@ impl AcmeStore {
     /// token may use; this is the second check, because the value reaching
     /// it comes from a request path and one missing check here is a file
     /// read chosen by whoever sent the request.
-    pub fn published_challenge(&self, token: &str) -> Option<String> {
+    pub fn published_challenge(&self, token: &str) -> Option<PublishedChallenge> {
         if !is_challenge_token(token) {
             return None;
         }
-        fs::read_to_string(self.challenge_path(token)).ok()
+        let text = fs::read_to_string(self.challenge_path(token)).ok()?;
+        let (name, key_authorization) = text.split_once('\n')?;
+        let name = name.trim();
+        let key_authorization = key_authorization.trim();
+        if !is_certifiable_name(name) || key_authorization.is_empty() {
+            debug!(
+                token,
+                "a file in the challenge directory does not have the shape this store writes and \
+                 is not answered"
+            );
+            return None;
+        }
+        Some(PublishedChallenge {
+            name: name.to_string(),
+            key_authorization: key_authorization.to_string(),
+        })
     }
 
     pub fn withdraw_challenge(&self, token: &str) {
@@ -333,6 +473,71 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<(), AcmeError> {
     write_atomic(path, contents, 0o600)
 }
 
+/// Read a certificate pair as one unit.
+///
+/// Takes the pair lock shared for the duration of both reads, so a writer
+/// in another process - which holds it exclusively across both of its
+/// renames - can never be caught between them. Without the lock, the two
+/// reads were two independent snapshots, and the key from one writer beside
+/// the chain from another read as a pair that did not match. The lock file
+/// is created if it is missing; a pair somebody placed by hand has none.
+pub fn read_certificate_pair(config: &CertificateConfig) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    let chain = Path::new(&config.cert_file);
+    let key = Path::new(&config.key_file);
+    // Best effort: a directory that cannot take a lock file - read-only
+    // media, say - still has readable files in it, and refusing to read
+    // them would turn a missing lock into a missing certificate.
+    let _lock = chain
+        .parent()
+        .and_then(|dir| lock_pair(dir, FlockArg::LockShared).ok());
+    Ok((fs::read(chain)?, fs::read(key)?))
+}
+
+/// Take the pair lock in `dir`: exclusive for a writer, shared for a reader.
+fn lock_pair(dir: &Path, how: FlockArg) -> Result<Flock<File>, AcmeError> {
+    let path = dir.join(PAIR_LOCK_FILE);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| AcmeError::Storage(format!("opening {}: {e}", path.display())))?;
+    Flock::lock(file, how)
+        .map_err(|(_, e)| AcmeError::Storage(format!("locking {}: {e}", path.display())))
+}
+
+/// Whether the pair lock in `dir` is currently held exclusively by someone.
+///
+/// For tests: the question "is a writer inside its two renames right now"
+/// asked without waiting.
+#[cfg(test)]
+fn pair_is_locked_for_writing(dir: &Path) -> bool {
+    lock_pair(dir, FlockArg::LockSharedNonblock).is_err()
+}
+
+/// A temporary name beside `path` that no other writer - in this process or
+/// another one - is using at the same time.
+///
+/// The process id keeps two processes apart and the counter keeps two
+/// writes in one process apart. A fixed `.<file>.tmp` was how a second
+/// writer truncated the first writer's temporary file from under it, so the
+/// first writer's rename then failed with a file-not-found that said nothing
+/// about the other process.
+fn temporary_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("acme"),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// Write `contents` to `path` through a temporary file in the same directory.
 ///
 /// The rename is what makes it atomic: a reader either sees the previous
@@ -346,12 +551,7 @@ fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), AcmeError
         .ok_or_else(|| AcmeError::Storage(format!("{} has no parent directory", path.display())))?;
     fs::create_dir_all(parent)
         .map_err(|e| AcmeError::Storage(format!("creating {}: {e}", parent.display())))?;
-    let temporary = parent.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("acme")
-    ));
+    let temporary = temporary_path(path);
 
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -369,13 +569,16 @@ fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), AcmeError
         .map_err(|e| AcmeError::Storage(format!("flushing {}: {e}", temporary.display())))?;
     drop(file);
 
-    fs::rename(&temporary, path).map_err(|e| {
-        AcmeError::Storage(format!(
+    if let Err(e) = fs::rename(&temporary, path) {
+        // Nothing else will ever rename this file; leaving it would be a
+        // key on disk with no certificate, or a chain nobody serves.
+        let _ = fs::remove_file(&temporary);
+        return Err(AcmeError::Storage(format!(
             "renaming {} to {}: {e}",
             temporary.display(),
             path.display()
-        ))
-    })?;
+        )));
+    }
     // `mode` is what the file is created with, but an existing file being
     // replaced keeps whatever it had; set it explicitly so a key written
     // once with a loose umask does not stay loose.
@@ -527,10 +730,15 @@ mod tests {
     fn a_published_answer_is_readable_and_a_traversal_is_not() {
         let temp = tempfile::tempdir().unwrap();
         let store = store(temp.path(), "https://ca.test/dir");
-        store.publish_challenge("tok-1_A", "tok-1_A.thumb").unwrap();
+        store
+            .publish_challenge("shop.example.com", "tok-1_A", "tok-1_A.thumb")
+            .unwrap();
         assert_eq!(
             store.published_challenge("tok-1_A"),
-            Some("tok-1_A.thumb".to_string())
+            Some(PublishedChallenge {
+                name: "shop.example.com".to_string(),
+                key_authorization: "tok-1_A.thumb".to_string(),
+            })
         );
         assert_eq!(store.published_challenge("tok-2"), None);
 
@@ -547,14 +755,32 @@ mod tests {
     }
 
     #[test]
+    fn a_file_planted_in_the_challenge_directory_is_not_an_answer() {
+        // Anything under the challenge directory used to be served for any
+        // token-shaped path, whoever wrote it. An answer this store writes
+        // names the host it is for on its first line; a file without that
+        // line was not written by this code and is not answered.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path(), "https://ca.test/dir");
+        fs::write(store.challenge_path("planted"), "planted").unwrap();
+        assert_eq!(store.published_challenge("planted"), None);
+        fs::write(store.challenge_path("planted2"), "not a host name\nx").unwrap();
+        assert_eq!(store.published_challenge("planted2"), None);
+    }
+
+    #[test]
     fn a_spent_answer_is_withdrawn_and_a_forgotten_one_is_swept() {
         let temp = tempfile::tempdir().unwrap();
         let store = store(temp.path(), "https://ca.test/dir");
-        store.publish_challenge("tok-1", "answer").unwrap();
+        store
+            .publish_challenge("shop.example.com", "tok-1", "answer")
+            .unwrap();
         store.withdraw_challenge("tok-1");
         assert_eq!(store.published_challenge("tok-1"), None);
 
-        store.publish_challenge("tok-2", "answer").unwrap();
+        store
+            .publish_challenge("shop.example.com", "tok-2", "answer")
+            .unwrap();
         assert_eq!(
             store.sweep_challenges(Duration::from_secs(3600)),
             0,
@@ -562,6 +788,108 @@ mod tests {
         );
         assert_eq!(store.sweep_challenges(Duration::ZERO), 1);
         assert_eq!(store.published_challenge("tok-2"), None);
+    }
+
+    #[test]
+    fn the_pair_lock_is_held_from_the_first_rename_to_the_second() {
+        // Two files renamed one after the other are two moments a reader
+        // can land between. The lock is what turns them into one moment for
+        // every reader that takes it, in this process or another; if it were
+        // released between the renames - or never taken - a reader would see
+        // the new key beside the old chain, which is a pair that does not
+        // match and used to be reordered for it.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path(), "https://ca.test/dir");
+        let dir = store.certificate_dir("shop.example.com");
+        let mut observed_locked = None;
+        store
+            .save_certificate_observed("shop.example.com", b"chain", b"key", || {
+                observed_locked = Some(pair_is_locked_for_writing(&dir));
+            })
+            .unwrap();
+        assert_eq!(
+            observed_locked,
+            Some(true),
+            "between the key rename and the chain rename the pair must be locked against readers"
+        );
+        assert!(
+            !pair_is_locked_for_writing(&dir),
+            "once both files are in place the lock must be released"
+        );
+        let config = store.certificate_config("shop.example.com");
+        assert_eq!(
+            read_certificate_pair(&config).unwrap(),
+            (b"chain".to_vec(), b"key".to_vec())
+        );
+    }
+
+    #[test]
+    fn one_renewal_pass_at_a_time_per_store() {
+        // The second writer is another process in real life - a second
+        // proxy on the same storage directory, or the outgoing half of an
+        // upgrade still in its pass. Both would otherwise decide the same
+        // name was due and order it twice.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path(), "https://ca.test/dir");
+        let other = AcmeStore::new(temp.path(), "https://ca.test/dir");
+
+        let held = store.try_renewal_lock().unwrap();
+        assert!(held.is_some(), "the first writer takes the lock");
+        assert!(
+            other.try_renewal_lock().unwrap().is_none(),
+            "a second writer must be told the store is being renewed, not given the lock"
+        );
+        drop(held);
+        assert!(
+            other.try_renewal_lock().unwrap().is_some(),
+            "the lock is free again once the pass that held it is over"
+        );
+    }
+
+    #[test]
+    fn two_writes_never_share_a_temporary_name() {
+        // With one fixed name, a second writer truncated the first writer's
+        // temporary file and the first writer's rename failed with a
+        // not-found that pointed nowhere near the cause.
+        let path = Path::new("/store/certificates/shop.example.com/privkey.pem");
+        let first = temporary_path(path);
+        let second = temporary_path(path);
+        assert_ne!(first, second);
+        let pid = std::process::id().to_string();
+        for temporary in [&first, &second] {
+            let name = temporary.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with(".privkey.pem."), "{name}");
+            assert!(name.contains(&pid), "{name} does not carry the process id");
+            assert!(name.ends_with(".tmp"), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_target_a_rename_cannot_replace_is_found_before_anything_is_ordered() {
+        // A directory where a file should be is the one shape a rename cannot
+        // recover from, and the probe has to say so before the authority is
+        // asked for anything.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path(), "https://ca.test/dir");
+        assert!(store.probe_writable("shop.example.com").is_ok());
+        let dir = store.certificate_dir("shop.example.com");
+        fs::create_dir_all(dir.join(KEY_FILE)).unwrap();
+        let error = store
+            .probe_writable("shop.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("privkey.pem"), "{error}");
+        assert!(error.contains("not a file"), "{error}");
+        // And a probe leaves nothing behind.
+        fs::remove_dir(dir.join(KEY_FILE)).unwrap();
+        store.probe_writable("shop.example.com").unwrap();
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".probe"))
+            .collect();
+        assert!(left.is_empty(), "the probe left {left:?} behind");
     }
 
     #[test]

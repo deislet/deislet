@@ -41,6 +41,20 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 // of, which is what an upgrade actually happens to.
 // ----------------------------------------------------------------------
 
+/// Copies of the binary and spawns of it never overlap across this binary's
+/// test threads.
+///
+/// Without this the suite failed now and then with `ExecutableFileBusy` on
+/// `spawn`, only when run beside the rest of the workspace. The mechanism is
+/// fork's: while one thread is inside `fs::copy` with a destination open for
+/// writing, another thread forks to exec *its own* copy, and the child holds
+/// every open descriptor of the process - the first thread's write handle
+/// included - until its exec closes them. A third thread whose exec lands in
+/// that window finds its file "open for writing" by a process that is about
+/// to exec something else, and the kernel answers ETXTBSY. Serialising copy
+/// and spawn removes the overlap; nothing else in the test changes.
+static COPY_OR_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A running `deis-proxy` started from a *copy* of the binary.
 ///
 /// The copy is the point of the whole struct: an upgrade is only an upgrade
@@ -69,9 +83,13 @@ impl Instance {
     async fn start(upstream: SocketAddr, ports: &[u16]) -> Instance {
         let dir = tempfile::tempdir().expect("a directory for the proxy");
         let binary = dir.path().join("deis-proxy");
-        std::fs::copy(Proxy::binary_path(), &binary).expect("a private copy of the proxy binary");
         let config = dir.path().join("deis-proxy.toml");
         let log = dir.path().join("deis-proxy-error.log");
+        // Copying and spawning under one lock: see `COPY_OR_SPAWN`.
+        let serial = COPY_OR_SPAWN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::fs::copy(Proxy::binary_path(), &binary).expect("a private copy of the proxy binary");
         let mut instance = Instance {
             addr: SocketAddr::from(([127, 0, 0, 1], ports[0])),
             binary,
@@ -82,6 +100,7 @@ impl Instance {
         };
         instance.write_config(upstream, ports);
         instance.child = instance.spawn();
+        drop(serial);
         instance.wait_until_answering().await;
         instance
     }
@@ -138,6 +157,9 @@ impl Instance {
     /// file that is being executed - so this is not one way of several, it is
     /// the only shape a real upgrade ever has.
     fn install_new_build(&self) -> u64 {
+        let _serial = COPY_OR_SPAWN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let staged = self.dir.path().join("deis-proxy.new");
         std::fs::copy(Proxy::binary_path(), &staged).expect("a new build is staged");
         std::fs::rename(&staged, &self.binary).expect("the new build is installed");

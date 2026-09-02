@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use pingora::connectors::http::Connector;
 use pingora::http::RequestHeader;
+use pingora::protocols::http::client::HttpSession;
 use pingora::upstreams::peer::HttpPeer;
 use tokio::time::timeout;
 
@@ -187,6 +188,51 @@ impl AcmeHttp {
         }
     }
 
+    /// Connect to the first of `addrs` that accepts, in the order the
+    /// resolver gave them.
+    ///
+    /// An authority publishes both address families, and a host with an
+    /// IPv6 route that is configured and broken sees every connection to the
+    /// first address time out. Taking only the first address made every
+    /// request fail after `request_timeout` with no fallback to the address
+    /// that would have worked; the failure line named the authority and
+    /// nothing else. Each address gets one attempt, and when none accepts
+    /// the error lists every attempt so the broken route is visible.
+    async fn connect_any(
+        &self,
+        authority: &str,
+        addrs: &[SocketAddr],
+        tls: bool,
+        sni: &str,
+    ) -> Result<HttpSession, AcmeError> {
+        let mut failures = Vec::new();
+        for addr in addrs {
+            let mut peer = HttpPeer::new(*addr, tls, sni.to_string());
+            peer.options.connection_timeout = Some(self.request_timeout);
+            peer.options.read_timeout = Some(self.request_timeout);
+            peer.options.write_timeout = Some(self.request_timeout);
+            match self.connector.get_http_session(&peer).await {
+                Ok((session, _reused)) => return Ok(session),
+                Err(e) => {
+                    if addrs.len() > 1 {
+                        tracing::debug!(
+                            authority,
+                            %addr,
+                            error = %e,
+                            "one of the authority's addresses did not accept a connection; \
+                             trying the next"
+                        );
+                    }
+                    failures.push(format!("{addr}: {e}"));
+                }
+            }
+        }
+        Err(AcmeError::transport(
+            format!("connecting to {authority}"),
+            failures.join(" | "),
+        ))
+    }
+
     async fn request_inner(
         &self,
         method: &str,
@@ -197,32 +243,25 @@ impl AcmeHttp {
         let authority = target.authority();
         let context = format!("{method} {url}");
 
-        let addr: SocketAddr = tokio::net::lookup_host(authority.as_str())
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(authority.as_str())
             .await
             .map_err(|e| AcmeError::transport(format!("resolving {authority}"), e))?
-            .next()
-            .ok_or_else(|| {
-                AcmeError::transport(
-                    format!("resolving {authority}"),
-                    "it resolved to no address",
-                )
-            })?;
+            .collect();
+        if addrs.is_empty() {
+            return Err(AcmeError::transport(
+                format!("resolving {authority}"),
+                "it resolved to no address",
+            ));
+        }
 
         let sni = if target.tls {
             target.host.clone()
         } else {
             String::new()
         };
-        let mut peer = HttpPeer::new(addr, target.tls, sni);
-        peer.options.connection_timeout = Some(self.request_timeout);
-        peer.options.read_timeout = Some(self.request_timeout);
-        peer.options.write_timeout = Some(self.request_timeout);
-
-        let (mut session, _reused) = self
-            .connector
-            .get_http_session(&peer)
-            .await
-            .map_err(|e| AcmeError::transport(format!("connecting to {authority}"), e))?;
+        let mut session = self
+            .connect_any(&authority, &addrs, target.tls, &sni)
+            .await?;
 
         let mut request = RequestHeader::build(method, target.path.as_bytes(), None)
             .map_err(|e| AcmeError::transport(context.clone(), e))?;
@@ -364,6 +403,45 @@ mod tests {
         assert_eq!(response.header("Replay-Nonce"), Some("abc"));
         assert_eq!(response.header("LOCATION"), Some("https://ca/acct/1"));
         assert_eq!(response.header("link"), None);
+    }
+
+    #[tokio::test]
+    async fn every_resolved_address_is_tried_before_the_authority_is_given_up_on() {
+        // The shape of a host with a broken IPv6 route: the first address the
+        // resolver returns does not answer, the second does. Only the first
+        // used to be tried, so the second never got a chance and every
+        // request failed with a timeout that named nothing but the authority.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.is_ok() });
+        // Port 1 is tcpmux, which nothing on a modern host listens on, so the
+        // connection is refused at once rather than timing out.
+        let refusing: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let http = AcmeHttp::new(Duration::from_secs(5));
+        let session = http
+            .connect_any("ca.test:80", &[refusing, live], false, "")
+            .await;
+        assert!(
+            session.is_ok(),
+            "the second address must be tried when the first refuses: {:?}",
+            session.err().map(|e| e.to_string())
+        );
+        assert!(accepted.await.unwrap(), "the live address was connected to");
+
+        // And when nothing accepts, the error names every address tried.
+        let error = http
+            .connect_any("ca.test:80", &[refusing, refusing], false, "")
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("127.0.0.1:1"), "{error}");
+        assert_eq!(
+            error.matches(" | ").count(),
+            1,
+            "one attempt per address, both reported: {error}"
+        );
     }
 
     #[test]

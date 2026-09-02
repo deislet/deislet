@@ -57,6 +57,7 @@ use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info, warn};
 
 use crate::config::RuntimeNodeConfig;
+use crate::node_key::NodeKeyFingerprint;
 use proto::runtime_management_client::RuntimeManagementClient;
 use trigger::trigger_client::TriggerClient;
 
@@ -172,6 +173,41 @@ impl tonic::service::Interceptor for NodeCallCredential {
 
 /// A channel to one node with this control plane's credential on every call.
 type NodeChannel = InterceptedService<Channel, NodeCallCredential>;
+
+/// One value of `node_preshared_keys`, ready to be presented and named.
+#[derive(Clone, Debug)]
+struct ConfiguredNodeKey {
+    fingerprint: NodeKeyFingerprint,
+    credential: NodeCallCredential,
+}
+
+/// Which of this control plane's node keys a node is driven with, as the
+/// fleet listing reports it.
+///
+/// The rule it reports: a node is spoken to with the key it proved when it
+/// registered, never with another one. During a rotation the list carries two
+/// values, and an address that proved the retiring one would otherwise be
+/// handed its replacement on the next poll - which is how a leaked value
+/// would turn into the new one instead of being rotated out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKeyStatus {
+    /// The node registered with a key that is in the list, and that is the
+    /// key every call to it carries.
+    Proved,
+    /// The node registered with a key that is no longer in the list. Nothing
+    /// is sent to it - no push, no cron fire, no health probe - until it
+    /// registers again with a current key. Reachable only if the key list
+    /// changes under a running registration, which the binary does not do:
+    /// the list is read at startup and a restart empties the registrations.
+    /// It is still a state, so that the answer to "what happens then" is
+    /// written down rather than left to whichever key is first.
+    Retired,
+    /// A node from `deis_runtime_nodes` that has not registered yet, so it
+    /// has proved nothing. It is driven with the first key in the list: the
+    /// file is the operator's word that this address is theirs.
+    FromFile,
+}
 
 /// Raise both message limits from the tonic default of 4 MB.
 ///
@@ -425,6 +461,10 @@ struct NodeEntry {
     registered_at: Option<DateTime<Utc>>,
     /// Last time it registered or refreshed. What expiry measures.
     last_registered_at: Option<DateTime<Utc>>,
+    /// The node key the most recent registration proved. `None` only for a
+    /// configured node nothing has registered yet. This is the credential
+    /// every call to this node is made with - see [`NodeKeyStatus`].
+    key: Option<NodeKeyFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -438,6 +478,12 @@ pub struct NodeView {
     pub registered_at: Option<DateTime<Utc>>,
     /// When it last refreshed its registration.
     pub last_registered_at: Option<DateTime<Utc>>,
+    /// Which key this node is driven with, and whether that key still
+    /// exists.
+    pub key_status: NodeKeyStatus,
+    /// Prefix of the SHA-256 of the key the node proved, so an operator can
+    /// tell which value of a rotating list a node is on. Never the value.
+    pub key_fingerprint: Option<NodeKeyFingerprint>,
     #[serde(flatten)]
     pub health: NodeHealth,
 }
@@ -559,11 +605,12 @@ pub struct RuntimeNodeManager {
     health: DashMap<String, NodeHealth>,
     poll_interval: Duration,
     registration_ttl: Duration,
-    /// What this control plane proves itself with on every call into a node.
-    /// Set by [`RuntimeNodeManager::with_node_credential`] from
-    /// `node_preshared_keys`; empty until then, which is what the tests that
-    /// never dial a node use.
-    credential: NodeCallCredential,
+    /// Every value of `node_preshared_keys`, in the file's order. A node is
+    /// driven with the one it proved at registration; a configured node that
+    /// has proved nothing yet is driven with the first. Set by
+    /// [`RuntimeNodeManager::with_node_keys`]; empty until then, which is
+    /// what the tests that never dial a node use.
+    keys: Vec<ConfiguredNodeKey>,
 }
 
 impl RuntimeNodeManager {
@@ -601,6 +648,7 @@ impl RuntimeNodeManager {
                     version: None,
                     registered_at: None,
                     last_registered_at: None,
+                    key: None,
                 },
             );
         }
@@ -611,11 +659,18 @@ impl RuntimeNodeManager {
             health,
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             registration_ttl: Duration::from_secs(registration_ttl_secs.max(1)),
-            credential: NodeCallCredential::default(),
+            keys: Vec::new(),
         }
     }
 
-    /// Present `key` on every call this fleet makes into a node.
+    /// The node keys this fleet may present, in the file's order:
+    /// `node_preshared_keys`, blank entries dropped.
+    ///
+    /// Which one a given call carries is decided per node, not here: a node
+    /// is driven with the key it proved when it registered, and a configured
+    /// node that has not registered yet with the first one. The list is the
+    /// same list the node endpoints authenticate against, so a key a node can
+    /// prove is always a key that can be presented back to it.
     ///
     /// Chained onto the constructor rather than passed to it, because the
     /// fleet is also built in places that never dial anything - the delivery
@@ -623,19 +678,78 @@ impl RuntimeNodeManager {
     /// credential would say the credential matters there, which it does not.
     /// What matters is that the two places which do serve a live fleet, the
     /// binary and [`crate::api::start_api_server`], both call this.
-    pub fn with_node_credential(mut self, key: Option<&str>) -> Self {
-        self.credential = NodeCallCredential::new(key);
-        if self.credential.is_present() {
-            info!(
-                header = NODE_AUTH_METADATA,
-                "Calls into a node's management plane carry this control plane's node key; a node that does not accept it refuses the push and keeps serving the version it already had"
-            );
-        } else {
+    pub fn with_node_keys(mut self, keys: &[String]) -> Self {
+        self.keys = keys
+            .iter()
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(|key| ConfiguredNodeKey {
+                fingerprint: NodeKeyFingerprint::of(key),
+                credential: NodeCallCredential::new(Some(key)),
+            })
+            // A value that cannot be sent as metadata is reported by
+            // `NodeCallCredential::new` and is not a key this fleet has.
+            .filter(|key| key.credential.is_present())
+            .collect();
+        if self.keys.is_empty() {
             error!(
                 "This control plane has no node key to present, so every deployment push, unload and cron fire it makes will be refused by any node that is not running unauthenticated on loopback. Set node_preshared_keys"
             );
+        } else {
+            info!(
+                header = NODE_AUTH_METADATA,
+                keys = self.keys.len(),
+                "Calls into a node's management plane carry this control plane's node key - the one that node proved when it registered, or the first configured one for a node from the file that has not registered yet; a node that does not accept it refuses the push and keeps serving the version it already had"
+            );
         }
         self
+    }
+
+    /// Whether at least one key can be presented. Reported at startup rather
+    /// than inferred from a fleet that has gone quiet.
+    pub fn has_node_key(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    /// The credential every call to `id` is made with.
+    ///
+    /// A node that registered is driven with the key it proved; if that key
+    /// has since left the list, nothing is sent to it at all, which is what
+    /// makes dropping a value from `node_preshared_keys` evict whatever was
+    /// still on it instead of upgrading it. A configured node that has not
+    /// registered yet is driven with the first key: the file is the
+    /// operator's own statement that the address is theirs.
+    fn credential_for(&self, id: &str) -> Result<NodeCallCredential, NodeError> {
+        let proved = self
+            .read()
+            .get(id)
+            .ok_or(NodeError::UnknownNode)?
+            .key
+            .clone();
+        match proved {
+            None => Ok(self
+                .keys
+                .first()
+                .map(|key| key.credential.clone())
+                .unwrap_or_default()),
+            Some(fingerprint) => self
+                .keys
+                .iter()
+                .find(|key| key.fingerprint == fingerprint)
+                .map(|key| key.credential.clone())
+                .ok_or(NodeError::KeyRetired { fingerprint }),
+        }
+    }
+
+    /// How a node's key stands, for the fleet listing.
+    fn key_status(&self, entry: &NodeEntry) -> NodeKeyStatus {
+        match &entry.key {
+            None => NodeKeyStatus::FromFile,
+            Some(fingerprint) if self.keys.iter().any(|key| key.fingerprint == *fingerprint) => {
+                NodeKeyStatus::Proved
+            }
+            Some(_) => NodeKeyStatus::Retired,
+        }
     }
 
     /// Seed the fleet with the default registration lifetime. Kept for call
@@ -764,12 +878,19 @@ impl RuntimeNodeManager {
     /// every cron fire to that node failing - would appear on a fleet that
     /// nobody had touched. The registration still counts: it refreshes the
     /// lease and updates the version, which is what it is for.
+    ///
+    /// `key` is the node key the caller proved to get here, and from now on
+    /// it is the key every call to this node carries - including for a
+    /// configured node, whose most recent registration says which value it is
+    /// on. Recording it is what keeps a rotation honest: an address that
+    /// proved the retiring value is never handed its replacement.
     pub fn register(
         &self,
         id: &str,
         addr: &str,
         version: Option<String>,
         now: DateTime<Utc>,
+        key: NodeKeyFingerprint,
     ) -> Result<Registered, RegistrationError> {
         let id = id.trim();
         if id.is_empty() {
@@ -820,6 +941,14 @@ impl RuntimeNodeManager {
                 entry.version = version;
                 entry.registered_at.get_or_insert(now);
                 entry.last_registered_at = Some(now);
+                if entry.key.as_ref() != Some(&key) {
+                    info!(
+                        node = %id,
+                        key = %key,
+                        "This node registered with a different node key than before; every management call to it now carries the key it just proved"
+                    );
+                    entry.key = Some(key);
+                }
                 Ok(outcome)
             }
             None => {
@@ -834,6 +963,7 @@ impl RuntimeNodeManager {
                         version,
                         registered_at: Some(now),
                         last_registered_at: Some(now),
+                        key: Some(key),
                     },
                 );
                 drop(nodes);
@@ -871,9 +1001,19 @@ impl RuntimeNodeManager {
         addr: &str,
         version: Option<String>,
         now: DateTime<Utc>,
+        key: NodeKeyFingerprint,
     ) -> Result<Registered, RegistrationError> {
-        self.register_claim_with(id, addr, version, now, |holder_addr| async move {
-            self.identify_at(&holder_addr).await
+        // The holder is asked with the key *it* proved, which may not be the
+        // one this claimant just proved. A holder whose key has since left
+        // the list cannot be asked anything, and that reads as "nothing
+        // answers there": the claim goes through and the address moves, which
+        // is the eviction a retired key is meant to cause.
+        let holder_credential = self.credential_for(id.trim()).ok();
+        self.register_claim_with(id, addr, version, now, key, |holder_addr| async move {
+            match holder_credential {
+                Some(credential) => self.identify_at(&holder_addr, credential).await,
+                None => None,
+            }
         })
         .await
     }
@@ -892,6 +1032,7 @@ impl RuntimeNodeManager {
         addr: &str,
         version: Option<String>,
         now: DateTime<Utc>,
+        key: NodeKeyFingerprint,
         probe: F,
     ) -> Result<Registered, RegistrationError>
     where
@@ -988,7 +1129,7 @@ impl RuntimeNodeManager {
             );
         }
 
-        let outcome = self.register(trimmed, &claimed, version, now)?;
+        let outcome = self.register(trimmed, &claimed, version, now, key)?;
         // The claim was granted, so this machine is not being refused
         // anything and there is nothing left to report as unreached for it.
         self.contested_write()
@@ -996,15 +1137,21 @@ impl RuntimeNodeManager {
         Ok(outcome)
     }
 
-    /// Ask whichever node is at `addr` who it thinks it is.
+    /// Ask whichever node is at `addr` who it thinks it is, proving
+    /// `credential` - the key the node that held this address registered
+    /// with.
     ///
-    /// `None` covers everything that is not a live deis-runtime answering with
-    /// this control plane's node credential: nothing listening, a connection
-    /// refused, a node that refuses the credential, a timeout. All of those
-    /// read the same way at the one call site - the machine that held this id
-    /// is not there any more - and a registration must not be refused because
-    /// a probe was slow.
-    async fn identify_at(&self, addr: &str) -> Option<NodeIdentity> {
+    /// `None` covers everything that is not a live deis-runtime answering to
+    /// that credential: nothing listening, a connection refused, a node that
+    /// refuses the credential, a timeout. All of those read the same way at
+    /// the one call site - the machine that held this id is not there any
+    /// more - and a registration must not be refused because a probe was
+    /// slow.
+    async fn identify_at(
+        &self,
+        addr: &str,
+        credential: NodeCallCredential,
+    ) -> Option<NodeIdentity> {
         let channel = Endpoint::from_shared(addr.to_string())
             .ok()?
             .connect_timeout(CONNECT_TIMEOUT)
@@ -1015,17 +1162,19 @@ impl RuntimeNodeManager {
                 debug!(address = %addr, error = %e, "Nothing answers at this address");
             })
             .ok()?;
-        let info = with_message_limits(RuntimeManagementClient::new(self.authorized(channel)))
-            .get_status(proto::GetStatusRequest {
-                include_apps: false,
-            })
-            .await
-            .map_err(|e| {
-                debug!(address = %addr, error = %e, "A node at this address would not say who it is");
-            })
-            .ok()?
-            .into_inner()
-            .node_info?;
+        let info = with_message_limits(RuntimeManagementClient::new(InterceptedService::new(
+            channel, credential,
+        )))
+        .get_status(proto::GetStatusRequest {
+            include_apps: false,
+        })
+        .await
+        .map_err(|e| {
+            debug!(address = %addr, error = %e, "A node at this address would not say who it is");
+        })
+        .ok()?
+        .into_inner()
+        .node_info?;
         Some(NodeIdentity {
             node_id: info.node_id,
             hostname: info.hostname,
@@ -1266,36 +1415,37 @@ impl RuntimeNodeManager {
                     source: entry.source,
                     registered_at: entry.registered_at,
                     last_registered_at: entry.last_registered_at,
+                    key_status: self.key_status(entry),
+                    key_fingerprint: entry.key.clone(),
                     health,
                 }
             })
             .collect()
     }
 
-    /// Open a channel to one node with the deadline this kind of call needs.
-    async fn channel(&self, id: &str, rpc_timeout: Duration) -> Result<Channel, NodeError> {
+    /// Open a channel to one node with the deadline this kind of call needs,
+    /// carrying the node key that node is entitled to be driven with.
+    ///
+    /// The credential is chosen before anything is dialled, and a node whose
+    /// key has left the list is not dialled at all. This is the only way a
+    /// channel is built in this module, so no RPC can be added that goes out
+    /// anonymous or with a key the node never proved.
+    async fn channel(&self, id: &str, rpc_timeout: Duration) -> Result<NodeChannel, NodeError> {
+        let credential = self.credential_for(id)?;
         let node = self.node(id).ok_or(NodeError::UnknownNode)?;
-        Endpoint::from_shared(node.addr.clone())
+        let channel = Endpoint::from_shared(node.addr.clone())
             .map_err(|e| NodeError::Transport(format!("invalid endpoint {}: {e}", node.addr)))?
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(rpc_timeout)
             .connect()
             .await
-            .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))
-    }
-
-    /// Wrap a channel so every call over it carries this control plane's node
-    /// key. The only way a client is built in this module, so no RPC can be
-    /// added that goes out anonymous.
-    fn authorized(&self, channel: Channel) -> NodeChannel {
-        InterceptedService::new(channel, self.credential.clone())
+            .map_err(|e| NodeError::Transport(format!("connect {}: {e}", node.addr)))?;
+        Ok(InterceptedService::new(channel, credential))
     }
 
     async fn connect(&self, id: &str) -> Result<RuntimeManagementClient<NodeChannel>, NodeError> {
         let channel = self.channel(id, RPC_TIMEOUT).await?;
-        Ok(with_message_limits(RuntimeManagementClient::new(
-            self.authorized(channel),
-        )))
+        Ok(with_message_limits(RuntimeManagementClient::new(channel)))
     }
 
     /// One health probe; updates the cache and returns the fresh state.
@@ -1381,8 +1531,7 @@ impl RuntimeNodeManager {
         request: proto::ApplyDeploymentRequest,
     ) -> Result<proto::ApplyDeploymentResponse, NodeError> {
         let channel = self.channel(id, APPLY_TIMEOUT).await?;
-        let mut client =
-            with_message_limits(RuntimeManagementClient::new(self.authorized(channel)));
+        let mut client = with_message_limits(RuntimeManagementClient::new(channel));
 
         let (app_id, environment, version_id) = (
             request.app_id.clone(),
@@ -1452,7 +1601,7 @@ impl RuntimeNodeManager {
         // that environment's secrets, so the same credential rides the same
         // wrapper. Fixing one service and not the other would have left the
         // cron door open.
-        let mut client = TriggerClient::new(self.authorized(channel))
+        let mut client = TriggerClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
 
@@ -1549,7 +1698,18 @@ impl RuntimeNodeManager {
                 if shutdown.is_triggered() {
                     return;
                 }
-                let was_healthy = self.health.get(&node).map(|h| h.healthy).unwrap_or(false);
+                let (was_healthy, was_retired) = self
+                    .health
+                    .get(&node)
+                    .map(|h| {
+                        (
+                            h.healthy,
+                            h.last_error
+                                .as_deref()
+                                .is_some_and(|e| e.starts_with(KEY_RETIRED_PREFIX)),
+                        )
+                    })
+                    .unwrap_or((false, false));
                 match self.check_node(&node).await {
                     Ok(h) if h.healthy => {
                         if !was_healthy {
@@ -1580,6 +1740,14 @@ impl RuntimeNodeManager {
                         // Registered away, or expired, between listing the
                         // ids and probing this one. Nothing to report.
                     }
+                    Err(e @ NodeError::KeyRetired { .. }) => {
+                        // Said once, when it is first noticed: the node was
+                        // not probed and will not be, so there is no
+                        // "became unreachable" moment to hang it on.
+                        if !was_retired {
+                            warn!(node = %node, reason = %e, "Runtime node is not being driven: {}", e);
+                        }
+                    }
                     Err(e) => {
                         if was_healthy {
                             warn!(node = %node, error = %e, "Runtime node became unreachable");
@@ -1593,12 +1761,26 @@ impl RuntimeNodeManager {
     }
 }
 
+/// How [`NodeError::KeyRetired`] begins when rendered, so the poll loop can
+/// tell "still not driven" from "newly not driven" by reading the health
+/// cache it already keeps, without a second field to keep in step.
+const KEY_RETIRED_PREFIX: &str = "not driven: ";
+
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error("unknown deis_runtime node")]
     UnknownNode,
     #[error("transport error: {0}")]
     Transport(String),
+    /// The node registered with a key that is no longer in
+    /// `node_preshared_keys`, so nothing was sent to it. Not a transport
+    /// failure and not the node's fault; it clears itself when the node
+    /// registers again with a current key.
+    #[error(
+        "{}this node registered with a node key (sha256 {fingerprint}) that is no longer in node_preshared_keys, so no push, cron fire or health probe is sent to it; it rejoins by registering again with a current key",
+        KEY_RETIRED_PREFIX
+    )]
+    KeyRetired { fingerprint: NodeKeyFingerprint },
     /// The call went out over an established connection and came back as a
     /// status instead of an answer.
     ///
@@ -1633,7 +1815,8 @@ impl NodeError {
     /// `RuntimeNodeManager::channel` connects before any RPC is sent, so
     /// [`NodeError::Transport`] is always the first case: the connection was
     /// never established, and nothing was sent over it.
-    /// [`NodeError::UnknownNode`] never left this process at all.
+    /// [`NodeError::UnknownNode`] and [`NodeError::KeyRetired`] never left
+    /// this process at all.
     ///
     /// For a status the list runs the other way round - the codes named below
     /// are the ones a node produces *before* it runs anything, and everything
@@ -1651,7 +1834,9 @@ impl NodeError {
     pub fn left_the_outcome_unknown(&self) -> bool {
         use tonic::Code;
         match self {
-            NodeError::UnknownNode | NodeError::Transport(_) => false,
+            NodeError::UnknownNode | NodeError::Transport(_) | NodeError::KeyRetired { .. } => {
+                false
+            }
             NodeError::Rpc { code, .. } => !matches!(
                 code,
                 Code::Unauthenticated
@@ -1761,26 +1946,142 @@ mod tests {
         );
     }
 
+    /// The key the tests' registrations prove. What matters in most of them
+    /// is the fleet bookkeeping, not which value it was.
+    fn key() -> NodeKeyFingerprint {
+        NodeKeyFingerprint::of("node-psk")
+    }
+
     #[test]
     fn a_fleet_presents_the_node_key_on_every_call_it_makes() {
         // The other half of the fix. The node now refuses a caller that
         // proves nothing, so a control plane that attaches nothing would
         // deliver no deployment and fire no cron at all.
-        let fleet = manager(&["a"]).with_node_credential(Some("node-psk"));
-        assert!(fleet.credential.is_present());
+        let fleet = manager(&["a"]).with_node_keys(&["node-psk".to_string()]);
+        assert!(fleet.has_node_key());
+        // A configured node that has not registered proves nothing, so it
+        // is driven with the first key.
+        assert!(fleet.credential_for("a").unwrap().is_present());
 
         // Blank is not a credential: an empty string in the file is an
         // operator who meant to fill it in, and sending it would be a call
         // that looks authenticated and is refused.
-        for blank in [None, Some(""), Some("   ")] {
+        for blank in [Vec::new(), vec![String::new()], vec!["   ".to_string()]] {
+            let fleet = manager(&["a"]).with_node_keys(&blank);
             assert!(
-                !manager(&["a"])
-                    .with_node_credential(blank)
-                    .credential
-                    .is_present(),
+                !fleet.has_node_key(),
                 "{blank:?} must not become a credential"
             );
+            assert!(!fleet.credential_for("a").unwrap().is_present());
         }
+    }
+
+    /// The rule the rotation depends on: a node is driven with the key it
+    /// proved, whichever position that key has in the list, and a node whose
+    /// key has left the list is not driven at all.
+    #[test]
+    fn a_node_is_driven_with_the_key_it_proved_and_only_that() {
+        use tonic::service::Interceptor;
+        let stamped = |credential: NodeCallCredential| {
+            let mut credential = credential;
+            Interceptor::call(&mut credential, tonic::Request::new(()))
+                .unwrap()
+                .metadata()
+                .get(NODE_AUTH_METADATA)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        let fleet =
+            manager(&["from-file"]).with_node_keys(&["new-key".to_string(), "old-key".to_string()]);
+        let now = Utc::now();
+        fleet
+            .register(
+                "on-old",
+                "http://10.0.0.5:8086",
+                None,
+                now,
+                NodeKeyFingerprint::of("old-key"),
+            )
+            .unwrap();
+        fleet
+            .register(
+                "on-new",
+                "http://10.0.0.6:8086",
+                None,
+                now,
+                NodeKeyFingerprint::of("new-key"),
+            )
+            .unwrap();
+        fleet
+            .register(
+                "gone",
+                "http://10.0.0.7:8086",
+                None,
+                now,
+                NodeKeyFingerprint::of("dropped-key"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            stamped(fleet.credential_for("on-old").unwrap()).as_deref(),
+            Some("Bearer old-key"),
+            "the second value in the list is presented to the node that proved it"
+        );
+        assert_eq!(
+            stamped(fleet.credential_for("on-new").unwrap()).as_deref(),
+            Some("Bearer new-key")
+        );
+        assert_eq!(
+            stamped(fleet.credential_for("from-file").unwrap()).as_deref(),
+            Some("Bearer new-key"),
+            "a configured node that proved nothing gets the first key"
+        );
+        assert!(
+            matches!(
+                fleet.credential_for("gone"),
+                Err(NodeError::KeyRetired { .. })
+            ),
+            "a key that left the list drives nothing"
+        );
+        assert!(
+            !fleet
+                .credential_for("gone")
+                .unwrap_err()
+                .left_the_outcome_unknown()
+        );
+
+        let status = |id: &str| fleet.list().into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(status("on-old").key_status, NodeKeyStatus::Proved);
+        assert_eq!(
+            status("on-old").key_fingerprint,
+            Some(NodeKeyFingerprint::of("old-key"))
+        );
+        assert_eq!(status("from-file").key_status, NodeKeyStatus::FromFile);
+        assert_eq!(status("from-file").key_fingerprint, None);
+        assert_eq!(status("gone").key_status, NodeKeyStatus::Retired);
+        // The listing never carries a key value, only a name for it.
+        let listing = serde_json::to_string(&fleet.list()).unwrap();
+        for value in ["old-key", "new-key", "dropped-key"] {
+            assert!(!listing.contains(value), "{listing}");
+        }
+
+        // A configured node that registers proves a key like any other, and
+        // from then on that is what it is driven with; the file's position
+        // no longer decides.
+        fleet
+            .register(
+                "from-file",
+                "http://10.0.0.9:8086",
+                None,
+                now,
+                NodeKeyFingerprint::of("old-key"),
+            )
+            .unwrap();
+        assert_eq!(
+            stamped(fleet.credential_for("from-file").unwrap()).as_deref(),
+            Some("Bearer old-key")
+        );
+        assert_eq!(status("from-file").key_status, NodeKeyStatus::Proved);
     }
 
     #[test]
@@ -1855,7 +2156,13 @@ mod tests {
 
         assert_eq!(
             manager
-                .register("joined", "http://10.0.0.5:8086", Some("0.1.0".into()), now)
+                .register(
+                    "joined",
+                    "http://10.0.0.5:8086",
+                    Some("0.1.0".into()),
+                    now,
+                    key()
+                )
                 .unwrap(),
             Registered::New
         );
@@ -1895,7 +2202,7 @@ mod tests {
 
         assert_eq!(
             manager
-                .register("from-file", "http://short-hostname:8086", None, now)
+                .register("from-file", "http://short-hostname:8086", None, now, key())
                 .unwrap(),
             Registered::Refreshed,
             "the lease is refreshed; the address is not adopted"
@@ -1925,11 +2232,11 @@ mod tests {
         let now = Utc::now();
 
         manager
-            .register("joined", "http://10.0.0.5:8086", None, now)
+            .register("joined", "http://10.0.0.5:8086", None, now, key())
             .unwrap();
         assert_eq!(
             manager
-                .register("joined", "http://10.0.0.9:8086", None, now)
+                .register("joined", "http://10.0.0.9:8086", None, now, key())
                 .unwrap(),
             Registered::AddressChanged
         );
@@ -1945,15 +2252,15 @@ mod tests {
         let now = Utc::now();
 
         assert!(matches!(
-            manager.register("  ", "http://10.0.0.5:8086", None, now),
+            manager.register("  ", "http://10.0.0.5:8086", None, now, key()),
             Err(RegistrationError::EmptyId)
         ));
         assert!(matches!(
-            manager.register("a b", "http://10.0.0.5:8086", None, now),
+            manager.register("a b", "http://10.0.0.5:8086", None, now, key()),
             Err(RegistrationError::InvalidId)
         ));
         assert!(matches!(
-            manager.register("node", "10.0.0.5:8086", None, now),
+            manager.register("node", "10.0.0.5:8086", None, now, key()),
             Err(RegistrationError::InvalidAddress { .. })
         ));
         assert!(manager.is_empty());
@@ -1974,12 +2281,12 @@ mod tests {
         );
         let start = Utc::now();
         manager
-            .register("joined", "http://10.0.0.5:8086", None, start)
+            .register("joined", "http://10.0.0.5:8086", None, start, key())
             .unwrap();
         // A node the operator also wrote into the file: registering must not
         // turn it into something that can expire.
         manager
-            .register("from-file", "http://10.0.0.9:8086", None, start)
+            .register("from-file", "http://10.0.0.9:8086", None, start, key())
             .unwrap();
 
         // Inside the lifetime nothing is dropped.
@@ -1998,6 +2305,7 @@ mod tests {
                     "http://10.0.0.5:8086",
                     None,
                     start + chrono::Duration::seconds(80),
+                    key(),
                 )
                 .unwrap(),
             Registered::Refreshed
@@ -2040,7 +2348,7 @@ mod tests {
     fn deregistering_takes_a_node_off_at_once() {
         let manager = manager(&["from-file"]);
         manager
-            .register("joined", "http://10.0.0.5:8086", None, Utc::now())
+            .register("joined", "http://10.0.0.5:8086", None, Utc::now(), key())
             .unwrap();
 
         assert_eq!(manager.deregister("joined"), Some(Deregistered::FromFleet));
@@ -2072,7 +2380,7 @@ mod tests {
         // The first machine. Nothing holds the id, so nothing is probed.
         let probed = std::sync::Mutex::new(Vec::<String>::new());
         manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |addr| {
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, key(), |addr| {
                 probed.lock().unwrap().push(addr);
                 async { None }
             })
@@ -2085,7 +2393,7 @@ mod tests {
 
         // The second machine, while the first is up and answering for the id.
         let error = manager
-            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, |addr| {
+            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, key(), |addr| {
                 probed.lock().unwrap().push(addr);
                 async { answering_as("node-a", "box-one") }
             })
@@ -2132,15 +2440,25 @@ mod tests {
         // Nothing answers at the old address any more.
         let manager = manager(&[]);
         manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| async {
-                None
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.7:8086",
+                None,
+                now,
+                key(),
+                |_| async { None },
+            )
             .await
             .unwrap();
         let outcome = manager
-            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, |_| async {
-                None
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.9:8086",
+                None,
+                now,
+                key(),
+                |_| async { None },
+            )
             .await
             .unwrap();
         assert_eq!(outcome, Registered::AddressChanged);
@@ -2151,15 +2469,25 @@ mod tests {
         // node: the address was reused after this one moved away.
         let manager = RuntimeNodeManager::new(Vec::new(), 15);
         manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| async {
-                None
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.7:8086",
+                None,
+                now,
+                key(),
+                |_| async { None },
+            )
             .await
             .unwrap();
         let outcome = manager
-            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, |_| async {
-                answering_as("node-b", "box-two")
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.9:8086",
+                None,
+                now,
+                key(),
+                |_| async { answering_as("node-b", "box-two") },
+            )
             .await
             .unwrap();
         assert_eq!(outcome, Registered::AddressChanged);
@@ -2174,15 +2502,20 @@ mod tests {
         let manager = manager(&[]);
         let now = Utc::now();
         manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| async {
-                None
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.7:8086",
+                None,
+                now,
+                key(),
+                |_| async { None },
+            )
             .await
             .unwrap();
 
         let probed = std::sync::Mutex::new(0usize);
         let outcome = manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| {
+            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, key(), |_| {
                 *probed.lock().unwrap() += 1;
                 async { answering_as("node-a", "box-one") }
             })
@@ -2201,15 +2534,25 @@ mod tests {
         let manager = RuntimeNodeManager::new_with_ttl(Vec::new(), 15, 90);
         let start = Utc::now();
         manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, start, |_| async {
-                None
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.7:8086",
+                None,
+                start,
+                key(),
+                |_| async { None },
+            )
             .await
             .unwrap();
         manager
-            .register_claim_with("node-a", "http://10.0.0.9:8086", None, start, |_| async {
-                answering_as("node-a", "box-one")
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.9:8086",
+                None,
+                start,
+                key(),
+                |_| async { answering_as("node-a", "box-one") },
+            )
             .await
             .unwrap_err();
         assert_eq!(manager.contested().len(), 1);
@@ -2231,15 +2574,25 @@ mod tests {
         let manager = manager(&[]);
         let now = Utc::now();
         manager
-            .register_claim_with("node-a", "http://10.0.0.7:8086", None, now, |_| async {
-                None
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.7:8086",
+                None,
+                now,
+                key(),
+                |_| async { None },
+            )
             .await
             .unwrap();
         manager
-            .register_claim_with("node-a", "http://10.0.0.9:8086", None, now, |_| async {
-                answering_as("node-a", "box-one")
-            })
+            .register_claim_with(
+                "node-a",
+                "http://10.0.0.9:8086",
+                None,
+                now,
+                key(),
+                |_| async { answering_as("node-a", "box-one") },
+            )
             .await
             .unwrap_err();
 

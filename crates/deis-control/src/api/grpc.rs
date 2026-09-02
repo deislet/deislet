@@ -302,9 +302,17 @@ async fn handle_payload(
 
             let session = Arc::new(NodeSession::new(node_id, node_info).with_sender(tx.clone()));
 
-            *current_session = Some(session.clone());
-
             let response = handler.handle_register(internal_req, &session).await;
+
+            // Only a registration that was accepted makes this stream the
+            // node's session. A refused one - the id is held by a channel
+            // that is still live - must leave no trace under that id: if the
+            // refused session were kept here, this stream's cleanup would
+            // record a disconnection against the holder's node row when the
+            // refused caller hangs up.
+            if response.success {
+                *current_session = Some(session);
+            }
 
             let reply = Payload::RegisterResponse(RegisterResponse {
                 success: response.success,
@@ -642,6 +650,145 @@ mod tests {
         assert_eq!(
             rows, 1,
             "two connections from one node must leave one node row, not one row per connection"
+        );
+    }
+
+    /// A second channel announcing a live node's name is refused, and the
+    /// live node notices nothing: its session, its state and its row are as
+    /// they were, including after the refused caller hangs up. Before this,
+    /// the newcomer displaced the holder, and the holder - a deis-proxy in
+    /// the r9 fleet - kept its stream open and was never a session again
+    /// until it was restarted.
+    #[tokio::test]
+    async fn a_second_channel_with_a_live_node_s_name_is_refused_and_the_holder_keeps_its_session()
+    {
+        let sessions = Arc::new(SessionManager::new());
+        let database = Arc::new(Database::init(":memory:").await.unwrap());
+        let service = GrpcControlService::new(
+            Arc::new(ControlConfig {
+                node_preshared_keys: vec!["node-psk".to_string()],
+                heartbeat_timeout: 90,
+                ..ControlConfig::default()
+            }),
+            Arc::clone(&sessions),
+        )
+        .with_database(Arc::clone(&database));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    deis_wire::pb::control_service_server::ControlServiceServer::new(service),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        // Authenticate and register as `r9-proxy`; answer whether the
+        // registration was accepted.
+        async fn attach(
+            addr: std::net::SocketAddr,
+        ) -> (
+            mpsc::Sender<ControlMessage>,
+            Streaming<ControlMessage>,
+            bool,
+        ) {
+            let mut client = ControlServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("the test server must accept a node");
+            let (node_tx, node_rx) = mpsc::channel(4);
+            node_tx
+                .send(ControlMessage {
+                    payload: Some(ClientPayload::Authenticate(AuthenticateRequest {
+                        instance_id: "r9-proxy".to_string(),
+                        secret: "node-psk".to_string(),
+                    })),
+                })
+                .await
+                .unwrap();
+            let mut inbound = client
+                .establish_channel(ReceiverStream::new(node_rx))
+                .await
+                .unwrap()
+                .into_inner();
+            inbound.next().await.expect("an auth reply is due").unwrap();
+            let node_info = NodeInfo {
+                node_role: crate::message::NodeRole::Proxy("1.0.0".to_string()),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: vec![8080],
+            };
+            node_tx
+                .send(ControlMessage {
+                    payload: Some(ClientPayload::Register(deis_wire::pb::RegisterRequest {
+                        node_info_json: serde_json::to_string(&node_info).unwrap(),
+                    })),
+                })
+                .await
+                .unwrap();
+            let accepted = match inbound
+                .next()
+                .await
+                .expect("a register reply is due")
+                .unwrap()
+                .payload
+            {
+                Some(Payload::RegisterResponse(response)) => response.success,
+                other => panic!("expected a register response, got {other:?}"),
+            };
+            (node_tx, inbound, accepted)
+        }
+
+        let (holder_tx, mut holder_inbound, accepted) = attach(addr).await;
+        assert!(accepted);
+        let holder = sessions
+            .get_node("r9-proxy")
+            .expect("the holder has a session");
+
+        let (impostor_tx, impostor_inbound, accepted) = attach(addr).await;
+        assert!(
+            !accepted,
+            "a live node's name is not handed to a second channel"
+        );
+        assert_eq!(
+            sessions.get_node("r9-proxy").map(|s| s.id.clone()),
+            Some(holder.id.clone())
+        );
+
+        // The impostor hangs up. Its stream's cleanup must touch nothing
+        // under the holder's name.
+        drop(impostor_tx);
+        drop(impostor_inbound);
+        // The holder keeps beating, and every beat is counted.
+        holder_tx
+            .send(ControlMessage {
+                payload: Some(ClientPayload::Heartbeat(Heartbeat {
+                    status: "ok".to_string(),
+                })),
+            })
+            .await
+            .unwrap();
+        holder_inbound
+            .next()
+            .await
+            .expect("a heartbeat ack is due")
+            .unwrap();
+        assert_eq!(holder.get_state().await, crate::session::NodeState::Active);
+        assert_eq!(sessions.count(), 1);
+
+        let state: String = database
+            .with_connection(|conn| {
+                Ok::<_, crate::database::DatabaseError>(conn.query_row(
+                    "SELECT state FROM nodes WHERE id = 'r9-proxy'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            crate::session::NodeState::Active.as_str(),
+            "the refused caller's hang-up must not be recorded against the holder's row"
         );
     }
 

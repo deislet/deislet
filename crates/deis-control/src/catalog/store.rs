@@ -108,6 +108,15 @@ impl CatalogStore {
         Self { db }
     }
 
+    /// The database this catalog lives in, for the one piece of state that
+    /// sits beside the catalog rather than in it: the scheduler lease
+    /// (`crate::scheduler::lease`), which has to be in the same file as the
+    /// catalog because "the same database" is exactly what two control
+    /// planes that must not both fire have in common.
+    pub fn database(&self) -> Arc<Database> {
+        Arc::clone(&self.db)
+    }
+
     /// Run a closure against the shared connection with the error type
     /// pinned to `CatalogError`. Without this the compiler cannot tell
     /// whether a `?` on a rusqlite error should produce a `CatalogError`

@@ -989,7 +989,17 @@ pub async fn run_control_loop(
                     );
                 }
                 let apps = deployer.installed_app_count();
-                health.mark_degraded(format!("control plane unreachable: {e}"), apps);
+                // The class only, without `{e}`. The error carries the control
+                // plane's own address, and this reason is stamped on
+                // `x-deis-node-reason`, which the node answers on its public
+                // data port to anyone who asks `/health` as `_system` -- so the
+                // internal URL would leave the node to whoever could reach that
+                // port. The address and the transport error are in the two
+                // warn lines just above, which are the node's own log; the
+                // header carries the class that tells an operator which of the
+                // degraded causes this is, and nothing an outside caller has no
+                // business reading.
+                health.mark_degraded("control plane unreachable", apps);
             }
         }
     }

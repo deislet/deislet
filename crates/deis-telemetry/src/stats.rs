@@ -454,6 +454,11 @@ service_stats! {
     logs_truncated: Counter =
         "logs_truncated_total", "Log entries stored with their message cut short";
     log_queries: Counter = "log_queries_total", "Query calls served";
+    query_pages_cut_by_bytes: Counter =
+        "query_pages_cut_by_bytes_total",
+        "Query, QueryTraces and QueryMetrics pages closed at the byte budget before reaching the \
+         requested row limit; each such page carries a cursor and has_more, and a client that \
+         stops at the first short page is missing records";
     tail_streams_started: Counter = "tail_streams_started_total", "Tail streams opened since start";
     tail_streams_open: Gauge = "tail_streams_open", "Tail streams currently open";
     tail_entries_dropped: Counter =

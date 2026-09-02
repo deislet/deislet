@@ -183,16 +183,23 @@ pub struct CronScheduler {
     tasks: Arc<DashMap<CronKey, Vec<CronTask>>>,   // key: (app_id, environment)
     tick_interval: Duration,
     rotation: AtomicUsize,
+    holder_id: String,                              // this process on the lease
+    lease_ttl: Duration,                            // three ticks
 }
 ```
 
 1. Rebuild the task list from the catalog: the expressions are whatever
    `manifest.cron` of each environment's currently deployed version declares,
    so they follow deploys and rollbacks and are never persisted separately.
-2. Fire everything due, one occurrence to exactly one node, trying the next
+2. Take or refresh the scheduler lease (`scheduler_lease`, one row). A
+   process that finds it held by another, fresh within three ticks, fires
+   nothing this tick and records the due occurrences as fired elsewhere, so
+   it does not fire a backlog when it takes over. It logs that once, at
+   `warn`.
+3. Fire everything due, one occurrence to exactly one node, trying the next
    node when one says it *cannot* run it; an occurrence nobody takes is
    skipped, not retried.
-3. Advance to the next occurrence.
+4. Advance to the next occurrence.
 
 A handler that throws is *not* retried on another node: the same code would
 fail the same way elsewhere, and it may already have had side effects. The
@@ -434,8 +441,14 @@ non-zero: the pointer moved, but that machine is still serving what it had.
 ## 🚀 Not done
 
 - **High availability.** One process, one SQLite file. No clustering, no
-  consensus. The whole design assumes a single control plane, which is also
-  why cron needs no leader election.
+  consensus. The whole design assumes a single control plane. The one place
+  two control planes on one database are tolerated rather than assumed away
+  is cron: a lease row (`scheduler_lease`, `src/scheduler/lease.rs`) makes
+  exactly one of them fire, and the other stands aside until the holder stops
+  refreshing it or releases it on shutdown. That is a guard against an
+  overlap - a manual start beside a service unit, a cut-over - not
+  leader election: the task list is not shared, and an occurrence that comes
+  due during the hand-over is skipped, as it is when no control plane runs.
 - **RBAC, mTLS, audit log.**
 - **No ACME.** The routing table now reaches deis-proxy — see
   `GET /api/routing-table` below — so path-prefix routing and an automatic

@@ -734,6 +734,23 @@ mod tests {
         fcntl(borrowed, FcntlArg::F_GETFD).is_ok()
     }
 
+    /// Which open file a descriptor number currently names, as
+    /// `(device, inode)`, or `None` if the number is closed.
+    ///
+    /// Asking "is this number closed" is not enough in a process where other
+    /// test threads open files: a number closed here is reused by the next
+    /// `open` anywhere in the process, and `still_open` then says yes about
+    /// a different file. Comparing identities asks the question this suite
+    /// means - "is the *placeholder* still open" - and is stable under that
+    /// reuse.
+    fn identity(fd: RawFd) -> Option<(u64, u64)> {
+        // SAFETY: only queries the descriptor; nothing is closed.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        nix::sys::stat::fstat(borrowed)
+            .ok()
+            .map(|stat| (stat.st_dev, stat.st_ino))
+    }
+
     fn is_free(bind: &str) -> bool {
         TcpListener::bind(bind).is_ok()
     }
@@ -859,6 +876,7 @@ mod tests {
         // would otherwise hand /dev/null to `TcpSocket::listen`, and that
         // failure lands after the readiness byte, where it is an outage.
         let (address, fd) = handed_over();
+        let placeholder = identity(fd).expect("the handed-over descriptor is open");
         let fds = table(&[(address.clone(), fd)]);
         let candidates = table_fds(&fds).await;
         reconcile_with(&fds, &[], Ok(candidates.clone())).await;
@@ -877,7 +895,7 @@ mod tests {
             .expect("the entry is still there");
         assert_ne!(fresh, fd, "the placeholder must have been replaced");
         assert!(
-            !still_open(fd),
+            identity(fd) != Some(placeholder),
             "the placeholder the map no longer names has to be closed, or every removal and \
              re-addition of an address leaves one more behind for the life of the fleet"
         );

@@ -413,6 +413,23 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     }
     enforce_one_holder_per_claim(conn)?;
 
+    // Which control plane fires cron. One row, ever: the process that holds
+    // it fires due occurrences and refreshes `refreshed_at` every tick; any
+    // other process on the same database sees a fresh row that is not its
+    // own and fires nothing. Two control planes on one file - a manual start
+    // beside a service unit, a blue/green cut-over - used to each fire every
+    // occurrence. See `scheduler::lease`.
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS scheduler_lease (
+            id           INTEGER PRIMARY KEY CHECK (id = 1),
+            holder       TEXT NOT NULL,
+            refreshed_at INTEGER NOT NULL
+        )
+        "#,
+        [],
+    )?;
+
     // Secrets are per environment and always stored as AES-256-GCM
     // ciphertext with the nonce prefixed. The master key lives in the file
     // named by `secret_key_file` and never touches this database.
@@ -564,6 +581,21 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 /// what, and an operator looking at a platform they inherited can read it. A
 /// row that should not be there is one `DELETE /api/domains` away, and the
 /// route it justified can then no longer be re-created.
+///
+/// What a route row proves is narrower than what a grant can say. A grant
+/// names a whole host; a route row names a host *and a path prefix*. When
+/// one application holds every route on a host, the two agree and the host
+/// is granted to it. When two applications share a host at different
+/// prefixes - `shop` at `/` and `blog` at `/api`, say - a grant to each would
+/// write down more than either row proves: `blog` would be free to claim any
+/// other prefix on the host, or `/` itself the day `shop` re-creates its
+/// route. So the host goes to the application holding the shortest prefix,
+/// the root-most one, whose row is the closest thing to "this host is mine"
+/// the old table can offer, and to nobody else. The other applications' routes
+/// keep serving - a grant gates writes, never traffic - and are named at
+/// `warn` so an operator can grant the host to them on purpose if editing
+/// those routes has to stay possible. When no single application holds the
+/// shortest prefix, nobody is granted and the same line says so.
 fn adopt_existing_route_claims(conn: &Connection) -> Result<()> {
     // A host two applications hold at the same path prefix is the one case
     // this must not decide. Without uniqueness there was nothing to stop a
@@ -585,17 +617,38 @@ fn adopt_existing_route_claims(conn: &Connection) -> Result<()> {
         rows.collect::<Result<_>>()?
     };
 
+    struct ExistingRoute {
+        host: Option<String>,
+        app_id: String,
+        environment: String,
+        /// `path_prefix` with its trailing slash removed, the way the edge
+        /// and the uniqueness index read it: `/` is the empty prefix.
+        prefix: String,
+    }
+
     let mut stmt = conn.prepare(
-        "SELECT r.host, r.app_id, e.name
-             FROM routes r JOIN environments e ON e.id = r.env_id",
+        "SELECT r.host, r.app_id, e.name, rtrim(r.path_prefix, '/')
+             FROM routes r JOIN environments e ON e.id = r.env_id
+             ORDER BY r.id",
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        Ok(ExistingRoute {
+            host: row.get(0)?,
+            app_id: row.get(1)?,
+            environment: row.get(2)?,
+            prefix: row.get(3)?,
+        })
     })?;
+
+    // Grouped by the host as the edge reads it, because the decision below
+    // is per host: who holds its root-most prefix.
+    let mut by_host: std::collections::BTreeMap<String, Vec<ExistingRoute>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let row = row?;
+        let key = row.host.as_deref().unwrap_or("").to_ascii_lowercase();
+        by_host.entry(key).or_default().push(row);
+    }
 
     // The catalog's own clock, so every timestamp in these tables is read
     // from one place.
@@ -604,39 +657,98 @@ fn adopt_existing_route_claims(conn: &Connection) -> Result<()> {
     let mut adopted = 0usize;
     let mut unreadable = Vec::new();
     let mut withheld = Vec::new();
-    for row in rows {
-        let (host, app_id, environment) = row?;
-        if contested.contains(&host.as_deref().unwrap_or("").to_ascii_lowercase()) {
-            withheld.push(format!(
-                "{}/{} claims {}",
-                app_id,
-                environment,
-                host.as_deref().unwrap_or("(every host)")
-            ));
+    let mut narrowed = Vec::new();
+    for (key, routes) in by_host {
+        let shown = |route: &ExistingRoute| {
+            route
+                .host
+                .clone()
+                .unwrap_or_else(|| "(every host)".to_string())
+        };
+        if contested.contains(&key) {
+            withheld.extend(routes.iter().map(|route| {
+                format!(
+                    "{}/{} claims {}",
+                    route.app_id,
+                    route.environment,
+                    shown(route)
+                )
+            }));
             continue;
         }
-        let Some(pattern) = existing_claim_pattern(host.as_deref()) else {
-            unreadable.push(format!(
-                "{}/{} claims {:?}",
-                app_id,
-                environment,
-                host.unwrap_or_default()
-            ));
-            continue;
+
+        // Who holds the shortest prefix on this host. One application: the
+        // host is its. Several: nobody's, by the rule in the header.
+        let shortest = routes.iter().map(|route| route.prefix.len()).min();
+        let mut root_holders: Vec<&str> = routes
+            .iter()
+            .filter(|route| Some(route.prefix.len()) == shortest)
+            .map(|route| route.app_id.as_str())
+            .collect();
+        root_holders.sort_unstable();
+        root_holders.dedup();
+        let granted_app = match root_holders.as_slice() {
+            [only] => Some(only.to_string()),
+            _ => None,
         };
-        let changed = conn.execute(
-            "INSERT OR IGNORE INTO domain_grants (pattern, app_id, environment, created_at, note)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                pattern,
-                app_id,
-                environment,
-                now,
-                "adopted from a route that already existed when this control plane learned to \
-                 record who owns a hostname"
-            ],
-        )?;
-        adopted += changed;
+
+        for route in &routes {
+            if granted_app.as_deref() != Some(route.app_id.as_str()) {
+                narrowed.push(format!(
+                    "{}/{} routes {} at {} (host {})",
+                    route.app_id,
+                    route.environment,
+                    shown(route),
+                    if route.prefix.is_empty() {
+                        "/"
+                    } else {
+                        route.prefix.as_str()
+                    },
+                    match &granted_app {
+                        Some(app) => format!("granted to {app}"),
+                        None => "granted to nobody: no single application holds its shortest \
+                                 prefix"
+                            .to_string(),
+                    }
+                ));
+                continue;
+            }
+            let Some(pattern) = existing_claim_pattern(route.host.as_deref()) else {
+                unreadable.push(format!(
+                    "{}/{} claims {:?}",
+                    route.app_id,
+                    route.environment,
+                    route.host.clone().unwrap_or_default()
+                ));
+                continue;
+            };
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO domain_grants (pattern, app_id, environment, created_at, note)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    pattern,
+                    route.app_id,
+                    route.environment,
+                    now,
+                    "adopted from a route that already existed when this control plane learned \
+                     to record who owns a hostname"
+                ],
+            )?;
+            adopted += changed;
+        }
+    }
+
+    if !narrowed.is_empty() {
+        tracing::warn!(
+            routes = narrowed.len(),
+            claims = %narrowed.join("; "),
+            "These existing routes share a host with another application that holds it at a \
+             shorter prefix, so the host was recorded as that application's and not as theirs: \
+             a route row proves a host and a path, and a grant can only say the whole host. \
+             Their routes are untouched and keep serving. They cannot be edited or re-created \
+             until an operator grants the host to that application on purpose with POST \
+             /api/domains - or decides that they should not hold it"
+        );
     }
 
     if adopted > 0 {
@@ -978,6 +1090,86 @@ mod tests {
             )],
             "the contested name belongs to neither of them until an operator says so"
         );
+    }
+
+    /// Two applications on one host at different prefixes. A route row proves
+    /// a host *and a path*; a grant can only say the host. Granting the host
+    /// to both used to leave the application on `/api` free to claim any
+    /// other prefix on it, or `/` itself the day the root holder re-created
+    /// its route. So the root-most holder gets the host and the other gets
+    /// nothing automatic - its route keeps serving, and the migration log
+    /// names it.
+    #[test]
+    fn a_host_shared_at_different_prefixes_is_granted_to_its_root_most_holder_only() {
+        let conn = platform_with_routes_and_no_registry();
+        for (app, env) in [("blog", "e2"), ("other", "e3")] {
+            conn.execute("INSERT INTO apps (id, created_at) VALUES (?1, 1)", [app])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO environments (id, app_id, name, created_at)
+                     VALUES (?1, ?2, 'production', 1)",
+                rusqlite::params![env, app],
+            )
+            .unwrap();
+        }
+        let add = |id: &str, app: &str, env: &str, host: Option<&str>, prefix: &str| {
+            conn.execute(
+                "INSERT INTO routes (id, app_id, env_id, host, path_prefix, priority)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                rusqlite::params![id, app, env, host, prefix],
+            )
+            .unwrap();
+        };
+        // shop holds the root of victim.example.com, blog squats /api on it.
+        add_route(&conn, "r1", Some("victim.example.com"), "/");
+        add("r2", "blog", "e2", Some("victim.example.com"), "/api");
+        // A second environment of the same application on the same host is
+        // that application's too.
+        conn.execute(
+            "INSERT INTO environments (id, app_id, name, created_at)
+                 VALUES ('e1p', 'shop', 'preview', 1)",
+            [],
+        )
+        .unwrap();
+        add("r3", "shop", "e1p", Some("victim.example.com"), "/beta");
+        // Nobody holds the shortest prefix alone: two applications at equal
+        // depth and no root. Neither is granted.
+        add("r4", "blog", "e2", Some("tie.example.com"), "/a");
+        add("r5", "other", "e3", Some("tie.example.com"), "/b");
+        // The same rule for the catch-all: blog's fallback at / is the
+        // root-most, other's at /x is not.
+        add("r6", "blog", "e2", None, "/");
+        add("r7", "other", "e3", None, "/x");
+
+        create_tables(&conn).unwrap();
+
+        assert_eq!(
+            grants(&conn),
+            vec![
+                (
+                    "(no-host)".to_string(),
+                    "blog".to_string(),
+                    "production".to_string()
+                ),
+                (
+                    "victim.example.com".to_string(),
+                    "shop".to_string(),
+                    "preview".to_string()
+                ),
+                (
+                    "victim.example.com".to_string(),
+                    "shop".to_string(),
+                    "production".to_string()
+                ),
+            ],
+            "the host goes to the root-most holder, every environment of it, and to nobody else"
+        );
+        // Nothing was granted for the tied host, and traffic is untouched:
+        // every route row is still there.
+        let routes: i64 = conn
+            .query_row("SELECT count(*) FROM routes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(routes, 7);
     }
 
     /// One address, one application - in the table, not only in the code that

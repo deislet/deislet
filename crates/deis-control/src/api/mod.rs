@@ -659,8 +659,9 @@ pub async fn start_api_server(
         // A node's management plane can unload an application, list every
         // tenant on the node and replace one tenant's code, so it is served
         // only to a caller that presents a node key. The same list the node
-        // endpoints already authenticate against.
-        .with_node_credential(config.node_call_credential()),
+        // endpoints authenticate against, so a node is driven with the very
+        // value it proved when it registered.
+        .with_node_keys(&config.node_preshared_keys),
     );
     // One stop signal for the server and the health poller, so the poller
     // stops probing at the same moment the listener stops accepting rather

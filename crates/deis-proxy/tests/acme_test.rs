@@ -55,6 +55,15 @@ fn app(id: &str, domains: &[&str]) -> serde_json::Value {
 /// The intervals are seconds rather than hours so a pass happens while the
 /// test is watching. Everything else is what an operator would write.
 fn acme_config(ca: &StubCa, storage_dir: &Path, renew_before_days: i64) -> String {
+    acme_config_with(ca, storage_dir, renew_before_days, 20)
+}
+
+fn acme_config_with(
+    ca: &StubCa,
+    storage_dir: &Path,
+    renew_before_days: i64,
+    max_names: usize,
+) -> String {
     format!(
         "\n[tls.acme]\n\
          enabled = true\n\
@@ -68,10 +77,85 @@ fn acme_config(ca: &StubCa, storage_dir: &Path, renew_before_days: i64) -> Strin
          retry_backoff_secs = 1\n\
          max_retry_backoff_secs = 2\n\
          request_timeout_secs = 10\n\
-         order_timeout_secs = 30\n",
+         order_timeout_secs = 30\n\
+         max_names = {max_names}\n",
         directory = ca.directory_url,
         storage = storage_dir.display(),
     )
+}
+
+/// How many renewal passes the proxy has finished, from its log.
+fn passes_finished(proxy: &Proxy) -> usize {
+    proxy
+        .log_text()
+        .matches("automatic certificate pass finished")
+        .count()
+}
+
+/// A self-signed pair for `name` written into the store where the proxy
+/// would have put one it obtained, ending `ending_in_secs` from now -
+/// negative for a certificate that has already expired. The key written is
+/// the certificate's own unless `matching` is false.
+fn plant_pair(dir: &Path, name: &str, ending_in_secs: i64, matching: bool) {
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::x509::X509NameBuilder;
+    use openssl::x509::extension::SubjectAlternativeName;
+
+    let key = PKey::generate_ed25519().unwrap();
+    let mut subject = X509NameBuilder::new().unwrap();
+    subject.append_entry_by_text("CN", name).unwrap();
+    let subject = subject.build();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_subject_name(&subject).unwrap();
+    builder.set_issuer_name(&subject).unwrap();
+    builder.set_pubkey(&key).unwrap();
+    builder
+        .set_not_before(&Asn1Time::from_unix(now + ending_in_secs - 90 * 86_400).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::from_unix(now + ending_in_secs).unwrap())
+        .unwrap();
+    let context = builder.x509v3_context(None, None);
+    let san = SubjectAlternativeName::new()
+        .dns(name)
+        .build(&context)
+        .unwrap();
+    builder.append_extension(san).unwrap();
+    builder.sign(&key, MessageDigest::null()).unwrap();
+    let certificate = builder.build();
+
+    std::fs::create_dir_all(dir).unwrap();
+    let written_key = if matching {
+        key
+    } else {
+        PKey::generate_ed25519().unwrap()
+    };
+    std::fs::write(dir.join("fullchain.pem"), certificate.to_pem().unwrap()).unwrap();
+    std::fs::write(
+        dir.join("privkey.pem"),
+        written_key.private_key_to_pem_pkcs8().unwrap(),
+    )
+    .unwrap();
+}
+
+/// Whether a TLS handshake for `server_name` completes at all, with no
+/// verification: the question is "does the proxy present anything", not
+/// "is it trusted".
+fn handshake_succeeds(addr: std::net::SocketAddr, server_name: &str) -> bool {
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("a TLS client");
+    builder.set_verify(SslVerifyMode::NONE);
+    let connector = builder.build();
+    let Ok(stream) = TcpStream::connect(addr) else {
+        return false;
+    };
+    connector.connect(server_name, stream).is_ok()
 }
 
 /// Where the store puts one name's files, mirroring `acme::store`'s layout.
@@ -119,6 +203,19 @@ impl Fixture {
         options: CaOptions,
         renew_before_days: i64,
     ) -> Fixture {
+        Fixture::start_with(apps, options, renew_before_days, 20, |_| {}).await
+    }
+
+    /// As [`Fixture::start`], with the `max_names` ceiling chosen and a hook
+    /// run on the store's authority directory before the proxy starts - how
+    /// a test plants a pair the proxy has to find already on disk.
+    async fn start_with(
+        apps: Vec<serde_json::Value>,
+        options: CaOptions,
+        renew_before_days: i64,
+        max_names: usize,
+        prepare_store: impl FnOnce(&Path),
+    ) -> Fixture {
         let backend = Backend::start().await;
         // The HTTP port is chosen first: the authority has to be told where
         // to fetch the challenge from, and that is the port the proxy will
@@ -132,7 +229,8 @@ impl Fixture {
 
         let dir = Arc::new(tempfile::tempdir().expect("a directory for the proxy"));
         let storage_dir = dir.path().join("acme");
-        let extra_config = acme_config(&ca, &storage_dir, renew_before_days);
+        let extra_config = acme_config_with(&ca, &storage_dir, renew_before_days, max_names);
+        prepare_store(&storage_dir.join(authority_key(&ca)));
 
         let proxy = Proxy::launch(ProxyOptions {
             upstream: backend.addr,
@@ -176,6 +274,302 @@ impl Fixture {
             "privkey.pem",
         )
     }
+
+    /// The store's directory for this authority.
+    fn authority_dir(&self) -> PathBuf {
+        self.storage_dir.join(authority_key(&self.ca))
+    }
+
+    /// Wait until the proxy has finished `more` passes beyond `since`.
+    async fn passes(&self, since: usize, more: usize) {
+        until("the renewal task runs more passes", || {
+            passes_finished(&self.proxy) >= since + more
+        })
+        .await;
+    }
+}
+
+// ----------------------------------------------------------------------
+// The pair on disk is judged by one rule, and what is served follows it
+// ----------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_that_stopped_matching_its_certificate_is_reordered_not_called_current() {
+    // The route table refused this pair and the renewal pass called it
+    // "still current" for the rest of its ninety days: no handshake for the
+    // name, a DEBUG line per pass, and a WARN at startup promising a
+    // reorder that never came. Now the pass reads the same verdict the
+    // loader does, orders a replacement, and the name serves again.
+    let fixture = Fixture::start(vec![app("shop", &[NAME])], CaOptions::default(), 30).await;
+    until("the first certificate is installed", || {
+        fixture.proxy.log_text().contains("certificate installed")
+    })
+    .await;
+    assert_eq!(fixture.ca.issued_count(), 1);
+    let stale_chain = std::fs::read(fixture.chain_path(NAME)).unwrap();
+
+    // The key file replaced by a key for nothing in particular: the shape a
+    // crash between the two renames leaves, and the shape a second writer
+    // on the same store produced in the round that found this.
+    let other_key = openssl::pkey::PKey::generate_ed25519().unwrap();
+    std::fs::write(
+        fixture.key_path(NAME),
+        other_key.private_key_to_pem_pkcs8().unwrap(),
+    )
+    .unwrap();
+
+    until("the mismatch is noticed and a replacement ordered", || {
+        fixture.ca.issued_count() >= 2
+    })
+    .await;
+    let log = fixture.proxy.log_text();
+    assert!(
+        log.contains("does not match the certificate"),
+        "the pass has to say what was wrong with the pair:\n{log}"
+    );
+    assert!(
+        log.contains("cannot be served and has not been, so a replacement is being ordered"),
+        "the reorder has to be announced at error, not debug:\n{log}"
+    );
+    until("the replacement is installed and served", || {
+        std::fs::read(fixture.chain_path(NAME)).ok().as_deref() != Some(&stale_chain[..])
+            && fixture
+                .proxy
+                .log_text()
+                .matches("certificate installed")
+                .count()
+                >= 2
+    })
+    .await;
+    let tls_addr = fixture.proxy.tls_addr.expect("a TLS listener");
+    let root = fixture.ca.root_pem();
+    let (leaf, _) = tokio::task::spawn_blocking(move || https_get(tls_addr, NAME, &root))
+        .await
+        .expect("the handshake task finishes");
+    assert_eq!(subject_alt_names(&leaf), vec![NAME.to_string()]);
+    drop(fixture.backend);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_certificate_is_not_served_and_plain_http_is_not_redirected_onto_it() {
+    // The renewal-failure ERROR promises "plain HTTP only, no redirect".
+    // With an expired pair on disk and every order failing, the proxy used
+    // to keep the expired certificate loaded, present it, and answer every
+    // plain request with a 301 onto it. The route table now refuses an
+    // expired automatic pair, and the redirect is computed from the table.
+    let fixture = Fixture::start_with(
+        vec![app("shop", &[NAME])],
+        CaOptions {
+            sabotage_validation: true,
+            ..Default::default()
+        },
+        30,
+        20,
+        |authority| {
+            plant_pair(
+                &authority.join("certificates").join(NAME),
+                NAME,
+                -10 * 86_400,
+                true,
+            )
+        },
+    )
+    .await;
+
+    until("the failed renewal is reported", || {
+        fixture.proxy.log_text().contains("obtaining a certificate")
+    })
+    .await;
+    let log = fixture.proxy.log_text();
+    assert!(
+        log.contains("has expired and is not served"),
+        "the loader has to say the expired pair was left out:\n{log}"
+    );
+
+    let answer = fixture.proxy.request("/", NAME).await;
+    assert!(
+        !answer.starts_with("HTTP/1.1 301"),
+        "plain HTTP must not be redirected onto an expired certificate: {answer}"
+    );
+    let tls_addr = fixture.proxy.tls_addr.expect("a TLS listener");
+    let served = tokio::task::spawn_blocking(move || handshake_succeeds(tls_addr, NAME))
+        .await
+        .unwrap();
+    assert!(
+        !served,
+        "an expired automatic certificate must not be presented"
+    );
+
+    // The redirect follows the TLS state in both directions: once a renewal
+    // succeeds, the name is served again and plain HTTP is redirected.
+    fixture.ca.sabotage_validation(false);
+    until("the renewal succeeds", || {
+        fixture.proxy.log_text().contains("certificate installed")
+    })
+    .await;
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if fixture
+            .proxy
+            .request("/", NAME)
+            .await
+            .starts_with("HTTP/1.1 301")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plain HTTP was not redirected again within {DEADLINE:?} of the renewal succeeding"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(fixture.backend);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_the_ceiling_leaves_out_is_named_on_every_pass() {
+    // With `max_names = 1` and two names, one is not covered. It used to be
+    // counted once at startup and never mentioned again, while whatever
+    // certificate it held was served with the redirect on until it expired.
+    let fixture = Fixture::start_with(
+        vec![app("shop", &[NAME]), app("blog", &[OTHER_NAME])],
+        CaOptions::default(),
+        30,
+        1,
+        |_| {},
+    )
+    .await;
+    // Names out of this instance's own configuration are taken in order:
+    // blog.test fits, shop.test does not.
+    fixture.passes(0, 3).await;
+    let log = fixture.proxy.log_text();
+    let per_name = log
+        .lines()
+        .filter(|line| {
+            line.contains("does not fit under") && line.contains(&format!("name={NAME}"))
+        })
+        .count();
+    assert!(
+        per_name >= 3,
+        "the uncovered name has to be named on every pass, saw it {per_name} times:\n{log}"
+    );
+    assert!(
+        log.contains("uncovered=1"),
+        "the pass summary has to carry the count:\n{log}"
+    );
+    assert_eq!(fixture.ca.issued(), vec![OTHER_NAME.to_string()]);
+    drop(fixture.backend);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_that_cannot_be_written_costs_no_certificate() {
+    // The store is checked before the order is placed. It used to be
+    // checked after: issue, fail to save, back off, issue again - one of the
+    // authority's weekly certificates per retry, five inside a quarter of an
+    // hour with the production backoff.
+    let fixture = Fixture::start(vec![app("shop", &[NAME])], CaOptions::default(), 30).await;
+    until("the first certificate is installed", || {
+        fixture.proxy.log_text().contains("certificate installed")
+    })
+    .await;
+    assert_eq!(fixture.ca.issued_count(), 1);
+
+    // Break the store the way the round did: the pair gone and a directory
+    // where the key file belongs, which no rename can replace.
+    std::fs::remove_file(fixture.chain_path(NAME)).unwrap();
+    std::fs::remove_file(fixture.key_path(NAME)).unwrap();
+    std::fs::create_dir(fixture.key_path(NAME)).unwrap();
+
+    until("the store fault is reported before any order", || {
+        fixture
+            .proxy
+            .log_text()
+            .contains("the certificate store cannot be written, so no certificate is ordered")
+    })
+    .await;
+    let since = passes_finished(&fixture.proxy);
+    fixture.passes(since, 3).await;
+    assert_eq!(
+        fixture.ca.issued_count(),
+        1,
+        "a broken store must not cost a certificate per retry: {:?}",
+        fixture.ca.issued()
+    );
+    assert!(
+        !fixture
+            .proxy
+            .log_text()
+            .contains("was issued and could not be stored"),
+        "nothing should have been issued into a store known to be broken"
+    );
+
+    // Fixed, the next attempt orders exactly one.
+    std::fs::remove_dir(fixture.key_path(NAME)).unwrap();
+    until("the name is certified again", || {
+        fixture.ca.issued_count() == 2
+    })
+    .await;
+    until("and installed", || {
+        fixture
+            .proxy
+            .log_text()
+            .matches("certificate installed")
+            .count()
+            >= 2
+    })
+    .await;
+    drop(fixture.backend);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_proxies_on_one_store_order_each_name_once() {
+    // Two processes pointed at the same storage directory: the second half
+    // of a zero-downtime upgrade, or plainly two proxies. Both used to
+    // decide every due name was due and order it, and their two-file
+    // writes crossed. The renewal lock makes the pass one writer at a time;
+    // the other finds the certificate on disk and orders nothing.
+    let fixture = Fixture::start(vec![app("shop", &[NAME])], CaOptions::default(), 30).await;
+    let second = Proxy::launch(ProxyOptions {
+        upstream: fixture.backend.addr,
+        http_port: None,
+        tls: Some(TlsOptions {
+            port: None,
+            default_certificate: None,
+        }),
+        extra_config: acme_config(&fixture.ca, &fixture.storage_dir, 30),
+        upgrade_sock: None,
+        top_level_config: String::new(),
+        apps: vec![app("shop", &[NAME])],
+        dir: None,
+        wait_for_forwarding: false,
+    })
+    .await;
+
+    until("both proxies have run three passes or skipped them", || {
+        let ran = |proxy: &Proxy| {
+            passes_finished(proxy)
+                + proxy
+                    .log_text()
+                    .matches("another process is running a renewal pass")
+                    .count()
+        };
+        ran(&fixture.proxy) >= 3 && ran(&second) >= 3
+    })
+    .await;
+    assert_eq!(
+        fixture.ca.issued(),
+        vec![NAME.to_string()],
+        "one name, two writers, one certificate"
+    );
+    // And both serve it: the one that did not write it found it on disk.
+    let tls_a = fixture.proxy.tls_addr.unwrap();
+    let tls_b = second.tls_addr.unwrap();
+    until("both proxies present the certificate", || {
+        handshake_succeeds(tls_a, NAME) && handshake_succeeds(tls_b, NAME)
+    })
+    .await;
+    drop(second);
+    drop(fixture.backend);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -540,6 +934,37 @@ async fn the_challenge_path_answers_only_what_this_instance_published() {
             "{hostile} read a file it should never have named: {answer}"
         );
     }
+
+    // An answer is served only under the host it was published for. The
+    // challenge directory is the handover path between two processes, and
+    // before this it answered any token-shaped file for any Host on either
+    // listener - a file server in front of every routing decision.
+    let challenges = fixture.authority_dir().join("challenges");
+    std::fs::write(
+        challenges.join("planted-for-shop"),
+        format!("{NAME}\nplanted"),
+    )
+    .unwrap();
+    std::fs::write(challenges.join("planted-bare"), "planted").unwrap();
+    let path = "/.well-known/acme-challenge/planted-for-shop";
+    let under_own_host = fixture.proxy.request(path, NAME).await;
+    assert!(
+        under_own_host.starts_with("HTTP/1.1 200") && under_own_host.ends_with("planted"),
+        "a handover answer is served under the name it was published for: {under_own_host}"
+    );
+    let under_other_host = fixture.proxy.request(path, "evil.example").await;
+    assert!(
+        under_other_host.starts_with("HTTP/1.1 404"),
+        "the same token under another host must be refused: {under_other_host}"
+    );
+    let bare = fixture
+        .proxy
+        .request("/.well-known/acme-challenge/planted-bare", NAME)
+        .await;
+    assert!(
+        bare.starts_with("HTTP/1.1 404"),
+        "a file with no name line was not written by this store and is not an answer: {bare}"
+    );
     drop(fixture.backend);
 }
 

@@ -499,6 +499,16 @@ hold the same pattern — an operator can say that deliberately — and then
 either may claim inside it, with the `(host, path_prefix)` uniqueness above
 deciding who actually holds a given address.
 
+A delegation constrains the **exact** claim, not the zone holder's wildcard:
+`team-a` may still create the route `*.example.com` (its own grant covers
+that claim, and `b.example.com` is not a zone), and at the edge an exact host
+beats a wildcard. So until `team-b` creates its exact route for
+`b.example.com`, requests to that name reach `team-a`'s wildcard route. That
+is the precedence the edge has always had and the registry does not change
+it; a delegate that wants its name answered only by itself creates its route
+first, and the routing table (`GET /api/routing-table`) shows who answers for
+what in the meantime.
+
 All four calls demand `admin:*/*`, the same as accounts and tokens: handing
 out a hostname decides which tenant receives somebody else's cookies.
 
@@ -515,6 +525,15 @@ claims becomes a grant to the application that claims it. The platform keeps
 serving exactly what it served, `GET /api/domains` is then the list of who
 holds what, and only a *new* name is a decision somebody has to make. The
 adoption runs once, not on every start.
+
+A route row proves a host *and a path prefix*; a grant can only name the
+host. So when two applications share a host at different prefixes, the host
+is granted to the one holding the shortest prefix — the root-most — and to
+nobody else; when no single application holds the shortest prefix, to nobody.
+The other applications' routes keep serving (a grant gates writes, never
+traffic), and the migration log names them at `warn`: they cannot be edited or
+re-created until an operator grants them the host with `POST /api/domains` on
+purpose. Read `GET /api/domains` after an upgrade.
 
 ### Secrets
 

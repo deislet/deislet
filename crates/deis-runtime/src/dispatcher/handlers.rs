@@ -63,10 +63,13 @@ pub(crate) mod ws_frame {
 /// The methods this node refuses at the door, whatever application would have
 /// served them.
 ///
-/// The Fetch standard's forbidden-method list, exactly. See the refusal in
-/// [`handle_request`] for why it is applied there and why nothing else is
-/// added to it.
-pub(crate) const FORBIDDEN_METHODS: [&str; 3] = ["CONNECT", "TRACE", "TRACK"];
+/// The Fetch standard's forbidden-method list lives in `deis_wire::conventions`
+/// (`FORBIDDEN_METHODS`, tested via `method_is_forbidden`) so the inbound HTTP
+/// path here and the service-call path in [`crate::runtime`] refuse the same
+/// set before either reaches the throw a handler's `Request` would produce.
+/// See the refusal in [`handle_request`] for why it is applied there and why
+/// nothing else is added to it.
+pub(crate) use deis_wire::conventions::method_is_forbidden;
 
 /// Why a request body was not read.
 #[derive(Debug)]
@@ -412,10 +415,7 @@ pub async fn handle_request(
     // these three, which is not a list, and the set *this application* accepts
     // is inside the handler and unknown here. A guessed `Allow` would be a
     // wrong answer given confidently, which is worse than an absent header.
-    if FORBIDDEN_METHODS
-        .iter()
-        .any(|forbidden| method.as_str().eq_ignore_ascii_case(forbidden))
-    {
+    if method_is_forbidden(method.as_str()) {
         tracing::warn!(
             app_id = %key.app_id(),
             environment = %key.environment(),
@@ -692,6 +692,32 @@ pub async fn handle_request(
     // missing: a handler that attached no socket, or a client that never asked
     // for one.
     let upgrade_offered = ws.is_some();
+
+    // An application this node does not run at all is a 404, not a 500.
+    //
+    // Without this the request went on to `execute_app`, whose "not found"
+    // came back through the error arm below as `500 Internal Server Error
+    // (incident <id>)` with an ERROR line naming the app. On the data port,
+    // which the proxy does not sit in front of for a node-to-node or a demo
+    // call, anyone who could reach it minted incident ids and ERROR lines by
+    // naming apps that do not exist -- and an operator counting incidents
+    // could not tell a real crash from a typo or a probe. An unknown app is
+    // not a failure of this node: it is answered `404` with a fixed body, and
+    // noted at debug with no incident. A name the control plane simply has
+    // not placed here yet reads the same way, which is correct -- this node
+    // cannot serve it. The proxy already answers `404` for an unknown id at
+    // the edge, so nothing a browser reaches changes.
+    if !state.app_manager.is_loaded(&key) {
+        tracing::debug!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            method = %method,
+            path = uri.path(),
+            "No application {} is running on this node, so a request naming it is answered 404",
+            key
+        );
+        return (StatusCode::NOT_FOUND, "No such application on this node.").into_response();
+    }
 
     // Execute application
     match state

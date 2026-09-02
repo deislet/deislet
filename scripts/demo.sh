@@ -3437,8 +3437,9 @@ check_a_stream_stops_when_the_client_hangs_up() {
 
   # Two frames and then the socket is closed where it stands, which is what a
   # visitor closing a tab looks like from inside the node.
+  local gap=80
   stream_exchange "$DEIS_RUNTIME_PORT" "$APP_ID" \
-    "${STREAM_ROUTE}?mode=endless&gapMs=80&tag=${tag}" \
+    "${STREAM_ROUTE}?mode=endless&gapMs=${gap}&tag=${tag}" \
     6000 2 "identity" > "$report" 2>"${LOG_DIR}/verify-stream-hangup.log" || true
 
   local frames
@@ -3466,17 +3467,42 @@ check_a_stream_stops_when_the_client_hangs_up() {
     return
   fi
 
-  produced_first=$(app_request "${LOG_DIR}/verify-stream-hangup.headers" \
-    "${STREAM_ROUTE}?mode=report" | jq -r '.framesProduced')
-  produced_second=$(app_request "${LOG_DIR}/verify-stream-hangup.headers" \
-    "${STREAM_ROUTE}?mode=report" | jq -r '.framesProduced')
+  # cancel() having run is one half. The other half - the producer stopped -
+  # is measured, not inferred from it, because a runtime whose cancel() fires
+  # while its pull loop goes on writing into a closed stream would pass the
+  # first half with the sentence below intact.
+  #
+  # The measurement has to be longer than the producer's period. It writes a
+  # frame every ${gap}ms, so two reads of its counter tens of milliseconds
+  # apart are equal whether or not it is still running - measured at 8 of 8
+  # trials against a producer known to be alive - and say nothing. A producer
+  # has stopped when its counter does not move across an interval longer than
+  # its period: read the counter, let a full second pass (poll_pause, which is
+  # curl's own retry pacing and not a shell sleep - twelve periods), read it
+  # again. One frame may still land after cancel(): the pull that was already
+  # past its timer when the client left. So a counter that moved is given
+  # another interval before it is called a running producer; a live one moves
+  # in every interval and never settles.
+  local rounds=0 settled="" produced_first="" produced_second=""
+  while [ "$rounds" -lt 3 ]; do
+    produced_first=$(app_request "${LOG_DIR}/verify-stream-hangup.headers" \
+      "${STREAM_ROUTE}?mode=report" | jq -r '.framesProduced')
+    poll_pause
+    produced_second=$(app_request "${LOG_DIR}/verify-stream-hangup.headers" \
+      "${STREAM_ROUTE}?mode=report" | jq -r '.framesProduced')
+    rounds=$(( rounds + 1 ))
+    if [ -n "$produced_first" ] && [ "$produced_first" = "$produced_second" ]; then
+      settled=yes
+      break
+    fi
+  done
 
-  if [ "$produced_first" = "$produced_second" ]; then
+  if [ "$settled" = "yes" ]; then
     pass_check "$title" \
-      "the client read ${frames} frame(s) and closed the socket; the handler's cancel() ran with tag ${tag}, and the frame counter stood still at ${produced_first} across two later requests - the producer stopped rather than writing into nothing"
+      "the client read ${frames} frame(s) and closed the socket; the handler's cancel() ran with tag ${tag}, and the frame counter stood still at ${produced_first} across a full second - more than twelve of its ${gap}ms periods, in round ${rounds} of at most 3 - so the producer stopped rather than writing into nothing"
   else
     fail_check "$title" \
-      "cancel() ran, but the producer kept going: the frame counter moved from ${produced_first} to ${produced_second} after the client had gone"
+      "cancel() ran, but the producer kept going: the frame counter moved from ${produced_first} to ${produced_second} across a full second after the client had gone, and did so in each of ${rounds} round(s)"
   fi
 }
 
@@ -3511,6 +3537,24 @@ check_a_producer_that_throws_leaves_a_failed_transfer() {
   fi
 }
 
+# The lines of one invocation: those whose *last* `trace_id="..."` field is
+# the given id.
+#
+# tracing appends its fields after the message, so the last such field on a
+# line is the node's, and an earlier one is text the application put in its
+# message. That is not a hypothetical: an application's line now arrives
+# escaped onto one line with everything a request put in it - the node's
+# wording, the level, and a `trace_id="..."` naming whatever id the request
+# chose - and a reader that took any occurrence of the field would count that
+# line for the invocation it names. The witness suite holds this against a
+# line copied from the real log. Used by the two counters and two quoters
+# below and by nothing else; `trace_of_witness` already reads the last field
+# for the same reason.
+lines_of_invocation() {
+  local trace=$1
+  grep -F "trace_id=\"${trace}\"" | grep -v -E "trace_id=\"${trace}\".*trace_id=\"" || true
+}
+
 # How many times this node has said, at warn, that it closed *one named
 # invocation's* stream for running past its budget.
 #
@@ -3528,7 +3572,7 @@ stream_budget_log_lines() {
     return 0
   fi
   node_log | grep " WARN " | grep "is past stream_timeout_ms" \
-    | grep -c -F "trace_id=\"${trace}\"" || true
+    | lines_of_invocation "$trace" | grep -c . || true
 }
 
 check_a_stream_past_its_budget_is_closed_by_the_node() {
@@ -3590,7 +3634,7 @@ check_a_stream_past_its_budget_is_closed_by_the_node() {
   local logged said
   logged=$(stream_budget_log_lines "$trace")
   said=$(node_log | grep " WARN " | grep "is past stream_timeout_ms" \
-    | grep -F "trace_id=\"${trace}\"" | tail -n 1 || true)
+    | lines_of_invocation "$trace" | tail -n 1 || true)
 
   if [ "$timed_out" != "true" ] && [ "$clean" != "true" ] \
     && [ "$last" -ge "$floor" ] && [ "$last" -le "$ceiling" ] && [ "$logged" -ge 1 ]; then
@@ -3685,7 +3729,7 @@ timer_cleared_log_lines() {
     return 0
   fi
   node_log | grep " WARN " | grep "were still armed when this invocation ended" \
-    | grep -c -F "trace_id=\"${trace}\"" || true
+    | lines_of_invocation "$trace" | grep -c . || true
 }
 
 check_no_timer_outlives_the_request_that_armed_it() {
@@ -3748,7 +3792,7 @@ check_no_timer_outlives_the_request_that_armed_it() {
   fi
   said_lines=$(timer_cleared_log_lines "$trace")
   said=$(node_log | grep " WARN " | grep "were still armed when this invocation ended" \
-    | grep -F "trace_id=\"${trace}\"" | tail -n 1 || true)
+    | lines_of_invocation "$trace" | tail -n 1 || true)
 
   if [ "$armed_interval" -gt 0 ] && [ "$armed_timeout" -gt 0 ] \
     && [ "$scope" = "undefined" ] && [ "$claim" = "null" ] \
@@ -5125,7 +5169,9 @@ check_queue_dead_letters() {
   # The wait is real: the node hands the message back with a ten-second retry
   # delay and the queue only gives up at the fifth delivery, so this is around
   # a minute. Polled on the condition - the message appearing in the table -
-  # rather than assumed, and every poll is the operator's own command.
+  # rather than assumed, and every poll is the operator's own command; the
+  # second between rounds is poll_pause, curl's retry pacing, like every
+  # other poll in this file.
   local waited=0 found="" listed=""
   while [ "$waited" -lt 180 ]; do
     if deis_cli queue dead-letters --queue jobs --json \
@@ -5141,8 +5187,8 @@ check_queue_dead_letters() {
         break
       fi
     fi
-    sleep 3
-    waited=$((waited + 3))
+    poll_pause
+    waited=$((waited + 1))
   done
 
   if [ -z "$found" ]; then
@@ -5261,7 +5307,7 @@ check_queue_capability_token() {
     && [ "$wrong_rc" -ne 0 ] && echo "$wrong" | grep -q 'Code: Unauthenticated' \
     && [ "$served_rc" -eq 0 ]; then
     pass_check "$title" \
-      "ListDeadLetters at deis-queue's own port for tenant ${tenant} was refused with no x-deis-storage-token header - $(echo "$none" | tr '\n' ' ' | sed 's/  */ /g' | head -c 120) - and refused again with a token that is not this tenant's, while the same call carrying the token the control plane mints from the same secret was served. Nothing that can merely reach the queue's port can list, drain or replay this tenant's messages"
+      "ListDeadLetters at deis-queue's own port for tenant ${tenant} was refused with no x-deis-storage-token header - $(echo "$none" | tr '\n' ' ' | sed 's/  */ /g' | head -c 120) - and refused again with a token that is not this tenant's, while the same call carrying the token the control plane mints from the same secret was served. Nothing that can merely reach the queue's port can list this tenant's dead letters. Drain and replay were not probed here: they sit behind the same interceptor (crates/deis-queue/src/server.rs wraps the whole service in it), which this check shows is switched on and does not show is complete"
     return
   fi
 
@@ -7067,6 +7113,15 @@ retry_backoff_secs = 1
 max_retry_backoff_secs = 4
 include_preview_addresses = true
 EOF
+  # The same mode as every other generated file that carries a credential:
+  # this one holds the node key under [control], and docs/trust-boundaries.md
+  # says the demo writes every such file 0600. This one was the exception
+  # until a round read the directory listing against that sentence, and it
+  # stays behind after the check (only the db and pid file are removed), so
+  # the mode is for the life of .demo/ and not for the seconds the process
+  # runs. scripts/test-demo-witnesses.sh holds every credential-bearing
+  # writer in this file to it.
+  chmod 600 "$config"
 
   rm -f "$error_log"
   "${BIN_DIR}/deis-proxy" -c "$config" > "$log" 2>&1 &
@@ -7155,6 +7210,45 @@ portable_artifact_fault() {
   fi
 }
 
+# What the build's own log says was verified against a vendor's tool and what
+# was not, one clause per vendor target, for the evidence line below.
+#
+# `deis build -v all` runs `wrangler deploy --dry-run` and `deno check` when
+# those tools are on PATH and says at ⚠ when they are not; the tencent target
+# has no local dry-run at all and says so every time. The files and markers
+# the check asserts on are the same either way, so a ✓ that did not quote
+# this read identically on a machine with both tools, on one with neither,
+# and on ubuntu-latest, which has neither - the local run silently carried a
+# wrangler acceptance that CI can never reproduce, and nothing said which of
+# the two runs a reader was looking at. A target the log says nothing about,
+# neither verified nor skipped, is reported as such and the check treats it
+# as a fault: it means the build stopped saying, and a check that fills the
+# silence in would be back where it started.
+vendor_verification_summary() {
+  local log=$1
+  local cloudflare deno tencent
+  if grep -q "wrangler accepted the Worker" "$log" 2>/dev/null; then
+    cloudflare="cloudflare verified (wrangler deploy --dry-run accepted the Worker)"
+  elif grep -q "the cloudflare target was not verified" "$log" 2>/dev/null; then
+    cloudflare="cloudflare NOT verified (wrangler is not on PATH)"
+  else
+    cloudflare="cloudflare: the build log says nothing about verification"
+  fi
+  if grep -q "deno check accepted the program" "$log" 2>/dev/null; then
+    deno="deno verified (deno check accepted the program)"
+  elif grep -q "the deno target was not verified" "$log" 2>/dev/null; then
+    deno="deno NOT verified (deno is not on PATH)"
+  else
+    deno="deno: the build log says nothing about verification"
+  fi
+  if grep -q "the tencent target was not verified against EdgeOne" "$log" 2>/dev/null; then
+    tencent="tencent NOT verified (EdgeOne has no local dry-run)"
+  else
+    tencent="tencent: the build log says nothing about verification"
+  fi
+  echo "${cloudflare}; ${deno}; ${tencent}"
+}
+
 check_every_compiler_target_is_built() {
   local title="one project compiles for all four targets, each with the files that host needs"
   local dir="${DEMO_DIR}/app-portable"
@@ -7231,6 +7325,14 @@ BUNDLE
   grep -q "/api/where" "${dir}/dist/deno/_deis_internal/router.ts" 2>/dev/null \
     || faults="${faults}Deno's router does not carry the route the function tree defines "
 
+  # Which vendor tools stood behind this run, from the build's own log.
+  local verified
+  verified=$(vendor_verification_summary "$log")
+  case "$verified" in
+    *"says nothing about verification"*)
+      faults="${faults}the build log no longer says, per vendor target, whether the vendor's tool verified the artifact or was skipped (${verified}) " ;;
+  esac
+
   faults=$(echo "$faults" | sed 's/^ *//; s/ *$//')
   if [ -n "$faults" ]; then
     fail_check "$title" \
@@ -7239,7 +7341,7 @@ BUNDLE
   fi
 
   pass_check "$title" \
-    "one \`deis build -v all\` over ${PORTABLE_SRC_DIR} wrote four directories: dist/deislet/bundle.zip (a manifest and a worker carrying this handler), dist/cloudflare (index.js plus the wrangler.toml naming \"portable\" and a package.json), dist/deno (the handler, a generated router that knows /api/where, and deno.json) and dist/tencent (edge-functions/index.js and edgeone.json). Every entry carries the handler's own marker, and Cloudflare's and EdgeOne's differ from one another, so each adapter built the shape its host expects rather than copying one output four times"
+    "one \`deis build -v all\` over ${PORTABLE_SRC_DIR} wrote four directories: dist/deislet/bundle.zip (a manifest and a worker carrying this handler), dist/cloudflare (index.js plus the wrangler.toml naming \"portable\" and a package.json), dist/deno (the handler, a generated router that knows /api/where, and deno.json) and dist/tencent (edge-functions/index.js and edgeone.json). Every entry carries the handler's own marker, and Cloudflare's and EdgeOne's differ from one another, so each adapter built the shape its host expects rather than copying one output four times. The files are this compiler's own work; what a vendor's tool said about them on this machine, from the build log: ${verified}. A target marked NOT verified was verified nowhere in this run"
 }
 
 check_cli_deploy() {

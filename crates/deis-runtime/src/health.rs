@@ -164,20 +164,38 @@ pub const SERVING_APPS_HEADER: &str = "x-deis-node-apps";
 ///
 /// The probe is answered on the node's public port to anyone who asks for
 /// `/health` with `x-deis-app-id: _system`, and the reason travels into the
-/// body. So a reason built from an error carries what that error carries -
-/// an application id, an environment, the control plane's own address out of
-/// a transport error - to whoever can reach the port. That is a deliberate
-/// trade and not an oversight: the reader this answer exists for is the
-/// operator holding a terminal during an incident, the audience that can
-/// reach a node's data port can already enumerate application ids by routing
-/// to them, and the alternative on offer was the invented cause this header
-/// replaced. What is kept out of it deliberately is any text that came from
-/// inside an isolate: a module that throws while it is being evaluated writes
-/// its own message, and `throw new Error(env.STRIPE_KEY)` would otherwise put
-/// a secret on an unauthenticated answer. So a refusal names which step
-/// refused ([`crate::deployment::DeployError::kind`]) and never the message
-/// that step produced, which stays in the log and in the answer the control
-/// plane gets.
+/// body and onto this header. So the reason a caller of [`NodeHealth`] hands
+/// in is read by whoever can reach that port, and what it may carry is drawn
+/// deliberately.
+///
+/// It *may* name the tenant's own things - which application, which
+/// environment, which version this node could not load or would not stop.
+/// That is a deliberate trade and not an oversight: the reader this answer
+/// exists for is the operator holding a terminal during an incident, and the
+/// audience that can reach a node's data port can already enumerate
+/// application ids by routing to them. The alternative on offer was the
+/// invented cause this header replaced, which sent every degraded node's
+/// operator to look at the control plane.
+///
+/// It must *not* carry the platform's own infrastructure or an isolate's own
+/// text, because neither is the caller's to read and neither is enumerable
+/// from the data port:
+///
+///   * the control plane's own address. A transport error carries the
+///     internal URL this node was configured to call, so a reason built with
+///     `format!("...: {e}")` over one put that URL on an unauthenticated
+///     answer. The transport case therefore stamps the *class* - "control
+///     plane unreachable" - and the address and the error stay in the node's
+///     own log. This is what [`crate::deployment`] does; the two warn lines it
+///     writes on every unreachable pass carry the URL, and this header does
+///     not.
+///   * any text that came from inside an isolate. A module that throws while
+///     it is being evaluated writes its own message, and `throw new
+///     Error(env.STRIPE_KEY)` would otherwise put a secret here. So a load
+///     refusal names which step refused
+///     ([`crate::deployment::DeployError::kind`]) and never the message that
+///     step produced, which stays in the log and in the answer the control
+///     plane gets.
 pub const REASON_HEADER: &str = "x-deis-node-reason";
 
 /// Longest reason that travels on [`REASON_HEADER`].

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use openssl::asn1::Asn1Time;
 use pingora::listeners::TlsAccept;
 use pingora::tls::ext;
 use pingora::tls::nid::Nid;
@@ -45,14 +46,23 @@ impl LoadedCertificate {
             .with_context(|| format!("reading certificate {}", config.cert_file))?;
         let key_pem = std::fs::read(&config.key_file)
             .with_context(|| format!("reading private key {}", config.key_file))?;
+        Self::from_pem(&cert_pem, &key_pem, config)
+    }
 
-        let mut certs = X509::stack_from_pem(&cert_pem)
+    /// Parse a chain and a key already read from `config`'s files.
+    ///
+    /// Split from [`Self::load`] so a caller that has to read the two files
+    /// as one unit - the automatic certificate store, whose writer replaces
+    /// them under a lock - can do the reading itself and still get the same
+    /// checks. `config` only names the files for the messages.
+    pub fn from_pem(cert_pem: &[u8], key_pem: &[u8], config: &CertificateConfig) -> Result<Self> {
+        let mut certs = X509::stack_from_pem(cert_pem)
             .with_context(|| format!("parsing certificate {}", config.cert_file))?;
         if certs.is_empty() {
             bail!("{} contains no certificate", config.cert_file);
         }
         let leaf = certs.remove(0);
-        let key = PKey::private_key_from_pem(&key_pem)
+        let key = PKey::private_key_from_pem(key_pem)
             .with_context(|| format!("parsing private key {}", config.key_file))?;
         let public_key = leaf
             .public_key()
@@ -79,6 +89,24 @@ impl LoadedCertificate {
             key,
             names,
         })
+    }
+
+    /// Whether the leaf's validity period has already ended.
+    ///
+    /// Judged against the clock now, not in whole days: a certificate three
+    /// hours past its end is expired, and a check that rounded to days would
+    /// go on serving it until midnight.
+    pub fn is_expired(&self) -> bool {
+        match Asn1Time::days_from_now(0) {
+            Ok(now) => self.leaf.not_after() < now.as_ref(),
+            // A clock that cannot be read is not a reason to stop serving.
+            Err(_) => false,
+        }
+    }
+
+    /// The leaf's end of validity, for log lines.
+    pub fn not_after(&self) -> String {
+        self.leaf.not_after().to_string()
     }
 }
 
@@ -243,6 +271,42 @@ mod certificate_name_tests {
             certificate_names(&cert).is_empty(),
             "a certificate whose common name hides a second name behind a NUL must match no host"
         );
+    }
+
+    #[test]
+    fn expiry_is_judged_against_the_clock_and_not_in_whole_days() {
+        // Built directly rather than through `cert_with`, whose validity is
+        // fixed: the case that matters is a certificate that ended a few
+        // hours ago, which a whole-day comparison still calls current.
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "old.example.com").unwrap();
+        let name = name.build();
+        let build = |not_after: Asn1Time| {
+            let mut builder = X509Builder::new().unwrap();
+            builder.set_version(2).unwrap();
+            builder.set_subject_name(&name).unwrap();
+            builder.set_issuer_name(&name).unwrap();
+            builder.set_pubkey(&key).unwrap();
+            builder
+                .set_not_before(&Asn1Time::from_unix(0).unwrap())
+                .unwrap();
+            builder.set_not_after(&not_after).unwrap();
+            builder.sign(&key, MessageDigest::sha256()).unwrap();
+            LoadedCertificate {
+                leaf: builder.build(),
+                chain: Vec::new(),
+                key: key.clone(),
+                names: vec!["old.example.com".to_string()],
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let three_hours = 3 * 3600;
+        assert!(build(Asn1Time::from_unix(now - three_hours).unwrap()).is_expired());
+        assert!(!build(Asn1Time::from_unix(now + three_hours).unwrap()).is_expired());
     }
 
     #[test]

@@ -159,6 +159,25 @@ async fn op_deis_service_call(
     };
     let callee = target.tenant();
 
+    // Refused before the chain is judged, the budget is charged, or anything
+    // is posted. A method no handler can answer -- one the Fetch standard
+    // forbids, or a string that is not a method at all -- would reach the
+    // callee's `createContext`, whose `new Request` throws before a line of
+    // the callee's code ran: the caller saw a 500 with an incident id, and the
+    // callee's own log stream gained an ERROR with a platform stack for a call
+    // it never served. Caught here, the caller gets the `TypeError` a failed
+    // `fetch` throws, naming the method, and the callee sees nothing.
+    if let Some(reason) = super::service_call::method_refusal(&request.method) {
+        return Err(refuse(
+            &caller,
+            ServiceCallError::MethodNotUsable {
+                binding,
+                method: request.method,
+                reason,
+            },
+        ));
+    }
+
     // The chain this invocation is part of, with the caller as its last frame.
     // An invocation that arrived from outside has an empty path, so the caller
     // is added here and the first hop is one frame deep.

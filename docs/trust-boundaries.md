@@ -22,10 +22,13 @@ calling:
 - `crates/deis-control/src/handler.rs` and
   `crates/deis-control/src/api/grpc.rs` - the node gRPC channel checks the
   same list.
-- `crates/deis-control/src/config.rs`, `node_call_credential` - the **first**
-  non-empty value is the one this control plane presents when it drives a
-  node. The rest are accepted, not presented; the list is therefore ordered,
-  which is what makes the rotation below work.
+- `crates/deis-control/src/runtime_client/mod.rs`, `NodeKeyStatus` - when
+  this control plane drives a node, it presents **the value that node proved
+  when it registered**, never another one; a node whose value has since left
+  the list is not called at all. A node from `deis_runtime_nodes` that has not
+  registered yet has proved nothing and is driven with the first value. Which
+  value a node is on is shown by `key_status` and `key_fingerprint` on
+  `GET /api/runtime` - a SHA-256 prefix, never the value.
 
 So there is no such thing as "one node's key". There is the fleet credential,
 and a holder of any one of its values.
@@ -126,34 +129,60 @@ the operator's to enforce:
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
 | Every node's configuration | `0600`, owned by the node's service user. It holds `[control] secret`. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same value, same consequences. |
-| `.demo/*.toml` written by `scripts/demo.sh` | The demo writes every file it generates that carries a credential - `state.env`, `secret.key` and all six service configurations - as `0600`. It is still a workstation tool: it puts every process under one user, so the mode separates the demo from other accounts on the host and nothing else. Do not copy a `.demo/` configuration into a real deployment. |
+| `.demo/*.toml` written by `scripts/demo.sh` | The demo writes every file it generates as `0600`: `state.env`, `secret.key`, the six service configurations (five of them carry a credential; deis-telemetry's carries none and gets the mode for uniformity) and the ACME-restart copy of the proxy configuration. It is still a workstation tool: it puts every process under one user, so the mode separates the demo from other accounts on the host and nothing else. Do not copy a `.demo/` configuration into a real deployment. |
 
 ## Rotating the credential
 
 The code supports rotation without an outage, because the control plane
-accepts every value in its list while presenting only the first, and a node
-accepts `[control] secret` plus everything in `[management] keys`
-(`crates/deis-runtime/src/config.rs`, `management_keys`). No process reloads
-its configuration on a signal, so every step below is a restart of the
-processes named in it - and only of those.
+accepts every value in its list and drives each node with the value that node
+itself proved when it registered, and a node accepts `[control] secret` plus
+everything in `[management] keys` (`crates/deis-runtime/src/config.rs`,
+`management_keys`). No process reloads its configuration on a signal, so every
+step below is a restart of the processes named in it - and only of those.
 
 1. **Teach every node the new value.** Add it to `[management] keys` on each
    node and restart the nodes one at a time. Each node now answers to both the
    old and the new value; the control plane is still presenting the old one,
    so nothing is interrupted.
-2. **Put the new value first in the control plane's `node_preshared_keys`,
-   keeping the old one behind it**, and restart the control plane. The control
-   plane now presents the new value on its pushes, and still accepts the old
-   one on the pull side, so a node that has not been moved yet keeps fetching
-   assignments and bundles.
+2. **Add the new value to the control plane's `node_preshared_keys`, keeping
+   the old one**, and restart the control plane. Put the new value first: the
+   position only decides what a node from `deis_runtime_nodes` is driven with
+   before it has registered. The control plane now accepts both values on the
+   pull side - registration, assignments, bundle download - and on its push
+   side drives each node with whichever value that node registered with. A
+   node still on the old value keeps being driven with the old value; nothing
+   is handed a value it did not prove.
 3. **Move each node's `[control] secret` to the new value** and drop the old
    one from that node's `[management] keys`. Restart the nodes one at a time.
+   On its first registration after the restart the node proves the new value,
+   and the control plane's calls to it carry the new value from then on
+   (`GET /api/runtime` shows the change in `key_fingerprint`).
 4. **Move deis-proxy's `[control] secret`** to the new value and run
-   `deis-proxy -s reload` (or the control plane's `restart` command). The
-   replacement process reads the file and takes the listening sockets over, so
-   this step drops no connection.
+   `deis-proxy -s reload` (or the control plane's `restart` command, which
+   answers that the upgrade was *queued*; the replacement's own registration
+   at `GET /api/sessions` is what says it came up). The replacement process
+   reads the file and takes the listening sockets over, so this step drops no
+   connection.
 5. **Remove the old value from `node_preshared_keys`** and restart the control
-   plane. The old value now opens nothing.
+   plane. The restart empties the registration list, and a node that can only
+   prove the old value is refused when it registers again: it is on no fleet
+   list, receives no push, no cron fire and no health probe, and its own log
+   says why. The old value now opens nothing.
+
+**What the code guarantees, and what it does not.** A node is driven with the
+value it proved at its most recent registration and with no other, so an
+address that registered by proving the old value between steps 2 and 5 is
+driven with the old value and is never handed the new one - which is what
+makes step 5 an eviction rather than an upgrade. What the code does *not* do:
+until step 5 the old value is still a fleet credential, so a holder of it can
+still register an address, read the assignment list and download bundles; a
+holder of it can also refresh the registration of a node that is on the new
+value, which switches that node to being driven with the old value until the
+node's own next refresh (a third of `node_registration_ttl_secs`, 30 s by
+default) - after step 3 the node refuses the old value, so the cost is one
+refresh interval of failed pushes to it, logged on both sides. The node gRPC
+channel (deis-proxy's) records nothing per key, because nothing is driven back
+over it with a credential: commands go down the stream that authenticated.
 
 Restarting nodes one at a time is what keeps traffic up: deis-proxy
 health-checks its upstreams and takes a node out of rotation while it is down.
@@ -163,7 +192,10 @@ what it already has when the control plane is unreachable.
 **If a value may have leaked, the rotation above is not enough on its own.**
 Whoever held it has had the assignment list, which means every secret in every
 environment. Rotate the application secrets too, and assume any bundle on the
-platform was readable.
+platform was readable. Before step 2, read `GET /api/runtime` and
+`DELETE /api/nodes/{id}/registration` any address you do not recognise; the
+rotation stops such an address from acquiring the new value, it does not stop
+it from having had everything the old one opened.
 
 ## What is not implemented
 

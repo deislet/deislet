@@ -1,11 +1,13 @@
-# What runs on every push and pull request.
+# What is meant to run on every push and pull request.
 #
 # Until this file grew the three jobs below it held one check that needed no
 # build, and a comment explaining that a cargo job was for later. The effect
-# was that nothing automatic ever compiled this workspace, ran its 2386 tests,
-# or ran `scripts/demo.sh verify` - the run this project's evidence is quoted
+# was that nothing automatic ever compiled this workspace, ran its tests, or
+# ran `scripts/demo.sh verify` - the run this project's evidence is quoted
 # from. Every one of those was a thing somebody remembered to do on a laptop,
-# and the record of it was a sentence in a commit message.
+# and the record of it was a sentence in a commit message. A file is not a
+# run: until a run of these jobs has been observed, what they prove is what
+# they would check, and the README says so where it quotes the numbers.
 #
 # The build is not free here, and the reason is worth stating once: deis-control
 # embeds `crates/deis-control/web/dist` at compile time, so any job that

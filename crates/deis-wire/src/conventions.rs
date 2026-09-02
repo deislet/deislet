@@ -178,6 +178,33 @@ pub fn split_namespace(namespace: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
+/// The request methods no application on this platform can be built to answer.
+///
+/// The Fetch standard's forbidden-method list, exactly. TRACE and TRACK are
+/// also the cross-site tracing pair -- a server that echoes a request echoes
+/// its cookies -- and CONNECT asks a node to be a tunnel, which it is not. The
+/// runtime builds a standard `Request` for a handler, and deno_fetch's
+/// constructor throws `TypeError: Method is forbidden` on these three: a
+/// request carrying one could never reach a handler that answered it, only a
+/// 500 built from that throw.
+///
+/// It lives here, spelled once, because more than one door on this platform
+/// has to refuse it before the throw: the inbound HTTP path in the dispatcher,
+/// and the application-to-application service-call path. A second copy would
+/// let the two drift, so a method refused at the edge could still be posted to
+/// a callee. See [`method_is_forbidden`] for the comparison.
+pub const FORBIDDEN_METHODS: [&str; 3] = ["CONNECT", "TRACE", "TRACK"];
+
+/// Whether `method` is one [`FORBIDDEN_METHODS`] names.
+///
+/// Case-insensitive, because the standard compares methods that way and a
+/// client sending `trace` means the same thing as one sending `TRACE`.
+pub fn method_is_forbidden(method: &str) -> bool {
+    FORBIDDEN_METHODS
+        .iter()
+        .any(|forbidden| method.eq_ignore_ascii_case(forbidden))
+}
+
 /// Ceiling for a single gRPC message, applied to both directions on every
 /// service in the platform.
 ///
@@ -274,6 +301,22 @@ pub const ASSIGNMENTS_COMPLETE_HEADER: &str = "x-deis-assignments-complete";
 /// Response header counting the assignments the control plane could not
 /// describe, and so left out. Non-zero always accompanies a `complete: false`.
 pub const ASSIGNMENTS_WITHHELD_HEADER: &str = "x-deis-assignments-withheld";
+
+/// The phrase the control plane puts in a registration refusal when the
+/// node id is held by a channel it still hears from, and the phrase the
+/// refused side looks for to decide the refusal is transient.
+///
+/// A second channel registering an id whose holder is live is one of two
+/// things: two processes sharing one `associated_id` (a configuration
+/// mistake that will never resolve on its own), or one process reconnecting,
+/// after a network break or as the replacement in a zero-downtime upgrade,
+/// before the control plane has noticed the old channel go. The refused side
+/// cannot tell which from its own seat, but the second is the common case
+/// and resolves within a heartbeat timeout, so it retries at the short
+/// interval and logs at warn rather than error. One shared constant, because
+/// a refusal spelled one way here and matched another way there would turn
+/// every upgrade back into an error storm.
+pub const NODE_ID_HELD_BY_LIVE_CHANNEL: &str = "is held by a live channel";
 
 // ---- proving a storage caller may be the tenant it claims --------------
 //

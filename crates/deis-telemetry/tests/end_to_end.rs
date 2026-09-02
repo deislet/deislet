@@ -1010,3 +1010,137 @@ async fn a_flood_from_one_application_does_not_delete_a_co_tenants_live_lines() 
 
     server.shutdown().await.expect("clean shutdown");
 }
+
+/// Microseconds in one UTC day, the width of a log partition.
+const DAY_US: i64 = 86_400_000_000;
+
+#[tokio::test]
+async fn a_page_of_big_lines_is_cut_by_bytes_and_pages_through() {
+    // 300 lines of 60 KiB each are inside the per-message cap and add up to
+    // 18 MiB, past the 16 MiB frame every Deislet service agrees on. A page
+    // built by row count alone cannot be encoded, tonic answers OutOfRange
+    // after the handler has returned, and `deis logs --limit 300` fails for
+    // the whole retention window. The page has to stop early and hand back a
+    // cursor, so whatever limit a client asks for pages through.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()))
+        .await
+        .expect("the service must start");
+    let mut client = connect(&server).await;
+
+    let base = now_us() - 1_000_000;
+    let line = "x".repeat(60 * 1024);
+    for batch in 0..6 {
+        client
+            .push_logs(PushLogsRequest {
+                entries: (0..50)
+                    .map(|i| entry("chatty", 3, &line, base + batch * 50 + i))
+                    .collect(),
+                metadata: HashMap::new(),
+            })
+            .await
+            .expect("a 3 MiB batch must be accepted");
+    }
+
+    let mut seen = 0usize;
+    let mut pages = 0usize;
+    let mut cursor = String::new();
+    loop {
+        let page = client
+            .query(QueryRequest {
+                app_id: "chatty".to_string(),
+                limit: 300,
+                cursor: cursor.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("a query for 300 big lines must be answered, not refused as too large")
+            .into_inner();
+        assert!(
+            prost::Message::encoded_len(&page) <= MAX_GRPC_MESSAGE_BYTES,
+            "a page must always fit the frame"
+        );
+        assert!(
+            !page.entries.is_empty(),
+            "every page carries at least one entry"
+        );
+        seen += page.entries.len();
+        pages += 1;
+        cursor = page.next_cursor;
+        if !page.has_more {
+            break;
+        }
+        assert!(
+            !cursor.is_empty(),
+            "a page cut short must hand back a cursor for the rest"
+        );
+    }
+    assert_eq!(
+        seen, 300,
+        "paging through must reach every line exactly once"
+    );
+    assert!(
+        pages >= 2,
+        "300 x 60 KiB cannot be one page; the first one must have been cut by bytes"
+    );
+
+    server.shutdown().await.expect("shutdown must succeed");
+}
+
+#[tokio::test]
+async fn entries_older_than_the_retention_window_are_refused_not_partitioned() {
+    // One batch, 300 entries each on its own day between 10 and 310 days ago.
+    // Logs are kept for 7 days, so every one of them would be dropped by the
+    // next retention sweep; storing them first would create 300 partitions
+    // with three indexes each inside one write transaction, holding the single
+    // writer against every other producer for as long as that takes.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()))
+        .await
+        .expect("the service must start");
+    let mut client = connect(&server).await;
+
+    let now = now_us();
+    let response = client
+        .push_logs(PushLogsRequest {
+            entries: (10..310)
+                .map(|d| entry("clock", 3, "from the past", now - d * DAY_US))
+                .collect(),
+            metadata: HashMap::new(),
+        })
+        .await
+        .expect("the push itself is answered")
+        .into_inner();
+    assert_eq!(
+        response.accepted_count, 0,
+        "nothing older than the retention window may be stored"
+    );
+    assert_eq!(response.rejected_count, 300);
+    assert!(
+        response.error_message.contains("retention"),
+        "the producer is told why: {}",
+        response.error_message
+    );
+    assert_eq!(
+        server
+            .store
+            .partition_count()
+            .expect("partitions can be counted"),
+        0,
+        "no partition may be created for data retention would delete on its next pass"
+    );
+
+    // A line from inside the window is still taken, so a producer that is a
+    // day behind is not cut off.
+    let response = client
+        .push_logs(PushLogsRequest {
+            entries: vec![entry("clock", 3, "yesterday", now - DAY_US)],
+            metadata: HashMap::new(),
+        })
+        .await
+        .expect("the push itself is answered")
+        .into_inner();
+    assert_eq!(response.accepted_count, 1);
+
+    server.shutdown().await.expect("shutdown must succeed");
+}

@@ -34,8 +34,9 @@ use crate::proto::{
 };
 use crate::stats::{Access, ServiceStats};
 use crate::store::{
-    LogCursor, LogFilter, LogRecord, MetricCursor, MetricFilter, MetricRecord, TelemetryStore,
-    TraceCursor, TraceFilter, TraceRecord,
+    DAY_US, LogCursor, LogFilter, LogRecord, MAX_PAGE_BYTES, MAX_PARTITIONS_PER_BATCH,
+    MetricCursor, MetricFilter, MetricRecord, TelemetryStore, TraceCursor, TraceFilter,
+    TraceRecord, day_of,
 };
 use crate::tail::{TailFilter, TailHub, TraceHub, TraceTailFilter};
 
@@ -43,6 +44,45 @@ use crate::tail::{TailFilter, TailHub, TraceHub, TraceTailFilter};
 /// a runaway `console.log` must not be able to bloat the database, and a
 /// truncated line is still worth more than a rejected one.
 pub const MAX_LOG_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Longest identifier-like string accepted: `app_id`, `component`,
+/// `trace_id`, `span_id`, a trace's `environment`, `node` and `method`, a
+/// metric's `name`. These name things, so they are refused rather than cut -
+/// a cut identifier would file the record under a name nothing else uses -
+/// and nothing legitimate comes anywhere near a kilobyte.
+pub const MAX_IDENTIFIER_BYTES: usize = 1024;
+
+/// Longest key of a structured field, trace attribute or metric label. A key
+/// cannot be cut without risking a collision with another key, so a longer
+/// one refuses the record.
+pub const MAX_KEY_BYTES: usize = 256;
+
+/// Longest value of a structured field or trace attribute kept verbatim;
+/// longer ones are cut and marked, like an oversized message.
+pub const MAX_FIELD_VALUE_BYTES: usize = 16 * 1024;
+
+/// Most bytes of structured fields or attributes - keys and values together,
+/// after values were cut - one record may carry. Beyond this the record is
+/// refused: with every value already capped, only a record built to be large
+/// gets here.
+pub const MAX_FIELDS_BYTES: usize = 64 * 1024;
+
+/// Most bytes of labels one metric sample may carry. Labels name the series,
+/// so a sample over this is refused rather than have its labels cut into a
+/// series nobody asked for - which the assertion under it guarantees: no
+/// single label value can be cut and still fit under the total.
+pub const MAX_LABELS_BYTES: usize = 4 * 1024;
+const _: () = assert!(MAX_LABELS_BYTES <= MAX_FIELD_VALUE_BYTES);
+
+// Together these bound what one stored record can weigh: a log entry at
+// roughly the message cap plus the fields cap, a trace at its attributes cap
+// plus the target and error caps. Both are far under the page budget, which
+// is what lets a page cut by bytes always carry at least one record and still
+// fit the frame. Only `message`, `target` and `error` were capped before;
+// everything else went to the database verbatim, and a single ten-megabyte
+// field value made every page that included it impossible to encode.
+const _: () =
+    assert!(MAX_LOG_MESSAGE_BYTES + MAX_FIELDS_BYTES + 8 * MAX_IDENTIFIER_BYTES < MAX_PAGE_BYTES);
 
 /// Marker appended to a message that was cut short, so a reader never mistakes
 /// the truncation for the end of the original line.
@@ -78,6 +118,193 @@ pub struct QueryLimits {
     pub max_limit: u32,
 }
 
+/// The retention policy, as ingest needs to know it.
+///
+/// A record older than what the next sweep would delete is refused at the
+/// door. Storing it first would be worse on both counts that matter: the
+/// data is gone within the hour either way, and getting it there creates a
+/// day partition - a table and its indexes, inside the one write transaction
+/// on the one write connection - per distinct day the batch names. One batch
+/// of records spread over a few thousand past days held the writer, and with
+/// it every other producer's push, for tens of seconds.
+///
+/// The one legitimate source of such stamps is a node whose clock is wrong.
+/// Refusing is what serves that operator: the push answer names the stamp
+/// and the window in `error_message`, so the producer can log it, and the
+/// alternative - filing the record under a stamp it did not carry - would
+/// hide the wrong clock behind data that looks right and is not. A producer
+/// that is late by less than the window, a node that was offline for a day,
+/// is still taken.
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    pub log_days: u32,
+    pub trace_days: u32,
+    pub metric_days: u32,
+}
+
+/// The stamps one push accepts, worked out once per call from the server
+/// clock and the retention for that kind of record.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    /// Server receive time; what an entry without a stamp gets.
+    now_us: i64,
+    /// Earliest stamp the next retention sweep would still keep.
+    oldest_us: i64,
+    retention_days: u32,
+    /// "log", "trace" or "metric", for the refusal text.
+    kind: &'static str,
+}
+
+impl Window {
+    fn new(now_us: i64, retention_days: u32, kind: &'static str) -> Self {
+        // Retention keeps `retention_days` whole UTC days counting today, so
+        // the oldest kept instant is the start of the oldest kept day.
+        let oldest_day = day_of(now_us) - i64::from(retention_days) + 1;
+        Self {
+            now_us,
+            oldest_us: oldest_day.saturating_mul(DAY_US),
+            retention_days,
+            kind,
+        }
+    }
+
+    /// The stamp to store for `stamp`, or why it cannot be stored.
+    fn accept(&self, stamp: i64, stamped: &mut u64) -> Result<i64, TimestampFault> {
+        if stamp == 0 {
+            *stamped += 1;
+            return Ok(self.now_us);
+        }
+        if stamp < 0 || stamp > self.now_us + MAX_FUTURE_SKEW_US {
+            return Err(TimestampFault::Future(stamp));
+        }
+        if stamp < self.oldest_us {
+            return Err(TimestampFault::Past {
+                stamp,
+                retention_days: self.retention_days,
+                kind: self.kind,
+            });
+        }
+        Ok(stamp)
+    }
+}
+
+/// Why a stamp was refused.
+#[derive(Debug)]
+enum TimestampFault {
+    /// Negative, or more than an hour ahead of the server clock.
+    Future(i64),
+    /// Older than what the next retention sweep keeps.
+    Past {
+        stamp: i64,
+        retention_days: u32,
+        kind: &'static str,
+    },
+}
+
+impl TimestampFault {
+    fn describe(&self, field: &str) -> String {
+        match self {
+            Self::Future(stamp) => {
+                format!(
+                    "{field} {stamp} is negative or more than an hour ahead of the server clock"
+                )
+            }
+            Self::Past {
+                stamp,
+                retention_days,
+                kind,
+            } => format!(
+                "{field} {stamp} is older than the {retention_days}-day {kind} retention window \
+                 and would be deleted by the next sweep, so it is refused rather than stored; \
+                 check the producer's clock"
+            ),
+        }
+    }
+}
+
+/// Why a record's strings cannot be stored as sent.
+#[derive(Debug)]
+enum SizeFault {
+    /// An identifier over [`MAX_IDENTIFIER_BYTES`].
+    Identifier { field: &'static str, len: usize },
+    /// A field, attribute or label key over [`MAX_KEY_BYTES`].
+    Key { len: usize },
+    /// Fields, attributes or labels over their total cap, after values
+    /// were cut.
+    Total { bytes: usize, cap: usize },
+}
+
+impl SizeFault {
+    fn describe(&self, what: &str) -> String {
+        match self {
+            Self::Identifier { field, len } => {
+                format!("{field} is {len} bytes, the limit is {MAX_IDENTIFIER_BYTES}")
+            }
+            Self::Key { len } => {
+                format!("a {what} key is {len} bytes, the limit is {MAX_KEY_BYTES}")
+            }
+            Self::Total { bytes, cap } => {
+                format!("{what} total {bytes} bytes, the limit is {cap}")
+            }
+        }
+    }
+}
+
+/// Refuse an identifier-like string that is too long to be one.
+fn check_identifier(field: &'static str, value: &str) -> Result<(), SizeFault> {
+    if value.len() > MAX_IDENTIFIER_BYTES {
+        return Err(SizeFault::Identifier {
+            field,
+            len: value.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Bound a map of free-form strings: keys are refused over
+/// [`MAX_KEY_BYTES`], values cut at [`MAX_FIELD_VALUE_BYTES`], and the whole
+/// map refused over `cap` once the values are cut.
+fn bound_map(
+    pairs: impl IntoIterator<Item = (String, String)>,
+    cap: usize,
+    truncated: &mut u64,
+) -> Result<BTreeMap<String, String>, SizeFault> {
+    let mut out = BTreeMap::new();
+    let mut total = 0usize;
+    for (key, value) in pairs {
+        if key.len() > MAX_KEY_BYTES {
+            return Err(SizeFault::Key { len: key.len() });
+        }
+        let value = truncate_to(value, MAX_FIELD_VALUE_BYTES, truncated);
+        total += key.len() + value.len();
+        if total > cap {
+            return Err(SizeFault::Total { bytes: total, cap });
+        }
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
+/// Keep a batch inside [`MAX_PARTITIONS_PER_BATCH`] distinct days.
+///
+/// Records on the oldest days beyond that count are dropped and counted as
+/// rejected; the newest days win, because a producer that is behind catches
+/// up from the newest end least badly. With stamps already refused outside
+/// the retention window this only triggers under a retention longer than a
+/// month, so the store's own refusal of such a batch is never reached.
+fn cap_distinct_days<T>(records: &mut Vec<T>, day: impl Fn(&T) -> i64) -> usize {
+    let mut days: Vec<i64> = records.iter().map(&day).collect();
+    days.sort_unstable_by(|a, b| b.cmp(a));
+    days.dedup();
+    if days.len() <= MAX_PARTITIONS_PER_BATCH {
+        return 0;
+    }
+    let oldest_kept = days[MAX_PARTITIONS_PER_BATCH - 1];
+    let before = records.len();
+    records.retain(|record| day(record) >= oldest_kept);
+    before - records.len()
+}
+
 impl QueryLimits {
     /// Resolve the page size a caller asked for. Zero means "server default";
     /// anything above the ceiling is clamped rather than refused, so a client
@@ -104,6 +331,7 @@ pub struct LogService {
     hub: Arc<TailHub>,
     stats: Arc<ServiceStats>,
     limits: QueryLimits,
+    retention: Retention,
 }
 
 impl LogService {
@@ -112,12 +340,14 @@ impl LogService {
         hub: Arc<TailHub>,
         stats: Arc<ServiceStats>,
         limits: QueryLimits,
+        retention: Retention,
     ) -> Self {
         Self {
             store,
             hub,
             stats,
             limits,
+            retention,
         }
     }
 }
@@ -132,14 +362,21 @@ pub struct MetricService {
     store: TelemetryStore,
     stats: Arc<ServiceStats>,
     limits: QueryLimits,
+    retention: Retention,
 }
 
 impl MetricService {
-    pub fn new(store: TelemetryStore, stats: Arc<ServiceStats>, limits: QueryLimits) -> Self {
+    pub fn new(
+        store: TelemetryStore,
+        stats: Arc<ServiceStats>,
+        limits: QueryLimits,
+        retention: Retention,
+    ) -> Self {
         Self {
             store,
             stats,
             limits,
+            retention,
         }
     }
 }
@@ -157,6 +394,7 @@ pub struct TraceService {
     hub: Arc<TraceHub>,
     stats: Arc<ServiceStats>,
     limits: QueryLimits,
+    retention: Retention,
 }
 
 impl TraceService {
@@ -165,12 +403,14 @@ impl TraceService {
         hub: Arc<TraceHub>,
         stats: Arc<ServiceStats>,
         limits: QueryLimits,
+        retention: Retention,
     ) -> Self {
         Self {
             store,
             hub,
             stats,
             limits,
+            retention,
         }
     }
 }
@@ -223,46 +463,56 @@ where
 /// Why an entry could not be stored.
 #[derive(Debug)]
 enum Rejection {
-    Timestamp(i64),
+    Timestamp(TimestampFault),
     Level(i32),
+    Size(SizeFault),
+    /// Dropped because the batch named more distinct days than one insert
+    /// may touch; see [`cap_distinct_days`].
+    TooManyDays,
 }
 
 impl Rejection {
     fn describe(&self) -> String {
         match self {
-            Self::Timestamp(ts) => {
-                format!(
-                    "timestamp_us {ts} is negative or more than an hour ahead of the server clock"
-                )
-            }
+            Self::Timestamp(fault) => fault.describe("timestamp_us"),
             Self::Level(level) => {
                 format!("level {level} is outside the LogLevel range 0..={MAX_LOG_LEVEL}")
             }
+            Self::Size(fault) => fault.describe("fields"),
+            Self::TooManyDays => format!(
+                "the batch spans more than {MAX_PARTITIONS_PER_BATCH} distinct days; entries on \
+                 the oldest days beyond that were dropped"
+            ),
         }
     }
 }
 
 /// Convert a wire entry into a storable record, or say why it cannot be.
 ///
-/// `now_us` is the server receive time, used to stamp entries that arrived
-/// without one - a missing timestamp is worth repairing, a wrong one is not.
+/// `window` carries the server receive time, used to stamp entries that
+/// arrived without one - a missing timestamp is worth repairing, a wrong one
+/// is not - and the oldest stamp retention would still keep.
 fn to_record(
     entry: LogEntry,
-    now_us: i64,
+    window: &Window,
     truncated: &mut u64,
     stamped: &mut u64,
 ) -> Result<LogRecord, Rejection> {
-    let timestamp_us = if entry.timestamp_us == 0 {
-        *stamped += 1;
-        now_us
-    } else if entry.timestamp_us < 0 || entry.timestamp_us > now_us + MAX_FUTURE_SKEW_US {
-        return Err(Rejection::Timestamp(entry.timestamp_us));
-    } else {
-        entry.timestamp_us
-    };
+    let timestamp_us = window
+        .accept(entry.timestamp_us, stamped)
+        .map_err(Rejection::Timestamp)?;
     if !(0..=MAX_LOG_LEVEL).contains(&entry.level) {
         return Err(Rejection::Level(entry.level));
     }
+    for (field, value) in [
+        ("app_id", &entry.app_id),
+        ("component", &entry.component),
+        ("trace_id", &entry.trace_id),
+        ("span_id", &entry.span_id),
+    ] {
+        check_identifier(field, value).map_err(Rejection::Size)?;
+    }
+    let fields = bound_map(entry.fields, MAX_FIELDS_BYTES, truncated).map_err(Rejection::Size)?;
     let message = truncate_to(entry.message, MAX_LOG_MESSAGE_BYTES, truncated);
     Ok(LogRecord {
         timestamp_us,
@@ -270,7 +520,7 @@ fn to_record(
         component: entry.component,
         app_id: entry.app_id,
         message,
-        fields: entry.fields.into_iter().collect(),
+        fields,
         trace_id: entry.trace_id,
         span_id: entry.span_id,
     })
@@ -310,7 +560,7 @@ fn to_entry(record: &LogRecord) -> LogEntry {
     }
 }
 
-fn to_metric_record(sample: MetricSample, now_us: i64) -> Result<MetricRecord, String> {
+fn to_metric_record(sample: MetricSample, window: &Window) -> Result<MetricRecord, String> {
     if sample.name.is_empty() {
         return Err("metric name is empty".to_string());
     }
@@ -320,20 +570,23 @@ fn to_metric_record(sample: MetricSample, now_us: i64) -> Result<MetricRecord, S
         // instead of coming back as a read error later.
         return Err(format!("value {} is not finite", sample.value));
     }
-    let timestamp_us = if sample.timestamp_us == 0 {
-        now_us
-    } else if sample.timestamp_us < 0 || sample.timestamp_us > now_us + MAX_FUTURE_SKEW_US {
-        return Err(format!(
-            "timestamp_us {} is negative or more than an hour ahead of the server clock",
-            sample.timestamp_us
-        ));
-    } else {
-        sample.timestamp_us
-    };
+    let mut stamped = 0u64;
+    let timestamp_us = window
+        .accept(sample.timestamp_us, &mut stamped)
+        .map_err(|fault| fault.describe("timestamp_us"))?;
+    for (field, value) in [("name", &sample.name), ("app_id", &sample.app_id)] {
+        check_identifier(field, value).map_err(|fault| fault.describe("labels"))?;
+    }
+    // Labels name the series, so no label is ever cut and kept: the total
+    // cap is below the per-value cut point (asserted below), so any value
+    // long enough to be cut fails the total and refuses the whole sample.
+    let mut cut = 0u64;
+    let labels = bound_map(sample.labels, MAX_LABELS_BYTES, &mut cut)
+        .map_err(|fault| fault.describe("labels"))?;
     Ok(MetricRecord {
         name: sample.name,
         app_id: sample.app_id,
-        labels: sample.labels.into_iter().collect(),
+        labels,
         value: sample.value,
         timestamp_us,
     })
@@ -350,6 +603,43 @@ fn to_metric_sample(record: &MetricRecord) -> MetricSample {
             .collect(),
         value: record.value,
         timestamp_us: record.timestamp_us,
+    }
+}
+
+/// Say, and count, that a page stopped at its byte budget short of the rows
+/// the caller asked for. At `warn` on purpose: the page is correct and the
+/// rest is behind `next_cursor`, but a client that takes a short page for
+/// the end of the data is missing entries, and this line is how an operator
+/// finds out that the limit they asked for is not the page size they get.
+fn note_page_cut(stats: &ServiceStats, kind: &str, returned: usize, limit: usize, filter: &str) {
+    ServiceStats::incr(&stats.query_pages_cut_by_bytes);
+    warn!(
+        kind,
+        returned,
+        limit,
+        budget_bytes = MAX_PAGE_BYTES,
+        filter,
+        "a page was cut short by its byte budget before reaching the requested limit; the \
+         rest is behind next_cursor and has_more is set. A client that reads only the first \
+         page is missing records - it has to follow the cursor"
+    );
+}
+
+impl LogService {
+    fn note_page_cut(&self, kind: &str, returned: usize, limit: usize, filter: &str) {
+        note_page_cut(&self.stats, kind, returned, limit, filter);
+    }
+}
+
+impl TraceService {
+    fn note_page_cut(&self, kind: &str, returned: usize, limit: usize, filter: &str) {
+        note_page_cut(&self.stats, kind, returned, limit, filter);
+    }
+}
+
+impl MetricService {
+    fn note_page_cut(&self, kind: &str, returned: usize, limit: usize, filter: &str) {
+        note_page_cut(&self.stats, kind, returned, limit, filter);
     }
 }
 
@@ -393,14 +683,14 @@ impl LogServiceRpc for LogService {
             return Ok(Response::new(PushLogsResponse::default()));
         }
 
-        let now = now_us();
+        let window = Window::new(now_us(), self.retention.log_days, "log");
         let mut records = Vec::with_capacity(received);
         let mut truncated = 0u64;
         let mut stamped = 0u64;
         let mut rejected = 0u64;
         let mut first_rejection: Option<String> = None;
         for entry in request.entries {
-            match to_record(entry, now, &mut truncated, &mut stamped) {
+            match to_record(entry, &window, &mut truncated, &mut stamped) {
                 Ok(record) => records.push(record),
                 Err(reason) => {
                     rejected += 1;
@@ -409,6 +699,11 @@ impl LogServiceRpc for LogService {
                     }
                 }
             }
+        }
+        let over_days = cap_distinct_days(&mut records, |record| day_of(record.timestamp_us));
+        if over_days > 0 {
+            rejected += over_days as u64;
+            first_rejection.get_or_insert_with(|| Rejection::TooManyDays.describe());
         }
 
         if rejected > 0 {
@@ -423,8 +718,10 @@ impl LogServiceRpc for LogService {
         if truncated > 0 {
             warn!(
                 truncated,
-                cap_bytes = MAX_LOG_MESSAGE_BYTES,
-                "log messages exceeded the size cap and are stored cut short, the tail of those messages is lost"
+                message_cap_bytes = MAX_LOG_MESSAGE_BYTES,
+                field_value_cap_bytes = MAX_FIELD_VALUE_BYTES,
+                "log messages or field values exceeded their size cap and are stored cut short, \
+                 the tail of those strings is lost"
             );
             ServiceStats::add(&self.stats.logs_truncated, truncated);
         }
@@ -517,6 +814,9 @@ impl LogServiceRpc for LogService {
             store.query_logs(&filter, limit, cursor)
         })
         .await?;
+        if page.cut_by_bytes {
+            self.note_page_cut("log", page.records.len(), limit, &describe);
+        }
         debug!(
             returned = page.records.len(),
             has_more = page.has_more,
@@ -564,18 +864,19 @@ impl LogServiceRpc for LogService {
 /// Why a trace record could not be stored.
 #[derive(Debug)]
 enum TraceRejection {
-    Timestamp(i64),
+    Timestamp(TimestampFault),
     Duration(i64),
     Kind(i32),
     Outcome(i32),
+    Size(SizeFault),
+    /// See [`Rejection::TooManyDays`].
+    TooManyDays,
 }
 
 impl TraceRejection {
     fn describe(&self) -> String {
         match self {
-            Self::Timestamp(ts) => format!(
-                "started_us {ts} is negative or more than an hour ahead of the server clock"
-            ),
+            Self::Timestamp(fault) => fault.describe("started_us"),
             Self::Duration(us) => format!("duration_us {us} is negative"),
             Self::Kind(kind) => {
                 format!("kind {kind} is outside the InvocationKind range 0..={MAX_INVOCATION_KIND}")
@@ -583,6 +884,11 @@ impl TraceRejection {
             Self::Outcome(outcome) => format!(
                 "outcome {outcome} is outside the InvocationOutcome range \
                  0..={MAX_INVOCATION_OUTCOME}"
+            ),
+            Self::Size(fault) => fault.describe("attributes"),
+            Self::TooManyDays => format!(
+                "the batch spans more than {MAX_PARTITIONS_PER_BATCH} distinct days; records on \
+                 the oldest days beyond that were dropped"
             ),
         }
     }
@@ -592,21 +898,17 @@ impl TraceRejection {
 ///
 /// A record with no `started_us` is stamped with the server receive time, the
 /// same repair a log entry gets: a producer whose clock is unset is still
-/// telling the truth about what happened, only not about when.
+/// telling the truth about what happened, only not about when. One that is
+/// set to before the retention window is refused, the same as a log entry.
 fn to_trace_record(
     record: ProtoTraceRecord,
-    now_us: i64,
+    window: &Window,
     truncated: &mut u64,
     stamped: &mut u64,
 ) -> Result<TraceRecord, TraceRejection> {
-    let started_us = if record.started_us == 0 {
-        *stamped += 1;
-        now_us
-    } else if record.started_us < 0 || record.started_us > now_us + MAX_FUTURE_SKEW_US {
-        return Err(TraceRejection::Timestamp(record.started_us));
-    } else {
-        record.started_us
-    };
+    let started_us = window
+        .accept(record.started_us, stamped)
+        .map_err(TraceRejection::Timestamp)?;
     // A negative duration would sort ahead of every real one under a
     // `min_duration_us` floor and would read as a clock that ran backwards.
     if record.duration_us < 0 {
@@ -618,6 +920,17 @@ fn to_trace_record(
     if !(0..=MAX_INVOCATION_OUTCOME).contains(&record.outcome) {
         return Err(TraceRejection::Outcome(record.outcome));
     }
+    for (field, value) in [
+        ("trace_id", &record.trace_id),
+        ("app_id", &record.app_id),
+        ("environment", &record.environment),
+        ("node", &record.node),
+        ("method", &record.method),
+    ] {
+        check_identifier(field, value).map_err(TraceRejection::Size)?;
+    }
+    let attributes =
+        bound_map(record.attributes, MAX_FIELDS_BYTES, truncated).map_err(TraceRejection::Size)?;
     Ok(TraceRecord {
         trace_id: record.trace_id,
         started_us,
@@ -631,7 +944,7 @@ fn to_trace_record(
         method: record.method,
         status: record.status,
         error: truncate_to(record.error, MAX_TRACE_ERROR_BYTES, truncated),
-        attributes: record.attributes.into_iter().collect(),
+        attributes,
     })
 }
 
@@ -706,14 +1019,14 @@ impl TraceServiceRpc for TraceService {
             return Ok(Response::new(PushTracesResponse::default()));
         }
 
-        let now = now_us();
+        let window = Window::new(now_us(), self.retention.trace_days, "trace");
         let mut records = Vec::with_capacity(received);
         let mut truncated = 0u64;
         let mut stamped = 0u64;
         let mut rejected = 0u64;
         let mut first_rejection: Option<String> = None;
         for record in request.records {
-            match to_trace_record(record, now, &mut truncated, &mut stamped) {
+            match to_trace_record(record, &window, &mut truncated, &mut stamped) {
                 Ok(record) => records.push(record),
                 Err(reason) => {
                     rejected += 1;
@@ -722,6 +1035,11 @@ impl TraceServiceRpc for TraceService {
                     }
                 }
             }
+        }
+        let over_days = cap_distinct_days(&mut records, |record| day_of(record.started_us));
+        if over_days > 0 {
+            rejected += over_days as u64;
+            first_rejection.get_or_insert_with(|| TraceRejection::TooManyDays.describe());
         }
 
         if rejected > 0 {
@@ -739,8 +1057,9 @@ impl TraceServiceRpc for TraceService {
                 truncated,
                 target_cap_bytes = MAX_TRACE_TARGET_BYTES,
                 error_cap_bytes = MAX_TRACE_ERROR_BYTES,
-                "trace targets or error messages exceeded their size cap and are stored cut \
-                 short; the tail of those strings is lost"
+                attribute_value_cap_bytes = MAX_FIELD_VALUE_BYTES,
+                "trace targets, error messages or attribute values exceeded their size cap and \
+                 are stored cut short; the tail of those strings is lost"
             );
             ServiceStats::add(&self.stats.traces_truncated, truncated);
         }
@@ -841,6 +1160,9 @@ impl TraceServiceRpc for TraceService {
             store.query_traces(&filter, limit, cursor)
         })
         .await?;
+        if page.cut_by_bytes {
+            self.note_page_cut("trace", page.records.len(), limit, &describe);
+        }
         debug!(
             returned = page.records.len(),
             has_more = page.has_more,
@@ -900,12 +1222,12 @@ impl MetricServiceRpc for MetricService {
             return Ok(Response::new(PushMetricsResponse::default()));
         }
 
-        let now = now_us();
+        let window = Window::new(now_us(), self.retention.metric_days, "metric");
         let mut records = Vec::with_capacity(received);
         let mut rejected = 0u64;
         let mut first_rejection: Option<String> = None;
         for sample in request.samples {
-            match to_metric_record(sample, now) {
+            match to_metric_record(sample, &window) {
                 Ok(record) => records.push(record),
                 Err(reason) => {
                     rejected += 1;
@@ -992,6 +1314,9 @@ impl MetricServiceRpc for MetricService {
             store.query_metrics(&filter, limit, cursor)
         })
         .await?;
+        if page.cut_by_bytes {
+            self.note_page_cut("metric", page.records.len(), limit, &describe);
+        }
         debug!(
             returned = page.records.len(),
             has_more = page.has_more,
@@ -1012,6 +1337,11 @@ impl MetricServiceRpc for MetricService {
 mod tests {
     use super::*;
 
+    /// A window around `now_us` with a week of log retention.
+    fn window(now_us: i64) -> Window {
+        Window::new(now_us, 7, "log")
+    }
+
     fn entry(message: &str) -> LogEntry {
         LogEntry {
             timestamp_us: 1_700_000_000_000_000,
@@ -1031,7 +1361,8 @@ mod tests {
         let mut stamped = 0;
         let mut e = entry("hello");
         e.timestamp_us = 0;
-        let record = to_record(e, 42, &mut truncated, &mut stamped).expect("must be accepted");
+        let record =
+            to_record(e, &window(42), &mut truncated, &mut stamped).expect("must be accepted");
         assert_eq!(record.timestamp_us, 42);
         assert_eq!(stamped, 1);
     }
@@ -1042,7 +1373,8 @@ mod tests {
         let mut stamped = 0;
         let mut e = entry("hello");
         e.timestamp_us = 10_000_000_000;
-        let err = to_record(e, 1_000, &mut truncated, &mut stamped).expect_err("must be rejected");
+        let err = to_record(e, &window(1_000), &mut truncated, &mut stamped)
+            .expect_err("must be rejected");
         assert!(err.describe().contains("ahead of the server clock"));
     }
 
@@ -1052,7 +1384,15 @@ mod tests {
         let mut stamped = 0;
         let mut e = entry("hello");
         e.level = 99;
-        assert!(to_record(e, 1_700_000_000_000_001, &mut truncated, &mut stamped).is_err());
+        assert!(
+            to_record(
+                e,
+                &window(1_700_000_000_000_001),
+                &mut truncated,
+                &mut stamped
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1062,7 +1402,7 @@ mod tests {
         let long = "x".repeat(MAX_LOG_MESSAGE_BYTES + 500);
         let record = to_record(
             entry(&long),
-            1_700_000_000_000_001,
+            &window(1_700_000_000_000_001),
             &mut truncated,
             &mut stamped,
         )
@@ -1083,7 +1423,7 @@ mod tests {
         let long = "\u{4e2d}".repeat(MAX_LOG_MESSAGE_BYTES);
         let record = to_record(
             entry(&long),
-            1_700_000_000_000_001,
+            &window(1_700_000_000_000_001),
             &mut truncated,
             &mut stamped,
         )
@@ -1100,7 +1440,7 @@ mod tests {
             value: f64::NAN,
             timestamp_us: 1,
         };
-        assert!(to_metric_record(sample, 10).is_err());
+        assert!(to_metric_record(sample, &window(10)).is_err());
     }
 
     #[test]
@@ -1112,7 +1452,7 @@ mod tests {
             value: 1.0,
             timestamp_us: 1,
         };
-        assert!(to_metric_record(sample, 10).is_err());
+        assert!(to_metric_record(sample, &window(10)).is_err());
     }
 
     fn proto_trace() -> ProtoTraceRecord {
@@ -1139,8 +1479,8 @@ mod tests {
         let mut stamped = 0;
         let mut record = proto_trace();
         record.started_us = 0;
-        let stored =
-            to_trace_record(record, 42, &mut truncated, &mut stamped).expect("must be accepted");
+        let stored = to_trace_record(record, &window(42), &mut truncated, &mut stamped)
+            .expect("must be accepted");
         assert_eq!(stored.started_us, 42);
         assert_eq!(stamped, 1);
     }
@@ -1151,7 +1491,7 @@ mod tests {
         // and would read as a clock that ran backwards.
         let mut record = proto_trace();
         record.duration_us = -1;
-        let err = to_trace_record(record, 1_700_000_000_000_001, &mut 0, &mut 0)
+        let err = to_trace_record(record, &window(1_700_000_000_000_001), &mut 0, &mut 0)
             .expect_err("must be rejected");
         assert!(err.describe().contains("duration_us"));
     }
@@ -1163,11 +1503,11 @@ mod tests {
         // skip it.
         let mut kind = proto_trace();
         kind.kind = 99;
-        assert!(to_trace_record(kind, 1_700_000_000_000_001, &mut 0, &mut 0).is_err());
+        assert!(to_trace_record(kind, &window(1_700_000_000_000_001), &mut 0, &mut 0).is_err());
 
         let mut outcome = proto_trace();
         outcome.outcome = 99;
-        assert!(to_trace_record(outcome, 1_700_000_000_000_001, &mut 0, &mut 0).is_err());
+        assert!(to_trace_record(outcome, &window(1_700_000_000_000_001), &mut 0, &mut 0).is_err());
     }
 
     #[test]
@@ -1177,8 +1517,13 @@ mod tests {
         let mut record = proto_trace();
         record.target = "x".repeat(MAX_TRACE_TARGET_BYTES + 500);
         let mut truncated = 0;
-        let stored = to_trace_record(record, 1_700_000_000_000_001, &mut truncated, &mut 0)
-            .expect("must be accepted");
+        let stored = to_trace_record(
+            record,
+            &window(1_700_000_000_000_001),
+            &mut truncated,
+            &mut 0,
+        )
+        .expect("must be accepted");
         assert_eq!(truncated, 1);
         assert!(stored.target.ends_with(TRUNCATION_MARKER));
         assert_eq!(
@@ -1213,5 +1558,195 @@ mod tests {
         assert!(check_window(100, 10).is_err());
         assert!(check_window(0, 10).is_ok());
         assert!(check_window(100, 0).is_ok());
+    }
+
+    /// A stamp `days` whole days before `now`, at the same time of day.
+    fn days_before(now: i64, days: i64) -> i64 {
+        now - days * DAY_US
+    }
+
+    #[test]
+    fn a_stamp_older_than_the_retention_window_is_refused_and_says_why() {
+        // Noon on a day well inside the epoch, so the window's day arithmetic
+        // is exercised for real rather than saturating at zero.
+        let now = 1_787_961_600_000_000 + DAY_US / 2;
+        let window = Window::new(now, 7, "log");
+
+        // Eight days back is behind the seven kept; six days back is inside.
+        let mut old = entry("late");
+        old.timestamp_us = days_before(now, 8);
+        let err = to_record(old, &window, &mut 0, &mut 0).expect_err("must be refused");
+        let reason = err.describe();
+        assert!(reason.contains("7-day log retention window"), "{reason}");
+        assert!(reason.contains("clock"), "{reason}");
+
+        let mut recent = entry("in time");
+        recent.timestamp_us = days_before(now, 6);
+        assert!(to_record(recent, &window, &mut 0, &mut 0).is_ok());
+
+        // The oldest kept day starts at midnight, and the whole of it counts.
+        let mut edge = entry("edge");
+        edge.timestamp_us = (day_of(now) - 6) * DAY_US;
+        assert!(to_record(edge, &window, &mut 0, &mut 0).is_ok());
+        let mut over = entry("over");
+        over.timestamp_us = (day_of(now) - 6) * DAY_US - 1;
+        assert!(to_record(over, &window, &mut 0, &mut 0).is_err());
+
+        // Traces and metrics run on their own retention.
+        let traces = Window::new(now, 3, "trace");
+        let mut old = proto_trace();
+        old.started_us = days_before(now, 4);
+        let err = to_trace_record(old, &traces, &mut 0, &mut 0).expect_err("must be refused");
+        assert!(
+            err.describe().contains("3-day trace retention"),
+            "{}",
+            err.describe()
+        );
+
+        let metrics = Window::new(now, 30, "metric");
+        let old = MetricSample {
+            name: "latency".into(),
+            app_id: "shop".into(),
+            labels: Default::default(),
+            value: 1.0,
+            timestamp_us: days_before(now, 31),
+        };
+        let err = to_metric_record(old, &metrics).expect_err("must be refused");
+        assert!(err.contains("30-day metric retention"), "{err}");
+    }
+
+    #[test]
+    fn a_batch_over_the_day_cap_keeps_the_newest_days() {
+        let mut records: Vec<LogRecord> = (0..(MAX_PARTITIONS_PER_BATCH as i64 + 8))
+            .map(|d| LogRecord {
+                timestamp_us: 1_787_961_600_000_000 - d * DAY_US,
+                level: 3,
+                component: "deis-runtime".into(),
+                app_id: "clock".into(),
+                message: "x".into(),
+                fields: Default::default(),
+                trace_id: String::new(),
+                span_id: String::new(),
+            })
+            .collect();
+        let dropped = cap_distinct_days(&mut records, |r| day_of(r.timestamp_us));
+        assert_eq!(dropped, 8);
+        assert_eq!(records.len(), MAX_PARTITIONS_PER_BATCH);
+        let oldest = records.iter().map(|r| r.timestamp_us).min().unwrap();
+        assert_eq!(
+            oldest,
+            1_787_961_600_000_000 - (MAX_PARTITIONS_PER_BATCH as i64 - 1) * DAY_US,
+            "the newest days survive, the oldest go"
+        );
+
+        // Under the cap nothing moves.
+        let mut few = records.clone();
+        assert_eq!(cap_distinct_days(&mut few, |r| day_of(r.timestamp_us)), 0);
+        assert_eq!(few.len(), records.len());
+    }
+
+    #[test]
+    fn oversized_identifiers_and_keys_refuse_the_record_and_values_are_cut() {
+        // The fixture stamps entries at 1_700_000_000_000_000; a window a
+        // microsecond later keeps them inside retention.
+        let w = window(1_700_000_000_000_001);
+
+        // An identifier over the cap names nothing real; the record goes.
+        let mut e = entry("id");
+        e.app_id = "a".repeat(MAX_IDENTIFIER_BYTES + 1);
+        let err = to_record(e, &w, &mut 0, &mut 0).expect_err("must be refused");
+        assert!(err.describe().contains("app_id"), "{}", err.describe());
+        for set in [
+            |e: &mut LogEntry| e.component = "c".repeat(MAX_IDENTIFIER_BYTES + 1),
+            |e: &mut LogEntry| e.trace_id = "t".repeat(MAX_IDENTIFIER_BYTES + 1),
+            |e: &mut LogEntry| e.span_id = "s".repeat(MAX_IDENTIFIER_BYTES + 1),
+        ] {
+            let mut e = entry("id");
+            set(&mut e);
+            assert!(to_record(e, &w, &mut 0, &mut 0).is_err());
+        }
+
+        // A key over the cap cannot be cut without colliding; the record goes.
+        let mut e = entry("key");
+        e.fields
+            .insert("k".repeat(MAX_KEY_BYTES + 1), "v".to_string());
+        let err = to_record(e, &w, &mut 0, &mut 0).expect_err("must be refused");
+        assert!(err.describe().contains("key"), "{}", err.describe());
+
+        // A value over the cap is cut and marked, and counted as truncated.
+        let mut e = entry("value");
+        e.fields
+            .insert("big".to_string(), "v".repeat(MAX_FIELD_VALUE_BYTES + 100));
+        let mut truncated = 0;
+        let record = to_record(e, &w, &mut truncated, &mut 0).expect("must be kept");
+        assert_eq!(truncated, 1);
+        assert!(record.fields["big"].ends_with(TRUNCATION_MARKER));
+        assert_eq!(
+            record.fields["big"].len(),
+            MAX_FIELD_VALUE_BYTES + TRUNCATION_MARKER.len()
+        );
+
+        // Many capped values still add up; past the total the record goes.
+        let mut e = entry("total");
+        for i in 0..(MAX_FIELDS_BYTES / MAX_FIELD_VALUE_BYTES + 1) {
+            e.fields
+                .insert(format!("f{i}"), "v".repeat(MAX_FIELD_VALUE_BYTES));
+        }
+        let err = to_record(e, &w, &mut 0, &mut 0).expect_err("must be refused");
+        assert!(
+            err.describe().contains("fields total"),
+            "{}",
+            err.describe()
+        );
+
+        // The same rules hold for a trace's identifiers and attributes.
+        let mut t = proto_trace();
+        t.method = "M".repeat(MAX_IDENTIFIER_BYTES + 1);
+        assert!(to_trace_record(t, &w, &mut 0, &mut 0).is_err());
+        let mut t = proto_trace();
+        t.attributes
+            .insert("big".to_string(), "v".repeat(MAX_FIELD_VALUE_BYTES + 100));
+        let mut truncated = 0;
+        let stored = to_trace_record(t, &w, &mut truncated, &mut 0).expect("must be kept");
+        assert_eq!(truncated, 1);
+        assert!(stored.attributes["big"].ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn metric_labels_are_refused_over_their_cap_never_cut() {
+        // Labels name the series. A cut label would file the sample under a
+        // series nobody asked for, so an oversized one refuses the sample.
+        let w = window(1_787_961_600_000_000);
+        let sample = |labels: Vec<(&str, String)>| MetricSample {
+            name: "latency".into(),
+            app_id: "shop".into(),
+            labels: labels
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            value: 1.0,
+            timestamp_us: 1_787_961_600_000_000,
+        };
+        let err = to_metric_record(
+            sample(vec![("route", "r".repeat(MAX_LABELS_BYTES + 1))]),
+            &w,
+        )
+        .expect_err("must be refused");
+        assert!(err.contains("labels"), "{err}");
+        // Long enough to be cut as a field value; as a label it still fails
+        // the total, so it is never stored cut.
+        let err = to_metric_record(
+            sample(vec![("route", "r".repeat(MAX_FIELD_VALUE_BYTES + 1))]),
+            &w,
+        )
+        .expect_err("must be refused");
+        assert!(err.contains("labels total"), "{err}");
+        let kept =
+            to_metric_record(sample(vec![("route", "/a".to_string())]), &w).expect("must be kept");
+        assert_eq!(kept.labels["route"], "/a");
+
+        let mut named = sample(vec![]);
+        named.name = "n".repeat(MAX_IDENTIFIER_BYTES + 1);
+        assert!(to_metric_record(named, &w).is_err());
     }
 }

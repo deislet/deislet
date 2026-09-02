@@ -66,6 +66,23 @@
 //! for. Grants at equal specificity are peers: either may claim, and the
 //! `(host, path_prefix)` uniqueness in [`super::store`] decides which one
 //! actually holds a given address.
+//!
+//! # What a delegation does not do
+//!
+//! A `Name` grant inside somebody else's `Zone` constrains the **exact**
+//! claim and nothing more. The zone holder may still create the wildcard
+//! route `*.example.com`: that claim is `Under(example.com)`, a `Name` grant
+//! is not a zone and so is never in the set covering it
+//! ([`GrantPattern::covers`]), and the zone grant is. At the edge an exact
+//! host beats a wildcard (`deis_proxy::catalog::table`), so until `team-b`
+//! creates its exact route for `b.example.com`, requests to that name reach
+//! `team-a`'s wildcard route. This is the precedence the edge has always
+//! had; the registry decides who may *write* a route, not which existing
+//! route answers. A delegate that wants its name answered only by itself
+//! creates its route first, and `GET /api/routing-table` shows who answers
+//! for what in the meantime. Changing the resolution order instead would
+//! change what every existing wildcard route serves, which is not this
+//! module's call to make.
 
 use serde::Serialize;
 

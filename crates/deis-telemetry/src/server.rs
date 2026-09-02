@@ -33,8 +33,10 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::server::NamedService;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
+use tonic_health::ServingStatus;
 use tracing::{error, info, warn};
 
 use crate::auth::TelemetryAuth;
@@ -43,7 +45,7 @@ use crate::http::{self, MetricsState};
 use crate::proto::log_service_server::LogServiceServer;
 use crate::proto::metric_service_server::MetricServiceServer;
 use crate::proto::trace_service_server::TraceServiceServer;
-use crate::service::{LogService, MetricService, QueryLimits, TraceService};
+use crate::service::{LogService, MetricService, QueryLimits, Retention, TraceService};
 use crate::stats::{Access, ServiceStats, StoreState};
 use crate::store::TelemetryStore;
 use crate::tail::{TailHub, TraceHub};
@@ -162,14 +164,29 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         default_limit: config.query_default_limit,
         max_limit: config.query_max_limit,
     };
-    let logs = LogService::new(store.clone(), Arc::clone(&hub), Arc::clone(&stats), limits);
+    // The same numbers the sweeper runs on, handed to ingest so a record the
+    // next sweep would delete is refused at the door instead of being given
+    // a partition first; see `service::Retention`.
+    let retention = Retention {
+        log_days: config.log_retention_days,
+        trace_days: config.trace_retention_days,
+        metric_days: config.metric_retention_days,
+    };
+    let logs = LogService::new(
+        store.clone(),
+        Arc::clone(&hub),
+        Arc::clone(&stats),
+        limits,
+        retention,
+    );
     let traces = TraceService::new(
         store.clone(),
         Arc::clone(&trace_hub),
         Arc::clone(&stats),
         limits,
+        retention,
     );
-    let metrics_service = MetricService::new(store.clone(), Arc::clone(&stats), limits);
+    let metrics_service = MetricService::new(store.clone(), Arc::clone(&stats), limits, retention);
 
     let grpc_listener = TcpListener::bind(&config.listen)
         .await
@@ -204,17 +221,11 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
     // process offers, which is what deis-store and deis-queue offer too: one
     // probe shape for the whole platform, and no second answer that could
     // disagree with it. Each service is reported separately so a caller can
-    // ask about the one it actually uses. It answers for this process only.
+    // ask about the one it actually uses, and the unnamed service - what a
+    // probe asks about when it names nothing - says the same as the three.
+    // It answers for this process only.
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<LogServiceServer<LogService>>()
-        .await;
-    health_reporter
-        .set_serving::<TraceServiceServer<TraceService>>()
-        .await;
-    health_reporter
-        .set_serving::<MetricServiceServer<MetricService>>()
-        .await;
+    set_all_health(&mut health_reporter, ServingStatus::Serving).await;
 
     // Log batches are the reason this ceiling exists: a runtime shipping a few
     // thousand lines at once must not be cut off at tonic's 4 MB default.
@@ -352,14 +363,10 @@ async fn health_follows_the_store(
                 }
                 let serving = state.borrow_and_update().is_serving();
                 if serving {
-                    reporter.set_serving::<LogServiceServer<LogService>>().await;
-                    reporter.set_serving::<TraceServiceServer<TraceService>>().await;
-                    reporter.set_serving::<MetricServiceServer<MetricService>>().await;
+                    set_all_health(&mut reporter, ServingStatus::Serving).await;
                     info!("grpc.health.v1 now reports SERVING for all three services again");
                 } else {
-                    reporter.set_not_serving::<LogServiceServer<LogService>>().await;
-                    reporter.set_not_serving::<TraceServiceServer<TraceService>>().await;
-                    reporter.set_not_serving::<MetricServiceServer<MetricService>>().await;
+                    set_all_health(&mut reporter, ServingStatus::NotServing).await;
                     warn!(
                         "grpc.health.v1 now reports NOT_SERVING for all three services: the \
                          database behind them stopped answering, so anything this process is \
@@ -370,6 +377,39 @@ async fn health_follows_the_store(
             _ = &mut shutdown => return,
         }
     }
+}
+
+/// Put every health entry this process answers for on one status.
+///
+/// The unnamed service is included on purpose. tonic-health seeds it as
+/// SERVING and nothing else touches it, so before this it stayed SERVING
+/// while the three named services were NOT_SERVING - and the unnamed service
+/// is exactly what `grpc_health_probe` and a Kubernetes gRPC probe ask about
+/// when given no name. A probe that keeps a process alive while it stores
+/// nothing is the failure the named statuses were fixed to prevent; the
+/// generic one has to say the same thing. There is one database under all
+/// three services, so "the worst named one" and "all of them" are the same
+/// answer here.
+async fn set_all_health(
+    reporter: &mut tonic_health::server::HealthReporter,
+    status: ServingStatus,
+) {
+    reporter
+        .set_service_status(<LogServiceServer<LogService> as NamedService>::NAME, status)
+        .await;
+    reporter
+        .set_service_status(
+            <TraceServiceServer<TraceService> as NamedService>::NAME,
+            status,
+        )
+        .await;
+    reporter
+        .set_service_status(
+            <MetricServiceServer<MetricService> as NamedService>::NAME,
+            status,
+        )
+        .await;
+    reporter.set_service_status("", status).await;
 }
 
 /// A future that resolves once shutdown is requested.

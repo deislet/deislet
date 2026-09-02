@@ -223,7 +223,9 @@ impl DeisProxy {
     /// The 404 matters as much as the 200: an authority that got a node's
     /// page back instead of a refusal would have to guess at what went
     /// wrong, and a token this instance never published must not be given
-    /// anything that could be mistaken for an answer.
+    /// anything that could be mistaken for an answer. The path is public by
+    /// protocol; the answer is served only under the host the token was
+    /// published for, which is the host the authority's fetch carries.
     async fn answer_acme_challenge(
         &self,
         session: &mut Session,
@@ -231,7 +233,7 @@ impl DeisProxy {
         host: &str,
     ) -> pingora::Result<bool> {
         let path = session.req_header().uri.path().to_string();
-        match responder.answer_for_path(&path) {
+        match responder.answer(host, &path) {
             Some(answer) => {
                 // Every fetch of a published answer is one step of a
                 // validation that is about to succeed or fail, and there are
@@ -260,7 +262,8 @@ impl DeisProxy {
                 debug!(
                     host,
                     path = %path,
-                    "an ACME challenge was requested for a token this instance never published"
+                    "an ACME challenge was requested for a token this instance never published \
+                     for this host"
                 );
                 session
                     .respond_error_with_body(404, Bytes::from_static(b"no such acme challenge\n"))

@@ -87,6 +87,15 @@ heartbeat_timeout = 90
 # on the two HTTP endpoints that serve nodes. Required in practice - with
 # no key here the assignment list refuses to hand a node the decrypted
 # secrets of any application, so applications with secrets do not run.
+# Any non-blank value is accepted, here and on every node and proxy; make
+# it `openssl rand -hex 32` all the same - a short value is one a caller
+# at the node endpoints can guess, and deis-proxy warns about one under
+# 32 characters. The control plane shows the first 12 hex characters of
+# each value's SHA-256 (as `key_fingerprint` on /api/runtime and in a
+# retired-key error) to tell values apart during a rotation; that prefix
+# confirms an offline guess of a weak value, which is one more reason the
+# value has to be random. More than one value means a rotation is in progress; see
+# docs/trust-boundaries.md.
 node_preshared_keys = [
     "your-random-key-here-change-me-in-production"
 ]
@@ -164,6 +173,16 @@ journalctl -u deis-control -n 200 | grep -E 'Master key unusable|Bundle director
 
 The readiness check that answers "can it serve" is in **Monitoring and
 Operations** below; it is also the one to run after a restore.
+
+**Run one control plane per database.** The design assumes a single process.
+If two are started on one database file even so - a manual start beside the
+service unit, an overlap during a cut-over - they do not both fire cron: the
+first to take the `scheduler_lease` row fires, and the other logs once at
+`WARN` ("Another control plane holds the cron scheduler lease") and fires
+nothing until the holder stops refreshing the row for three ticks or releases
+it on a clean stop. Everything else - deployment pushes, health polling, the
+API - runs in both processes without coordination, so an overlap is something
+to end, not to run with.
 
 ---
 

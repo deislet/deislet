@@ -4,7 +4,7 @@ use crate::database::{Database, Event, EventSeverity, HeartbeatEntry};
 use crate::message::{
     AuthData, AuthResponse, HeartbeatAck, HeartbeatRequest, RegisterRequest, RegisterResponse,
 };
-use crate::session::{NodeEvent, NodeSession, SessionManager};
+use crate::session::{NodeEvent, NodeSession, NodeState, SessionManager};
 use chrono::Utc;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -92,6 +92,88 @@ impl MessageHandler {
         request: RegisterRequest,
         session: &Arc<NodeSession>,
     ) -> RegisterResponse {
+        // A node keeps the name it announces, so a second stream with the
+        // same name lands on the same id as the first. Which of the two is
+        // the node depends on whether the first is still talking:
+        //
+        // * A first channel that is still beating is a live process. A second
+        //   channel with its name is then either a second process that was
+        //   given the same `associated_id` - a cloned configuration, a
+        //   scale-out that reused a name - or the same process reconnecting
+        //   over a break this side has not noticed yet. In both cases the
+        //   newcomer is refused. Letting it win used to displace a live
+        //   deis-proxy: its stream stayed open, its heartbeats were
+        //   "acknowledged, but not counted", it took no command and no
+        //   configuration push, and nothing on its side ever told it to
+        //   reconnect - a silent outage of the internet-facing process that
+        //   only a restart ended. Refusing costs the genuine reconnect one
+        //   `heartbeat_timeout` of retries, which the message says.
+        //
+        // * A first channel that has gone quiet past `heartbeat_timeout`, or
+        //   that the sweep has already marked unresponsive, is a channel to a
+        //   process that rebooted or a connection cut somewhere that never
+        //   told this side. The newcomer is that node coming back, and the
+        //   older entry is dropped so that `SessionManager::get_node` cannot
+        //   hand a command to the channel to nowhere.
+        //
+        // Only the entry is dropped in the second case. The older stream's
+        // own task still owns its cleanup and removes nothing but its own
+        // session id, so this cannot race it into deleting the new session.
+        if let Some(previous) = self.sessions.get_node(&request.id)
+            && previous.id != session.id
+        {
+            let timeout = chrono::Duration::seconds(self.config.heartbeat_timeout as i64);
+            let silence = previous.silence(Utc::now()).await;
+            let state = previous.get_state().await;
+            let live =
+                matches!(state, NodeState::Registered | NodeState::Active) && silence < timeout;
+            if live {
+                let message = format!(
+                    "node id {} {} (instance {}, last heard {}s ago, \
+                     heartbeat_timeout {}s), so this registration is refused and nothing here \
+                     changes. If this is the same process reconnecting after a break this \
+                     control plane has not noticed, keep retrying: the earlier channel is given \
+                     up {}s after its last heartbeat. If two processes share this \
+                     associated_id, change one of them",
+                    request.id,
+                    deis_wire::conventions::NODE_ID_HELD_BY_LIVE_CHANNEL,
+                    previous.instance_id,
+                    silence.num_seconds(),
+                    self.config.heartbeat_timeout,
+                    self.config.heartbeat_timeout,
+                );
+                tracing::warn!(
+                    node_id = %request.id,
+                    holder_instance = %previous.instance_id,
+                    holder_state = state.as_str(),
+                    holder_silent_secs = silence.num_seconds(),
+                    refused_instance = %session.instance_id,
+                    host = %session.host,
+                    ports = ?session.ports,
+                    "A second channel registered a node id whose channel is still live; the newcomer is refused and the holder keeps the id. Either two processes share one associated_id, or one process is reconnecting before this side noticed the break - in which case it gets in once the old channel runs out"
+                );
+                return RegisterResponse {
+                    success: false,
+                    message,
+                    instance_id: None,
+                };
+            }
+
+            let _ = previous.apply(NodeEvent::Disconnected).await;
+            self.sessions.remove(&previous.id);
+            tracing::warn!(
+                node_id = %request.id,
+                superseded_instance = %previous.instance_id,
+                superseded_state = state.as_str(),
+                superseded_silent_secs = silence.num_seconds(),
+                instance_id = %session.instance_id,
+                "Node {} registered again while an earlier channel of its own was still open and \
+                 no longer beating; the earlier one is dropped, because a command sent down it \
+                 would have gone nowhere",
+                request.id
+            );
+        }
+
         if let Err(state) = session.apply(NodeEvent::Registered).await {
             tracing::warn!(
                 node_id = %request.id,
@@ -100,34 +182,6 @@ impl MessageHandler {
                 "A node registered on a session that is already {}; the registration is \
                  recorded but the session keeps the state it had",
                 state.as_str()
-            );
-        }
-        // A node now keeps the name it announces, so a second stream from the
-        // same node lands on the same id as the first. That is the moment to
-        // let the older one go: the node has just proved, by opening a fresh
-        // channel and registering on it, that it is no longer using the old
-        // one - a machine that rebooted, or one whose connection was cut
-        // somewhere that never told this side. Left in place the two would
-        // both answer to the same node id and `SessionManager::get_node`
-        // would hand commands to whichever it happened to find first, which
-        // could be the channel to nowhere.
-        //
-        // Only the entry is dropped here. The older stream's own task still
-        // owns its cleanup and removes nothing but its own session id, so
-        // this cannot race it into deleting the new session.
-        if let Some(previous) = self.sessions.get_node(&request.id)
-            && previous.id != session.id
-        {
-            let _ = previous.apply(NodeEvent::Disconnected).await;
-            self.sessions.remove(&previous.id);
-            tracing::warn!(
-                node_id = %request.id,
-                superseded_instance = %previous.instance_id,
-                instance_id = %session.instance_id,
-                "Node {} registered again while an earlier channel of its own was still open; \
-                 the earlier one is dropped, because a command sent down it would have gone \
-                 nowhere",
-                request.id
             );
         }
 
@@ -372,34 +426,44 @@ mod tests {
         assert!(event.message.contains("Test disconnect"));
     }
 
-    /// Two channels, one node. A node keeps the name it announces, so a
-    /// reconnect while the old stream is still half-open - a machine that
-    /// rebooted, a connection cut somewhere that never told this side - now
-    /// lands on the same node id as the channel it is replacing.
-    /// `SessionManager::get_node` answers with whichever it finds first, so
-    /// leaving both in place would have meant commands going down the dead
-    /// one at random.
-    #[tokio::test]
-    async fn registering_again_drops_the_node_s_earlier_channel() {
-        let config = Arc::new(ControlConfig::default());
-        let sessions = Arc::new(SessionManager::new());
-        let handler = MessageHandler::new(Arc::clone(&config), Arc::clone(&sessions));
-
-        let info = || NodeInfo {
+    fn proxy_info() -> NodeInfo {
+        NodeInfo {
             node_role: NodeRole::Proxy("1.0.0".to_string()),
             listen_host: "127.0.0.1".to_string(),
             listen_port: vec![8080],
-        };
-        let request = || RegisterRequest {
+        }
+    }
+
+    fn alpha() -> RegisterRequest {
+        RegisterRequest {
             id: "node-alpha".to_string(),
-            info: info(),
-        };
+            info: proxy_info(),
+        }
+    }
 
-        let first = Arc::new(NodeSession::new("node-alpha".to_string(), info()));
-        handler.handle_register(request(), &first).await;
+    /// Two channels, one node, and the first has stopped beating. A reconnect
+    /// while the old stream is still half-open - a machine that rebooted, a
+    /// connection cut somewhere that never told this side - lands on the same
+    /// node id as the channel it is replacing. `SessionManager::get_node`
+    /// answers with whichever it finds first, so leaving both in place would
+    /// have meant commands going down the dead one at random.
+    #[tokio::test]
+    async fn registering_again_drops_the_node_s_earlier_channel_once_it_has_gone_quiet() {
+        let config = Arc::new(ControlConfig {
+            heartbeat_timeout: 90,
+            ..ControlConfig::default()
+        });
+        let sessions = Arc::new(SessionManager::new());
+        let handler = MessageHandler::new(Arc::clone(&config), Arc::clone(&sessions));
 
-        let second = Arc::new(NodeSession::new("node-alpha".to_string(), info()));
-        handler.handle_register(request(), &second).await;
+        let first = Arc::new(NodeSession::new("node-alpha".to_string(), proxy_info()));
+        assert!(handler.handle_register(alpha(), &first).await.success);
+        // Silent past the timeout, whether or not the sweep has been round
+        // to say so yet.
+        *first.last_heartbeat.lock().await = Utc::now() - chrono::Duration::seconds(91);
+
+        let second = Arc::new(NodeSession::new("node-alpha".to_string(), proxy_info()));
+        assert!(handler.handle_register(alpha(), &second).await.success);
 
         assert_eq!(sessions.count(), 1, "one node, one live channel");
         assert_eq!(
@@ -412,6 +476,88 @@ mod tests {
             NodeState::Disconnected,
             "the superseded channel is finished, so nothing arriving on it counts"
         );
+
+        // The same when the sweep already withdrew the claim.
+        let third = Arc::new(NodeSession::new("node-alpha".to_string(), proxy_info()));
+        second.apply(NodeEvent::HeartbeatExpired).await.unwrap();
+        assert!(handler.handle_register(alpha(), &third).await.success);
+        assert_eq!(
+            sessions.get_node("node-alpha").map(|s| s.id.clone()),
+            Some(third.id.clone())
+        );
+    }
+
+    /// The r9 finding: a second channel with a live proxy's `associated_id`
+    /// used to displace it. The proxy's stream stayed open, its heartbeats
+    /// were acknowledged and not counted, it took no command and no push, and
+    /// nothing told it to reconnect - until somebody restarted it. Now the
+    /// holder that is still beating keeps the id and the newcomer is told
+    /// why.
+    #[tokio::test]
+    async fn a_live_channel_is_not_displaced_by_a_second_one_with_its_name() {
+        let config = Arc::new(ControlConfig {
+            heartbeat_timeout: 90,
+            ..ControlConfig::default()
+        });
+        let sessions = Arc::new(SessionManager::new());
+        let handler = MessageHandler::new(Arc::clone(&config), Arc::clone(&sessions));
+
+        let incumbent = Arc::new(NodeSession::new("node-alpha".to_string(), proxy_info()));
+        assert!(handler.handle_register(alpha(), &incumbent).await.success);
+        handler
+            .handle_heartbeat(
+                crate::message::HeartbeatRequest {
+                    id: "node-alpha".to_string(),
+                },
+                &incumbent,
+            )
+            .await;
+
+        let newcomer = Arc::new(NodeSession::new("node-alpha".to_string(), proxy_info()));
+        let refused = handler.handle_register(alpha(), &newcomer).await;
+        assert!(!refused.success, "{}", refused.message);
+        assert!(
+            refused.message.contains("node-alpha"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains(&incumbent.instance_id),
+            "the refusal names the holder: {}",
+            refused.message
+        );
+        assert!(refused.message.contains("90s"), "{}", refused.message);
+
+        assert_eq!(sessions.count(), 1);
+        assert_eq!(
+            sessions.get_node("node-alpha").map(|s| s.id.clone()),
+            Some(incumbent.id.clone()),
+            "the holder keeps the id"
+        );
+        assert_eq!(
+            incumbent.get_state().await,
+            NodeState::Active,
+            "and is untouched by the attempt"
+        );
+        assert_eq!(
+            newcomer.get_state().await,
+            NodeState::Connected,
+            "the refused channel registered nothing"
+        );
+
+        // A node that registered and has not beaten yet is live too: the
+        // clock for its silence started when its stream opened.
+        let sessions = Arc::new(SessionManager::new());
+        let handler = MessageHandler::new(Arc::clone(&config), Arc::clone(&sessions));
+        let just_registered = Arc::new(NodeSession::new("node-alpha".to_string(), proxy_info()));
+        assert!(
+            handler
+                .handle_register(alpha(), &just_registered)
+                .await
+                .success
+        );
+        let newcomer = Arc::new(NodeSession::new("node-alpha".to_string(), proxy_info()));
+        assert!(!handler.handle_register(alpha(), &newcomer).await.success);
     }
 
     /// The persisted row used to be written once, at registration, and never

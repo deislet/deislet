@@ -975,8 +975,8 @@ mod tests {
         );
     }
 
-    /// Every call site of an allow-list predicate in this crate's own source,
-    /// classified.
+    /// Every call site of an allow-list predicate in the source of every
+    /// crate that reads a manifest, classified.
     ///
     /// A new refusal for a value from a newer release can only be written by
     /// asking one of these predicates, so counting their call sites is how
@@ -987,26 +987,50 @@ mod tests {
     /// it has to say which of the three it is - here, and in the module
     /// documentation.
     ///
+    /// The field of view is the promise: "a reader of the manifest outside
+    /// deis-bundle that still refuses whole" is what this exists to catch,
+    /// so it walks every `.rs` file, recursively, under the `src` tree of
+    /// each crate in [`MANIFEST_READERS`] - this one, the builder that writes
+    /// the archive, the node that serves it and the control plane that
+    /// accepts it. It used to read this crate's top-level `src` and nothing
+    /// else, which guarded the module it lived in and not the promise; a
+    /// predicate called from a subdirectory here, or from any of the other
+    /// three crates, went uncounted. A crate directory that is missing fails
+    /// the test rather than narrowing it silently, for the same reason.
+    ///
     /// Counted over the non-test part of each file, so a test that exercises
     /// a predicate does not count as a reader of it.
     #[test]
     fn every_reader_of_an_allow_list_is_classified_here() {
-        // (predicate, [(file, sites)]). Each site, and what it is:
+        /// The crates that read a manifest, relative to `crates/`. A reader
+        /// added anywhere else is a reader this test cannot see, so a new
+        /// crate that takes a `Manifest` belongs on this list first.
+        const MANIFEST_READERS: &[&str] =
+            &["deis-bundle", "deis-build", "deis-runtime", "deis-control"];
+
+        // (predicate, [(file, sites)]), files as `crate/path` under
+        // `crates/`. Each site, and what it is:
         const READERS: &[(&str, &[(&str, usize)])] = &[
             (
                 "CompiledPattern::compile(",
                 &[
                     // `match_pattern`: `.ok()?` - a pattern that does not
                     // compile matches nothing. Narrow.
-                    ("routing.rs", 1),
+                    ("deis-bundle/src/routing.rs", 1),
                     // `source_is_readable` (the predicate `unreadable_values`
                     // asks) and `compile_rule`, which the node drops on and
                     // the build refuses on by line. Narrow at load, build-only
                     // at build.
-                    ("redirects.rs", 2),
+                    ("deis-bundle/src/redirects.rs", 2),
                     // `HeaderTable::compile` - the gate `site.headers[].pattern`
                     // - and `parse_headers`, build-only.
-                    ("headers.rs", 2),
+                    ("deis-bundle/src/headers.rs", 2),
+                    // `SiteRules::compile` on the node: a function route
+                    // whose pattern does not compile is logged at warn and
+                    // left out, so the static fallback answers what the
+                    // route would have claimed. The version still loads.
+                    // Narrow.
+                    ("deis-runtime/src/assets/site.rs", 1),
                 ],
             ),
             (
@@ -1014,13 +1038,16 @@ mod tests {
                 // The definition, and `compile_rule`: narrow at load,
                 // build-only at build. `unreadable_values` names the predicate
                 // without calling it with parentheses.
-                &[("redirects.rs", 2)],
+                &[("deis-bundle/src/redirects.rs", 2)],
             ),
             (
                 "source_is_readable(",
                 // The definition, and the branch in `unreadable_values` that
                 // names a dropped rule. Narrow.
-                &[("redirects.rs", 1), ("forward.rs", 1)],
+                &[
+                    ("deis-bundle/src/redirects.rs", 1),
+                    ("deis-bundle/src/forward.rs", 1),
+                ],
             ),
             (
                 "BindingKind::from_name(",
@@ -1028,14 +1055,20 @@ mod tests {
                 // kind through unread, and the branch in `unreadable_values`.
                 // Narrow on a node; the control plane's gate reads the
                 // carried-through entry, see `GATES`.
-                &[("bindings.rs", 1), ("forward.rs", 1)],
+                &[
+                    ("deis-bundle/src/bindings.rs", 1),
+                    ("deis-bundle/src/forward.rs", 1),
+                ],
             ),
             (
                 "MANIFEST_SPELLINGS",
                 // The definition, and the branch in `unreadable_values`.
                 // `NotFound::deserialize` reads narrowly through
                 // `from_manifest`, whose match arm is the allow-list itself.
-                &[("site.rs", 1), ("forward.rs", 1)],
+                &[
+                    ("deis-bundle/src/site.rs", 1),
+                    ("deis-bundle/src/forward.rs", 1),
+                ],
             ),
             (
                 "callable_by_entry_is_readable(",
@@ -1043,30 +1076,74 @@ mod tests {
                 // `validate_callable_by` refuses on (build-only, because a
                 // parsed list has already been narrowed); `readable_callable_by`,
                 // the narrow reader; and the branch in `unreadable_values`.
-                &[("bindings.rs", 3), ("forward.rs", 1)],
+                &[
+                    ("deis-bundle/src/bindings.rs", 3),
+                    ("deis-bundle/src/forward.rs", 1),
+                ],
             ),
         ];
 
-        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut sources: BTreeMap<String, String> = BTreeMap::new();
-        for entry in std::fs::read_dir(&src).expect("the crate's own source directory") {
-            let path = entry.expect("a directory entry").path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.ends_with(".rs") || name.ends_with("_test.rs") {
-                continue;
+        // Every `.rs` file under `dir`, recursively, with its path relative
+        // to `crates/`. Symlinks are not followed; none exist under `src`,
+        // and one that pointed out of the tree would count somebody else's
+        // code as ours.
+        fn collect(
+            crates: &std::path::Path,
+            dir: &std::path::Path,
+            into: &mut BTreeMap<String, String>,
+        ) {
+            let entries =
+                std::fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+            for entry in entries {
+                let entry = entry.expect("a directory entry");
+                let path = entry.path();
+                let kind = entry.file_type().expect("a file type");
+                if kind.is_dir() {
+                    collect(crates, &path, into);
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !kind.is_file() || !name.ends_with(".rs") || name.ends_with("_test.rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a readable source file");
+                // Everything after the first `#[cfg(test)]` is tests.
+                let code = match text.find("#[cfg(test)]") {
+                    Some(at) => text[..at].to_string(),
+                    None => text,
+                };
+                let relative = path
+                    .strip_prefix(crates)
+                    .expect("a file under crates/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                into.insert(relative, code);
             }
-            let text = std::fs::read_to_string(&path).expect("a readable source file");
-            // Everything after the first `#[cfg(test)]` is tests.
-            let code = match text.find("#[cfg(test)]") {
-                Some(at) => text[..at].to_string(),
-                None => text,
-            };
-            sources.insert(name.to_string(), code);
+        }
+
+        let crates = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .canonicalize()
+            .expect("the crates directory");
+        let mut sources: BTreeMap<String, String> = BTreeMap::new();
+        for reader in MANIFEST_READERS {
+            let src = crates.join(reader).join("src");
+            assert!(
+                src.is_dir(),
+                "{} has no src directory at {}; this test walks the source of every crate \
+                 that reads a manifest, and a crate it cannot find is a reader it cannot \
+                 see, so update MANIFEST_READERS rather than letting it look away",
+                reader,
+                src.display()
+            );
+            collect(&crates, &src, &mut sources);
         }
         assert!(
-            sources.contains_key("forward.rs") && sources.contains_key("redirects.rs"),
+            sources.contains_key("deis-bundle/src/forward.rs")
+                && sources.contains_key("deis-bundle/src/redirects.rs")
+                && sources.contains_key("deis-runtime/src/assets/site.rs"),
             "read the wrong directory: {:?}",
             sources.keys().collect::<Vec<_>>()
         );

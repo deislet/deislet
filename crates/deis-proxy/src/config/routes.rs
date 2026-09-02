@@ -10,6 +10,8 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 use tracing::{debug, warn};
 
+use crate::acme::store::read_certificate_pair;
+use crate::acme::{Stored, stored_certificate};
 use crate::config::Validatable;
 use crate::config::apps::AppConfig;
 use crate::config::apps::certificate::CertificateConfig;
@@ -39,6 +41,11 @@ pub struct RouteTable {
     /// Every exact host an application configured here claims, for the
     /// renewal task to certify.
     served_names: BTreeSet<String>,
+    /// The automatic certificates that were loaded, by the name they were
+    /// obtained for. The renewal pass compares this with what the store
+    /// holds and rebuilds the table when the two disagree - a certificate
+    /// that expired while loaded, or one another process wrote.
+    automatic_names: BTreeSet<String>,
 }
 
 impl RouteTable {
@@ -134,6 +141,22 @@ impl RouteTable {
             for cert_cfg in &app.certificates {
                 match LoadedCertificate::load(cert_cfg) {
                     Ok(cert) => {
+                        if cert.is_expired() {
+                            // Still served: the operator named this file and
+                            // replacing it is theirs to do. Said out loud
+                            // because every browser is about to refuse it,
+                            // and plain HTTP for these domains redirects
+                            // onto it.
+                            warn!(
+                                app = %app.id,
+                                cert = %cert_cfg.cert_file,
+                                not_after = %cert.not_after(),
+                                "a configured certificate has expired and is still being served \
+                                 because it was named in the configuration; browsers will refuse \
+                                 it. Replace the file, or remove it from the application and let \
+                                 tls.acme obtain one"
+                            );
+                        }
                         let cert = Arc::new(cert);
                         for name in &cert.names {
                             table.insert_certificate(name, &cert);
@@ -172,6 +195,14 @@ impl RouteTable {
         // Automatic certificates come last and never displace a configured
         // one: a file an operator placed is a decision, and this map is what
         // the handshake reads.
+        //
+        // Judged by the same function the renewal pass judges them with, so
+        // what is served and what is ordered can never disagree: a pair the
+        // pass calls unusable is not served here, and a pair that is not
+        // served here is one the pass will order again. An expired one is
+        // not served either - unlike a configured certificate, nobody chose
+        // it, and serving it would redirect plain HTTP onto a handshake
+        // every browser refuses while the renewal log says "plain HTTP only".
         for (name, config) in automatic_certificates {
             let name = normalize_host(name);
             if table.covered_by_configured_certificate(&name) {
@@ -182,7 +213,38 @@ impl RouteTable {
                 );
                 continue;
             }
-            match LoadedCertificate::load(config) {
+            match stored_certificate(config) {
+                Stored::Valid { days_left } if days_left >= 0 => {}
+                Stored::Valid { days_left } => {
+                    warn!(
+                        name = %name,
+                        cert = %config.cert_file,
+                        days_left,
+                        "an automatic certificate on disk has expired and is not served; this \
+                         name answers plain HTTP without a redirect until the renewal pass \
+                         obtains a new one"
+                    );
+                    continue;
+                }
+                Stored::Unusable(reason) => {
+                    warn!(
+                        name = %name,
+                        cert = %config.cert_file,
+                        reason = %reason,
+                        "an automatic certificate on disk cannot be used and is not served; this \
+                         name answers plain HTTP without a redirect and the renewal pass orders \
+                         it again"
+                    );
+                    continue;
+                }
+                Stored::Missing => continue,
+            }
+            let loaded = read_certificate_pair(config)
+                .map_err(anyhow::Error::from)
+                .and_then(|(cert_pem, key_pem)| {
+                    LoadedCertificate::from_pem(&cert_pem, &key_pem, config)
+                });
+            match loaded {
                 Ok(cert) => {
                     let cert = Arc::new(cert);
                     // Registered under the name it was obtained for as well
@@ -195,6 +257,7 @@ impl RouteTable {
                             table.insert_certificate(subject, &cert);
                         }
                     }
+                    table.automatic_names.insert(name);
                 }
                 Err(e) => warn!(
                     name = %name,
@@ -291,6 +354,12 @@ impl RouteTable {
     /// not from a list beside it.
     pub fn served_names(&self) -> Vec<String> {
         self.served_names.iter().cloned().collect()
+    }
+
+    /// The automatic certificates this table serves, by the name each was
+    /// obtained for.
+    pub fn automatic_certificate_names(&self) -> &BTreeSet<String> {
+        &self.automatic_names
     }
 
     fn has_certificate_named(&self, name: &str) -> bool {
@@ -546,6 +615,16 @@ mod tests {
     /// A throwaway self-signed certificate written to disk, so the route
     /// table loads it the way it loads a real one.
     fn write_certificate(dir: &std::path::Path, name: &str) -> CertificateConfig {
+        write_certificate_ending(dir, name, 90 * 86_400)
+    }
+
+    /// As above, with the end of validity `ending_in_secs` from now -
+    /// negative for a certificate that has already expired.
+    fn write_certificate_ending(
+        dir: &std::path::Path,
+        name: &str,
+        ending_in_secs: i64,
+    ) -> CertificateConfig {
         use openssl::asn1::Asn1Time;
         use openssl::hash::MessageDigest;
         use openssl::pkey::PKey;
@@ -557,16 +636,20 @@ mod tests {
         subject.append_entry_by_text("CN", name).unwrap();
         let subject = subject.build();
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         let mut builder = X509::builder().unwrap();
         builder.set_version(2).unwrap();
         builder.set_subject_name(&subject).unwrap();
         builder.set_issuer_name(&subject).unwrap();
         builder.set_pubkey(&key).unwrap();
         builder
-            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .set_not_before(&Asn1Time::from_unix(now + ending_in_secs - 90 * 86_400).unwrap())
             .unwrap();
         builder
-            .set_not_after(&Asn1Time::days_from_now(90).unwrap())
+            .set_not_after(&Asn1Time::from_unix(now + ending_in_secs).unwrap())
             .unwrap();
         let context = builder.x509v3_context(None, None);
         let san = SubjectAlternativeName::new()
@@ -617,6 +700,60 @@ mod tests {
             "an application whose certificate was obtained rather than placed still terminates \
              TLS, so plain HTTP for it has to be redirected"
         );
+        assert_eq!(
+            table
+                .automatic_certificate_names()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec!["shop.example.com"]
+        );
+    }
+
+    #[test]
+    fn an_expired_automatic_certificate_is_not_served_and_plain_http_is_not_redirected() {
+        // The promise the renewal log makes when an order keeps failing is
+        // "plain HTTP only, no redirect". It used to be false: the expired
+        // pair stayed loaded, the handshake presented it, and every plain
+        // request was redirected onto a certificate no browser accepts.
+        // The redirect is computed from this map, so not loading the pair
+        // is what makes the promise true.
+        let dir = tempfile::tempdir().unwrap();
+        let expired = write_certificate_ending(dir.path(), "shop.example.com", -3 * 3600);
+
+        let mut apps = HashMap::new();
+        apps.insert("shop".to_string(), app("shop", &["shop.example.com"], true));
+        let table = RouteTable::build(&apps, None, &[("shop.example.com".to_string(), expired)]);
+
+        assert!(
+            table.certificate_for(Some("shop.example.com")).is_none(),
+            "an expired automatic certificate must not be presented"
+        );
+        let shop = table.app_by_host("shop.example.com").unwrap();
+        assert!(!table.https_available(shop));
+        assert!(!table.https_available_for_host("shop.example.com"));
+        assert!(table.automatic_certificate_names().is_empty());
+    }
+
+    #[test]
+    fn an_automatic_pair_whose_key_does_not_match_is_not_served() {
+        // The loader always refused such a pair; what it now also does is
+        // agree with the renewal pass about it, so the pass orders a
+        // replacement instead of calling the pair current.
+        let dir = tempfile::tempdir().unwrap();
+        let good = write_certificate(dir.path(), "shop.example.com");
+        let other = write_certificate(dir.path(), "other.example.com");
+        let mismatched = CertificateConfig {
+            cert_file: good.cert_file.clone(),
+            key_file: other.key_file.clone(),
+        };
+
+        let mut apps = HashMap::new();
+        apps.insert("shop".to_string(), app("shop", &["shop.example.com"], true));
+        let table = RouteTable::build(&apps, None, &[("shop.example.com".to_string(), mismatched)]);
+        assert!(table.certificate_for(Some("shop.example.com")).is_none());
+        assert!(table.automatic_certificate_names().is_empty());
+        let shop = table.app_by_host("shop.example.com").unwrap();
+        assert!(!table.https_available(shop));
     }
 
     #[test]

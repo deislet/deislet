@@ -122,12 +122,22 @@ fn repair_log_writes(data_dir: &std::path::Path) {
 /// wakeup, and yielding until it has happened is the real condition. A sleep
 /// would either be longer than it needs to be or shorter than it can be.
 async fn health_settles_on(server: &RunningServer, expected: ServingStatus) -> ServingStatus {
+    health_of_settles_on(server, "deis.telemetry.LogService", expected).await
+}
+
+/// The same, for any service name - including the empty one, which is what
+/// `grpc_health_probe` and a Kubernetes gRPC probe ask about by default.
+async fn health_of_settles_on(
+    server: &RunningServer,
+    service: &str,
+    expected: ServingStatus,
+) -> ServingStatus {
     let mut client = HealthClient::new(channel(server).await);
     let mut last = ServingStatus::Unknown;
     for _ in 0..1_000 {
         let response = client
             .check(HealthCheckRequest {
-                service: "deis.telemetry.LogService".to_string(),
+                service: service.to_string(),
             })
             .await
             .expect("the health service answers without a token");
@@ -207,6 +217,15 @@ async fn a_store_that_refuses_writes_moves_the_counters_and_the_health_status() 
         ServingStatus::NotServing,
         "a collector that cannot store anything must not report SERVING"
     );
+    // The unnamed service is the one a generic probe asks about, and it has
+    // to say the same thing: a process whose three named services are all
+    // NOT_SERVING is not healthy under any name.
+    assert_eq!(
+        health_of_settles_on(&server, "", ServingStatus::NotServing).await,
+        ServingStatus::NotServing,
+        "the unnamed service must reflect the named ones, or a default probe keeps the \
+         process alive while it stores nothing"
+    );
 
     // The scrape still works - reads are unaffected - so this is what the
     // operator watching /metrics actually sees.
@@ -240,6 +259,11 @@ async fn a_store_that_refuses_writes_moves_the_counters_and_the_health_status() 
     assert_eq!(
         health_settles_on(&server, ServingStatus::Serving).await,
         ServingStatus::Serving,
+    );
+    assert_eq!(
+        health_of_settles_on(&server, "", ServingStatus::Serving).await,
+        ServingStatus::Serving,
+        "the unnamed service recovers with the named ones"
     );
     assert_eq!(
         ServiceStats::get(&stats.storage_failures),

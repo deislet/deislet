@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
@@ -33,6 +33,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::api::middleware::{NodeAuthConfig, node_auth};
+use crate::node_key::ProvedNodeKey;
 use crate::runtime_client::{
     Deregistered, NodeSource, Registered, RegistrationError, RuntimeNodeManager,
 };
@@ -91,9 +92,17 @@ pub struct RegisterResponse {
 /// it is the same fleet credential, and an unauthenticated caller must not be
 /// able to add a delivery target that would then be handed every environment's
 /// decrypted secrets on its first assignment fetch.
+///
+/// Which value of that credential the caller proved is recorded with the
+/// registration ([`ProvedNodeKey`], put on the request by the layer), and it
+/// is the value every later call to this address carries. The list holds two
+/// values during a rotation, and an address that proved the retiring one is
+/// never handed its replacement - so dropping the old value evicts whatever
+/// registered with it instead of upgrading it.
 pub async fn register(
     State(state): State<RegistrationState>,
     Path(node_id): Path<String>,
+    Extension(ProvedNodeKey(proved)): Extension<ProvedNodeKey>,
     Json(request): Json<RegisterRequest>,
 ) -> impl IntoResponse {
     let outcome = match state
@@ -103,6 +112,7 @@ pub async fn register(
             &request.address,
             request.version.clone(),
             Utc::now(),
+            proved,
         )
         .await
     {

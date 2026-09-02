@@ -343,3 +343,38 @@ async fn an_unrecognised_method_still_reaches_the_application() {
         "every one of them has to have reached the handler"
     );
 }
+
+/// A request naming an application this node does not run is a 404, not a 500
+/// with an incident id, and it puts no ERROR line in the node's log.
+///
+/// On the data port -- which the proxy does not sit in front of for a
+/// node-to-node or a demo call -- an unknown app id used to come back through
+/// the invoke error path as `500 Internal Server Error (incident <id>)` with
+/// an ERROR naming the app. Anyone who could reach the port minted incident
+/// ids and ERROR lines by naming apps that do not exist, and an operator
+/// counting incidents could not tell a crash from a typo. An unknown app is
+/// not a failure of this node.
+#[tokio::test]
+async fn an_unknown_application_is_a_404_without_an_incident() {
+    // One app is loaded; the request below names a different one, which this
+    // node has never been told to run.
+    let router = node("known-probe-app", COUNTING_APP).await;
+
+    let (status, body) = ask(&router, "GET", "/verify", "ghost-probe-app").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an app this node does not run has to be a 404, not a 500: {body:?}"
+    );
+    assert!(
+        !body.contains("incident") && !body.contains("Internal Server Error"),
+        "a 404 for an unknown app must not carry an incident id or the 500 body: {body:?}"
+    );
+
+    let log = logged();
+    assert!(
+        !log.contains("ghost-probe-app.production execution failed")
+            && !log.contains("Application ghost-probe-app"),
+        "an unknown app must not mint an ERROR line in the node log:\n{log}"
+    );
+}

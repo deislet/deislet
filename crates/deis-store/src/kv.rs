@@ -243,13 +243,21 @@ impl KvService {
     ) -> StoreResult<(Vec<KvListing>, Option<String>)> {
         let limit = clamp_limit(limit);
         let tenant_id = tenant.as_str().to_string();
+        // `None` means "no upper bound": scan to the end of this tenant's
+        // range.
+        let upper = prefix_upper_bound(prefix);
         // The cursor is the last key of the previous page, so resume strictly
-        // after it. A cursor that sits before the prefix is ignored rather
-        // than trusted: honouring it would widen the scan to keys the caller
-        // did not ask for, which is how a paging bug turns into a leak of
-        // unrelated keys.
+        // after it. A cursor outside the prefix is ignored rather than
+        // trusted, on either side: before it, honouring it would widen the
+        // scan to keys the caller did not ask for, which is how a paging bug
+        // turns into a leak of unrelated keys; after it, the scan would find
+        // nothing and answer an empty page, which reads as an empty prefix to
+        // a caller that mixed up its cursors. Both restart at the prefix. A
+        // cursor this service issued is always a key inside the prefix, so a
+        // well-behaved caller never lands here.
+        let inside_prefix = |key: &str| key >= prefix && upper.as_deref().is_none_or(|u| key < u);
         let (lower, exclusive_lower) = match cursor {
-            Some(c) if c.as_str() >= prefix => (c, true),
+            Some(c) if inside_prefix(&c) => (c, true),
             Some(c) => {
                 tracing::debug!(
                     cursor = %c,
@@ -260,9 +268,6 @@ impl KvService {
             }
             None => (prefix.to_string(), false),
         };
-        // `None` means "no upper bound": scan to the end of this tenant's
-        // range.
-        let upper = prefix_upper_bound(prefix);
         let now = unix_seconds();
 
         let (entries, page_bytes, cut_short) = self
@@ -944,6 +949,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(&page), vec!["user:1", "user:2"]);
+        // "zzz" sorts after every key under the prefix; honouring it would
+        // answer an empty page that reads as "nothing under user:". It is
+        // outside the prefix just the same, and restarts the scan.
+        let (page, next) = svc
+            .list(&a, "user:", None, Some("zzz".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(names(&page), vec!["user:1", "user:2"]);
+        assert!(next.is_none());
     }
 
     #[tokio::test]

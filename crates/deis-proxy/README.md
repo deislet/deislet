@@ -123,16 +123,49 @@ authority.
   the authority's host so switching from staging to production obtains
   everything again rather than serving staging certificates nobody trusts.
   A restart loads what is there and orders nothing.
+- **One rule decides what is served and what is ordered.** A stored pair is
+  usable when its key matches its certificate and the certificate has not
+  expired; the route table loads only usable pairs and the renewal pass
+  orders a replacement for anything else. A key that stops matching its
+  certificate, or a certificate that expires while a renewal keeps failing,
+  therefore leaves its name on plain HTTP with no redirect to the TLS port
+  until a new one is obtained — never served, never redirected onto. A
+  certificate an operator named in the configuration is the exception: it
+  is served as long as it loads, expired or not, with a warning.
 - **Renewal is a background pass** every `check_interval_secs`, ordering a
   name once it is within `renew_before_days` of expiry. A failure is logged
   at `WARN` while there is slack and at `ERROR` once the certificate is
   within `alarm_before_days` of expiry, always saying when the next attempt
   is, and retried with a doubling backoff up to `max_retry_backoff_secs`.
+  The store is checked to be writable before an order is placed, and a
+  certificate that was issued and could not be written is kept in memory and
+  written on the next attempt rather than ordered again — an order counts
+  against the authority's weekly allowance whether or not it reaches disk.
+  Every pass also names each host that wants a certificate and does not fit
+  under `max_names`, and the summary line carries `uncovered=N`.
+- **One renewal writer per store.** The pass holds `renewal.lock` in the
+  store while it runs; a second process on the same `storage_dir` — another
+  proxy, or the outgoing half of a zero-downtime upgrade — skips its pass
+  while the lock is held and finds whatever was ordered on disk afterwards.
+  Each pair is written under its own lock, taken shared by every reader, so
+  a reader never sees one writer's key beside another's chain. A pass also
+  stops starting new orders once the server is shutting down.
+- **The state of renewal is kept as counters** (`acme::AcmeHealth`: names
+  wanted, covered, failing, uncovered, unsaved, orders issued and failed,
+  least days left, last pass) for whatever reports this process — the
+  control plane's `get_status` answer does not carry them yet.
 - **The default authority is Let's Encrypt staging** and the startup log says
   so. Set `directory_url` to production only once a name has been issued
   successfully: production's rate limits are counted per registered domain
   per week and cannot be given back. `max_names` bounds how many names this
   instance will ever order for, for the same reason.
+- **The challenge path is public by protocol** — RFC 8555 fixes it and the
+  authority fetches it unauthenticated — but an answer is served only under
+  the host it was published for, which is the host the authority's fetch
+  carries. A published answer is a two-line file (`name`, then the key
+  authorization) in the store's `challenges/` directory, so the process that
+  did not create the order can still answer it during an upgrade; a file of
+  any other shape there is not an answer.
 
 Turning it on needs port 80 reachable from the internet at every name being
 certified, an email address the authority writes to when a certificate is

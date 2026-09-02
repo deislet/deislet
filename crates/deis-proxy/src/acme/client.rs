@@ -376,7 +376,7 @@ impl AcmeClient {
         // Published before the authority is told to look, and withdrawn
         // however this ends - including on the error paths below, which is
         // why the result is held rather than returned straight away.
-        responder.publish(&token, &key_authorization);
+        responder.publish(name, &token, &key_authorization);
         info!(
             name,
             "http-01 answer published; the authority will now fetch \

@@ -689,6 +689,7 @@ mod tests {
             max_object_bytes: 8 * 1024 * 1024,
             upload_idle_timeout: Some(Duration::from_secs(60)),
             download_idle_timeout: Some(Duration::from_secs(60)),
+            remove_orphans_on_start: false,
         }
     }
 

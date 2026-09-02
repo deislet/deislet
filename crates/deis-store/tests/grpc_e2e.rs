@@ -1668,3 +1668,61 @@ async fn a_named_binding_written_over_the_wire_survives_a_restart() {
         "the tenant's unnamed namespace never held this key"
     );
 }
+
+#[tokio::test]
+async fn a_single_chunk_above_the_message_ceiling_is_refused_not_an_internal_error() {
+    // The client is told to send 1 MiB chunks. One that sends a single 17 MiB
+    // message is breaking the protocol, and used to be answered Internal - the
+    // code for "the store is broken" - because the decode failure on the
+    // inbound stream was folded into an I/O error. It is the caller's fault
+    // and the answer has to say so, naming the ceiling it went over.
+    let harness = Harness::start().await;
+    let mut blob = BlobStoreClient::new(harness.channel().await)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        // Raised on the client only, so the oversized frame leaves at all.
+        .max_encoding_message_size(2 * MAX_GRPC_MESSAGE_BYTES);
+
+    let messages = vec![
+        PutRequest {
+            payload: Some(put_request::Payload::Header(PutHeader {
+                key: "one-giant-chunk".to_string(),
+                precondition: None,
+                content_type: None,
+            })),
+        },
+        PutRequest {
+            payload: Some(put_request::Payload::Chunk(vec![
+                0u8;
+                MAX_GRPC_MESSAGE_BYTES
+                    + 1024
+            ])),
+        },
+    ];
+
+    let response = blob
+        .put(as_tenant(
+            "app-one.production",
+            tokio_stream::iter(messages),
+        ))
+        .await
+        .expect("a protocol violation by the caller is not an internal error")
+        .into_inner();
+    assert!(!response.success);
+    let error = response.error.unwrap_or_default();
+    assert!(
+        error.contains(&MAX_GRPC_MESSAGE_BYTES.to_string()),
+        "the refusal names the ceiling: {error}"
+    );
+
+    let absent = blob
+        .get(as_tenant(
+            "app-one.production",
+            deis_store::proto::blob::GetRequest {
+                range: None,
+                key: "one-giant-chunk".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(absent.code(), tonic::Code::NotFound);
+}

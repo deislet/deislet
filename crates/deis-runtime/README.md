@@ -40,6 +40,16 @@ Chinese: [README.zh.md](README.zh.md).
   invocation — request, queue batch, cron tick, WebSocket message — carrying
   the outcome *this node* decided, so "the app threw" and "we cut it off" are
   different records. `deis trace` reads them back.
+- **Ends an invocation when its handler is done, and sweeps what the handler
+  left running.** A `fetch` or a service call the handler started and did not
+  await is aborted when the invocation ends, so a continuation cannot run
+  under the next caller's name. The one place this is easy to trip over is a
+  WebSocket message listener: a message is its own invocation, which ends
+  when the listener returns, so an `async` listener that awaits a `fetch` or
+  `env.SERVICE.fetch()` is cut off with a `TimeoutError` saying the invocation
+  ended. Do that work in the request that accepted the socket, or from a
+  `waitUntil` there; storage calls (`kv`, `db`, `blob`, `queue`) are not swept
+  and finish on their own.
 
 It keeps its own state in a local SQLite database and can serve what it
 already has when the control plane is unreachable — it reports UNHEALTHY and

@@ -117,6 +117,8 @@ const {
   ObjectDefineProperties,
   ObjectFreeze,
   ObjectGetOwnPropertyDescriptor,
+  Promise,
+  PromisePrototypeThen,
   ReflectApply,
   SafeMap,
   SafeSet,
@@ -694,14 +696,20 @@ const nativeClearTimeout = timers.clearTimeout;
 // one. The set it starts in is the one the ownership section above chose; see
 // there for why there is more than one.
 
-// What an application is told when the budget ran out under it. A
-// `TimeoutError` is what an `AbortSignal` deadline produces everywhere else,
-// so `e.name === "TimeoutError"` is the check a handler already knows.
+// What an application is told when the budget ran out under it, or when the
+// stretch that made the call ended with it still in flight. A `TimeoutError`
+// is what an `AbortSignal` deadline produces everywhere else, so `e.name ===
+// "TimeoutError"` is the check a handler already knows; the sweep uses the
+// same one because to the call it is the same thing -- the time it had to
+// finish in is gone. The message names both causes: a service call ended by
+// the sweep is not a fetch, and it was not slow.
 function budgetExpired() {
   return new domException.DOMException(
-    "The outbound fetch was aborted: this invocation's execution budget ran " +
-      "out while the request was still in flight. Shorten the call, or ask " +
-      "the operator for a longer execution timeout",
+    "The outbound call was aborted: this invocation's execution budget ran " +
+      "out, or the invocation ended, while the call was still in flight. " +
+      "Await the call or hand it to context.waitUntil so it finishes inside " +
+      "its own invocation; if it is simply slow, shorten it or ask the " +
+      "operator for a longer execution timeout",
     "TimeoutError",
   );
 }
@@ -1073,6 +1081,56 @@ const streamScope = ObjectFreeze({
   // caller set it, which is what keeps the answer the runtime's.
   scope() {
     return chargedScope();
+  },
+  // Run one outbound call that does not go through `fetch` above -- a
+  // service call -- under the guard a fetch gets, so that it is ended by the
+  // same sweep.
+  //
+  // `js/runtime.js` dispatches a service call as an op of its own, and until
+  // this existed that op was filed in no guard set: the sweep that ends an
+  // invocation's detached fetches did not know the call was there, so a call
+  // the handler fired and never awaited stayed pending across the end of its
+  // invocation and settled inside whichever one next pumped this isolate's
+  // event loop. Its continuation then ran there -- on that invocation's
+  // budget, and reading that invocation's statement about the request being
+  // answered. Filed here, the call is aborted where a detached fetch is: at
+  // the end of the stretch that made it, or, for a producer's call, when its
+  // stream ends.
+  //
+  // No timer of its own. The node already bounds a service call by what the
+  // caller's budget has left, and answers that case with a message that says
+  // whose time ran out; a second clock here would race it and answer first
+  // with a vaguer one. `rearmGuards` still puts a stream's clock on it when a
+  // stream adopts it, which is the same treatment a fetch gets.
+  //
+  // What comes back settles exactly as `start()`'s promise does unless the
+  // guard is aborted first, in which case it rejects with the abort's reason
+  // and whatever the op later answers is dropped: nothing is waiting for it.
+  bound(start) {
+    const controller = new abortSignal.AbortController();
+    const guard = { controller, id: 0, set: ownedGuards() };
+    SetPrototypeAdd(guard.set, guard);
+    const signal = controller.signal;
+    return new Promise((resolve, reject) => {
+      const ended = () => reject(signal.reason);
+      const settled = () => {
+        signal[abortSignal.remove](ended);
+        nativeClearTimeout(guard.id);
+        SetPrototypeDelete(guard.set, guard);
+      };
+      signal[abortSignal.add](ended);
+      PromisePrototypeThen(
+        start(),
+        (value) => {
+          settled();
+          resolve(value);
+        },
+        (error) => {
+          settled();
+          reject(error);
+        },
+      );
+    });
   },
   // End everything this stream held, and say how much there was.
   //

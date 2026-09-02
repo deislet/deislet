@@ -12,6 +12,17 @@
 //! on an async runtime must wrap them in `spawn_blocking`. Writes take the one
 //! write connection; reads take a connection out of a small pool of their own,
 //! which is what keeps a long query from holding up ingest.
+//!
+//! # A page is bounded in bytes, not only in rows
+//!
+//! Every page a query builds has to travel in one gRPC frame of at most
+//! [`crate::MAX_GRPC_MESSAGE_BYTES`]. A page built by row count alone cannot
+//! promise that: three hundred log lines of 60 KiB each are inside every
+//! per-entry cap and still add up to 18 MiB, and tonic then refuses to encode
+//! the response after the handler has already returned, so the caller sees
+//! `OutOfRange` and this process logs nothing. So a page also stops at
+//! [`MAX_PAGE_BYTES`], well under the frame, and reports `has_more` with a
+//! cursor for the rest. Whatever limit a client asks for pages through.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -23,8 +34,96 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, params_from_iter};
 use tracing::{debug, info, warn};
 
+use crate::MAX_GRPC_MESSAGE_BYTES;
+
 /// Microseconds in one day, the width of a log partition.
-const DAY_US: i64 = 86_400_000_000;
+pub const DAY_US: i64 = 86_400_000_000;
+
+/// Most bytes of records one page may carry, whatever its row limit.
+///
+/// Half the frame: the estimate in [`WireSize`] is deliberately generous
+/// rather than exact, and the response carries a cursor and framing on top of
+/// the records, so the budget leaves room for both and a page can never reach
+/// the ceiling tonic enforces. The same ratio deis-queue uses for a `Pull`.
+pub const MAX_PAGE_BYTES: usize = MAX_GRPC_MESSAGE_BYTES / 2;
+
+/// Most distinct day partitions one insert may create or touch.
+///
+/// Creating a partition is a `CREATE TABLE` plus its indexes inside the one
+/// write transaction on the one write connection, and a batch of records
+/// spread over hundreds of distinct days used to do exactly that, holding the
+/// writer against every other producer for tens of seconds. The service
+/// refuses stamps older than the retention window before a batch gets here,
+/// which keeps a batch inside a handful of days; this is the belt under that,
+/// so a bug or a configuration with a years-long retention can still not make
+/// one insert build hundreds of tables.
+pub const MAX_PARTITIONS_PER_BATCH: usize = 32;
+
+/// An upper estimate of a record's size on the wire.
+///
+/// Protobuf spends a tag and a length prefix per string and per map entry,
+/// and a few bytes per integer; the estimate charges more than that for each,
+/// so the real encoding is never larger than the sum. Exactness is not the
+/// point - [`MAX_PAGE_BYTES`] leaves half the frame spare - what matters is
+/// that a page assembled against this estimate cannot outgrow the frame.
+pub trait WireSize {
+    fn wire_size(&self) -> usize;
+}
+
+/// What one string field costs at most: its bytes, a tag and a length varint.
+fn string_cost(value: &str) -> usize {
+    value.len() + 6
+}
+
+/// What one map entry costs at most: both strings, each with tag and length,
+/// wrapped in an entry with a tag and length of its own.
+fn pair_cost(key: &str, value: &str) -> usize {
+    string_cost(key) + string_cost(value) + 6
+}
+
+/// The framing of one record inside a repeated field, plus its numeric
+/// fields, which are at most eleven bytes each.
+const RECORD_FIXED_COST: usize = 64;
+
+/// Bytes still available in the page being built, and whether it was cut.
+///
+/// Cutting a page by bytes is never allowed to leave it empty: a single
+/// record larger than the whole budget is returned on a page of its own,
+/// because the alternative is a cursor that never advances. Such a record is
+/// still under the frame, since every string that reaches storage is capped
+/// at ingest.
+struct PageBudget {
+    remaining: usize,
+    taken: usize,
+    cut: bool,
+}
+
+impl PageBudget {
+    fn new(bytes: usize) -> Self {
+        Self {
+            remaining: bytes,
+            taken: 0,
+            cut: false,
+        }
+    }
+
+    /// Whether `record` fits on the page. Once this says no, the page is
+    /// closed: the caller stops reading and reports the cut.
+    fn admit<R: WireSize>(&mut self, record: &R) -> bool {
+        let size = record.wire_size();
+        if size > self.remaining && self.taken > 0 {
+            self.cut = true;
+            return false;
+        }
+        self.remaining = self.remaining.saturating_sub(size);
+        self.taken += 1;
+        true
+    }
+
+    fn is_closed(&self) -> bool {
+        self.cut
+    }
+}
 
 /// One stored log record. This is the storage-side shape; the proto type is
 /// converted to and from it at the service boundary so storage does not
@@ -85,6 +184,53 @@ pub struct TraceRecord {
     pub error: String,
     /// Extra dimensions, kept ordered so the stored JSON is canonical.
     pub attributes: BTreeMap<String, String>,
+}
+
+impl WireSize for LogRecord {
+    fn wire_size(&self) -> usize {
+        RECORD_FIXED_COST
+            + string_cost(&self.component)
+            + string_cost(&self.app_id)
+            + string_cost(&self.message)
+            + string_cost(&self.trace_id)
+            + string_cost(&self.span_id)
+            + self
+                .fields
+                .iter()
+                .map(|(k, v)| pair_cost(k, v))
+                .sum::<usize>()
+    }
+}
+
+impl WireSize for MetricRecord {
+    fn wire_size(&self) -> usize {
+        RECORD_FIXED_COST
+            + string_cost(&self.name)
+            + string_cost(&self.app_id)
+            + self
+                .labels
+                .iter()
+                .map(|(k, v)| pair_cost(k, v))
+                .sum::<usize>()
+    }
+}
+
+impl WireSize for TraceRecord {
+    fn wire_size(&self) -> usize {
+        RECORD_FIXED_COST
+            + string_cost(&self.trace_id)
+            + string_cost(&self.app_id)
+            + string_cost(&self.environment)
+            + string_cost(&self.node)
+            + string_cost(&self.target)
+            + string_cost(&self.method)
+            + string_cost(&self.error)
+            + self
+                .attributes
+                .iter()
+                .map(|(k, v)| pair_cost(k, v))
+                .sum::<usize>()
+    }
 }
 
 /// Filters for [`TelemetryStore::query_traces`]. `None` and an empty list
@@ -187,6 +333,10 @@ pub struct LogPage {
     /// Position to resume from; `None` when the page is the last one.
     pub next_cursor: Option<LogCursor>,
     pub has_more: bool,
+    /// The page holds fewer rows than asked for because the next row would
+    /// have taken it past [`MAX_PAGE_BYTES`]. `has_more` is true whenever
+    /// this is; it is reported apart so the caller can say why.
+    pub cut_by_bytes: bool,
 }
 
 /// Position of the last row of a metric page. Like [`LogCursor`], keyset
@@ -233,6 +383,8 @@ pub struct MetricPage {
     /// Position to resume from; `None` when the page is the last one.
     pub next_cursor: Option<MetricCursor>,
     pub has_more: bool,
+    /// Cut short at [`MAX_PAGE_BYTES`]; see [`LogPage::cut_by_bytes`].
+    pub cut_by_bytes: bool,
 }
 
 /// Position of the last row of a trace page. Keyset based, like the other
@@ -283,6 +435,8 @@ pub struct TracePage {
     /// Position to resume from; `None` when the page is the last one.
     pub next_cursor: Option<TraceCursor>,
     pub has_more: bool,
+    /// Cut short at [`MAX_PAGE_BYTES`]; see [`LogPage::cut_by_bytes`].
+    pub cut_by_bytes: bool,
 }
 
 /// A log partition removed by a retention sweep.
@@ -463,7 +617,10 @@ impl TelemetryStore {
     /// Append log records, creating day partitions as needed.
     ///
     /// Returns the number of rows written. The whole call is one transaction,
-    /// so a batch either lands entirely or not at all.
+    /// so a batch either lands entirely or not at all. A batch spread over
+    /// more than [`MAX_PARTITIONS_PER_BATCH`] distinct days is refused before
+    /// the transaction opens; the service keeps batches inside the retention
+    /// window, so reaching this is a bug upstream, not a producer's doing.
     pub fn insert_logs(&self, records: &[LogRecord]) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
@@ -477,6 +634,7 @@ impl TelemetryStore {
                 .or_default()
                 .push(record);
         }
+        check_partition_span("log", by_day.len())?;
 
         let mut conn = self.writer();
         let tx = conn.transaction().context("cannot begin log insert")?;
@@ -516,7 +674,9 @@ impl TelemetryStore {
     /// Read one page of logs, newest first.
     ///
     /// `limit` is the page size; the store fetches one extra row to decide
-    /// whether an older page exists, and never returns that extra row.
+    /// whether an older page exists, and never returns that extra row. The
+    /// page also stops at [`MAX_PAGE_BYTES`], whatever `limit` says; a page
+    /// cut that way reports `has_more` and a cursor like any other.
     pub fn query_logs(
         &self,
         filter: &LogFilter,
@@ -524,14 +684,15 @@ impl TelemetryStore {
         cursor: Option<LogCursor>,
     ) -> Result<LogPage> {
         let limit = limit.max(1);
-        let mut collected = self.with_reader(|conn| {
+        let (mut collected, cut_by_bytes) = self.with_reader(|conn| {
             let mut partitions = list_partitions(conn, LOG_PARTITIONS)?;
             partitions.sort_unstable_by(|a, b| b.cmp(a));
 
             let mut collected: Vec<(LogCursor, LogRecord)> = Vec::new();
+            let mut budget = PageBudget::new(MAX_PAGE_BYTES);
             let want = limit + 1;
             for day in partitions {
-                if collected.len() >= want {
+                if collected.len() >= want || budget.is_closed() {
                     break;
                 }
                 if !day_intersects(day, filter.start_us, filter.end_us) {
@@ -553,13 +714,16 @@ impl TelemetryStore {
                     filter,
                     partition_cursor,
                     want - collected.len(),
+                    &mut budget,
                 )?;
                 collected.extend(rows);
             }
-            Ok(collected)
+            Ok((collected, budget.is_closed()))
         })?;
 
-        let has_more = collected.len() > limit;
+        // A page closed by bytes has already seen a row it did not take, so
+        // there is more behind it whatever the count says.
+        let has_more = cut_by_bytes || collected.len() > limit;
         collected.truncate(limit);
         let next_cursor = if has_more {
             collected.last().map(|(cursor, _)| *cursor)
@@ -570,13 +734,15 @@ impl TelemetryStore {
             records: collected.into_iter().map(|(_, record)| record).collect(),
             next_cursor,
             has_more,
+            cut_by_bytes,
         })
     }
 
     /// Append trace records, creating day partitions as needed.
     ///
     /// Returns the number of rows written. The whole call is one transaction,
-    /// so a batch either lands entirely or not at all.
+    /// so a batch either lands entirely or not at all, and the same
+    /// [`MAX_PARTITIONS_PER_BATCH`] ceiling as [`Self::insert_logs`] applies.
     pub fn insert_traces(&self, records: &[TraceRecord]) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
@@ -591,6 +757,7 @@ impl TelemetryStore {
                 .or_default()
                 .push(record);
         }
+        check_partition_span("trace", by_day.len())?;
 
         let mut conn = self.writer();
         let tx = conn.transaction().context("cannot begin trace insert")?;
@@ -636,7 +803,8 @@ impl TelemetryStore {
     /// Read one page of traces, newest invocation first.
     ///
     /// `limit` is the page size; the store fetches one extra row to decide
-    /// whether an older page exists, and never returns that extra row.
+    /// whether an older page exists, and never returns that extra row. Like
+    /// [`Self::query_logs`], the page also stops at [`MAX_PAGE_BYTES`].
     pub fn query_traces(
         &self,
         filter: &TraceFilter,
@@ -644,14 +812,15 @@ impl TelemetryStore {
         cursor: Option<TraceCursor>,
     ) -> Result<TracePage> {
         let limit = limit.max(1);
-        let mut collected = self.with_reader(|conn| {
+        let (mut collected, cut_by_bytes) = self.with_reader(|conn| {
             let mut partitions = list_partitions(conn, TRACE_PARTITIONS)?;
             partitions.sort_unstable_by(|a, b| b.cmp(a));
 
             let mut collected: Vec<(TraceCursor, TraceRecord)> = Vec::new();
+            let mut budget = PageBudget::new(MAX_PAGE_BYTES);
             let want = limit + 1;
             for day in partitions {
-                if collected.len() >= want {
+                if collected.len() >= want || budget.is_closed() {
                     break;
                 }
                 if !day_intersects(day, filter.start_us, filter.end_us) {
@@ -670,13 +839,14 @@ impl TelemetryStore {
                     filter,
                     partition_cursor,
                     want - collected.len(),
+                    &mut budget,
                 )?;
                 collected.extend(rows);
             }
-            Ok(collected)
+            Ok((collected, budget.is_closed()))
         })?;
 
-        let has_more = collected.len() > limit;
+        let has_more = cut_by_bytes || collected.len() > limit;
         collected.truncate(limit);
         let next_cursor = if has_more {
             collected.last().map(|(cursor, _)| *cursor)
@@ -687,6 +857,7 @@ impl TelemetryStore {
             records: collected.into_iter().map(|(_, record)| record).collect(),
             next_cursor,
             has_more,
+            cut_by_bytes,
         })
     }
 
@@ -722,6 +893,10 @@ impl TelemetryStore {
     }
 
     /// Read one page of metric samples, newest first.
+    ///
+    /// Like the other two, the page stops at [`MAX_PAGE_BYTES`] as well as at
+    /// `limit`: a sample carries its labels, and a thousand samples with
+    /// large label sets are a page the frame cannot hold.
     pub fn query_metrics(
         &self,
         filter: &MetricFilter,
@@ -729,7 +904,7 @@ impl TelemetryStore {
         cursor: Option<MetricCursor>,
     ) -> Result<MetricPage> {
         let limit = limit.max(1);
-        let mut collected = self.with_reader(|conn| {
+        let (mut collected, cut_by_bytes) = self.with_reader(|conn| {
             let (sql, args) = build_metric_query(filter, cursor);
             let mut stmt = prepare_stmt(conn, &sql)?;
             let mut rows = stmt
@@ -737,6 +912,7 @@ impl TelemetryStore {
                 .context("cannot run metric query")?;
 
             let mut collected: Vec<(MetricCursor, MetricRecord)> = Vec::new();
+            let mut budget = PageBudget::new(MAX_PAGE_BYTES);
             while collected.len() <= limit {
                 let Some(row) = rows.next().context("cannot read metric row")? else {
                     break;
@@ -760,24 +936,28 @@ impl TelemetryStore {
                 {
                     continue;
                 }
+                let record = MetricRecord {
+                    name: row.get(1)?,
+                    app_id: row.get(2)?,
+                    labels,
+                    value: row.get(4)?,
+                    timestamp_us,
+                };
+                if !budget.admit(&record) {
+                    break;
+                }
                 collected.push((
                     MetricCursor {
                         timestamp_us,
                         row_id: id,
                     },
-                    MetricRecord {
-                        name: row.get(1)?,
-                        app_id: row.get(2)?,
-                        labels,
-                        value: row.get(4)?,
-                        timestamp_us,
-                    },
+                    record,
                 ));
             }
-            Ok(collected)
+            Ok((collected, budget.is_closed()))
         })?;
 
-        let has_more = collected.len() > limit;
+        let has_more = cut_by_bytes || collected.len() > limit;
         collected.truncate(limit);
         let next_cursor = if has_more {
             collected.last().map(|(cursor, _)| *cursor)
@@ -788,6 +968,7 @@ impl TelemetryStore {
             records: collected.into_iter().map(|(_, record)| record).collect(),
             next_cursor,
             has_more,
+            cut_by_bytes,
         })
     }
 
@@ -1068,6 +1249,18 @@ const LOG_PARTITIONS: &str = "logs_";
 /// for the same reason logs are, and expire on their own shorter schedule.
 const TRACE_PARTITIONS: &str = "traces_";
 
+/// Refuse a batch that would touch more day partitions than one insert may.
+fn check_partition_span(kind: &str, distinct_days: usize) -> Result<()> {
+    if distinct_days > MAX_PARTITIONS_PER_BATCH {
+        anyhow::bail!(
+            "a {kind} batch spans {distinct_days} distinct days, more than the \
+             {MAX_PARTITIONS_PER_BATCH} partitions one insert may touch; the batch is refused \
+             whole rather than allowed to build that many tables inside one transaction"
+        );
+    }
+    Ok(())
+}
+
 /// Table name of the partition of `prefix` holding `day`.
 fn partition_table(prefix: &str, day: i64) -> Result<String> {
     let seconds = day
@@ -1310,6 +1503,9 @@ fn build_metric_query(
     (sql, args)
 }
 
+/// Read up to `limit` rows of one partition, stopping early once `budget`
+/// is spent. Rows are stepped one at a time, so a partition of large rows
+/// costs the page's budget in memory and no more.
 fn query_partition(
     conn: &Connection,
     table: &str,
@@ -1317,6 +1513,7 @@ fn query_partition(
     filter: &LogFilter,
     cursor: Option<LogCursor>,
     limit: usize,
+    budget: &mut PageBudget,
 ) -> Result<Vec<(LogCursor, LogRecord)>> {
     let (sql, args) = build_partition_query(table, filter, cursor, limit);
     let mut stmt = prepare_stmt(conn, &sql)?;
@@ -1353,7 +1550,11 @@ fn query_partition(
         .with_context(|| format!("cannot query log partition {table}"))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.with_context(|| format!("cannot read row of {table}"))?);
+        let (cursor, record) = row.with_context(|| format!("cannot read row of {table}"))?;
+        if !budget.admit(&record) {
+            break;
+        }
+        out.push((cursor, record));
     }
     Ok(out)
 }
@@ -1439,6 +1640,7 @@ fn build_trace_partition_query(
     (sql, args)
 }
 
+/// The trace twin of [`query_partition`], under the same byte budget.
 fn query_trace_partition(
     conn: &Connection,
     table: &str,
@@ -1446,6 +1648,7 @@ fn query_trace_partition(
     filter: &TraceFilter,
     cursor: Option<TraceCursor>,
     limit: usize,
+    budget: &mut PageBudget,
 ) -> Result<Vec<(TraceCursor, TraceRecord)>> {
     let (sql, args) = build_trace_partition_query(table, filter, cursor, limit);
     let mut stmt = prepare_stmt(conn, &sql)?;
@@ -1487,7 +1690,11 @@ fn query_trace_partition(
         .with_context(|| format!("cannot query trace partition {table}"))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.with_context(|| format!("cannot read row of {table}"))?);
+        let (cursor, record) = row.with_context(|| format!("cannot read row of {table}"))?;
+        if !budget.admit(&record) {
+            break;
+        }
+        out.push((cursor, record));
     }
     Ok(out)
 }
@@ -2512,5 +2719,189 @@ mod tests {
             .query_logs(&LogFilter::default(), 10, None)
             .unwrap();
         assert_eq!(messages(&page), vec!["persisted"]);
+    }
+
+    /// A record whose message is `kib` KiB, so a page of them is sized by
+    /// bytes long before it is sized by rows.
+    fn big_record(ts: i64, kib: usize) -> LogRecord {
+        record(ts, "chatty", 3, &"x".repeat(kib * 1024))
+    }
+
+    #[test]
+    fn a_log_page_stops_at_the_byte_budget_and_the_cursor_resumes_behind_it() {
+        // 150 lines of 60 KiB are 9 MiB, over the 8 MiB budget and under
+        // the 16 MiB frame twice over once split. Asked for 200 rows, the
+        // page must close early, say so, and hand back a cursor that walks
+        // the rest without a gap or a repeat.
+        let store = TelemetryStore::open_in_memory().unwrap();
+        let batch: Vec<LogRecord> = (0..150).map(|i| big_record(BASE_US + i, 60)).collect();
+        store.insert_logs(&batch).unwrap();
+
+        let first = store.query_logs(&LogFilter::default(), 200, None).unwrap();
+        assert!(first.cut_by_bytes, "9 MiB of rows cannot be one page");
+        assert!(first.has_more);
+        assert!(first.next_cursor.is_some());
+        assert!(
+            first.records.len() < 150 && !first.records.is_empty(),
+            "got {}",
+            first.records.len()
+        );
+        let bytes: usize = first.records.iter().map(WireSize::wire_size).sum();
+        assert!(bytes <= MAX_PAGE_BYTES, "{bytes} bytes on one page");
+
+        let mut seen: Vec<i64> = first.records.iter().map(|r| r.timestamp_us).collect();
+        let mut cursor = first.next_cursor;
+        while let Some(c) = cursor {
+            let page = store
+                .query_logs(&LogFilter::default(), 200, Some(c))
+                .unwrap();
+            seen.extend(page.records.iter().map(|r| r.timestamp_us));
+            cursor = page.next_cursor;
+            if !page.has_more {
+                assert!(!page.cut_by_bytes, "the last page was not cut");
+            }
+        }
+        let expected: Vec<i64> = (0..150).rev().map(|i| BASE_US + i).collect();
+        assert_eq!(
+            seen, expected,
+            "paging must reach every row once, newest first"
+        );
+    }
+
+    #[test]
+    fn a_byte_cut_page_crosses_partitions_the_same_way() {
+        // The budget is per page, not per partition: a page that is cut
+        // inside an older partition must resume there, not skip the rest of
+        // that day.
+        let store = TelemetryStore::open_in_memory().unwrap();
+        let mut batch: Vec<LogRecord> = (0..40).map(|i| big_record(BASE_US + i, 60)).collect();
+        batch.extend((0..120).map(|i| big_record(BASE_US - DAY_US + i, 60)));
+        store.insert_logs(&batch).unwrap();
+        assert_eq!(store.partition_count().unwrap(), 2);
+
+        let mut seen = 0usize;
+        let mut cursor = None;
+        loop {
+            let page = store
+                .query_logs(&LogFilter::default(), 1000, cursor)
+                .unwrap();
+            seen += page.records.len();
+            cursor = page.next_cursor;
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(seen, 160);
+    }
+
+    #[test]
+    fn a_single_record_over_the_budget_still_travels_on_a_page_of_its_own() {
+        // The store cannot refuse to hand back a row it holds, and a page
+        // that carried nothing would come with a cursor that never moves.
+        // Such a row cannot arrive through the service, whose caps keep a
+        // record far under the budget; this guards the store's own promise.
+        let store = TelemetryStore::open_in_memory().unwrap();
+        store
+            .insert_logs(&[
+                big_record(BASE_US + 1, (MAX_PAGE_BYTES / 1024) + 1),
+                record(BASE_US + 2, "chatty", 3, "small"),
+            ])
+            .unwrap();
+        let first = store.query_logs(&LogFilter::default(), 10, None).unwrap();
+        assert_eq!(messages(&first), vec!["small"]);
+        assert!(first.cut_by_bytes && first.has_more);
+        let second = store
+            .query_logs(&LogFilter::default(), 10, first.next_cursor)
+            .unwrap();
+        assert_eq!(
+            second.records.len(),
+            1,
+            "the oversized row is delivered alone"
+        );
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn a_trace_page_stops_at_the_byte_budget_too() {
+        let store = TelemetryStore::open_in_memory().unwrap();
+        let batch: Vec<TraceRecord> = (0..150)
+            .map(|i| {
+                let mut t = trace(BASE_US + i, "shop", OUTCOME_OK, "/big");
+                t.attributes
+                    .insert("payload".to_string(), "y".repeat(60 * 1024));
+                t
+            })
+            .collect();
+        store.insert_traces(&batch).unwrap();
+
+        let first = store
+            .query_traces(&TraceFilter::default(), 200, None)
+            .unwrap();
+        assert!(first.cut_by_bytes && first.has_more);
+        assert!(first.records.len() < 150 && !first.records.is_empty());
+
+        let mut seen = first.records.len();
+        let mut cursor = first.next_cursor;
+        while let Some(c) = cursor {
+            let page = store
+                .query_traces(&TraceFilter::default(), 200, Some(c))
+                .unwrap();
+            seen += page.records.len();
+            cursor = page.next_cursor;
+        }
+        assert_eq!(seen, 150);
+    }
+
+    #[test]
+    fn a_metric_page_stops_at_the_byte_budget_too() {
+        let store = TelemetryStore::open_in_memory().unwrap();
+        let big = "z".repeat(60 * 1024);
+        let batch: Vec<MetricRecord> = (0..150)
+            .map(|i| metric("requests", "shop", &[("payload", &big)], 1.0, BASE_US + i))
+            .collect();
+        store.insert_metrics(&batch).unwrap();
+
+        let first = store
+            .query_metrics(&MetricFilter::default(), 200, None)
+            .unwrap();
+        assert!(first.cut_by_bytes && first.has_more);
+        assert!(first.records.len() < 150 && !first.records.is_empty());
+
+        let mut seen = first.records.len();
+        let mut cursor = first.next_cursor;
+        while let Some(c) = cursor {
+            let page = store
+                .query_metrics(&MetricFilter::default(), 200, Some(c))
+                .unwrap();
+            seen += page.records.len();
+            cursor = page.next_cursor;
+        }
+        assert_eq!(seen, 150);
+    }
+
+    #[test]
+    fn a_batch_over_the_partition_cap_is_refused_before_it_opens_a_transaction() {
+        // One record per day for one day more than an insert may touch. The
+        // batch is refused whole and no table is created: the point of the
+        // cap is that the writer is never held for that many CREATE TABLEs.
+        let store = TelemetryStore::open_in_memory().unwrap();
+        let days = MAX_PARTITIONS_PER_BATCH as i64 + 1;
+        let logs: Vec<LogRecord> = (0..days)
+            .map(|d| record(BASE_US - d * DAY_US, "clock", 3, "past"))
+            .collect();
+        let err = store.insert_logs(&logs).unwrap_err();
+        assert!(err.to_string().contains("distinct days"), "{err}");
+        assert_eq!(store.partition_count().unwrap(), 0);
+
+        let traces: Vec<TraceRecord> = (0..days)
+            .map(|d| trace(BASE_US - d * DAY_US, "clock", OUTCOME_OK, "/past"))
+            .collect();
+        let err = store.insert_traces(&traces).unwrap_err();
+        assert!(err.to_string().contains("distinct days"), "{err}");
+        assert_eq!(store.trace_partition_count().unwrap(), 0);
+
+        // Exactly the cap is fine.
+        store.insert_logs(&logs[1..]).unwrap();
+        assert_eq!(store.partition_count().unwrap(), MAX_PARTITIONS_PER_BATCH);
     }
 }

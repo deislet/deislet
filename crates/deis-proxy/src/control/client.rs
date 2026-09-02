@@ -39,6 +39,12 @@ pub const CONFIG_KEY_APP_PREFIX: &str = "app.";
 /// `ConfigUpdate` key carrying a system configuration overlay.
 pub const CONFIG_KEY_SYSTEM: &str = "system";
 
+/// What a `restart` command is answered with. It states the queued state
+/// rather than an outcome, because the outcome is not observed on this
+/// channel: the replacement process announces itself, or this one logs the
+/// failure and keeps serving.
+pub const UPGRADE_QUEUED: &str = "upgrade queued, not yet done: a replacement process is being started and this process cannot observe whether it comes up. Completion is the replacement registering - a new session for this associated_id at GET /api/sessions. If the replacement fails to start, this process logs 'process command failed' and goes on serving unchanged";
+
 /// Delay policy between connection attempts: doubling from `first` up to
 /// `max`, starting over after every successful registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +60,82 @@ impl Default for Backoff {
             max: Duration::from_secs(30),
         }
     }
+}
+
+/// What a failed connection attempt tells the retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// The control plane still hears the previous holder of this node id;
+    /// resolves on its own within a heartbeat timeout.
+    HeldByLiveChannel,
+    /// A wrong secret or a registration the control plane will not take;
+    /// retrying alone will not change it.
+    Rejected,
+    /// Anything else - unreachable, timed out, closed mid-handshake.
+    Transient,
+}
+
+fn refusal_kind(error: &WireError) -> Refusal {
+    match error {
+        WireError::RegistrationError(text)
+            if text.contains(deis_wire::conventions::NODE_ID_HELD_BY_LIVE_CHANNEL) =>
+        {
+            Refusal::HeldByLiveChannel
+        }
+        WireError::AuthenticationError(_) | WireError::RegistrationError(_) => Refusal::Rejected,
+        _ => Refusal::Transient,
+    }
+}
+
+/// The two flags a zero-downtime upgrade uses to hand the control channel
+/// from the old process to its replacement: `requested` is raised by the
+/// upgrade path before it asks pingora for the socket transfer, `released`
+/// is raised by the client once it has closed its channel. Process-wide
+/// because the client is owned by a pingora background service the upgrade
+/// path has no handle to; a `watch` rather than a `Notify` so a request made
+/// before the client started looking is not lost.
+struct Handover {
+    requested: tokio::sync::watch::Sender<bool>,
+    released: tokio::sync::watch::Sender<bool>,
+}
+
+fn handover() -> &'static Handover {
+    static HANDOVER: std::sync::OnceLock<Handover> = std::sync::OnceLock::new();
+    HANDOVER.get_or_init(|| Handover {
+        requested: tokio::sync::watch::channel(false).0,
+        released: tokio::sync::watch::channel(false).0,
+    })
+}
+
+/// Whether a control client exists in this process at all. Set by
+/// [`ProxyControlClient::new`]; an instance with no `[control]` section has
+/// nothing to release and must not wait for it.
+static CLIENT_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the control client to close its channel and wait up to `patience`
+/// for it to say so. Returns whether it did; the caller proceeds either way,
+/// because the hand-over is more important than the channel, but says in its
+/// log which of the two happened.
+pub async fn release_control_channel_for_handover(patience: Duration) -> bool {
+    if !CLIENT_PRESENT.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    let flags = handover();
+    let mut released = flags.released.subscribe();
+    flags.requested.send_replace(true);
+    if *released.borrow_and_update() {
+        return true;
+    }
+    timeout(patience, async {
+        while released.changed().await.is_ok() {
+            if *released.borrow_and_update() {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
 }
 
 pub struct ProxyControlClient {
@@ -78,6 +160,12 @@ impl ProxyControlClient {
     /// [`with_listen_ports`](Self::with_listen_ports) to announce the real ones.
     pub fn new(config: ControlConfig) -> SdkResult<Self> {
         config.validate().map_err(WireError::ConfigurationError)?;
+        CLIENT_PRESENT.store(true, std::sync::atomic::Ordering::Release);
+        // Accepted, like the control plane accepts it, and flagged: the
+        // node endpoints it opens have no lockout.
+        if let Some(advisory) = config.secret_advisory() {
+            warn!(instance = %config.associated_id, "{advisory}");
+        }
         let state_manager = Arc::new(ProxyStateManager::new(config.associated_id.clone()));
         let deis_wire_client = Self::build_deis_wire_client(&config, vec![80, 443]);
         Ok(Self {
@@ -128,16 +216,66 @@ impl ProxyControlClient {
     /// connection is lost. Never returns on its own; the caller races it
     /// against the shutdown signal.
     pub async fn run(&mut self) {
+        let mut handover = handover().requested.subscribe();
         loop {
-            self.connect_with_backoff().await;
-            if let Err(e) = self.serve().await {
-                warn!(
+            // A hand-over asked for before this loop looked is still a
+            // hand-over: `borrow_and_update` reads the value whether or not
+            // `changed` would have fired for it.
+            if *handover.borrow_and_update() {
+                return self.stand_down_for_handover().await;
+            }
+            tokio::select! {
+                biased;
+                _ = handover.changed() => return self.stand_down_for_handover().await,
+                _ = self.connect_with_backoff() => {}
+            }
+            let served = tokio::select! {
+                biased;
+                _ = handover.changed() => None,
+                result = self.serve() => Some(result),
+            };
+            match served {
+                None => return self.stand_down_for_handover().await,
+                Some(Err(e)) => warn!(
                     instance = %self.config.associated_id,
                     error = %e,
                     "control connection lost; reconnecting"
-                );
+                ),
+                Some(Ok(())) => {}
             }
         }
+    }
+
+    /// Give the node id back to the control plane so the replacement process
+    /// can take it, then stay off the channel for the rest of this process's
+    /// life.
+    ///
+    /// Without this a zero-downtime upgrade was an error storm: the old
+    /// process kept its channel alive through the grace period, the control
+    /// plane rightly refused the replacement's registration for an id whose
+    /// holder it still heard from, and the replacement retried at error level
+    /// with doubling delay until the old channel finally went silent. Routes
+    /// come from the catalog so traffic never noticed, but commands and
+    /// configuration pushes were delayed by a heartbeat timeout plus the
+    /// backoff, and the log said something was wrong when nothing was.
+    ///
+    /// Never returns: `run`'s caller treats a return as the client dying,
+    /// and this process is about to exit anyway.
+    async fn stand_down_for_handover(&mut self) {
+        info!(
+            instance = %self.config.associated_id,
+            "releasing the control channel so the replacement process can register"
+        );
+        if let Err(e) = self.disconnect().await {
+            warn!(
+                instance = %self.config.associated_id,
+                error = %e,
+                "the control channel did not close cleanly; the control plane gives it up after \
+                 its heartbeat timeout"
+            );
+        }
+        handover().released.send_replace(true);
+        std::future::pending::<()>().await
     }
 
     /// Connect, authenticate and register, retrying with capped exponential
@@ -181,10 +319,26 @@ impl ProxyControlClient {
 
             // Drop any half-open channel before trying again.
             let _ = self.deis_wire_client.disconnect().await;
-            let rejected = matches!(
-                error,
-                WireError::AuthenticationError(_) | WireError::RegistrationError(_)
-            );
+            let refusal = refusal_kind(&error);
+            if refusal == Refusal::HeldByLiveChannel {
+                // The common reading is the benign one: this process is the
+                // replacement in an upgrade, or is reconnecting after a break
+                // the control plane has not noticed. It resolves within a
+                // heartbeat timeout on its own, so the retry stays short and
+                // the log stays at warn. Two processes sharing an id look the
+                // same from here and keep warning until someone reads it.
+                warn!(
+                    instance = %self.config.associated_id,
+                    attempt,
+                    error = %error,
+                    next_attempt_in = ?self.backoff.first,
+                    "the control plane still hears the previous holder of this node id; retrying \
+                     until it gives that channel up"
+                );
+                tokio::time::sleep(self.backoff.first).await;
+                continue;
+            }
+            let rejected = refusal == Refusal::Rejected;
             if rejected || attempt >= self.config.retry_count {
                 error!(
                     instance = %self.config.associated_id,
@@ -281,10 +435,18 @@ impl ProxyControlClient {
                 .dispatch(ProcessCommand::Shutdown)
                 .await
                 .map(|_| "graceful shutdown initiated".to_string()),
+            // What is answered here is that the upgrade was *queued*: the
+            // process-control loop starts the replacement after this reply
+            // has gone, and this process cannot see whether that works. It
+            // used to say "initiated", which the control plane recorded as
+            // Completed while the replacement had failed to bind its socket
+            // and nothing had changed. The truthful completion signal is the
+            // replacement registering: a new session for this associated_id
+            // at GET /api/sessions.
             "restart" | "reload" | "graceful_restart" => self
                 .dispatch(ProcessCommand::Upgrade)
                 .await
-                .map(|_| "zero-downtime restart initiated".to_string()),
+                .map(|_| UPGRADE_QUEUED.to_string()),
             "get_status" => Ok(self.status().await.to_string()),
             "get_metrics" => Err("metrics are not implemented".to_string()),
             other => Err(format!("unknown command: {other}")),
@@ -436,6 +598,47 @@ mod tests {
     use super::*;
     use crate::control::mock::MockControl;
 
+    #[test]
+    fn a_refusal_for_a_node_id_still_held_is_transient_and_the_others_are_not() {
+        let held = WireError::RegistrationError(format!(
+            "node id edge-1 {} (instance abc, last heard 2s ago, heartbeat_timeout 90s)",
+            deis_wire::conventions::NODE_ID_HELD_BY_LIVE_CHANNEL
+        ));
+        assert_eq!(refusal_kind(&held), Refusal::HeldByLiveChannel);
+
+        let unknown = WireError::RegistrationError("node id edge-1 is not in the fleet".into());
+        assert_eq!(refusal_kind(&unknown), Refusal::Rejected);
+        let wrong_secret = WireError::AuthenticationError("secret refused".into());
+        assert_eq!(refusal_kind(&wrong_secret), Refusal::Rejected);
+        let unreachable = WireError::ConnectionError("no answer within 5s".into());
+        assert_eq!(refusal_kind(&unreachable), Refusal::Transient);
+    }
+
+    #[tokio::test]
+    async fn a_handover_request_made_before_the_client_looked_is_still_seen() {
+        // `run` subscribes after the process has been alive for a while; a
+        // request raised before that subscription must not be lost, which
+        // is what `borrow_and_update` on a fresh receiver guarantees and a
+        // `Notify` would not.
+        let (requested, _keep) = tokio::sync::watch::channel(false);
+        requested.send_replace(true);
+        let mut late = requested.subscribe();
+        assert!(
+            *late.borrow_and_update(),
+            "a late subscriber reads the raised flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_instance_with_no_control_client_has_nothing_to_release() {
+        // Only meaningful when no client was constructed in this test
+        // process: `CLIENT_PRESENT` is process-wide, so this asserts the
+        // cheap path on whichever side of it the process is on.
+        if !CLIENT_PRESENT.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(release_control_channel_for_handover(Duration::from_millis(10)).await);
+        }
+    }
+
     fn test_config() -> ControlConfig {
         config_for("http://localhost:8080")
     }
@@ -515,10 +718,17 @@ mod tests {
         assert!(ProxyControlClient::new(test_config()).is_ok());
     }
 
+    /// The proxy accepts the secret shapes the control plane accepts and
+    /// refuses only a blank one; a short value starts with a warning rather
+    /// than not at all (r9 tenancy-fleet F6).
     #[test]
-    fn rejects_invalid_secret() {
+    fn accepts_what_the_control_plane_accepts_and_refuses_only_a_blank_secret() {
         let mut config = test_config();
-        config.secret = "invalid".to_string();
+        config.secret = "r9nodekey".to_string();
+        assert!(ProxyControlClient::new(config).is_ok());
+
+        let mut config = test_config();
+        config.secret = " ".to_string();
         assert!(ProxyControlClient::new(config).is_err());
     }
 
@@ -561,5 +771,17 @@ mod tests {
         let response = client.handle_command_request(&request("reload")).await;
         assert!(response.success, "{}", response.error);
         assert_eq!(rx.recv().await.unwrap(), ProcessCommand::Upgrade);
+        // Queued is what happened; "done" is not known here and is not said.
+        assert_eq!(response.message, UPGRADE_QUEUED);
+        assert!(
+            response.message.contains("not yet done"),
+            "{}",
+            response.message
+        );
+        assert!(
+            response.message.contains("/api/sessions"),
+            "{}",
+            response.message
+        );
     }
 }

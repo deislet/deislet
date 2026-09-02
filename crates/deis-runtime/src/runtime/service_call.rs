@@ -333,6 +333,61 @@ pub enum ServiceCallError {
         callee: String,
         ceiling: usize,
     },
+    /// The method named on the call is one no application can be built to
+    /// answer, or is not a method at all. Refused in the caller before the
+    /// call is posted: the callee would only build a `Request` out of it and
+    /// throw, spending an invocation and writing an error into its own log for
+    /// a call no code of its ever ran. `reason` says which of the two it is.
+    MethodNotUsable {
+        binding: String,
+        method: String,
+        reason: &'static str,
+    },
+}
+
+/// Why a method a service call named cannot be carried, or `None` when it can.
+///
+/// Two ways a method fails before a handler could ever see it, and the callee
+/// throws a different sentence for each -- so this names which, and the caller
+/// is told rather than handed a 500 the callee minted. First, the Fetch
+/// standard's forbidden methods (`deis_wire`'s shared list), which
+/// deno_fetch's `Request` refuses with "Method is forbidden". Second, a string
+/// that is not an HTTP method token at all -- a space, a control byte,
+/// anything outside RFC 9110's `tchar` set, or the empty string -- which it
+/// refuses with "Method is not valid".
+pub fn method_refusal(method: &str) -> Option<&'static str> {
+    if deis_wire::conventions::method_is_forbidden(method) {
+        return Some("which the Fetch standard forbids, so no handler can be built to answer it");
+    }
+    // RFC 9110 token: one or more of these characters and nothing else. An
+    // empty method is not a token either.
+    fn is_tchar(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    }
+    if method.is_empty() || !method.bytes().all(is_tchar) {
+        return Some(
+            "which is not an HTTP method: a method is one or more of the token \
+                     characters RFC 9110 allows, and nothing else",
+        );
+    }
+    None
 }
 
 impl std::fmt::Display for ServiceCallError {
@@ -397,6 +452,16 @@ impl std::fmt::Display for ServiceCallError {
                  bytes, which is the most one service call carries. Put the body in object \
                  storage and answer with a key"
             ),
+            Self::MethodNotUsable {
+                binding,
+                method,
+                reason,
+            } => write!(
+                f,
+                "the service call {binding:?} names the method {method:?}, {reason}. A service \
+                 call cannot carry it: the callee would only build a request out of it and \
+                 throw before any of its code ran. Call with a method a handler can answer"
+            ),
         }
     }
 }
@@ -414,6 +479,7 @@ impl ServiceCallError {
             Self::CallerBudgetSpent { .. } => "caller-budget-spent",
             Self::CalleeFailed { .. } => "callee-failed",
             Self::ResponseTooLarge { .. } => "response-too-large",
+            Self::MethodNotUsable { .. } => "method-not-usable",
         }
     }
 

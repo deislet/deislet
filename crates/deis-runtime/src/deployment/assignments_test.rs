@@ -451,6 +451,67 @@ async fn a_control_plane_that_is_not_there_is_a_transport_failure() {
     assert!(matches!(err, AssignmentError::Transport { .. }), "{err}");
 }
 
+/// A node that cannot reach its control plane degrades, and the reason it then
+/// answers on its public data port names the class only -- never the control
+/// plane's own address out of the transport error.
+///
+/// `x-deis-node-reason` is answered unauthenticated to anyone who reaches the
+/// node's data port (see `crate::health::REASON_HEADER`), and the transport
+/// error the reconcile pass fails with carries the internal URL this node was
+/// configured to call. The reason used to be `format!("control plane
+/// unreachable: {e}")`, so that URL left the node to whoever asked. It stays
+/// in the node's own log; the header carries the class.
+#[tokio::test]
+async fn the_unreachable_reason_names_the_class_not_the_control_plane_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps).await;
+    let health = crate::health::NodeHealth::starting();
+
+    // A control plane at a port nothing answers on, so every reconcile pass is
+    // a transport failure carrying this address.
+    let unreachable = client("http://127.0.0.1:1", "node-a");
+    let health_for_loop = health.clone();
+    let loop_task = tokio::spawn(async move {
+        run_control_loop(
+            Some(unreachable),
+            None,
+            deployer,
+            health_for_loop,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        )
+        .await;
+    });
+
+    // The first pass runs with no delay before it, so the node degrades within
+    // milliseconds. Polled rather than slept on: yield until the loop has
+    // published the degraded state, bounded so a regression that never
+    // degrades fails the test rather than hanging it.
+    let degraded = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let crate::health::Readiness::Degraded { reason, .. } = health.snapshot() {
+                return reason;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the node has to degrade when its control plane cannot be reached");
+    loop_task.abort();
+
+    assert!(
+        degraded.contains("control plane unreachable"),
+        "the reason has to name the class so an operator can tell this cause from the others: \
+         {degraded}"
+    );
+    assert!(
+        !degraded.contains("127.0.0.1:1") && !degraded.contains("http://"),
+        "the control plane's own address must not travel on the header the node answers \
+         unauthenticated on its data port; it belongs in the node's log: {degraded}"
+    );
+}
+
 #[test]
 fn the_node_id_is_escaped_into_the_path_it_addresses() {
     let client = client("http://control:8080/", "node/../other");

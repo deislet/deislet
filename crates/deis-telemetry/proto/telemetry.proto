@@ -79,7 +79,14 @@ enum LogLevel {
 
 // A single log record
 message LogEntry {
-    // Timestamp (microseconds)
+    // Timestamp (microseconds since the Unix epoch). 0 is stamped with the
+    // server receive time. Anything negative or more than an hour ahead of
+    // the server clock is refused, and so is anything older than the log
+    // retention window (the next sweep would delete it, and getting it there
+    // would first create a day partition inside the one write transaction);
+    // the refusal names the stamp and the window in
+    // PushLogsResponse.error_message, which is how a node with a wrong clock
+    // gets found.
     int64 timestamp_us = 1;
 
     // Log level
@@ -99,7 +106,12 @@ message LogEntry {
     // Log message
     string message = 5;
 
-    // Structured fields
+    // Structured fields. Keys over 256 bytes refuse the entry; values are
+    // cut at 16 KiB and marked, like an oversized message; more than 64 KiB
+    // of fields altogether refuses the entry. app_id, component, trace_id
+    // and span_id are identifiers and are refused over 1 KiB rather than cut.
+    // Together with the 64 KiB message cap this bounds one stored entry,
+    // which is what lets a query page always fit one frame.
     map<string, string> fields = 6;
 
     // Trace ID (for distributed tracing)
@@ -153,7 +165,12 @@ message QueryRequest {
     string contains = 6;
 
     // Page size. 0 selects the server default, values above the server
-    // maximum are clamped down to it.
+    // maximum are clamped down to it. A page may also hold fewer entries
+    // than this: it is closed early when the next entry would take it past
+    // the server's byte budget (half the 16 MiB frame), and then has_more is
+    // true and next_cursor is set like any other short page. A reader that
+    // wants `limit` entries follows the cursor; a short page is not the end
+    // of the data.
     int32 limit = 7;
 
     // Opaque continuation token taken from a previous QueryResponse.
@@ -244,7 +261,10 @@ message TraceRecord {
     // invocation's log.
     string trace_id = 1;
 
-    // When the invocation started (microseconds since the Unix epoch).
+    // When the invocation started (microseconds since the Unix epoch). 0 is
+    // stamped with the server receive time; negative, more than an hour
+    // ahead, or older than the trace retention window is refused, for the
+    // reasons LogEntry.timestamp_us gives.
     int64 started_us = 2;
 
     // How long it ran, in microseconds. Includes the time a cut-off
@@ -281,6 +301,10 @@ message TraceRecord {
     string error = 12;
 
     // Extra dimensions: a queue batch's message counts, a retry number.
+    // Bounded the way LogEntry.fields is: keys over 256 bytes refuse the
+    // record, values are cut at 16 KiB, more than 64 KiB altogether refuses
+    // the record. trace_id, app_id, environment, node and method are refused
+    // over 1 KiB.
     map<string, string> attributes = 13;
 }
 
@@ -348,7 +372,8 @@ message QueryTracesRequest {
     string target_contains = 9;
 
     // Page size. 0 selects the server default, values above the server
-    // maximum are clamped down to it.
+    // maximum are clamped down to it. Also closed early at the server's
+    // byte budget, with has_more and next_cursor set; see QueryRequest.limit.
     int32 limit = 10;
 
     // Opaque continuation token taken from a previous QueryTracesResponse
@@ -392,12 +417,18 @@ message MetricSample {
     string app_id = 2;
 
     // Additional dimensions
+    // Labels name the series, so they are never cut: a key over 256 bytes,
+    // or more than 4 KiB of labels altogether, refuses the sample. name and
+    // app_id are refused over 1 KiB.
     map<string, string> labels = 3;
 
     // Sample value
     double value = 4;
 
-    // Timestamp (microseconds)
+    // Timestamp (microseconds since the Unix epoch). 0 is stamped with the
+    // server receive time; negative, more than an hour ahead, or older than
+    // the metric retention window is refused, for the reasons
+    // LogEntry.timestamp_us gives.
     int64 timestamp_us = 5;
 }
 
@@ -442,7 +473,8 @@ message QueryMetricsRequest {
     int64 end_us = 5;
 
     // Page size. 0 selects the server default, values above the server
-    // maximum are clamped down to it.
+    // maximum are clamped down to it. Also closed early at the server's
+    // byte budget, with has_more and next_cursor set; see QueryRequest.limit.
     int32 limit = 6;
 
     // Opaque continuation token taken from a previous QueryMetricsResponse
