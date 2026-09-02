@@ -372,11 +372,16 @@ async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_an
     drop(guard);
 }
 
-/// A flag name this build does not know is the same refusal, for the same
-/// reason: a node that dropped it would be running an application without the
-/// behaviour it asked for and saying nothing.
+/// A flag name this build does not know is **not** the same refusal, and the
+/// two sit next to each other because the difference is the whole rule
+/// (`deis_bundle::forward`). A date asks for every answer as of a day this
+/// node has never seen and there is no honest subset of that to serve. A flag
+/// names one behaviour this build does not have in either direction, so
+/// ignoring it gives exactly what this node was already giving - while
+/// refusing it made every version naming a flag added since undeployable here,
+/// which is what a rollback runs into.
 #[tokio::test]
-async fn a_deployment_naming_a_flag_this_node_does_not_know_is_refused() {
+async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_it() {
     let dir = tempfile::tempdir().unwrap();
     let guard = test_host::take();
     let (apps, service) = service_with(dir.path(), "flag-app", &["production"]).await;
@@ -399,10 +404,18 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_refused() {
         .expect("the call itself succeeds; the answer is the refusal")
         .into_inner();
 
+    // The deployment gets past the compatibility gate and fails where this
+    // fixture makes it fail - the bundle URL points at a closed port. What
+    // matters is that the flag is not what stopped it.
     assert!(!response.success, "{}", response.message);
     assert!(
-        response.message.contains("behaviour_from_a_later_build"),
-        "{}",
+        !response.message.contains("behaviour_from_a_later_build"),
+        "a flag name from a newer build must not be what refuses a deployment: {}",
+        response.message
+    );
+    assert!(
+        response.message.contains("bundle"),
+        "and the refusal that remains has to be the real one: {}",
         response.message
     );
 

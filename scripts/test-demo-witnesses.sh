@@ -4,7 +4,7 @@
 #
 # Why this exists
 # ---------------
-# `demo.sh verify` is the evidence this project is judged by, and thirteen of
+# `demo.sh verify` is the evidence this project is judged by, and fifteen of
 # its checks get that evidence by grepping the node's log file. Two defects in
 # that path were found together, and neither of them made a check say "failed":
 #
@@ -24,18 +24,30 @@
 # Together they meant one request from outside deleted half the proof and
 # stopped the run without a word. These tests hold both closed.
 #
+# The sections after them hold closed the rest of what a later round found in
+# the same place: a check that passed because something outside it moved (a
+# counted log line that any caller could produce, and one that a caller could
+# forge outright), a `start` that replaced the settings it was given with the
+# last run's, a summary that could not report a check that had left the list,
+# and a cross-caller check that nobody had ever seen say no.
+#
 # What they test
 # --------------
 # The real definitions, read out of `scripts/demo.sh` at run time rather than
 # copied here: a test that carried its own copy of `node_log` would go on
 # passing after somebody changed the one that ships.
 #
-# Usage: test-demo-witnesses.sh
+# Usage: test-demo-witnesses.sh [path/to/demo.sh]
+#
+# The optional argument is there so a candidate copy can be held to these
+# tests before it is the one that ships - and so that "this used to fail" is
+# a thing anybody can re-run against an older copy rather than a claim in a
+# commit message.
 
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-DEMO_SH="${ROOT_DIR}/scripts/demo.sh"
+DEMO_SH="${1:-${ROOT_DIR}/scripts/demo.sh}"
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -64,11 +76,16 @@ definition_of() {
 # looking for that line is the one that goes blind.
 LOG_DIR="${WORK_DIR}/logs"
 mkdir -p "$LOG_DIR"
+#
+# The two node lines carry the `trace_id` field tracing appends, because that
+# is what the counters read: they count what one invocation caused, not what
+# matches a form of words. See section 7.
+POISONED_TRACE=00000000000000000000000000000042
 {
   printf '2026-09-02T00:00:00.000000Z \033[33m WARN\033[0m ThreadId(01) an early warning\n'
   printf '2026-09-02T00:00:01.000000Z  INFO ThreadId(02) greeted \000 from v1\n'
-  printf '2026-09-02T00:00:02.000000Z  WARN ThreadId(03) A response stream of app demo.production was closed after 4000ms: it is past stream_timeout_ms\n'
-  printf '2026-09-02T00:00:03.000000Z  WARN ThreadId(04) 1 interval(s) were still armed when this invocation ended, and have been cleared\n'
+  printf '2026-09-02T00:00:02.000000Z  WARN ThreadId(03) A response stream of app demo.production was closed after 4000ms: it is past stream_timeout_ms app_id="demo.production" trace_id="%s" stream_id=1\n' "$POISONED_TRACE"
+  printf '2026-09-02T00:00:03.000000Z  WARN ThreadId(04) 1 interval(s) were still armed when this invocation ended, and have been cleared app_id="demo.production" trace_id="%s"\n' "$POISONED_TRACE"
 } > "${LOG_DIR}/deis-runtime.log"
 
 export LOG_DIR
@@ -96,7 +113,7 @@ fi
 eval "$(definition_of stream_budget_log_lines)"
 eval "$(definition_of timer_cleared_log_lines)"
 
-counted=$(stream_budget_log_lines)
+counted=$(stream_budget_log_lines "$POISONED_TRACE")
 if [ "$counted" -eq 1 ]; then
   pass "stream_budget_log_lines counts the line the node wrote after the NUL"
 else
@@ -104,7 +121,7 @@ else
     "expected 1, got ${counted}"
 fi
 
-counted=$(timer_cleared_log_lines)
+counted=$(timer_cleared_log_lines "$POISONED_TRACE")
 if [ "$counted" -eq 1 ]; then
   pass "timer_cleared_log_lines counts the line the node wrote after the NUL"
 else
@@ -140,11 +157,19 @@ fi
 probe="${WORK_DIR}/probe.sh"
 while IFS= read -r entry; do
   line_no=${entry%%:*}
-  statement=${entry#*:}
+  # The whole assignment, continuation lines included: these quotations now
+  # name the invocation they belong to and are wrapped over two lines, and a
+  # probe fed half a statement measures its own truncation.
+  statement=$(awk -v start="$line_no" 'NR >= start { print; if ($0 !~ /\\$/) exit }' "$DEMO_SH")
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
     definition_of node_log
+    # The quotations now name the invocation they are about, so the probe has
+    # to supply one. Any id will do: the point of this test is a log that does
+    # not carry the line, and an id nothing logged is one more way not to
+    # carry it.
+    echo 'trace=00000000000000000000000000000000'
     printf '%s\n' "$statement"
     echo 'printf "%s" "${said:-}" > /dev/null'
   } > "$probe"
@@ -525,6 +550,422 @@ case "$out" in
       "no summary at all: $(printf '%s' "$out" | tr '\n' ' ' | head -c 160)"
     ;;
 esac
+
+# ----------------------------------------------------------------------
+# 7. A counted line is one this invocation caused
+# ----------------------------------------------------------------------
+#
+# Two checks assert that the node said something at warn while they ran, and
+# both used to do it by counting the lines whose *wording* matched. The
+# wording is the same for every stream on the node and for every request that
+# leaves a timer armed, so the count answered a question about the whole node
+# and was read as an answer about one check's own request.
+#
+# Two ways to move it, both measured against the demo as it shipped. The
+# cheap one needs no forgery at all: `GET /api/timers?mode=arm` from outside,
+# unauthenticated like every route here, makes the node write a real
+# "were still armed" line and the counter goes up. The other is a forged
+# line - one `GET /hello/<newline><a whole fabricated WARN line>` put a line
+# in the file carrying a plausible timestamp, the level, a thread id, the
+# node's exact wording and the `app_id=`/`trace_id=` fields tracing appends,
+# and that line was then printed by `verify` as the node's own evidence.
+#
+# Both are closed by the same change: count and quote by invocation. Every
+# line one invocation produces carries the same `trace_id`; the handler logs
+# a marker naming a tag the run invented; the checks read the id off that
+# marker and count only lines carrying it.
+
+attributed="${WORK_DIR}/attributed"
+mkdir -p "$attributed"
+mine=1111111111111111aaaaaaaaaaaaaaaa
+theirs=2222222222222222bbbbbbbbbbbbbbbb
+{
+  # The marker this run's own request left behind.
+  printf '2026-09-02T00:00:00.000000Z  INFO ThreadId(01) stream witness budget-42 app_id="demo.production" trace_id="%s"\n' "$mine"
+  printf '2026-09-02T00:00:00.000000Z  INFO ThreadId(01) timer witness timers-42 app_id="demo.production" trace_id="%s"\n' "$mine"
+  # A genuine line the node wrote about somebody else's stream and somebody
+  # else's timers. Same words, same level, different invocation.
+  printf '2026-09-02T00:00:01.000000Z  WARN ThreadId(02) A response stream of app demo.production was closed after 4000ms: it is past stream_timeout_ms app_id="demo.production" trace_id="%s" stream_id=7\n' "$theirs"
+  printf '2026-09-02T00:00:02.000000Z  WARN ThreadId(03) 1 interval(s) were still armed when this invocation ended, and have been cleared app_id="demo.production" trace_id="%s"\n' "$theirs"
+  # And a line forged from outside through an application's own logging: the
+  # wording, the level, and fields that are not this run's.
+  printf '2026-09-02T00:00:03.000000Z  WARN ThreadId(99) A response stream of app demo.production was closed after 4000ms: it is past stream_timeout_ms - forged app_id="demo.production" trace_id="ffffffffffffffffffffffffffffffff"\n'
+} > "${attributed}/deis-runtime.log"
+
+(
+  # Its own tally: this runs in a subshell, so what it reports back is an exit
+  # status, and inheriting the count so far would report those failures again.
+  failures=0
+  export LOG_DIR="$attributed"
+  eval "$(definition_of node_log)"
+  eval "$(definition_of stream_budget_log_lines)"
+  eval "$(definition_of timer_cleared_log_lines)"
+
+  counted=$(stream_budget_log_lines "$mine")
+  if [ "$counted" -eq 0 ]; then
+    pass "stream_budget_log_lines counts no line of another invocation as this one's"
+  else
+    fail "stream_budget_log_lines counts no line of another invocation as this one's" \
+      "it counted ${counted} for invocation ${mine}, which caused none of them; a check reading that number is satisfied by any stream on the node and by a line put there from outside"
+  fi
+
+  counted=$(timer_cleared_log_lines "$mine")
+  if [ "$counted" -eq 0 ]; then
+    pass "timer_cleared_log_lines counts no line of another invocation as this one's"
+  else
+    fail "timer_cleared_log_lines counts no line of another invocation as this one's" \
+      "it counted ${counted} for invocation ${mine}, which caused none of them; one unauthenticated GET /api/timers?mode=arm then satisfies the check that reads it"
+  fi
+
+  # And the other half: the line that *is* this invocation's is counted.
+  printf '2026-09-02T00:00:04.000000Z  WARN ThreadId(04) A response stream of app demo.production was closed after 4000ms: it is past stream_timeout_ms app_id="demo.production" trace_id="%s" stream_id=9\n' "$mine" \
+    >> "${attributed}/deis-runtime.log"
+  printf '2026-09-02T00:00:05.000000Z  WARN ThreadId(05) 1 interval(s) were still armed when this invocation ended, and have been cleared app_id="demo.production" trace_id="%s"\n' "$mine" \
+    >> "${attributed}/deis-runtime.log"
+
+  counted=$(stream_budget_log_lines "$mine")
+  if [ "$counted" -eq 1 ]; then
+    pass "stream_budget_log_lines counts the line this invocation did cause"
+  else
+    fail "stream_budget_log_lines counts the line this invocation did cause" "expected 1, got ${counted}"
+  fi
+
+  counted=$(timer_cleared_log_lines "$mine")
+  if [ "$counted" -eq 1 ]; then
+    pass "timer_cleared_log_lines counts the line this invocation did cause"
+  else
+    fail "timer_cleared_log_lines counts the line this invocation did cause" "expected 1, got ${counted}"
+  fi
+
+  # A counter given no invocation says nothing rather than everything: the
+  # callers report a missing marker as a failure, and a helper that fell back
+  # to counting by wording would put that decision back where it was.
+  counted=$(stream_budget_log_lines "")
+  if [ "$counted" -eq 0 ]; then
+    pass "a counter with no invocation to attribute to answers nothing, not everything"
+  else
+    fail "a counter with no invocation to attribute to answers nothing, not everything" \
+      "it answered ${counted}"
+  fi
+
+  exit "$failures"
+) || failures=$((failures + $?))
+
+# The reader that turns a marker into an invocation id, against the same log.
+(
+  failures=0
+  export LOG_DIR="$attributed"
+  eval "$(definition_of node_log)"
+  eval "$(definition_of trace_of_witness)"
+
+  found=$(trace_of_witness "stream witness budget-42")
+  if [ "$found" = "$mine" ]; then
+    pass "trace_of_witness reads this run's own invocation id off its marker"
+  else
+    fail "trace_of_witness reads this run's own invocation id off its marker" \
+      "expected ${mine}, got \"${found:-nothing}\""
+  fi
+
+  found=$(trace_of_witness "stream witness a-tag-nobody-logged")
+  if [ -z "$found" ]; then
+    pass "trace_of_witness answers nothing for a marker that was never logged"
+  else
+    fail "trace_of_witness answers nothing for a marker that was never logged" \
+      "it answered \"${found}\", so a check would go on to count lines under an invocation that is not its own"
+  fi
+
+  exit "$failures"
+) || failures=$((failures + $?))
+
+# ----------------------------------------------------------------------
+# 8. A start is configured by its arguments, not by the last run's file
+# ----------------------------------------------------------------------
+#
+# `start` reads the state file to find out whether a previous run is still
+# up. It used to do that by sourcing the file into its own shell, and the
+# file is a complete settings dump - SECRET, API_KEY, STORAGE_AUTH_SECRET,
+# APP_SRC_DIR, APP_ID, ENV_NAME, NODE_ID, DEMO_SECRET_VALUE and every port.
+# So every setting the person typed was replaced by the last run's, silently:
+# `--secret <hex>` came up on the previous run's node key and `--app-dir
+# <path>` deployed the previous run's sources. Ten ports had been noticed and
+# were copied aside and put back; nothing else was.
+#
+# The whole preamble is taken out of demo.sh and run here, with the things
+# that touch the disk or the process table stubbed out. What is asserted is
+# that four settings given before it runs are still the same four afterwards.
+
+preamble=$(sed -n '/^start_demo() {/,/^  claim_port DEIS_RUNTIME_PORT/p' "$DEMO_SH" | sed '$d')
+if [ -z "$preamble" ]; then
+  echo "❌ ${DEMO_SH} has no start_demo() preamble ending at claim_port; this test is out of date" >&2
+  exit 1
+fi
+
+old_run="${WORK_DIR}/old-run"
+mkdir -p "$old_run"
+cat > "${old_run}/state.env" <<'OLD'
+DEIS_CONTROL_PORT=28801
+DEIS_RUNTIME_PORT=28802
+APP_SRC_DIR=/sources/from/the/previous/run
+SECRET=00000000000000000000000000000000
+APP_ID=app-from-the-previous-run
+ENV_NAME=environment-from-the-previous-run
+DEIS_CONTROL_PID=
+DEIS_RUNTIME_PID=
+DEIS_PROXY_PID=
+DEIS_STORE_PID=
+DEIS_QUEUE_PID=
+DEIS_TELEMETRY_PID=
+OLD
+
+probe="${WORK_DIR}/preamble.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  # Everything the preamble does that is not the question being asked.
+  echo 'ensure_dirs() { :; }'
+  echo 'reset_previous_run() { :; }'
+  echo 'require_command() { :; }'
+  # A function beats the binary, so no stale process anywhere on this machine
+  # can decide the outcome of this test.
+  echo 'pgrep() { return 1; }'
+  definition_of pid_running
+  printf 'STATE_FILE=%q\n' "${old_run}/state.env"
+  printf 'DEMO_DIR=%q\n' "$old_run"
+  printf 'LOG_DIR=%q\n' "$old_run"
+  echo 'BIN_DIR=/nonexistent/bin'
+  # What the person typed, or set in the environment, for *this* run.
+  echo 'APP_SRC_DIR=/sources/from/the/command/line'
+  echo 'SECRET=deadbeefdeadbeefdeadbeefdeadbeef'
+  echo 'APP_ID=app-from-the-command-line'
+  echo 'DEIS_RUNTIME_PORT=19999'
+  printf '%s\n' "$preamble"
+  echo '}'
+  echo 'start_demo'
+  echo 'printf "%s|%s|%s|%s\n" "$APP_SRC_DIR" "$SECRET" "$APP_ID" "$DEIS_RUNTIME_PORT"'
+} > "$probe"
+
+status=0
+out=$(bash "$probe" 2>&1) || status=$?
+want='/sources/from/the/command/line|deadbeefdeadbeefdeadbeefdeadbeef|app-from-the-command-line|19999'
+got=$(printf '%s' "$out" | tail -n 1)
+if [ "$status" -eq 0 ] && [ "$got" = "$want" ]; then
+  pass "start keeps the settings it was given rather than the previous run's"
+else
+  fail "start keeps the settings it was given rather than the previous run's" \
+    "expected \"${want}\", got \"${got}\" (exit ${status}). Each field that came back holding a previous-run value is a setting the person asked for and did not get, with nothing said about it"
+fi
+
+# And the reason the file is read at all still works: a live pid in it stops
+# the start.
+live_run="${WORK_DIR}/live-run"
+mkdir -p "$live_run"
+sleep 30 &
+live=$!
+{
+  sed "s/^DEIS_CONTROL_PID=$/DEIS_CONTROL_PID=${live}/" "${old_run}/state.env"
+} > "${live_run}/state.env"
+
+probe="${WORK_DIR}/preamble-live.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'ensure_dirs() { :; }'
+  echo 'reset_previous_run() { :; }'
+  echo 'require_command() { :; }'
+  echo 'pgrep() { return 1; }'
+  definition_of pid_running
+  printf 'STATE_FILE=%q\n' "${live_run}/state.env"
+  printf 'DEMO_DIR=%q\n' "$live_run"
+  printf 'LOG_DIR=%q\n' "$live_run"
+  echo 'BIN_DIR=/nonexistent/bin'
+  printf '%s\n' "$preamble"
+  echo '}'
+  echo 'start_demo'
+} > "$probe"
+
+status=0
+out=$(bash "$probe" 2>&1) || status=$?
+kill "$live" 2>/dev/null || true
+wait "$live" 2>/dev/null || true
+case "$out" in
+  *"existing instance is running"*)
+    if [ "$status" -ne 0 ]; then
+      pass "start still refuses to run while a previous run's process is alive"
+    else
+      fail "start still refuses to run while a previous run's process is alive" \
+        "it said so and exited 0, so a second run would go ahead"
+    fi
+    ;;
+  *)
+    fail "start still refuses to run while a previous run's process is alive" \
+      "exit ${status}; it printed: $(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
+    ;;
+esac
+
+# ----------------------------------------------------------------------
+# 9. A run says how many checks it ran, and is held to the number
+# ----------------------------------------------------------------------
+#
+# The summary is a tally of what happened to the checks that ran, and a tally
+# says nothing about a check that did not run. A call deleted from the list
+# turns "93 passed, 0 failed" into "92 passed, 0 failed", which reads as a
+# slightly shorter green run. So the length of the list is written down and
+# asserted, and two verdicts printed under one claim - which keeps the tally
+# right while the list is wrong - is its own failure.
+
+roll_call=$(sed -n '/^  # The roll call\./,/^}/p' "$DEMO_SH")
+if [ -z "$roll_call" ]; then
+  echo "❌ ${DEMO_SH} has no roll call in verify_demo; this test is out of date" >&2
+  exit 1
+fi
+
+roll_call_probe() {
+  local expected=$1
+  shift
+  local probe="${WORK_DIR}/roll-call.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'CHECKS_PASSED=0'
+    echo 'CHECKS_FAILED=0'
+    echo 'VERIFY_CLAIMS=""'
+    echo 'VERIFY_REACHED_ITS_SUMMARY=false'
+    printf 'VERIFY_EXPECTED_CHECKS=%s\n' "$expected"
+    definition_of pass_check
+    definition_of fail_check
+    echo 'summarise() {'
+    printf '%s\n' "$roll_call"
+    local claim
+    for claim in "$@"; do
+      printf 'pass_check %q\n' "$claim"
+    done
+    echo 'summarise'
+  } > "$probe"
+  bash "$probe" 2>&1
+}
+
+status=0
+out=$(roll_call_probe 3 "one" "two" "three") || status=$?
+if [ "$status" -eq 0 ] && [ "${out#*3 of the 3 checks}" != "$out" ]; then
+  pass "a run that printed every verdict on the list says so and passes"
+else
+  fail "a run that printed every verdict on the list says so and passes" \
+    "exit ${status}: $(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
+fi
+
+status=0
+out=$(roll_call_probe 3 "one" "two") || status=$?
+if [ "$status" -ne 0 ] && [ "${out#*roll call does not add up}" != "$out" ]; then
+  pass "a check that quietly left the list fails the run rather than shortening it"
+else
+  fail "a check that quietly left the list fails the run rather than shortening it" \
+    "exit ${status}: $(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
+fi
+
+status=0
+out=$(roll_call_probe 3 "one" "two" "two") || status=$?
+if [ "$status" -ne 0 ] && [ "${out#*under one claim}" != "$out" ]; then
+  pass "two verdicts under one claim fail the run, tally or no tally"
+else
+  fail "two verdicts under one claim fail the run, tally or no tally" \
+    "exit ${status}: $(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
+fi
+
+# ----------------------------------------------------------------------
+# 10. The cross-caller check says no when a caller is handed another's page
+# ----------------------------------------------------------------------
+#
+# `verify` drives one application through one node as one caller, and a whole
+# class of defect cannot appear in that shape of question at all: what one
+# caller is handed that belonged to another. A build whose cache was keyed by
+# the address alone - so the answer to one user's POST went to the next
+# anonymous GET of it - passed every one of the ninety checks that existed.
+#
+# The check added for it puts a second caller to the same address and compares
+# the two answers. This holds that comparison to its job: the check is run
+# against a stand-in that answers the way a leaking platform answers, and it
+# has to say ✗. A witness nobody has ever seen fail is not yet a witness.
+
+route=$(grep '^PRIVATE_PAGE_ROUTE=' "$DEMO_SH" || true)
+if [ -z "$route" ]; then
+  echo "❌ ${DEMO_SH} defines no PRIVATE_PAGE_ROUTE; this test is out of date" >&2
+  exit 1
+fi
+
+# $1 is "leaking" or "separate": which platform the stand-in imitates.
+cross_caller_probe() {
+  local platform=$1
+  local probe="${WORK_DIR}/cross-caller-${platform}.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'CHECKS_PASSED=0'
+    echo 'CHECKS_FAILED=0'
+    echo 'VERIFY_CLAIMS=""'
+    printf 'LOG_DIR=%q\n' "$WORK_DIR"
+    echo 'APP_ID=demo'
+    echo 'DEIS_RUNTIME_PORT=9'
+    printf '%s\n' "$route"
+    definition_of pass_check
+    definition_of fail_check
+    definition_of private_page_field
+    echo 'http_status() { echo 200; }'
+    # The stand-in. It never reaches a node: it answers the way each of the
+    # two platforms answers, so that what is being tested is the check's
+    # judgement and nothing else.
+    printf 'MEMO=%q\n' "${WORK_DIR}/cross-caller-memo"
+    echo 'rm -f "$MEMO"'
+    if [ "$platform" = "leaking" ]; then
+      cat <<'STUB'
+private_page_request() {
+  local credential=$3
+  # One store keyed by the address, which is the whole defect: whoever wrote
+  # it first owns the answer everybody after gets.
+  if [ ! -s "$MEMO" ] && [ -n "$credential" ]; then
+    printf '%s' "$credential" > "$MEMO"
+  fi
+  local owner
+  owner=$(cat "$MEMO" 2>/dev/null || true)
+  printf '{"caller":"%s","hit":true,"served":"page-for-%s","stored":true,"refused":null,"scopeId":"one-store"}' \
+    "$credential" "$owner"
+}
+STUB
+    else
+      cat <<'STUB'
+private_page_request() {
+  local credential=$3
+  local caller=${credential:-anonymous}
+  local seen="${MEMO}-$(printf '%s' "$caller" | tr -c 'A-Za-z0-9' '_')"
+  local hit=false
+  if [ -e "$seen" ]; then hit=true; else : > "$seen"; fi
+  printf '{"caller":"%s","hit":%s,"served":"page-for-%s","stored":true,"refused":null,"scopeId":"one-store"}' \
+    "$caller" "$hit" "$caller"
+}
+STUB
+    fi
+    definition_of check_a_second_caller_is_not_handed_the_first_ones_answer
+    echo 'check_a_second_caller_is_not_handed_the_first_ones_answer'
+    echo 'echo "verdicts: ${CHECKS_PASSED} passed ${CHECKS_FAILED} failed"'
+  } > "$probe"
+  bash "$probe" 2>&1
+}
+
+out=$(cross_caller_probe leaking)
+if [ "${out#*verdicts: 0 passed 1 failed}" != "$out" ] \
+  && [ "${out#*handed the first caller}" != "$out" ]; then
+  pass "the cross-caller check fails when the second caller is handed the first one's page"
+else
+  fail "the cross-caller check fails when the second caller is handed the first one's page" \
+    "against a store keyed by the address alone it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
+fi
+
+out=$(cross_caller_probe separate)
+if [ "${out#*verdicts: 1 passed 0 failed}" != "$out" ]; then
+  pass "the cross-caller check passes when each caller is answered its own page"
+else
+  fail "the cross-caller check passes when each caller is answered its own page" \
+    "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
+fi
 
 echo
 if [ "$failures" -eq 0 ]; then

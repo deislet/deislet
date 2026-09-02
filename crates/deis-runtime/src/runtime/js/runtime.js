@@ -90,6 +90,7 @@ const NativeWeakSet = WeakSet;
 const NativeMap = Map;
 const NativeSet = Set;
 const NumberIsInteger = Number.isInteger;
+const NumberIsFinite = Number.isFinite;
 const hasOwn = typeof Object.hasOwn === "function"
   ? Object.hasOwn
   : (target, key) => Object.prototype.hasOwnProperty.call(target, key);
@@ -735,6 +736,204 @@ function cacheKeyMethod(request) {
   return typeof method === "string" ? method.toUpperCase() : "GET";
 }
 
+// Headers a request may carry that cannot single one caller out from another.
+//
+// This is the list the whole cache now turns on, and it is a list of what is
+// *safe* rather than of what is not. Four rounds of repair to this file each
+// added the name that round had found -- repeated `Set-Cookie` collapsed, then
+// `Vary` unread, then the method unread, then `Authorization` -- and each
+// repair was correct and left the next name to be found, because the set of
+// headers that can carry an identity has no end. `Cookie` is how most of the
+// web authenticates and walked past a rule that named `Authorization`;
+// `Proxy-Authorization` sits beside it in the same RFC; the one after that is
+// whatever an application decides to call its own session token. A list of
+// what is unsafe is always one name short of the next round. A list of what is
+// safe is short, arguable name by name, and wrong in the direction that
+// refuses to store something rather than the direction that hands one caller's
+// page to the next.
+//
+// Every name is here for one reason: its value describes the format the caller
+// can read, the software it is running, the network the request came over, or
+// the copy the caller already holds. None of them says which principal is
+// asking. A header this platform has never heard of is not here, which is the
+// entire point -- an unknown name is refused, and the application is told
+// which name and what to do about it.
+const HEADERS_THAT_CANNOT_NAME_A_CALLER = new NativeSet([
+  // What the caller can read, and what it already has. A language or an
+  // encoding is a preference millions of callers share; a validator describes
+  // a copy of the representation rather than its holder.
+  "accept",
+  "accept-charset",
+  "accept-encoding",
+  "accept-language",
+  "accept-datetime",
+  "if-match",
+  "if-none-match",
+  "if-modified-since",
+  "if-unmodified-since",
+  "if-range",
+  "range",
+  // How the request travelled and where it was addressed.
+  "host",
+  "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade-insecure-requests",
+  "expect",
+  "content-length",
+  "content-type",
+  "referer",
+  // The caller's own software, and what it would like given its device.
+  "user-agent",
+  "dnt",
+  "sec-gpc",
+  "priority",
+  "save-data",
+  "device-memory",
+  "downlink",
+  "ect",
+  "rtt",
+  "viewport-width",
+  "width",
+  // The caller's own cache directives: what it wants done, not who it is.
+  "cache-control",
+  "pragma",
+  // This node's own routing decision, put back on the request by the
+  // dispatcher after the client's copy of the platform namespace was swept.
+  // Both carry the same value on every request this isolate will ever see,
+  // because the isolate *is* one application and one environment. The rest of
+  // `x-deis-` is deliberately absent: `x-deis-caller` names which application
+  // made a service call, which is precisely an identity.
+  "x-deis-app-id",
+  "x-deis-environment"
+]);
+
+// Two families rather than two hundred names, for the same reason and with the
+// same care: a client hint describes the device and the browser, and a fetch
+// metadata header describes how the fetch was made. Neither family has a
+// member that says who is asking, and both keep growing names this platform
+// will not have heard of.
+const PREFIXES_THAT_CANNOT_NAME_A_CALLER = ["sec-ch-", "sec-fetch-"];
+
+// Whether this header could make a response one caller's.
+//
+// The default is yes. That is the inversion: a name nobody listed is treated
+// as one that might carry an identity, so the next credential header anybody
+// invents arrives already refused.
+function couldNameACaller(name) {
+  if (HEADERS_THAT_CANNOT_NAME_A_CALLER.has(name)) return false;
+  for (const prefix of PREFIXES_THAT_CANNOT_NAME_A_CALLER) {
+    if (name.slice(0, prefix.length) === prefix) return false;
+  }
+  return true;
+}
+
+// The names on one request that could make its answer one caller's, lower
+// cased, sorted and without repeats.
+function headersThatCouldNameTheCaller(request) {
+  const headers = readableHeaders(request);
+  if (headers === null) return [];
+  const names = [];
+  for (const pair of headers) {
+    const name = String(pair[0]).toLowerCase();
+    if (!couldNameACaller(name)) continue;
+    if (names.indexOf(name) === -1) names.push(name);
+  }
+  names.sort();
+  return names;
+}
+
+// Response headers a stranger may be handed.
+//
+// The other half of the same inversion, and it is needed even when the request
+// carried nothing: a response does not only *depend* on a caller, it can also
+// *establish* something for one. `Set-Cookie` replayed out of a cache hands
+// every later caller the session the first one was given, which is fixation
+// rather than disclosure -- and no `Vary` can make it safe, because `Vary`
+// describes what the request decided and this is something the response does
+// to whoever receives it. Enumerating that family fails the same way the
+// credential family did: `Set-Cookie2`, `Clear-Site-Data`,
+// `Authentication-Info` and whatever is defined next.
+//
+// So the same sentence, in the other direction: a stored response may carry
+// only what describes the representation, its freshness, or a policy that is
+// the same for every caller of the site. Everything else -- including every
+// header an application invented a name for, which is where a per-request
+// token actually lives -- is refused, and the application stores a copy
+// carrying the headers it means to serve.
+const HEADERS_A_STRANGER_MAY_RECEIVE = new NativeSet([
+  // What the body is.
+  "content-type",
+  "content-length",
+  "content-encoding",
+  "content-language",
+  "content-location",
+  "content-disposition",
+  "content-digest",
+  "repr-digest",
+  "digest",
+  "etag",
+  "last-modified",
+  "accept-ranges",
+  "allow",
+  "link",
+  "location",
+  "retry-after",
+  "vary",
+  // How long it is good for.
+  "cache-control",
+  "expires",
+  "age",
+  "date",
+  "pragma",
+  "warning",
+  // Policy the site states, which is the same sentence for every caller of it.
+  "content-security-policy",
+  "content-security-policy-report-only",
+  "cross-origin-opener-policy",
+  "cross-origin-embedder-policy",
+  "cross-origin-resource-policy",
+  "permissions-policy",
+  "referrer-policy",
+  "strict-transport-security",
+  "timing-allow-origin",
+  "x-content-type-options",
+  "x-frame-options",
+  "x-permitted-cross-domain-policies",
+  "x-xss-protection",
+  "nel",
+  "report-to",
+  "reporting-endpoints",
+  "alt-svc",
+  "server",
+  // Which origins may read it. `access-control-allow-credentials` is
+  // deliberately absent: a credentialed cross-origin answer is one caller's by
+  // definition. `Origin` is not on the request list either, so a response that
+  // reflects one is filed under it or refused.
+  "access-control-allow-origin",
+  "access-control-allow-methods",
+  "access-control-allow-headers",
+  "access-control-expose-headers",
+  "access-control-max-age"
+]);
+
+// The names on this response that a later, unidentified caller may not be
+// handed. Empty when the whole response may be replayed.
+function headersAStrangerMayNotReceive(response) {
+  const headers = readableHeaders(response);
+  if (headers === null) return [];
+  const names = [];
+  for (const pair of headers) {
+    const name = String(pair[0]).toLowerCase();
+    if (HEADERS_A_STRANGER_MAY_RECEIVE.has(name)) continue;
+    if (names.indexOf(name) === -1) names.push(name);
+  }
+  names.sort();
+  return names;
+}
+
 // One `Cache-Control` field, taken apart into the directives it carries.
 //
 // Written once and read by everything below, because the field decides two
@@ -855,23 +1054,82 @@ function freshnessSeconds(directives) {
 // ends rather than serving it on, so it never reaches the case they govern.
 function refusesToBeStored(directives) {
   if (directives.has("no-store")) {
-    return "no-store, which means it may not be stored at all";
+    return "Cache-Control: no-store, which means it may not be stored at all";
   }
   if (directives.has("private")) {
-    return "private, which means it is one user's and a cache every later " +
-      "request reads may not hold it";
+    return "Cache-Control: private, which means it is one user's and a cache " +
+      "every later request reads may not hold it";
   }
   if (directives.has("no-cache")) {
-    return "no-cache, which means it may only be served after revalidating " +
-      "with the origin, and this cache cannot revalidate";
+    return "Cache-Control: no-cache, which means it may only be served after " +
+      "revalidating with the origin, and this cache cannot revalidate";
   }
   const shared = wholeSeconds(directives.get("s-maxage"));
   const lifetime = shared !== null ? shared : wholeSeconds(directives.get("max-age"));
   if (lifetime === 0) {
-    return "a lifetime of zero seconds, which means it is stale as soon as it " +
-      "is stored, and this cache cannot revalidate a stale entry";
+    return "Cache-Control: a lifetime of zero seconds, which means it is stale " +
+      "as soon as it is stored, and this cache cannot revalidate a stale entry";
   }
   return null;
+}
+
+// How long this response may be kept, and why it may not be kept at all.
+//
+// Answers `{ refusal, seconds }`: `refusal` is the sentence the application is
+// given when the response says a cache like this one may not hold it, and
+// `seconds` is the lifetime to store it with -- zero meaning the response named
+// none and the store's default applies.
+//
+// Three fields say something about freshness and all three are read here. A
+// response is stale when *any* of them says so, and which one its author wrote
+// is not this platform's to choose: reading only `Cache-Control` meant a
+// response saying in `Expires` that it went stale an hour ago was kept for the
+// store's ten-minute default and served to everything that asked. The order is
+// RFC 9111's: `Cache-Control` decides whenever it names a lifetime; `Expires`
+// is read when it does not; `Pragma` -- the HTTP/1.0 spelling, still written by
+// plenty of frameworks -- is read only when there is no `Cache-Control` at all,
+// because a response carrying both has already said what it means in the field
+// that has a meaning for a shared cache.
+function lifetimeOf(response, directives) {
+  const refusal = refusesToBeStored(directives);
+  if (refusal !== null) return { refusal, seconds: 0 };
+
+  const named = freshnessSeconds(directives);
+  if (named > 0) return { refusal: null, seconds: named };
+
+  const expires = headerValue(response, "expires");
+  if (typeof expires === "string" && expires.trim() !== "") {
+    // RFC 9111 section 5.3: a value that is not an HTTP-date means the
+    // response is already stale, and `0` and `-1` are what frameworks write
+    // when they mean exactly that.
+    const at = Date.parse(expires);
+    const now = Date.now();
+    if (!NumberIsFinite(at) || at <= now) {
+      return {
+        refusal: "Expires: " + expires.trim() + ", which is a moment that has " +
+          "already passed, so the response is stale before it is stored and " +
+          "this cache cannot revalidate a stale entry",
+        seconds: 0
+      };
+    }
+    // At least a second: a date less than a second away is still a lifetime,
+    // and rounding it to zero would mean "the response named none", which is
+    // the store's ten-minute default and the opposite of what it said.
+    return { refusal: null, seconds: Math.max(1, Math.ceil((at - now) / 1000)) };
+  }
+
+  if (directives.size === 0) {
+    const pragma = headerValue(response, "pragma");
+    if (typeof pragma === "string" && pragma.toLowerCase().indexOf("no-cache") !== -1) {
+      return {
+        refusal: "Pragma: no-cache, the HTTP/1.0 spelling of no-cache, which " +
+          "means it may only be served after revalidating with the origin, and " +
+          "this cache cannot revalidate",
+        seconds: 0
+      };
+    }
+  }
+  return { refusal: null, seconds: 0 };
 }
 
 // The header names a response says its body depends on, lower-cased, sorted
@@ -1004,44 +1262,77 @@ function notACompleteAnswer(response) {
   return null;
 }
 
-// Why an entry for this key would be one caller's answer sitting in a store
-// every caller reads, or null when it would not.
+// Why this entry would not be safe to hand to a caller this platform cannot
+// identify, or null when it would be.
 //
-// RFC 9111 section 3.5: a shared cache must not use a response to a request
-// that carried `Authorization` to satisfy any later request unless the
-// response says it may. This store is exactly that kind of cache -- one per
-// isolate, read by every later request to this application, from every client
-// -- and the entry records nothing about who it was for unless the response
-// asked it to.
+// This is the whole of the rule, and it is asked of two requests rather than
+// one. The key says what the entry will be filed under. The request this
+// invocation is answering says what the response could have been *about*: a
+// handler serving a caller who sent a session cookie may produce anything from
+// that cookie, whatever key the application then writes the answer under. So
+// both are read, and every name on either of them that this platform does not
+// recognise as one that cannot single a caller out has to be accounted for:
 //
-// This is the same disclosure the `Vary` rules exist to prevent, reached by a
-// handler that simply did not write `Vary`: `cache.put(context.request,
-// answer)` inside a route that reads a bearer token stored the authenticated
-// page under the bare URL, and the next anonymous GET matched it.
+//   * the response has to file the entry under it, by naming it in `Vary`; and
+//   * the key has to carry the same value for it as the request being
+//     answered, or the entry would be filed under one caller and hold
+//     another's answer.
 //
-// Three things make it safe again, and every one of them is the *response*
-// saying something rather than this platform guessing:
-//
-//   * `Vary: authorization`, which files the entry under the credential, so
-//     only a caller presenting the same one matches it;
-//   * `public`, the directive whose whole meaning is "this answer is not one
-//     caller's";
-//   * `s-maxage`, which the RFC lists beside `public` because naming a shared
-//     lifetime is naming a shared cache.
-//
-// `must-revalidate`, the fourth on the RFC's list, is deliberately absent: it
-// allows storing on the promise that the entry is revalidated before reuse,
-// and there is nothing here that can revalidate anything.
-function aCredentialTheEntryDoesNotRecord(request, vary, directives) {
-  if (headerValue(request, "authorization") === null) return null;
-  if (vary.indexOf("authorization") !== -1) return null;
-  if (directives.has("public")) return null;
-  if (wholeSeconds(directives.get("s-maxage")) !== null) return null;
-  return "the key carries an Authorization header and the response records " +
-    "nothing about whose answer it is. A cache every later request reads may " +
-    "not hold it: the next caller of this URL would be given this caller's " +
-    "page. Add Vary: Authorization to file it under the credential, or " +
-    "Cache-Control: public (or s-maxage) to say the answer is everyone's";
+// What this replaces named `Authorization` and nothing else, and offered
+// `public` and `s-maxage` as ways round it. `Cookie` walked straight past the
+// name, and the two ways round turned a correctly refused `put` into the
+// disclosure it had just refused -- with the refusal message recommending
+// them. Neither directive says anything here now: a directive is a lifetime,
+// not a permission, and the only statements that mean "this answer is not one
+// caller's" are made on the call, where no upstream and no copied header can
+// produce one by accident.
+function notSafeForAStranger(request, vary) {
+  const alsoServed =
+    servedRequest !== null && servedRequest !== request
+      ? headersThatCouldNameTheCaller(servedRequest)
+      : [];
+  const names = headersThatCouldNameTheCaller(request);
+  for (const name of alsoServed) {
+    if (names.indexOf(name) === -1) names.push(name);
+  }
+  if (names.length === 0) return null;
+  names.sort();
+
+  const unfiled = names.filter((name) => vary.indexOf(name) === -1);
+  if (unfiled.length > 0) {
+    return "the request this entry answers, or the key it would be filed " +
+      "under, carries " + unfiled.join(", ") + ", and nothing files the entry " +
+      "under " +
+      (unfiled.length === 1 ? "it" : "them") + ". This platform does not know " +
+      "what every header means, so a name it cannot recognise as one that " +
+      "describes the format, the software, the network or the caller's own " +
+      "copy is treated as one that could name the caller -- a session cookie, " +
+      "an API key, whatever this application calls its own token. A cache " +
+      "every later request reads would hand this answer to whoever asked " +
+      "next. Either file the entry under " + (unfiled.length === 1 ? "it" : "them") +
+      " with Vary: " + unfiled.join(", ") + ", so only a caller sending the " +
+      "same value matches, or say it on the call: { forCaller: <the caller " +
+      "this answer is for> } stores it for that caller alone, and " +
+      "{ forAnyCaller: true } states that the answer does not depend on the " +
+      "caller at all";
+  }
+
+  if (servedRequest === null || servedRequest === request) return null;
+  const servedHeaders = readableHeaders(servedRequest);
+  if (servedHeaders === null) return null;
+  const keyHeaders = readableHeaders(request);
+  const mismatched = names.filter(
+    (name) => (keyHeaders === null ? null : keyHeaders.get(name)) !== servedHeaders.get(name)
+  );
+  if (mismatched.length > 0) {
+    return "the key carries a different " + mismatched.join(", ") + " than the " +
+      "request this handler is answering, so the entry would be filed under " +
+      "one caller and hold another's answer, and the caller it is filed under " +
+      "is the one who would be given it. Key the entry with the request this " +
+      "handler was given, or say whose answer it is with { forCaller: <the " +
+      "caller this answer is for> }";
+  }
+  return null;
 }
 
 // Whether a stored entry is the variant this request is asking for.
@@ -1068,6 +1359,118 @@ function selectedBy(stored, request) {
   return true;
 }
 
+// The options one of these calls understands, per verb.
+//
+// `put` takes the two statements an application makes about who an answer is
+// for; `match` and `delete` take the one that says which caller's entry to
+// look for, plus the one option of the specification's bag this store can
+// honour.
+const PUT_OPTIONS = ["forCaller", "forAnyCaller"];
+const READ_OPTIONS = ["forCaller", "ignoreMethod"];
+
+// The options the specification defines that this cache will not honour, and
+// why each one.
+//
+// They are refused by name rather than ignored. `match(request, { ignoreVary:
+// true })` asks in so many words for the entry stored for a different set of
+// request headers than this request carries -- which is the answer belonging
+// to somebody else -- and the bag used to be taken and dropped on the floor,
+// so the call read as an ordinary match and was answered as though nothing had
+// been asked. An option that is silently ignored is worse than one that does
+// not exist, because the application is written believing it took effect.
+const OPTIONS_THIS_CACHE_REFUSES = new NativeMap([
+  ["ignoreVary",
+    "it asks for an entry stored for a different set of request headers than " +
+    "this request carries, which is one caller's answer handed to another, and " +
+    "refusing that is what this cache is for"],
+  ["ignoreSearch",
+    "this store is keyed by the exact URL and has no way to find the entries a " +
+    "key without its query string would stand for; build the key you mean to " +
+    "read"],
+  ["cacheName",
+    "each cache here is reached through the object caches.open answered, so " +
+    "there is no second name for this call to consult"]
+]);
+
+// What one call said about who its entry is for.
+//
+// `forCaller` is the string the entry is filed under, empty for the ordinary
+// entry that any caller may be handed. `forAnyCaller` is the statement that
+// this answer does not depend on the caller at all.
+//
+// Both are arguments rather than headers, and that is the point of them: an
+// upstream, a framework and a copied header can all produce `Cache-Control:
+// public`, which is why it no longer means anything here, and none of them can
+// produce a third argument to a call in this application's own source.
+function cacheCallOptions(verb, options, understood) {
+  const said = { forCaller: "", forAnyCaller: false, ignoreMethod: false };
+  if (options === null || options === undefined) return said;
+  const kind = typeof options;
+  if (kind !== "object" && kind !== "function") {
+    throw new TypeError(
+      "cache." + verb + ": the options have to be an object, got " + kind +
+        ". Nothing was done"
+    );
+  }
+  for (const name in options) {
+    if (!hasOwn(options, name)) continue;
+    if (understood.indexOf(name) !== -1) continue;
+    const refused = OPTIONS_THIS_CACHE_REFUSES.get(name);
+    throw new TypeError(
+      "cache." + verb + ": the option " + name + " is not honoured here, and " +
+        "this call did nothing rather than pretending it had been read. " +
+        (refused !== undefined
+          ? refused
+          : "cache." + verb + " understands " + understood.join(" and ") +
+            ", and nothing else")
+    );
+  }
+
+  const forCaller = optionOf(options, "forCaller");
+  if (forCaller !== undefined) {
+    if (typeof forCaller !== "string" || forCaller === "") {
+      throw new TypeError(
+        "cache." + verb + ": forCaller names the caller this entry belongs to, " +
+          "so it has to be a non-empty string, got " +
+          (forCaller === "" ? "an empty string" : typeof forCaller) +
+          ". Nothing was done"
+      );
+    }
+    said.forCaller = forCaller;
+  }
+
+  const forAnyCaller = optionOf(options, "forAnyCaller");
+  if (forAnyCaller !== undefined) {
+    if (forAnyCaller !== true) {
+      throw new TypeError(
+        "cache." + verb + ": forAnyCaller is the statement that this answer " +
+          "does not depend on who asked, so the only value it takes is true, " +
+          "got " + String(forAnyCaller) + ". Nothing was done"
+      );
+    }
+    if (said.forCaller !== "") {
+      throw new TypeError(
+        "cache." + verb + ": forCaller and forAnyCaller say opposite things " +
+          "about the same entry -- that it is one caller's, and that it is " +
+          "nobody's in particular. Pass one of them. Nothing was done"
+      );
+    }
+    said.forAnyCaller = true;
+  }
+
+  const ignoreMethod = optionOf(options, "ignoreMethod");
+  if (ignoreMethod !== undefined) {
+    if (typeof ignoreMethod !== "boolean") {
+      throw new TypeError(
+        "cache." + verb + ": ignoreMethod is a boolean, got " +
+          typeof ignoreMethod + ". Nothing was done"
+      );
+    }
+    said.ignoreMethod = ignoreMethod;
+  }
+  return said;
+}
+
 class Cache {
   // `name` is the namespace this instance reads and writes; see
   // `runtime/cache_ops.rs`. `caches.default` and `ctx.services.cache` are the
@@ -1077,7 +1480,8 @@ class Cache {
   constructor(name) {
     this.name = name;
   }
-  async put(request, response) {
+  async put(request, response, options) {
+    const said = cacheCallOptions("put", options, PUT_OPTIONS);
     const key = cacheKeyOf(request);
 
     // Question one: what is this an answer *to*. A cache entry is the answer
@@ -1109,12 +1513,14 @@ class Cache {
     // A response that declares itself unusable by a cache like this one is not
     // stored, and the caller is told rather than left to believe it was.
     // Silently keeping a `private` or `no-cache` response in a store every
-    // later request reads is how one user's data reaches another.
+    // later request reads is how one user's data reaches another. All three
+    // freshness fields are read here, not just `Cache-Control`; see
+    // `lifetimeOf`.
     const directives = cacheControlOf(response);
-    const refusal = refusesToBeStored(directives);
-    if (refusal) {
+    const lifetime = lifetimeOf(response, directives);
+    if (lifetime.refusal) {
       throw new TypeError(
-        "cache.put: this response carries Cache-Control: " + refusal +
+        "cache.put: this response carries " + lifetime.refusal +
           ". It was not stored"
       );
     }
@@ -1122,7 +1528,9 @@ class Cache {
     // What the response says its body depends on. `Vary: *` is the response
     // saying that nothing may reuse it -- the specification's own words are
     // that such an entry always fails to match -- so it is refused here rather
-    // than stored as something no `match` could ever hand back.
+    // than stored as something no `match` could ever hand back. It is refused
+    // even for an entry filed under one named caller, because "no later
+    // request may reuse this" includes that caller's later requests.
     const vary = varyNames(response);
     if (vary.indexOf("*") !== -1) {
       throw new TypeError(
@@ -1131,71 +1539,107 @@ class Cache {
       );
     }
     // What variant this entry would be filed under, which is the question the
-    // two refusals below are both about: not what the key is, but what it is
-    // able to say about who this response is for.
+    // refusals below are about: not what the key is, but what it is able to
+    // say about who this response is for.
     const selector = vary.length > 0 ? varySelector(vary, request) : [];
-    if (vary.length > 0 && !readableHeaders(request)) {
-      // The key was a URL or a string, so there is nothing to read the varying
-      // headers off, and an entry whose selector is unknown is exactly the one
-      // that must not be stored: a later `match` under that same string would
-      // be answered with it whoever asked. Refused rather than stored, with
-      // the fix named in the message, because this is the shape that serves
-      // one user's page to another.
-      throw new TypeError(
-        "cache.put: this response varies on " + vary.join(", ") +
-          ", and the key given for " + key + " was not a Request, so there is " +
-          "nothing to read those headers from and no way to tell one caller's " +
-          "copy from another's. Pass the Request itself as the key. It was " +
-          "not stored"
-      );
-    }
-    const unvouched =
-      vary.length > 0 && request !== servedRequest
-        ? varyNamesTheKeyDoesNotCarry(selector)
-        : [];
-    if (unvouched.length > 0) {
-      // The variant this entry would be filed under has to be one somebody
-      // actually stated. A value the key carries is at least the caller's own
-      // statement about what this response is for; a value it does not carry
-      // is this platform inventing "the caller sent none of that header",
-      // which is the variant every anonymous caller matches. `new
-      // Request(url)` -- built from the request being served, to normalise a
-      // key, to drop a query string -- is a `Request` and carries no headers
-      // at all, so a page fetched with somebody's `Authorization` was filed as
-      // the "carried no Authorization" variant and handed to every anonymous
-      // caller after.
-      //
-      // The rule this replaces asked whether the key carried *any* of them,
-      // which one extra name in `Vary` walked straight past: a key carrying
-      // `Accept-Language` and nothing else counted as carrying some, and the
-      // authenticated page went out to the next anonymous caller sending that
-      // language. The property is per name, not per key.
-      //
-      // The exception is why this is not one rule with the refusal above: when
-      // the key is the very request this invocation is answering, "carries
-      // none of them" is not a claim, it is the truth. An anonymous caller
-      // storing an anonymous page under `context.request` is the ordinary case
-      // and stays ordinary. Any other key has to bring the values with it --
-      // which `cache.put(context.request, ...)` does for free, and which
-      // caching an upstream answer under the request that fetched it does too.
-      throw new TypeError(
-        "cache.put: this response varies on " + vary.join(", ") +
-          ", and the key given for " + key + " carries no value for " +
-          unvouched.join(", ") + " while not being the request this handler " +
-          "is answering. Stored, it would be filed as the variant for a " +
-          "caller who sends none of those, and handed to every such caller " +
-          "afterwards. Pass the Request this handler was given, or a key that " +
-          "carries the same values for those headers. It was not stored"
-      );
-    }
 
-    // Question two, last half: does the entry record whose answer it is. A key
-    // carrying a credential and a response that says nothing about one is the
-    // same disclosure as an invented variant, written by a handler that never
-    // reached for `Vary` at all. See `aCredentialTheEntryDoesNotRecord`.
-    const credential = aCredentialTheEntryDoesNotRecord(request, vary, directives);
-    if (credential) {
-      throw new TypeError("cache.put: " + credential + ". It was not stored");
+    // Everything from here to the write is one question -- could this entry be
+    // handed to a caller nobody can identify -- and an application that has
+    // said whose answer it is has already answered it. An entry stored with
+    // `forCaller` lives under that string and is never handed to a `match`
+    // that names another, so the ways one caller's answer reaches a different
+    // one do not arise; the statement is on the call, which no header an
+    // upstream sets can produce.
+    if (said.forCaller === "") {
+      if (vary.length > 0 && !readableHeaders(request)) {
+        // The key was a URL or a string, so there is nothing to read the
+        // varying headers off, and an entry whose selector is unknown is
+        // exactly the one that must not be stored: a later `match` under that
+        // same string would be answered with it whoever asked. Refused rather
+        // than stored, with the fix named in the message, because this is the
+        // shape that serves one user's page to another.
+        throw new TypeError(
+          "cache.put: this response varies on " + vary.join(", ") +
+            ", and the key given for " + key + " was not a Request, so there is " +
+            "nothing to read those headers from and no way to tell one caller's " +
+            "copy from another's. Pass the Request itself as the key. It was " +
+            "not stored"
+        );
+      }
+      const unvouched =
+        vary.length > 0 && request !== servedRequest
+          ? varyNamesTheKeyDoesNotCarry(selector)
+          : [];
+      if (unvouched.length > 0) {
+        // The variant this entry would be filed under has to be one somebody
+        // actually stated. A value the key carries is at least the caller's own
+        // statement about what this response is for; a value it does not carry
+        // is this platform inventing "the caller sent none of that header",
+        // which is the variant every anonymous caller matches. `new
+        // Request(url)` -- built from the request being served, to normalise a
+        // key, to drop a query string -- is a `Request` and carries no headers
+        // at all, so a page fetched with somebody's `Authorization` was filed as
+        // the "carried no Authorization" variant and handed to every anonymous
+        // caller after.
+        //
+        // The rule this replaces asked whether the key carried *any* of them,
+        // which one extra name in `Vary` walked straight past: a key carrying
+        // `Accept-Language` and nothing else counted as carrying some, and the
+        // authenticated page went out to the next anonymous caller sending that
+        // language. The property is per name, not per key.
+        //
+        // The exception is why this is not one rule with the refusal above: when
+        // the key is the very request this invocation is answering, "carries
+        // none of them" is not a claim, it is the truth. An anonymous caller
+        // storing an anonymous page under `context.request` is the ordinary case
+        // and stays ordinary. Any other key has to bring the values with it --
+        // which `cache.put(context.request, ...)` does for free, and which
+        // caching an upstream answer under the request that fetched it does too.
+        throw new TypeError(
+          "cache.put: this response varies on " + vary.join(", ") +
+            ", and the key given for " + key + " carries no value for " +
+            unvouched.join(", ") + " while not being the request this handler " +
+            "is answering. Stored, it would be filed as the variant for a " +
+            "caller who sends none of those, and handed to every such caller " +
+            "afterwards. Pass the Request this handler was given, or a key that " +
+            "carries the same values for those headers. It was not stored"
+        );
+      }
+
+      // Question two, last half, and the one the previous four rounds kept
+      // finding a way round: is this answer one caller's. Not "does the key
+      // carry Authorization" -- the set of headers that carry an identity has
+      // no end -- but "is every header on either request one this platform
+      // knows cannot name a caller, or one the entry is filed under". See
+      // `notSafeForAStranger`.
+      if (!said.forAnyCaller) {
+        const unsafe = notSafeForAStranger(request, vary);
+        if (unsafe) {
+          throw new TypeError("cache.put: " + unsafe + ". It was not stored");
+        }
+      }
+
+      // And what the response would *give* whoever receives it, which no
+      // `Vary` and no statement about the request can make safe: see
+      // `headersAStrangerMayNotReceive`. `forAnyCaller` does not waive this
+      // one, because a response that hands the recipient a session and an
+      // application saying the answer suits every caller contradict each
+      // other, and the safe reading of a contradiction is to refuse it.
+      const replayed = headersAStrangerMayNotReceive(response);
+      if (replayed.length > 0) {
+        throw new TypeError(
+          "cache.put: this response carries " + replayed.join(", ") + ", which " +
+            "this platform will not replay to a later caller. A stored response " +
+            "may carry only what describes the representation, how long it is " +
+            "good for, or a policy that is the same for every caller of the " +
+            "site; anything else -- a Set-Cookie, a token, a header this " +
+            "application invented -- is given to whoever is handed the entry " +
+            "next, which for a Set-Cookie means every later caller shares one " +
+            "caller's session. Store a copy carrying the headers you mean to " +
+            "serve, or say whose answer it is with { forCaller: <the caller " +
+            "this answer is for> }. It was not stored"
+        );
+      }
     }
 
     // Clone first: reading the body of the response the handler is about to
@@ -1236,21 +1680,26 @@ class Cache {
     if (vary.length > 0) meta.vary = selector;
     await DenoCore.ops.op_cache_set(
       this.name,
+      said.forCaller,
       key,
       JSON.stringify(meta),
       body,
-      freshnessSeconds(directives)
+      lifetime.seconds
     );
   }
-  async match(request) {
+  async match(request, options) {
+    const said = cacheCallOptions("match", options, READ_OPTIONS);
     const key = cacheKeyOf(request);
     // Nothing but the answer to a GET is ever stored, so a key naming another
     // method has no entry here and a miss is the honest answer: the handler
     // falls through and answers the request properly, which is what a miss is
     // for. Without this the store was consulted by URL alone, so a POST was
-    // answered with whatever a GET of that URL had left behind.
-    if (cacheKeyMethod(request) !== "GET") return undefined;
-    const hit = await DenoCore.ops.op_cache_get(this.name, key);
+    // answered with whatever a GET of that URL had left behind. `ignoreMethod`
+    // is the specification's way for an application to ask for the GET entry
+    // from inside a handler answering something else, which is a question it
+    // is entitled to ask about its own cache.
+    if (!said.ignoreMethod && cacheKeyMethod(request) !== "GET") return undefined;
+    const hit = await DenoCore.ops.op_cache_get(this.name, said.forCaller, key);
     if (!hit) return undefined;
     try {
       const meta = JSON.parse(hit.meta);
@@ -1274,10 +1723,11 @@ class Cache {
       return undefined;
     }
   }
-  async delete(request) {
+  async delete(request, options) {
+    const said = cacheCallOptions("delete", options, READ_OPTIONS);
     const key = cacheKeyOf(request);
     const method = cacheKeyMethod(request);
-    if (method !== "GET") {
+    if (!said.ignoreMethod && method !== "GET") {
       // Nothing was ever stored under a key that is not a GET, so `false` --
       // the Cache API's word for "there was nothing to delete" -- is the
       // truth. It is said out loud because it is almost never what the caller
@@ -1294,7 +1744,31 @@ class Cache {
       );
       return false;
     }
-    return await DenoCore.ops.op_cache_delete(this.name, key);
+    // Which variant is under that key, before anything is removed. The store
+    // holds one variant per key and this used to remove it by key alone, so a
+    // caller who does not have the variant -- an anonymous `delete` against an
+    // entry filed under somebody's credential -- was told `true`, which says
+    // "there was an entry here for you", and threw away an entry that was not
+    // its own. `true` for a variant the caller cannot see is also an oracle:
+    // it answers "is there a cached page for that credential" to anyone.
+    //
+    // Read then remove, both from this isolate's single thread. Another
+    // invocation of this same application could write between the two, and
+    // then this drops an entry a moment younger than the one it checked --
+    // which is a miss and a refetch, never a wrong answer, and is the same
+    // outcome as the two calls having arrived in the other order.
+    const meta = await DenoCore.ops.op_cache_meta(this.name, said.forCaller, key);
+    if (meta === null || meta === undefined) return false;
+    let stored = null;
+    try {
+      stored = JSON.parse(meta).vary;
+    } catch {
+      // An entry this side cannot read is one no `match` can hand back
+      // either, so removing it is the useful answer.
+      stored = null;
+    }
+    if (!selectedBy(stored, request)) return false;
+    return await DenoCore.ops.op_cache_delete(this.name, said.forCaller, key);
   }
 }
 
@@ -1310,6 +1784,33 @@ const DEFAULT_CACHE_NAME = "default";
 // through `caches.default` and reads through `context.services.cache` sees
 // its own entry.
 const defaultCache = new Cache(DEFAULT_CACHE_NAME);
+
+// The one name `caches.open` and `caches.delete` will not take.
+//
+// The default cache is an ordinary namespace on the Rust side and its name is
+// an ordinary string, so an application opening a cache under a name it took
+// from a request -- a tenant, a locale, a path segment, anything a caller can
+// choose -- handed a caller who sent "default" the namespace every other part
+// of that application reads and writes through `context.services.cache`. It
+// could read what was cached there and, through `caches.delete`, empty it.
+//
+// Refused rather than renamed to something unguessable, because an application
+// that wrote the name meaning the default cache should be told where the
+// default cache is instead of quietly being given a second one that shares
+// nothing with it. The cost is that the default namespace has no bulk empty:
+// its entries go one key at a time through `cache.delete(key)`, which is the
+// only way `caches.default` could ever be emptied anyway on a platform where
+// the name is not addressable.
+function reserveTheDefaultName(verb, name) {
+  if (name !== DEFAULT_CACHE_NAME) return;
+  throw new TypeError(
+    "caches." + verb + ": \"" + DEFAULT_CACHE_NAME + "\" is the name of the " +
+      "cache reached as caches.default and context.services.cache, so it is " +
+      "not a name an application may " + verb + " -- a name taken from a " +
+      "request would otherwise reach the namespace the rest of this " +
+      "application caches into. Use caches.default, or choose another name"
+  );
+}
 
 // What this cache is and how long it lasts, read once per isolate.
 //
@@ -1346,6 +1847,7 @@ globalThis.caches = {
           (name === "" ? "an empty string" : typeof name)
       );
     }
+    reserveTheDefaultName("open", name);
     return new Cache(name);
   },
   // Drop everything in one named cache, and say whether it held anything.
@@ -1364,6 +1866,7 @@ globalThis.caches = {
           (name === "" ? "an empty string" : typeof name)
       );
     }
+    reserveTheDefaultName("delete", name);
     return (await DenoCore.ops.op_cache_clear(name)) > 0;
   }
 };

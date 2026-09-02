@@ -70,6 +70,17 @@ pub const DEFAULT_STATUS: u16 = 302;
 /// way a `Location` does.
 pub const ALLOWED_STATUSES: [u16; 7] = [200, 301, 302, 303, 307, 308, 404];
 
+/// Whether this build can carry out a rule with this status.
+///
+/// Its own function because the two readers of the answer want opposite
+/// things: [`parse_redirects`] is looking at a file an author has open and
+/// refuses what is not here, while [`RedirectTable::compile`] is reading a
+/// manifest a possibly newer builder wrote and drops the rule instead. See
+/// [`crate::forward`] for why those have to differ.
+pub fn status_is_known(status: u16) -> bool {
+    ALLOWED_STATUSES.contains(&status)
+}
+
 /// How many rules one bundle may carry.
 ///
 /// The table is scanned linearly on every request that misses the asset index,
@@ -140,6 +151,19 @@ impl RedirectTable {
     /// version loads. The second run is not redundant: the manifest arrives
     /// from outside the process, and a rule that only the build had checked
     /// would be a rule a crafted bundle could smuggle past.
+    ///
+    /// A rule whose status this build does not know is **dropped** rather than
+    /// refused, and it is the one thing this differs from
+    /// [`parse_redirects`] on. [`ALLOWED_STATUSES`] is an allow-list that
+    /// grows, so refusing here cost the whole bundle on any node one release
+    /// behind the builder - see [`crate::forward`]. Dropping the rule is the
+    /// narrow reading: the asset index is consulted before this table, so a
+    /// dropped rule cannot uncover a file it was hiding, and what answers
+    /// instead is another of the author's own rules, the application, or the
+    /// not-found behaviour. Substituting a status this build does know would
+    /// be worse than any of those - a 301 answered as a 302, or the reverse,
+    /// is a wrong entry in a visitor's browser cache that outlives the
+    /// rollback that produced it.
     pub fn compile(rules: &[RedirectRule]) -> Result<Self, RuleError> {
         if rules.len() > MAX_RULES {
             return Err(RuleError::at(
@@ -156,6 +180,9 @@ impl RedirectTable {
 
         let mut compiled = Vec::with_capacity(rules.len());
         for rule in rules {
+            if !status_is_known(rule.status) {
+                continue;
+            }
             compiled.push(compile_rule(rule, 0)?);
         }
         Ok(Self { rules: compiled })
@@ -333,7 +360,7 @@ fn compile_rule(rule: &RedirectRule, line: usize) -> Result<Compiled, RuleError>
     let text = format!("{} {} {}", rule.from, rule.to, rule.status);
     let fail = |reason: String| RuleError::at(REDIRECTS_FILE, line, text.clone(), reason);
 
-    if !ALLOWED_STATUSES.contains(&rule.status) {
+    if !status_is_known(rule.status) {
         return Err(fail(format!(
             "status {} is not one of {ALLOWED_STATUSES:?}; 200 rewrites, 404 serves the target \
              as a not-found page, and the rest are redirects",

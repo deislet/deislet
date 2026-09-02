@@ -69,7 +69,7 @@ mod tests {
         let code = r#"
             (async () => {
                 await Deno.core.ops.op_cache_set(
-                    "default", "test_key", "{\"status\":200}", bytes("test_value"), 0);
+                    "default", "", "test_key", "{\"status\":200}", bytes("test_value"), 0);
             })()
         "#;
 
@@ -79,7 +79,7 @@ mod tests {
         let cache = store(&runtime);
 
         let value = cache
-            .entry("default", "test_key")
+            .entry("default", "", "test_key")
             .await
             .expect("the entry was written");
         assert_eq!(value.meta, "{\"status\":200}");
@@ -92,14 +92,14 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_get("default", "nonexistent_key");
+                await Deno.core.ops.op_cache_get("default", "", "nonexistent_key");
             })()
         "#;
 
         run(&mut runtime, code).await;
 
         let cache = store(&runtime);
-        assert_eq!(cache.entry("default", "nonexistent_key").await, None);
+        assert_eq!(cache.entry("default", "", "nonexistent_key").await, None);
     }
 
     #[tokio::test]
@@ -109,15 +109,15 @@ mod tests {
         let code = r#"
             (async () => {
                 await Deno.core.ops.op_cache_set(
-                    "default", "key_to_delete", "{}", bytes("value"), 0);
-                await Deno.core.ops.op_cache_delete("default", "key_to_delete");
+                    "default", "", "key_to_delete", "{}", bytes("value"), 0);
+                await Deno.core.ops.op_cache_delete("default", "", "key_to_delete");
             })()
         "#;
 
         run(&mut runtime, code).await;
 
         let cache = store(&runtime);
-        assert_eq!(cache.entry("default", "key_to_delete").await, None);
+        assert_eq!(cache.entry("default", "", "key_to_delete").await, None);
     }
 
     /// Two names, one store, and nothing crosses between them.
@@ -134,9 +134,9 @@ mod tests {
             r#"
             (async () => {
                 await Deno.core.ops.op_cache_set(
-                    "default", "shared_key", "{}", bytes("from-default"), 0);
+                    "default", "", "shared_key", "{}", bytes("from-default"), 0);
                 await Deno.core.ops.op_cache_set(
-                    "pages", "shared_key", "{}", bytes("from-pages"), 0);
+                    "pages", "", "shared_key", "{}", bytes("from-pages"), 0);
             })()
         "#,
         )
@@ -144,11 +144,11 @@ mod tests {
 
         let cache = store(&runtime);
         assert_eq!(
-            cache.entry("default", "shared_key").await.unwrap().body,
+            cache.entry("default", "", "shared_key").await.unwrap().body,
             b"from-default".to_vec()
         );
         assert_eq!(
-            cache.entry("pages", "shared_key").await.unwrap().body,
+            cache.entry("pages", "", "shared_key").await.unwrap().body,
             b"from-pages".to_vec()
         );
         // One store, two namespaces: both entries are really there.
@@ -169,17 +169,64 @@ mod tests {
             &mut runtime,
             r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("ab", "c", "{}", bytes("one"), 0);
-                await Deno.core.ops.op_cache_set("a", "b:c", "{}", bytes("two"), 0);
+                await Deno.core.ops.op_cache_set("ab", "", "c", "{}", bytes("one"), 0);
+                await Deno.core.ops.op_cache_set("a", "", "b:c", "{}", bytes("two"), 0);
             })()
         "#,
         )
         .await;
 
         let cache = store(&runtime);
-        assert_eq!(cache.entry("ab", "c").await.unwrap().body, b"one".to_vec());
-        assert_eq!(cache.entry("a", "b:c").await.unwrap().body, b"two".to_vec());
+        assert_eq!(
+            cache.entry("ab", "", "c").await.unwrap().body,
+            b"one".to_vec()
+        );
+        assert_eq!(
+            cache.entry("a", "", "b:c").await.unwrap().body,
+            b"two".to_vec()
+        );
         assert_eq!(cache.len().await, 2, "the two keys collided");
+    }
+
+    /// The same question one join further in, where the caller an entry is
+    /// filed under is joined to the key.
+    ///
+    /// An application names its callers from its own data -- a tenant, a user
+    /// id, a token digest -- so the strings are as attacker-shaped as a cache
+    /// name is. Without a length at that join too, a caller who arranged to be
+    /// called `4:bob` would read and overwrite the entries filed under `bob`,
+    /// which is the disclosure the whole `forCaller` statement exists to
+    /// prevent, reached through the composition rather than through the rule.
+    #[tokio::test]
+    async fn a_caller_name_containing_the_separator_cannot_reach_another_caller() {
+        let mut runtime = setup_test_runtime();
+
+        run(
+            &mut runtime,
+            r#"
+            (async () => {
+                await Deno.core.ops.op_cache_set("c", "bob", "p", "{}", bytes("bob"), 0);
+                await Deno.core.ops.op_cache_set("c", "3:bob", "p", "{}", bytes("forged"), 0);
+                await Deno.core.ops.op_cache_set("c", "", "3:bob:p", "{}", bytes("shared"), 0);
+            })()
+        "#,
+        )
+        .await;
+
+        let cache = store(&runtime);
+        assert_eq!(
+            cache.entry("c", "bob", "p").await.unwrap().body,
+            b"bob".to_vec()
+        );
+        assert_eq!(
+            cache.entry("c", "3:bob", "p").await.unwrap().body,
+            b"forged".to_vec()
+        );
+        assert_eq!(
+            cache.entry("c", "", "3:bob:p").await.unwrap().body,
+            b"shared".to_vec()
+        );
+        assert_eq!(cache.len().await, 3, "two of the three keys collided");
     }
 
     /// `caches.delete(name)` empties one namespace and leaves the others.
@@ -191,15 +238,15 @@ mod tests {
             &mut runtime,
             r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("pages", "one", "{}", bytes("a"), 0);
-                await Deno.core.ops.op_cache_set("pages", "two", "{}", bytes("b"), 0);
-                await Deno.core.ops.op_cache_set("default", "kept", "{}", bytes("c"), 0);
+                await Deno.core.ops.op_cache_set("pages", "", "one", "{}", bytes("a"), 0);
+                await Deno.core.ops.op_cache_set("pages", "", "two", "{}", bytes("b"), 0);
+                await Deno.core.ops.op_cache_set("default", "", "kept", "{}", bytes("c"), 0);
                 const dropped = await Deno.core.ops.op_cache_clear("pages");
                 const none = await Deno.core.ops.op_cache_clear("never_used");
                 // Parked in the store rather than read back through a v8
                 // scope: the answers under test are values the op returned.
                 await Deno.core.ops.op_cache_set(
-                    "default", "answers", "{}", bytes(dropped + "," + none), 0);
+                    "default", "", "answers", "{}", bytes(dropped + "," + none), 0);
             })()
         "#,
         )
@@ -207,14 +254,14 @@ mod tests {
 
         let cache = store(&runtime);
         assert_eq!(
-            cache.entry("default", "answers").await.unwrap().body,
+            cache.entry("default", "", "answers").await.unwrap().body,
             b"2,0".to_vec(),
             "clear must report how many entries it dropped"
         );
-        assert_eq!(cache.entry("pages", "one").await, None);
-        assert_eq!(cache.entry("pages", "two").await, None);
+        assert_eq!(cache.entry("pages", "", "one").await, None);
+        assert_eq!(cache.entry("pages", "", "two").await, None);
         assert_eq!(
-            cache.entry("default", "kept").await.unwrap().body,
+            cache.entry("default", "", "kept").await.unwrap().body,
             b"c".to_vec()
         );
     }
@@ -250,10 +297,10 @@ mod tests {
 
         let code = r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("default", "multi1", "{}", bytes("value1"), 0);
-                await Deno.core.ops.op_cache_set("default", "multi2", "{}", bytes("value2"), 0);
-                await Deno.core.ops.op_cache_set("default", "multi3", "{}", bytes("value3"), 0);
-                await Deno.core.ops.op_cache_delete("default", "multi2");
+                await Deno.core.ops.op_cache_set("default", "", "multi1", "{}", bytes("value1"), 0);
+                await Deno.core.ops.op_cache_set("default", "", "multi2", "{}", bytes("value2"), 0);
+                await Deno.core.ops.op_cache_set("default", "", "multi3", "{}", bytes("value3"), 0);
+                await Deno.core.ops.op_cache_delete("default", "", "multi2");
             })()
         "#;
 
@@ -261,9 +308,9 @@ mod tests {
 
         let cache = store(&runtime);
 
-        let v1 = cache.entry("default", "multi1").await;
-        let v2 = cache.entry("default", "multi2").await;
-        let v3 = cache.entry("default", "multi3").await;
+        let v1 = cache.entry("default", "", "multi1").await;
+        let v2 = cache.entry("default", "", "multi2").await;
+        let v3 = cache.entry("default", "", "multi3").await;
 
         assert_eq!(v1.map(|entry| entry.body), Some(b"value1".to_vec()));
         assert!(v2.is_none());
@@ -280,8 +327,8 @@ mod tests {
             &mut runtime,
             r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("default", "with_ttl", "{}", bytes("value"), 120);
-                await Deno.core.ops.op_cache_set("default", "without_ttl", "{}", bytes("value"), 0);
+                await Deno.core.ops.op_cache_set("default", "", "with_ttl", "{}", bytes("value"), 120);
+                await Deno.core.ops.op_cache_set("default", "", "without_ttl", "{}", bytes("value"), 0);
             })()
         "#,
         )
@@ -289,13 +336,13 @@ mod tests {
 
         let cache = store(&runtime);
         assert_eq!(
-            cache.entry("default", "with_ttl").await.unwrap().ttl,
+            cache.entry("default", "", "with_ttl").await.unwrap().ttl,
             Some(Duration::from_secs(120))
         );
         // Zero is not "expire immediately"; it is "the response named no
         // lifetime", and the store's own default applies.
         assert_eq!(
-            cache.entry("default", "without_ttl").await.unwrap().ttl,
+            cache.entry("default", "", "without_ttl").await.unwrap().ttl,
             None
         );
     }
@@ -360,15 +407,15 @@ mod tests {
             &mut runtime,
             r#"
             (async () => {
-                await Deno.core.ops.op_cache_set("default", "present", "{}", bytes("value"), 0);
+                await Deno.core.ops.op_cache_set("default", "", "present", "{}", bytes("value"), 0);
                 const removedPresent =
-                    await Deno.core.ops.op_cache_delete("default", "present");
+                    await Deno.core.ops.op_cache_delete("default", "", "present");
                 const removedAbsent =
-                    await Deno.core.ops.op_cache_delete("default", "never_written");
+                    await Deno.core.ops.op_cache_delete("default", "", "never_written");
                 // Parked in the cache itself rather than read back through a
                 // v8 scope: the answer under test is a value the op returned.
                 await Deno.core.ops.op_cache_set(
-                    "default", "answers", "{}", bytes(removedPresent + "," + removedAbsent), 0);
+                    "default", "", "answers", "{}", bytes(removedPresent + "," + removedAbsent), 0);
             })()
         "#,
         )
@@ -376,11 +423,11 @@ mod tests {
 
         let cache = store(&runtime);
         assert_eq!(
-            cache.entry("default", "answers").await.unwrap().body,
+            cache.entry("default", "", "answers").await.unwrap().body,
             b"true,false".to_vec(),
             "delete() must report a hit as true and a miss as false"
         );
-        assert!(cache.entry("default", "present").await.is_none());
+        assert!(cache.entry("default", "", "present").await.is_none());
     }
 
     /// A cached body that is not text comes back byte for byte.
@@ -599,7 +646,7 @@ mod tests {
             (async () => {
                 const body = new Uint8Array(128 * 1024);
                 for (let i = 0; i < 16; i++) {
-                    await Deno.core.ops.op_cache_set("default", "k" + i, "{}", body, 0);
+                    await Deno.core.ops.op_cache_set("default", "", "k" + i, "{}", body, 0);
                 }
             })()
         "#,
@@ -645,7 +692,7 @@ mod tests {
             r#"
             (async () => {
                 for (let i = 0; i < 40; i++) {
-                    await Deno.core.ops.op_cache_set("default", "k" + i, "{}", bytes("x"), 0);
+                    await Deno.core.ops.op_cache_set("default", "", "k" + i, "{}", bytes("x"), 0);
                 }
             })()
         "#,
@@ -687,11 +734,11 @@ mod tests {
                 let outcome = "the oversized response was accepted";
                 try {
                     await Deno.core.ops.op_cache_set(
-                        "default", "big", "{}", new Uint8Array(300 * 1024), 0);
+                        "default", "", "big", "{}", new Uint8Array(300 * 1024), 0);
                 } catch (e) {
                     outcome = e.message;
                 }
-                await Deno.core.ops.op_cache_set("default", "outcome", "{}", bytes(outcome), 0);
+                await Deno.core.ops.op_cache_set("default", "", "outcome", "{}", bytes(outcome), 0);
             })()
         "#,
         )
@@ -700,7 +747,7 @@ mod tests {
         let cache = store(&runtime);
         let outcome = String::from_utf8(
             cache
-                .entry("default", "outcome")
+                .entry("default", "", "outcome")
                 .await
                 .expect("the small entry beside it was stored")
                 .body,
@@ -714,7 +761,7 @@ mod tests {
              store holds: {outcome}"
         );
         assert_eq!(
-            cache.entry("default", "big").await,
+            cache.entry("default", "", "big").await,
             None,
             "the oversized response must not be in the store"
         );
@@ -758,6 +805,25 @@ mod what_the_cache_refuses_to_store {
         headers: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> String {
+        ask_at(runtime, method, "/account", headers, body).await
+    }
+
+    /// The same, at a path the caller chooses.
+    ///
+    /// The path is a parameter because a test that steers its handler needs
+    /// somewhere to put the instruction, and a header is now the wrong place:
+    /// what a request carries is exactly what decides whether its answer may
+    /// be stored, so `x-directive: no-store` would be refused for carrying an
+    /// unrecognised header rather than for the directive it names, and the
+    /// test would pass while checking nothing. A query string steers the
+    /// handler without changing what the request says about its caller.
+    async fn ask_at(
+        runtime: &mut AppRuntime,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+    ) -> String {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let headers: Vec<(String, String)> = headers
             .iter()
@@ -765,7 +831,7 @@ mod what_the_cache_refuses_to_store {
             .collect();
         runtime
             .execute_fetch(
-                "http://localhost/account".to_string(),
+                format!("http://localhost{path}"),
                 method.to_string(),
                 headers,
                 body,
@@ -777,6 +843,16 @@ mod what_the_cache_refuses_to_store {
         let body = String::from_utf8(body.into_bytes().unwrap_or_default()).expect("text");
         assert_eq!(status, 200, "the handler failed: {body}");
         body
+    }
+
+    /// One GET at a path, with its answer read as JSON.
+    async fn ask_json(
+        runtime: &mut AppRuntime,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> serde_json::Value {
+        let answered = ask_at(runtime, "GET", path, headers, None).await;
+        serde_json::from_str(&answered).unwrap_or_else(|e| panic!("json ({e}): {answered}"))
     }
 
     /// The canonical shape: check the cache, fall through to a handler whose
@@ -990,10 +1066,36 @@ mod what_the_cache_refuses_to_store {
 
     #[tokio::test]
     async fn a_response_that_says_do_not_reuse_me_is_not_stored() {
+        // The directives live in the handler and the request names one by
+        // index, because what a request carries is now what decides whether
+        // its answer may be stored at all: an `x-directive` header would be
+        // refused for being a name this platform does not recognise, the
+        // assertion below would still hold, and the test would have stopped
+        // reading `Cache-Control` without anything saying so.
         let code = r#"
+            const DIRECTIVES = [
+                "no-store",
+                "private",
+                "no-cache",
+                "max-age=0",
+                // A shared cache reads `s-maxage` first, so this one is stale
+                // on arrival however long `max-age` says.
+                "max-age=600, s-maxage=0",
+                // The field-name forms. Three regular expressions scanning the
+                // same string used to read `private="set-cookie"` as an
+                // ordinary header value and store the response.
+                "private=\"set-cookie\"",
+                "no-cache=\"set-cookie\"",
+                // Not the first directive, and spelled the way a real upstream
+                // spells it.
+                "public, max-age=600, no-store",
+            ];
             export default async function handler(context) {
-                const directive = context.request.headers.get("x-directive");
-                const key = "https://example.invalid/" + directive;
+                const which = Number(
+                    new URL(context.request.url).searchParams.get("directive")
+                );
+                const directive = DIRECTIVES[which];
+                const key = "https://example.invalid/" + which;
                 let refused = null;
                 try {
                     await caches.default.put(key, new Response("secret", {
@@ -1004,36 +1106,28 @@ mod what_the_cache_refuses_to_store {
                 }
                 const hit = await caches.default.match(key);
                 return new Response(JSON.stringify({
+                    directive,
                     refused,
                     stored: hit === undefined ? null : await hit.text(),
                 }));
             }
         "#;
         let mut runtime = runtime("cache_directive_app.production", code).await;
-        for directive in [
-            "no-store",
-            "private",
-            "no-cache",
-            "max-age=0",
-            // A shared cache reads `s-maxage` first, so this one is stale on
-            // arrival however long `max-age` says.
-            "max-age=600, s-maxage=0",
-            // The field-name forms. Three regular expressions scanning the
-            // same string used to read `private="set-cookie"` as an ordinary
-            // header value and store the response.
-            "private=\"set-cookie\"",
-            "no-cache=\"set-cookie\"",
-            // Not the first directive, and spelled the way a real upstream
-            // spells it.
-            "public, max-age=600, no-store",
-        ] {
-            let answered = ask(&mut runtime, &[("x-directive", directive)]).await;
-            let seen: serde_json::Value = serde_json::from_str(&answered).expect("json");
-            println!("{directive} -> {seen}");
+        for which in 0..8 {
+            let seen = ask_json(&mut runtime, &format!("/account?directive={which}"), &[]).await;
+            let directive = seen["directive"].as_str().unwrap_or_default().to_string();
             assert_eq!(
                 seen["stored"],
                 serde_json::Value::Null,
                 "a response carrying Cache-Control: {directive} was stored anyway"
+            );
+            assert!(
+                seen["refused"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Cache-Control:"),
+                "the refusal has to say it was the response's own directive that refused it \
+                 ({directive}): {seen}"
             );
         }
     }
@@ -1200,30 +1294,43 @@ mod what_the_cache_refuses_to_store {
         );
     }
 
-    /// A response to a request that carried a credential, with no `Vary` and
-    /// no directive allowing a shared cache to reuse it.
+    /// A response to a request that carried a credential, with no `Vary` to
+    /// file it under.
     ///
-    /// RFC 9111 section 3.5: a shared cache must not use such a response to
-    /// satisfy any later request unless the response says it may. Nothing in
-    /// the entry records *who* it was for -- there is no `Vary` to file it
-    /// under -- so every later caller of that URL matched it, credential or
-    /// none. This is the same disclosure the `Vary` rules exist to prevent,
-    /// reached by a handler that simply did not set `Vary`.
+    /// Round six: nothing in the entry recorded *who* it was for, so every
+    /// later caller of that URL matched it, credential or none. Round seven:
+    /// the repair named `Authorization` and offered `public` and `s-maxage`
+    /// as ways to say the answer is everyone's -- so a handler that wrote
+    /// either of them turned the refusal back into the disclosure, with the
+    /// refusal message recommending it.
+    ///
+    /// Both are closed here by the same sentence, and this test is the pair
+    /// of them: the credential is refused whatever the response says about
+    /// its lifetime, and the two things that do make it storable are the
+    /// response filing the entry under the credential, and the application
+    /// saying whose answer it is on the call.
     #[tokio::test]
     async fn an_authenticated_answer_with_no_vary_is_not_stored_for_everyone() {
         let code = r#"
             export default async function handler(context) {
                 const request = context.request;
+                const url = new URL(request.url);
                 const hit = await caches.default.match(request);
                 if (hit) {
                     return new Response(JSON.stringify({ served: await hit.text() }));
                 }
                 const who = request.headers.get("authorization") ?? "nobody";
-                const directive = request.headers.get("x-directive");
+                const directive = url.searchParams.get("directive");
                 const headers = directive ? { "cache-control": directive } : {};
+                if (url.searchParams.get("vary")) headers["vary"] = "authorization";
+                const forCaller = url.searchParams.get("forCaller");
                 let refused = null;
                 try {
-                    await caches.default.put(request, new Response("page-for:" + who, { headers }));
+                    await caches.default.put(
+                        request,
+                        new Response("page-for:" + who, { headers }),
+                        forCaller ? { forCaller } : undefined,
+                    );
                 } catch (e) {
                     refused = e.message;
                 }
@@ -1231,41 +1338,71 @@ mod what_the_cache_refuses_to_store {
             }
         "#;
         let mut runtime = runtime("cache_authorization_app.production", code).await;
+        let alice = &[("authorization", "Bearer alice")][..];
 
-        let alice: serde_json::Value =
-            serde_json::from_str(&ask(&mut runtime, &[("authorization", "Bearer alice")]).await)
-                .expect("json");
-        let anonymous: serde_json::Value =
-            serde_json::from_str(&ask(&mut runtime, &[]).await).expect("json");
-
+        let stored = ask_json(&mut runtime, "/account", alice).await;
+        let anonymous = ask_json(&mut runtime, "/account", &[]).await;
         assert_eq!(
             anonymous["served"],
             serde_json::Value::Null,
             "an anonymous caller was handed the answer to a request that carried a credential"
         );
-        let refused = alice["refused"].as_str().unwrap_or_default();
         assert!(
-            refused.contains("Authorization"),
-            "the refusal has to name the credential that made the answer one caller's: {alice}"
+            stored["refused"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("authorization"),
+            "the refusal has to name the credential that made the answer one caller's: {stored}"
         );
 
-        // And the two ways out the specification gives, both of which have to
-        // keep working: say the answer is everyone's, or record whose it is.
-        let public: serde_json::Value = serde_json::from_str(
-            &ask(
-                &mut runtime,
-                &[
-                    ("authorization", "Bearer alice"),
-                    ("x-directive", "public, max-age=60"),
-                ],
-            )
-            .await,
+        // The directive that used to be the way out. It says how long the
+        // answer is good for and nothing about whose it is, so it changes
+        // nothing here -- and a caller sending no credential is still not
+        // given the credentialed page.
+        let public = ask_json(
+            &mut runtime,
+            "/account?directive=public,%20max-age=60",
+            alice,
         )
-        .expect("json");
+        .await;
+        assert!(
+            public["refused"].is_string(),
+            "Cache-Control: public was read as permission to store one caller's answer: {public}"
+        );
+        let after_public =
+            ask_json(&mut runtime, "/account?directive=public,%20max-age=60", &[]).await;
         assert_eq!(
-            public["refused"],
+            after_public["served"],
             serde_json::Value::Null,
-            "a response that says `public` is one a shared cache may keep: {public}"
+            "an anonymous caller was handed a credentialed answer marked public: {after_public}"
+        );
+
+        // And the two that do work, because each one says who the answer is
+        // for: the response files the entry under the credential, or the
+        // application names the caller in the call itself.
+        let varied = ask_json(&mut runtime, "/account?vary=1", alice).await;
+        assert_eq!(
+            varied["refused"],
+            serde_json::Value::Null,
+            "a response that files the entry under the credential is storable: {varied}"
+        );
+        let varied_again = ask_json(&mut runtime, "/account?vary=1", alice).await;
+        assert_eq!(
+            varied_again["served"], "page-for:Bearer alice",
+            "the caller the entry was filed under did not get it back: {varied_again}"
+        );
+        let stranger = ask_json(&mut runtime, "/account?vary=1", &[]).await;
+        assert_eq!(
+            stranger["served"],
+            serde_json::Value::Null,
+            "a caller sending no credential matched the variant filed under one: {stranger}"
+        );
+
+        let named = ask_json(&mut runtime, "/account?forCaller=alice", alice).await;
+        assert_eq!(
+            named["refused"],
+            serde_json::Value::Null,
+            "an application that named the caller on the call was still refused: {named}"
         );
     }
 
@@ -1360,6 +1497,535 @@ mod what_the_cache_refuses_to_store {
                 .unwrap_or_default()
                 .contains("304"),
             "a 304 was stored as though it were a representation: {not_modified}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // The rule, exercised as families rather than as names.
+    //
+    // Four rounds of this cache were repaired by adding the name the round
+    // had found: `Set-Cookie` collapsed, then `Vary` unread, then the method
+    // unread, then `Authorization`. Each repair was right and each left the
+    // next name to be found, because the question the cache asked was "is
+    // this one of the things known to be unsafe". The tests below ask the
+    // question the cache asks now -- "is this one of the things known to be
+    // safe" -- and they ask it with names no list has heard of, because a
+    // name nobody thought of is the whole point.
+    // ---------------------------------------------------------------
+
+    /// A handler whose answer is one caller's, cached under the request it
+    /// answered, with the header that identifies the caller named in the
+    /// query string rather than sent as one more header. Where the credential
+    /// lives is the variable; that it is a credential is the constant.
+    const DASHBOARD: &str = r#"
+        export default async function handler(context) {
+            const request = context.request;
+            const url = new URL(request.url);
+            const hit = await caches.default.match(request);
+            if (hit) return new Response(JSON.stringify({ served: await hit.text() }));
+            const name = url.searchParams.get("credential");
+            const who = request.headers.get(name) ?? "nobody";
+            const directive = url.searchParams.get("directive");
+            const headers = directive ? { "cache-control": directive } : {};
+            let refused = null;
+            try {
+                await caches.default.put(
+                    request,
+                    new Response("dashboard-for:" + who, { headers }),
+                );
+            } catch (e) {
+                refused = e.message;
+            }
+            return new Response(JSON.stringify({ refused, served: null }));
+        }
+    "#;
+
+    /// Every header that can carry a credential, including ones no list of
+    /// credentials contains.
+    ///
+    /// The rule this replaces named `Authorization` and nothing else, so
+    /// `Cookie` -- which is how most of the web authenticates -- walked past
+    /// it: the page was stored under the bare URL and handed to the next
+    /// anonymous caller. So did `Proxy-Authorization`, and so would any name
+    /// an application invents for its own session token. The platform cannot
+    /// enumerate what a credential is called, so it no longer tries: a header
+    /// it does not recognise as one that cannot single a caller out is one
+    /// the entry has to be filed under.
+    #[tokio::test]
+    async fn no_header_that_could_name_a_caller_is_cached_under_the_bare_url() {
+        let mut runtime = runtime("cache_credential_family.production", DASHBOARD).await;
+        for name in [
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "x-api-key",
+            "x-session-token",
+            // The one that matters: a name invented by one application, that
+            // no list of credentials will ever contain.
+            "x-acme-tenant-ticket",
+        ] {
+            let path = format!("/account?credential={name}");
+            let identified = ask_json(&mut runtime, &path, &[(name, "secret-of-alice")]).await;
+            let anonymous = ask_json(&mut runtime, &path, &[]).await;
+            assert_eq!(
+                anonymous["served"],
+                serde_json::Value::Null,
+                "a caller sending nothing was handed the page answered for a caller who sent \
+                 {name}: {anonymous}"
+            );
+            assert!(
+                identified["refused"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(name),
+                "the refusal has to name the header that made the answer one caller's ({name}): \
+                 {identified}"
+            );
+        }
+    }
+
+    /// The two directives the old refusal recommended, against the same
+    /// family.
+    ///
+    /// `public` and `s-maxage` used to be accepted as the response saying
+    /// "this answer is everyone's", which turned a correctly refused `put`
+    /// into the disclosure it had just refused -- and the refusal message
+    /// said to add them. Nothing a response can carry says that any more:
+    /// a directive is a lifetime, not a permission.
+    #[tokio::test]
+    async fn saying_public_does_not_make_one_callers_page_everyones() {
+        let mut runtime = runtime("cache_public_directive.production", DASHBOARD).await;
+        for directive in ["public, max-age=60", "s-maxage=60", "public"] {
+            let path =
+                format!("/account?credential=cookie&directive={directive}").replace(' ', "%20");
+            let identified = ask_json(&mut runtime, &path, &[("cookie", "session=alice")]).await;
+            let anonymous = ask_json(&mut runtime, &path, &[]).await;
+            assert_eq!(
+                anonymous["served"],
+                serde_json::Value::Null,
+                "Cache-Control: {directive} let one caller's page be stored for everyone: \
+                 {anonymous}"
+            );
+            assert!(
+                identified["refused"].is_string(),
+                "Cache-Control: {directive} was read as permission to store a credentialed \
+                 answer: {identified}"
+            );
+        }
+    }
+
+    /// A response that carries something for the caller who receives it.
+    ///
+    /// `Set-Cookie` is the one that matters most -- replayed to every later
+    /// caller it is session fixation rather than disclosure -- but it is not
+    /// the rule. The rule is that a stored response may carry only headers
+    /// that describe the representation, so `Authentication-Info`,
+    /// `Clear-Site-Data` and a token an application invented a name for are
+    /// refused by the same sentence, and so is the next such header anyone
+    /// defines.
+    #[tokio::test]
+    async fn no_response_header_that_carries_one_callers_state_is_stored() {
+        let code = r#"
+            export default async function handler(context) {
+                const request = context.request;
+                const url = new URL(request.url);
+                const hit = await caches.default.match(request);
+                if (hit) return new Response(JSON.stringify({ served: await hit.text() }));
+                const name = url.searchParams.get("header");
+                const headers = {};
+                headers[name] = name === "set-cookie"
+                    ? "session=alice; HttpOnly; Path=/"
+                    : "one-callers-value";
+                const directive = url.searchParams.get("directive");
+                if (directive) headers["cache-control"] = directive;
+                let refused = null;
+                try {
+                    await caches.default.put(request, new Response("page", { headers }));
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, served: null }));
+            }
+        "#;
+        let mut runtime = runtime("cache_response_header_family.production", code).await;
+        for name in [
+            "set-cookie",
+            "authentication-info",
+            "clear-site-data",
+            "www-authenticate",
+            // Invented, and exactly as dangerous: a token minted for one
+            // caller and replayed to every later one.
+            "x-csrf-token",
+        ] {
+            let path = format!("/account?header={name}");
+            let stored = ask_json(&mut runtime, &path, &[]).await;
+            let next = ask_json(&mut runtime, &path, &[]).await;
+            assert_eq!(
+                next["served"],
+                serde_json::Value::Null,
+                "a later caller was handed a response carrying {name}: {next}"
+            );
+            assert!(
+                stored["refused"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(name),
+                "the refusal has to name the header it would not replay ({name}): {stored}"
+            );
+        }
+
+        // And the remedy the old message recommended does not turn it into a
+        // store: a `Set-Cookie` a shared cache may keep is a contradiction
+        // however the response spells its lifetime.
+        let path = "/account?header=set-cookie&directive=public,%20max-age=60";
+        let stored = ask_json(&mut runtime, path, &[]).await;
+        let next = ask_json(&mut runtime, path, &[]).await;
+        assert_eq!(
+            next["served"],
+            serde_json::Value::Null,
+            "Cache-Control: public turned a refused Set-Cookie into a stored one: {next}"
+        );
+        assert!(
+            stored["refused"].is_string(),
+            "Cache-Control: public turned a refused Set-Cookie into a stored one: {stored}"
+        );
+    }
+
+    /// The freshness spellings that were never read.
+    ///
+    /// `Cache-Control` was the only field the store consulted, so a response
+    /// that said it had gone stale an hour ago in `Expires`, or `no-cache` in
+    /// the HTTP/1.0 spelling, was kept for the store's ten-minute default.
+    #[tokio::test]
+    async fn a_response_that_says_it_is_already_stale_is_not_kept_for_ten_minutes() {
+        let code = r#"
+            export default async function handler(context) {
+                const request = context.request;
+                const url = new URL(request.url);
+                const hit = await caches.default.match(request);
+                if (hit) return new Response(JSON.stringify({ served: await hit.text() }));
+                const headers = {};
+                switch (url.searchParams.get("stale")) {
+                    case "past":
+                        headers["expires"] = new Date(Date.now() - 3600000).toUTCString();
+                        break;
+                    case "zero":
+                        // What a framework writes to mean "never cache this",
+                        // and what RFC 9111 reads as a date in the past.
+                        headers["expires"] = "0";
+                        break;
+                    case "pragma":
+                        headers["pragma"] = "no-cache";
+                        break;
+                    case "future":
+                        headers["expires"] = new Date(Date.now() + 3600000).toUTCString();
+                        break;
+                }
+                let refused = null;
+                try {
+                    await caches.default.put(request, new Response("page", { headers }));
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, served: null }));
+            }
+        "#;
+        let mut runtime = runtime("cache_expires_pragma.production", code).await;
+        for stale in ["past", "zero", "pragma"] {
+            let path = format!("/account?stale={stale}");
+            let stored = ask_json(&mut runtime, &path, &[]).await;
+            let next = ask_json(&mut runtime, &path, &[]).await;
+            assert_eq!(
+                next["served"],
+                serde_json::Value::Null,
+                "a response that said it was already stale ({stale}) was served from the cache: \
+                 {next}"
+            );
+            assert!(
+                stored["refused"].is_string(),
+                "a response that said it was already stale ({stale}) was stored: {stored}"
+            );
+        }
+        // And the other half: a date in the future is a lifetime, so the
+        // entry is stored and the next caller gets it.
+        let path = "/account?stale=future";
+        let stored = ask_json(&mut runtime, path, &[]).await;
+        assert_eq!(
+            stored["refused"],
+            serde_json::Value::Null,
+            "an Expires in the future is a lifetime, not a refusal: {stored}"
+        );
+        let next = ask_json(&mut runtime, path, &[]).await;
+        assert_eq!(
+            next["served"], "page",
+            "an entry whose Expires is an hour away was not there a moment later: {next}"
+        );
+    }
+
+    /// `delete` answers for the variant the caller has, not for the URL.
+    ///
+    /// The store holds one variant per key and `delete` removed it by key
+    /// alone, so an anonymous caller's `delete` reported `true` -- telling it
+    /// that a variant it cannot see exists -- and threw away the entry
+    /// belonging to somebody else.
+    #[tokio::test]
+    async fn delete_answers_for_the_variant_the_caller_has() {
+        let code = r#"
+            const KEY = "https://example.invalid/dash";
+            const keyFor = (request) => {
+                const credential = request.headers.get("authorization");
+                return credential
+                    ? new Request(KEY, { headers: { authorization: credential } })
+                    : new Request(KEY);
+            };
+            export default async function handler(context) {
+                const request = context.request;
+                const url = new URL(request.url);
+                const key = keyFor(request);
+                switch (url.searchParams.get("do")) {
+                    case "store": {
+                        const who = request.headers.get("authorization") ?? "nobody";
+                        await caches.default.put(key, new Response("page-for:" + who, {
+                            headers: { vary: "authorization" },
+                        }));
+                        return new Response(JSON.stringify({ stored: true }));
+                    }
+                    case "drop": {
+                        const dropped = await caches.default.delete(key);
+                        return new Response(JSON.stringify({ dropped }));
+                    }
+                    default: {
+                        const hit = await caches.default.match(key);
+                        return new Response(JSON.stringify({
+                            served: hit === undefined ? null : await hit.text(),
+                        }));
+                    }
+                }
+            }
+        "#;
+        let mut runtime = runtime("cache_delete_variant.production", code).await;
+        let alice = &[("authorization", "Bearer alice")][..];
+
+        let stored = ask_json(&mut runtime, "/account?do=store", alice).await;
+        assert_eq!(stored["stored"], true);
+
+        let dropped = ask_json(&mut runtime, "/account?do=drop", &[]).await;
+        assert_eq!(
+            dropped["dropped"], false,
+            "an anonymous delete reported that it had removed a variant it cannot see: {dropped}"
+        );
+
+        let still_there = ask_json(&mut runtime, "/account?do=read", alice).await;
+        assert_eq!(
+            still_there["served"], "page-for:Bearer alice",
+            "an anonymous delete threw away another caller's entry: {still_there}"
+        );
+
+        // And the caller who does have the variant still deletes it.
+        let dropped = ask_json(&mut runtime, "/account?do=drop", alice).await;
+        assert_eq!(dropped["dropped"], true);
+        let gone = ask_json(&mut runtime, "/account?do=read", alice).await;
+        assert_eq!(gone["served"], serde_json::Value::Null);
+    }
+
+    /// The options the specification defines, none of which this cache used
+    /// to read.
+    ///
+    /// `match(request, options)` and `delete(request, options)` took the bag
+    /// and dropped it, so `ignoreVary: true` -- which asks for exactly the
+    /// disclosure this file exists to prevent -- read as an ordinary match
+    /// and was answered as though the caller had not asked for anything. An
+    /// option this cache cannot honour is refused by name; the one it can is
+    /// honoured.
+    #[tokio::test]
+    async fn an_option_this_cache_cannot_honour_is_refused_rather_than_dropped() {
+        let code = r#"
+            export default async function handler(context) {
+                const request = context.request;
+                const said = async (fn) => {
+                    try {
+                        await fn();
+                        return null;
+                    } catch (e) {
+                        return e.message;
+                    }
+                };
+                return new Response(JSON.stringify({
+                    ignoreVary: await said(() =>
+                        caches.default.match(request, { ignoreVary: true })),
+                    ignoreSearch: await said(() =>
+                        caches.default.match(request, { ignoreSearch: true })),
+                    unknown: await said(() =>
+                        caches.default.match(request, { ignoreCase: true })),
+                    deleteIgnoreVary: await said(() =>
+                        caches.default.delete(request, { ignoreVary: true })),
+                }));
+            }
+        "#;
+        let mut runtime = runtime("cache_options_bag.production", code).await;
+        let seen = ask_json(&mut runtime, "/account", &[]).await;
+        for option in ["ignoreVary", "ignoreSearch", "unknown", "deleteIgnoreVary"] {
+            assert!(
+                seen[option].is_string(),
+                "{option} was taken and dropped rather than refused: {seen}"
+            );
+        }
+        assert!(
+            seen["ignoreVary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ignoreVary"),
+            "the refusal has to name the option: {seen}"
+        );
+    }
+
+    /// `caches.open` cannot be talked into handing back the default cache.
+    ///
+    /// An application that opens a cache under a name it took from a request
+    /// -- a tenant, a locale, a path segment -- would otherwise hand a caller
+    /// who sent the name "default" the namespace every other part of the
+    /// application writes to through `context.services.cache`.
+    #[tokio::test]
+    async fn the_default_cache_cannot_be_opened_by_name() {
+        let code = r#"
+            export default async function handler(context) {
+                const name = new URL(context.request.url).searchParams.get("name");
+                await caches.default.put("https://example.invalid/p", new Response("the-default"));
+                let refused = null;
+                let seen = null;
+                try {
+                    const opened = await caches.open(name);
+                    const hit = await opened.match("https://example.invalid/p");
+                    seen = hit === undefined ? null : await hit.text();
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, seen }));
+            }
+        "#;
+        let mut runtime = runtime("cache_reserved_name.production", code).await;
+        let seen = ask_json(&mut runtime, "/account?name=default", &[]).await;
+        assert_eq!(
+            seen["seen"],
+            serde_json::Value::Null,
+            "a cache opened under a name from the request read the default cache: {seen}"
+        );
+        assert!(
+            seen["refused"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("default"),
+            "the refusal has to say which name is reserved: {seen}"
+        );
+        // An ordinary name is still an ordinary namespace.
+        let ordinary = ask_json(&mut runtime, "/account?name=pages", &[]).await;
+        assert_eq!(ordinary["refused"], serde_json::Value::Null);
+        assert_eq!(ordinary["seen"], serde_json::Value::Null);
+    }
+
+    /// The two statements an application makes on the call rather than in a
+    /// header.
+    ///
+    /// A per-caller answer may be cached, but only when the application says
+    /// whose it is -- and it says so in an argument, which no upstream, no
+    /// framework and no copied header can produce by accident. The entry is
+    /// then filed under that string and handed back only to a `match` that
+    /// names the same one.
+    #[tokio::test]
+    async fn a_per_caller_answer_is_cached_only_under_the_caller_the_application_names() {
+        let code = r#"
+            const KEY = "https://example.invalid/dash";
+            export default async function handler(context) {
+                const request = context.request;
+                const url = new URL(request.url);
+                const caller = url.searchParams.get("caller");
+                const options = caller ? { forCaller: caller } : undefined;
+                const hit = await caches.default.match(KEY, options);
+                if (hit) return new Response(JSON.stringify({ served: await hit.text() }));
+                let refused = null;
+                try {
+                    await caches.default.put(
+                        KEY,
+                        new Response("dashboard-for:" + (caller ?? "nobody")),
+                        options,
+                    );
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, served: null }));
+            }
+        "#;
+        let mut runtime = runtime("cache_for_caller.production", code).await;
+        let cookie = &[("cookie", "session=alice")][..];
+
+        let alice = ask_json(&mut runtime, "/account?caller=alice", cookie).await;
+        assert_eq!(
+            alice["refused"],
+            serde_json::Value::Null,
+            "an application that said whose answer this is was still refused: {alice}"
+        );
+        let alice_again = ask_json(&mut runtime, "/account?caller=alice", cookie).await;
+        assert_eq!(
+            alice_again["served"], "dashboard-for:alice",
+            "the caller the entry was filed under did not get it back: {alice_again}"
+        );
+        let bob = ask_json(
+            &mut runtime,
+            "/account?caller=bob",
+            &[("cookie", "session=bob")],
+        )
+        .await;
+        assert_eq!(
+            bob["served"],
+            serde_json::Value::Null,
+            "one caller's entry was handed to another: {bob}"
+        );
+        let anonymous = ask_json(&mut runtime, "/account", &[]).await;
+        assert_eq!(
+            anonymous["served"],
+            serde_json::Value::Null,
+            "a caller naming nobody was handed an entry filed under a caller: {anonymous}"
+        );
+    }
+
+    /// The other statement: this answer is not one caller's, said inside an
+    /// invocation that is serving one.
+    ///
+    /// Without it a cache is useless to any application whose requests carry
+    /// a session, because everything it fetches while serving that request is
+    /// refused. With it the application takes the decision, in a line of its
+    /// own code, that the answer does not depend on the caller.
+    #[tokio::test]
+    async fn an_application_may_state_that_an_answer_is_not_one_callers() {
+        let code = r#"
+            const KEY = "https://example.invalid/config";
+            export default async function handler(context) {
+                const hit = await caches.default.match(KEY);
+                if (hit) return new Response(JSON.stringify({ served: await hit.text() }));
+                let refused = null;
+                try {
+                    await caches.default.put(
+                        KEY,
+                        new Response("shared-config"),
+                        { forAnyCaller: true },
+                    );
+                } catch (e) {
+                    refused = e.message;
+                }
+                return new Response(JSON.stringify({ refused, served: null }));
+            }
+        "#;
+        let mut runtime = runtime("cache_for_any_caller.production", code).await;
+        let first = ask_json(&mut runtime, "/account", &[("cookie", "session=alice")]).await;
+        assert_eq!(
+            first["refused"],
+            serde_json::Value::Null,
+            "an application that stated the answer is everyone's was refused: {first}"
+        );
+        let second = ask_json(&mut runtime, "/account", &[("cookie", "session=bob")]).await;
+        assert_eq!(
+            second["served"], "shared-config",
+            "the entry the application stated was everyone's was not served: {second}"
         );
     }
 }

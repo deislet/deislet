@@ -28,7 +28,19 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
     let validation = compiler.validate(&project_dir, false)?;
 
     if !validation.is_valid() {
+        // The errors themselves, not only that there were some. This used to
+        // print two lines that named nothing, so an author whose build stopped
+        // here had to guess which file, and then run `deis-build validate`
+        // just to be told - which is the same work twice for information this
+        // command already had in its hand.
         println!("\n{}", "Validation failed".red().bold());
+        for error in &validation.errors {
+            println!("\n  {}:{}", error.file.red(), error.line.to_string().red());
+            println!("  {}: {}", "Error".red(), error.message.red());
+            if let Some(suggestion) = &error.suggestion {
+                println!("  {}: {}", "Suggestion".cyan(), suggestion.cyan());
+            }
+        }
         println!("{}", "\n✗ Fix validation errors before building".red());
         std::process::exit(1);
     }

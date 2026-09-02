@@ -217,7 +217,8 @@ stopped refreshing is exactly a node that is still serving what it last
 received and is not reconciling either, so every fleet-wide answer — a deploy,
 an application deletion — names it as unreached instead of describing only the
 half of the fleet that still answers. It clears itself when the node registers
-again, or with `DELETE /api/nodes/{id}/registration` when the machine is gone.
+again, or with a `DELETE` of `deis_wire::conventions::NODE_REGISTRATION_ROUTE`
+when the machine is gone.
 
 ### 8. Configuration management (`src/config_manager/`)
 

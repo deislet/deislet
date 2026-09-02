@@ -865,9 +865,15 @@ async fn a_named_flag_takes_the_fix_without_a_date() {
 /// handler is answered out of the entry the first one wrote.
 const TWO_COOKIES_THROUGH_THE_CACHE: &str = r#"
 const KEY = "http://localhost/cached";
+// A response that sets cookies is one caller's, and this cache stores such an
+// answer only when the application says whose it is -- an argument on the
+// call, which is the one statement no upstream header can produce. Without it
+// the `put` is refused, because a `Set-Cookie` handed to the next caller out
+// of a shared store gives them the first caller's session.
+const WHOSE = { forCaller: "the-one-caller" };
 
 export default async function handler(context) {
-  const hit = await caches.default.match(KEY);
+  const hit = await caches.default.match(KEY, WHOSE);
   if (hit) {
     hit.headers.set("x-served-from", "cache");
     return hit;
@@ -877,7 +883,7 @@ export default async function handler(context) {
   headers.append("set-cookie", "csrf=xyz; Path=/");
   headers.set("x-served-from", "handler");
   const fresh = new Response("ok", { status: 200, headers });
-  await caches.default.put(KEY, fresh);
+  await caches.default.put(KEY, fresh, WHOSE);
   return fresh;
 }
 "#;
@@ -1109,6 +1115,63 @@ async fn unloading_an_app_takes_its_bundles_and_its_record_with_it() {
     assert!(deployer.store().records().await.is_empty());
     // Otherwise a restart with no control plane would bring the app back.
     assert!(!dir.path().join("bundles/apps/demo").exists());
+}
+
+/// What the node says about itself follows a delivery and an unload, not the
+/// next reconcile pass.
+///
+/// A degraded node is judged at the edge on the count it states: `200` while
+/// it is serving something, `503` once it is serving nothing. Recomputing that
+/// count only at the end of a reconcile pass left both mistakes standing for a
+/// whole interval - a node that had stopped the last thing it had still
+/// claiming it could serve, and one that had just taken delivery still
+/// claiming it could not.
+///
+/// The reason has to survive both, because neither event says anything about
+/// why the node lost touch with its control plane in the first place.
+#[tokio::test]
+async fn a_delivery_and_an_unload_move_what_a_degraded_node_says_it_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let control =
+        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
+
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer_in(dir.path(), apps.clone()).await;
+
+    let health = crate::health::NodeHealth::starting();
+    // What `run_control_loop` does before its first pass.
+    deployer.report_readiness_to(health.clone());
+
+    // The state a fleet enters together when its control plane goes down: the
+    // node kept what it had, and what it had was nothing.
+    let reason = "control plane unreachable: connection refused";
+    health.mark_degraded(reason, 0);
+
+    deployer
+        .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
+        .await
+        .expect("the push itself succeeds");
+    assert_eq!(
+        health.snapshot(),
+        crate::health::Readiness::Degraded {
+            reason: reason.to_string(),
+            apps: 1,
+        },
+        "the node has something to serve now and the probe answers 200 off that count; nothing \
+         about the control plane changed, so the reason must not"
+    );
+
+    deployer.unload("demo", None).await.expect("it was running");
+    assert_eq!(
+        health.snapshot(),
+        crate::health::Readiness::Degraded {
+            reason: reason.to_string(),
+            apps: 0,
+        },
+        "a degraded node with nothing loaded answers 500 to every request it is given, and it \
+         has to say so before the next reconcile pass rather than after it"
+    );
 }
 
 #[tokio::test]

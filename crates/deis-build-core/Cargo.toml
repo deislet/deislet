@@ -31,3 +31,10 @@ thiserror = "1.0"
 # breaks the build; if the pin has to move, move rolldown first.
 rolldown = { git = "https://github.com/rolldown/rolldown", tag = "v1.0.0-rc.1", features = ["experimental"] }
 rolldown_common = { git = "https://github.com/rolldown/rolldown", tag = "v1.0.0-rc.1" }
+# The diagnostic types the bundler reports its warnings as. Named here rather
+# than matched on the text of `EventKind`'s `Display`, because which warnings
+# mean "the module this build emitted refers to something that is not there"
+# is a decision the build has to keep making correctly across a bundler
+# upgrade, and a renamed code would then stop matching in silence - see
+# `BuildBundler::refuse_broken_references`.
+rolldown_error = { git = "https://github.com/rolldown/rolldown", tag = "v1.0.0-rc.1" }

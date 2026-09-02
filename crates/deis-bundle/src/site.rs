@@ -81,7 +81,7 @@ impl std::error::Error for RuleError {}
 /// The names are the ones Cloudflare's `not_found_handling` uses, because an
 /// author arriving from Pages already knows them and a second vocabulary for
 /// the same three choices helps nobody.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub enum NotFound {
     /// Let the request through to the isolate, which answers 404 itself.
     #[default]
@@ -93,6 +93,33 @@ pub enum NotFound {
     /// Serve `index.html` with status 200.
     #[serde(rename = "single-page-app")]
     SinglePageApp,
+}
+
+impl<'de> Deserialize<'de> for NotFound {
+    /// A spelling this build does not know reads as [`NotFound::None`] rather
+    /// than refusing the manifest.
+    ///
+    /// This is a three-value allow-list and the list can grow, so a derived
+    /// `Deserialize` made every future fourth behaviour a bundle an older node
+    /// would throw away whole - the application's code, routes, bindings and
+    /// assets with it, unrepairable, because the manifest is inside the
+    /// archive whose digest is the version id. See [`crate::forward`] for the
+    /// rule.
+    ///
+    /// `None` is the narrow reading and not merely the default: it is what
+    /// every application had before this field existed - the request reaches
+    /// the isolate and the application answers its own 404 - so an older node
+    /// serves the application's own answer instead of a page it cannot name.
+    /// The value that was written is still in the manifest text and is named
+    /// at `warn` by [`crate::forward::report`]; only this build's reading of
+    /// it is narrowed.
+    ///
+    /// [`NotFound::parse`] stays strict, because it reads what an author has
+    /// just typed into a project file rather than what a builder wrote.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Ok(Self::from_manifest(&text))
+    }
 }
 
 impl NotFound {
@@ -113,6 +140,24 @@ impl NotFound {
             Self::SinglePageApp => 200,
         }
     }
+
+    /// The manifest spelling of one behaviour, or [`Self::None`] for a
+    /// spelling this build does not know.
+    ///
+    /// The exact strings [`Serialize`] writes, and nothing else: this reads
+    /// what a builder wrote, where the loose spellings [`Self::parse`] accepts
+    /// have already been resolved.
+    pub fn from_manifest(text: &str) -> Self {
+        match text {
+            "404-page" => Self::Page,
+            "single-page-app" => Self::SinglePageApp,
+            _ => Self::None,
+        }
+    }
+
+    /// Every spelling this build reads out of a manifest, for the message that
+    /// names one it does not.
+    pub const MANIFEST_SPELLINGS: [&'static str; 3] = ["none", "404-page", "single-page-app"];
 
     /// Parse the spelling a project config uses.
     pub fn parse(text: &str) -> Result<Self, String> {

@@ -44,6 +44,28 @@ function root decides which requests reach it:
 Patterns go into `manifest.json` as `routes[].pattern`, spelled exactly the way
 `RouteRule.pattern` is spelled on the wire.
 
+**Every one of those files needs a `export default` handler.** The generated
+entry module reaches each one as `import handlerN from "<file>"` and puts
+`handlerN` into a table built at module scope, so a file with nothing to bind
+there leaves a free identifier in a module that throws `ReferenceError` as the
+node evaluates it - the whole application down, every route, not the one file.
+Named exports alone are not enough, and the build refuses such a file by name.
+A helper that is not a handler belongs outside the function root.
+
+**A file name is data in the route table, never syntax.** `[name]` and
+`[[name]]` are how the file tree spells a placeholder and a catch-all, so a
+raw `:` or `*` in a name is a literal and is escaped to stay one:
+`functions/api/*.ts` answers `/api/%2A`, not the catch-all `/api/*`, and
+`functions/users/:id.ts` answers `/users/%3Aid` rather than colliding with
+`[id].ts`. A `%` is escaped too, which is what makes one file name mean exactly
+one route. The build names every segment it escaped, because a name written
+that way is usually a misspelling of the bracket form.
+
+A backslash in a name is **refused** instead of escaped. It is a directory
+separator on Windows and a name character elsewhere, so the same tree would be
+two different route tables on two machines, and a version identity that depends
+on the build host is not an identity.
+
 **The table is ordered by specificity**, most specific first, so the generated
 matcher can take the first pattern that fits. The rule compares two patterns
 segment by segment - a literal beats a `:name`, which beats a catch-all - and a

@@ -29,13 +29,39 @@ impl Validator {
         _strict: bool,
         result: &mut ValidationResult,
     ) -> anyhow::Result<()> {
-        // Check for exports
-        if !handler_info.has_default_export && handler_info.named_exports.is_empty() {
+        // The default export, and only the default export.
+        //
+        // This used to accept named exports instead, and a file with named
+        // exports and no default reported no errors at all - while the build
+        // it was meant to speak for produced an application that could not
+        // load. Every generated router imports a handler as
+        // `import handlerN from "<file>"` and puts `handlerN` in its route
+        // table at module scope, so a file with nothing to bind there leaves a
+        // free identifier in a module that throws `ReferenceError` while it is
+        // being evaluated: the whole application is down, not the one route.
+        // `deis_build_core::bundler::BuildBundler` refuses the same thing at
+        // the other end, on the bundler's own report; this is the half that
+        // can name the author's own file.
+        if !handler_info.has_default_export {
+            let named = if handler_info.named_exports.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " It exports {} by name ({}), and named exports are not what a router \
+                     imports.",
+                    handler_info.named_exports.len(),
+                    handler_info.named_exports.join(", ")
+                )
+            };
             result.add_error(ValidationError {
                 file: handler_info.path.clone(),
                 line: 1,
                 column: 1,
-                message: "Handler must have a default export or named exports".to_string(),
+                message: format!(
+                    "Handler has no default export, so the generated router has nothing to call \
+                     and the whole application fails to load - every route, not only this one.\
+                     {named}"
+                ),
                 code: "NO_EXPORTS".to_string(),
                 severity: Severity::Error,
                 suggestion: Some(
@@ -261,8 +287,11 @@ export default async function handler(context) {
         assert!(result.errors.is_empty());
     }
 
+    /// Named exports without a default used to pass, and the build that
+    /// followed produced a worker that threw `ReferenceError` on load - every
+    /// route down, with a green build behind it.
     #[test]
-    fn test_named_exports_ok() {
+    fn named_exports_without_a_default_are_not_enough() {
         let validator = Validator::new();
         let code = r#"
 export const config = { runtime: 'edge' };
@@ -282,8 +311,21 @@ export function middleware(req) { return req; }
             )
             .unwrap();
 
-        // Named exports should be acceptable
-        assert!(result.errors.is_empty());
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].code, "NO_EXPORTS");
+        // The message has to name what the file does have, or an author
+        // reading "no export" while looking at two `export` keywords stops
+        // believing the tool.
+        assert!(
+            result.errors[0].message.contains("middleware"),
+            "{:?}",
+            result.errors[0]
+        );
+        assert!(
+            result.errors[0].message.contains("whole application"),
+            "the cost is the whole app, not the route: {:?}",
+            result.errors[0]
+        );
     }
 
     #[test]

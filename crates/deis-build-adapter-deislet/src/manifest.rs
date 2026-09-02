@@ -177,7 +177,13 @@ fn compatibility(config: &ProjectConfig) -> Result<Option<DeclaredCompatibility>
     if declared.is_empty() {
         return Ok(None);
     }
-    declared.validate().map_err(|e| {
+    // `validate_as_written`, not `validate`: this is the one reader of a
+    // compatibility block that is looking at what an author just typed, so a
+    // flag name nothing knows is a misspelling here and is refused. Every
+    // other reader - the control plane at upload, a node at install - cannot
+    // tell a misspelling from a flag a newer release added, so it ignores the
+    // name instead of refusing the bundle (`deis_bundle::forward`).
+    declared.validate_as_written().map_err(|e| {
         anyhow::anyhow!("the project's compatibility declaration is not usable: {e}")
     })?;
     Ok(Some(declared))

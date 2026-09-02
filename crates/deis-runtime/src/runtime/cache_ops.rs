@@ -30,126 +30,201 @@
 //!
 //! `caches.open(name)` answers a cache of its own. There is one store, and a
 //! name is a namespace inside it: keys are composed by [`namespaced`], which
-//! is length-prefixed so no two `(name, key)` pairs can ever produce the same
-//! composed key. Sharing the store is what keeps the isolate's memory ceiling
-//! one number rather than one per name an application invents.
+//! is length-prefixed at every join so no two `(name, caller, key)` triples
+//! can ever produce the same composed key. Sharing the store is what keeps the
+//! isolate's memory ceiling one number rather than one per name an application
+//! invents.
 //!
-//! Nothing here knows which name is the default one. `caches.default` and
-//! `ctx.services.cache` are one object in `js/runtime.js` holding one name, so
-//! the two spellings cannot come apart; these ops take whatever name they are
-//! given and would treat `"default"` as an ordinary namespace if an
-//! application opened it by hand -- which is the right answer, because it is
-//! the same cache.
+//! These ops take whatever name they are given and know nothing about which
+//! one is the default. `caches.default` and `ctx.services.cache` are one
+//! object in `js/runtime.js` holding one name, so the two spellings cannot
+//! come apart -- and that name is refused to `caches.open` and
+//! `caches.delete`, because an application opening a cache under a name it
+//! took from a request would otherwise hand a caller who sent `"default"` the
+//! namespace the rest of that application caches into.
 //!
 //! # Freshness, and what is not stored at all
 //!
 //! An entry carries the lifetime the response asked for. The JavaScript side
-//! reads `s-maxage`, then `max-age`, off the response's `Cache-Control` and
-//! passes it here as whole seconds; zero means the response said nothing and
-//! the store's own default applies. Expiry is from the write, not from the
-//! last read: reading a cached response does not make it fresher.
+//! reads `s-maxage`, then `max-age`, then `Expires`, and passes the result
+//! here as whole seconds; zero means the response named no lifetime and the
+//! store's own default applies. Expiry is from the write, not from the last
+//! read: reading a cached response does not make it fresher.
 //!
-//! The same field decides whether the response reaches this module at all.
-//! This is a *shared* cache -- one store per isolate, read by every later
+//! The same three fields decide whether the response reaches this module at
+//! all. This is a *shared* cache -- one store per isolate, read by every later
 //! request to the same application, from every client -- so `js/runtime.js`
-//! refuses `no-store`, `private`, `no-cache` and a shared lifetime of zero,
-//! and tells the caller which of them it was. The first two are what RFC 9111
-//! says for a shared cache. The other two both mean "check with the origin
-//! before reusing this", and there is nothing here that can check: no
-//! revalidation, no conditional request, no upstream to ask. An entry that may
-//! only be served after a check that cannot be made is one that may never be
-//! served, so it is refused rather than kept for the default lifetime -- which
-//! is what used to happen to every `no-cache` and `max-age=0` response.
+//! refuses `no-store`, `private`, `no-cache`, a shared lifetime of zero, an
+//! `Expires` that has already passed, and `Pragma: no-cache` where there is no
+//! `Cache-Control` to override it. The first two are what RFC 9111 says for a
+//! shared cache. The rest all mean "check with the origin before reusing
+//! this", and there is nothing here that can check: no revalidation, no
+//! conditional request, no upstream to ask. An entry that may only be served
+//! after a check that cannot be made is one that may never be served, so it is
+//! refused rather than kept for the default lifetime -- which is what used to
+//! happen to every `no-cache`, every `max-age=0`, and every response that said
+//! in `Expires` that it had gone stale an hour ago.
 //!
-//! # The contract
+//! # The rule
 //!
-//! Three questions, and this is the whole of the answer to each. They are
-//! enforced in one place -- `Cache.put` and `Cache.match` in `js/runtime.js`,
-//! which read the predicates written directly above them -- rather than one
-//! rule per axis somebody happened to look at. Every refusal below names
-//! itself and names the fix, because a `put` that quietly does nothing leaves
-//! the application believing it has a cache.
+//! **An entry is stored only when this platform can see that it is safe to
+//! hand to a caller it cannot identify: every header on the request being
+//! answered and on the key is one of a closed list that cannot single a caller
+//! out, or one the response files the entry under with `Vary`; and every
+//! header on the response is one of a closed list that describes the
+//! representation. Anything else is refused -- including every name neither
+//! list has heard of -- and an application that wants a per-caller answer
+//! cached says whose it is on the call.**
 //!
-//! ## 1. What an entry is an answer to
+//! ## Why it is written that way round
+//!
+//! Because the other way round does not converge. Four rounds of adversarial
+//! review found a cross-user disclosure here, each repair was correct for what
+//! it covered, and each left the next name to be found: repeated `Set-Cookie`
+//! collapsed onto one, then `Vary` unread, then the request's method unread,
+//! then a credential rule that named `Authorization` and nothing else -- so
+//! `Cookie`, which is how most of the web authenticates, walked past it and a
+//! private dashboard went out to the next anonymous caller together with its
+//! `HttpOnly` session cookie. The pattern is the finding: the set of headers
+//! that can carry an identity, and the set of response headers that carry
+//! per-caller state, are both open-ended, and a cache that decides by
+//! enumerating what is unsafe is always one name short of the next round.
+//!
+//! So the lists in `js/runtime.js` are lists of what is *safe*
+//! (`HEADERS_THAT_CANNOT_NAME_A_CALLER`, `HEADERS_A_STRANGER_MAY_RECEIVE`),
+//! and a name on neither of them is refused. They are arguable name by name,
+//! and every argument about them is settled in the direction of refusing to
+//! store something rather than the direction of handing one caller's page to
+//! the next.
+//!
+//! ## The four questions, and the whole of the answer to each
+//!
+//! They are enforced in one place -- `Cache.put`, `Cache.match` and
+//! `Cache.delete` in `js/runtime.js`, which read the predicates written
+//! directly above them -- rather than one rule per axis somebody happened to
+//! look at. Every refusal names itself and names the fix, because a `put` that
+//! quietly does nothing leaves the application believing it has a cache.
+//!
+//! ### 1. What an entry is an answer to
 //!
 //! One GET, and nothing else. The Cache API's key is a `Request`, and a
 //! `Request` carries a method: an entry is the answer to *that request*, not
 //! to its URL. The answer to `POST /orders` is the result of an action rather
 //! than a representation of anything, so a `put` keyed by any other method is
-//! refused, and a `match` or a `delete` for one finds nothing. A key given as
-//! a string or a `URL` is the spelling for `new Request(url)`, which is a GET.
+//! refused, and a `match` or a `delete` for one finds nothing unless the
+//! caller passes `{ ignoreMethod: true }` and asks for the GET entry by name.
+//! A key given as a string or a `URL` is the spelling for `new Request(url)`,
+//! which is a GET.
 //!
 //! This was missing outright: the store was keyed by the URL alone, so a
 //! handler that cached the answer to a POST handed that answer to every later
 //! GET of the same address, whoever sent it.
 //!
-//! ## 2. What may be stored
-//!
-//! A response that is a whole answer to that GET, that a shared cache is
-//! allowed to keep, and whose variant this platform can vouch for.
+//! ### 2. What may be stored
 //!
 //! * **A whole answer.** A status of 200-599 -- 101 and the rest of the 1xx
 //!   range are not answers, and a stored 101 would come back out of `match` as
 //!   an upgrade nothing can perform. Not `206 Partial Content` and nothing
 //!   carrying `Content-Range`: those are one range of a body, and there is
 //!   nothing here that can join ranges or match a `Range` header against a
-//!   stored one, so such an entry could only be handed whole to a caller who
-//!   asked for the whole body. Not `304 Not Modified`: it answers a
-//!   conditional request by saying the caller already has the body, and this
-//!   cache has no validator to check.
+//!   stored one. Not `304 Not Modified`: it answers a conditional request by
+//!   saying the caller already has the body, and this cache has no validator
+//!   to check.
 //! * **Not one the response itself excludes**: `no-store`, `private`,
-//!   `no-cache`, and a shared lifetime of zero. See the section below on
-//!   freshness for why each of those means what it means to a cache that
-//!   cannot revalidate.
-//! * **Not one whose reader this store cannot tell from another.** The three
-//!   rules for that are question 3.
-//! * **Not one so large that admitting it would empty the store**; see
+//!   `no-cache`, a shared lifetime of zero, a past `Expires`, `Pragma:
+//!   no-cache`. See the section on freshness above.
+//! * **Nothing whose reader this store cannot tell from another**: question 3.
+//! * **Nothing that would give its reader something that is somebody's**:
+//!   question 4.
+//! * **Nothing so large that admitting it would empty the store**; see
 //!   [`CacheScope::max_entry_bytes`].
 //!
-//! ## 3. Who may be handed it back
+//! ### 3. Whether the answer could be one caller's
 //!
-//! A later GET of the same key whose values, for every header the entry
-//! varies on, are the values the entry was stored for. Everything else is a
-//! miss, and a miss is a refetch, which is the whole point.
+//! Two requests are read, not one. The key says what the entry will be filed
+//! under; the request this invocation is answering says what the response
+//! could have been *about*, because a handler serving a caller who sent a
+//! session cookie may produce anything from that cookie whatever key the
+//! application then writes the answer under. Every header on either of them
+//! that is not on the closed safe list has to be accounted for: the response
+//! must name it in `Vary`, and the key must carry the same value for it as the
+//! request being answered.
 //!
 //! A response that carries `Vary` says its body depends on named headers of
 //! the request. The values those names had are stored *with* the entry, so the
 //! store holds one variant per key -- a second `put` replaces the first --
-//! which costs a hit and never costs a wrong answer.
+//! which costs a hit and never costs a wrong answer. The property that makes a
+//! hit safe is that **the variant an entry is filed under was stated by
+//! somebody, never inferred by this platform**, so `Vary: *` is refused (no
+//! later request may reuse it), a varying response under a bare URL is refused
+//! (nothing to read the values off), and a varying response under a `Request`
+//! carrying no value for one of those names is refused unless that `Request`
+//! is the one being answered -- where "carries none of them" is not a claim but
+//! the truth.
 //!
-//! The property that makes a hit safe is that **the variant an entry is filed
-//! under was stated by somebody, never inferred by this platform**. Three
-//! refusals at `put` are that one property, applied to the three ways a
-//! variant can come out unstated:
+//! `public` and `s-maxage` say nothing here. RFC 9111 lists them as ways a
+//! response may permit a shared cache to reuse an authenticated answer, and
+//! that is exactly what made them dangerous: they are what an upstream, a
+//! framework or a copied header produces by accident, and the refusal message
+//! used to recommend them, so a developer following this platform's own
+//! written instruction created the disclosure it had just refused. A directive
+//! is a lifetime now, and nothing more.
 //!
-//! * `Vary: *` says no later request may reuse this response at all.
-//! * A varying response whose key is a bare URL or a string carries no headers
-//!   to read the values off, so the entry would be handed to whoever asked for
-//!   that string next.
-//! * A varying response whose key is a `Request` that carries no value for one
-//!   of those names, and is not the request this invocation is answering. A
-//!   value the key carries is at least the caller's own statement about what
-//!   the response is for; a missing one is this platform inventing "the caller
-//!   sent none of that header", which is precisely the variant every anonymous
-//!   caller matches. The exception is the request being answered, where
-//!   "carries none of them" is not a claim but the truth -- an anonymous
-//!   caller caching its own anonymous page stays ordinary.
+//! ### 4. What the answer would give its reader
 //!
-//! The third refusal used to ask whether the key carried *any* of the varying
-//! headers, and one extra name in `Vary` walked past it: a key carrying
-//! `Accept-Language` and no `Authorization` counted as carrying some, was
-//! filed as the "sent no Authorization" variant, and the authenticated page
-//! went out to the next anonymous caller sending that language. The question
-//! is per name.
+//! A response does not only *depend* on a caller; it can also *establish*
+//! something for one, and no `Vary` can make that safe because `Vary`
+//! describes what the request decided. A `Set-Cookie` replayed out of this
+//! store hands every later caller the session the first one was given -- which
+//! is session fixation, not disclosure -- and the family it belongs to
+//! (`Set-Cookie2`, `Clear-Site-Data`, `Authentication-Info`, whatever is
+//! defined next, plus every per-request token an application puts in a header
+//! of its own naming) has no more of an end than the credential family does.
+//! So the same sentence in the other direction: a stored response may carry
+//! only what describes the representation, how long it is good for, or a
+//! policy that is the same for every caller of the site.
 //!
-//! And the same disclosure reached without `Vary` at all: a key carrying
-//! `Authorization` against a response that records nothing about whose answer
-//! it is. RFC 9111 section 3.5 forbids a shared cache to reuse such a
-//! response unless the response says it may, and this is such a cache. The
-//! three ways to say it may are `Vary: Authorization` (file the entry under
-//! the credential), `public`, and `s-maxage`. `must-revalidate`, the fourth
-//! the RFC lists, is not accepted here: it permits storing on the promise that
-//! the entry is revalidated before reuse, and nothing here can revalidate.
+//! ## The two statements, and why they are arguments
+//!
+//! An application that genuinely wants a per-caller answer cached says so in a
+//! third argument to `put`, and reads it back by naming the same caller:
+//!
+//! ```text
+//! await cache.put(request, response, { forCaller: userId });
+//! const hit = await cache.match(request, { forCaller: userId });
+//! ```
+//!
+//! The entry is filed under that string -- it is part of the composed key, see
+//! [`namespaced`] -- so it is never handed to a `match` that names another
+//! caller, and the checks that keep one caller's answer away from another do
+//! not arise. The other statement, `{ forAnyCaller: true }`, is how an
+//! application says an answer does not depend on the caller at all, which is
+//! what a handler needs when it is serving an identified caller and caching
+//! something shared. It does not waive question 4: a response that hands its
+//! reader a session and an application saying the answer suits everybody
+//! contradict each other, and a contradiction is refused.
+//!
+//! Both are arguments rather than headers, and that is the whole point of
+//! them. `Cache-Control: public` can be produced by an upstream, a framework,
+//! a proxy or a copied line; a third argument in this application's own source
+//! cannot be produced by accident.
+//!
+//! ## What it costs
+//!
+//! An application relying on the old behaviour loses these, and is told so at
+//! the call rather than left to find out:
+//!
+//! * caching the answer to any request carrying a header this platform does
+//!   not recognise -- a `Cookie`, an `Origin`, an `X-Forwarded-For`, a vendor
+//!   header a CDN in front adds -- unless the response varies on it or the
+//!   application makes one of the two statements;
+//! * caching an upstream response verbatim when the upstream decorates it
+//!   (`x-amz-request-id`, `cf-ray`, `server-timing`): store a copy carrying
+//!   the headers it means to serve;
+//! * `public` and `s-maxage` as permission to store anything;
+//! * `caches.open("default")` and `caches.delete("default")`, which now throw;
+//! * `match`/`delete` quietly ignoring `ignoreVary`, `ignoreSearch` and
+//!   `cacheName`, which are now refused by name.
 //!
 //! # Why a body is bytes and the rest is a string
 //!
@@ -297,8 +372,8 @@ impl IsolateCache {
     /// through the ops, and this is how a test asks what an op actually wrote
     /// without having to compose the namespaced key itself.
     #[cfg(test)]
-    pub(crate) async fn entry(&self, name: &str, key: &str) -> Option<CacheEntry> {
-        self.entries.get(&namespaced(name, key)).await
+    pub(crate) async fn entry(&self, name: &str, caller: &str, key: &str) -> Option<CacheEntry> {
+        self.entries.get(&namespaced(name, caller, key)).await
     }
 
     /// How many entries this store holds, after pending maintenance.
@@ -325,16 +400,40 @@ impl IsolateCache {
 /// context and must not hold the state borrow across an await.
 pub type CacheStore = Arc<IsolateCache>;
 
-/// The key one `(cache name, request key)` pair is stored under.
+/// Everything one named cache holds, whichever caller it was filed under.
 ///
-/// Length-prefixed, so the composition is injective: `("ab", "c")` becomes
-/// `2:ab:c` and `("a", "b:c")` becomes `1:a:b:c`, and no pair of names and
-/// keys can be made to collide. A plain `name + ":" + key` could, and an
-/// application that opened a cache named after user input would then be able
-/// to read and overwrite another of its own caches -- a correctness failure
-/// that would look like the cache occasionally returning the wrong page.
-fn namespaced(name: &str, key: &str) -> String {
-    format!("{}:{}:{}", name.len(), name, key)
+/// The prefix `namespaced` builds on, and what `op_cache_clear` walks: a
+/// `caches.delete(name)` empties that namespace for every caller at once,
+/// which is what an application asking for the namespace to be empty means.
+fn namespace_prefix(name: &str) -> String {
+    format!("{}:{}:", name.len(), name)
+}
+
+/// The key one `(cache name, caller, request key)` triple is stored under.
+///
+/// Length-prefixed at both joins, so the composition is injective:
+/// `("ab", "", "c")` becomes `2:ab:0::c` and `("a", "", "b:c")` becomes
+/// `1:a:0::b:c`, and no triple can be made to collide with another. A plain
+/// `name + ":" + key` could, and an application that opened a cache named
+/// after user input would then be able to read and overwrite another of its
+/// own caches -- a correctness failure that would look like the cache
+/// occasionally returning the wrong page.
+///
+/// `caller` is empty for the ordinary entry, which is one any caller may be
+/// handed, and is the string the application named in `{ forCaller }` for an
+/// entry that is one caller's. Composed here rather than in `js/runtime.js`
+/// so that there is one composition and one test of it: an application that
+/// names its callers from its own data would otherwise be able to pick a
+/// string that reads as another caller's key, which is the same collision
+/// one join up.
+fn namespaced(name: &str, caller: &str, key: &str) -> String {
+    format!(
+        "{}{}:{}:{}",
+        namespace_prefix(name),
+        caller.len(),
+        caller,
+        key
+    )
 }
 
 /// Applies each entry's own lifetime, falling back to the store's default.
@@ -384,6 +483,7 @@ impl Expiry<String, CacheEntry> for ResponseFreshness {
 async fn op_cache_get(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
+    #[string] caller: String,
     #[string] key: String,
 ) -> Option<CachedResponse> {
     let cache = {
@@ -392,12 +492,39 @@ async fn op_cache_get(
     };
     cache
         .entries
-        .get(&namespaced(&name, &key))
+        .get(&namespaced(&name, &caller, &key))
         .await
         .map(|entry| CachedResponse {
             meta: entry.meta,
             body: ToJsBuffer::from(entry.body),
         })
+}
+
+/// Read one entry's `meta` without its body.
+///
+/// `Cache.delete` has to know what variant an entry was filed under before it
+/// may remove it -- a caller who does not have that variant is deleting
+/// somebody else's entry -- and the variant is in `meta`. Reading it through
+/// `op_cache_get` would copy the whole body out of the store to answer a
+/// question about its headers, which for a cached image is megabytes moved to
+/// decide one comparison.
+#[op2]
+#[string]
+async fn op_cache_meta(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] caller: String,
+    #[string] key: String,
+) -> Option<String> {
+    let cache = {
+        let state_borrow = state.borrow();
+        state_borrow.borrow::<CacheStore>().clone()
+    };
+    cache
+        .entries
+        .get(&namespaced(&name, &caller, &key))
+        .await
+        .map(|entry| entry.meta)
 }
 
 /// Write a cached response.
@@ -411,6 +538,7 @@ async fn op_cache_get(
 async fn op_cache_set(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
+    #[string] caller: String,
     #[string] key: String,
     #[string] meta: String,
     #[buffer] body: JsBuffer,
@@ -427,7 +555,7 @@ async fn op_cache_set(
         )
     };
 
-    let composed = namespaced(&name, &key);
+    let composed = namespaced(&name, &caller, &key);
     let entry = CacheEntry {
         meta,
         body: body.to_vec(),
@@ -479,6 +607,7 @@ async fn op_cache_set(
 async fn op_cache_delete(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
+    #[string] caller: String,
     #[string] key: String,
 ) -> bool {
     let cache = {
@@ -487,7 +616,7 @@ async fn op_cache_delete(
     };
     cache
         .entries
-        .remove(&namespaced(&name, &key))
+        .remove(&namespaced(&name, &caller, &key))
         .await
         .is_some()
 }
@@ -512,7 +641,7 @@ async fn op_cache_clear(state: Rc<RefCell<OpState>>, #[string] name: String) -> 
         state_borrow.borrow::<CacheStore>().clone()
     };
 
-    let prefix = namespaced(&name, "");
+    let prefix = namespace_prefix(&name);
     let doomed: Vec<Arc<String>> = cache
         .entries
         .iter()
@@ -545,6 +674,7 @@ extension!(
     deis_runtime_cache_ops,
     ops = [
         op_cache_get,
+        op_cache_meta,
         op_cache_set,
         op_cache_delete,
         op_cache_clear,

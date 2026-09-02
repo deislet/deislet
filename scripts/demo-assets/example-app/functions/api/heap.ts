@@ -21,6 +21,16 @@
 export default async function handler(context: any): Promise<Response> {
   const held: number[][] = [];
 
+  // A caller may name this attempt, and the name is logged before the first
+  // allocation. Every line one invocation produces carries the same
+  // `trace_id`, and `deis trace` prints that id on the row it writes for the
+  // invocation, so a caller that passes `?tag=` can find out which invocation
+  // was its own and insist the trace row it judges be that one. Without it a
+  // check watching for an out-of-heap ending is watching this environment for
+  // one, and any caller who can reach this route produces one.
+  const tag = new URL(context.request.url).searchParams.get("tag") ?? "";
+  if (tag !== "") context.log.info("heap witness " + tag);
+
   context.log.warn("allocating until this isolate reaches its heap ceiling");
   for (let i = 0; i < 100_000; i++) {
     held.push(new Array(64 * 1024).fill(i));

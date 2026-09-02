@@ -480,6 +480,83 @@ async fn without_a_control_plane_the_node_is_ready_on_what_it_has() {
     assert!(health.is_healthy());
 }
 
+/// A node with no control plane still has to notice when it refuses a push.
+///
+/// This is the worst version of the fault: with no control plane configured
+/// there is no reconcile pass at all after the first, so the readiness the
+/// loop computed on its way out was the last word for the life of the
+/// process. A node that then refused a pushed deployment answered the edge
+/// `ready`, and kept its full share of that application's traffic,
+/// indefinitely.
+///
+/// It also pins the one line that joins the two: `run_control_loop` handing
+/// the deployment manager the same readiness it reports its own passes
+/// through. Without it every hook in `DeploymentManager` is dead code.
+#[tokio::test]
+async fn a_refused_push_degrades_a_node_that_has_no_next_reconcile_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps).await;
+    let health = crate::health::NodeHealth::starting();
+
+    run_control_loop(
+        None,
+        None,
+        Arc::clone(&deployer),
+        health.clone(),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        health.is_healthy(),
+        "a node with nothing to be missing is ready: {:?}",
+        health.snapshot()
+    );
+
+    // A bundle URL nothing answers on: the push is refused after the control
+    // plane has already been told this node would run the version.
+    let refused = DeploymentOrder {
+        app_id: "demo".to_string(),
+        version_id: "v1".to_string(),
+        environment: "production".to_string(),
+        bundle_url: "http://127.0.0.1:1/bundle".to_string(),
+        bundle_sha: "0".repeat(64),
+        env: std::collections::HashMap::new(),
+        limits: None,
+        compatibility: None,
+    };
+    let err = deployer
+        .apply(refused)
+        .await
+        .expect_err("nothing serves that bundle");
+
+    match health.snapshot() {
+        crate::health::Readiness::Degraded { reason, apps } => {
+            assert!(
+                reason.contains("demo") && reason.contains("did not take it"),
+                "the reason has to name what this node refused, or the answer is one more \
+                 guess: {reason}"
+            );
+            assert!(
+                reason.contains("could not be downloaded"),
+                "and which step refused, which is what sends an operator to the right place: \
+                 {reason}"
+            );
+            assert!(
+                !reason.contains("127.0.0.1:1"),
+                "but not the error's own message: this reason is answered unauthenticated on \
+                 the node's data port, and a load error is text the application wrote: {reason}"
+            );
+            assert_eq!(apps, 0, "nothing was installed, so nothing is being served");
+        }
+        other => panic!(
+            "a node that has just refused a push must not go on answering the edge that it is \
+             running what it was told to; it answered {other:?} after {err}"
+        ),
+    }
+}
+
 #[test]
 fn retries_back_off_but_never_stop() {
     let base = Duration::from_secs(15);

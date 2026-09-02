@@ -184,6 +184,12 @@ dist/
     └── deno.json          # Deno 配置
 ```
 
+`dist/<vendor>/` 下面的东西就是要部署的全部，不多一件。构建自带的冒烟检查——
+Cloudflare 那边是 `wrangler deploy --dry-run`——写在这棵树外面的临时目录里、跑完就删，
+所以同一份源码构建两次得到的字节是一样的。以前它写在 `dist/cloudflare/dist-check/`，
+于是 wrangler 自己那份 Worker 和一个带墙上时间的文件进了交付物，同一份源码构建两次
+结果还不一样。
+
 ## 部署到平台
 
 Build 只负责构建，部署需要使用各平台的工具。

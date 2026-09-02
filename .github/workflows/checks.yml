@@ -1,12 +1,17 @@
-# Repository checks that do not need a build.
+# What runs on every push and pull request.
 #
-# There is deliberately no cargo job here yet. `deis-control` embeds
-# `crates/deis-control/web/dist` at compile time, so a build in CI has to run
-# `npm ci && npm run build` in `crates/deis-control/web` first or it compiles a
-# binary that answers 404 for every dashboard page. Adding that belongs in its
-# own change, with the caching it needs; this workflow exists now because the
-# check below has no such prerequisite and the mistake it catches has already
-# been made twice.
+# Until this file grew the three jobs below it held one check that needed no
+# build, and a comment explaining that a cargo job was for later. The effect
+# was that nothing automatic ever compiled this workspace, ran its 2386 tests,
+# or ran `scripts/demo.sh verify` - the run this project's evidence is quoted
+# from. Every one of those was a thing somebody remembered to do on a laptop,
+# and the record of it was a sentence in a commit message.
+#
+# The build is not free here, and the reason is worth stating once: deis-control
+# embeds `crates/deis-control/web/dist` at compile time, so any job that
+# compiles it has to `npm ci && npm run build` first or it produces a binary
+# that answers 404 for every dashboard page. Both cargo jobs below do that, and
+# both cache what it costs.
 name: checks
 
 on:
@@ -16,6 +21,20 @@ on:
 
 permissions:
   contents: read
+
+# A second push supersedes the first: these jobs take minutes, and a queue of
+# runs against commits nobody is looking at any more is a queue in front of the
+# one somebody is.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here is a performance measurement and every job starts from a cold
+  # target directory or a restored cache, so incremental compilation buys
+  # nothing and costs cache size.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   document-path-literals:
@@ -30,3 +49,146 @@ jobs:
       # and names the constant to reference instead.
       - name: Node-facing paths are referenced, not restated
         run: ./scripts/check-doc-path-literals.sh
+
+  demo-witnesses:
+    name: the demo's own witnesses hold
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Unit tests for the parts of `demo.sh verify` that decide whether a
+      # check passed: the readers of the node's log, the guards that keep one
+      # dead component from ending the run without a summary, the roll call
+      # that holds the run to the number of checks it lists, and the
+      # cross-caller check, run against a stand-in that leaks so that the
+      # witness is seen to fail as well as to pass. No build, so it answers in
+      # seconds and answers first.
+      - name: Witness tests
+        run: ./scripts/test-demo-witnesses.sh
+
+  workspace:
+    name: build, lint and test the workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/deis-control/web/package-lock.json
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-workspace-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-workspace-
+
+      # Before anything cargo does. deis-control embeds this directory, and a
+      # build without it is a build of a control plane whose dashboard is 404.
+      - name: Build the web console deis-control embeds
+        working-directory: crates/deis-control/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` so tests and examples are linted too: a warning in a
+      # test file is a warning in this repository.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Tests
+        run: cargo test --workspace
+
+  demo:
+    name: the demo runs end to end
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/deis-control/web/package-lock.json
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-demo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-demo-
+
+      - name: Build the web console deis-control embeds
+        working-directory: crates/deis-control/web
+        run: |
+          npm ci
+          npm run build
+
+      # curl, jq, python3, openssl and iproute2 are on the runner already.
+      # grpcurl is not, and without it the four checks that ask deis-store and
+      # deis-telemetry directly report a failure rather than skipping - which
+      # is the right behaviour and would fail this job. Installed from the
+      # published release rather than built, and the download is checked
+      # against its own checksum file so a job does not run a tarball it
+      # cannot identify.
+      - name: Install grpcurl
+        env:
+          GRPCURL_VERSION: 1.9.3
+        run: |
+          set -euo pipefail
+          base="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}"
+          curl -sSLf -o grpcurl.tar.gz "${base}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
+          curl -sSLf -o grpcurl.sha256sum "${base}/grpcurl_${GRPCURL_VERSION}_checksums.txt"
+          grep " grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz\$" grpcurl.sha256sum \
+            | sed "s/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz/grpcurl.tar.gz/" \
+            | sha256sum -c -
+          tar -xzf grpcurl.tar.gz grpcurl
+          sudo install -m 0755 grpcurl /usr/local/bin/grpcurl
+          grpcurl --version
+
+      - name: Start the demo
+        run: ./scripts/demo.sh start
+
+      # The run this project's claims are quoted from. It prints one line of
+      # evidence per check and ends with the tally and the roll call; a check
+      # that fails, or a run that does not reach the number of checks the
+      # script lists, exits non-zero.
+      - name: Verify
+        run: ./scripts/demo.sh verify
+
+      - name: Stop the demo
+        if: always()
+        run: ./scripts/demo.sh stop || true
+
+      # Every component's log, and the per-check transcripts `verify` leaves
+      # behind. A failure here is a failure nobody can reproduce by reading
+      # the job's output alone: the reason is in these files.
+      - name: Keep the run's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-logs
+          path: .demo/logs
+          retention-days: 7

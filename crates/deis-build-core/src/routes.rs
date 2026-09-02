@@ -16,6 +16,12 @@
 //! `:name` and `*` are also exactly how a pattern is spelled in
 //! `deis_bundle::Route::pattern` and in `RouteRule.pattern` on the wire, so a
 //! pattern derived here can go straight into a bundle manifest.
+//!
+//! Which is why a file name that *already* reads as that syntax has to be
+//! escaped rather than passed through: `[name]` and `[[name]]` are the file
+//! tree's spelling of a placeholder and a catch-all, so a raw `:` or `*` in a
+//! name is a literal, and a literal has to be written into the pattern in a
+//! form that can only mean itself. See `escape_literal`.
 
 /// Where the compiler stages a handler, as the generated entry module reaches
 /// it.
@@ -134,6 +140,34 @@ fn strip_handler_extension(path: &str) -> &str {
     path
 }
 
+/// The segments of `relative_path` whose own text had to be escaped, as
+/// `(what the file is called, what it became in the pattern)`.
+///
+/// Empty for every ordinary file name, which is what makes it usable as a
+/// build warning: a name only appears here when the author wrote pattern
+/// syntax the file-tree convention does not use, and would otherwise have got
+/// a route that means something other than the file's own name.
+pub fn escaped_segments(relative_path: &str) -> Vec<(String, String)> {
+    let normalised = relative_path.replace('\\', "/");
+    strip_handler_extension(&normalised)
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .filter_map(|segment| {
+            let pattern = pattern_segment(segment);
+            (pattern != segment && !is_placeholder(segment)).then(|| (segment.to_string(), pattern))
+        })
+        .collect()
+}
+
+/// Whether this segment is the file tree's own spelling of a placeholder,
+/// `[name]` or `[[name]]`, rather than a literal that had to be escaped.
+fn is_placeholder(segment: &str) -> bool {
+    segment
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .is_some_and(|inner| !inner.trim_matches(['[', ']']).is_empty())
+}
+
 fn pattern_segment(segment: &str) -> String {
     if let Some(inner) = segment
         .strip_prefix("[[")
@@ -148,7 +182,53 @@ fn pattern_segment(segment: &str) -> String {
             return format!(":{inner}");
         }
     }
-    segment.to_string()
+    escape_literal(segment)
+}
+
+/// A literal segment, written so that it can only ever mean itself.
+///
+/// The pattern language has exactly three pieces of syntax inside a segment: a
+/// segment that *is* `*` is the catch-all, a segment that *starts with* `:` is
+/// a placeholder, and a `%XX` escape is decoded before the comparison
+/// (`deis_bundle::routing::CompiledPattern::compile`, and the same rule in the
+/// generated entry module's matcher). A file whose name contains one of the
+/// three used to be handed straight through, so the file tree stopped being a
+/// route table and started being a route *language* that anyone could write
+/// into a file name:
+///
+/// * `functions/api/*.ts` became `/api/*` - a catch-all that swallowed every
+///   path under `/api`, shadowing its siblings, that no author had asked for
+///   with `[[name]]`;
+/// * `functions/users/:id.ts` became `/users/:id` - a placeholder binding
+///   `context.params.id`, indistinguishable from `[id].ts`, and colliding with
+///   it if both existed, with which of the two answered decided by a
+///   tie-break;
+/// * `functions/caf%C3%A9.ts` became `/caf%C3%A9`, which decodes to `/café` -
+///   the same route as an ordinary file called `café.ts`.
+///
+/// Escaped rather than refused. The file tree is the route table, so every
+/// file has to have a route, and a legal file name is not a build error - it
+/// is a name that has to be spelled in the pattern language rather than
+/// interpreted by it. `%2A` and `%3A` decode back to `*` and `:` in both
+/// matchers, so the file answers the URL that spells its own name and nothing
+/// else. `%` itself is escaped first, which is what makes the mapping from
+/// file name to pattern one-to-one: without it `*.ts` and a file actually
+/// called `%2A.ts` would land on one route.
+///
+/// The build says so, once per file, because an author who typed `:id.ts`
+/// almost certainly meant `[id].ts` - see
+/// `Compiler::report_escaped_route_segments`.
+fn escape_literal(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for (index, character) in segment.char_indices() {
+        match character {
+            '%' => out.push_str("%25"),
+            '*' => out.push_str("%2A"),
+            ':' if index == 0 => out.push_str("%3A"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -199,6 +279,94 @@ mod tests {
     fn empty_brackets_are_a_literal_segment() {
         // `[].ts` names no placeholder, so it can only be a literal.
         assert_eq!(route_pattern("[].ts"), "/[]");
+    }
+
+    /// A file name that is itself a route pattern used to become one. The
+    /// placeholder and the catch-all are spelled `[name]` and `[[name]]` in a
+    /// file tree, so a raw `:` or `*` in a name is a literal - and reading it
+    /// as syntax gave the author a route they never wrote.
+    #[test]
+    fn a_file_named_like_a_pattern_answers_its_own_name_and_nothing_else() {
+        // This one is the dangerous half: unescaped it is `/api/*`, a
+        // catch-all that swallows every path under `/api` and shadows every
+        // sibling route, from a file the author called `*.ts`.
+        assert_eq!(route_pattern("api/*.ts"), "/api/%2A");
+        // And this one is indistinguishable from `[id].ts` unescaped, so the
+        // two files collide on one route and a tie-break picks the winner.
+        assert_eq!(route_pattern("users/:id.ts"), "/users/%3Aid");
+        assert_ne!(
+            route_pattern("users/:id.ts"),
+            route_pattern("users/[id].ts")
+        );
+    }
+
+    #[test]
+    fn one_file_name_is_one_route_and_no_two_share_it() {
+        // `%` is escaped first, and that is what makes the mapping one-to-one.
+        // Without it a file called `%2A.ts` and a file called `*.ts` both
+        // reached `/%2A`, and `caf%C3%A9.ts` reached the same route as
+        // `café.ts` - because the matcher decodes a pattern's literal
+        // segments before comparing them.
+        let names = [
+            "*.ts",
+            "%2A.ts",
+            ":id.ts",
+            "%3Aid.ts",
+            "café.ts",
+            "caf%C3%A9.ts",
+            "[id].ts",
+            "[[rest]].ts",
+        ];
+        let mut patterns: Vec<String> = names.iter().map(|name| route_pattern(name)).collect();
+        patterns.sort();
+        let distinct = patterns.len();
+        patterns.dedup();
+        assert_eq!(
+            patterns.len(),
+            distinct,
+            "two file names produced one route: {patterns:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_name_is_left_exactly_as_it_is() {
+        // The escape must be invisible to every project that does not write
+        // pattern syntax into a file name, or it changes the route table - and
+        // the manifest, and therefore the version id - of applications that
+        // were never affected.
+        for name in [
+            "index.ts",
+            "api/hello.ts",
+            "users/[id]/index.ts",
+            "api/[[catch]].ts",
+            "data/report.tar.gz",
+            "my file.ts",
+            "a+b.ts",
+            "a:b.ts",
+        ] {
+            assert!(
+                escaped_segments(name).is_empty(),
+                "{name} was escaped: {:?}",
+                escaped_segments(name)
+            );
+        }
+        assert_eq!(route_pattern("my file.ts"), "/my file");
+        // Only a *leading* colon is a placeholder, so this one means itself
+        // already.
+        assert_eq!(route_pattern("a:b.ts"), "/a:b");
+    }
+
+    #[test]
+    fn what_was_escaped_is_reportable_so_the_build_can_say_so() {
+        assert_eq!(
+            escaped_segments("api/*.ts"),
+            vec![("*".to_string(), "%2A".to_string())]
+        );
+        assert_eq!(
+            escaped_segments("users/:id.ts"),
+            vec![(":id".to_string(), "%3Aid".to_string())]
+        );
+        assert!(escaped_segments("users/[id].ts").is_empty());
     }
 
     #[test]

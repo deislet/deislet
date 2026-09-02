@@ -105,7 +105,61 @@ impl BuildBundler {
     pub async fn generate(&self) -> Result<String> {
         let mut bundler = Bundler::new(self.options.clone())?;
         let result = bundler.generate().await?;
+        Self::refuse_broken_references(&result.warnings)?;
         Self::single_js_chunk(result.assets)
+    }
+
+    /// Stop on a warning that says the emitted module names something that is
+    /// not in it.
+    ///
+    /// The bundler reports these and carries on, because in a browser bundle
+    /// carrying on is usually right: the reference is in a branch that never
+    /// runs, and a hundred other modules load fine. Here it is never right.
+    /// Every target this compiler builds for loads **one** ESM module, and an
+    /// ESM module with a free identifier at its top level throws
+    /// `ReferenceError` while it is being evaluated - before any handler runs,
+    /// before any route is matched. The whole application is down, not the one
+    /// route whose handler was wrong.
+    ///
+    /// That is exactly what a handler file with named exports and no default
+    /// export produced. The generated entry module imports each handler as
+    /// `import handlerN from "../src/<file>"` and puts `handlerN` in its route
+    /// table; with no default to bind, the import disappears and `handlerN`
+    /// is left free in `const ROUTES = [...]`, which runs at module scope. The
+    /// build printed a green line and packed a bundle that could not be
+    /// loaded, and the manifest read-back that called itself verification only
+    /// ever looked at the manifest.
+    ///
+    /// Only these two kinds are fatal. Everything else the bundler has to say
+    /// is printed and left alone: a circular import or an unused external is
+    /// worth an author's attention and is not a module that fails to
+    /// evaluate, and turning every warning into an error here would make a
+    /// bundler upgrade able to fail builds that are correct.
+    fn refuse_broken_references(warnings: &[rolldown_error::BuildDiagnostic]) -> Result<()> {
+        use rolldown_error::EventKind;
+
+        let mut fatal: Vec<String> = Vec::new();
+        for warning in warnings {
+            let message = warning.to_diagnostic().to_string();
+            match warning.kind() {
+                EventKind::ImportIsUndefined | EventKind::MissingExportError => fatal.push(message),
+                _ => eprintln!("  ⚠ {message}"),
+            }
+        }
+
+        if fatal.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "the bundled entry module refers to {} binding(s) that nothing defines ({}); an ESM \
+             module with a free identifier throws ReferenceError as it is evaluated, so this \
+             application would deploy and then fail to load in its entirety - every route, not \
+             only the one the missing export belongs to. A handler file the build routes to has \
+             to have a `export default` handler: named exports alone give the generated router \
+             nothing to import",
+            fatal.len(),
+            fatal.join("; ")
+        );
     }
 
     /// The one module the bundler was asked for, or an explanation of what else

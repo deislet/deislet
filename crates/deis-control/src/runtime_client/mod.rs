@@ -186,6 +186,40 @@ fn with_message_limits(
         .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
 }
 
+/// What a node that answered `healthy: false` said about itself, in one line.
+///
+/// The map is `deis_runtime::health::NodeHealth::details`: `state` is always
+/// there, and `reason` is there for every state that has one. Both are copied
+/// out rather than one of them, because the state is the word an operator
+/// greps for and the reason is the sentence that tells them where to look.
+///
+/// Nothing is invented when the node gave no reason. Saying so is a fact; a
+/// plausible cause put in its place is not, and a node reporting a state this
+/// control plane has never heard of is exactly the case where a guess would be
+/// furthest from the truth.
+fn reported_error(
+    healthy: bool,
+    details: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if healthy {
+        return None;
+    }
+    let state = details
+        .get("state")
+        .map(String::as_str)
+        .unwrap_or("not ready");
+    Some(
+        match details
+            .get("reason")
+            .map(|reason| reason.trim())
+            .filter(|reason| !reason.is_empty())
+        {
+            Some(reason) => format!("the node reports {state}: {reason}"),
+            None => format!("the node reports {state} and gave no reason"),
+        },
+    )
+}
+
 /// Last observed health of one deis-runtime node.
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeHealth {
@@ -1265,6 +1299,11 @@ impl RuntimeNodeManager {
     }
 
     /// One health probe; updates the cache and returns the fresh state.
+    ///
+    /// A probe that fails and a probe that succeeds with `healthy: false` are
+    /// two different facts and both end up in [`NodeHealth::last_error`]: the
+    /// first is this control plane's own transport error, the second is the
+    /// node's account of itself.
     pub async fn check_node(&self, id: &str) -> Result<NodeHealth, NodeError> {
         let result = async {
             let mut client = self.connect(id).await?;
@@ -1289,7 +1328,16 @@ impl RuntimeNodeManager {
                 healthy: resp.healthy,
                 version: Some(resp.version.clone()),
                 last_checked: Some(Utc::now()),
-                last_error: None,
+                // A node that answers `healthy: false` has already said why,
+                // in `details`. This used to be `None` whenever the RPC
+                // itself succeeded, so the one reason anybody had was thrown
+                // away at the moment it arrived: the fleet listing showed
+                // `healthy: false` with no reason at all, and `deis status`
+                // filled the empty column with "could not be asked" - about a
+                // node that had been asked and had answered. During an
+                // incident that sends an operator to the network instead of
+                // to the cause the node had just named.
+                last_error: reported_error(resp.healthy, &resp.details),
             },
             Err(e) => NodeHealth {
                 healthy: false,
@@ -1503,9 +1551,29 @@ impl RuntimeNodeManager {
                 }
                 let was_healthy = self.health.get(&node).map(|h| h.healthy).unwrap_or(false);
                 match self.check_node(&node).await {
-                    Ok(h) => {
+                    Ok(h) if h.healthy => {
                         if !was_healthy {
                             info!(node = %node, version = ?h.version, "Runtime node is healthy");
+                        }
+                    }
+                    // It answered, and what it answered was that it is not
+                    // running what this control plane told it to. Answering is
+                    // not health: this arm used to be folded into the one
+                    // above, so a node that had just declared itself degraded
+                    // was announced to the operator's log as healthy - the
+                    // opposite of what it had said, in the one place they
+                    // would look first.
+                    Ok(h) => {
+                        let reason = h.last_error.as_deref().unwrap_or("no reason stated");
+                        if was_healthy {
+                            warn!(
+                                node = %node,
+                                version = ?h.version,
+                                reason = %reason,
+                                "Runtime node answered its health probe and reports it is NOT running what it was assigned: {}. Deployments are still pushed to it - every node runs every application - but a cron occurrence goes to it only after every node this control plane believes healthy has been tried", reason
+                            );
+                        } else {
+                            debug!(node = %node, reason = %reason, "Runtime node still reports it is not ready: {}", reason);
                         }
                     }
                     Err(NodeError::UnknownNode) => {
@@ -1602,6 +1670,62 @@ impl NodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node that answers the probe and says it is not ready keeps its own
+    /// account of why.
+    ///
+    /// The probe succeeded, so nothing here is this control plane's error to
+    /// report - and that is precisely how the node's reason came to be thrown
+    /// away: `last_error` was filled in only when the RPC itself failed. The
+    /// fleet listing then showed `healthy: false` with an empty reason, and
+    /// `deis status` printed "could not be asked" over the top of it, about a
+    /// node that had been asked, had answered, and had named its cause.
+    #[test]
+    fn a_node_that_answers_unhealthy_is_reported_with_the_reason_it_gave() {
+        let details = std::collections::HashMap::from([
+            ("state".to_string(), "degraded".to_string()),
+            (
+                "reason".to_string(),
+                "2 of 5 assigned versions could not be loaded and 0 could not be stopped"
+                    .to_string(),
+            ),
+            ("apps".to_string(), "3".to_string()),
+        ]);
+
+        let reported = reported_error(false, &details).expect("an unhealthy node has a reason");
+        assert!(
+            reported.contains("degraded"),
+            "the state is the word an operator greps for: {reported}"
+        );
+        assert!(
+            reported.contains("could not be loaded"),
+            "the reason is the sentence that says where to look: {reported}"
+        );
+
+        assert_eq!(
+            reported_error(true, &details),
+            None,
+            "a node that reports healthy has no error to show, whatever else is in the map"
+        );
+    }
+
+    /// Nothing is invented for a node that gave no reason.
+    ///
+    /// This is a node older than the `reason` detail, or one reporting a state
+    /// this control plane has never heard of - which is exactly the case where
+    /// a plausible guess would be furthest from the truth.
+    #[test]
+    fn a_node_that_gives_no_reason_gets_none_invented_for_it() {
+        let bare = std::collections::HashMap::from([("state".to_string(), "starting".to_string())]);
+        let reported = reported_error(false, &bare).expect("an unhealthy node has something said");
+        assert!(reported.contains("starting"), "{reported}");
+        assert!(reported.contains("gave no reason"), "{reported}");
+
+        let empty = std::collections::HashMap::new();
+        let reported = reported_error(false, &empty).expect("still something, and still true");
+        assert!(reported.contains("not ready"), "{reported}");
+        assert!(reported.contains("gave no reason"), "{reported}");
+    }
 
     fn manager(ids: &[&str]) -> RuntimeNodeManager {
         RuntimeNodeManager::new(

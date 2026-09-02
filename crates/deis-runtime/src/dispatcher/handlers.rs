@@ -549,6 +549,26 @@ pub async fn handle_request(
                 crate::health::SERVING_APPS_HEADER,
                 readiness.serving_apps().to_string(),
             );
+            // Why, for the one state that has a why. Stamped only when the
+            // node recorded one, so the system application can tell "this
+            // node did not say" from "this node said the following" instead
+            // of guessing a cause, which is what it used to do: every
+            // degraded node was reported as one that cannot reach its
+            // control plane, including the ones whose control plane had
+            // answered and whose real trouble was a bundle that would not
+            // load.
+            //
+            // Put through `header_safe_reason` because a reason is built
+            // from somebody else's error message and a header value cannot
+            // hold a newline: a carriage return in one is how a header
+            // becomes two.
+            if let Some(reason) = readiness.reason() {
+                header_list::set_unique(
+                    &mut request_headers,
+                    crate::health::REASON_HEADER,
+                    crate::health::header_safe_reason(reason),
+                );
+            }
         }
     }
 

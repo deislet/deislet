@@ -123,6 +123,15 @@ impl HandlerVisitor {
     }
 }
 
+/// The text of an exported name, whether it was written as an identifier or as
+/// a string literal (`export { x as "with-a-dash" }`).
+fn export_name(name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Ident(ident) => ident.sym.to_string(),
+        ModuleExportName::Str(literal) => literal.value.to_string_lossy().into_owned(),
+    }
+}
+
 impl Visit for HandlerVisitor {
     fn visit_export_default_decl(&mut self, _: &ExportDefaultDecl) {
         self.has_default_export = true;
@@ -153,12 +162,33 @@ impl Visit for HandlerVisitor {
     }
 
     fn visit_named_export(&mut self, n: &NamedExport) {
-        // Handle: export { foo, bar }
+        // `export { foo, bar }`, `export { handler as default }`,
+        // `export { default } from "./elsewhere"`.
+        //
+        // The name that matters is the one the module is exported *under*, not
+        // the local binding: `export { handler as default }` is a default
+        // export, and this used to record it as a named export called
+        // `handler` with `has_default_export` still false. That was invisible
+        // while a missing default export was not an error; the moment it
+        // became one it would have failed a build over an idiomatic file that
+        // is perfectly correct. `export { default as thing }` is the mirror
+        // image and has to come out the other way round: a named export called
+        // `thing`, and no default.
         for spec in n.specifiers.iter() {
-            if let ExportSpecifier::Named(named) = spec {
-                if let ModuleExportName::Ident(ident) = &named.orig {
-                    self.named_exports.push(ident.sym.to_string());
+            let name = match spec {
+                ExportSpecifier::Named(named) => {
+                    export_name(named.exported.as_ref().unwrap_or(&named.orig))
                 }
+                // `export * as ns from "./x"` publishes one name and no
+                // default; `export * from "./x"` publishes whatever the other
+                // module does, which this file cannot know.
+                ExportSpecifier::Namespace(namespace) => export_name(&namespace.name),
+                ExportSpecifier::Default(_) => "default".to_string(),
+            };
+            if name == "default" {
+                self.has_default_export = true;
+            } else {
+                self.named_exports.push(name);
             }
         }
     }
@@ -196,6 +226,39 @@ export default async function handler(context) {
         assert!(info.has_default_export);
         assert_eq!(info.route, "/api/hello");
         assert_eq!(info.named_exports.len(), 0);
+    }
+
+    /// `export { handler as default }` is a default export, and
+    /// `export { default } from "./elsewhere"` is one too. Both used to be
+    /// recorded as named exports with no default, which - now that a missing
+    /// default export stops a build - would have refused two correct files.
+    #[test]
+    fn a_default_written_as_a_named_specifier_is_still_a_default() {
+        let parser = TypeScriptParser::new();
+        for code in [
+            "async function handler(c) { return new Response(\"x\"); }\nexport { handler as default };\n",
+            "export { default } from \"./elsewhere\";\n",
+            "export { default, helper } from \"./elsewhere\";\n",
+        ] {
+            let info = parser.parse(code, "functions/index.ts").expect("parses");
+            assert!(info.has_default_export, "{code}");
+            assert!(!info.named_exports.contains(&"default".to_string()), "{code}");
+        }
+    }
+
+    /// And the mirror image: re-exporting somebody else's default under
+    /// another name leaves this file without one.
+    #[test]
+    fn a_default_re_exported_under_another_name_is_not_this_files_default() {
+        let parser = TypeScriptParser::new();
+        let info = parser
+            .parse(
+                "export { default as report } from \"./elsewhere\";\n",
+                "functions/index.ts",
+            )
+            .expect("parses");
+        assert!(!info.has_default_export);
+        assert_eq!(info.named_exports, vec!["report".to_string()]);
     }
 
     #[test]

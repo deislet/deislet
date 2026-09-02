@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
@@ -44,6 +45,7 @@ use crate::app::types::{AppConfig, ResourceLimits};
 use crate::app::{AppKey, ApplicationManager, VersionInstall};
 use crate::assets::{AssetBundle, AssetError};
 use crate::config::RuntimeConfig;
+use crate::health::NodeHealth;
 
 pub use assignments::{
     run_control_loop, Assignment, AssignmentClient, AssignmentError, AssignmentList, Reconciler,
@@ -170,6 +172,32 @@ impl std::fmt::Display for DeployError {
     }
 }
 
+impl DeployError {
+    /// Which step refused, in a sentence that is this node's own words.
+    ///
+    /// Not [`Display`], which carries the underlying message - and that
+    /// message can come from inside an isolate, where a module that throws
+    /// during evaluation writes the text: `throw new Error(env.STRIPE_KEY)`
+    /// puts a secret in it. This is what travels on the node's readiness,
+    /// which is answered unauthenticated on the node's data port, so it says
+    /// which step failed and nothing that was handed to that step. The full
+    /// message still goes to the log, to the control plane in the deployment's
+    /// answer, and nowhere a stranger can read it.
+    ///
+    /// [`Display`]: std::fmt::Display
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Identifier(_) => "it names an identifier this node cannot use",
+            Self::Fetch(_) => "its bundle could not be downloaded, or is not what was promised",
+            Self::Bundle(_) => "its bundle is not readable as a deislet bundle",
+            Self::Assets(_) => "its static files cannot be served as declared",
+            Self::Storage(_) => "its bundle could not be put on this node's disk",
+            Self::Compatibility(_) => "this node's build cannot honour what the version declares",
+            Self::Load(_) => "the isolate would not take the new code",
+        }
+    }
+}
+
 impl std::error::Error for DeployError {}
 
 /// What happened to one deployment order.
@@ -219,6 +247,21 @@ pub struct DeploymentManager {
     /// holding a stamp from before it asked the control plane anything can ask
     /// whether this environment moved since.
     last_change: DashMap<AppKey, u64>,
+    /// What this node says about itself, so the events that happen here can
+    /// move it.
+    ///
+    /// Readiness used to be recomputed only where it is reported - at the end
+    /// of a reconcile pass. Everything this type does happens between two of
+    /// those: a pushed deployment taken or refused, an application stopped.
+    /// So a node that had just refused a push went on answering the edge
+    /// `ready`, and taking its full share of that application's traffic, until
+    /// the next pass - a whole `reconcile_interval` - and for ever on a node
+    /// with no control plane configured, where there is no next pass at all.
+    ///
+    /// Empty until [`Self::report_readiness_to`] is called, which is what a
+    /// unit test that builds a manager and asks nothing of its health leaves
+    /// it as. A missing handle is silence, never a guess.
+    health: ArcSwapOption<NodeHealth>,
 }
 
 impl DeploymentManager {
@@ -241,7 +284,23 @@ impl DeploymentManager {
             locks: DashMap::new(),
             changes: AtomicU64::new(0),
             last_change: DashMap::new(),
+            health: ArcSwapOption::empty(),
         })
+    }
+
+    /// Report what happens here to the node's readiness as well.
+    ///
+    /// Called by [`run_control_loop`], which holds the same handle it reports
+    /// its own passes through - so the two halves of the answer, "what the
+    /// last pass found" and "what has happened since", are one value and
+    /// cannot disagree.
+    pub fn report_readiness_to(&self, health: Arc<NodeHealth>) {
+        self.health.store(Some(health));
+    }
+
+    /// What this node says about itself, if anything has claimed it.
+    fn readiness(&self) -> Option<Arc<NodeHealth>> {
+        self.health.load_full()
     }
 
     pub fn store(&self) -> &BundleStore {
@@ -304,9 +363,38 @@ impl DeploymentManager {
     /// produces no new version but does change what the isolate must see, and
     /// `context.env` is read when the isolate is built.
     pub async fn apply(&self, order: DeploymentOrder) -> Result<Applied, DeployError> {
-        let lock = self.lock_for(&order.key());
+        let key = order.key();
+        // Taken before `install` consumes the order, for the readiness below.
+        let version_id = order.version_id.clone();
+        let lock = self.lock_for(&key);
         let _guard = lock.lock().await;
-        self.install(order, false).await
+        let applied = self.install(order, false).await;
+
+        // A push is a single instruction with no pass behind it to sum it up,
+        // so it reports itself. A reconcile pass never installs through here -
+        // it goes through `apply_from_assignment` and reports its whole list
+        // once, at the end, through this same handle.
+        if let Some(health) = self.readiness() {
+            match &applied {
+                Ok(_) => health.note_serving(self.installed_app_count()),
+                // Still degraded even though this environment kept the version
+                // it was already on: the control plane named a version, this
+                // node did not switch to it, and until it does the node is not
+                // running what it was told to.
+                // `kind` and not the error itself: this reason is answered
+                // unauthenticated on the node's data port and an isolate's own
+                // load error is text the application wrote.
+                Err(e) => health.note_refusal(
+                    format!(
+                        "version {version_id} of {key} was pushed and this node did not take \
+                         it: {}",
+                        e.kind()
+                    ),
+                    self.installed_app_count(),
+                ),
+            }
+        }
+        applied
     }
 
     /// Apply a deployment from an assignment list.
@@ -521,6 +609,11 @@ impl DeploymentManager {
 
         let mut unloaded: Vec<String> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
+        // The same environments as `failures`, without the errors. What the
+        // node says about itself is answered unauthenticated on its data port,
+        // so it names which environment would not stop and leaves the message
+        // to the log and to the caller's own answer.
+        let mut would_not_stop: Vec<String> = Vec::new();
         for key in &targets {
             let lock = self.lock_for(key);
             let _guard = lock.lock().await;
@@ -532,7 +625,10 @@ impl DeploymentManager {
                     self.record_change(key);
                     unloaded.push(key.environment().to_string());
                 }
-                Err(e) => failures.push(format!("{key}: {e}")),
+                Err(e) => {
+                    failures.push(format!("{key}: {e}"));
+                    would_not_stop.push(key.environment().to_string());
+                }
             }
             // The lock stays in the map on purpose. Removing it while holding
             // it would let the next caller mint a fresh mutex and run
@@ -548,6 +644,34 @@ impl DeploymentManager {
                     .await
             }
             None => self.store.forget(app_id).await,
+        }
+
+        // What this node can serve has just changed, whichever way this went,
+        // and the count is what decides 200 against 503 at the edge for a
+        // degraded node - so a node that has stopped the last thing it had has
+        // to stop claiming it can serve before the next reconcile pass rather
+        // than after it.
+        if let Some(health) = self.readiness() {
+            let serving = self.installed_app_count();
+            if failures.is_empty() {
+                health.note_serving(serving);
+            } else {
+                // Told to stop and still serving, with the secrets of a
+                // version nobody is asking for. That is the same fault a
+                // reconcile pass counts as `unload_failed` and degrades on at
+                // the end of the pass - but a pass is not the only caller
+                // here, and one that arrives as a management call has nothing
+                // else to report it. Recording it here also names which
+                // environment would not stop, which the pass's own count of
+                // them never did.
+                health.note_refusal(
+                    format!(
+                        "{app_id} was told to stop on this node and is still serving in: {}",
+                        would_not_stop.join(", ")
+                    ),
+                    serving,
+                );
+            }
         }
 
         if !failures.is_empty() {

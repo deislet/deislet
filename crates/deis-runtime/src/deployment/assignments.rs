@@ -838,6 +838,15 @@ impl RegistrationState {
 /// the standalone case: the node loads what it has and calls itself ready,
 /// because there is no list it could be missing and nobody to register with.
 ///
+/// A pass is not the only thing that changes what this node can serve, so it
+/// is not the only thing that moves what this node says about itself. Before
+/// the first pass the deployment manager is handed the same readiness handle
+/// ([`DeploymentManager::report_readiness_to`]), and every pushed deployment
+/// and every unload moves it as it happens. Without that a node that had just
+/// refused a push answered the edge `ready` for a whole reconcile interval -
+/// and for the life of the process in the standalone case above, where this
+/// function returns and no pass ever runs again.
+///
 /// A pass that cannot reach the control plane backs off and puts registration
 /// back to pending: contact was lost, so nothing this node said before can be
 /// assumed to still be known on the other side. A pass that *did* reach it and
@@ -856,6 +865,13 @@ pub async fn run_control_loop(
     retry_interval: Duration,
     reconcile_interval: Duration,
 ) {
+    // Every event that changes what this node can serve has to move what it
+    // says about itself, not only the passes below. The deployment manager is
+    // where those events land - a pushed deployment taken or refused, an
+    // application stopped - and this is the one place that holds both it and
+    // the readiness, so this is where the two are joined.
+    deployer.report_readiness_to(Arc::clone(&health));
+
     let Some(client) = client else {
         let recovered = deployer.recover_from_disk().await;
         info!(

@@ -179,6 +179,64 @@ ensure_dirs() {
   mkdir -p "$LOG_DIR"
 }
 
+# The ceiling on the node's log file, in bytes.
+#
+# Why there is one at all. `${LOG_DIR}/deis-runtime.log` is not written only by
+# the node: an application's own `context.log` line lands in it, and an
+# application's line carries whatever a request put in it. So the file's size
+# is decided by whoever can reach the node's port, which on this demo is
+# anybody - the routes are unauthenticated by design, that being what most of
+# the checks exercise. Measured against this demo as it shipped: one
+# unauthenticated `GET /hello/<7000 characters>` adds about 51KB to the file,
+# so twenty thousand of them fill a gigabyte, and nothing anywhere was
+# counting.
+#
+# Why the number is this large. A single, entirely ordinary `verify` run
+# already writes about 35MB into it, almost all of which is `h2` and `hyper`
+# TRACE events: deis-runtime installs no level filter on its subscriber
+# (crates/deis-runtime/src/main.rs), so every event every dependency emits is
+# written out. A ceiling has to leave a normal run far below it or it becomes
+# a way for the demo to lose its own evidence, so this is seven times what a
+# run needs. Lowering it is a matter of that filter, not of this number.
+#
+# What happens at the ceiling is not silence: the writer says it stopped, and
+# the last check in `verify` reads the file for that sentence and fails the
+# run. A run whose log was cut short is a run whose log-reading checks were
+# reading a partial file, and that has to be said rather than discovered.
+DEMO_LOG_MAX_BYTES="${DEMO_LOG_MAX_BYTES:-268435456}"
+
+# The sentence the writer leaves behind when it stops. Written here so the
+# writer and the check that looks for it cannot drift apart.
+DEMO_LOG_CAPPED_MARKER="deis demo: this log reached its ceiling and was cut off here"
+
+# Copy stdin into $1, stopping at DEMO_LOG_MAX_BYTES.
+#
+# `LC_ALL=C` so `length()` counts bytes rather than characters - the ceiling
+# is a disk ceiling. `fflush()` after every line because the readiness probes
+# and fifteen checks read this file while it is being written, and an awk
+# that buffered would make the node look silent. The line that ends it is
+# written *through* the same fflush, so the marker is on disk before anything
+# further is dropped.
+bounded_log() {
+  local file=$1
+  LC_ALL=C awk -v cap="$DEMO_LOG_MAX_BYTES" -v marker="$DEMO_LOG_CAPPED_MARKER" '
+    BEGIN { written = 0; capped = 0 }
+    capped { next }
+    {
+      len = length($0) + 1
+      if (written + len > cap) {
+        print marker " (" cap " bytes). Everything after this point was dropped, so any check that reads this file from here on is reading a partial log."
+        fflush()
+        capped = 1
+        next
+      }
+      print
+      written += len
+      fflush()
+    }
+  ' > "$file"
+}
+
 # `start` begins a new run, so it clears what the previous one left behind.
 #
 # This is not tidiness. deis-store and deis-queue partition by tenant --
@@ -1021,6 +1079,20 @@ export default async function handler(context: any): Promise<Response> {
   }
 
   const tag = url.searchParams.get("tag") ?? "";
+
+  // One line at the top of this invocation, carrying the tag the caller
+  // invented for this stream, before anything is produced.
+  //
+  // It is not written for a person. The node files every line of one
+  // invocation -- this one, and its own later line about what became of the
+  // body -- under the same `trace_id`, so a caller that can find this line
+  // learns the id of the invocation it has just started and can then tell the
+  // node's sentence about *its* stream from a sentence about somebody else's.
+  // Without it the only handle on the node's line is its wording, which is the
+  // same for every stream on the node - see `trace_of_witness` in
+  // scripts/demo.sh for what that cost.
+  if (tag !== "") context.log.info("stream witness " + tag);
+
   const frames = Math.min(Math.max(Number(url.searchParams.get("frames")) || 5, 1), 100);
   const gapMs = Math.min(Math.max(Number(url.searchParams.get("gapMs")) || 120, 0), 2000);
   const throwAfter = mode === "throw"
@@ -1120,6 +1192,13 @@ export default async function handler(context: any): Promise<Response> {
     await new Promise((resolve) => setTimeout(resolve, 250));
     return json({ doors, before, after: { intervalTicks, timeoutTicks, ownerTicks } });
   }
+
+  // The same marker the streaming handler writes, for the same reason: the
+  // node's own warning about the timers this invocation left armed is written
+  // under this invocation's `trace_id`, and this line is how a caller learns
+  // what that id is. See `trace_of_witness` in scripts/demo.sh.
+  const tag = url.searchParams.get("tag") ?? "";
+  if (tag !== "") context.log.info("timer witness " + tag);
 
   doors = {};
 
@@ -1538,36 +1617,41 @@ start_demo() {
     exit 1
   fi
 
-  local user_deis_control_port
-  local user_deis_runtime_port
-  local user_deis_proxy_port
-  local user_deis_proxy_tls_port
-  local user_acme_ca_port
-  local user_deis_store_port
-  local user_deis_queue_port
-  local user_deis_telemetry_port
-  local user_deis_telemetry_metrics_port
-  local user_deis_origin_port
-  user_deis_control_port=${DEIS_CONTROL_PORT:-}
-  user_deis_runtime_port=${DEIS_RUNTIME_PORT:-}
-  user_deis_proxy_port=${DEIS_PROXY_PORT:-}
-  user_deis_proxy_tls_port=${DEIS_PROXY_TLS_PORT:-}
-  user_acme_ca_port=${ACME_CA_PORT:-}
-  user_deis_store_port=${DEIS_STORE_PORT:-}
-  user_deis_queue_port=${DEIS_QUEUE_PORT:-}
-  user_deis_telemetry_port=${DEIS_TELEMETRY_PORT:-}
-  user_deis_telemetry_metrics_port=${DEIS_TELEMETRY_METRICS_PORT:-}
-  user_deis_origin_port=${DEIS_ORIGIN_PORT:-}
-
+  # Is a previous run still up? The answer is in the state file, and the file
+  # is read in a subshell rather than sourced here.
+  #
+  # Sourcing it here is what this used to do, and the file is a complete
+  # settings dump: SECRET, API_KEY, STORAGE_AUTH_SECRET, APP_SRC_DIR, APP_ID,
+  # ENV_NAME, NODE_ID, DEMO_SECRET_VALUE and every port. So every one of them
+  # was silently replaced by the last run's value, and the option the person
+  # typed on the command line lost to a file they had never opened:
+  # `demo.sh start --secret <hex>` came up on the *previous* run's node key,
+  # `--app-dir <path>` deployed the previous run's sources, and nothing said
+  # so. Only the ten ports were rescued afterwards, by copying them aside
+  # first, which fixed the ten symptoms that had been noticed and left the
+  # rule -- a start is configured by its arguments, never by a leftover file
+  # -- untrue for everything else.
+  #
+  # A subshell makes it structural rather than a list to keep in step: the
+  # only thing that crosses back out is the pids that are still alive, as
+  # text.
+  local still_running=""
   if [ -f "$STATE_FILE" ]; then
-    # shellcheck disable=SC1090
-    source "$STATE_FILE"
-    if pid_running "${DEIS_CONTROL_PID:-}" || pid_running "${DEIS_RUNTIME_PID:-}" \
-      || pid_running "${DEIS_PROXY_PID:-}" || pid_running "${DEIS_STORE_PID:-}" \
-      || pid_running "${DEIS_QUEUE_PID:-}" || pid_running "${DEIS_TELEMETRY_PID:-}"; then
-      echo "⚠️  An existing instance is running, please run stop first"
-      exit 1
-    fi
+    still_running=$(
+      # shellcheck disable=SC1090
+      source "$STATE_FILE"
+      for pid in "${DEIS_CONTROL_PID:-}" "${DEIS_RUNTIME_PID:-}" \
+        "${DEIS_PROXY_PID:-}" "${DEIS_STORE_PID:-}" \
+        "${DEIS_QUEUE_PID:-}" "${DEIS_TELEMETRY_PID:-}"; do
+        if pid_running "$pid"; then
+          printf '%s ' "$pid"
+        fi
+      done
+    )
+  fi
+  if [ -n "$still_running" ]; then
+    echo "⚠️  An existing instance is running (pids: ${still_running}), please run stop first"
+    exit 1
   fi
 
   # The state file is how `stop` finds the processes, so deleting the demo
@@ -1599,17 +1683,6 @@ start_demo() {
     echo "      pkill -f '${BIN_DIR}/deis-'; pkill -f '${DEMO_DIR}/origin/origin.py'  # otherwise"
     exit 1
   fi
-
-  DEIS_CONTROL_PORT=$user_deis_control_port
-  DEIS_RUNTIME_PORT=$user_deis_runtime_port
-  DEIS_PROXY_PORT=$user_deis_proxy_port
-  DEIS_PROXY_TLS_PORT=$user_deis_proxy_tls_port
-  ACME_CA_PORT=$user_acme_ca_port
-  DEIS_STORE_PORT=$user_deis_store_port
-  DEIS_QUEUE_PORT=$user_deis_queue_port
-  DEIS_TELEMETRY_PORT=$user_deis_telemetry_port
-  DEIS_TELEMETRY_METRICS_PORT=$user_deis_telemetry_metrics_port
-  DEIS_ORIGIN_PORT=$user_deis_origin_port
 
   claim_port DEIS_RUNTIME_PORT "${DEIS_RUNTIME_PORT:-$DEFAULT_DEIS_RUNTIME_PORT}"
   claim_port DEIS_PROXY_PORT "${DEIS_PROXY_PORT:-$DEFAULT_DEIS_PROXY_PORT}"
@@ -1863,10 +1936,18 @@ EOF
   fi
 
   echo "🚀 Starting Runtime (HTTP: ${DEIS_RUNTIME_PORT})"
+  # Through `bounded_log` rather than straight into the file: this is the one
+  # component's log an application - and so anyone who can reach the node -
+  # writes into, and it had no ceiling at all. See `DEMO_LOG_MAX_BYTES`.
+  #
+  # A process substitution and not a pipe, because `$!` after `cmd | writer &`
+  # is the writer's pid, and `stop` would then signal the writer while the
+  # node kept its port. With `>` `>(...)` the job is the node and `$!` is the
+  # node.
   DEIS_RUNTIME_CONFIG="$DEIS_RUNTIME_CONFIG" \
     DEIS_RUNTIME_HTTP_PORT="$DEIS_RUNTIME_PORT" \
     "${BIN_DIR}/deis-runtime" \
-    > "${LOG_DIR}/deis-runtime.log" 2>&1 &
+    > >(bounded_log "${LOG_DIR}/deis-runtime.log") 2>&1 &
   DEIS_RUNTIME_PID=$!
 
   local runtime_rc
@@ -2016,8 +2097,37 @@ stop_demo() {
 CHECKS_PASSED=0
 CHECKS_FAILED=0
 
+# How many verdicts a complete run prints, and the number every run is held
+# to.
+#
+# The summary is a tally of what happened to the checks that ran, and a tally
+# has nothing to say about a check that did not run. Delete a call from the
+# list in `verify_demo` -- by accident, in a merge, or because a check was
+# being skipped "for now" -- and the run goes from "93 passed, 0 failed" to
+# "92 passed, 0 failed", which reads as a slightly shorter green run and not
+# as one that stopped asking a question. The whole of the difference is a
+# digit nobody has the previous run in front of them to compare against.
+#
+# So the list has a length, it is written down, and a run that does not reach
+# it fails. Adding a check means changing this number, which is the point:
+# the number is the roll call.
+VERIFY_EXPECTED_CHECKS=93
+
+# Every claim a verdict has been printed for, one per line.
+#
+# The count alone cannot tell "a check vanished" from "a check vanished and
+# another printed twice"; two verdicts under one claim keep the tally right
+# while the list is wrong. Claims are compared rather than function names
+# because the claim is what a reader is told was proved.
+VERIFY_CLAIMS=""
+
 pass_check() {
   CHECKS_PASSED=$((CHECKS_PASSED + 1))
+  # `:-` so a harness that lifts this function out of the file -- which
+  # scripts/test-demo-witnesses.sh does -- is not ended by `set -u` on a
+  # variable it had no reason to know about.
+  VERIFY_CLAIMS="${VERIFY_CLAIMS:-}
+$1"
   echo "   ✓ $1"
   [ -n "${2:-}" ] && echo "     $2"
   return 0
@@ -2025,6 +2135,8 @@ pass_check() {
 
 fail_check() {
   CHECKS_FAILED=$((CHECKS_FAILED + 1))
+  VERIFY_CLAIMS="${VERIFY_CLAIMS:-}
+$1"
   echo "   ✗ $1"
   [ -n "${2:-}" ] && echo "     $2"
   return 0
@@ -2188,6 +2300,59 @@ node_log() {
 # quotation is only readable if it is the sentence rather than the whole line.
 log_message() {
   sed 's/^[^ ]* *[A-Z]* *ThreadId([0-9]*) //; s/^request{[^}]*}: //; s/ app_id=.*//'
+}
+
+# ----------------------------------------------------------------------
+# Whose line is it
+# ----------------------------------------------------------------------
+#
+# The node's log is not a private channel between the node and this script.
+# Every application log line lands in the same file, and an application's line
+# carries whatever a request put in it, so the file is writable - in content,
+# not only in volume - by anyone who can reach the port. Measured against this
+# demo as it shipped: one unauthenticated
+#
+#   GET /hello/x%0A<timestamp>%20%20WARN%20ThreadId(99)%20...stream_timeout_ms
+#
+# put a line in the file that carries a plausible timestamp, the WARN level,
+# a thread id, the node's exact wording and the `app_id=` and `trace_id=`
+# fields tracing appends - indistinguishable, read as text, from one the node
+# wrote. And no forgery was needed for the cheaper half: an ordinary
+# `GET /api/timers?mode=arm` from outside makes the node write a real
+# "were still armed" line, which was equally enough.
+#
+# Both mattered because two checks asserted on a *count* of matching lines
+# going up while they ran. That count is a fact about the file, not about the
+# check: it moved when anything else on the node moved, and it could be moved
+# on purpose by one request. The evidence a check prints as the node's own
+# sentence could likewise be written from outside.
+#
+# So the question a check asks the log is no longer "did a line like this
+# appear" but "did the node write this about the invocation I started". Every
+# line one invocation produces - the handler's own, and the node's about it -
+# carries the same `trace_id`. The handler logs a marker naming a tag this
+# script invented a moment ago; this reads the id off that marker; and the
+# checks then count and quote only lines carrying it. An outsider cannot
+# produce a line under that id without knowing the tag, which never left this
+# script and the node.
+#
+# What this does not close, said plainly: anyone who can *read* the log file
+# can read the id out of it and then write a line carrying it, and an
+# application can still put a newline and a whole fabricated line into this
+# file at all. Closing the second belongs where an application's message
+# enters the operator's log - crates/deis-runtime/src/logging - by escaping
+# the control characters out of it there. This makes the evidence
+# unforgeable by someone who only has HTTP, which is what the demo hands to
+# the world; it does not make the log a trustworthy channel.
+#
+# Answers nothing when the marker was never logged, which every caller
+# reports as a failure rather than treating as zero matching lines.
+trace_of_witness() {
+  local marker=$1
+  # `.*trace_id=` is greedy on purpose: a message that itself contains the
+  # word matches the earlier one, and the field tracing appended is the last.
+  node_log | grep -F -- "$marker" | sed -n 's/.*trace_id=//p' | tr -d '"' \
+    | awk '{ print $1 }' | grep -x '[0-9a-f]\{8,\}' | tail -n 1 || true
 }
 
 # base64(HMAC-SHA256(STORAGE_AUTH_SECRET, tenant)) - the identical
@@ -3157,32 +3322,40 @@ check_a_producer_that_throws_leaves_a_failed_transfer() {
   fi
 }
 
-# How many times this node has said, at warn, that it closed a stream for
-# running past its budget. Counted rather than merely looked for: several
-# checks leave a stream behind that meets the same fate, so what is evidence
-# about one of them is the number this grows by while it runs.
+# How many times this node has said, at warn, that it closed *one named
+# invocation's* stream for running past its budget.
+#
+# By invocation, not by wording. Several checks here leave a stream behind
+# that meets the same fate and is logged in the same words, so the count of
+# lines that match the wording says nothing about any one of them - and,
+# worse, it is a count over a file anything reaching the node can add to. See
+# `trace_of_witness`. `$1` is the invocation id the stream belonged to; a
+# count over that is a count of what the node said about this stream and
+# nothing else.
 stream_budget_log_lines() {
-  node_log | grep " WARN " | grep -c "is past stream_timeout_ms" || true
+  local trace=$1
+  if [ -z "$trace" ]; then
+    echo 0
+    return 0
+  fi
+  node_log | grep " WARN " | grep "is past stream_timeout_ms" \
+    | grep -c -F "trace_id=\"${trace}\"" || true
 }
 
 check_a_stream_past_its_budget_is_closed_by_the_node() {
   local title="a stream that runs past stream_timeout_ms is closed by the node"
   local report="${LOG_DIR}/verify-stream-budget.json"
-  local tag="budget-$$"
+  # A tag this run invents. It reaches the handler, which logs it, and nothing
+  # else knows it - which is what makes the node's line about this stream
+  # findable and what stops any other line from standing in for it. `$$` alone
+  # was not enough even before anybody was being adversarial: two `verify` runs
+  # against one demo can be the same shell.
+  local tag="budget-$$-${RANDOM}"
 
   if ! command -v python3 >/dev/null 2>&1; then
     fail_check "$title" "python3 is not installed, so no stream was opened"
     return
   fi
-
-  # How many times the node has already said this, before this check opens
-  # anything. The count matters because the line is not this check's alone:
-  # the parallel-request check above abandons an endless stream of its own,
-  # which this node then closes at the same ceiling and logs in the same
-  # words. Asserting only that the line exists was therefore satisfied before
-  # this stream was opened, and said nothing about it.
-  local logged_before
-  logged_before=$(stream_budget_log_lines)
 
   # Read for well past the ceiling. The node is what has to end this, and the
   # client keeps asking until it does.
@@ -3199,8 +3372,21 @@ check_a_stream_past_its_budget_is_closed_by_the_node() {
 
   local floor=$(( DEMO_STREAM_TIMEOUT_MS / 2 ))
   local ceiling=$(( DEMO_STREAM_TIMEOUT_MS * 2 ))
-  # Only the lines this check caused, and only lines carrying the level the
-  # evidence claims. `stream_budget_log_lines` counts at warn, so a line
+  # Which invocation this stream was, read off the marker the handler logged
+  # under the tag above. Everything below is then asked about that invocation
+  # rather than about the wording of a line, so neither a second `verify` run,
+  # nor the parallel-request check's abandoned stream, nor a request from
+  # outside can supply the evidence this check reports as its own.
+  local trace
+  trace=$(trace_of_witness "stream witness ${tag}")
+  if [ -z "$trace" ]; then
+    fail_check "$title" \
+      "the node logged no 'stream witness ${tag}' line, so this check cannot tell which invocation its own stream was and will not read another one's evidence as its own; the log is ${LOG_DIR}/deis-runtime.log"
+    return
+  fi
+
+  # Only the lines this invocation caused, and only lines carrying the level
+  # the evidence claims. `stream_budget_log_lines` counts at warn, so a line
   # demoted to debug - which is where a message stops being something an
   # operator sees - fails here rather than passing on the wording alone.
   #
@@ -3213,16 +3399,17 @@ check_a_stream_past_its_budget_is_closed_by_the_node() {
   # than kill the script on the way; the failure branch already prints
   # `${said:-<none>}` for it.
   local logged said
-  logged=$(( $(stream_budget_log_lines) - logged_before ))
-  said=$(node_log | grep " WARN " | grep "is past stream_timeout_ms" | tail -n 1 || true)
+  logged=$(stream_budget_log_lines "$trace")
+  said=$(node_log | grep " WARN " | grep "is past stream_timeout_ms" \
+    | grep -F "trace_id=\"${trace}\"" | tail -n 1 || true)
 
   if [ "$timed_out" != "true" ] && [ "$clean" != "true" ] \
     && [ "$last" -ge "$floor" ] && [ "$last" -le "$ceiling" ] && [ "$logged" -ge 1 ]; then
     pass_check "$title" \
-      "an endless stream ran for ${last}ms against the ${DEMO_STREAM_TIMEOUT_MS}ms ceiling this node is configured with, delivered ${frames} frame(s), and was then ended without its terminating chunk. The node wrote ${logged} new line(s) at warn about it while this check ran, the last of them: \"$(printf '%s' "$said" | log_message | head -c 200)\""
+      "an endless stream ran for ${last}ms against the ${DEMO_STREAM_TIMEOUT_MS}ms ceiling this node is configured with, delivered ${frames} frame(s), and was then ended without its terminating chunk. The node wrote ${logged} line(s) at warn about invocation ${trace} - the one this check started, and no other - the last of them: \"$(printf '%s' "$said" | log_message | head -c 200)\""
   else
     fail_check "$title" \
-      "expected the node to close the stream between ${floor}ms and ${ceiling}ms and to say so at warn; last frame at ${last}ms, clean_end=${clean}, client gave up=${timed_out}, new warn line(s) about the ceiling=${logged}"
+      "expected the node to close the stream between ${floor}ms and ${ceiling}ms and to say so at warn; last frame at ${last}ms, clean_end=${clean}, client gave up=${timed_out}, warn line(s) about the ceiling filed under this check's own invocation ${trace}=${logged}"
   fi
 }
 
@@ -3297,21 +3484,30 @@ check_a_request_is_served_while_a_stream_is_open() {
 }
 
 # How many times this node has said, at warn, that it cleared timers an
-# invocation left armed. The same counted-not-found reason as
-# `stream_budget_log_lines`: a `verify` run twice against one demo would
-# otherwise satisfy the assertion below with the first run's line.
+# invocation left armed, filed under the invocation that armed them. The same
+# reason as `stream_budget_log_lines`, and the same `$1`: counting the lines
+# that match the wording counts a second `verify` run's line, another check's
+# line, and any line a request from outside put in the file, none of which is
+# evidence about the request this check made.
 timer_cleared_log_lines() {
-  node_log | grep " WARN " | grep -c "were still armed when this invocation ended" || true
+  local trace=$1
+  if [ -z "$trace" ]; then
+    echo 0
+    return 0
+  fi
+  node_log | grep " WARN " | grep "were still armed when this invocation ended" \
+    | grep -c -F "trace_id=\"${trace}\"" || true
 }
 
 check_no_timer_outlives_the_request_that_armed_it() {
   local title="no timer outlives the request that armed it, however the handler files it"
   local headers="${LOG_DIR}/verify-timers.headers"
-
-  # Before anything is armed, so the line quoted at the end is one this
-  # request caused.
-  local said_before
-  said_before=$(timer_cleared_log_lines)
+  # A tag this run invents, for the reason given at `trace_of_witness`: the
+  # node's warning about cleared timers is written for every request that
+  # leaves one armed, so one `GET ${TIMER_ROUTE}?mode=arm` from outside used
+  # to satisfy the assertion below on its own, and a line forged through an
+  # application's own logging used to be quoted here as the node's.
+  local tag="timers-$$-${RANDOM}"
 
   # One request arms everything it can; a second, in the same isolate, reads
   # whether any of it is still ticking. Two requests is the whole point: a timer
@@ -3319,7 +3515,7 @@ check_no_timer_outlives_the_request_that_armed_it() {
   # fires inside the next one is somebody else's CPU and somebody else's rate
   # limit being spent.
   local armed
-  armed=$(app_request "$headers" "${TIMER_ROUTE}?mode=arm")
+  armed=$(app_request "$headers" "${TIMER_ROUTE}?mode=arm&tag=${tag}")
   if [ "$(http_status "$headers")" != "200" ]; then
     fail_check "$title" "GET ${TIMER_ROUTE}?mode=arm answered $(http_status "$headers"): $(printf '%s' "$armed" | head -c 200)"
     return
@@ -3354,20 +3550,27 @@ check_no_timer_outlives_the_request_that_armed_it() {
   # that matches nothing ends the whole run under `set -euo pipefail`, and
   # the missing line is exactly what the failure branch below is written to
   # report.
-  local said_after said
-  said_after=$(timer_cleared_log_lines)
-  said=$(node_log | grep " WARN " | grep "were still armed when this invocation ended" | tail -n 1 || true)
+  local trace said_lines said
+  trace=$(trace_of_witness "timer witness ${tag}")
+  if [ -z "$trace" ]; then
+    fail_check "$title" \
+      "the node logged no 'timer witness ${tag}' line, so this check cannot tell which invocation armed the timers and will not read another request's evidence as its own; the log is ${LOG_DIR}/deis-runtime.log"
+    return
+  fi
+  said_lines=$(timer_cleared_log_lines "$trace")
+  said=$(node_log | grep " WARN " | grep "were still armed when this invocation ended" \
+    | grep -F "trace_id=\"${trace}\"" | tail -n 1 || true)
 
   if [ "$armed_interval" -gt 0 ] && [ "$armed_timeout" -gt 0 ] \
     && [ "$scope" = "undefined" ] && [ "$claim" = "null" ] \
     && [ "${invented#threw:}" != "$invented" ] && [ "${adopted#threw:}" != "$adopted" ] \
     && [ "$after_i" = "$before_i" ] && [ "$after_t" = "$before_t" ] \
-    && [ "$after_o" = "$before_o" ] && [ "$said_after" -gt "$said_before" ]; then
+    && [ "$after_o" = "$before_o" ] && [ "$said_lines" -ge 1 ]; then
     pass_check "$title" \
-      "the arming request watched its own timers fire (${armed_interval} interval tick(s), ${armed_timeout} tick(s) of a setTimeout that rearms itself) and could reach neither door to the runtime's ownership of them: __deis_runtime_stream_scope is ${scope} and the claim answers ${claim}, so enter() ${invented} and adopt() ${adopted}. A later request through the same isolate then sat for 250ms and none of the three counters moved (${before_i}/${before_t}/${before_o}). The node said so at warn: \"$(printf '%s' "$said" | sed 's/.*: //' | head -c 160)\""
+      "the arming request watched its own timers fire (${armed_interval} interval tick(s), ${armed_timeout} tick(s) of a setTimeout that rearms itself) and could reach neither door to the runtime's ownership of them: __deis_runtime_stream_scope is ${scope} and the claim answers ${claim}, so enter() ${invented} and adopt() ${adopted}. A later request through the same isolate then sat for 250ms and none of the three counters moved (${before_i}/${before_t}/${before_o}). The node said so at warn, about invocation ${trace} and no other: \"$(printf '%s' "$said" | log_message | head -c 160)\""
   else
     fail_check "$title" \
-      "arming request: intervalTicks=${armed_interval} timeoutTicks=${armed_timeout} scope=${scope} claim=${claim} invented=${invented} adopted=${adopted}; later request: intervals ${before_i}->${after_i}, timeouts ${before_t}->${after_t}, redirected ${before_o}->${after_o}; warn lines naming cleared timers went ${said_before} -> ${said_after} and the last one reads \"$(printf '%s' "${said:-<none>}" | log_message | head -c 160)\""
+      "arming request: intervalTicks=${armed_interval} timeoutTicks=${armed_timeout} scope=${scope} claim=${claim} invented=${invented} adopted=${adopted}; later request: intervals ${before_i}->${after_i}, timeouts ${before_t}->${after_t}, redirected ${before_o}->${after_o}; warn lines naming cleared timers filed under this check's own invocation ${trace}=${said_lines}, the last reading \"$(printf '%s' "${said:-<none>}" | log_message | head -c 160)\""
   fi
 }
 
@@ -4629,13 +4832,48 @@ check_queue_consumer_concurrency() {
   line=$(node_log | grep -m 1 "Consuming queue jobs for app ${APP_ID}.${ENV_NAME}:" || true)
   applied=$(echo "$line" | sed -n 's/.*at most \([0-9]*\) batch(es).*/\1/p')
 
+  # The line above is written once, by the consumer task as it is spawned, and
+  # then it sits in the log for the rest of the run. So a check that read only
+  # the line was reporting what the node *said when it started*, and this one
+  # passed with deis-queue killed and its port free -- measured, not supposed.
+  # The claim is about a consumer that is holding batches, which is the present
+  # tense, so the present tense has to be asked: one message of this check's
+  # own, enqueued now, and consumed now.
+  #
+  # Its own message rather than another check's: an assertion resting on what
+  # some earlier check left behind is the same defect as one resting on a line
+  # some earlier run left behind. The consumer writes the value under
+  # `job:<key>` in KV, which is the effect an outsider cannot produce for this
+  # key because nobody else knows it.
+  local key="concurrency-$$-${RANDOM}"
+  local value="consumed-while-this-check-watched"
+  local headers="${LOG_DIR}/verify-queue-concurrency.headers"
+  local sent
+  sent=$(curl -s -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+    -H 'content-type: application/json' \
+    -d "{\"key\":\"${key}\",\"value\":\"${value}\"}" \
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/enqueue" || true)
+  local accepted
+  accepted=$(http_status "$headers")
+
+  # The consumer is a poller, so what there is to do is wait for its effect.
+  # curl paces its own retries a second apart; nothing here sleeps.
+  local got consumed=""
+  if [ "$accepted" = "202" ]; then
+    got=$(curl -sf --retry 45 --retry-delay 1 --retry-max-time 90 --retry-all-errors \
+      -H "x-deis-app-id: ${APP_ID}" \
+      "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/job:${key}" 2>/dev/null || echo '')
+    consumed=$(echo "$got" | jq -r '.value // empty' 2>/dev/null || true)
+  fi
+
   if [ "$applied" = "$declared" ] && [ -n "$line" ] \
-    && echo "$line" | grep -q "Outstanding, not parallel"; then
+    && echo "$line" | grep -q "Outstanding, not parallel" \
+    && [ "$consumed" = "$value" ]; then
     pass_check "$title" \
-      "the project asks for maxConcurrency ${declared} on queue jobs and the node reported \"$(echo "$line" | log_message)\""
+      "the project asks for maxConcurrency ${declared} on queue jobs and the node reported \"$(echo "$line" | log_message)\". The consumer that line describes is the one running now: job:${key}, enqueued by this check, came back out of it"
   else
     fail_check "$title" \
-      "expected the node to log that it holds ${declared} batch(es) of queue jobs at once and to say the number is not parallelism; it reported '${applied:-<none>}' in the line $(if [ -n "$line" ]; then echo "\"$(echo "$line" | log_message)\""; else echo "which was never written"; fi)"
+      "expected the node to log that it holds ${declared} batch(es) of queue jobs at once, to say the number is not parallelism, and that consumer to still be consuming; it reported '${applied:-<none>}' in the line $(if [ -n "$line" ]; then echo "\"$(echo "$line" | log_message)\""; else echo "which was never written"; fi), POST /api/enqueue answered ${accepted:-nothing} and job:${key} read back '${consumed:-<nothing>}' within 90s"
   fi
 }
 
@@ -5236,8 +5474,21 @@ check_a_date_this_platform_cannot_honour_is_refused() {
   fi
 }
 
-check_an_unknown_compatibility_flag_is_refused() {
-  local title="a bundle naming a behaviour flag this build does not know is refused at upload"
+# The mirror of the check above, and the two are next to each other because
+# the difference between them is the rule (`deis_bundle::forward`). A date this
+# build cannot honour is refused: it asks for the whole set of answers as of a
+# day nobody here has seen, and there is no honest subset of that to serve. A
+# flag name this build does not know is accepted and ignored: it names one
+# behaviour this build does not have in either direction, so ignoring it is
+# exactly what this build was already doing.
+#
+# This used to expect the refusal, and that refusal was the rollback failure
+# in miniature - a control plane one release behind the builder could not take,
+# or later re-deliver, any version naming a flag added since, and the manifest
+# is inside the archive whose digest is the version id, so nothing repaired
+# one. The author's own misspelling is still refused, at the build.
+check_an_unknown_compatibility_flag_is_carried_not_refused() {
+  local title="a bundle naming a behaviour flag this build does not know is stored, not refused"
 
   if ! command -v python3 >/dev/null 2>&1; then
     fail_check "$title" "python3 is needed to alter a bundle's manifest"
@@ -5246,15 +5497,19 @@ check_an_unknown_compatibility_flag_is_refused() {
 
   local status message
   status=$(upload_altered_bundle "unknown-flag-bundle" \
-    'manifest["compatibility"] = {"flags": ["cookies_but_faster"]}')
+    'manifest["compatibility"] = {"date": "2026-09-01", "flags": ["cookies_but_faster"]}')
   message=$(refusal_message "${LOG_DIR}/unknown-flag-bundle-upload.json")
 
-  if [ "$status" = "400" ] && echo "$message" | grep -q "cookies_but_faster"; then
+  local stored_date
+  stored_date=$(jq -r '.version.manifest.compatibility.date // empty' \
+    < "${LOG_DIR}/unknown-flag-bundle-upload.json" 2>/dev/null || true)
+
+  if [ "$status" = "201" ] && [ "$stored_date" = "2026-09-01" ]; then
     pass_check "$title" \
-      "POST /api/apps/${APP_ID}/versions with the flag \"cookies_but_faster\" answered HTTP ${status}: \"$(echo "$message" | cut -c1-220)\". A flag nothing implements is refused rather than ignored, so an application is never told it has a behaviour it does not"
+      "POST /api/apps/${APP_ID}/versions with the flag \"cookies_but_faster\" answered HTTP ${status} and stored the version with its date 2026-09-01 intact. The flag names a behaviour this build does not have in either direction, so it is ignored and named at warn rather than costing the whole version - which is what a control plane one release behind a builder has to be able to do"
   else
     fail_check "$title" \
-      "expected HTTP 400 naming cookies_but_faster, got HTTP ${status} and message '${message:-<empty>}'"
+      "expected HTTP 201 with the compatibility date carried through, got HTTP ${status}, date '${stored_date:-<none>}' and message '${message:-<empty>}'"
   fi
 }
 
@@ -5728,6 +5983,166 @@ check_named_caches() {
   else
     fail_check "$title" \
       "expected the default cache to answer 'default-copy' (got '${from_default:-<none>}'), the named cache 'pages-copy' (got '${from_pages:-<none>}'), delete to report true and empty the name (got '${emptied:-<none>}'/'${empty_after:-<none>}') while the default kept its entry (got '${survived:-<none>}'), and both requests to report scope kind 'isolate' (got '${kind:-<none>}') with one stable id (got '${first_id:-<none>}' then '${second_id:-<none>}')"
+  fi
+}
+
+# ----------------------------------------------------------------------
+# Two callers, one address
+# ----------------------------------------------------------------------
+#
+# Everything else in this file drives one deployed application through one
+# node as a single caller, and asks what that caller was given. A whole class
+# of defect is invisible to that shape of question, because it needs two
+# callers to appear at all: what one caller is handed that belonged to
+# another. `verify` reported "90 passed, 0 failed" on a build whose cache was
+# keyed by the address alone, so the answer to one user's `POST /orders` was
+# handed to the next anonymous `GET /orders` - a live cross-caller disclosure,
+# every check green, and the person who found it was a person.
+#
+# So there is a second caller here. The two requests differ only in the
+# credential they carry, they ask for the same address, and the check compares
+# the two answers. That comparison is the whole mechanism, and it is not
+# specific to a cache: it is what any check of a per-caller boundary looks
+# like.
+#
+# The address they ask for is a route in the example app that follows the
+# pattern the Cache API is written for. It is deliberately not a route that
+# knows it is being tested: a handler with a special case for the second
+# caller would be proving something about itself.
+
+# The route both callers ask for. Named once so the handler in the example
+# app's sources and the two checks below cannot drift apart.
+PRIVATE_PAGE_ROUTE="/api/private-page"
+
+# One caller's request for it. An empty credential means an anonymous caller,
+# which is a caller like any other and the one every mistaken variant matches.
+private_page_request() {
+  local headers=$1
+  local mode=$2
+  local credential=$3
+
+  if [ -n "$credential" ]; then
+    curl -s -D "$headers" -H "x-deis-app-id: ${APP_ID}" \
+      -H "authorization: ${credential}" \
+      "http://127.0.0.1:${DEIS_RUNTIME_PORT}${PRIVATE_PAGE_ROUTE}?mode=${mode}" || true
+  else
+    curl -s -D "$headers" -H "x-deis-app-id: ${APP_ID}" \
+      "http://127.0.0.1:${DEIS_RUNTIME_PORT}${PRIVATE_PAGE_ROUTE}?mode=${mode}" || true
+  fi
+}
+
+# One field of one answer, or nothing when the field is absent or the answer
+# was not JSON at all.
+#
+# Not `jq -r '.field // empty'`, which is the idiom used everywhere else in
+# this file: `//` in jq treats `false` as absent, so `.stored // empty`
+# answers nothing for `"stored": false` - and `false` is the value the second
+# check below exists to see. Measured: the check reported `stored=<none>` and
+# failed against a platform that had refused the put exactly as it should.
+private_page_field() {
+  printf '%s' "$1" | jq -r "if $2 == null then empty else $2 end" 2>/dev/null || true
+}
+
+check_a_second_caller_is_not_handed_the_first_ones_answer() {
+  local title="a second caller asking for the same address is not handed the first caller's answer"
+  local headers="${LOG_DIR}/verify-private-page.headers"
+  # Credentials this run invents. Nothing an earlier run, or anybody else on
+  # this node, can have left in the store reads as either caller's answer.
+  local first="Bearer first-$$-${RANDOM}"
+  local second="Bearer second-$$-${RANDOM}"
+
+  local one two three four
+  one=$(private_page_request "$headers" vary "$first")
+  if [ "$(http_status "$headers")" != "200" ]; then
+    fail_check "$title" \
+      "GET ${PRIVATE_PAGE_ROUTE} answered $(http_status "$headers") for the first caller: $(printf '%s' "$one" | head -c 200)"
+    return
+  fi
+  # The same caller again. This is what makes the rest of the check mean
+  # something: a platform with no cache at all would hand nobody anybody
+  # else's page, and would pass every "no leak" assertion below while giving
+  # the application none of what it asked for.
+  two=$(private_page_request "$headers" vary "$first")
+  # A caller with no credential, asking for the same address.
+  three=$(private_page_request "$headers" vary "")
+  # And a third caller, with a credential of its own, after the anonymous one.
+  four=$(private_page_request "$headers" vary "$second")
+
+  local stored_one hit_two served_two served_three served_four
+  local scope_one scope_two
+  stored_one=$(private_page_field "$one" '.stored')
+  scope_one=$(private_page_field "$one" '.scopeId')
+  hit_two=$(private_page_field "$two" '.hit')
+  served_two=$(private_page_field "$two" '.served')
+  scope_two=$(private_page_field "$two" '.scopeId')
+  served_three=$(private_page_field "$three" '.served')
+  served_four=$(private_page_field "$four" '.served')
+
+  # A cache that lost its store between the two requests would report a miss
+  # for the second, and a miss proves nothing about what the store would have
+  # handed back. Said separately so a failure names that rather than blaming
+  # the caching rules.
+  if [ -n "$scope_one" ] && [ "$scope_one" != "$scope_two" ]; then
+    fail_check "$title" \
+      "the isolate's cache store changed between the first caller's two requests (${scope_one} then ${scope_two}), so nothing here was served out of the store the first request wrote to and this check proves nothing either way"
+    return
+  fi
+
+  if [ "$stored_one" = "true" ] && [ "$hit_two" = "true" ] \
+    && [ "$served_two" = "page-for-${first}" ] \
+    && [ "$served_three" = "page-for-anonymous" ] \
+    && [ "$served_four" = "page-for-${second}" ]; then
+    pass_check "$title" \
+      "the first caller's page was stored under its credential and served back to it out of the cache (store ${scope_one}); the anonymous caller and a second credentialed caller asked the same address next and were each answered their own page - \"${served_three}\" and \"page-for-${second}\" - rather than \"page-for-${first}\""
+    return
+  fi
+
+  local leaked=""
+  if [ "$served_three" = "page-for-${first}" ]; then
+    leaked=" The anonymous caller was handed the first caller's page."
+  fi
+  if [ "$served_four" = "page-for-${first}" ] || [ "$served_four" = "page-for-anonymous" ]; then
+    leaked="${leaked} The second credentialed caller was handed \"${served_four}\", which is not its own."
+  fi
+  fail_check "$title" \
+    "expected the first caller's put to be accepted (got stored=${stored_one:-<none>}), its second request to be a hit for \"page-for-${first}\" (got hit=${hit_two:-<none>} serving \"${served_two:-<none>}\"), the anonymous caller to be answered \"page-for-anonymous\" (got \"${served_three:-<none>}\") and the second credentialed caller \"page-for-${second}\" (got \"${served_four:-<none>}\").${leaked}"
+}
+
+check_a_credentialed_answer_that_records_no_owner_is_not_stored() {
+  local title="a credentialed answer that records nothing about whose it is is refused by the cache, not stored"
+  local headers="${LOG_DIR}/verify-private-page-bare.headers"
+  local credential="Bearer bare-$$-${RANDOM}"
+
+  # The same two callers, against a handler that caches a credentialed answer
+  # while saying nothing about whose it is. RFC 9111 section 3.5: a shared
+  # cache may not reuse such a response. The platform is what has to refuse
+  # it, because the handler here does not know it is doing anything wrong -
+  # which is the point, since neither does the handler in a real application.
+  local one two
+  one=$(private_page_request "$headers" bare "$credential")
+  if [ "$(http_status "$headers")" != "200" ]; then
+    fail_check "$title" \
+      "GET ${PRIVATE_PAGE_ROUTE}?mode=bare answered $(http_status "$headers"): $(printf '%s' "$one" | head -c 200)"
+    return
+  fi
+  two=$(private_page_request "$headers" bare "")
+
+  local stored refused served_two
+  stored=$(private_page_field "$one" '.stored')
+  refused=$(private_page_field "$one" '.refused')
+  served_two=$(private_page_field "$two" '.served')
+
+  # Two things, and both are needed. That the anonymous caller was not handed
+  # the credentialed page is the property; that the platform said why is what
+  # keeps a handler from believing it has a cache when it has none.
+  if [ "$stored" = "false" ] \
+    && printf '%s' "$refused" | grep -qi "authorization" \
+    && [ "$served_two" = "page-for-anonymous" ]; then
+    pass_check "$title" \
+      "the put was refused and named the reason - \"$(printf '%s' "$refused" | head -c 220)\" - and the anonymous caller that asked next was answered its own page rather than \"page-for-${credential}\""
+  else
+    fail_check "$title" \
+      "expected the cache to refuse the put and name Authorization (got stored=${stored:-<none>}, refused=\"${refused:-<none>}\") and the next anonymous caller to be answered \"page-for-anonymous\" (got \"${served_two:-<none>}\")"
   fi
 }
 
@@ -7162,9 +7577,20 @@ open_trace_stream() {
 
 # Read rows until one contains $1, keeping every line for the failure message.
 # Sets TRACE_ROW to the row that matched.
+# Read rows until one carries every string asked for, or the stream goes
+# quiet for a minute.
+#
+# `$3` is optional and is what makes a row *this* check's. `deis trace`
+# renders the invocation id as `trace=<id>` at the end of every row, so a
+# caller that knows the id of the invocation it started - see
+# `trace_of_witness` - can insist the row be that invocation's rather than
+# the next one that happens to end the same way. Without it a check watching
+# for an outcome is watching the whole environment for it, and any caller who
+# can reach the node can produce one.
 await_trace_row() {
   local wanted=$1
   local transcript=$2
+  local also=${3:-}
   local line
 
   TRACE_ROW=""
@@ -7172,6 +7598,12 @@ await_trace_row() {
     printf '%s\n' "$line" >> "$transcript"
     case "$line" in
       *"$wanted"*)
+        if [ -n "$also" ]; then
+          case "$line" in
+            *"$also"*) ;;
+            *) continue ;;
+          esac
+        fi
         TRACE_ROW=$line
         return 0
         ;;
@@ -7296,17 +7728,34 @@ check_memory_cutoff() {
     return
   fi
 
+  # A tag this run invents, so the trace row judged below is the one written
+  # for this request. Without it the check waits for *an* invocation of this
+  # environment to end out of heap, and one `GET /api/heap` from outside -
+  # the route is unauthenticated, like every other - supplies that ending
+  # while this request fails for some other reason entirely.
+  local tag="heap-$$-${RANDOM}"
   local answered status seconds
   answered=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' \
     -H "x-deis-app-id: ${APP_ID}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/heap" || true)
+    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/heap?tag=${tag}" || true)
   status=${answered%% *}
   seconds=${answered##* }
 
-  if ! await_trace_row "memory-limit" "$out"; then
+  # Which invocation that was, read off the marker the handler logged before
+  # its first allocation. `deis trace` prints the same id as `trace=<id>`.
+  local trace
+  trace=$(trace_of_witness "heap witness ${tag}")
+  if [ -z "$trace" ]; then
     close_trace_stream
     fail_check "$title" \
-      "GET /api/heap answered HTTP ${status} after ${seconds}s, but no invocation ended as memory-limit within 60s - so either the ceiling was never reached or the near-heap-limit callback did not classify it; see ${out}"
+      "GET /api/heap answered HTTP ${status} after ${seconds}s, but the node logged no 'heap witness ${tag}' line, so this check cannot tell which invocation was its own and will not accept another caller's out-of-heap ending as evidence for it; the log is ${LOG_DIR}/deis-runtime.log"
+    return
+  fi
+
+  if ! await_trace_row "memory-limit" "$out" "trace=${trace}"; then
+    close_trace_stream
+    fail_check "$title" \
+      "GET /api/heap answered HTTP ${status} after ${seconds}s, but invocation ${trace} - this request's own - was not reported as memory-limit within 60s, so either the ceiling was never reached or the near-heap-limit callback did not classify it; see ${out}"
     return
   fi
   close_trace_stream
@@ -7334,7 +7783,7 @@ check_memory_cutoff() {
   fi
 
   pass_check "$title" \
-    "GET /api/heap allocated past the ${ceiling:-?}MB heap this version's manifest asks for and answered HTTP ${status} after ${seconds}s. deis trace calls that invocation memory-limit, which nothing but the near-heap-limit callback can produce - from the request path an out-of-heap kill and a handler that threw are the same terminated execution: $(echo "$TRACE_ROW" | sed 's/[[:space:]][[:space:]]*/ /g'). The same callback increments deis_runtime_memory_cutoffs_total, and deis-telemetry's scrape for this tenant went from ${before:-nothing} to ${after} while this check waited for it"
+    "GET /api/heap allocated past the ${ceiling:-?}MB heap this version's manifest asks for and answered HTTP ${status} after ${seconds}s. deis trace calls invocation ${trace} - this request's own, and no other - memory-limit, which nothing but the near-heap-limit callback can produce - from the request path an out-of-heap kill and a handler that threw are the same terminated execution: $(echo "$TRACE_ROW" | sed 's/[[:space:]][[:space:]]*/ /g'). The same callback increments deis_runtime_memory_cutoffs_total, and deis-telemetry's scrape for this tenant went from ${before:-nothing} to ${after} while this check waited for it - that series carries no invocation dimension, so its rise says the counter is written at all, and the row above is what says this request is the one that was cut off"
 }
 
 check_cli_tail() {
@@ -7411,6 +7860,38 @@ check_cli_tail() {
   fi
 }
 
+# ----------------------------------------------------------------------
+# The evidence this run rests on
+# ----------------------------------------------------------------------
+
+check_the_node_log_this_run_read_was_whole() {
+  local title="the log fifteen of these checks read was not cut off while they read it"
+  local log="${LOG_DIR}/deis-runtime.log"
+
+  if [ ! -f "$log" ]; then
+    fail_check "$title" \
+      "${log} does not exist, so every check above that quoted the node was quoting an empty file"
+    return
+  fi
+
+  local size
+  size=$(wc -c < "$log" | tr -d ' ')
+
+  # The marker `bounded_log` writes when it stops. Its absence is the pass:
+  # the ceiling exists so that an application - or anyone who can reach this
+  # node's unauthenticated routes - cannot fill the disk with the operator's
+  # log, and reaching it means the checks above read a partial file without
+  # any of them being able to tell.
+  if grep -a -q -F "$DEMO_LOG_CAPPED_MARKER" "$log"; then
+    fail_check "$title" \
+      "the node's log hit its ${DEMO_LOG_MAX_BYTES} byte ceiling during this run and was cut off from that point on, so every check above that read it may have been reading a file that stops before the line it wanted. Raise DEMO_LOG_MAX_BYTES and start again, and look at what filled it: ${log}"
+    return
+  fi
+
+  pass_check "$title" \
+    "${log} is ${size} bytes against the ${DEMO_LOG_MAX_BYTES} byte ceiling this demo gives it, and carries no cut-off marker, so the checks that read the node's own sentences read a whole file. The ceiling is there because an application's log line lands in this file and carries whatever a request put in it: without one, an unauthenticated GET is a write to the operator's disk with nothing counting it"
+}
+
 verify_demo() {
   load_state
   require_command curl
@@ -7485,6 +7966,12 @@ verify_demo() {
   check_a_redirect_hop_to_a_refused_host_is_stopped
   check_web_crypto
   check_named_caches
+  # Straight after the cache the application holds, because these two are the
+  # same store asked the one question a single caller cannot ask it: what a
+  # second caller is handed. They run before the rollback, which replaces the
+  # isolate and with it the store they read.
+  check_a_second_caller_is_not_handed_the_first_ones_answer
+  check_a_credentialed_answer_that_records_no_owner_is_not_stored
   echo "-- secrets --"
   # The list runs before the sweep: it writes its own output under LOG_DIR,
   # and the sweep is what would catch a value in it.
@@ -7561,7 +8048,7 @@ verify_demo() {
   check_every_set_cookie_reaches_a_dated_application
   check_an_undated_application_keeps_the_old_answer
   check_a_date_this_platform_cannot_honour_is_refused
-  check_an_unknown_compatibility_flag_is_refused
+  check_an_unknown_compatibility_flag_is_carried_not_refused
   echo "-- versions --"
   # This one moves production to v2 and back, so it runs after every check
   # that expects production to be on v1.
@@ -7598,6 +8085,10 @@ verify_demo() {
   check_acme_challenge_answers_only_what_was_published
   check_acme_does_not_reissue_a_current_certificate
   check_acme_restart_reuses_the_account_and_certificates
+  echo "-- the evidence this run rests on --"
+  # Last, and about the run rather than about the platform: whether the file
+  # the log-reading checks above quoted was whole while they quoted it.
+  check_the_node_log_this_run_read_was_whole
 
   # Before the summary, so the traps above stand down only once the whole
   # list has actually been asked. The line below returns non-zero when a
@@ -7605,9 +8096,29 @@ verify_demo() {
   # a run that stopped.
   VERIFY_REACHED_ITS_SUMMARY=true
 
+  # The roll call. A run that reached the end of its list has still proved
+  # nothing about a check that quietly left the list, so the length is
+  # asserted and the number is printed whether it matches or not.
+  local counted roll_call duplicates
+  counted=$((CHECKS_PASSED + CHECKS_FAILED))
+  roll_call=0
+  if [ "$counted" -ne "$VERIFY_EXPECTED_CHECKS" ]; then
+    roll_call=1
+    echo
+    echo "   ✗ the roll call does not add up"
+    echo "     ${counted} verdict(s) were printed and this file says a complete run prints ${VERIFY_EXPECTED_CHECKS}. If a check was added or removed on purpose, VERIFY_EXPECTED_CHECKS in scripts/demo.sh is the number to change; until then the difference is a question that stopped being asked, and no count of what did run says anything about it."
+  fi
+  duplicates=$(printf '%s\n' "$VERIFY_CLAIMS" | sed '/^$/d' | sort | uniq -d)
+  if [ -n "$duplicates" ]; then
+    roll_call=1
+    echo
+    echo "   ✗ two verdicts were printed under one claim"
+    echo "     $(printf '%s' "$duplicates" | tr '\n' ';' | head -c 300). Either one check reported twice or two checks make the same claim; either way the tally above is right about its own arithmetic and wrong about how many questions were asked."
+  fi
+
   echo
-  echo "${CHECKS_PASSED} passed, ${CHECKS_FAILED} failed"
-  [ "$CHECKS_FAILED" -eq 0 ]
+  echo "${CHECKS_PASSED} passed, ${CHECKS_FAILED} failed, ${counted} of the ${VERIFY_EXPECTED_CHECKS} checks this file lists"
+  [ "$CHECKS_FAILED" -eq 0 ] && [ "$roll_call" -eq 0 ]
 }
 
 status_demo() {

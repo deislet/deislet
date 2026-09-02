@@ -132,6 +132,19 @@ impl BindingKind {
         }
     }
 
+    /// The kind one manifest spelling names, or `None` for a spelling this
+    /// build has never heard of.
+    ///
+    /// Asked before a binding entry is parsed rather than after, so that "a
+    /// kind from a newer release" and "a binding whose shape is wrong" stay
+    /// two different answers: the first is carried through unread (see
+    /// [`DeclaredBindings`]), the second is a refusal. Reading them apart out
+    /// of serde's error text instead would make the difference depend on the
+    /// wording of a message.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
+
     /// Whether this kind is a namespace inside the tenant's own storage, as
     /// opposed to a route to another application.
     pub fn is_storage(self) -> bool {
@@ -273,9 +286,72 @@ impl Binding {
 ///
 /// A `BTreeMap` so the order is the author's names sorted, which is what makes
 /// a manifest byte-identical across builds and a log line stable.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct DeclaredBindings(BTreeMap<String, Binding>);
+///
+/// # A `kind` this build does not know
+///
+/// Kept aside in [`Self::unreadable`] rather than refused. `kind` is an
+/// allow-list of the five spellings this release has, and the list grows: a
+/// node one release behind that refused the entry would have refused the whole
+/// manifest with it, taking the application's code, routes and every *other*
+/// binding down, and no re-upload could repair the version because the
+/// manifest is inside the archive whose digest is the version id. See
+/// [`crate::forward`] for the rule this follows.
+///
+/// The narrow reading is that the binding is simply not there: nothing is
+/// published on `env` under that name, so a handler reaching for it gets
+/// `undefined` and fails on that one call rather than the application failing
+/// to load. The *name* is still held to every rule a name is held to - see
+/// [`Self::validate`] - because a name that collides with a variable or with
+/// another binding is ambiguous whatever kind it turns out to be.
+///
+/// The entry is kept verbatim so that serialising this value back does not
+/// quietly delete it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredBindings {
+    known: BTreeMap<String, Binding>,
+    /// Entries whose `kind` is a spelling this build does not know, exactly as
+    /// they were written.
+    unreadable: BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for DeclaredBindings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw: BTreeMap<String, serde_json::Value> = BTreeMap::deserialize(deserializer)?;
+        let mut declared = Self::default();
+        for (name, value) in raw {
+            // Only an unknown *kind* is carried through unread. Anything else
+            // wrong with the entry - no `kind` at all, a `kind` that is not a
+            // string, an `app` that is not one - is a shape this format has
+            // never had, which is a change no older build could have ignored
+            // safely and therefore takes a new `schema` number rather than
+            // arriving inside schema 1. Those still fail here, by name.
+            if let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str)
+                && BindingKind::from_name(kind).is_none()
+            {
+                declared.unreadable.insert(name, value);
+                continue;
+            }
+            let binding =
+                serde_json::from_value::<Binding>(value).map_err(serde::de::Error::custom)?;
+            declared.known.insert(name, binding);
+        }
+        Ok(declared)
+    }
+}
+
+impl Serialize for DeclaredBindings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.known.len() + self.unreadable.len()))?;
+        for (name, binding) in &self.known {
+            map.serialize_entry(name, binding)?;
+        }
+        for (name, value) in &self.unreadable {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
 
 impl DeclaredBindings {
     pub fn new() -> Self {
@@ -283,26 +359,59 @@ impl DeclaredBindings {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.known.is_empty() && self.unreadable.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.known.len()
+    }
+
+    /// The names this build could not read a kind for, and the kind each one
+    /// asked for.
+    ///
+    /// What [`crate::forward::report`] names at `warn`, and what an operator
+    /// reads to find out that this component is one release behind the builder
+    /// that produced the bundle.
+    pub fn unreadable_kinds(&self) -> Vec<(&str, &str)> {
+        self.unreadable
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|kind| (name.as_str(), kind))
+            })
+            .collect()
+    }
+
+    /// Every name the manifest declares a binding under, readable or not.
+    ///
+    /// The name is the part that has to be judged whatever the kind is: it
+    /// becomes a namespace on the storage service and a property on `env`, so
+    /// a collision is a collision even when this build cannot say what the
+    /// thing behind the name is.
+    pub fn all_names(&self) -> impl Iterator<Item = &str> {
+        self.known
+            .keys()
+            .chain(self.unreadable.keys())
+            .map(String::as_str)
     }
 
     pub fn get(&self, name: &str) -> Option<&Binding> {
-        self.0.get(name)
+        self.known.get(name)
     }
 
+    /// The bindings this build can act on. An entry whose kind it does not
+    /// know is not here - see [`Self::unreadable_kinds`].
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Binding)> {
-        self.0
+        self.known
             .iter()
             .map(|(name, binding)| (name.as_str(), binding))
     }
 
     /// The names of one kind, in the order they appear in the manifest.
     pub fn names_of(&self, kind: BindingKind) -> Vec<&str> {
-        self.0
+        self.known
             .iter()
             .filter(|(_, binding)| binding.kind == kind)
             .map(|(name, _)| name.as_str())
@@ -311,7 +420,7 @@ impl DeclaredBindings {
 
     /// Every kind this application declares a binding of.
     pub fn kinds(&self) -> Vec<BindingKind> {
-        let mut kinds: Vec<BindingKind> = self.0.values().map(|binding| binding.kind).collect();
+        let mut kinds: Vec<BindingKind> = self.known.values().map(|binding| binding.kind).collect();
         kinds.sort_unstable();
         kinds.dedup();
         kinds
@@ -320,17 +429,27 @@ impl DeclaredBindings {
     /// Add one, for the builders and the tests. Returns the previous entry of
     /// that exact name, if there was one.
     pub fn insert(&mut self, name: impl Into<String>, binding: Binding) -> Option<Binding> {
-        self.0.insert(name.into(), binding)
+        self.known.insert(name.into(), binding)
     }
 
     /// A one-line rendering for an operator's log.
+    ///
+    /// An entry this build cannot read is named too, and named as such: an
+    /// operator looking at a deploy report has to be able to see that a
+    /// binding the author declared is not in force here, rather than find it
+    /// simply missing from the list.
     pub fn describe(&self) -> String {
-        if self.0.is_empty() {
+        if self.is_empty() {
             return "nothing".to_string();
         }
-        self.0
+        self.known
             .iter()
             .map(|(name, binding)| format!("{name} ({})", binding.describe()))
+            .chain(
+                self.unreadable_kinds().into_iter().map(|(name, kind)| {
+                    format!("{name} (kind {kind}, which this build cannot read)")
+                }),
+            )
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -349,10 +468,21 @@ impl DeclaredBindings {
     /// naming its own application and environment - which is a call into
     /// itself, and a guaranteed cycle - is refused where it is written rather
     /// than on the first request that takes it.
+    ///
+    /// An entry whose `kind` this build does not know is held to every rule in
+    /// the first loop and to none in the second: the name is a namespace and a
+    /// property on `env` whatever the kind is, so a name that is ambiguous is
+    /// ambiguous here too, while what a kind may carry is a question only the
+    /// build that has the kind can answer.
     pub fn validate(&self, app: &str) -> Result<(), String> {
         let mut lowercased: BTreeMap<String, &str> = BTreeMap::new();
 
-        for (name, binding) in &self.0 {
+        // Sorted, not the chained map order, so that two names differing only
+        // in case are always reported the same way round however they were
+        // spelled and whichever half of this value they landed in.
+        let mut names: Vec<&str> = self.all_names().collect();
+        names.sort_unstable();
+        for name in names {
             if !deis_wire::conventions::is_valid_binding_name(name) {
                 return Err(format!(
                     "binding name {name:?} is not usable: it must be 1 to {MAX_BINDING_NAME_LEN} \
@@ -381,7 +511,7 @@ impl DeclaredBindings {
             }
 
             let folded = name.to_ascii_lowercase();
-            if let Some(first) = lowercased.insert(folded, name.as_str()) {
+            if let Some(first) = lowercased.insert(folded, name) {
                 return Err(format!(
                     "bindings {first:?} and {name:?} differ only in case. A binding name becomes a \
                      directory and a file name in the storage service, where those are one name on \
@@ -389,7 +519,9 @@ impl DeclaredBindings {
                      some machines and not on others"
                 ));
             }
+        }
 
+        for (name, binding) in &self.known {
             match binding.kind {
                 BindingKind::Service => {
                     let target = binding.app.as_deref().map(str::trim).unwrap_or_default();

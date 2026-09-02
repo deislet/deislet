@@ -561,9 +561,17 @@ fn decode_limits(limits: ResourceLimitsMessage) -> ResourceLimits {
 /// simply believed the flag names it was handed would be claiming to
 /// implement behaviour it may not have.
 ///
-/// `Err` carries a message for the control plane's delivery report: a flag
-/// name this build does not know, or a date later than
-/// `deis_bundle::PLATFORM_KNOWN_THROUGH`.
+/// `Err` carries a message for the control plane's delivery report, and there
+/// is one thing left that produces it: a date later than
+/// `deis_bundle::PLATFORM_KNOWN_THROUGH`, which asks for the whole set of
+/// answers as of a day this build has never seen.
+///
+/// A flag name this build does not know is **not** an error. It used to be,
+/// and that made every version naming a flag added since undeployable on this
+/// node - the rollback failure `deis_bundle::forward` exists to prevent,
+/// reached through the compatibility block itself. Such a name is a behaviour
+/// this build does not have in either direction, so ignoring it gives exactly
+/// what this node was already giving; `resolve` names it at `warn`.
 fn decode_compatibility(
     declared: CompatibilityDeclarationMessage,
 ) -> Result<deis_bundle::CompatibilityProfile, String> {

@@ -203,8 +203,27 @@ impl Compiler {
                         "{}",
                         "  Create smoke test (wrangler deploy --dry-run)...".dimmed()
                     );
+                    // `--outdir` used to be `dist-check`, which is relative to
+                    // `current_dir` - so the check wrote its own build of the
+                    // Worker *into the directory it was checking*, and left it
+                    // there. Two builds of unchanged source then produced two
+                    // different trees, because wrangler stamps the wall clock
+                    // into the `README.md` it writes beside the output; the
+                    // deliverable also carried a second copy of the Worker
+                    // that nothing was meant to deploy, and what shipped was
+                    // no longer what had been verified. A build whose output
+                    // depends on when it ran cannot be content-addressed, and
+                    // content-addressing is how this platform says which
+                    // version is which.
+                    //
+                    // The scratch directory is outside the output tree and is
+                    // removed when this scope ends, including on the error
+                    // path below. `current_dir` stays the output directory:
+                    // that is where the `wrangler.toml` being checked is.
+                    let scratch = ScratchDir::create("cloudflare-verify")?;
                     let status = Command::new("wrangler")
-                        .args(["deploy", "--dry-run", "--outdir", "dist-check"])
+                        .args(["deploy", "--dry-run", "--outdir"])
+                        .arg(scratch.path())
                         .current_dir(output_dir)
                         .status()?;
 
@@ -243,6 +262,18 @@ impl Compiler {
                 // the shared reader. A bundle that this rejects would be
                 // rejected at upload instead, a long way from the build that
                 // produced it.
+                //
+                // This is a read-back of the *manifest*, and the line it
+                // prints says so. It used to say "Bundle verified" and stop
+                // there, which read as a claim about the whole bundle: a
+                // handler with no default export produced a worker that threw
+                // ReferenceError the moment a node evaluated it, and this
+                // check - which never looks at the code - printed a green tick
+                // over it. What makes the module itself loadable is checked
+                // where the module is made: `BuildBundler::generate` refuses a
+                // bundle whose entry refers to a binding nothing defines, and
+                // `refuse_a_handler_with_no_default_export` refuses the file
+                // that causes it before that.
                 let bundle = output_dir.join(deis_build_adapter_deislet::BUNDLE_FILE_NAME);
                 let bytes = fs::read(&bundle)
                     .map_err(|e| anyhow::anyhow!("cannot read back {}: {e}", bundle.display()))?;
@@ -252,7 +283,8 @@ impl Compiler {
                 println!(
                     "{}",
                     format!(
-                        "  ✓ Bundle verified: app {}, entry {}, {} route(s), {} asset(s)",
+                        "  ✓ Bundle manifest reads back: app {}, entry {}, {} route(s), \
+                         {} asset(s)",
                         parsed.manifest.app,
                         parsed.manifest.entry,
                         parsed.manifest.routes.len(),
@@ -289,12 +321,13 @@ impl Compiler {
             return Ok(handlers);
         }
 
-        for entry in WalkDir::new(functions_dir) {
+        for entry in WalkDir::new(&functions_dir) {
             let entry = entry?;
             if entry.file_type().is_file() {
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
                     if ext == "ts" || ext == "js" || ext == "wasm" {
+                        Self::refuse_a_separator_inside_a_name(&functions_dir, path)?;
                         handlers.push(path.to_string_lossy().to_string());
                     }
                 }
@@ -302,6 +335,53 @@ impl Compiler {
         }
 
         Ok(handlers)
+    }
+
+    /// Stop a build over a handler whose name contains a backslash.
+    ///
+    /// `\` is a directory separator on Windows and an ordinary character in a
+    /// file name here, and the route table cannot hold both readings. The
+    /// derivation in `deis_build_core::routes` takes the Windows one - it has
+    /// only a string to go on, and a Windows build really does hand it
+    /// `users\[id].ts` - so on this platform a single file called `a\b.ts`
+    /// became the two-segment route `/a/b` and an import of `../src/a/b.ts`, a
+    /// file nobody wrote. What an author saw was the build failing with
+    /// `Could not resolve '../src/a/b.ts'`, naming a path that is not in their
+    /// project; and where `a/b.ts` did exist, the build instead reported two
+    /// handlers claiming one route and silently dropped one of them.
+    ///
+    /// Refused rather than escaped, which is the opposite of what a `:` or a
+    /// `*` in a name gets (`deis_build_core::routes::escape_literal`). Those
+    /// two are unambiguous - they are always literals in a file name, so there
+    /// is one right answer and the build can write it down. This one is not:
+    /// the same tree means two different route tables depending on which
+    /// machine the build ran on, and a version identity that depends on the
+    /// build host is not an identity. Picking either reading silently is
+    /// worse than saying the name cannot be carried.
+    ///
+    /// Checked against the path's real components, which is where the platform
+    /// knowledge is: on Windows this never fires, because a backslash cannot
+    /// be part of a name there.
+    fn refuse_a_separator_inside_a_name(
+        function_root: &Path,
+        handler: &Path,
+    ) -> anyhow::Result<()> {
+        let relative = handler.strip_prefix(function_root).unwrap_or(handler);
+        for component in relative.components() {
+            let name = component.as_os_str().to_string_lossy();
+            if name.contains('\\') {
+                return Err(anyhow::anyhow!(
+                    "{} contains a backslash in the name {name:?}. A backslash is a directory \
+                     separator on Windows and a name character here, so the same project would \
+                     produce two different route tables on two machines - this one would route \
+                     it as {:?} while the file itself stays a single file, and the bundler would \
+                     then be asked for a module nobody wrote. Rename the file",
+                    handler.display(),
+                    deis_build_core::routes::route_pattern(&relative.to_string_lossy()),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn get_enabled_vendors(&self, config: &ProjectConfig) -> Vec<String> {
@@ -559,6 +639,7 @@ impl Compiler {
             }
 
             let code = fs::read_to_string(&handler_path)?;
+            Self::refuse_a_handler_with_no_default_export(&self.parser, &handler_path, &code)?;
             let transformed = self
                 .transformer
                 .transform(&code, &handler_path, vendor, config)?;
@@ -583,6 +664,23 @@ impl Compiler {
             // Add to routes
             if !handler_path.ends_with(".wasm") {
                 let route = Transformer::filename_to_route(relative_path.to_str().unwrap(), "");
+                // A name that reads as pattern syntax is escaped so it can
+                // only mean itself; the author still has to be told, because
+                // `:id.ts` is almost always a misspelling of `[id].ts` and the
+                // route it now answers is not the one they had in mind.
+                for (written, escaped) in
+                    deis_build_core::routes::escaped_segments(&relative_path.to_string_lossy())
+                {
+                    let warning = format!(
+                        "{} has a name segment {written:?} that reads as route-pattern syntax; it \
+                         is escaped to {escaped:?} so the file answers its own name and nothing \
+                         else, and the route is {route}. In a file tree a placeholder is written \
+                         [name] and a catch-all [[name]]",
+                        relative_path.display()
+                    );
+                    println!("{}", format!("  ⚠ {warning}").yellow());
+                    warnings.push(warning);
+                }
                 // Use relative path for import (from _deis_internal/router.ts to src/...)
                 let import_path = format!(
                     "{}{}",
@@ -914,6 +1012,57 @@ impl Compiler {
             warnings,
             artifacts: build_artifacts,
         })
+    }
+
+    /// Stop a build whose router would import a handler that is not there.
+    ///
+    /// Every generated router - all four vendors - reaches a handler as
+    /// `import handlerN from "<file>"` and puts `handlerN` in a table built at
+    /// module scope. A file with no default export binds nothing there, so the
+    /// module the target loads throws `ReferenceError` while it is being
+    /// evaluated and **the whole application** is down: every route, the static
+    /// fallback that depends on the isolate, the queue consumer, all of it -
+    /// not the one file that was wrong.
+    ///
+    /// Caught here, against the author's own path, rather than only at the far
+    /// end where `deis_build_core::bundler::BuildBundler` refuses the same
+    /// thing on the bundler's report: by then the only name in the message is
+    /// the staged copy under `dist/`, which is not a file the author has ever
+    /// opened.
+    ///
+    /// A file that does not parse is left alone rather than failed on. swc and
+    /// the bundler are two different parsers, and failing a build here on
+    /// source the bundler would have accepted is a worse trade than letting
+    /// the bundler speak for itself - it refuses the same module a moment
+    /// later, from its own reading of it.
+    fn refuse_a_handler_with_no_default_export(
+        parser: &TypeScriptParser,
+        handler_path: &str,
+        code: &str,
+    ) -> anyhow::Result<()> {
+        let Ok(info) = parser.parse(code, handler_path) else {
+            return Ok(());
+        };
+        if info.has_default_export {
+            return Ok(());
+        }
+        let exports = if info.named_exports.is_empty() {
+            "it exports nothing at all".to_string()
+        } else {
+            format!(
+                "it exports {} by name ({}), which is not what a router imports",
+                info.named_exports.len(),
+                info.named_exports.join(", ")
+            )
+        };
+        Err(anyhow::anyhow!(
+            "{handler_path} has no default export: {exports}. Every file under the function root \
+             is a handler, and the generated router imports each one's default export and calls \
+             it; with nothing to import, the module this build would produce throws \
+             ReferenceError as the target loads it, and the entire application serves nothing - \
+             not just this route. Add `export default async function handler(context)`, or move \
+             the file out of the function root if it is a helper rather than a handler"
+        ))
     }
 
     /// Where this project's static files live.

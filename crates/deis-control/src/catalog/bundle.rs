@@ -492,18 +492,36 @@ pub(crate) mod tests {
         );
     }
 
+    /// A flag this build does not know is stored, not refused.
+    ///
+    /// It used to be refused here, which meant a control plane one release
+    /// behind the builder could not accept - or later re-deliver - any version
+    /// naming a flag added since. The flag names a behaviour this build does
+    /// not have in either direction, so ignoring it is what this build was
+    /// already doing; see `deis_bundle::forward`. The author's own misspelling
+    /// is refused at the build instead, with the project file on screen.
     #[test]
-    fn rejects_a_compatibility_flag_nobody_knows() {
+    fn stores_a_bundle_naming_a_compatibility_flag_it_does_not_know() {
         let dir = tempfile::tempdir().unwrap();
         let store = BundleStore::new(dir.path());
         let bytes = bundle_with_manifest(
             r#"{"schema":1,"app":"demo","entry":"worker/index.js",
-                "compatibility":{"flags":["cookies_but_faster"]}}"#,
+                "compatibility":{"date":"2026-09-01","flags":["cookies_but_faster"]}}"#,
             true,
         );
 
-        let err = store.store("demo", &bytes, None).unwrap_err();
-        assert!(err.to_string().contains("cookies_but_faster"), "{err}");
+        let stored = store
+            .store("demo", &bytes, None)
+            .expect("a flag from a newer builder must not cost the version");
+        assert_eq!(
+            stored
+                .compatibility
+                .date()
+                .map(|d| d.to_string())
+                .as_deref(),
+            Some("2026-09-01"),
+            "and everything this build does read is still in force"
+        );
     }
 
     #[test]

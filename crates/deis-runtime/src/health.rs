@@ -37,8 +37,8 @@
 //! `dispatcher/handlers.rs` - which is exactly a channel for "what this node
 //! decided about this request", and cannot be forged from outside because the
 //! sweep drops the client's copy first. So the readiness travels in on
-//! [`READINESS_HEADER`] and [`SERVING_APPS_HEADER`], stamped for
-//! [`SYSTEM_APP_ID`] alone.
+//! [`READINESS_HEADER`], [`SERVING_APPS_HEADER`] and [`REASON_HEADER`],
+//! stamped for [`SYSTEM_APP_ID`] alone.
 //!
 //! # What the probe is answered, and when
 //!
@@ -74,6 +74,30 @@
 //! node that says `degraded` - keep its share and warn, by default. That
 //! header is the edge's contract and is spelled identically in
 //! `deis_proxy::config::system::health::NODE_READINESS_HEADER`.
+//!
+//! **The body answers "why", and only ever in the node's own words.** A node
+//! is degraded for more than one reason - a control plane nobody can reach, a
+//! version that would not load, an environment that would not stop, a pushed
+//! deployment this node refused - and the state name alone used to be all that
+//! travelled, so the system application filled the gap by naming the first of
+//! those for every degraded node. An operator reading that during an incident
+//! is sent to the one part of the system that is working, which is worse than
+//! being told nothing. [`REASON_HEADER`] carries the reason the node actually
+//! recorded, and the answer says `"reason": null` when there is none rather
+//! than choosing one.
+//!
+//! # When the answer changes
+//!
+//! Not only once a reconcile pass ends. The pass is the slowest of the events
+//! that change what this node can serve, and between two of them a pushed
+//! deployment can be taken or refused and an application can be stopped - so a
+//! node that had just refused a push went on answering `ready`, and taking its
+//! full share of that application's traffic, for a whole reconcile interval.
+//! On a node with no control plane configured there is no next pass at all and
+//! it answered `ready` for ever. Every such event goes through
+//! [`NodeHealth::note_serving`] or [`NodeHealth::note_refusal`] as it happens;
+//! `deployment::run_control_loop` is what hands the deployment manager the
+//! same handle it reports its own passes through.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -116,6 +140,87 @@ pub const READINESS_READY: &str = "ready";
 /// tell them apart, and treating them alike is how the second kind kept its
 /// full share of the fleet's traffic indefinitely.
 pub const SERVING_APPS_HEADER: &str = "x-deis-node-apps";
+
+/// Header carrying *why* the node is degraded, stamped beside the two above on
+/// a request for [`SYSTEM_APP_ID`].
+///
+/// Absent for a node that is not degraded, because the other two states have
+/// no reason to carry.
+///
+/// It exists because `degraded` has more than one cause and the probe's answer
+/// used to name only one of them. The state name alone travelled, so the
+/// system application had nothing to go on and said "this node cannot reach
+/// its control plane" for every degraded node - including the ones whose
+/// control plane had answered perfectly well and whose real trouble was a
+/// bundle that would not load or an environment that would not stop. An
+/// operator reading that during an incident is sent to the one part of the
+/// system that is working.
+///
+/// The value is [`Readiness::reason`] put through [`header_safe_reason`],
+/// because a reason is built from an error message and a header value is not
+/// allowed to be arbitrary bytes.
+///
+/// # What this puts on an unauthenticated answer
+///
+/// The probe is answered on the node's public port to anyone who asks for
+/// `/health` with `x-deis-app-id: _system`, and the reason travels into the
+/// body. So a reason built from an error carries what that error carries -
+/// an application id, an environment, the control plane's own address out of
+/// a transport error - to whoever can reach the port. That is a deliberate
+/// trade and not an oversight: the reader this answer exists for is the
+/// operator holding a terminal during an incident, the audience that can
+/// reach a node's data port can already enumerate application ids by routing
+/// to them, and the alternative on offer was the invented cause this header
+/// replaced. What is kept out of it deliberately is any text that came from
+/// inside an isolate: a module that throws while it is being evaluated writes
+/// its own message, and `throw new Error(env.STRIPE_KEY)` would otherwise put
+/// a secret on an unauthenticated answer. So a refusal names which step
+/// refused ([`crate::deployment::DeployError::kind`]) and never the message
+/// that step produced, which stays in the log and in the answer the control
+/// plane gets.
+pub const REASON_HEADER: &str = "x-deis-node-reason";
+
+/// Longest reason that travels on [`REASON_HEADER`].
+///
+/// Long enough for the reasons this node builds - the longest is a transport
+/// error with a URL in it, around 150 characters - and short enough that a
+/// pathological error message cannot push the probe's request headers past
+/// what a server will accept.
+const MAX_REASON_BYTES: usize = 256;
+
+/// One line of visible ASCII, at most [`MAX_REASON_BYTES`] bytes.
+///
+/// A reason is `format!("...: {e}")` over somebody else's error type, so it
+/// can hold anything: a newline out of a nested error, a NUL, a non-ASCII
+/// path. None of that may reach a header value - a carriage return in one is
+/// how a header becomes two - so everything outside printable ASCII becomes a
+/// space here, and a reason too long to carry is cut and ends in three dots so
+/// a truncated one is never mistaken for the whole of what the node said.
+pub fn header_safe_reason(reason: &str) -> String {
+    /// What a cut reason ends with. Three ASCII dots and not an ellipsis
+    /// character: the point of this function is that nothing outside printable
+    /// ASCII leaves it.
+    const CUT: &str = "...";
+
+    let mut out = String::with_capacity(reason.len().min(MAX_REASON_BYTES));
+    for c in reason.chars() {
+        // One space per character and not per byte, so a path with non-ASCII
+        // in it keeps its shape rather than growing.
+        let c = if c.is_ascii_graphic() || c == ' ' {
+            c
+        } else {
+            ' '
+        };
+        // Everything this writes is one byte, so the room left for `CUT` is
+        // counted once here rather than after the fact.
+        if out.len() + 1 > MAX_REASON_BYTES - CUT.len() {
+            out.push_str(CUT);
+            return out;
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// The readiness of the node running in this process.
 ///
@@ -162,6 +267,18 @@ impl Readiness {
         match self {
             Readiness::Starting => 0,
             Readiness::Ready { apps } | Readiness::Degraded { apps, .. } => *apps,
+        }
+    }
+
+    /// Why the node is in this state, for the states that have a why.
+    ///
+    /// `None` for [`Readiness::Ready`] and [`Readiness::Starting`]: neither is
+    /// a fault, and inventing a reason for them would be the defect this
+    /// method exists to end.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Readiness::Starting | Readiness::Ready { .. } => None,
+            Readiness::Degraded { reason, .. } => Some(reason),
         }
     }
 
@@ -250,6 +367,103 @@ impl NodeHealth {
         }
     }
 
+    /// The set of applications this node serves changed between reconcile
+    /// passes, and nothing else about its situation did.
+    ///
+    /// Moves the count and keeps the state and its reason, because a push that
+    /// landed or an application that was stopped says nothing about whether
+    /// this node is running what the control plane last told it to. The count
+    /// is not decoration: it is what decides `200` against `503` at the edge
+    /// for a degraded node, so a node that unloaded its last application while
+    /// degraded has to stop claiming it can serve before the next pass, and a
+    /// node that took delivery of one has to stop claiming it cannot.
+    ///
+    /// [`Readiness::Starting`] is left exactly as it is. Such a node has not
+    /// been told what it should be running yet, so no count of it is an
+    /// answer - and `Degraded` with applications loaded is a *more* permissive
+    /// answer at the edge than `Starting` is, so an intermediate count must
+    /// never be the thing that lifts it.
+    ///
+    /// Read-modify-write through `rcu`, not a load and a store: a push and an
+    /// unload for two different applications run side by side, and a plain
+    /// store would let the slower of the two put its own count back.
+    pub fn note_serving(&self, apps: usize) {
+        let previous = self.state.rcu(|current| match &**current {
+            Readiness::Starting => Readiness::Starting,
+            Readiness::Ready { .. } => Readiness::Ready { apps },
+            Readiness::Degraded { reason, .. } => Readiness::Degraded {
+                reason: reason.clone(),
+                apps,
+            },
+        });
+
+        let was = previous.serving_apps();
+        match &*previous {
+            // Nothing was changed above, so nothing is reported.
+            Readiness::Starting => {}
+            _ if was == apps => {}
+            // The moment the edge stops sending this node traffic: the probe
+            // answers 503 from here, because a degraded node with nothing
+            // loaded fails every request it is given.
+            Readiness::Degraded { reason, .. } if apps == 0 => tracing::warn!(
+                apps,
+                previously = was,
+                reason = %reason,
+                "This node is degraded and has just stopped serving the last of its {} \
+                 application(s); the edge's health probe answers 503 from now on and this node \
+                 leaves rotation, which is right - it has nothing left to answer with",
+                was
+            ),
+            Readiness::Degraded { reason, .. } => tracing::info!(
+                apps,
+                previously = was,
+                reason = %reason,
+                "This node is degraded and now serves {} application(s) rather than {}; the \
+                 edge's health probe answers 200 while that count is above zero",
+                apps,
+                was
+            ),
+            Readiness::Ready { .. } => tracing::debug!(
+                apps,
+                previously = was,
+                "This node now serves {} application(s) rather than {}, and is still running \
+                 what the control plane last assigned it",
+                apps,
+                was
+            ),
+        }
+    }
+
+    /// An instruction reached this node between reconcile passes and this node
+    /// did not carry it out.
+    ///
+    /// Degrades the node there and then. Without this, a node that had just
+    /// refused a pushed deployment went on answering the edge `ready` - and
+    /// taking its full share of the traffic for that application - until the
+    /// next reconcile pass, which is a whole `reconcile_interval` away and
+    /// never arrives at all on a node with no control plane configured.
+    ///
+    /// A node that is still [`Readiness::Starting`] is left starting. It has
+    /// not claimed to be running the assignment list yet, so it is not falling
+    /// short of one; and `Degraded` with applications loaded is the more
+    /// permissive answer of the two at the edge, so a refusal must never be
+    /// what promotes a node into rotation.
+    pub fn note_refusal(&self, reason: impl Into<String>, apps: usize) {
+        let reason = reason.into();
+        if matches!(self.snapshot(), Readiness::Starting) {
+            tracing::warn!(
+                apps,
+                reason = %reason,
+                "This node refused an instruction while it is still loading its assignment \
+                 list: {}. It keeps reporting `starting`, which already keeps it out of \
+                 rotation; the first reconcile pass is what decides what it reports next",
+                reason
+            );
+            return;
+        }
+        self.mark_degraded(reason, apps);
+    }
+
     /// Key/value form for the `HealthCheck` RPC, so an operator sees *why*
     /// rather than just `healthy: false`.
     pub fn details(&self) -> HashMap<String, String> {
@@ -278,6 +492,57 @@ impl NodeHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ask `system_app.js` the edge's probe with exactly the headers a node in
+    /// `readiness` would have stamped.
+    ///
+    /// Returns the status, the readiness the answer states back on
+    /// [`READINESS_HEADER`] - which is the only part of the answer the edge
+    /// reads - and the body an operator would see.
+    async fn probe(
+        apps: &std::sync::Arc<crate::app::ApplicationManager>,
+        key: &crate::app::AppKey,
+        readiness: Option<&Readiness>,
+    ) -> (u16, Option<String>, String) {
+        let headers = match readiness {
+            Some(readiness) => {
+                let mut headers = vec![
+                    (
+                        READINESS_HEADER.to_string(),
+                        readiness.state_name().to_string(),
+                    ),
+                    (
+                        SERVING_APPS_HEADER.to_string(),
+                        readiness.serving_apps().to_string(),
+                    ),
+                ];
+                // Exactly as `dispatcher::handlers` stamps it: present for the
+                // one state that has a reason, absent otherwise.
+                if let Some(reason) = readiness.reason() {
+                    headers.push((REASON_HEADER.to_string(), header_safe_reason(reason)));
+                }
+                headers
+            }
+            None => Vec::new(),
+        };
+        let (status, headers, body) = apps
+            .execute_app(
+                key,
+                "http://node.invalid/health".to_string(),
+                "GET".to_string(),
+                headers,
+                None,
+            )
+            .await
+            .expect("the probe reaches the handler");
+        let stated = crate::runtime::header_list::first_value(&headers, READINESS_HEADER)
+            .map(str::to_string);
+        (
+            status,
+            stated,
+            String::from_utf8(body.into_bytes().unwrap()).unwrap(),
+        )
+    }
 
     #[test]
     fn a_starting_node_is_not_healthy() {
@@ -357,44 +622,6 @@ mod tests {
         .await
         .expect("the system application loads");
 
-        /// Status, the readiness the answer states back, and the body.
-        async fn probe(
-            apps: &std::sync::Arc<crate::app::ApplicationManager>,
-            key: &AppKey,
-            readiness: Option<&Readiness>,
-        ) -> (u16, Option<String>, String) {
-            let headers = match readiness {
-                Some(readiness) => vec![
-                    (
-                        READINESS_HEADER.to_string(),
-                        readiness.state_name().to_string(),
-                    ),
-                    (
-                        SERVING_APPS_HEADER.to_string(),
-                        readiness.serving_apps().to_string(),
-                    ),
-                ],
-                None => Vec::new(),
-            };
-            let (status, headers, body) = apps
-                .execute_app(
-                    key,
-                    "http://node.invalid/health".to_string(),
-                    "GET".to_string(),
-                    headers,
-                    None,
-                )
-                .await
-                .expect("the probe reaches the handler");
-            let stated = crate::runtime::header_list::first_value(&headers, READINESS_HEADER)
-                .map(str::to_string);
-            (
-                status,
-                stated,
-                String::from_utf8(body.into_bytes().unwrap()).unwrap(),
-            )
-        }
-
         // A ready node, including one the catalog has assigned nothing: an
         // empty assignment list is a correct answer and such a node serves
         // every request it is given exactly as it should.
@@ -462,6 +689,237 @@ mod tests {
         assert!(body.contains("unknown"), "{body}");
 
         let _ = apps.unload_app(&key).await;
+    }
+
+    /// The probe states the reason the node recorded, not a guess at it.
+    ///
+    /// `Degraded` has more than one cause and only one of them is a control
+    /// plane nobody can reach. A bundle that will not load, or an environment
+    /// that would not stop, degrades a node whose control plane answered
+    /// perfectly well - and the answer that told an operator to go and look at
+    /// the control plane sent them to the one part of the system that was
+    /// working. During an incident that is worse than saying nothing.
+    ///
+    /// The guard is held across the awaits on purpose: it is what keeps two
+    /// tests off the shared isolate host at once, which is exactly this span.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_probe_states_the_reason_the_node_recorded_rather_than_guessing_it() {
+        use crate::app::{test_host, AppConfig, AppKey};
+
+        let _turn = test_host::take();
+        let apps = test_host::host();
+        let key = AppKey::production("system-probe-reason");
+        apps.load_app(
+            key.clone(),
+            include_str!("dispatcher/system_app.js").to_string(),
+            AppConfig::default(),
+            None,
+        )
+        .await
+        .expect("the system application loads");
+
+        // Exactly what `run_control_loop` records when a reconcile pass
+        // reached the control plane and could not put the node right.
+        let reason = "2 of 5 assigned versions could not be loaded and 0 could not be stopped";
+        let (status, _stated, body) = probe(
+            &apps,
+            &key,
+            Some(&Readiness::Degraded {
+                reason: reason.to_string(),
+                apps: 3,
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains(reason),
+            "the operator reading this probe has to be told what actually degraded the node: \
+             {body}"
+        );
+        assert!(
+            !body.contains("cannot reach its control plane"),
+            "the control plane answered this node; sending an operator to look at it during an \
+             incident is worse than saying nothing: {body}"
+        );
+
+        let _ = apps.unload_app(&key).await;
+    }
+
+    /// A reason is built from somebody else's error message, so it has to be
+    /// made fit for a header before it is one.
+    #[test]
+    fn a_reason_is_cut_down_to_something_a_header_may_hold() {
+        assert_eq!(
+            header_safe_reason("control plane unreachable"),
+            "control plane unreachable"
+        );
+
+        // A carriage return in a header value is how one header becomes two.
+        assert_eq!(
+            header_safe_reason("connect failed:\r\nno route\tto host\0"),
+            "connect failed:  no route to host "
+        );
+
+        // Non-ASCII out of a path or a locale-translated OS error: one space
+        // per character, not per byte, so the reason keeps its shape.
+        assert_eq!(
+            header_safe_reason("bundle /srv/\u{5e94}\u{7528}/x.zip"),
+            "bundle /srv/  /x.zip"
+        );
+
+        let long = "e".repeat(4096);
+        let cut = header_safe_reason(&long);
+        assert!(
+            cut.len() <= MAX_REASON_BYTES,
+            "a pathological error message must not push the probe's headers past what a server \
+             accepts, and this one is {} bytes",
+            cut.len()
+        );
+        assert!(
+            cut.ends_with("..."),
+            "a cut reason has to look cut, or it reads as the whole of what the node said: {cut}"
+        );
+        assert!(
+            cut.bytes().all(|b| b.is_ascii_graphic() || b == b' '),
+            "a header value may not hold anything else: {cut}"
+        );
+    }
+
+    /// A node that states no reason gets none invented for it.
+    ///
+    /// This is the fleet-upgrade case as much as anything: a node built before
+    /// [`REASON_HEADER`] existed stamps two headers and not three, and the
+    /// answer has to stay honest about what it was not told.
+    ///
+    /// The guard is held across the awaits on purpose: it is what keeps two
+    /// tests off the shared isolate host at once, which is exactly this span.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_node_that_states_no_reason_has_none_made_up_for_it() {
+        use crate::app::{test_host, AppConfig, AppKey};
+
+        let _turn = test_host::take();
+        let apps = test_host::host();
+        let key = AppKey::production("system-probe-no-reason");
+        apps.load_app(
+            key.clone(),
+            include_str!("dispatcher/system_app.js").to_string(),
+            AppConfig::default(),
+            None,
+        )
+        .await
+        .expect("the system application loads");
+
+        let (status, headers, body) = apps
+            .execute_app(
+                &key,
+                "http://node.invalid/health".to_string(),
+                "GET".to_string(),
+                vec![
+                    (READINESS_HEADER.to_string(), "degraded".to_string()),
+                    (SERVING_APPS_HEADER.to_string(), "2".to_string()),
+                ],
+                None,
+            )
+            .await
+            .expect("the probe reaches the handler");
+        let body = String::from_utf8(body.into_bytes().unwrap()).unwrap();
+
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            crate::runtime::header_list::first_value(&headers, READINESS_HEADER),
+            Some("degraded"),
+            "{body}"
+        );
+        assert!(
+            body.contains("did not say why"),
+            "an answer that was told no reason has to say so: {body}"
+        );
+        assert!(
+            body.contains("\"reason\":null"),
+            "null is the fact that nothing was stated, which no invented reason can stand in \
+             for: {body}"
+        );
+
+        let _ = apps.unload_app(&key).await;
+    }
+
+    /// A count that arrives between two reconcile passes moves the answer and
+    /// leaves the reason alone.
+    ///
+    /// Both directions matter and for the same reason: the count is what the
+    /// edge's probe turns into 200 or 503 for a degraded node. A node that has
+    /// just stopped the last thing it had must stop claiming it can serve
+    /// before the next pass, and one that has just taken delivery must stop
+    /// claiming it cannot.
+    #[test]
+    fn a_push_or_an_unload_moves_the_count_and_keeps_the_reason() {
+        let health = NodeHealth::starting();
+        health.mark_degraded("control plane unreachable: connection refused", 2);
+
+        health.note_serving(3);
+        assert_eq!(
+            health.snapshot(),
+            Readiness::Degraded {
+                reason: "control plane unreachable: connection refused".to_string(),
+                apps: 3,
+            },
+            "taking delivery of one more application says nothing about why the node is degraded"
+        );
+
+        health.note_serving(0);
+        assert_eq!(
+            health.snapshot(),
+            Readiness::Degraded {
+                reason: "control plane unreachable: connection refused".to_string(),
+                apps: 0,
+            },
+            "a degraded node with nothing left loaded fails every request it is given, and the \
+             probe answers 503 off this count"
+        );
+
+        health.mark_ready(1);
+        health.note_serving(2);
+        assert_eq!(
+            health.snapshot(),
+            Readiness::Ready { apps: 2 },
+            "a node running what it was told to is still running what it was told to when one \
+             more version arrives"
+        );
+    }
+
+    /// Nothing that happens between passes lifts a node out of `Starting`.
+    ///
+    /// `Starting` keeps a node out of rotation entirely, and `Degraded` with
+    /// applications loaded does not - so if a refusal or a stray count could
+    /// move it, a *failure* would be the thing that put a node which has never
+    /// seen an assignment list into the edge's rotation.
+    #[test]
+    fn nothing_between_passes_lifts_a_node_that_is_still_starting() {
+        let health = NodeHealth::starting();
+
+        health.note_serving(4);
+        assert_eq!(
+            health.snapshot(),
+            Readiness::Starting,
+            "a node still working through its first assignment list has not been told what it \
+             should be running, so no count of it is an answer"
+        );
+
+        health.note_refusal(
+            "demo.production was pushed and this node did not take it",
+            4,
+        );
+        assert_eq!(
+            health.snapshot(),
+            Readiness::Starting,
+            "a refusal must never be what promotes a node into rotation"
+        );
+
+        // The first pass is still what decides, and it still can.
+        health.mark_ready(4);
+        assert!(health.is_healthy());
     }
 
     #[test]

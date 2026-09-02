@@ -31,8 +31,8 @@ node.
 the platform: an upstream for the example app's `fetch` to reach, and a
 loopback certificate authority for the ACME checks. It deploys an application
 with `deis deploy` — the same command a person would run, not a `curl` against
-the REST API — and then runs ninety checks in twenty groups, printing the
-evidence for each. What they prove, by group — a few rows stand for two
+the REST API — and then runs ninety-three checks in twenty-one groups,
+printing the evidence for each. What they prove, by group — a few rows stand for two
 consecutive checks:
 
 | Check | Evidence |
@@ -120,6 +120,7 @@ consecutive checks:
 | a certificate is obtained over ACME for the names the routing table carries | against a real ACME authority on loopback, and then served over TLS by deis-proxy |
 | the challenge path answers only what was published | a token nobody issued gets nothing |
 | a current certificate is not reissued, and a restart reuses the account | which is what keeps a restart loop from spending an issuance quota |
+| the node's log was not cut off while these checks read it | fifteen of them get their evidence by grepping it, and it is a file any unauthenticated request can add to; the demo gives it a ceiling, and a run that reached the ceiling says so instead of quoting a file that stops early |
 
 ## The nine components
 
@@ -196,7 +197,7 @@ environment map) and the node fetches the bytes itself.
 
 ```bash
 scripts/demo.sh start     # build everything, start the processes, deploy the example app with `deis deploy`
-scripts/demo.sh verify    # run the ninety checks and print the evidence for each
+scripts/demo.sh verify    # run every check on the list and print the evidence for each
 scripts/demo.sh stop      # stop everything and wait until each process has really exited
 ```
 
@@ -233,6 +234,69 @@ in, so the console asks for a key before it shows anything: paste the
 `API_KEY` line from `.demo/state.env`. A control plane with authentication off
 opens straight to the dashboard, because a caller on its own machine needs no
 credential there and there is none to ask for.
+
+The last line of a `verify` run is a tally and a roll call: `93 passed, 0
+failed, 93 of the 93 checks this file lists`. The second half is there because
+the first half cannot report a check that did not run - a call deleted from
+the list turns a green run into a slightly shorter green run, and nothing in
+the output says so. The number the run is held to is `VERIFY_EXPECTED_CHECKS`
+in `scripts/demo.sh`, and adding a check means changing it.
+
+### What a green `verify` is evidence of, and what it is not
+
+It drives one deployed application, through one node, from one caller. That
+shape answers "was this caller given the right answer" and cannot, by
+construction, answer several other questions:
+
+* **What one caller is handed that belonged to another.** A single caller
+  cannot see a disclosure: the wrong answer and the right one look the same
+  when there is nobody else's answer to be given. This is not hypothetical -
+  `verify` reported ninety passed and none failed on a build whose response
+  cache was keyed by the address alone, so one user's `POST` answer went to
+  the next anonymous `GET` of it. Two checks now put a second and a third
+  caller to the same address and compare what comes back; that is the shape
+  such a check has to take, and it is the only place in the suite that has
+  it. Every other per-caller boundary in the platform is still checked one
+  caller at a time.
+* **Anything that needs two nodes.** There is one. Scheduling across a fleet,
+  a cache or a route table that disagrees between nodes, and what a rolling
+  deployment looks like from outside are all invisible here.
+* **Anything that needs two tenants at once.** The isolation checks compare
+  two *environments* of the same application and two named bindings; the
+  neighbour is never a second customer under load.
+* **Load, contention and time.** Every check is one request, or a handful.
+  Nothing here runs long enough to find a leak, a lock held too long, or a
+  ceiling that is only reached under concurrency.
+* **The platform on any machine but this one.** One host, loopback
+  everywhere, a stub certificate authority, and a `python3` origin standing
+  in for the internet.
+
+Read a green run as: these ninety-three claims were each checked, once, in
+that arrangement. It is a good deal more than a build that compiles, and it
+is not a statement about anything above.
+
+### What runs without anyone remembering to
+
+`.github/workflows/checks.yml`, on every push to `main` and every pull
+request: the document-path check, the witness tests below, `cargo fmt
+--check`, `cargo clippy -D warnings`, `cargo build --workspace`, `cargo test
+--workspace`, and a full `start` → `verify` → `stop`. Until it grew those
+jobs it held the document-path check alone, and nothing automatic had ever
+compiled this workspace, run its tests, or run the verification the project's
+claims are quoted from.
+
+```bash
+bash scripts/test-demo-witnesses.sh    # unit tests for verify itself; no demo needed
+```
+
+Those tests are about the evidence rather than the platform: the readers of
+the node's log, the guards that stop one dead component from ending a run
+without a summary, the roll call, the rule that a check may not pass because
+something outside it moved, and the cross-caller check run against a
+stand-in that leaks, so that the witness is seen to fail as well as to pass.
+They lift the real functions out of `scripts/demo.sh` at run time rather than
+keeping copies, and they take a path argument, so "this used to fail" is
+something anyone can re-run against an older copy.
 
 [DEMO.md](DEMO.md) walks through what `start` does step by step, what each
 check proves, and what lands in the `.demo/` run directory.

@@ -2066,6 +2066,7 @@ dependencies = [
  "anyhow",
  "rolldown",
  "rolldown_common",
+ "rolldown_error",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

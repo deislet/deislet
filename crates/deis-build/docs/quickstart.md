@@ -184,6 +184,14 @@ dist/
     └── deno.json          # Deno configuration
 ```
 
+Everything under `dist/<vendor>/` is what gets deployed and nothing else. The
+build's own smoke test - `wrangler deploy --dry-run` for the Cloudflare target -
+writes into a scratch directory outside the tree and removes it, so building
+the same source twice produces the same bytes. It used to write its output into
+`dist/cloudflare/dist-check/`, which put wrangler's own build of the Worker and
+a file with the wall-clock time into the deliverable, and made two builds of one
+source differ.
+
 ## Deploy to Platforms
 
 Build only handles building. Deployment requires platform-specific tools.

@@ -46,7 +46,8 @@ pub use compatibility::{
     PLATFORM_KNOWN_THROUGH, flag_spec, known_flag_names,
 };
 pub use forward::{
-    BINDING_FIELDS, COMPATIBILITY_FIELDS, LIMITS_FIELDS, MANIFEST_FIELDS, unknown_fields,
+    BINDING_FIELDS, COMPATIBILITY_FIELDS, LIMITS_FIELDS, MANIFEST_FIELDS, VALUE_PATHS,
+    unknown_fields, unreadable_values,
 };
 pub use headers::{HeaderField, HeaderNamesWritten, HeaderRule, HeaderTable, parse_headers};
 pub use limits::DeclaredLimits;
@@ -374,7 +375,13 @@ impl Manifest {
         // application's own variables, and the platform's property wins, so a
         // variable of the same name would be a value the author set and the
         // handler never sees. Refused here rather than silently overwritten.
-        for (name, _) in self.bindings.iter() {
+        //
+        // Over every name the manifest declares, not only the ones this build
+        // can read a kind for: a binding whose kind came from a newer release
+        // is still published on `env` by the build that has that kind, so the
+        // collision is real there and refusing it only here would mean two
+        // builds disagreeing about whether the same bundle is loadable.
+        for name in self.bindings.all_names() {
             if self.env.contains_key(name) {
                 return Err(BundleError::InvalidManifest(format!(
                     "{name:?} is both a binding and an environment variable. Bindings are \

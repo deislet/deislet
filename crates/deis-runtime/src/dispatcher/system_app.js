@@ -3,8 +3,8 @@
 
 // What the node stamps on a request for this application to say how it is
 // doing, and the one state that means it is running what it was assigned.
-// Spelled in src/health.rs as READINESS_HEADER, SERVING_APPS_HEADER and
-// READINESS_READY; the spellings are held together by
+// Spelled in src/health.rs as READINESS_HEADER, SERVING_APPS_HEADER,
+// REASON_HEADER and READINESS_READY; the spellings are held together by
 // health::tests::the_system_application_answers_the_probe_from_the_header,
 // which runs this file.
 //
@@ -14,6 +14,15 @@
 // the node, not the caller.
 const READINESS_HEADER = "x-deis-node-readiness";
 const SERVING_APPS_HEADER = "x-deis-node-apps";
+// Why the node is degraded, in its own words. Absent for the states that have
+// no why, and absent from a node older than the header - so this file must
+// never guess one in its place, which is exactly what it used to do: it
+// reported every degraded node as one that cannot reach its control plane,
+// including the ones whose control plane had answered and whose real trouble
+// was a bundle that would not load or an environment that would not stop. An
+// operator reading that during an incident is sent to the one part of the
+// system that is working.
+const REASON_HEADER = "x-deis-node-reason";
 const READINESS_READY = "ready";
 const READINESS_DEGRADED = "degraded";
 const READINESS_STARTING = "starting";
@@ -55,6 +64,9 @@ export default async function handler(context) {
     if (path === "/health" && method === "GET") {
       const readiness = request.headers.get(READINESS_HEADER) || READINESS_UNKNOWN;
       const reported = request.headers.get(SERVING_APPS_HEADER);
+      // The node's own words, or null. Never substituted for: an answer that
+      // does not know why says so.
+      const reason = request.headers.get(REASON_HEADER) || null;
       // A count this handler cannot parse is treated as no applications, which
       // is the reading that keeps traffic away from a node nothing can be said
       // about.
@@ -64,6 +76,16 @@ export default async function handler(context) {
         readiness === READINESS_READY ||
         (readiness === READINESS_DEGRADED && apps > 0);
 
+      // What a degraded node was told to say about itself, kept apart from
+      // what this handler can add. There are several ways to be degraded - a
+      // control plane nobody can reach, a version that would not load, an
+      // environment that would not stop, a pushed deployment this node
+      // refused - and only the node knows which one it is in.
+      const because = reason
+        ? "This node is not running what the control plane assigned it: " + reason
+        : "This node is not running what the control plane assigned it and " +
+          "did not say why";
+
       let message;
       if (readiness === READINESS_READY) {
         message =
@@ -72,14 +94,16 @@ export default async function handler(context) {
           " application(s)";
       } else if (readiness === READINESS_DEGRADED && apps > 0) {
         message =
-          "This node cannot reach its control plane and is serving the " +
+          because +
+          ". It is still serving the " +
           apps +
-          " application(s) it recovered from its own disk, which may be older " +
-          "than the versions it is assigned";
+          " application(s) it has, which may be older than the versions it " +
+          "is assigned, and any secret they declare may be missing";
       } else if (readiness === READINESS_DEGRADED) {
         message =
-          "This node cannot reach its control plane and has no application " +
-          "loaded, so every request it is given fails";
+          because +
+          ", and it has no application loaded, so every request it is given " +
+          "fails";
       } else if (readiness === READINESS_UNKNOWN) {
         message =
           "This node did not state its readiness on this request, so nothing " +
@@ -102,6 +126,10 @@ export default async function handler(context) {
           status: serving ? "healthy" : "unhealthy",
           readiness: readiness,
           apps: apps,
+          // Null rather than absent, and never filled in from anywhere but
+          // the node: a reader that sees null knows nothing was stated,
+          // which is a different fact from any reason this file could pick.
+          reason: reason,
           message: message,
         }),
         {

@@ -261,15 +261,40 @@ impl DeclaredCompatibility {
         self.date.is_none() && self.flags.is_empty()
     }
 
+    /// The names in [`Self::flags`] that this build has never heard of.
+    ///
+    /// Empty for every manifest this build wrote. A name in here came from a
+    /// builder one or more releases newer, and it is ignored rather than
+    /// refused - see the module documentation of [`crate::forward`] for why,
+    /// and [`Self::validate_as_written`] for the one caller that still
+    /// refuses it.
+    pub fn unknown_flags(&self) -> Vec<&str> {
+        self.flags
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| {
+                !name.is_empty()
+                    && !FLAGS
+                        .iter()
+                        .any(|spec| spec.enable == *name || spec.disable == *name)
+            })
+            .collect()
+    }
+
     /// Refuse a declaration this build cannot honour.
     ///
     /// Two separate refusals, because they are two different mistakes:
     ///
-    /// * a flag name nothing knows, or a pair that contradicts each other -
-    ///   caught by [`CompatibilityProfile::resolve`], which is where the
-    ///   names are read;
+    /// * two flags that contradict each other - caught by
+    ///   [`CompatibilityProfile::resolve`], which is where the names are read;
     /// * a date after [`PLATFORM_KNOWN_THROUGH`] - semantics this binary does
     ///   not have.
+    ///
+    /// A flag name this build does not know is **not** one of them. It names a
+    /// behaviour this build does not have in either direction, so ignoring it
+    /// is exactly the answer both spellings of it would have produced; see
+    /// [`crate::forward`] for the rule, and for what refusing it here used to
+    /// cost a fleet mid-rollback.
     ///
     /// Called wherever a manifest is read, so a bundle that no component could
     /// run is refused at the build, at the upload and at the node, rather than
@@ -285,6 +310,30 @@ impl DeclaredCompatibility {
                  behaviour of a day it has never seen, and running it on today's answers instead \
                  would be exactly the silent change the date exists to prevent. Name a date up to \
                  {PLATFORM_KNOWN_THROUGH}, or upgrade the platform"
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::validate`], plus a refusal of any flag name this build does not
+    /// know.
+    ///
+    /// **For the build, and only for the build.** A misspelled flag is a
+    /// declaration that will never do what its author meant, and the one
+    /// moment worth saying so is while the project file is still on screen.
+    /// Everywhere else a manifest is read - the control plane at upload, a
+    /// node when it installs a version - the same name may equally be a real
+    /// flag from a newer release, and the two are indistinguishable from
+    /// there, so those callers take [`Self::validate`] and ignore it. This is
+    /// the same split `limits` already makes: `deny_unknown_fields` on
+    /// `deis_build_core::config::LimitsConfig` and nothing on
+    /// [`crate::limits::DeclaredLimits`].
+    pub fn validate_as_written(&self) -> Result<(), String> {
+        self.validate()?;
+        if let Some(name) = self.unknown_flags().first() {
+            return Err(format!(
+                "compatibility flag {name:?} is not one this build knows. Known flags: {}",
+                known_flag_names()
             ));
         }
         Ok(())
@@ -363,10 +412,20 @@ impl CompatibilityProfile {
                 .iter()
                 .find(|spec| spec.enable == name || spec.disable == name)
             else {
-                return Err(format!(
-                    "compatibility flag {name:?} is not one this build knows. Known flags: {}",
-                    known_flag_names()
-                ));
+                // A name this build does not know is skipped, not refused.
+                // It names a behaviour this build does not have, so there is
+                // nothing here to turn on and nothing to hold back: doing
+                // nothing is what both the `enable` and the `disable`
+                // spelling of it would have produced anyway. Refusing instead
+                // cost the whole bundle - a node one release behind refused
+                // every version deployed since, and the manifest sits inside
+                // the archive whose digest is the version id, so no re-upload
+                // could repair one. `crate::forward` carries the rule and
+                // `crate::forward::report` names the skipped name at `warn`
+                // once per bundle read. The author's own typo is caught by
+                // `DeclaredCompatibility::validate_as_written`, at the build,
+                // with the project file still on screen.
+                continue;
             };
             let bit = 1u64 << (spec.flag as u8);
             let enabling = spec.enable == name;
@@ -611,15 +670,59 @@ mod tests {
     }
 
     #[test]
-    fn a_flag_nobody_knows_is_refused_with_the_list_of_ones_that_are() {
-        let err = CompatibilityProfile::resolve(&declared(None, &["multipl_set_cookie"]))
-            .expect_err("a misspelled flag must not be dropped in silence");
+    fn a_flag_nobody_knows_is_refused_at_the_build_with_the_list_of_ones_that_are() {
+        let err = declared(None, &["multipl_set_cookie"])
+            .validate_as_written()
+            .expect_err("a misspelled flag must not be dropped in silence at the build");
         assert!(err.contains("multipl_set_cookie"), "{err}");
         assert!(err.contains("multiple_set_cookie_headers"), "{err}");
         assert!(
             err.contains(flag_spec(Flag::MultipleSetCookieHeaders).summary),
             "the list has to say what each flag does, not only that it exists: {err}"
         );
+    }
+
+    /// The other half of the split, and the one that costs a fleet when it is
+    /// wrong: a node reading a manifest cannot tell a misspelling from a flag
+    /// a newer release added, so it takes the behaviour it has and carries on.
+    #[test]
+    fn a_flag_nobody_knows_is_ignored_wherever_a_manifest_is_read() {
+        let block = declared(
+            Some("2026-09-01"),
+            &["single_set_cookie_header", "streaming_uploads"],
+        );
+        assert_eq!(block.unknown_flags(), vec!["streaming_uploads"]);
+        assert!(
+            block.validate().is_ok(),
+            "a flag from a newer builder must not cost the bundle"
+        );
+
+        let profile =
+            CompatibilityProfile::resolve(&block).expect("an unknown flag is skipped, not refused");
+        assert_eq!(
+            profile.date().map(|d| d.to_string()).as_deref(),
+            Some("2026-09-01")
+        );
+        assert!(
+            !profile.is_on(Flag::MultipleSetCookieHeaders),
+            "the flags this build does know still decide what is on"
+        );
+    }
+
+    /// Ignoring an unknown flag may only narrow. Both spellings of a behaviour
+    /// this build does not have resolve to the same profile as naming nothing,
+    /// which is the oldest behaviour for it.
+    #[test]
+    fn an_unknown_flag_resolves_to_the_behaviour_this_build_already_had() {
+        let baseline = CompatibilityProfile::resolve(&declared(Some("2026-01-01"), &[])).unwrap();
+        for name in ["streaming_uploads", "no_streaming_uploads"] {
+            let with_it =
+                CompatibilityProfile::resolve(&declared(Some("2026-01-01"), &[name])).unwrap();
+            assert_eq!(
+                with_it, baseline,
+                "{name} must not move a behaviour this build does not have"
+            );
+        }
     }
 
     #[test]

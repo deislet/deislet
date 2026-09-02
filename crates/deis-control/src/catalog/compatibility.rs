@@ -10,14 +10,23 @@
 //! in the assignment list - so that a node never has to open a bundle to find
 //! out which answers an application expects.
 //!
-//! Unlike the `limits` block next door, a declaration that cannot be read is
-//! **not** degraded to "declares nothing" here. The two failures are not the
-//! same kind: a limit nobody can read costs the application the node's own
-//! ceiling, which is never wider than what it asked for, while a compatibility
-//! declaration nobody can read would leave every component guessing which
-//! answers to give - which is the exact silent behaviour change the block
-//! exists to prevent. So an unreadable one refuses the upload, and refuses the
-//! delivery if a version stored by an older build somehow carries one.
+//! A declaration this build cannot honour refuses the upload, and refuses the
+//! delivery if a version stored by a *newer* build carries one. There is
+//! exactly one of those left, and it is the date: a date past
+//! [`deis_bundle::PLATFORM_KNOWN_THROUGH`] asks for the complete set of
+//! answers as of a day this build has never seen, and a build that served a
+//! subset would be giving an application semantics it did not ask for with
+//! nothing downstream to say so.
+//!
+//! A flag name this build does not know is **not** one of those and is
+//! ignored, at `warn`, by [`deis_bundle::CompatibilityProfile::resolve`]. It
+//! used to refuse, and that refusal landed here twice over - at the upload and
+//! again at every delivery - so a control plane one release behind the builder
+//! could not deliver any version naming a flag added since, and the manifest
+//! is inside the archive whose digest is the version id, so nothing could
+//! repair one. `deis_bundle::forward` carries the rule and the reasoning. The
+//! author's own misspelling is still refused, at the build, by
+//! `DeclaredCompatibility::validate_as_written`.
 //!
 //! An application that declares **nothing** is a different case and is
 //! allowed: it predates the mechanism, it is held to the oldest behaviour the
@@ -111,11 +120,22 @@ mod tests {
         );
     }
 
+    /// The mirror of the test above, and the reason the two are next to each
+    /// other: a date this build cannot honour is refused, a flag it does not
+    /// know is not. A flag names one behaviour this build does not have in
+    /// either direction, so ignoring it gives exactly what this build was
+    /// already giving; refusing it took the whole version away from every
+    /// component one release behind the builder that wrote it.
     #[test]
-    fn a_flag_nobody_knows_is_refused_rather_than_ignored() {
-        let err = read(r#"{"flags":["turbo_cookies"]}"#)
-            .expect_err("a flag nothing reads must not be accepted");
-        assert!(err.contains("turbo_cookies"), "{err}");
+    fn a_flag_nobody_knows_is_ignored_rather_than_refused() {
+        let profile = read(r#"{"date":"2026-09-01","flags":["turbo_cookies"]}"#)
+            .expect("a flag from a newer builder must not cost the version");
+        assert_eq!(
+            profile.date().map(|d| d.to_string()).as_deref(),
+            Some("2026-09-01"),
+            "everything this build does read is still in force"
+        );
+        assert!(profile.is_on(Flag::MultipleSetCookieHeaders));
     }
 
     #[test]
