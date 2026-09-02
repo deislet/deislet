@@ -178,3 +178,50 @@ fn a_callable_by_entry_that_is_not_an_application_is_refused() {
     assert!(err.contains("not an application id"), "{err}");
     assert!(validate_callable_by(&["a.b".into()]).is_err());
 }
+
+#[test]
+fn a_callable_by_entry_this_build_cannot_read_consents_to_nobody_and_costs_nothing_else() {
+    // The split between the author's list and a builder's. Built in process
+    // - which is what the build holds - the entry is refused by name, with
+    // the project file on screen. Parsed out of a manifest - which is what a
+    // node or a control plane one release behind the builder holds - the same
+    // entry is left out, the neighbour beside it still consents, and the
+    // manifest loads. A refusal there cost the whole application on the older
+    // half of a fleet for a spelling that was correct where it was written.
+    let written = vec!["storefront".to_string(), "checkout/production".to_string()];
+    let err = validate_callable_by(&written).expect_err("the build refuses the author's typo");
+    assert!(err.contains("checkout/production"), "{err}");
+    assert_eq!(
+        unreadable_callable_by(&written),
+        vec!["checkout/production"]
+    );
+
+    let manifest = crate::Manifest::parse(
+        r#"{"schema":1,"app":"api","entry":"e.js","callable_by":["storefront","checkout/production"]}"#,
+    )
+    .expect("a manifest from a newer builder must still load");
+    assert_eq!(manifest.callable_by, vec!["storefront".to_string()]);
+    assert!(callable_by_allows(&manifest.callable_by, "storefront"));
+    assert!(
+        !callable_by_allows(&manifest.callable_by, "checkout"),
+        "an entry this build cannot read is never read as the caller it looks most like"
+    );
+    // Narrowed is not unsaid: the raw text still names it, and `report` will.
+    assert!(
+        unreadable_callable_by(&written)
+            .iter()
+            .all(|entry| !manifest.callable_by.iter().any(|kept| kept == entry))
+    );
+
+    // A padded id is readable and is kept exactly as written, because the
+    // node trims when it compares and the manifest keeps what the author
+    // wrote.
+    let padded = crate::Manifest::parse(
+        r#"{"schema":1,"app":"api","entry":"e.js","callable_by":[" storefront ","*"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        padded.callable_by,
+        vec![" storefront ".to_string(), "*".to_string()]
+    );
+}

@@ -88,6 +88,11 @@ documentation used to repeat that. The distinction matters to anyone reasoning
 about length-extension resistance, and changing it is a protocol change on both
 sides.
 
+The `secret` here is a `node_preshared_keys` value, which is one credential
+for the whole fleet rather than one node's identity - what it opens and how it
+is rotated is stated once, in
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md).
+
 ### Message types
 
 Core: `AuthMessage`, `RegisterMessage`, `HeartbeatMessage`, `CommandMessage`,

@@ -62,8 +62,18 @@ fn init_logging(system: &SystemConfig) -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false);
+        .with_target(false)
+        // ANSI was already off on the file branch, where colour codes are
+        // only litter. It is off on both branches now because both wrap their
+        // writer in `deis_wire::LineSafe`, which escapes ESC along with every
+        // other control character; leaving colour on would just mean watching
+        // the formatter's own escapes get spelled out.
+        .with_ansi(false);
 
+    // Wrapping both branches is the point: this proxy logs host names, paths
+    // and header values a client chose, and a newline in any of them would
+    // otherwise end the line and start one the client wrote in full - in the
+    // error log file as readily as on stdout.
     match &error_log.path {
         Some(path) => {
             let file = OpenOptions::new()
@@ -72,11 +82,12 @@ fn init_logging(system: &SystemConfig) -> Result<()> {
                 .open(path)
                 .with_context(|| format!("opening error log {path}"))?;
             builder
-                .with_ansi(false)
-                .with_writer(Mutex::new(file))
+                .with_writer(deis_wire::LineSafe::new(Mutex::new(file)))
                 .init();
         }
-        None => builder.init(),
+        None => builder
+            .with_writer(deis_wire::LineSafe::new(std::io::stdout))
+            .init(),
     }
     Ok(())
 }

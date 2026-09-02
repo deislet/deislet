@@ -31,7 +31,10 @@ Chinese: [README.zh.md](README.zh.md).
   pushes over gRPC. The two HTTP paths are
   `deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`
   and both need the node credential (`[control] secret`), because the
-  assignment list carries decrypted secrets.
+  assignment list carries decrypted secrets. That credential is one value for
+  the whole fleet and this node's data port is a trust boundary; both are
+  stated once, in
+  [docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 - **Ships logs, metrics and traces** to deis-telemetry in batches, dropping the
   oldest when the buffer fills rather than growing without bound. One trace per
   invocation — request, queue batch, cron tick, WebSocket message — carrying
@@ -450,6 +453,11 @@ extra listener is exposed:
 deis-proxy validates `x-deis-app-id` against the application list, so
 `_inspect:` targets are not reachable through it — use the node's own port.
 See [docs/TESTING.md](docs/TESTING.md).
+
+No extra listener is exposed, but that cuts both ways: the debugger lives on
+the same `0.0.0.0` port that serves traffic, which is one of the reasons that
+port has to be firewalled to the proxy and the control plane. See
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 
 ## Documentation
 

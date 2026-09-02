@@ -181,7 +181,10 @@ plane, which is what makes it a push target and a candidate for cron. After
 that a new deployment reaches it as a push. Both of those node-facing endpoints
 need a node credential from `node_preshared_keys`, independently of whether the
 human-facing API has authentication turned on at all — the assignment list
-contains decrypted secrets.
+contains decrypted secrets. That credential is one value for the whole fleet,
+deis-proxy holds one too, and a node's data port is a trust boundary that has
+to be firewalled: [docs/trust-boundaries.md](docs/trust-boundaries.md) states
+all of it in one place, with the rotation procedure.
 
 The two paths are not spelled out here on purpose. They are
 `deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE` and `NODE_REGISTRATION_ROUTE`
@@ -309,6 +312,10 @@ check proves, and what lands in the `.demo/` run directory.
 - [docs/implementation-plan.zh.md](docs/implementation-plan.zh.md) — the
   contracts to build against: bundle format, control-plane schema, proto
   shapes, and the wave-by-wave record of what has actually landed.
+- [docs/trust-boundaries.md](docs/trust-boundaries.md) — what the node
+  credential opens, which ports have to be firewalled and why, the file
+  permissions every configuration needs, and how to rotate the credential
+  without an outage.
 - [DEMO.md](DEMO.md) — the demo script in detail.
 - [crates/deis-control/DEPLOYMENT.md](crates/deis-control/DEPLOYMENT.md) —
   running the control plane outside the demo: the minimal configuration that

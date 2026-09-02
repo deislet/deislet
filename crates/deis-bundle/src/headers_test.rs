@@ -188,6 +188,51 @@ fn a_manifest_is_checked_again_rather_than_trusted() {
 }
 
 #[test]
+fn a_pattern_this_build_cannot_compile_refuses_the_bundle_and_says_why() {
+    // The one `site` rule that is a deliberate forward-compatibility gate
+    // (`deis_bundle::forward::GATES`). A `_redirects` rule with the same
+    // pattern is dropped; a `_headers` block is not, because the block may be
+    // the one setting `Content-Security-Policy`, and a site served without it
+    // lets the browser do more than the author allowed. So the whole table
+    // fails, at upload and on the node, and the message says that this is on
+    // purpose and which way out there is.
+    let from_a_newer_builder = vec![
+        HeaderRule {
+            pattern: "/*".to_string(),
+            set: vec![HeaderField {
+                name: "content-security-policy".to_string(),
+                value: "default-src 'self'".to_string(),
+            }],
+            remove: Vec::new(),
+        },
+        HeaderRule {
+            pattern: "/*.js".to_string(),
+            set: vec![HeaderField {
+                name: "cache-control".to_string(),
+                value: "immutable".to_string(),
+            }],
+            remove: Vec::new(),
+        },
+    ];
+    let err = HeaderTable::compile(&from_a_newer_builder)
+        .expect_err("a header block this build cannot place is a refusal, not a drop")
+        .to_string();
+    assert!(err.contains("/*.js"), "{err}");
+    assert!(err.contains("refused rather than dropped"), "{err}");
+    assert!(err.contains("upgrade this component"), "{err}");
+
+    // A block that only removes is refused the same way: `! Name` is how an
+    // author takes a site-wide permission back off one directory, so dropping
+    // the removal widens that directory.
+    let removal_only = vec![HeaderRule {
+        pattern: "/private/*.json".to_string(),
+        set: Vec::new(),
+        remove: vec!["access-control-allow-origin".to_string()],
+    }];
+    assert!(HeaderTable::compile(&removal_only).is_err());
+}
+
+#[test]
 fn a_wildcard_inside_a_segment_is_refused_rather_than_half_understood() {
     // The pattern language is one language: the same segments a function
     // route and a redirect rule are written in. A `/*.jpg` that matched here

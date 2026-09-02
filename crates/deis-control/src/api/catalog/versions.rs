@@ -14,7 +14,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use super::CatalogState;
-use crate::api::bindings::check_service_bindings;
+use crate::api::bindings::{BindingRefusal, check_service_bindings};
 use crate::api::error::{ApiError, ApiResult};
 use crate::catalog::Version;
 use crate::identity::Principal;
@@ -159,19 +159,49 @@ pub async fn upload_version(
         .map(|Extension(principal)| principal)
         .unwrap_or_else(Principal::anonymous);
     if let Err(refusal) = check_service_bindings(&principal, &stored.manifest) {
-        warn!(
-            app_id = %app_id,
-            bundle_sha = %stored.sha256,
-            caller = %principal.label(),
-            binding = %refusal.binding,
-            callee = %refusal.callee,
-            needed = %refusal.required_scope,
-            held = %refusal.held,
-            "Refused a bundle upload: it declares a service binding to an application this \
-             credential is not entitled to. No version was created, so nothing can be deployed \
-             with that route in it, and the refusal is in the audit log"
-        );
-        return Err(ApiError::Forbidden(refusal.to_string()));
+        return Err(match &refusal {
+            BindingRefusal::Unentitled {
+                binding,
+                callee,
+                required_scope,
+                held,
+            } => {
+                warn!(
+                    app_id = %app_id,
+                    bundle_sha = %stored.sha256,
+                    caller = %principal.label(),
+                    binding = %binding,
+                    callee = %callee,
+                    needed = %required_scope,
+                    held = %held,
+                    "Refused a bundle upload: it declares a service binding to an application \
+                     this credential is not entitled to. No version was created, so nothing can \
+                     be deployed with that route in it, and the refusal is in the audit log"
+                );
+                ApiError::Forbidden(refusal.to_string())
+            }
+            // Not a 403: the credential may well be entitled, and a wider one
+            // would be refused the same way. It is the same shape as a
+            // compatibility date this build does not know, which
+            // `catalog::bundle` also answers with a 400 - the bundle asks for
+            // a platform this control plane is not yet.
+            BindingRefusal::Unjudgeable { binding, kind, app } => {
+                warn!(
+                    app_id = %app_id,
+                    bundle_sha = %stored.sha256,
+                    caller = %principal.label(),
+                    binding = %binding,
+                    kind = %kind,
+                    names_app = app.as_deref().unwrap_or("-"),
+                    "Refused a bundle upload: it declares a binding of a kind this control plane \
+                     cannot read, so the entitlement gate could not judge whether it reaches \
+                     another application. This control plane is older than the builder that \
+                     produced the bundle; upgrade it to a release that knows the kind. No version \
+                     was created"
+                );
+                ApiError::BadRequest(refusal.to_string())
+            }
+        });
     }
     if !stored.manifest.bindings.is_empty() {
         info!(

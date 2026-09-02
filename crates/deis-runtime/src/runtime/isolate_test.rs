@@ -1718,7 +1718,17 @@ export default function handler(context: any): Response {
         let (status, _headers, body) = result_data;
         let body = text(body);
         assert_eq!(status, 500);
-        assert!(body.unwrap().contains("Test error"));
+        // The answer says a handler failed and nothing else. It used to carry
+        // the exception's own text and stack, which is the tenant's bundle
+        // layout and this runtime's line numbers handed to whoever made the
+        // request; see the catch in `js/runtime.js`. The stack is in the node's
+        // log for this application, which is where the author reads it.
+        let body = body.unwrap();
+        assert!(!body.contains("Test error"), "{body}");
+        assert!(
+            body.starts_with("Internal Server Error (incident "),
+            "{body}"
+        );
     }
 
     #[tokio::test]

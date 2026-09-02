@@ -1010,8 +1010,23 @@ enum ConfigAction {
 fn main() -> ExitCode {
     // Progress and diagnostics belong on stderr: stdout is where `--json`
     // puts the one document a script reads.
+    // This subscriber carries the CLI's own events, and some of those quote
+    // text a server sent back - a refusal's reason, a name from a listing.
+    // `LineSafe` escapes every control character so none of that text can
+    // end a line and start a forged one on the operator's terminal. It does
+    // not cover `deis dev`'s node: that is a separate `deis-runtime` process
+    // (`dev/node.rs`) whose output is re-printed here line by line, and it is
+    // that process's own `LineSafe` and console escaping that keep those
+    // lines whole.
+    //
+    // ANSI is off for the same reason it is off everywhere else: the wrapper
+    // escapes ESC too, and there is no honest way to tell the formatter's
+    // colour codes from a tenant's. Little is lost here - the colour a user
+    // actually sees from this CLI comes from `colored` on the `eprintln!`
+    // paths below and in `commands`, not from `tracing`.
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_writer(deis_wire::LineSafe::new(std::io::stderr))
         .init();
 
     let cli = Cli::parse();

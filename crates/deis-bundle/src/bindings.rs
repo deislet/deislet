@@ -304,6 +304,18 @@ impl Binding {
 /// [`Self::validate`] - because a name that collides with a variable or with
 /// another binding is ambiguous whatever kind it turns out to be.
 ///
+/// That reading is a **node's**. It is not enough for the control plane's
+/// entitlement gate (`deis_control::api::bindings::check_service_bindings`),
+/// which is the only place that asks whether the uploader may wire this
+/// application to another one: an entry this build cannot read may be a
+/// cross-application binding of a kind it has never seen, and "not published
+/// on an older node" is not "authorised" - a newer node reads the same bundle
+/// and would honour it with no authority check ever having run. So that gate
+/// reads [`Self::unreadable_entries`] as well as [`Self::iter`] and refuses
+/// the upload while the author is present. See [`crate::forward`] for why a
+/// refusal there does not reopen the rollback failure this type exists to
+/// prevent.
+///
 /// The entry is kept verbatim so that serialising this value back does not
 /// quietly delete it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -373,15 +385,28 @@ impl DeclaredBindings {
     /// reads to find out that this component is one release behind the builder
     /// that produced the bundle.
     pub fn unreadable_kinds(&self) -> Vec<(&str, &str)> {
-        self.unreadable
-            .iter()
+        self.unreadable_entries()
             .filter_map(|(name, value)| {
                 value
                     .get("kind")
                     .and_then(serde_json::Value::as_str)
-                    .map(|kind| (name.as_str(), kind))
+                    .map(|kind| (name, kind))
             })
             .collect()
+    }
+
+    /// The entries this build could not read a kind for, exactly as they were
+    /// written, in name order.
+    ///
+    /// For the one reader that has to look *inside* such an entry: the
+    /// control plane's entitlement gate, which cannot tell from the kind alone
+    /// whether the binding crosses into another application and reads the
+    /// `app` the author wrote to name it in the refusal. Everything else wants
+    /// [`Self::unreadable_kinds`] or [`Self::describe`].
+    pub fn unreadable_entries(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.unreadable
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
     }
 
     /// Every name the manifest declares a binding under, readable or not.
@@ -403,6 +428,12 @@ impl DeclaredBindings {
 
     /// The bindings this build can act on. An entry whose kind it does not
     /// know is not here - see [`Self::unreadable_kinds`].
+    ///
+    /// Right for every reader that *acts* on a binding - builds a client,
+    /// publishes a property, dispatches a call - because there is nothing such
+    /// a reader could do with a kind it does not have. Wrong for a reader that
+    /// *judges* a binding, which has to know the entry exists to refuse it:
+    /// that reader takes [`Self::unreadable_entries`] too.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Binding)> {
         self.known
             .iter()
@@ -595,25 +626,88 @@ impl<'a> IntoIterator for &'a DeclaredBindings {
 /// when it loads a version carrying it.
 pub const CALLABLE_BY_EVERYONE: &str = "*";
 
-/// Refuse a `callable_by` list a node could not act on.
+/// Whether one `callable_by` entry is a spelling this build can read: an
+/// application id, or the wildcard.
+///
+/// The one predicate behind [`validate_callable_by`], [`readable_callable_by`]
+/// and [`unreadable_callable_by`], so the build, the manifest reader and the
+/// log line cannot disagree about which entries those are. Compared trimmed,
+/// because that is how [`callable_by_allows`] reads the list.
+pub fn callable_by_entry_is_readable(entry: &str) -> bool {
+    let entry = entry.trim();
+    entry == CALLABLE_BY_EVERYONE || deis_wire::conventions::is_valid_tenant_part(entry)
+}
+
+/// The entries of a `callable_by` list this build cannot read, as written.
+///
+/// What [`crate::forward::report`] names at `warn`. Empty for every list a
+/// manifest parsed on this build holds, because [`readable_callable_by`] has
+/// already taken those entries out; it is for the raw text, and for a list
+/// built in process.
+pub fn unreadable_callable_by(callable_by: &[String]) -> Vec<&str> {
+    callable_by
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| !callable_by_entry_is_readable(entry))
+        .collect()
+}
+
+/// Read a `callable_by` list out of a manifest, keeping only the entries this
+/// build can read.
+///
+/// The `deserialize_with` behind [`crate::Manifest::callable_by`], and the
+/// narrow reading for that field: an entry this build cannot read consents to
+/// nobody, which is the same answer [`callable_by_allows`] would have given it
+/// anyway, so the list means strictly less here than where it was built and
+/// never more. The entry is not refused, because the list's vocabulary is an
+/// allow-list that grows - `*` is one spelling of it today, and a
+/// per-environment or per-team spelling is the obvious next one - and refusing
+/// cost the whole manifest on every component one release behind the builder.
+/// See [`crate::forward`].
+///
+/// This is the split the other narrowed values make between the author's own
+/// text and a builder's: a list built in process - which is what the build
+/// holds when it calls [`crate::Manifest::validate`] - never passes through
+/// here, so [`validate_callable_by`] still refuses the author's typo by name
+/// with the project file on screen. A list parsed out of JSON has been through
+/// here first, so the same call finds nothing to refuse. The entry that was
+/// dropped is still in the manifest text, which is what every component
+/// stores and carries, and [`crate::forward::report`] names it at `warn`.
+pub(crate) fn readable_callable_by<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<String> = Vec::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter(|entry| callable_by_entry_is_readable(entry))
+        .collect())
+}
+
+/// Refuse a `callable_by` list an author wrote that a node could not act on.
 ///
 /// Every entry must be an application id or the wildcard. A malformed entry is
 /// refused rather than skipped: an entry that was silently dropped would leave
 /// an author looking at a list that says a caller is allowed while the node
 /// refuses it.
+///
+/// **This is the build's moment, and it only bites there.** It runs from
+/// [`crate::Manifest::validate`] wherever a manifest is read, but a manifest
+/// parsed out of JSON has already had every unreadable entry taken out by
+/// [`readable_callable_by`], so on a node or a control plane this finds
+/// nothing and the bundle loads. Only a manifest built in process - the
+/// build's, with the author's list in it - can still carry an entry this
+/// refuses. That is the same split `compatibility.flags` makes between
+/// `DeclaredCompatibility::validate_as_written` and `validate`, arranged so
+/// that neither the build nor any other caller has to pick the right one.
 pub fn validate_callable_by(callable_by: &[String]) -> Result<(), String> {
-    for entry in callable_by {
+    if let Some(entry) = unreadable_callable_by(callable_by).first() {
         let entry = entry.trim();
-        if entry == CALLABLE_BY_EVERYONE {
-            continue;
-        }
-        if !deis_wire::conventions::is_valid_tenant_part(entry) {
-            return Err(format!(
-                "callable_by entry {entry:?} is not an application id: ids are 1 to 64 characters \
-                 of ASCII letters, digits, '_' or '-', and {CALLABLE_BY_EVERYONE:?} means every \
-                 application on this platform"
-            ));
-        }
+        return Err(format!(
+            "callable_by entry {entry:?} is not an application id: ids are 1 to 64 characters \
+             of ASCII letters, digits, '_' or '-', and {CALLABLE_BY_EVERYONE:?} means every \
+             application on this platform"
+        ));
     }
     Ok(())
 }
@@ -624,6 +718,10 @@ pub fn validate_callable_by(callable_by: &[String]) -> Result<(), String> {
 /// with the **callee's own current manifest**, so consent moves with the
 /// callee's code: an application that stops consenting stops being callable at
 /// its next deployment, with nothing to redeliver to anybody who named it.
+///
+/// An exact comparison, so an entry this build cannot read - were one to reach
+/// here in a list built in process - consents to nobody rather than to whoever
+/// it looks most like.
 pub fn callable_by_allows(callable_by: &[String], caller_app: &str) -> bool {
     callable_by
         .iter()

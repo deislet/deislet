@@ -23,6 +23,13 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // This service's own log, not the tenant logs it aggregates: those go
+        // to storage, not through here. It still handles tenant text (app ids,
+        // node ids, rejected payloads in error messages), so it gets the same
+        // floor - every control character escaped, ANSI off because the
+        // wrapper escapes ESC too. See `deis_wire::logging`.
+        .with_ansi(false)
+        .with_writer(deis_wire::LineSafe::new(std::io::stdout))
         .init();
 
     let cli = Cli::parse();

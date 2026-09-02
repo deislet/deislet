@@ -22,15 +22,20 @@
 //! is additive, an older build ignores what it does not know and says so, and
 //! only a `schema` it does not know refuses a bundle whole.
 //!
-//! That first went in covering unknown *keys* only, and four **values** in
-//! known fields went on doing exactly the same damage: a binding kind, a
-//! not-found behaviour, a redirect status and a compatibility flag are each an
-//! allow-list of the spellings one release happens to have, and each of them
-//! refused the whole bundle for a spelling from the next one. The second half
-//! of this file is that case. The rule for a value is in
-//! `deis_bundle::forward` beside the rule for a key: take the narrowest
-//! reading the field can already hold, say so at `warn`, and never refuse the
-//! document.
+//! That first went in covering unknown *keys* only, and **values** in known
+//! fields went on doing exactly the same damage: a binding kind, a not-found
+//! behaviour, a redirect status, a redirect source pattern, a `callable_by`
+//! entry and a compatibility flag are each an allow-list of the spellings one
+//! release happens to have, and each of them refused the whole bundle for a
+//! spelling from the next one. The second half of this file is that case. The
+//! rule for a value is in `deis_bundle::forward` beside the rule for a key:
+//! take the narrowest reading the field can already hold, say so at `warn`,
+//! and never refuse the document.
+//!
+//! The values that *are* still refused are the rows of
+//! `deis_bundle::forward::GATES`, each with its reason, and the last test here
+//! is the one of them that costs a bundle: a `_headers` pattern this build
+//! cannot compile.
 
 use deis_bundle::{
     BundleError, MANIFEST_ENTRY, NotFound, SUPPORTED_SCHEMA, WORKER_ENTRY, read_manifest,
@@ -161,8 +166,9 @@ fn a_schema_this_build_does_not_know_is_still_refused_whole() {
 
 /// The same bundle, from a builder several releases newer: every value this
 /// build can read is still readable, and beside each one sits a value from an
-/// allow-list that has grown since - a vector namespace, a maintenance page, a
-/// `410 Gone` rule, a flag for a behaviour that did not exist yet.
+/// allow-list that has grown since - a vector namespace, a per-environment
+/// consent, a maintenance page, a `410 Gone` rule, a wildcard inside a
+/// segment, a flag for a behaviour that did not exist yet.
 const VALUES_FROM_A_NEWER_BUILDER: &str = r#"{
   "schema": 1,
   "app": "demo",
@@ -174,10 +180,12 @@ const VALUES_FROM_A_NEWER_BUILDER: &str = r#"{
     "HOT": {"kind": "kv"},
     "SEARCH": {"kind": "vector"}
   },
+  "callable_by": ["storefront", "checkout/production"],
   "site": {
     "not_found": "maintenance-page",
     "redirects": [
       {"from": "/gone", "to": "/gone.html", "status": 410},
+      {"from": "/*.js", "to": "/static/:splat", "status": 301},
       {"from": "/old", "to": "/new", "status": 301}
     ]
   },
@@ -195,7 +203,7 @@ fn a_value_a_newer_builder_wrote_costs_that_declaration_and_nothing_else() {
     ]);
 
     let parsed = read_manifest(&bundle).expect(
-        "a manifest holding values this build does not know must still load. Each of these four \
+        "a manifest holding values this build does not know must still load. Each of these six \
          fields is an allow-list that grows with the platform, so refusing one costs the whole \
          application - its code, its routes, its other bindings - on every node one release \
          behind, and no re-upload repairs it: the manifest is inside the archive whose digest is \
@@ -203,7 +211,7 @@ fn a_value_a_newer_builder_wrote_costs_that_declaration_and_nothing_else() {
     );
     let manifest = &parsed.manifest;
 
-    // Everything beside the four is untouched. That is the claim.
+    // Everything beside the six is untouched. That is the claim.
     assert_eq!(manifest.app, "demo");
     assert_eq!(manifest.cron, vec!["*/5 * * * *"]);
     assert_eq!(manifest.route_patterns(), vec!["/hello/:name"]);
@@ -226,15 +234,24 @@ fn a_value_a_newer_builder_wrote_costs_that_declaration_and_nothing_else() {
         "and it must not vanish either: an operator has to be able to see it"
     );
 
+    // A `callable_by` entry this build cannot read consents to nobody. The
+    // entry beside it still consents, so the callee is reachable by fewer
+    // applications here than where it was built, never by more.
+    assert_eq!(manifest.callable_by, vec!["storefront".to_string()]);
+    assert!(!deis_bundle::callable_by_allows(
+        &manifest.callable_by,
+        "checkout"
+    ));
+
     // A not-found behaviour this build does not know reads as "none", which is
     // what every application had before the field existed.
     assert_eq!(manifest.site.not_found, NotFound::None);
 
-    // A redirect status this build cannot answer with drops that one rule.
-    // The rule beside it still works, which is the point of dropping rather
-    // than refusing.
+    // A redirect status this build cannot answer with, or a source pattern it
+    // cannot compile, drops that one rule. The rule beside them still works,
+    // which is the point of dropping rather than refusing.
     let table = deis_bundle::RedirectTable::compile(&manifest.site.redirects)
-        .expect("a status from a newer release must not make the table unusable");
+        .expect("a status or a pattern from a newer release must not make the table unusable");
     assert_eq!(table.len(), 1);
     assert!(
         matches!(
@@ -246,6 +263,10 @@ fn a_value_a_newer_builder_wrote_costs_that_declaration_and_nothing_else() {
     assert!(
         table.apply(&["gone".to_string()], "").is_none(),
         "and the one it does not is not answered with a status it made up"
+    );
+    assert!(
+        table.apply(&["app.js".to_string()], "").is_none(),
+        "and a pattern it cannot compile matches nothing rather than its literal text"
     );
 
     // A compatibility flag this build does not know is ignored; the flag
@@ -262,14 +283,16 @@ fn a_value_a_newer_builder_wrote_costs_that_declaration_and_nothing_else() {
         "single_set_cookie_header still holds the behaviour back"
     );
 
-    // Narrowed is not unsaid: `read_manifest` names all four at `warn`, once,
+    // Narrowed is not unsaid: `read_manifest` names all six at `warn`, once,
     // on the node that installs the version.
     assert_eq!(
         unreadable_values(&parsed.json),
         vec![
             "bindings.SEARCH.kind = \"vector\"".to_string(),
+            "callable_by[1] = \"checkout/production\"".to_string(),
             "site.not_found = \"maintenance-page\"".to_string(),
             "site.redirects[0].status = 410".to_string(),
+            "site.redirects[1].from = \"/*.js\"".to_string(),
             "compatibility.flags[0] = \"streaming_uploads\"".to_string(),
         ]
     );
@@ -281,6 +304,44 @@ fn a_value_a_newer_builder_wrote_costs_that_declaration_and_nothing_else() {
     // carried to every component and are still there after the upgrade.
     assert!(parsed.json.contains("\"vector\""), "{}", parsed.json);
     assert!(parsed.json.contains("410"), "{}", parsed.json);
+    assert!(
+        parsed.json.contains("checkout/production"),
+        "{}",
+        parsed.json
+    );
+    assert!(parsed.json.contains("/*.js"), "{}", parsed.json);
+}
+
+/// The one `site` value that is deliberately still a gate, and what it costs.
+///
+/// A `_headers` block whose pattern this build cannot compile refuses the
+/// whole bundle - the same rollback failure the tests above forbid for every
+/// other value. It is accepted for this one because a header block has no
+/// narrow reading: dropping it drops whatever it set, and what `_headers` sets
+/// is `Content-Security-Policy` and its kind, so a site served without the
+/// block lets a visitor's browser do *more*. `deis_bundle::forward::GATES`
+/// carries the row and the reason; this test pins the cost so nobody pays it
+/// by accident, and pins the message so an operator meeting it knows it is
+/// deliberate and which release ends it.
+#[test]
+fn a_headers_pattern_this_build_cannot_compile_is_the_gate_it_says_it_is() {
+    let with_headers = VALUES_FROM_A_NEWER_BUILDER.replace(
+        "\"not_found\": \"maintenance-page\",",
+        "\"not_found\": \"maintenance-page\",\n    \"headers\": [{\"pattern\": \"/*.js\", \
+         \"set\": [{\"name\": \"cache-control\", \"value\": \"immutable\"}]}],",
+    );
+    assert_ne!(
+        with_headers, VALUES_FROM_A_NEWER_BUILDER,
+        "the fixture was not edited"
+    );
+    let bundle = zip_with(&[(MANIFEST_ENTRY, &with_headers), (WORKER_ENTRY, "export {}")]);
+
+    let err = read_manifest(&bundle).expect_err("a header block this build cannot place");
+    let message = err.to_string();
+    assert!(matches!(err, BundleError::InvalidManifest(_)), "{message}");
+    assert!(message.contains("/*.js"), "{message}");
+    assert!(message.contains("refused rather than dropped"), "{message}");
+    assert!(message.contains("upgrade this component"), "{message}");
 }
 
 /// The one value that is still refused, and the shape of that refusal.

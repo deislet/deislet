@@ -34,7 +34,14 @@ impl AccessLog {
     }
 
     pub fn record(&self, session: &Session, ctx: &RequestCtx) {
-        let line = self.format(session, ctx);
+        // User-Agent, Referer and the request path are the client's bytes.
+        // This file is read by line, so a newline in any of them would write
+        // a whole line the client composed, and a U+009B would repaint the
+        // terminal of whoever tails it. The same rule every service's
+        // `tracing` output already obeys applies here, to the whole line: a
+        // legitimate field never contains a control character.
+        let formatted = self.format(session, ctx);
+        let line = deis_wire::escape_control(&formatted);
         match self.file.lock() {
             Ok(mut file) => {
                 if let Err(e) = writeln!(file, "{line}") {

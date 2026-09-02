@@ -967,6 +967,161 @@ else
     "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
 fi
 
+# ----------------------------------------------------------------------
+# 11. The cron check knows a tick from a leftover
+# ----------------------------------------------------------------------
+#
+# `check_cron` used to read `cron:last-run` and pass on any non-empty value.
+# The key is fixed, the value was never parsed, and the application's KV
+# endpoint takes no credential - so a second `verify` against one `start`
+# passed on the value the first one had already seen, and anything that could
+# reach the node could write the key by hand. None of those three needs cron
+# to have fired.
+#
+# What decides it now is `cron_tick_is_fresh`, and this holds that decision to
+# canned values: a live demo can only show it saying yes, and a witness that
+# has never been seen saying no is not yet a witness. The fetching is not
+# tested here - that is what a `verify` run does - only the judgement.
+
+eval "$(definition_of cron_instant_digits)"
+eval "$(definition_of cron_tick_is_fresh)"
+
+# $1 what the check saw at the start, $2 its marker, $3 the counter in the
+# record, $4 the instant in it, $5 whether it should be judged fresh.
+fresh_case() {
+  local previous_tick=$1 marker=$2 tick=$3 at=$4 want=$5 name=$6
+  local got=no
+  if cron_tick_is_fresh "$previous_tick" "$marker" "$tick" "$at"; then
+    got=yes
+  fi
+  if [ "$got" = "$want" ]; then
+    pass "$name"
+  else
+    fail "$name" \
+      "cron_tick_is_fresh ${previous_tick} ${marker} ${tick} ${at} said ${got}, expected ${want}"
+  fi
+}
+
+marker="2026-09-02T10:22:02Z"
+
+fresh_case 4 "$marker" 5 "2026-09-02T10:23:00.000Z" yes \
+  "a tick counted above the last one seen and scheduled after the marker is fresh"
+fresh_case 4 "$marker" 4 "2026-09-02T10:23:00.000Z" no \
+  "the same counter is not a new tick, however new its timestamp claims to be"
+fresh_case 4 "$marker" 5 "2026-09-02T10:21:00.000Z" no \
+  "a tick scheduled before the marker is somebody else's evidence, not this run's"
+fresh_case 4 "$marker" 5 "2026-09-02T10:22:02.000Z" no \
+  "a tick scheduled in the very second of the marker is not proof it came after it"
+fresh_case 0 "$marker" 1 "2026-09-02T10:23:00.000Z" yes \
+  "the first tick after a fresh start passes with nothing to compare against"
+fresh_case 4 "$marker" 9 "just now" no \
+  "a value that is not an instant does not become one by being stored"
+fresh_case 4 "$marker" 9 "" no \
+  "an empty timestamp is not a timestamp"
+fresh_case 4 "$marker" "" "2026-09-02T10:23:00.000Z" no \
+  "a record with no counter cannot say it is a later tick"
+fresh_case 4 "$marker" "tomorrow" "2026-09-02T10:23:00.000Z" no \
+  "a counter that is not a number is not compared as one"
+fresh_case 4 "$marker" 5 "2026-09-02T10:23:00Z" yes \
+  "an instant with no fractional second is still an instant"
+fresh_case 4 "$marker" 5 "2026-09-02T10:23:00.000+02:00" no \
+  "an instant in some other offset is refused rather than read as UTC"
+fresh_case 4 "$marker" 999999 "2099-01-01T00:00:00.000Z" yes \
+  "a forged record passes this decision, which is why the check does not rest on it alone"
+
+# ----------------------------------------------------------------------
+# 12. The node-channel check says no when anybody may join the fleet
+# ----------------------------------------------------------------------
+#
+# `check_the_node_channel_needs_the_node_key` is the only thing in `verify`
+# that asks the control plane's node channel a question with no node key in
+# it. A demo can only ever show it saying yes: the running control plane has
+# `node_preshared_keys` configured, and configuring none closes the channel
+# rather than opening it, so there is no way to arrange the failure it exists
+# to catch by starting a second one.
+#
+# So it is run here against a stand-in that answers the way an ungated control
+# plane answers - every registration accepted, the invented node then on the
+# fleet - and it has to say ✗. `curl` and `control_api` are the only two doors
+# it uses, and both are replaced; nothing here reaches a network.
+
+# $1 is "open" or "gated": which control plane the stand-in imitates.
+node_channel_probe() {
+  local platform=$1
+  local probe="${WORK_DIR}/node-channel-${platform}.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'CHECKS_PASSED=0'
+    echo 'CHECKS_FAILED=0'
+    echo 'VERIFY_CLAIMS=""'
+    printf 'LOG_DIR=%q\n' "$WORK_DIR"
+    echo 'NODE_ID=deis-runtime-demo-01'
+    echo 'DEIS_RUNTIME_PORT=9'
+    echo 'API_KEY=the-deploy-credential'
+    echo 'control_url() { echo "http://127.0.0.1:9"; }'
+    definition_of pass_check
+    definition_of fail_check
+    if [ "$platform" = "open" ]; then
+      cat <<'STUB'
+# Every registration accepted, whoever asks.
+curl() {
+  local out="" i args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [ "${args[i]}" = "-o" ]; then out=${args[i + 1]}; fi
+  done
+  if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then
+    printf '{"details":"registered"}' > "$out"
+  fi
+  printf '200'
+}
+control_api() {
+  printf '{"nodes":[{"id":"%s","healthy":true},{"id":"%s-uninvited-%s","healthy":true}]}' \
+    "$NODE_ID" "$NODE_ID" "$$"
+}
+STUB
+    else
+      cat <<'STUB'
+# The gate the real control plane has.
+curl() {
+  local out="" i args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [ "${args[i]}" = "-o" ]; then out=${args[i + 1]}; fi
+  done
+  if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then
+    printf '{"error":"Unauthorized","details":"This endpoint serves runtime nodes. Provide one of the control plane%s node_preshared_keys."}' "'s" > "$out"
+  fi
+  printf '401'
+}
+control_api() {
+  printf '{"nodes":[{"id":"%s","healthy":true}]}' "$NODE_ID"
+}
+STUB
+    fi
+    definition_of check_the_node_channel_needs_the_node_key
+    echo 'check_the_node_channel_needs_the_node_key'
+    echo 'echo "verdicts: ${CHECKS_PASSED} passed ${CHECKS_FAILED} failed"'
+  } > "$probe"
+  bash "$probe" 2>&1
+}
+
+out=$(node_channel_probe open)
+if [ "${out#*verdicts: 0 passed 1 failed}" != "$out" ] \
+  && [ "${out#*expected 401 with no credential (got 200)}" != "$out" ]; then
+  pass "the node-channel check fails when an uncredentialed caller may join the fleet"
+else
+  fail "the node-channel check fails when an uncredentialed caller may join the fleet" \
+    "against a control plane that accepts anybody it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
+fi
+
+out=$(node_channel_probe gated)
+if [ "${out#*verdicts: 1 passed 0 failed}" != "$out" ]; then
+  pass "the node-channel check passes when the registration endpoint refuses all three"
+else
+  fail "the node-channel check passes when the registration endpoint refuses all three" \
+    "it reported: $(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
   echo "all witness tests passed"

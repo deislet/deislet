@@ -381,7 +381,10 @@ pub fn new_trace_id() -> String {
 /// full, and, worse, `tracing` appends the real `app_id=` and `trace_id=`
 /// fields *after* the injected newline, so the forged line arrives already
 /// stamped with the genuine invocation id. Attribution cannot recover from
-/// that; only refusing to emit the newline can.
+/// that; only refusing to emit the newline can. That is now refused twice -
+/// here, and again at the writer (`deis_wire::logging::LineSafe`, installed on
+/// every service binary) - and the section below says which of the two is
+/// load-bearing for what.
 ///
 /// deis-telemetry is reached through [`crate::logging::RuntimeLayer`], which is
 /// a `Layer` and never passes through `fmt` at all. Nothing on that route
@@ -393,15 +396,48 @@ pub fn new_trace_id() -> String {
 ///
 /// # What this does not cover, said plainly
 ///
-/// This function guards what passes through it. `emit_app_log` - every
-/// `console.*` call - does; so do the queue ops, which log the
-/// application's queue name. But any *other* `tracing` call that
-/// interpolates an application-controlled string (a URL, a header value, a
-/// key, an error built from one) is its own producer, and one that skips
-/// this function writes the unescaped bytes. The closure that would end
-/// the enumeration is at the sink - a formatter on the subscriber itself -
-/// and until that exists, a new log line carrying tenant text must call
-/// [`escape_control`] at the site, the way `queue_ops` does.
+/// The sink now exists. `deis_wire::logging::LineSafe` is a `MakeWriter`
+/// wrapper installed on the `fmt` subscriber of every service binary
+/// (deis-runtime, deis-control, deis-store, deis-queue, deis-telemetry,
+/// deis-proxy, and the `deis` CLI), and it escapes every control character in
+/// an event before the bytes leave the process. Line integrity on a service's
+/// log is therefore a floor rather than a per-site habit: the roughly ninety
+/// `tracing` calls in this workspace that interpolate a URL, a header value, a
+/// key or an error built from one no longer each have to remember. Nothing
+/// that reaches `fmt` can end a line early.
+///
+/// Two things write tenant text to a log without passing through `fmt`, and
+/// each is covered by name rather than by the sink:
+///
+/// * The isolate's native console. `console.*` in an application is bridged
+///   to `op_log` *and* still calls deno's own console, which writes straight
+///   to this process's stdout - the same stream the node's log file is. That
+///   copy is escaped in `js/runtime.js` itself (`escapeControl`, the same
+///   rule as this function), because no Rust code sees it.
+/// * deis-build is not wrapped. It is the author's own compiler, run on the
+///   author's own tree; the text in its log is the author's, and no other
+///   tenant's bytes reach it.
+///
+/// This function stays for the two things the sink does not do:
+///
+/// * The deis-telemetry route. [`crate::logging::RuntimeLayer`] is a `Layer`,
+///   not a writer; it takes the message before any formatter and ships it to
+///   deis-telemetry, where `deis logs` and `deis trace` render it. No
+///   `MakeWriter` sits anywhere on that path, so an application's message is
+///   escaped there only because it was escaped here.
+/// * Values quoted as evidence. `emit_app_log` (every `console.*` call) and
+///   the queue ops (which log the application's queue name) escape their
+///   value, not just their line, so what an operator reads and what a check
+///   greps is the application's text with visible boundaries rather than a
+///   line that merely happens to hold together.
+///
+/// And what neither covers, plainly: a *field value* is still whatever the
+/// producer put there. An application that logs `app_id=other` inside its own
+/// message produces one honest, unbroken line whose tail reads exactly like a
+/// structured field, and an operator skimming it can still be misled. Only
+/// the producer knows which of its bytes are its own and which are quoted.
+/// The sink guarantees the record boundary; it cannot un-forge what is inside
+/// the record.
 ///
 /// # Why `is_control`, and what that deliberately leaves
 ///

@@ -60,6 +60,14 @@ pub(crate) mod ws_frame {
     }
 }
 
+/// The methods this node refuses at the door, whatever application would have
+/// served them.
+///
+/// The Fetch standard's forbidden-method list, exactly. See the refusal in
+/// [`handle_request`] for why it is applied there and why nothing else is
+/// added to it.
+pub(crate) const FORBIDDEN_METHODS: [&str; 3] = ["CONNECT", "TRACE", "TRACK"];
+
 /// Why a request body was not read.
 #[derive(Debug)]
 pub(crate) enum BodyRefusal {
@@ -375,6 +383,50 @@ pub async fn handle_request(
             e
         );
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    // A method no application on this platform can be written to answer.
+    //
+    // Refused here, before an isolate is entered, because the refusal already
+    // existed one layer too deep: the runtime builds a standard `Request` for
+    // the handler, deno_fetch's constructor throws `TypeError: Method is
+    // forbidden` on these three, and the throw came back out of the invoke
+    // wrapper as a 500 carrying that constructor's stack. So `curl -X TRACE`
+    // at any application answered 500 with the platform's internals in the
+    // body, and every one of them spent a runtime thread on a request that
+    // could never be served.
+    //
+    // The list is the Fetch standard's forbidden methods and nothing else.
+    // TRACE and TRACK are also the cross-site tracing pair -- a server that
+    // echoes a request echoes its cookies -- and CONNECT asks this node to be
+    // a tunnel, which it is not. Compared case-insensitively because that is
+    // how the standard compares them, and because a client sending `trace`
+    // means the same thing as one sending `TRACE`.
+    //
+    // Everything else this node does not recognise is passed through
+    // untouched: PROPFIND, REPORT, and whatever method an application invents
+    // are all served today, and a handler is free to answer any of them.
+    //
+    // No `Allow` header. RFC 9110 asks a 405 to carry one, but this node
+    // cannot state a truthful list: the set it accepts is every method except
+    // these three, which is not a list, and the set *this application* accepts
+    // is inside the handler and unknown here. A guessed `Allow` would be a
+    // wrong answer given confidently, which is worse than an absent header.
+    if FORBIDDEN_METHODS
+        .iter()
+        .any(|forbidden| method.as_str().eq_ignore_ascii_case(forbidden))
+    {
+        tracing::warn!(
+            app_id = %key.app_id(),
+            environment = %key.environment(),
+            method = %method,
+            path = uri.path(),
+            "Refusing {} for {}: the Fetch standard forbids this method, so no handler can be \
+             built to answer it. The application was not called",
+            method,
+            key
+        );
+        return (StatusCode::METHOD_NOT_ALLOWED, "This method is not served.").into_response();
     }
 
     // Asset-first, the platform's first design principle: a request whose path
@@ -768,14 +820,50 @@ pub async fn handle_request(
             }
         }
         Err(e) => {
+            // The other half of the same disclosure the invoke wrapper had.
+            //
+            // This arm is not only "the runtime thread went away". A bundle
+            // whose module fails to evaluate is reported here too -- see
+            // `AppRuntime::execute_fetch`, which sends the module-init error
+            // down this channel -- and a deno module error carries the
+            // application's own stack, so the tenant's bundle layout used to
+            // leave through this body as well. The cut-off errors that also
+            // land here name the application and the budget it was held to,
+            // which is a configuration fact and equally nobody else's.
+            //
+            // The client gets a fixed sentence and an incident id; the error
+            // itself stays in the line below, which carries `app_id`,
+            // `environment` and the same id.
+            //
+            // That line is the node's own log and not the application's log
+            // stream: `crate::logging::RuntimeLayer` ships only `target:
+            // "app"` events, so this is found with `grep incident=<id>` in the
+            // node's log file rather than with `deis logs -a <app>`. Moving it
+            // into the application's stream is the right next step and is not
+            // done here, because `e` can be an application's own error text --
+            // a module that would not evaluate -- and a line shipped to
+            // telemetry has to go through `runtime::ops::escape_control`
+            // first, which is private to `runtime`. A newline in a message
+            // forges a whole log line, stamped with the real ids.
+            //
+            // The id is minted here because this failure never reached an
+            // isolate and so has no trace id of its own to quote. The isolate's
+            // own 500s carry an id in the same shape, from `js/runtime.js`, and
+            // those lines do reach `deis logs -a <app>`.
+            let incident = uuid::Uuid::new_v4().simple().to_string();
             tracing::error!(
                 app_id = %key.app_id(),
                 environment = %key.environment(),
+                incident = %incident,
                 "Application {} execution failed: {}",
                 key,
                 e
             );
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Internal Server Error (incident {incident})"),
+            )
+                .into_response()
         }
     }
 }

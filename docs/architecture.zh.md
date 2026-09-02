@@ -416,6 +416,13 @@ sequenceDiagram
 拿活的方式——没注册的节点照样自取并服务它拉到的每个应用，只是收不到推送、也不会被
 选中跑 cron。
 
+**这把凭据是整支机队共用的一把，不是每个节点一把。** 拿到其中任意一个值，就能读到
+任意节点的 assignments（也就是全部环境的明文密钥与每个租户的存储 capability token）、
+下载任意 bundle、以及驱动每个节点的管理面；deis-proxy 也持有同一个值。节点的数据端口
+绑在 `0.0.0.0`，本身就是一道信任边界。这些事实、各端口该对谁开放、每个配置文件的权限
+要求、以及不停机轮换的步骤，只在一处写全：
+[docs/trust-boundaries.md](trust-boundaries.md)（英文）。
+
 **这两条路径不在文档里写死。** 它们是
 `deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`
 （服务端注册路由用的 `:id` 模板）与 `node_registration_path` /
@@ -709,6 +716,10 @@ deis-store、deis-queue、deis-control 都还只把日志写自己的 stdout / �
   下载挂在独立的 `node_auth` 上，凭据是 `node_preshared_keys`，不受面板的
   `api_auth_enabled` 影响，也不接受面板 API Key。这条路会把全部环境的明文密钥当 JSON 返回，早前它只挂在默认关闭的
   面板鉴权上，等于任何能连到控制面 HTTP 端口的人 curl 一次就能拿走整个平台的密钥。
+- 本版**没有**做按租户分密钥（信封加密）：全部环境的密钥都用 `secret_key_file` 里的
+  同一把主密钥加密，清单接口再明文发下去。所以一个 `node_preshared_keys` 值等于全部
+  租户的明文。这条结论连同它要求的端口边界与轮换步骤见
+  [docs/trust-boundaries.md](trust-boundaries.md)（英文）。
 
 ---
 

@@ -9,6 +9,7 @@ pub mod client;
 pub mod config;
 pub mod conventions;
 pub mod error;
+pub mod logging;
 pub mod models;
 
 pub mod pb {
@@ -19,6 +20,10 @@ pub mod pb {
 pub use client::WireClient;
 pub use config::{ControlConfig, NodeInfo, NodeRole};
 pub use error::{SdkResult, WireError};
+
+// The log sink every binary installs. Named here as well as in its module
+// because it is a thing every `main` reaches for, not a wire type.
+pub use logging::{LineSafe, escape_control};
 
 // Re-export the cross-component conventions.
 //

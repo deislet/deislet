@@ -22,7 +22,9 @@ English: [README.md](README.md)。
 - **主动连控制面**。启动时先登记自己，再要一份自己的清单，逐个用 HTTP 把包下下来、
   校验 sha256、装好，全部装好之后才报 healthy。之后新的部署以 gRPC 推送到达。那两条
   HTTP 路径是 `deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`，
-  两条都要带节点凭据（`[control] secret`）——清单里带着解密后的密钥。
+  两条都要带节点凭据（`[control] secret`）——清单里带着解密后的密钥。这把凭据是整支
+  机队共用的一把，而本节点的数据端口本身就是一道信任边界，两件事都写在
+  [docs/trust-boundaries.md](../../docs/trust-boundaries.md)（英文）。
 - **投递日志、指标与调用轨迹**给 deis-telemetry，攒批发送；缓冲满了丢最旧的，而不是
   一直涨。轨迹是一次调用一条——请求、队列批次、cron 触发、WebSocket 消息各算一次——
   记的是**这个节点做的判定**，所以「应用自己抛了」和「我们把它切断了」是两条不同的

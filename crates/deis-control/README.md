@@ -80,7 +80,10 @@ This is the part worth reading before changing anything about authentication.
   every application and hostname this installation serves, and deis-proxy
   already holds a node credential — the `[control] secret` in its own file is a
   `node_preshared_keys` value, because that is what its gRPC control channel
-  authenticates with.
+  authenticates with. That makes deis-proxy's configuration file as sensitive
+  as this one: the same value reads every environment's decrypted secrets from
+  the assignment list and drives every node's management plane. See
+  [docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 
 An API key is not accepted on the node endpoints, and a node credential is not
 accepted on the human ones.

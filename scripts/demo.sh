@@ -554,6 +554,7 @@ listen = "127.0.0.1:${DEIS_TELEMETRY_PORT}"
 metrics_listen = "127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}"
 data_dir = "${DEMO_DIR}/deis-telemetry-data"
 EOF
+  chmod 600 "$DEIS_TELEMETRY_CONFIG"
 
   # auth_secret turns on the capability-token check
   # (crates/deis-store/src/auth.rs): every call must then present
@@ -567,12 +568,14 @@ listen = "127.0.0.1:${DEIS_STORE_PORT}"
 data_dir = "${DEMO_DIR}/deis-store-data"
 auth_secret = "${STORAGE_AUTH_SECRET}"
 EOF
+  chmod 600 "$DEIS_STORE_CONFIG"
 
   cat > "$DEIS_QUEUE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_QUEUE_PORT}"
 data_dir = "${DEMO_DIR}/deis-queue-data"
 auth_secret = "${STORAGE_AUTH_SECRET}"
 EOF
+  chmod 600 "$DEIS_QUEUE_CONFIG"
 
   echo "🚀 Starting Telemetry (gRPC: ${DEIS_TELEMETRY_PORT}, metrics: ${DEIS_TELEMETRY_METRICS_PORT})"
   "${BIN_DIR}/deis-telemetry" --config "$DEIS_TELEMETRY_CONFIG" \
@@ -1794,6 +1797,10 @@ storage_auth_secret = "${STORAGE_AUTH_SECRET}"
 id = "${NODE_ID}"
 addr = "http://127.0.0.1:${DEIS_RUNTIME_PORT}"
 EOF
+    # Every generated configuration is the operator's alone: this one holds
+    # node_preshared_keys, api_keys and storage_auth_secret, and the node's
+    # and proxy's hold the fleet credential (docs/trust-boundaries.md).
+    chmod 600 "$DEIS_CONTROL_CONFIG"
 
     # [control] is architecture principle 8: on startup the node asks the
     # control plane which applications and versions it should be running,
@@ -1848,6 +1855,7 @@ allow = ["127.0.0.1:${DEIS_ORIGIN_PORT}"]
 [default_execution_limits]
 stream_timeout_ms = ${DEMO_STREAM_TIMEOUT_MS}
 EOF
+    chmod 600 "$DEIS_RUNTIME_CONFIG"
 
     ACME_STORE_DIR="${DEMO_DIR}/acme"
     cat > "$DEIS_PROXY_CONFIG" <<EOF
@@ -1904,6 +1912,7 @@ max_retry_backoff_secs = 4
 # dns-01.
 include_preview_addresses = true
 EOF
+    chmod 600 "$DEIS_PROXY_CONFIG"
 
     echo "🚀 Starting Control (HTTP/gRPC: ${DEIS_CONTROL_PORT})"
     "${BIN_DIR}/deis-control" \
@@ -2114,15 +2123,15 @@ CHECKS_FAILED=0
 # The summary is a tally of what happened to the checks that ran, and a tally
 # has nothing to say about a check that did not run. Delete a call from the
 # list in `verify_demo` -- by accident, in a merge, or because a check was
-# being skipped "for now" -- and the run goes from "93 passed, 0 failed" to
-# "92 passed, 0 failed", which reads as a slightly shorter green run and not
+# being skipped "for now" -- and the run goes from "95 passed, 0 failed" to
+# "94 passed, 0 failed", which reads as a slightly shorter green run and not
 # as one that stopped asking a question. The whole of the difference is a
 # digit nobody has the previous run in front of them to compare against.
 #
 # So the list has a length, it is written down, and a run that does not reach
 # it fails. Adding a check means changing this number, which is the point:
 # the number is the roll call.
-VERIFY_EXPECTED_CHECKS=93
+VERIFY_EXPECTED_CHECKS=95
 
 # Every claim a verdict has been printed for, one per line.
 #
@@ -2292,11 +2301,14 @@ http_status() {
 # here, because everything else in this file came out of a Rust String and is
 # therefore valid UTF-8.
 #
-# The newline half of this is now closed at the producer.
-# `crates/deis-runtime/src/runtime/ops.rs::escape_control` escapes every
-# control character out of an application's message before `op_log` hands it
-# to `tracing`, so one request can no longer end the node's line and begin a
-# whole line of its own. Measured before it was: `tracing-subscriber` 0.3.23
+# The newline half of this is now closed on every route an application's
+# text takes to this file: at the producer
+# (`crates/deis-runtime/src/runtime/ops.rs::escape_control` escapes every
+# control character out of a message before `op_log` hands it to `tracing`),
+# under the node's whole `tracing` output (`deis_wire::logging::LineSafe`),
+# and in the native console copy that writes to stdout past both
+# (`escapeControl` in js/runtime.js). One request can no longer end the
+# node's line and begin a whole line of its own. Measured before it was: `tracing-subscriber` 0.3.23
 # escapes ESC and BEL and does not escape LF or CR, and `tracing` appends the
 # real `app_id=` and `trace_id=` fields *after* an injected newline - so the
 # forged line arrived already carrying the genuine invocation id, which is why
@@ -2366,8 +2378,12 @@ log_message() {
 # the request that forged it, and matched a `trace_id="<id>"` filter exactly.
 # The sentence above about an outsider needing to know the tag was therefore
 # not true of an outsider who could reach a handler that logs what they sent.
-# `escape_control` in crates/deis-runtime/src/runtime/ops.rs is what makes it
-# true: no message reaching this file can contain a newline any more.
+# Three things make it true now, one per route an application's text takes
+# to this file: `escape_control` in crates/deis-runtime/src/runtime/ops.rs at
+# the app-log producer; `deis_wire::logging::LineSafe` under the node's whole
+# `tracing` output; and `escapeControl` in js/runtime.js for the native
+# console copy, which writes to stdout past both of the others. No message
+# reaching this file can contain a newline any more.
 #
 # This makes the evidence unforgeable by someone who only has HTTP, which is
 # what the demo hands to the world; it does not make the log a trustworthy
@@ -5182,27 +5198,267 @@ check_queue_dead_letters() {
   fi
 }
 
+# The capability token on the queue, asked the one question nothing else in
+# this demo asks it.
+#
+# `start` writes the same auth_secret onto deis-store, deis-queue and
+# deis-control, and every queue check above reaches the queue through the
+# node - which always carries the token the control plane handed it with the
+# deployment. So DEIS_QUEUE_PORT was configured, started, waited on and
+# printed in the summary, and never dialled by anything without a credential:
+# deis-queue could have been started with no auth_secret at all, or its
+# interceptor could have been left off the service, and every queue check
+# would still have been green. That is the hole check_storage_capability_token
+# closes on deis-store; this is the queue's half of it
+# (crates/deis-queue/src/auth.rs).
+#
+# ListDeadLetters is the call to ask it with: it is the operator's read of the
+# dead letter table and changes nothing, so neither the refusal nor the served
+# call moves a message the rest of the demo depends on. Three probes, because
+# a refusal alone would also be what a queue that refuses everything looks
+# like: no token, a wrong token, and the real one.
+check_queue_capability_token() {
+  local title="a queue call presenting no capability token is refused"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is not installed, so this check could not be run"
+    return
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    fail_check "$title" \
+      "openssl is not installed, so this check could not mint the token its third probe needs"
+    return
+  fi
+
+  # The same tenant form the node presents for this application and
+  # environment, and the same token construction every side of the platform
+  # uses (deis_wire::conventions::storage_token).
+  local tenant="${APP_ID}.${ENV_NAME}"
+  local request='{"queue_name":"jobs","limit":1}'
+  local none wrong served none_rc wrong_rc served_rc
+
+  none=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -d "$request" \
+    "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && none_rc=0 || none_rc=$?
+
+  wrong=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -H "x-deis-storage-token: not-the-token-for-this-tenant" \
+    -d "$request" \
+    "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && wrong_rc=0 || wrong_rc=$?
+
+  served=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -H "x-deis-storage-token: $(storage_token "$tenant")" \
+    -d "$request" \
+    "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && served_rc=0 || served_rc=$?
+
+  if [ "$none_rc" -ne 0 ] && echo "$none" | grep -q 'Code: Unauthenticated' \
+    && [ "$wrong_rc" -ne 0 ] && echo "$wrong" | grep -q 'Code: Unauthenticated' \
+    && [ "$served_rc" -eq 0 ]; then
+    pass_check "$title" \
+      "ListDeadLetters at deis-queue's own port for tenant ${tenant} was refused with no x-deis-storage-token header - $(echo "$none" | tr '\n' ' ' | sed 's/  */ /g' | head -c 120) - and refused again with a token that is not this tenant's, while the same call carrying the token the control plane mints from the same secret was served. Nothing that can merely reach the queue's port can list, drain or replay this tenant's messages"
+    return
+  fi
+
+  fail_check "$title" \
+    "expected Code: Unauthenticated with no token (grpcurl exited ${none_rc}, said $(echo "$none" | tr '\n' ' ' | head -c 140)), the same with a wrong one (exited ${wrong_rc}, said $(echo "$wrong" | tr '\n' ' ' | head -c 140)), and the real token to be served (exited ${served_rc}, said $(echo "$served" | tr '\n' ' ' | head -c 140))"
+}
+
+# The UTC second of an ISO 8601 instant as digits:
+# "2026-09-02T12:01:00.000Z" -> 20260902120100.
+#
+# Compared as a number rather than as text so that nothing rests on how a
+# locale collates '.' against 'Z', and cut at the second because the marker a
+# verify run takes for itself carries no fraction.
+cron_instant_digits() {
+  local at=${1%%.*}
+  at=${at//[-T:Z]/}
+  printf '%s' "$at"
+}
+
+# Does this record describe a tick that fired after the moment this verify run
+# chose for itself?
+#
+# The decision is kept apart from the fetching so it can be held to canned
+# values in scripts/test-demo-witnesses.sh rather than only to a live demo.
+# All three have to hold:
+#
+#   * the counter is above the one that was in the store when this run started
+#     looking, so the record an earlier verify against the same `start` left
+#     behind is not enough on its own;
+#   * the timestamp has the shape `toISOString()` produces, so a stored string
+#     that is not an instant cannot pass as one;
+#   * that instant is later than the marker, which is what a tick scheduled
+#     before this run began cannot satisfy - including the one that was due in
+#     the same second the marker was taken.
+cron_tick_is_fresh() {
+  local previous_tick=$1 marker=$2 tick=$3 at=$4
+
+  case "$tick" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ "$tick" -gt "$previous_tick" ] || return 1
+
+  printf '%s' "$at" \
+    | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$' \
+    || return 1
+
+  [ "$(cron_instant_digits "$at")" -gt "$(cron_instant_digits "$marker")" ]
+}
+
 check_cron() {
   # The whole cron path in one observation: the expression rode into the
   # control plane inside the bundle manifest, the scheduler rebuilt its task
-  # list from the catalog, it picked this node and called Trigger/OnScheduled,
-  # and the app's `scheduled` export wrote the key below.
+  # list from the catalog, it picked a node and called Trigger/OnScheduled,
+  # and the app's `scheduled` export wrote the record below.
+  #
+  # What this check used to be, and why it is not that any more. It read
+  # `cron:last-run` and passed on any non-empty value. The key is fixed, so a
+  # second `verify` against one `start` passed on the value the first one had
+  # already seen - cron could have stopped firing in between and nothing here
+  # would say so. The value was never parsed, so anything at all in that key
+  # satisfied it. And the app's own KV endpoint takes no credential, so
+  # anything that could reach the node could write the key by hand. Three ways
+  # to pass without a tick having happened.
+  #
+  # So the evidence now has to be all of: a tick this run had not already seen
+  # (a counter that only goes up), scheduled after a moment this run chose (an
+  # instant that parses, compared against that marker), recorded by the
+  # platform as well as by the application (`deis trace --kind cron`, which
+  # comes from the node's own report to deis-telemetry and not through KV),
+  # and unwritable from the endpoint this check reads it through (the app
+  # refuses a PUT under `cron:`).
   #
   # The expression is "every minute" and the demo sets the scheduler's tick to
-  # five seconds, so the wait is a minute plus a little rather than the three
-  # minutes the default tick would need. curl paces its own retries a second
-  # apart.
-  local got
-  got=$(curl -sf --retry 150 --retry-delay 1 --retry-max-time 180 --retry-all-errors \
-    -H "x-deis-app-id: ${APP_ID}" \
-    "http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv/cron:last-run" 2>/dev/null || echo '')
+  # five seconds, so each round of the wait is a minute plus a little rather
+  # than the three minutes the default tick would need. curl paces its own
+  # retries a second apart; nothing here sleeps.
+  local title="a cron expression fires on one node and runs the app's handler"
+  local kv="http://127.0.0.1:${DEIS_RUNTIME_PORT}/api/kv"
 
-  local at
-  at=$(echo "$got" | jq -r '.value // empty' 2>/dev/null || true)
-  if [ -n "$at" ]; then
-    pass_check "a cron expression fires on one node and runs the app's handler"       "deis-control triggered the node and the scheduled handler recorded ${at}"
+  # The moment this run chose. Taken before anything is read, so every
+  # judgement below is about what happened after it.
+  local marker marker_us
+  marker=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  marker_us=$(( $(date -u +%s) * 1000000 ))
+
+  # Half one: the endpoint this check reads the record through cannot also
+  # write it. The refusal is by prefix rather than by key, so the probe writes
+  # a name of its own instead of touching the record the rest of the check
+  # depends on - a probe that could corrupt the evidence it is checking would
+  # be its own defect.
+  local probe_key="cron:forgery-probe-$$-${RANDOM}"
+  local probe_headers="${LOG_DIR}/verify-cron-forgery.headers"
+  local refused forged_status probe_found
+  refused=$(curl -s -D "$probe_headers" -X PUT -H "x-deis-app-id: ${APP_ID}" \
+    --data-binary '{"at":"2099-01-01T00:00:00.000Z","tick":999999}' \
+    "${kv}/${probe_key}" 2>/dev/null || true)
+  forged_status=$(http_status "$probe_headers")
+  # `tostring` rather than `// empty`: jq's `//` yields its right side for
+  # `false` as well as for null, so the one answer this probe wants to see -
+  # "found": false - would come back indistinguishable from no answer at all.
+  probe_found=$(curl -s -m 5 -H "x-deis-app-id: ${APP_ID}" "${kv}/${probe_key}" 2>/dev/null \
+    | jq -r '.found | tostring' 2>/dev/null || true)
+
+  # What the store already held. Missing - the first minute after `start` -
+  # and a value this app did not write both read as tick 0, which any real
+  # tick beats.
+  local seen previous_record previous_tick previous_at
+  seen=$(curl -s -m 5 -H "x-deis-app-id: ${APP_ID}" "${kv}/cron:last-run" 2>/dev/null || true)
+  previous_record=$(echo "$seen" | jq -r '.value // empty' 2>/dev/null || true)
+  previous_tick=$(echo "$previous_record" | jq -r '.tick // empty' 2>/dev/null || true)
+  previous_at=$(echo "$previous_record" | jq -r '.at // empty' 2>/dev/null || true)
+  case "$previous_tick" in
+    '' | *[!0-9]*) previous_tick=0 ;;
+  esac
+
+  # Half two: wait for one named key rather than re-reading a key that is
+  # already there. `cron:tick:<n>` does not exist until tick n fires, so curl
+  # retries a 404 until it does and the wait is paced by curl itself. A tick
+  # that turns out to have been scheduled before the marker is not evidence
+  # for this run, so the wait moves on to the next one rather than settling
+  # for it; three rounds is two more than a healthy demo needs and still
+  # bounded.
+  local want=$((previous_tick + 1))
+  local round=0 fresh=0 record="" tick="" at="" waited_for=""
+  while [ "$round" -lt 3 ]; do
+    round=$((round + 1))
+    waited_for="cron:tick:${want}"
+    record=$(curl -sf --retry 100 --retry-delay 1 --retry-max-time 130 --retry-all-errors \
+      -H "x-deis-app-id: ${APP_ID}" "${kv}/${waited_for}" 2>/dev/null \
+      | jq -r '.value // empty' 2>/dev/null || true)
+    if [ -z "$record" ]; then
+      break
+    fi
+    tick=$(echo "$record" | jq -r '.tick // empty' 2>/dev/null || true)
+    at=$(echo "$record" | jq -r '.at // empty' 2>/dev/null || true)
+    if cron_tick_is_fresh "$previous_tick" "$marker" "$tick" "$at"; then
+      fresh=1
+      break
+    fi
+    want=$((want + 1))
+  done
+
+  # Half three: the platform's own account of the same tick, which does not
+  # come through KV at all. The node reports every invocation to
+  # deis-telemetry with the kind it ran under, so `deis trace --kind cron` is
+  # the other side of the same event - the way the log-line checks pair what
+  # an application said with the trace id the platform gave the invocation
+  # that said it. An application that wrote the KV record without a tick, or
+  # an outsider that wrote it from outside, produces no row here.
+  #
+  # Polled rather than asked once: a node ships what it has recorded in
+  # batches, so the row for a tick arrives a few seconds after the KV record
+  # the handler wrote inside it, and one query at the moment the record
+  # appears asks too early. The condition is the row, not a duration - and
+  # the poll only runs when there is a record to corroborate, so a demo whose
+  # cron never fired fails on the record rather than spending a minute here.
+  local traces="${LOG_DIR}/verify-cron-trace.json"
+  local platform_ticks=0 platform_newest="" trace_waited=0
+  # A node buffers its traces and pushes them on a timer, so the record of
+  # the tick the store already shows may not have reached deis-telemetry yet.
+  # Ask once; if it is not there, wait on the platform's own event - `deis
+  # trace --follow` streams each record as it lands, and the first one to
+  # arrive (this tick's, or the next tick's, either of which started after
+  # the marker) ends the wait - and ask again. `timeout` bounds the wait; no
+  # polling loop and nothing here sleeps.
+  read_platform_ticks() {
+    deis_cli trace --kind cron --since 15m --limit 200 --json \
+      > "$traces" 2> "${LOG_DIR}/verify-cron-trace.log" || return 0
+    platform_ticks=$(jq -r --argjson since "$marker_us" \
+      '[.invocations[] | select(.started_us >= $since)] | length' \
+      < "$traces" 2>/dev/null || echo 0)
+    platform_newest=$(jq -r --argjson since "$marker_us" \
+      '[.invocations[] | select(.started_us >= $since)] | last | .time // empty' \
+      < "$traces" 2>/dev/null || true)
+    case "$platform_ticks" in
+      '' | *[!0-9]*) platform_ticks=0 ;;
+    esac
+  }
+  if [ "$fresh" = "1" ]; then
+    read_platform_ticks
+    if [ "$platform_ticks" -lt 1 ]; then
+      local followed_from=$SECONDS
+      deis_cli_env
+      timeout 60 env "${DEIS_CLI_ENV[@]}" "${BIN_DIR}/deis" trace --kind cron --follow --json \
+        2>> "${LOG_DIR}/verify-cron-trace.log" | head -n 1 > /dev/null || true
+      trace_waited=$((SECONDS - followed_from))
+      read_platform_ticks
+    fi
+  fi
+
+  if [ "$fresh" = "1" ] && [ "$forged_status" = "403" ] && [ "$probe_found" = "false" ] \
+    && [ "$platform_ticks" -ge 1 ]; then
+    pass_check "$title" \
+      "at ${marker} the store held $(if [ -n "$previous_at" ]; then echo "tick ${previous_tick} scheduled ${previous_at}"; else echo "no cron record at all"; fi); this check then waited for ${waited_for}, a key that does not exist until that tick fires, and the scheduled handler wrote it with tick ${tick} scheduled ${at} - later than the marker, so no earlier run and no earlier tick can be what satisfied this. The platform says the same thing by its own route, which does not pass through KV at all: deis trace --kind cron lists ${platform_ticks} cron invocation(s) that the node reported to deis-telemetry as having started after that marker, the newest at ${platform_newest} (node-local time). That is corroboration that cron ran in this window rather than a second reading of this one tick - the trace carries the expression, not the counter - and it is a row an application cannot write and a caller of the KV endpoint cannot produce. And the record is not something a caller can write: PUT ${probe_key} through the app's own KV endpoint - the credential-free endpoint this check reads through - answered ${forged_status} and stored nothing"
   else
-    fail_check "a cron expression fires on one node and runs the app's handler"       "nothing was recorded for cron:last-run within 120s; last answer: ${got:-<none>}"
+    fail_check "$title" \
+      "expected a cron tick scheduled after ${marker}: waited for ${waited_for:-<nothing>} through ${round} round(s) from tick ${previous_tick} and got $(if [ -n "$record" ]; then echo "tick '${tick:-<none>}' scheduled '${at:-<none>}'"; else echo "nothing"; fi); deis trace --kind cron reports ${platform_ticks} invocation(s) started after the marker after ${trace_waited}s of asking for one (expected at least 1, see ${LOG_DIR}/verify-cron-trace.log; 0s means the record above never arrived, so the platform's side was not asked); and a PUT under the cron: prefix answered ${forged_status:-<none>} (expected 403) leaving found='${probe_found:-<none>}' (expected false)$(if [ -n "$refused" ]; then echo ", saying \"$(printf '%s' "$refused" | head -c 120)\""; fi)"
   fi
 }
 
@@ -7806,6 +8062,69 @@ check_dynamic_node_registration() {
   fi
 }
 
+# The other side of the check above: the same endpoint, dialled by a caller
+# that holds no node key.
+#
+# Self-registration is the one route on this control plane where an unlisted
+# machine can put itself on the fleet, and a node on the fleet receives
+# deployment pushes, cron fires and decrypted secrets. Both checks above
+# present `node_preshared_keys` and are served, so between them they show that
+# the credential works - and nothing showed that it is required. A control
+# plane with an empty key list, or with the node middleware left off this
+# router, would pass both of them and let anything that can reach the port
+# join the fleet.
+#
+# The three probes are one gate asked three ways, and the third is the one
+# worth having: the demo's API key is the most powerful credential a person
+# holds here, and it must not be a node credential. SECRET authenticates a
+# node, API_KEY authenticates a caller who may deploy, and the start script
+# says so in a comment; this is where that separation is observed rather than
+# asserted. Nothing here can succeed, so nothing here leaves a node behind -
+# and the fleet is read afterwards to say so.
+check_the_node_channel_needs_the_node_key() {
+  local title="a node joins the fleet only with the node key, and the deploy credential is not one"
+  local invented="${NODE_ID}-uninvited-$$"
+  local route
+  route="$(control_url)/api/nodes/${invented}/registration"
+  local body="{\"address\":\"http://127.0.0.1:${DEIS_RUNTIME_PORT}\"}"
+  local answer="${LOG_DIR}/verify-node-channel.json"
+
+  local none wrong human
+  none=$(curl -s -o "$answer" -w '%{http_code}' -X PUT \
+    -H 'content-type: application/json' -d "$body" "$route" || true)
+  wrong=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "Authorization: Bearer not-the-node-key" \
+    -H 'content-type: application/json' -d "$body" "$route" || true)
+  human=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "Authorization: Bearer ${API_KEY}" \
+    -H 'content-type: application/json' -d "$body" "$route" || true)
+
+  # What the refusal says. A 401 that named nothing would leave an operator
+  # with a working node and no way to tell which of the three credentials
+  # this endpoint wanted.
+  local told
+  told=$(jq -r '.details // empty' < "$answer" 2>/dev/null || true)
+
+  # And the fleet, which is where a caller that got through would show up.
+  local fleet="${LOG_DIR}/verify-node-channel-fleet.json"
+  control_api /api/runtime > "$fleet" 2>/dev/null || true
+  local joined healthy
+  joined=$(jq -r --arg id "$invented" \
+    '[.nodes[] | select(.id == $id)] | length' < "$fleet" 2>/dev/null || echo "?")
+  healthy=$(jq -r --arg id "$NODE_ID" \
+    '.nodes[] | select(.id == $id) | .healthy' < "$fleet" 2>/dev/null || true)
+
+  if [ "$none" = "401" ] && [ "$wrong" = "401" ] && [ "$human" = "401" ] \
+    && [ "$joined" = "0" ] && [ "$healthy" = "true" ] \
+    && printf '%s' "$told" | grep -q "node_preshared_keys"; then
+    pass_check "$title" \
+      "PUT /api/nodes/${invented}/registration answered ${none} with no credential, ${wrong} with a wrong one and ${human} carrying the API key this demo deploys with - which is a different channel and not a node key - and it says which credential it wants: \"$(printf '%s' "$told" | head -c 140)\". The fleet lists ${joined} node(s) under that id afterwards, so nothing joined and nothing is now being sent deployments, cron fires or decrypted secrets; ${NODE_ID}, which does hold the key, is still healthy"
+  else
+    fail_check "$title" \
+      "expected 401 with no credential (got ${none}), with a wrong one (got ${wrong}) and with the deploy API key (got ${human}), a refusal naming node_preshared_keys (it said \"${told:-nothing}\"), no fleet entry for ${invented} (found ${joined}) and ${NODE_ID} still healthy (healthy=${healthy:-unknown})"
+  fi
+}
+
 # ----------------------------------------------------------------------
 # `deis trace`
 # ----------------------------------------------------------------------
@@ -8299,10 +8618,14 @@ verify_demo() {
   check_queue_roundtrip
   check_queue_send_batch
   check_queue_consumer_concurrency
-  # Last of the queue checks: it is the only one that has to wait for the
-  # attempt ceiling to be reached, and it leaves a message on the queue with a
-  # long delay rather than in the dead letter table.
+  # Last of the queue checks that move messages: it is the only one that has
+  # to wait for the attempt ceiling to be reached, and it leaves a message on
+  # the queue with a long delay rather than in the dead letter table.
   check_queue_dead_letters
+  # And the one that goes at deis-queue's own port instead of through the
+  # node. It only reads the dead letter table, so it runs after the check that
+  # fills and empties it and disturbs nothing either way.
+  check_queue_capability_token
   echo "-- cron --"
   check_cron
   echo "-- calling another application --"
@@ -8350,6 +8673,10 @@ verify_demo() {
   echo "-- the fleet --"
   check_node_registration
   check_dynamic_node_registration
+  # Straight after it: the same endpoint asked by a caller with no node key,
+  # which is what says the two above were served for a reason. It leaves no
+  # node behind, so it can run either side of them.
+  check_the_node_channel_needs_the_node_key
   check_cli_status
   echo "-- accounts, scopes and the audit log --"
   # After every check that expects a particular version on the preview

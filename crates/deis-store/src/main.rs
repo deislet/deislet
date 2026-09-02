@@ -87,6 +87,12 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // Every control character escaped on the way out, so a bucket or key
+        // name a tenant chose cannot end this line and start a forged one.
+        // ANSI off because the wrapper escapes ESC too; see
+        // `deis_wire::logging`.
+        .with_ansi(false)
+        .with_writer(deis_wire::LineSafe::new(std::io::stdout))
         .init();
 
     let cli = Cli::parse();

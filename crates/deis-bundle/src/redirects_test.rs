@@ -284,6 +284,49 @@ fn a_manifest_is_checked_again_rather_than_trusted() {
 }
 
 #[test]
+fn a_source_pattern_this_build_cannot_compile_drops_the_rule_and_nothing_else() {
+    // A builder one release newer writes `/*.js`; this build's pattern
+    // grammar has no wildcard inside a segment. The build refuses it by line
+    // (see `a_star_in_the_middle_is_refused`), because there it is the
+    // author's own file. Here it is a manifest, and refusing it cost the
+    // whole bundle on every node one release behind - so the rule is dropped,
+    // the rule beside it still answers, and the dropped one matches neither
+    // its literal text nor anything else.
+    let from_a_newer_builder = vec![
+        RedirectRule {
+            from: "/*.js".to_string(),
+            to: "/assets/:splat".to_string(),
+            status: 301,
+        },
+        RedirectRule {
+            from: "/old".to_string(),
+            to: "/new".to_string(),
+            status: 301,
+        },
+    ];
+    let table = RedirectTable::compile(&from_a_newer_builder)
+        .expect("a pattern from a newer release must not make the table unusable");
+    assert_eq!(table.len(), 1);
+    assert!(table.apply(&["old".to_string()], "").is_some());
+    assert!(table.apply(&["app.js".to_string()], "").is_none());
+    assert!(table.apply(&["*.js".to_string()], "").is_none());
+    assert!(!source_is_readable("/*.js"));
+    assert!(source_is_readable("/assets/*"));
+
+    // The pattern is dropped, not the check: a rule whose *shape* is wrong -
+    // the source not a path at all - is still a refusal, because no builder
+    // of any release writes one and a bundle carrying it came from somewhere
+    // else.
+    let malformed = vec![RedirectRule {
+        from: "old".to_string(),
+        to: "/new".to_string(),
+        status: 301,
+    }];
+    let err = RedirectTable::compile(&malformed).unwrap_err().to_string();
+    assert!(err.contains("absolute path"), "{err}");
+}
+
+#[test]
 fn a_redirect_target_is_not_required_to_be_a_file() {
     // `/new` may well be a function route. Only the rules that serve bytes -
     // 200 and 404 - name something the bundle has to contain.

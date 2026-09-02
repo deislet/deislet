@@ -1306,11 +1306,28 @@ impl RuntimePool {
 
         match answered {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(e)) => Err(ServiceCallError::CalleeFailed {
-                binding,
-                callee: callee_tenant.to_string(),
-                reason: format!("{e:#}"),
-            }),
+            Ok(Err(e)) => {
+                // The caller is another tenant. What the callee's machinery
+                // said - a module path, a cut-off with its ceiling, an
+                // exception's text - is the callee's to read in its own logs,
+                // under its own app id, and not the caller's to receive. The
+                // caller gets the fact and an incident id that finds the line.
+                let incident = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+                tracing::warn!(
+                    app_id = %callee_tenant,
+                    incident = %incident,
+                    error = %format!("{e:#}"),
+                    "service call failed inside the callee"
+                );
+                Err(ServiceCallError::CalleeFailed {
+                    binding,
+                    callee: callee_tenant.to_string(),
+                    reason: format!(
+                        "its invocation did not answer (incident {incident}); the detail is in \
+                         {callee_tenant}'s own logs, not in the caller's"
+                    ),
+                })
+            }
             Err(_) => Err(ServiceCallError::CalleeFailed {
                 binding,
                 callee: callee_tenant.to_string(),

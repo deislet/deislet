@@ -76,6 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 节点发过去的是 `sha256(secret ‖ node_id ‖ timestamp)` 加上那个时间戳；控制面自己算一
 遍对比，超过 300 秒的一律拒。
 
+这里的 `secret` 是整支机队共用的一把凭据，不是某个节点的身份：拿到它就能读到全部环境的
+明文密钥、驱动每个节点的管理面。它能开什么、谁持有它、怎么轮换，都写在
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md)（英文）。
+
 这是一个 **secret-prefix 的 SHA-256 构造，不是 HMAC-SHA256**，尽管
 `src/models/auth.rs` 里紧挨着它的注释写着「HMAC」，而且文档一直照抄。这个区别对任何
 要论证它抗不抗长度扩展的人都要紧；换构造是两侧同改的协议变更。

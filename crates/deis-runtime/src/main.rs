@@ -110,7 +110,17 @@ async fn run(
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .with_thread_ids(true),
+                .with_thread_ids(true)
+                // Colour off and every control character escaped on the way
+                // out. This node logs more tenant-chosen text than anything
+                // else in the platform - application names, queue names, URLs
+                // - and without this a single newline in any of them ends the
+                // line and starts one the application wrote in full. See
+                // `deis_wire::logging`. The two go together: the wrapper
+                // escapes ESC, so leaving ANSI on would only turn the
+                // formatter's own colour codes into visible `\u{1b}[` litter.
+                .with_ansi(false)
+                .with_writer(deis_wire::LineSafe::new(std::io::stdout)),
         )
         .with(RuntimeLayer::new(log_buffer.clone(), node_id.clone()))
         .init();

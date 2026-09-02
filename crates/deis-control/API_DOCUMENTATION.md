@@ -105,6 +105,15 @@ cannot be switched off. deis-proxy is not a runtime node and holds one
 anyway: the `[control] secret` in its own file is a `node_preshared_keys`
 value, because that is what its gRPC control channel authenticates with.
 
+**What that value is worth is decided by the whole list of endpoints above,
+not by the one deis-proxy calls.** A `node_preshared_keys` value is one
+credential for the whole fleet: the same bearer that reads the routing table
+reads every environment's decrypted secrets from the assignment list and
+drives every node's management plane, so the internet-facing proxy process
+holds a credential as valuable as the control plane's own configuration file.
+See [docs/trust-boundaries.md](../../docs/trust-boundaries.md) for what it
+opens in full, which ports must be firewalled, and how to rotate it.
+
 ```bash
 curl -H "Authorization: Bearer <one of node_preshared_keys>" \
      http://localhost:8080/api/nodes/deis-runtime-1/assignments
@@ -650,7 +659,11 @@ empty one.
 
 That is why this endpoint authenticates the caller as a node with
 `node_preshared_keys`, whatever `api_auth_enabled` says; see
-[Authentication](#node-endpoints-use-a-different-credential). An
+[Authentication](#node-endpoints-use-a-different-credential). The `node_id`
+in the path is not checked against a registered node and does not narrow the
+answer - the list is the same for every node - so one credential reads every
+tenant's plaintext here; the boundaries that credential depends on are in
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md). An
 environment whose secrets will not decrypt is left out of the list entirely
 rather than sent with a hole in it - the node then does not run it, and an
 `ERROR` line says which application and why.

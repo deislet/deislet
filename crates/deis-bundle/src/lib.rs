@@ -39,14 +39,15 @@ pub use archive::{
 pub use assets::{AssetIndex, AssetMatch, guess_content_type};
 pub use bindings::{
     Binding, BindingKind, CALLABLE_BY_EVERYONE, DeclaredBindings, MAX_BINDING_NAME_LEN,
-    ServiceEnvironment, callable_by_allows, validate_callable_by,
+    ServiceEnvironment, callable_by_allows, callable_by_entry_is_readable, unreadable_callable_by,
+    validate_callable_by,
 };
 pub use compatibility::{
     CompatibilityDate, CompatibilityProfile, DeclaredCompatibility, FLAGS, Flag, FlagSpec,
     PLATFORM_KNOWN_THROUGH, flag_spec, known_flag_names,
 };
 pub use forward::{
-    BINDING_FIELDS, COMPATIBILITY_FIELDS, LIMITS_FIELDS, MANIFEST_FIELDS, VALUE_PATHS,
+    BINDING_FIELDS, COMPATIBILITY_FIELDS, GATES, LIMITS_FIELDS, MANIFEST_FIELDS, VALUE_PATHS,
     unknown_fields, unreadable_values,
 };
 pub use headers::{HeaderField, HeaderNamesWritten, HeaderRule, HeaderTable, parse_headers};
@@ -65,12 +66,13 @@ pub use site::{
 
 /// Manifest schema this version of the platform understands.
 ///
-/// **The manifest's only forward-compatibility gate.** Within one schema the
-/// format is additive and a build ignores keys it does not know; a change an
-/// older build could not safely ignore takes a new number here, and an older
-/// build then refuses the whole manifest by name rather than acting on half
-/// of it. See [`forward`] for the rule and what it costs an operator rolling
-/// back.
+/// **The manifest's forward-compatibility gate for its shape.** Within one
+/// schema the format is additive and a build ignores keys it does not know; a
+/// change an older build could not safely ignore takes a new number here, and
+/// an older build then refuses the whole manifest by name rather than acting
+/// on half of it. It is the first of the few gates [`forward::GATES`] names,
+/// and the only one that is about the document rather than one value in it.
+/// See [`forward`] for the rule and what it costs an operator rolling back.
 pub const SUPPORTED_SCHEMA: u32 = 1;
 
 /// Name of the manifest at the root of the archive.
@@ -224,7 +226,19 @@ pub struct Manifest {
     /// application that has never thought about being called should mean.
     /// [`CALLABLE_BY_EVERYONE`] is the one wildcard, and a node says so out
     /// loud when it loads a version carrying it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Read narrowly: an entry this build cannot read is left out of the
+    /// parsed list rather than refusing the manifest, because the list's
+    /// vocabulary grows and a left-out entry consents to nobody, which is
+    /// less than it meant and never more. The build's own list never passes
+    /// through that reader, so [`validate_callable_by`] still refuses the
+    /// author's typo by name. See `bindings::readable_callable_by` and
+    /// [`forward`].
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "bindings::readable_callable_by"
+    )]
     pub callable_by: Vec<String>,
     /// Plain environment variables. Secret values never appear here.
     #[serde(default)]

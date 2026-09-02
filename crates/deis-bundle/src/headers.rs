@@ -186,6 +186,33 @@ impl HeaderTable {
     /// Run by the build on what the author wrote and again by a node when a
     /// version loads: the manifest arrives from outside the process, and the
     /// refused-header list is a platform rule, not a lint.
+    ///
+    /// # A block this build cannot read is refused, and the bundle with it
+    ///
+    /// This is one of the few deliberate forward-compatibility gates a
+    /// manifest has - `site.headers[].pattern` in [`crate::forward::GATES`] -
+    /// and it is the only one on a `site` rule. The pattern grammar is an
+    /// allow-list that grows, so a `_headers` block from a newer builder can
+    /// carry a pattern this build cannot compile, and the rule for every other
+    /// such value is to take the narrowest reading and go on. A header block
+    /// has none. Dropping it drops whatever it set, and what `_headers` exists
+    /// to set is `Content-Security-Policy`, `Strict-Transport-Security`,
+    /// `X-Frame-Options`: the headers that decide what a visitor's browser
+    /// will do with the response. A response without them lets the browser do
+    /// *more*, which is the one direction a narrow reading may never take.
+    /// Nor does a block that only removes headers escape that: `! Name` is how
+    /// an author takes a site-wide `Access-Control-Allow-Origin` back off one
+    /// directory, and dropping the removal widens that directory. Applying
+    /// the block to every path instead would be a nearby value, not the
+    /// absence of one - a directory's `Cache-Control: immutable` on every HTML
+    /// page is a wrong entry in every visitor's cache.
+    ///
+    /// So a pattern this build cannot compile refuses the bundle, whole and by
+    /// name, wherever a manifest is read - at upload, where the author is
+    /// present, and on a node that installs the version. That is the rollback
+    /// failure [`crate::forward`] otherwise forbids, accepted for this one
+    /// value because the alternative is a site whose security headers are in
+    /// force on half a fleet. The refusal says which release to be on.
     pub fn compile(rules: &[HeaderRule]) -> Result<Self, RuleError> {
         if rules.len() > MAX_RULES {
             return Err(RuleError::at(
@@ -206,7 +233,15 @@ impl HeaderTable {
                     rule.pattern
                 )));
             }
-            let pattern = CompiledPattern::compile(&rule.pattern).map_err(&fail)?;
+            let pattern = CompiledPattern::compile(&rule.pattern).map_err(|reason| {
+                fail(format!(
+                    "{reason}. This block is refused rather than dropped, and the bundle with it: \
+                     a header block may carry the headers a visitor's browser relies on, so a \
+                     build that cannot apply it must not serve the site without it. If a newer \
+                     builder wrote this pattern, upgrade this component to a release that \
+                     compiles it"
+                ))
+            })?;
 
             let mut set = Vec::with_capacity(rule.set.len());
             for field in &rule.set {

@@ -17,20 +17,24 @@
 //! does not know, whole and by name, which is the loud failure such a change
 //! deserves.
 //!
-//! So the manifest has exactly one forward-compatibility gate, and it is the
-//! `schema` field. Nothing else in a manifest may refuse a bundle for being
-//! newer than the build reading it.
+//! So the manifest's *shape* has exactly one forward-compatibility gate, and
+//! it is the `schema` field. Its *values* have a short list of deliberate
+//! gates, every one of them named in [`GATES`] with the reason it has no
+//! narrow reading. Nothing outside that list may refuse a bundle for being
+//! newer than the build reading it, and the tests at the bottom of this file
+//! are what hold the code to that sentence.
 //!
 //! # The rule for a value
 //!
 //! The rule above is about keys, and for a while it was the whole rule. It was
-//! not enough: four *values* in fields this build does know went on refusing a
+//! not enough: *values* in fields this build does know went on refusing a
 //! bundle for being newer than the build reading it, which is the same
-//! rollback failure one level down. Each of those four is an **allow-list of
-//! the spellings this release happens to have**, and every release adds to
-//! one - a new binding kind, a new not-found behaviour, a new redirect status,
-//! a new behaviour flag - so each was a bundle an older node would throw away
-//! whole, unrepairably, for a value that was correct when it was written.
+//! rollback failure one level down. Each of them is an **allow-list of the
+//! spellings this release happens to have**, and every release adds to one -
+//! a new binding kind, a new not-found behaviour, a new redirect status, a new
+//! pattern syntax, a new way to name a caller, a new behaviour flag - so each
+//! was a bundle an older node would throw away whole, unrepairably, for a
+//! value that was correct when it was written.
 //!
 //! **Within one [`crate::SUPPORTED_SCHEMA`], a value in a known field must be
 //! safe to read narrowly.** A build that meets a value it does not know takes
@@ -53,7 +57,16 @@
 //!   call, instead of the whole application failing to load. The *name* is
 //!   still held to every rule a name is held to, because a name that collides
 //!   with a variable, a secret or another binding is ambiguous whatever kind
-//!   turns out to be behind it. See [`crate::DeclaredBindings`].
+//!   turns out to be behind it. See [`crate::DeclaredBindings`]. That is a
+//!   node's reading; the control plane's entitlement gate does something
+//!   else with the same value, and [`GATES`] says what and why.
+//! * `callable_by[]` - the entry consents to nobody. It is left out of the
+//!   parsed list, which is the answer the node's exact comparison would have
+//!   given it anyway, so the callee is reachable by fewer applications here
+//!   than where it was built and never by more. The build's own list never
+//!   goes through that reader, so an author's typo is still refused by name
+//!   with the project file on screen. See `bindings::readable_callable_by`
+//!   and [`crate::validate_callable_by`].
 //! * `site.not_found` - `"none"`, which is not merely the default but what
 //!   every application had before the field existed: the request reaches the
 //!   isolate and the application answers its own 404. See [`crate::NotFound`].
@@ -62,6 +75,14 @@
 //!   what answers instead is another of the author's own rules, the
 //!   application, or the not-found behaviour. See
 //!   [`crate::RedirectTable::compile`].
+//! * `site.redirects[].from` - the rule is dropped, for the same reason and
+//!   with the same consequence. The pattern grammar is [`crate::routing`]'s
+//!   and it grows; a `/*.js` matched as literal text would be a rule firing on
+//!   a path nobody asked for, which is a nearby value and not the absence of
+//!   one. What a dropped rule can uncover is a function route or the
+//!   not-found page a `404` rule stood in front of, never an asset - and
+//!   `_redirects` is not an access control. See
+//!   [`crate::redirects::source_is_readable`].
 //! * `compatibility.flags` - the name is ignored. A flag this build does not
 //!   know names a behaviour this build does not have, so doing nothing is
 //!   already what both the `enable` and the `disable` spelling of it would
@@ -79,38 +100,101 @@
 //! older half of a fleet, unrecoverably if that version is the one being
 //! rolled back to.
 //!
-//! # The one value that is still refused
+//! # The values that are still refused
 //!
-//! A `compatibility.date` later than
-//! [`crate::PLATFORM_KNOWN_THROUGH`], and only that.
+//! [`GATES`] is the list, and it is short on purpose. A row goes in only when
+//! there is no reading of the value that leaves the application able to do
+//! *less or the same*; each row says where it refuses, because *where* is
+//! most of what makes a gate tolerable.
 //!
-//! It is the one value in the manifest with no narrow reading to take. Every
-//! other value above has an "absent" that means *less*; a date means "give me
-//! the answers of this day", and the older answers are not less of that, they
-//! are a different one - which is the silent behaviour change the date exists
-//! to prevent, delivered by the date itself. So it refuses, and it is allowed
-//! to because of *where* it refuses: not in [`crate::Manifest::parse`] or
-//! [`crate::Manifest::validate`], which would make the manifest unreadable,
-//! but in [`crate::Manifest::compatibility_profile`], which every component
-//! calls for itself. The manifest still parses, everything else in it is still
+//! **`schema`** refuses in [`crate::Manifest::validate`], whole. It is the
+//! gate the rule above is built on, and the only one that is about the
+//! document rather than a value in it.
+//!
+//! **`compatibility.date`** later than [`crate::PLATFORM_KNOWN_THROUGH`] has
+//! no narrow reading to take: every narrowed value above has an "absent" that
+//! means *less*; a date means "give me the answers of this day", and the older
+//! answers are not less of that, they are a different one - which is the
+//! silent behaviour change the date exists to prevent, delivered by the date
+//! itself. So it refuses, and it is allowed to because of *where* it refuses:
+//! not in [`crate::Manifest::parse`] or [`crate::Manifest::validate`], which
+//! would make the manifest unreadable, but in
+//! [`crate::Manifest::compatibility_profile`], which every component calls
+//! for itself. The manifest still parses, everything else in it is still
 //! readable, the refusal names both days, and the very same bundle returns
-//! `Ok` on a node one release newer - which is the mixed fleet working as
-//! intended rather than a bundle being refused.
+//! `Ok` on a node one release newer.
 //!
-//! # Applying this to a field that is not one of the four
+//! **`site.headers[].pattern`** this build cannot compile refuses in
+//! [`crate::HeaderTable::compile`], and because [`crate::SiteConfig::validate`]
+//! runs it, that is the whole manifest - at upload and on the node. It is the
+//! one `site` rule with no narrow reading. A `_headers` block is where
+//! `Content-Security-Policy`, `Strict-Transport-Security` and
+//! `X-Frame-Options` are set, so dropping a block this build cannot place lets
+//! a visitor's browser do *more*; a block that only removes headers does not
+//! escape that, because `! Access-Control-Allow-Origin` on one directory is
+//! also a narrowing an author wrote down; and applying the block to every
+//! path would be a nearby value with its own damage. This is the rollback
+//! failure the rest of this module forbids, accepted for one value because
+//! the alternative is a site whose security headers hold on half a fleet. It
+//! is a cost, and the refusal says which release ends it. Round 7 claimed
+//! there was exactly one gate; this row is why that sentence was replaced.
+//!
+//! **`bindings.<name>.kind`, at the control plane only.** A node reads it
+//! narrowly, as above. The control plane's entitlement gate
+//! (`deis_control::api::bindings::check_service_bindings`) is the only place
+//! that ever asks whether the *uploader* may wire this application to another
+//! one, and it refuses the upload when the manifest carries a kind it cannot
+//! read - naming the binding and the kind, and saying the control plane must
+//! be upgraded to judge it. It has to, because "not published on an older
+//! node" is not "authorised": a newer node reads the same bundle out of the
+//! archive, publishes the binding, and would honour a cross-application route
+//! that no authority check ever ran on. A refusal at upload is not the
+//! rollback failure: the author is present, the failure is loud, and nothing
+//! is in the catalog yet. It does not reopen that failure later either - a
+//! version already in the catalog was judged by the control plane that
+//! accepted it, and neither `deployments::deploy` nor `deployments::rollback`
+//! runs the gate again (they build a delivery from the stored version and
+//! record a pointer; `check_service_bindings` has exactly one caller, the
+//! upload handler), so rolling a control plane back does not make an accepted
+//! version undeployable. Today no such kind exists; the gate is here so that
+//! the day one does, the older control plane fails closed instead of open.
+//!
+//! # Applying this to a field that is not one of the six
 //!
 //! The test is which way the list moves between releases.
 //!
 //! An **allow-list** - the spellings a field accepts - grows, so a newer
 //! builder can write a value an older reader has never seen. Every such list in
-//! a manifest is one of these hazards, and needs a narrow reading, a row in
-//! [`VALUE_PATHS`] and a line above.
+//! a manifest is one of these hazards, and needs either a narrow reading, a
+//! row in [`VALUE_PATHS`] and a line above, or - when no reading leaves the
+//! application able to do less or the same - a row in [`GATES`] with the
+//! reason, and a refusal that names the release it stops on.
 //!
 //! A **deny-list** - the spellings a field refuses - also grows, but that
 //! moves the other way: the newer build refuses *more*, so an older reader
 //! accepts everything a newer one would and no bundle is ever refused for
 //! being new. [`crate::headers::HeaderRule`] and its refused header names are
-//! the example, and they need nothing.
+//! the example, and they need nothing. So are the shapes a redirect rule may
+//! never take - a host a visitor could choose, a rewrite to another origin -
+//! which [`crate::RedirectTable::compile`] still refuses whole, because a
+//! builder never writes one and a bundle carrying one came from somewhere
+//! else.
+//!
+//! **Identifier grammar** is neither. A binding name, an application id and an
+//! environment name are held to `deis_wire::conventions`, which every
+//! component shares and which the control plane admits tenants under. It is
+//! not a manifest vocabulary that a builder can get ahead of: an id this
+//! build cannot spell is an id no tenant on this build can have, and a change
+//! to that grammar is a platform change, which is what a schema bump is for.
+//! `callable_by` is the exception only because it has a vocabulary of its own
+//! beside the ids - `*` today - and that vocabulary is what grows.
+//!
+//! **Structural refusals** are not gates in this sense and stay: a document
+//! that does not parse, a required key that is missing, an archive or a member
+//! past a ceiling in [`crate::archive`], a binding entry with no `kind` or an
+//! `app` that is not a string. Those are shapes the format has never had, and
+//! a builder that produced one would be producing a new format, not a newer
+//! value in this one.
 //!
 //! # Why an unknown key used to be fatal, and why that was the wrong trade
 //!
@@ -139,12 +223,22 @@
 //!
 //! # Keeping these lists honest
 //!
-//! The four tables below are the field names of four structs, and a name that
-//! drifted would make a key this build *does* read look unrecognised. Nothing
-//! in the compiler ties a `&'static str` to a struct field, so
-//! `every_table_matches_the_struct_it_describes` in the tests below serialises
-//! a fully populated instance of each and compares the key sets. Adding a
-//! field without adding it here fails that test.
+//! The four field tables below are the field names of four structs, and a
+//! name that drifted would make a key this build *does* read look
+//! unrecognised. Nothing in the compiler ties a `&'static str` to a struct
+//! field, so `every_table_matches_the_struct_it_describes` in the tests below
+//! serialises a fully populated instance of each and compares the key sets.
+//! Adding a field without adding it here fails that test.
+//!
+//! [`VALUE_PATHS`] and [`GATES`] are held the same way, from two sides.
+//! `every_value_path_is_walked` and `every_gate_refuses_where_it_says` feed a
+//! manifest from a newer builder through the code and check that each row
+//! does what it claims. `every_reader_of_an_allow_list_is_classified_here`
+//! reads this crate's own sources and counts the call sites of every
+//! allow-list predicate against a table that classifies each one as narrow,
+//! gate or build-only: a new reader of one of those predicates - which is
+//! what a new refusal looks like - fails the test until somebody has written
+//! down which of the three it is.
 
 use serde_json::Value;
 use tracing::warn;
@@ -185,20 +279,66 @@ pub const COMPATIBILITY_FIELDS: &[&str] = &["date", "flags"];
 /// Every key one [`crate::Binding`] reads.
 pub const BINDING_FIELDS: &[&str] = &["kind", "app", "environment"];
 
-/// Every place a manifest holds a value from an allow-list, as a dotted path.
+/// Every place a manifest holds a value from an allow-list that is read
+/// narrowly, as a dotted path.
 ///
 /// Not read by the code that walks a manifest - [`unreadable_values`] has one
-/// branch per row, because the four live at four different depths and two of
-/// them are inside arrays, so a table of paths could not drive the walk
-/// without a path language of its own. It is here to be *read*: the module
+/// branch per row, because the six live at different depths and three of them
+/// are inside arrays, so a table of paths could not drive the walk without a
+/// path language of its own. It is here to be *read*: the module
 /// documentation above explains what a narrow reading is, and this is the list
 /// of everywhere one had to be found. `every_value_path_is_walked` below is
 /// what keeps a row from being added without the branch that goes with it.
 pub const VALUE_PATHS: &[&str] = &[
     "bindings.*.kind",
+    "callable_by[]",
     "site.not_found",
+    "site.redirects[].from",
     "site.redirects[].status",
     "compatibility.flags[]",
+];
+
+/// One value a manifest may be refused for, for being newer than the build
+/// reading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gate {
+    /// The dotted path, in the spelling [`VALUE_PATHS`] uses.
+    pub path: &'static str,
+    /// Where the refusal is made, and therefore what it costs.
+    pub refused_at: &'static str,
+    /// Why no narrow reading exists.
+    pub reason: &'static str,
+}
+
+/// Every deliberate forward-compatibility gate a manifest has.
+///
+/// The complete list. A refusal of a bundle for carrying a value from a newer
+/// release that is not a row here is a defect, and the module documentation
+/// above argues each row on its own. `every_gate_refuses_where_it_says` below
+/// checks that each still refuses, and where.
+pub const GATES: &[Gate] = &[
+    Gate {
+        path: "schema",
+        refused_at: "Manifest::validate, the whole manifest, on every component",
+        reason: "the shape of the document; a change an older build could not ignore safely",
+    },
+    Gate {
+        path: "compatibility.date",
+        refused_at: "Manifest::compatibility_profile, per component; the manifest still parses",
+        reason: "a day's answers have no narrower day, only a different one",
+    },
+    Gate {
+        path: "site.headers[].pattern",
+        refused_at: "HeaderTable::compile, the whole manifest, at upload and on the node",
+        reason: "a header block may carry the headers a browser relies on; dropping it widens",
+    },
+    Gate {
+        path: "bindings.*.kind",
+        refused_at: "deis_control::api::bindings::check_service_bindings, at upload only; a node \
+                     reads it narrowly",
+        reason: "the control plane must not deliver a cross-application binding it could not \
+                 judge; a newer node would honour it with no authority check ever run",
+    },
 ];
 
 /// How many key names one log line quotes before it stops and counts the
@@ -270,7 +410,7 @@ pub fn unknown_fields(json: &str) -> Vec<String> {
 
 /// The values in `json` that sit in a field this build reads and are spellings
 /// it does not know - `"site.not_found = \"custom-page\""`,
-/// `"bindings.HOT.kind = \"vector\""`.
+/// `"bindings.HOT.kind = \"vector\""`, `"callable_by[1] = \"shop/prod\""`.
 ///
 /// The other half of [`unknown_fields`]: that one names the declarations this
 /// build dropped because it did not recognise the *key*, and this one names
@@ -282,14 +422,14 @@ pub fn unknown_fields(json: &str) -> Vec<String> {
 /// "custom-page"` on a node knows both which application declared it and which
 /// release they would have to be on to honour it.
 ///
-/// Sorted by where it sits in the document, and stable: `serde_json` keeps an
-/// object's keys in a `BTreeMap` and an array's entries in order, so two
-/// builds reading one manifest report the same list in the same order.
+/// Stable: `serde_json` keeps an object's keys in a `BTreeMap` and an array's
+/// entries in order, so two builds reading one manifest report the same list
+/// in the same order - bindings, `callable_by`, `site`, `compatibility`, and
+/// within `site` each redirect rule's source before its status.
 ///
-/// A `compatibility.date` past [`crate::PLATFORM_KNOWN_THROUGH`] is
-/// deliberately **not** here. It is refused rather than narrowed - see the
-/// module documentation - and the refusal already names both days, at the one
-/// component that cannot honour it.
+/// The rows of [`GATES`] are deliberately **not** here. Those are refused
+/// rather than narrowed, and each refusal already names what it could not
+/// read, at the one place that could not read it.
 pub fn unreadable_values(json: &str) -> Vec<String> {
     let Ok(Value::Object(root)) = serde_json::from_str::<Value>(json) else {
         return Vec::new();
@@ -306,6 +446,17 @@ pub fn unreadable_values(json: &str) -> Vec<String> {
         }
     }
 
+    if let Some(Value::Array(callable_by)) = root.get("callable_by") {
+        for (index, entry) in callable_by.iter().enumerate() {
+            let Some(entry) = entry.as_str() else {
+                continue;
+            };
+            if !crate::bindings::callable_by_entry_is_readable(entry) {
+                out.push(format!("callable_by[{index}] = {entry:?}"));
+            }
+        }
+    }
+
     if let Some(Value::Object(site)) = root.get("site") {
         if let Some(choice) = site.get("not_found").and_then(Value::as_str)
             && !crate::NotFound::MANIFEST_SPELLINGS.contains(&choice)
@@ -314,6 +465,15 @@ pub fn unreadable_values(json: &str) -> Vec<String> {
         }
         if let Some(Value::Array(rules)) = site.get("redirects") {
             for (index, rule) in rules.iter().enumerate() {
+                // Only a source that is otherwise a source: one that is not
+                // an absolute path is malformed, and `Manifest::parse` has
+                // refused the document already, with a better message.
+                if let Some(from) = rule.get("from").and_then(Value::as_str)
+                    && from.starts_with('/')
+                    && !crate::redirects::source_is_readable(from)
+                {
+                    out.push(format!("site.redirects[{index}].from = {from:?}"));
+                }
                 let Some(status) = rule.get("status").and_then(Value::as_u64) else {
                     continue;
                 };
@@ -410,11 +570,12 @@ pub fn report(json: &str, schema: u32) {
         not_named = unreadable.len().saturating_sub(named.len()),
         "this bundle's manifest holds values this build does not know, in fields it does read, \
          so each was taken in its narrowest reading instead: a binding kind is not published at \
-         all, an unknown not-found behaviour is \"none\", a redirect rule with an unknown status \
-         is dropped, an unknown compatibility flag is ignored. The application runs; these four \
-         declarations do less here than where they were built. Within schema {schema} a value is \
-         only added when that narrow reading is safe, so this means a newer builder wrote the \
-         bundle - upgrade this component to honour them",
+         all, a callable_by entry consents to nobody, an unknown not-found behaviour is \
+         \"none\", a redirect rule with an unknown status or an uncompilable source is dropped, \
+         an unknown compatibility flag is ignored. The application runs; these declarations do \
+         less here than where they were built. Within schema {schema} a value is only added \
+         when that narrow reading is safe, so this means a newer builder wrote the bundle - \
+         upgrade this component to honour them",
     );
 }
 
@@ -422,10 +583,10 @@ pub fn report(json: &str, schema: u32) {
 mod tests {
     use super::*;
     use crate::{
-        Asset, Binding, BindingKind, DeclaredBindings, DeclaredCompatibility, DeclaredLimits,
-        Manifest, NotFound, QueueConsumer, Route, SiteConfig,
+        Asset, Binding, BindingKind, BundleError, DeclaredBindings, DeclaredCompatibility,
+        DeclaredLimits, Manifest, NotFound, QueueConsumer, Route, SiteConfig,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// The key names one value actually serialises as.
     fn keys_of<T: serde::Serialize>(value: &T) -> BTreeSet<String> {
@@ -557,18 +718,26 @@ mod tests {
     }
 
     /// A manifest as a builder some releases newer would write it: one value
-    /// this build has never seen at every path in [`VALUE_PATHS`].
+    /// this build has never seen at every path in [`VALUE_PATHS`], and beside
+    /// each one a value it does know, so the test can see that the neighbour
+    /// survives.
     ///
     /// Deliberately plausible rather than nonsense, like the unknown keys
     /// above. A value that breaks a rollback is never a hostile one; it is the
-    /// next small feature - a vector namespace, a maintenance page, a `410
-    /// Gone` rule, a behaviour flag.
+    /// next small feature - a vector namespace, a per-environment consent, a
+    /// maintenance page, a `410 Gone` rule, a wildcard inside a segment, a
+    /// behaviour flag.
     const FROM_A_NEWER_BUILDER: &str = r#"{
         "schema": 1, "app": "demo", "entry": "worker/index.js",
         "bindings": {"SEARCH": {"kind": "vector"}},
+        "callable_by": ["storefront", "checkout/production"],
         "site": {
             "not_found": "maintenance-page",
-            "redirects": [{"from": "/gone", "to": "/gone.html", "status": 410}]
+            "redirects": [
+                {"from": "/gone", "to": "/gone.html", "status": 410},
+                {"from": "/*.js", "to": "/assets/:splat", "status": 301},
+                {"from": "/old", "to": "/new", "status": 301}
+            ]
         },
         "compatibility": {"date": "2026-09-01", "flags": ["streaming_uploads"]}
     }"#;
@@ -616,13 +785,76 @@ mod tests {
     }
 
     #[test]
+    fn every_value_path_is_read_narrowly_and_nothing_beside_it_is_lost() {
+        // The other half of the row: not only is the value named, the
+        // manifest carrying it still parses, and every neighbour this build
+        // does know is intact. This is the sentence in the module
+        // documentation - "it never refuses the document" - run against the
+        // code for all six paths at once, so a refusal creeping back into any
+        // one of them fails here by name.
+        let manifest = Manifest::parse(FROM_A_NEWER_BUILDER).unwrap_or_else(|e| {
+            panic!("a manifest from a newer builder must still parse; it was refused: {e}")
+        });
+
+        assert!(manifest.bindings.get("SEARCH").is_none());
+        assert_eq!(
+            manifest.bindings.unreadable_kinds(),
+            vec![("SEARCH", "vector")]
+        );
+
+        assert_eq!(
+            manifest.callable_by,
+            vec!["storefront".to_string()],
+            "the entry this build cannot read consents to nobody; its neighbour still consents"
+        );
+        assert!(crate::callable_by_allows(
+            &manifest.callable_by,
+            "storefront"
+        ));
+        assert!(!crate::callable_by_allows(
+            &manifest.callable_by,
+            "checkout"
+        ));
+
+        assert_eq!(manifest.site.not_found, NotFound::None);
+
+        let table = crate::RedirectTable::compile(&manifest.site.redirects)
+            .expect("a status or a pattern from a newer release must not make the table unusable");
+        assert_eq!(
+            table.len(),
+            1,
+            "the 410 rule and the /*.js rule are dropped; /old survives"
+        );
+        assert!(table.apply(&["old".to_string()], "").is_some());
+        assert!(table.apply(&["gone".to_string()], "").is_none());
+        assert!(
+            table.apply(&["app.js".to_string()], "").is_none(),
+            "a pattern this build cannot compile matches nothing, not its literal text"
+        );
+        assert!(
+            table.apply(&["*.js".to_string()], "").is_none(),
+            "and not the literal asterisk either"
+        );
+
+        let profile = manifest
+            .compatibility_profile()
+            .expect("an unknown flag name must not make the profile unresolvable");
+        assert_eq!(
+            profile.date().map(|d| d.to_string()).as_deref(),
+            Some("2026-09-01")
+        );
+    }
+
+    #[test]
     fn an_unknown_value_is_reported_by_path_with_the_value_it_could_not_read() {
         assert_eq!(
             unreadable_values(FROM_A_NEWER_BUILDER),
             vec![
                 "bindings.SEARCH.kind = \"vector\"".to_string(),
+                "callable_by[1] = \"checkout/production\"".to_string(),
                 "site.not_found = \"maintenance-page\"".to_string(),
                 "site.redirects[0].status = 410".to_string(),
+                "site.redirects[1].from = \"/*.js\"".to_string(),
                 "compatibility.flags[0] = \"streaming_uploads\"".to_string(),
             ]
         );
@@ -640,8 +872,8 @@ mod tests {
             redirects: crate::redirects::ALLOWED_STATUSES
                 .iter()
                 .map(|status| crate::RedirectRule {
-                    from: "/a".to_string(),
-                    to: "/b".to_string(),
+                    from: "/a/:slug/*".to_string(),
+                    to: "/b/:slug/:splat".to_string(),
                     status: *status,
                 })
                 .collect(),
@@ -650,10 +882,219 @@ mod tests {
         .expect("serialises");
         assert!(
             unreadable_values(&format!(
-                r#"{{"schema":1,"app":"d","entry":"e.js","site":{with_rules}}}"#
+                r#"{{"schema":1,"app":"d","entry":"e.js","callable_by":["*"," shop "],"site":{with_rules}}}"#
             ))
             .is_empty(),
             "{with_rules}"
+        );
+    }
+
+    /// Every row of [`GATES`] still refuses, and refuses where it says.
+    ///
+    /// The list claims to be complete and each row claims a place; this is
+    /// what makes both claims checkable. A gate that moved - a header pattern
+    /// that started being dropped, a date that started refusing in `parse` -
+    /// changes what a rollback costs, and should change this test on purpose.
+    #[test]
+    fn every_gate_refuses_where_it_says() {
+        let paths: BTreeSet<&str> = GATES.iter().map(|gate| gate.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "schema",
+                "compatibility.date",
+                "site.headers[].pattern",
+                "bindings.*.kind"
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+            "a gate was added or removed; this test has to say what it does"
+        );
+
+        // `schema`: the whole manifest, in `validate`.
+        let future = FROM_A_NEWER_BUILDER.replace("\"schema\": 1", "\"schema\": 2");
+        assert!(matches!(
+            Manifest::parse(&future),
+            Err(BundleError::UnsupportedSchema {
+                found: 2,
+                supported: 1
+            })
+        ));
+
+        // `compatibility.date`: the manifest parses, the profile refuses, the
+        // refusal names both days.
+        let later = FROM_A_NEWER_BUILDER.replace("2026-09-01", "2099-01-01");
+        let manifest = Manifest::parse(&later).expect("only the compatibility answer is refused");
+        let err = manifest
+            .compatibility_profile()
+            .expect_err("a day this build never saw");
+        assert!(err.contains("2099-01-01"), "{err}");
+        assert!(
+            err.contains(&crate::PLATFORM_KNOWN_THROUGH.to_string()),
+            "{err}"
+        );
+
+        // `site.headers[].pattern`: the whole manifest, in `validate`, with a
+        // refusal that says it is deliberate and which release ends it.
+        let headers = r#"{
+            "schema": 1, "app": "demo", "entry": "worker/index.js",
+            "site": {"headers": [
+                {"pattern": "/*", "set": [{"name": "x-frame-options", "value": "DENY"}]},
+                {"pattern": "/*.js", "set": [{"name": "cache-control", "value": "immutable"}]}
+            ]}
+        }"#;
+        let err = Manifest::parse(headers).expect_err("a header pattern this build cannot compile");
+        let message = err.to_string();
+        assert!(matches!(err, BundleError::InvalidManifest(_)), "{message}");
+        assert!(message.contains("/*.js"), "{message}");
+        assert!(
+            message.contains("refused rather than dropped"),
+            "the refusal has to say why this value is the exception: {message}"
+        );
+        assert!(message.contains("upgrade this component"), "{message}");
+        // And it is a gate, not a narrowed value, so `report` does not list
+        // it among the things this build quietly did less of.
+        assert!(
+            unreadable_values(headers).is_empty(),
+            "{:?}",
+            unreadable_values(headers)
+        );
+
+        // `bindings.*.kind` at the control plane: that gate lives in
+        // deis-control and is tested there
+        // (`api::bindings::tests::a_binding_kind_this_control_plane_cannot_read_is_refused_whatever_the_credential_holds`).
+        // What this crate can check is the half it owns: the node's reading
+        // is narrow, and the gate has the entry to look at.
+        let manifest = Manifest::parse(FROM_A_NEWER_BUILDER).expect("narrow on a node");
+        let unreadable: Vec<(&str, &Value)> = manifest.bindings.unreadable_entries().collect();
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].0, "SEARCH");
+        assert_eq!(
+            unreadable[0].1.get("kind").and_then(Value::as_str),
+            Some("vector")
+        );
+    }
+
+    /// Every call site of an allow-list predicate in this crate's own source,
+    /// classified.
+    ///
+    /// A new refusal for a value from a newer release can only be written by
+    /// asking one of these predicates, so counting their call sites is how
+    /// this module finds out about one. The counts are the classification: a
+    /// site is *narrow* (it drops or ignores), a *gate* (a row in [`GATES`]),
+    /// or *build-only* (it reads the author's own text and refuses by line).
+    /// A count that moved means a site was added or removed, and whoever did
+    /// it has to say which of the three it is - here, and in the module
+    /// documentation.
+    ///
+    /// Counted over the non-test part of each file, so a test that exercises
+    /// a predicate does not count as a reader of it.
+    #[test]
+    fn every_reader_of_an_allow_list_is_classified_here() {
+        // (predicate, [(file, sites)]). Each site, and what it is:
+        const READERS: &[(&str, &[(&str, usize)])] = &[
+            (
+                "CompiledPattern::compile(",
+                &[
+                    // `match_pattern`: `.ok()?` - a pattern that does not
+                    // compile matches nothing. Narrow.
+                    ("routing.rs", 1),
+                    // `source_is_readable` (the predicate `unreadable_values`
+                    // asks) and `compile_rule`, which the node drops on and
+                    // the build refuses on by line. Narrow at load, build-only
+                    // at build.
+                    ("redirects.rs", 2),
+                    // `HeaderTable::compile` - the gate `site.headers[].pattern`
+                    // - and `parse_headers`, build-only.
+                    ("headers.rs", 2),
+                ],
+            ),
+            (
+                "status_is_known(",
+                // The definition, and `compile_rule`: narrow at load,
+                // build-only at build. `unreadable_values` names the predicate
+                // without calling it with parentheses.
+                &[("redirects.rs", 2)],
+            ),
+            (
+                "source_is_readable(",
+                // The definition, and the branch in `unreadable_values` that
+                // names a dropped rule. Narrow.
+                &[("redirects.rs", 1), ("forward.rs", 1)],
+            ),
+            (
+                "BindingKind::from_name(",
+                // `DeclaredBindings::deserialize`, which carries an unknown
+                // kind through unread, and the branch in `unreadable_values`.
+                // Narrow on a node; the control plane's gate reads the
+                // carried-through entry, see `GATES`.
+                &[("bindings.rs", 1), ("forward.rs", 1)],
+            ),
+            (
+                "MANIFEST_SPELLINGS",
+                // The definition, and the branch in `unreadable_values`.
+                // `NotFound::deserialize` reads narrowly through
+                // `from_manifest`, whose match arm is the allow-list itself.
+                &[("site.rs", 1), ("forward.rs", 1)],
+            ),
+            (
+                "callable_by_entry_is_readable(",
+                // The definition; `unreadable_callable_by`, which
+                // `validate_callable_by` refuses on (build-only, because a
+                // parsed list has already been narrowed); `readable_callable_by`,
+                // the narrow reader; and the branch in `unreadable_values`.
+                &[("bindings.rs", 3), ("forward.rs", 1)],
+            ),
+        ];
+
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: BTreeMap<String, String> = BTreeMap::new();
+        for entry in std::fs::read_dir(&src).expect("the crate's own source directory") {
+            let path = entry.expect("a directory entry").path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".rs") || name.ends_with("_test.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a readable source file");
+            // Everything after the first `#[cfg(test)]` is tests.
+            let code = match text.find("#[cfg(test)]") {
+                Some(at) => text[..at].to_string(),
+                None => text,
+            };
+            sources.insert(name.to_string(), code);
+        }
+        assert!(
+            sources.contains_key("forward.rs") && sources.contains_key("redirects.rs"),
+            "read the wrong directory: {:?}",
+            sources.keys().collect::<Vec<_>>()
+        );
+
+        let mut unclassified = Vec::new();
+        for (predicate, expected) in READERS {
+            let mut found: BTreeMap<&str, usize> = BTreeMap::new();
+            for (file, code) in &sources {
+                let count = code.matches(predicate).count();
+                if count > 0 {
+                    found.insert(file.as_str(), count);
+                }
+            }
+            let expected: BTreeMap<&str, usize> = expected.iter().copied().collect();
+            if found != expected {
+                unclassified.push(format!(
+                    "{predicate:?}: expected {expected:?}, found {found:?}"
+                ));
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "a reader of an allow-list was added or removed without being classified. Every \
+             such site is either a narrow reading (a row in VALUE_PATHS), a deliberate gate (a \
+             row in GATES, with the reason), or build-only (it reads the author's own file). \
+             Decide which, write it into the module documentation, and update the table in this \
+             test:\n{}",
+            unclassified.join("\n")
         );
     }
 

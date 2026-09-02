@@ -310,7 +310,11 @@ Prometheus text format at `/api/metrics`, JSON summary at
 
 ## 🔒 Security
 
-**Node authentication.** A pre-shared key from `node_preshared_keys`.
+**Node authentication.** A pre-shared key from `node_preshared_keys`. One
+value is one credential for the whole fleet - it reads every environment's
+decrypted secrets and drives every node - so what it opens and what has to be
+firewalled around it is stated once, in
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 
 On the gRPC handshake the node sends `sha256(secret ‖ node_id ‖ timestamp)`
 together with the timestamp, and this side recomputes it; a timestamp more than

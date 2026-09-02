@@ -466,6 +466,15 @@ sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --reload
 ```
 
+Open 8080 to the nodes, to deis-proxy and to the operators' network - not to
+the internet. It serves the assignment list, which hands out every
+environment's decrypted secrets to any caller holding a `node_preshared_keys`
+value. The node data ports need a rule of their own, on the node hosts, for
+the same kind of reason.
+[docs/trust-boundaries.md](../../docs/trust-boundaries.md) states which port
+may be reached from where, the file permissions each configuration needs, and
+how to rotate the credential without an outage.
+
 ---
 
 ## 📊 Monitoring and Operations
@@ -961,6 +970,9 @@ sudo journalctl -u deis-control -n 50
 ## 📚 Related Documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - Architecture document
+- [docs/trust-boundaries.md](../../docs/trust-boundaries.md) - what the node
+  credential opens, which ports must be firewalled, the file permissions
+  every configuration needs, and the rotation procedure
 - [TLS_SETUP.md](TLS_SETUP.md) - TLS configuration guide
 - [API_DOCUMENTATION.md](API_DOCUMENTATION.md) - API documentation
 - [DEVELOPMENT.md](DEVELOPMENT.md) - Development guide

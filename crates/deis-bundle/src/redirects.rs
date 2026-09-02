@@ -152,18 +152,37 @@ impl RedirectTable {
     /// from outside the process, and a rule that only the build had checked
     /// would be a rule a crafted bundle could smuggle past.
     ///
-    /// A rule whose status this build does not know is **dropped** rather than
-    /// refused, and it is the one thing this differs from
-    /// [`parse_redirects`] on. [`ALLOWED_STATUSES`] is an allow-list that
-    /// grows, so refusing here cost the whole bundle on any node one release
-    /// behind the builder - see [`crate::forward`]. Dropping the rule is the
-    /// narrow reading: the asset index is consulted before this table, so a
-    /// dropped rule cannot uncover a file it was hiding, and what answers
-    /// instead is another of the author's own rules, the application, or the
-    /// not-found behaviour. Substituting a status this build does know would
-    /// be worse than any of those - a 301 answered as a 302, or the reverse,
-    /// is a wrong entry in a visitor's browser cache that outlives the
-    /// rollback that produced it.
+    /// A rule this build cannot read is **dropped** rather than refused, and
+    /// that is the one thing this differs from [`parse_redirects`] on. Two
+    /// parts of a rule are allow-lists that grow with the platform - the
+    /// status ([`ALLOWED_STATUSES`]) and the grammar of the source pattern
+    /// ([`CompiledPattern::compile`]) - so refusing either cost the whole
+    /// bundle on any node one release behind the builder; see
+    /// [`crate::forward`]. Dropping the rule is the narrow reading: the asset
+    /// index is consulted before this table, so a dropped rule cannot uncover
+    /// a file it was hiding, and what answers instead is another of the
+    /// author's own rules, the application, or the not-found behaviour.
+    /// Substituting a status this build does know, or matching the pattern as
+    /// literal text, would be worse than any of those - a 301 answered as a
+    /// 302 is a wrong entry in a visitor's browser cache that outlives the
+    /// rollback that produced it, and a `/*.js` matched literally is a rule
+    /// that fires on a path nobody asked for.
+    ///
+    /// What a dropped rule can uncover is a *function route* or the not-found
+    /// behaviour that a `404` rule was standing in front of. That is accepted
+    /// for the same reason the status was: `_redirects` is not an access
+    /// control - it cannot hide an asset, which is what a static site has to
+    /// protect - and the alternative is the whole application refusing to
+    /// load on the older half of a fleet. Nothing else this table does is
+    /// security-relevant: a pattern matches a path only, so a rule cannot
+    /// enforce a scheme or a host.
+    ///
+    /// Everything else wrong with a rule is still refused here, whole: a
+    /// relative source, a target that names another origin for a rewrite, a
+    /// host a visitor could choose. Those are shapes no release of the format
+    /// has had or ever will have, and a bundle carrying one was not written by
+    /// a builder - it is exactly what a manifest arriving from outside the
+    /// process has to be checked for.
     pub fn compile(rules: &[RedirectRule]) -> Result<Self, RuleError> {
         if rules.len() > MAX_RULES {
             return Err(RuleError::at(
@@ -180,10 +199,14 @@ impl RedirectTable {
 
         let mut compiled = Vec::with_capacity(rules.len());
         for rule in rules {
-            if !status_is_known(rule.status) {
-                continue;
+            match compile_rule(rule, 0) {
+                Ok(rule) => compiled.push(rule),
+                // Named at `warn` by `crate::forward::report`, once per bundle
+                // read, beside every other value this build narrowed; a line
+                // here as well would be a second one per version load.
+                Err(Unusable::Unknown(_)) => continue,
+                Err(Unusable::Malformed(error)) => return Err(error),
             }
-            compiled.push(compile_rule(rule, 0)?);
         }
         Ok(Self { rules: compiled })
     }
@@ -337,7 +360,10 @@ pub fn parse_redirects(text: &str) -> Result<ParsedRedirects, RuleError> {
             to: to.to_string(),
             status,
         };
-        compile_rule(&rule, line)?;
+        // Both kinds of refusal, by line: this is the author's own file, and a
+        // status or a pattern this build does not have is a typo here, not a
+        // value from a newer release.
+        compile_rule(&rule, line).map_err(Unusable::into_error)?;
         rules.push(rule);
         lines.push(line);
     }
@@ -354,40 +380,82 @@ pub fn parse_redirects(text: &str) -> Result<ParsedRedirects, RuleError> {
     Ok(ParsedRedirects { rules, lines })
 }
 
+/// Why one rule could not be compiled, split by what the reader should do
+/// about it.
+///
+/// The build refuses both, by line, because it is looking at the author's own
+/// file. A node, and the control plane's check of an uploaded manifest, drop
+/// an [`Self::Unknown`] rule and refuse the bundle for a [`Self::Malformed`]
+/// one - see [`RedirectTable::compile`] for why the two are not the same.
+enum Unusable {
+    /// A value from an allow-list this build does not have: a status not in
+    /// [`ALLOWED_STATUSES`], or a source pattern [`CompiledPattern::compile`]
+    /// does not read. An older build cannot tell these from a typo, and a
+    /// newer builder writes them.
+    Unknown(RuleError),
+    /// A shape no release of the format has had, or one every release refuses
+    /// for a visitor's sake. A newer builder never writes one.
+    Malformed(RuleError),
+}
+
+impl Unusable {
+    fn into_error(self) -> RuleError {
+        match self {
+            Self::Unknown(error) | Self::Malformed(error) => error,
+        }
+    }
+}
+
+/// Whether this build can read a rule's source pattern.
+///
+/// The pattern grammar is [`crate::routing`]'s and it grows - a wildcard inside
+/// a segment, an optional segment, a regular expression - so this is the second
+/// allow-list a redirect rule carries, beside [`status_is_known`], and its two
+/// readers want the same opposite things: [`parse_redirects`] refuses what is
+/// not here with the line number, [`RedirectTable::compile`] drops the rule.
+/// [`crate::forward::unreadable_values`] asks the same question of the raw
+/// text so the dropped rule is named at `warn`.
+pub fn source_is_readable(from: &str) -> bool {
+    CompiledPattern::compile(from).is_ok()
+}
+
 /// Everything a single rule has to satisfy, in one place so the parser and the
 /// node check exactly the same things.
-fn compile_rule(rule: &RedirectRule, line: usize) -> Result<Compiled, RuleError> {
+fn compile_rule(rule: &RedirectRule, line: usize) -> Result<Compiled, Unusable> {
     let text = format!("{} {} {}", rule.from, rule.to, rule.status);
     let fail = |reason: String| RuleError::at(REDIRECTS_FILE, line, text.clone(), reason);
+    let malformed = |reason: String| Unusable::Malformed(fail(reason));
 
     if !status_is_known(rule.status) {
-        return Err(fail(format!(
+        return Err(Unusable::Unknown(fail(format!(
             "status {} is not one of {ALLOWED_STATUSES:?}; 200 rewrites, 404 serves the target \
              as a not-found page, and the rest are redirects",
             rule.status
-        )));
+        ))));
     }
 
     if !rule.from.starts_with('/') {
-        return Err(fail(format!(
+        return Err(malformed(format!(
             "the source {:?} has to be an absolute path starting with \"/\"; this table matches \
              paths on the domains the app already answers, not other hosts",
             rule.from
         )));
     }
     if rule.from.contains('?') || rule.from.contains('#') {
-        return Err(fail(format!(
+        return Err(malformed(format!(
             "the source {:?} carries a query string or a fragment; rules match the path only, so \
              write the path and let the query through",
             rule.from
         )));
     }
 
-    let pattern = CompiledPattern::compile(&rule.from).map_err(&fail)?;
+    let pattern = CompiledPattern::compile(&rule.from)
+        .map_err(&fail)
+        .map_err(Unusable::Unknown)?;
 
     let absolute = is_absolute(&rule.to);
     if absolute && rule.status == 200 {
-        return Err(fail(format!(
+        return Err(malformed(format!(
             "a 200 rule rewrites to a file in this bundle, and {:?} names another origin; the \
              node would have to fetch it, which the asset path does not do - write a function and \
              call fetch() if that is what you want",
@@ -395,7 +463,7 @@ fn compile_rule(rule: &RedirectRule, line: usize) -> Result<Compiled, RuleError>
         )));
     }
     if absolute && rule.status == 404 {
-        return Err(fail(format!(
+        return Err(malformed(format!(
             "a 404 rule serves a page from this bundle, and {:?} names another origin",
             rule.to
         )));
@@ -403,26 +471,26 @@ fn compile_rule(rule: &RedirectRule, line: usize) -> Result<Compiled, RuleError>
 
     let target = if absolute {
         let (origin, rest) = split_origin(&rule.to);
-        check_origin(origin).map_err(&fail)?;
+        check_origin(origin).map_err(&malformed)?;
         let mut parts = vec![TargetPart::Literal(origin.to_string())];
         // A bare origin is a legal target; only the part after it can carry
         // captures, which is what keeps `:8080` from reading as one.
         if !rest.is_empty() {
-            parts.extend(parse_target(rest).map_err(&fail)?);
+            parts.extend(parse_target(rest).map_err(&malformed)?);
         }
         parts
     } else {
         // `/\host` is read as protocol-relative by several browsers, so it is
         // the same off-site redirect as `//host` wearing a disguise.
         if rule.to.starts_with("/\\") {
-            return Err(fail(format!(
+            return Err(malformed(format!(
                 "the target {:?} starts with a backslash after its slash, which several browsers \
                  read as another host rather than a path on this one",
                 rule.to
             )));
         }
         if rule.to.starts_with("//") {
-            return Err(fail(format!(
+            return Err(malformed(format!(
                 "the target {:?} starts with \"//\", which a browser reads as another host rather \
                  than a path on this one; write \"https://host/...\" if that is what you meant, or \
                  a single leading slash if it is not",
@@ -430,13 +498,13 @@ fn compile_rule(rule: &RedirectRule, line: usize) -> Result<Compiled, RuleError>
             )));
         }
         if !rule.to.starts_with('/') {
-            return Err(fail(format!(
+            return Err(malformed(format!(
                 "the target {:?} has to be an absolute path starting with \"/\", or a full \
                  http(s) URL",
                 rule.to
             )));
         }
-        parse_target(&rule.to).map_err(&fail)?
+        parse_target(&rule.to).map_err(&malformed)?
     };
 
     // A target naming a capture the source never takes would expand to the
@@ -446,7 +514,7 @@ fn compile_rule(rule: &RedirectRule, line: usize) -> Result<Compiled, RuleError>
         if let TargetPart::Capture(name) = part {
             if name == SPLAT_NAME {
                 if !pattern.has_catch_all() {
-                    return Err(fail(format!(
+                    return Err(malformed(format!(
                         ":{SPLAT_NAME} stands for what a trailing \"*\" matched, and the source \
                          {:?} has no \"*\"",
                         rule.from
@@ -455,7 +523,7 @@ fn compile_rule(rule: &RedirectRule, line: usize) -> Result<Compiled, RuleError>
                 continue;
             }
             if !source_names(&rule.from).any(|declared| declared == name) {
-                return Err(fail(format!(
+                return Err(malformed(format!(
                     "the target names :{name}, which the source {:?} does not capture",
                     rule.from
                 )));

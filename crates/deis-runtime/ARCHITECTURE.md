@@ -189,6 +189,8 @@ batch_size = 100
 [control]                   # how this node reaches deis-control
 # endpoint = "http://127.0.0.1:8080"
 # secret = "one of the control plane's node_preshared_keys"
+#   (a fleet-wide credential: it reads every tenant's secrets and drives every
+#   node - see docs/trust-boundaries.md before you write it anywhere)
 reconcile_interval_secs = 60
 
 [bundles]                   # downloaded application bundles

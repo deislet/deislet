@@ -27,12 +27,24 @@ fn init_logging() {
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
+    // Both branches write through `deis_wire::LineSafe`, which escapes every
+    // control character so nothing a tenant put in a log message can end the
+    // line early. On the JSON branch the real protection is `serde_json` -
+    // string escaping turns a newline into the two characters `\` and `n`
+    // before the writer ever sees it - and the wrapper finds nothing to do;
+    // it is installed anyway so the two branches cannot drift apart.
+    // ANSI is off because the wrapper escapes ESC along with the rest.
     match log_format.as_str() {
         "json" => {
             // JSON format log, suitable for log collection systems
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().json())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_ansi(false)
+                        .with_writer(deis_wire::LineSafe::new(std::io::stdout)),
+                )
                 .init();
         }
         _ => {
@@ -43,7 +55,9 @@ fn init_logging() {
                     tracing_subscriber::fmt::layer()
                         .with_target(true)
                         .with_thread_ids(false)
-                        .with_line_number(false),
+                        .with_line_number(false)
+                        .with_ansi(false)
+                        .with_writer(deis_wire::LineSafe::new(std::io::stdout)),
                 )
                 .init();
         }

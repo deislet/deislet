@@ -4350,6 +4350,30 @@ globalThis.__deis_runtime_stream_release_all = function() {
   return released;
 };
 
+// Captured for the reason the captures at the top of this file are: an
+// application may replace `Math.random`, and the id below is the node's word
+// about one of its own failures rather than something the application gets to
+// choose. Captured at load, which is before any application code has run.
+const MathRandom = Math.random;
+
+// A handle for one failed invocation: what the client is given in place of the
+// error, and what the node's log line about that same error carries beside the
+// stack. See the catch in `__deis_runtime_invoke` for why the client gets this
+// and not the error.
+//
+// Sixteen hex characters. It authorises nothing and guards nothing -- it is a
+// handle, not a token -- so `Math.random` is enough: what it has to be is
+// unique enough that a `deis logs -a <app>` search lands on one line. The loop
+// is bounded rather than "until long enough" because `Math.random()` may
+// return 0, whose hex form contributes no digits at all.
+function newIncidentId() {
+  let id = "";
+  for (let i = 0; i < 8 && id.length < 16; i++) {
+    id += MathRandom().toString(16).slice(2);
+  }
+  return (id + "0000000000000000").slice(0, 16);
+}
+
 globalThis.__deis_runtime_invoke = async function(requestPayload) {
   // The reference to a stream the previous invocation stashed and never began
   // is dropped here. It could not become this request's body -- the slot
@@ -4439,9 +4463,44 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
 
     return respond(resp.status, headers, body);
   } catch (e) {
+    // What the client is told, and what it is deliberately not told.
+    //
+    // The stack goes to the node's log and nowhere else. It names the tenant's
+    // bundle layout ("deis:///apps/<app>.<env>/worker/index.js:22:24"), this
+    // runtime's own line numbers, the vendored deno version's internals, and
+    // whatever the exception message happens to carry -- which, for a throw
+    // from inside a credential check, is the credential. Anyone who can reach
+    // this node can make a handler throw: `curl -X POST` at a handler that
+    // parses JSON is enough, and until this wave `curl -X TRACE` needed no
+    // handler at all, because deno_fetch's forbidden-method list threw while
+    // the request was being built. The body below is also what a *service
+    // call* sees -- app A calling app B through a binding gets B's status and
+    // body verbatim -- and A is another tenant.
+    //
+    // The application's author should see the stack, and does: through
+    // `deis logs -a <app>`, which is a channel the platform authenticates.
+    // The HTTP body is not that channel, because it has no reader the platform
+    // can identify.
+    //
+    // `incident` is what joins the two. `platformConsole.error` goes through
+    // `op_log`, which stamps the line with this application's id and this
+    // invocation's trace id, so the line below is already attributable and
+    // already reaches `deis logs`; the id in the body is what lets an operator
+    // find that one line without knowing the second the request arrived, and
+    // the same line carries the trace id for `deis trace --trace-id`.
+    //
+    // It is a fresh id rather than the trace id itself only because the trace
+    // id lives in the node's `OpState` and no op hands it to this isolate --
+    // see `runtime/ops.rs::current_trace_id`, which every log line goes
+    // through and nothing here can call. When an op exposes it, this should
+    // carry the trace id and drop the second identifier.
     const errorText = e && e.stack ? e.stack : String(e);
-    platformConsole.error("Runtime invoke error:", errorText);
-    return respond(500, {}, `Runtime Error: ${errorText}`);
+    const incident = newIncidentId();
+    platformConsole.error(
+      "Runtime invoke error [incident " + incident + "]:",
+      errorText
+    );
+    return respond(500, {}, "Internal Server Error (incident " + incident + ")");
   }
 };
 
@@ -4493,13 +4552,38 @@ globalThis.__deis_runtime_invoke = async function(requestPayload) {
       // Never let logging break the request that produced it; the native
       // console call below still puts the line in this node's own output.
     }
+    return line;
   };
+
+  // The same rule `escape_control` applies on the Rust side (Unicode `Cc`:
+  // C0, DEL and the C1 block, spelled the way `char::escape_debug` spells
+  // them), for the one copy of an application's text that never passes
+  // through Rust: the native console below writes straight to this process's
+  // stdout, past `op_log`, past `tracing`, past the writer that keeps every
+  // other line whole. The node's log file is that stdout, and fifteen demo
+  // checks and every operator read it by line, so a newline here forged a
+  // whole line there while the `tracing` copy of the same call was already
+  // escaped. Both copies now obey one rule.
+  const escapeControl = (text) =>
+    text.replace(/[\u0000-\u001f\u007f-\u009f]/g, (c) => {
+      switch (c) {
+        case "\n": return "\\n";
+        case "\r": return "\\r";
+        case "\t": return "\\t";
+        case "\0": return "\\0";
+        default: return "\\u{" + c.charCodeAt(0).toString(16) + "}";
+      }
+    });
 
   const bridged = (level, method) =>
     function (...args) {
-      forward(level, args);
+      const line = forward(level, args);
       if (native && typeof native[method] === "function") {
-        native[method].apply(native, args);
+        // One already-rendered string, not the original arguments: the
+        // native console would render an Error's stack and an object's
+        // fields itself, and those are exactly the values that carry a
+        // tenant's newlines.
+        native[method].call(native, escapeControl(line));
       }
     };
 
