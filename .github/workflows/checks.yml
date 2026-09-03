@@ -50,8 +50,8 @@ jobs:
     name: product decisions, standard lock and roadmap agree
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install governance schema validator
@@ -65,7 +65,7 @@ jobs:
     name: documents reference the path constants
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Fails when a document spells out an HTTP path that
       # `deis_wire::conventions` already defines a constant for, and when one
@@ -78,7 +78,7 @@ jobs:
     name: the demo's own witnesses hold
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Unit tests for the parts of `demo.sh verify` that decide whether a
       # check passed: the readers of the node's log, the guards that keep one
@@ -95,7 +95,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The version rust-toolchain.toml pins, spelled here as well because
       # the action installs what it is told and this file must not silently
@@ -104,7 +104,7 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
@@ -125,7 +125,7 @@ jobs:
       # this workspace it is larger than the cache's per-entry ceiling, so a
       # cached `target` was a slow way of restoring nothing.
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -174,11 +174,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@1.96.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
@@ -193,7 +193,7 @@ jobs:
           df -h / | tail -1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -253,7 +253,7 @@ jobs:
       # the job's output alone: the reason is in these files.
       - name: Keep the run's logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: demo-logs
           path: .demo/logs

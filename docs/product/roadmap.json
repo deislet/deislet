@@ -124,12 +124,12 @@
           "id": "P0-CI-001",
           "title": "升级使用 Node 20 action runtime 的 GitHub Actions",
           "owner": "deislet",
-          "status": "queued",
+          "status": "active",
           "dependsOn": ["P0-ROAD-001"],
           "outputs": [
-            {"type": "planned-path", "value": "Node 24-native GitHub Action revisions"}
+            {"type": "local-path", "value": ".github/workflows/checks.yml"}
           ],
-          "verification": "GitHub Actions 不再产生 Node 20 action runtime deprecation annotation"
+          "verification": "actions/checkout@v5、setup-node@v5、setup-python@v6、cache@v5、upload-artifact@v6 的完整 checks run 成功且不再产生 Node 20 runtime annotation"
         }
       ]
     },

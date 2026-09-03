@@ -1191,6 +1191,7 @@ Application/framework source + versioned build plan
 - Edge Canon 顶层入口已指向单一标准 proposal，但 v0.1 的 `SPECIFICATION`、`PRINCIPLES`、`COMPATIBILITY`、Basic/Extended 文档和平台矩阵仍可能被误读为下一版本规则。已在各入口明确版本边界，历史正文保留，下一版本只由 proposal、机器契约和 registry 推进。
 - GitHub Actions 的 Rust 审计步骤声称使用 `.cargo/audit.toml`，该文件却只存在于本机并被 `.git/info/exclude` 排除，导致 CI 无法取得四条已有详细论证的例外。本阶段已把文件正式纳入 Git，并让产品治理校验核对四个精确 advisory ID；后续删除或静默增加例外都会使 CI 失败。
 - GitHub Actions 报告若干 action revision 仍以已弃用的 Node 20 action runtime 发布，目前 runner 强制用 Node 24 执行且不阻断任务。该维护项记录为路线 `P0-CI-001`，验收标准是 annotation 消失，不以设置允许旧 runtime 的环境变量掩盖。
+- GitHub 官方 release 说明确认 `actions/checkout@v5`、`setup-node@v5`、`setup-python@v6`、`cache@v5` 与 `upload-artifact@v6` 原生使用 Node 24，且要求 Actions Runner `2.327.1` 或更新版本。workflow 已迁移到这些主版本；本项目当前只用 GitHub-hosted `ubuntu-latest`，但若以后增加 self-hosted runner，版本下限必须进入 preflight。`P0-CI-001` 在新 revisions 的完整 run 成功且 annotation 消失前保持 `active`。
 
 ## 12. P0-SPEC-002 首个能力族推进记录
 
