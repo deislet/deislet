@@ -217,6 +217,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS apps (
             id           TEXT PRIMARY KEY,
             canonical_id TEXT,
+            revision     INTEGER NOT NULL DEFAULT 1,
             created_at   INTEGER NOT NULL
         )
         "#,
@@ -566,6 +567,13 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // A migration is planned from one immutable catalog snapshot. This adds
+    // the revision, durable plan and catalog-side fence that make such a
+    // snapshot real. It intentionally does not claim to fence deis-store or
+    // deis-queue yet: those services need the same token in their write path
+    // before a data cutover can start.
+    ensure_identity_migration_schema(conn)?;
+
     info!("Database tables created successfully");
     Ok(())
 }
@@ -648,6 +656,15 @@ fn ensure_canonical_ids(conn: &Connection) -> Result<()> {
                 SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
             END;
 
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_canonical_id_immutable_v1
+            BEFORE UPDATE OF canonical_id ON {table}
+            WHEN OLD.canonical_id IS NOT NULL
+             AND OLD.canonical_id != ''
+             AND NEW.canonical_id != OLD.canonical_id
+            BEGIN
+                SELECT RAISE(ABORT, 'canonical_id is immutable once allocated');
+            END;
+
             CREATE TRIGGER IF NOT EXISTS trg_{table}_canonical_id
             AFTER INSERT ON {table}
             WHEN NEW.canonical_id IS NULL OR NEW.canonical_id = ''
@@ -696,6 +713,247 @@ fn ensure_canonical_ids(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    Ok(())
+}
+
+/// Add the durable catalog half of canonical-identity migration.
+///
+/// `apps.revision` is bumped by every catalog mutation that can change the
+/// migration inventory. Once a plan acquires its catalog fence, database
+/// triggers refuse those mutations even from an older Control binary. This
+/// prevents a frozen inventory from changing behind the coordinator; it is
+/// not the later storage-writer fence described by the product contract.
+fn ensure_identity_migration_schema(conn: &Connection) -> Result<()> {
+    let has_revision = conn
+        .prepare("PRAGMA table_info(apps)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "revision");
+    if !has_revision {
+        conn.execute(
+            "ALTER TABLE apps ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS identity_migrations (
+            migration_id                 TEXT PRIMARY KEY,
+            operation_id                 TEXT NOT NULL UNIQUE,
+            app_id                       TEXT NOT NULL,
+            canonical_application_id     TEXT NOT NULL UNIQUE,
+            state                        TEXT NOT NULL
+                                                 CHECK(state IN
+                                                   ('planned', 'running', 'waiting', 'verified',
+                                                    'cutover', 'completed', 'failed')),
+            record_revision              INTEGER NOT NULL CHECK(record_revision >= 1),
+            expected_application_revision INTEGER NOT NULL
+                                                   CHECK(expected_application_revision >= 1),
+            fence_token                  TEXT NOT NULL CHECK(length(fence_token) >= 32),
+            catalog_inventory            TEXT NOT NULL CHECK(json_valid(catalog_inventory)),
+            error_code                   TEXT,
+            created_at                   INTEGER NOT NULL,
+            updated_at                   INTEGER NOT NULL,
+            CHECK(length(migration_id) = 36
+              AND lower(migration_id) = migration_id
+              AND substr(migration_id, 9, 1) = '-'
+              AND substr(migration_id, 14, 1) = '-'
+              AND substr(migration_id, 15, 1) = '7'
+              AND substr(migration_id, 19, 1) = '-'
+              AND substr(migration_id, 20, 1) GLOB '[89ab]'
+              AND substr(migration_id, 24, 1) = '-'
+              AND length(replace(migration_id, '-', '')) = 32
+              AND replace(migration_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(operation_id) = 36
+              AND lower(operation_id) = operation_id
+              AND substr(operation_id, 9, 1) = '-'
+              AND substr(operation_id, 14, 1) = '-'
+              AND substr(operation_id, 15, 1) = '7'
+              AND substr(operation_id, 19, 1) = '-'
+              AND substr(operation_id, 20, 1) GLOB '[89ab]'
+              AND substr(operation_id, 24, 1) = '-'
+              AND length(replace(operation_id, '-', '')) = 32
+              AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(canonical_application_id) = 36
+              AND lower(canonical_application_id) = canonical_application_id
+              AND substr(canonical_application_id, 9, 1) = '-'
+              AND substr(canonical_application_id, 14, 1) = '-'
+              AND substr(canonical_application_id, 15, 1) = '7'
+              AND substr(canonical_application_id, 19, 1) = '-'
+              AND substr(canonical_application_id, 20, 1) GLOB '[89ab]'
+              AND substr(canonical_application_id, 24, 1) = '-'
+              AND length(replace(canonical_application_id, '-', '')) = 32
+              AND replace(canonical_application_id, '-', '') NOT GLOB '*[^0-9a-f]*')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_identity_migrations_state
+            ON identity_migrations(state, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_identity_migrations_legacy_name
+            ON identity_migrations(app_id, created_at);
+
+        CREATE TRIGGER IF NOT EXISTS trg_identity_migrations_identity_immutable_v1
+        BEFORE UPDATE OF migration_id, operation_id, app_id,
+                         canonical_application_id, created_at
+        ON identity_migrations
+        WHEN NEW.migration_id != OLD.migration_id
+          OR NEW.operation_id != OLD.operation_id
+          OR NEW.app_id != OLD.app_id
+          OR NEW.canonical_application_id != OLD.canonical_application_id
+          OR NEW.created_at != OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'identity migration identity is immutable');
+        END;
+
+        CREATE TABLE IF NOT EXISTS canonical_binding_ids (
+            binding_id                  TEXT PRIMARY KEY,
+            app_id                      TEXT NOT NULL,
+            canonical_application_id    TEXT NOT NULL,
+            env_id                      TEXT NOT NULL,
+            canonical_environment_id    TEXT NOT NULL,
+            legacy_name                 TEXT NOT NULL,
+            kind                        TEXT NOT NULL,
+            created_at                  INTEGER NOT NULL,
+            UNIQUE(canonical_environment_id, legacy_name),
+            CHECK(length(binding_id) = 36
+              AND lower(binding_id) = binding_id
+              AND substr(binding_id, 9, 1) = '-'
+              AND substr(binding_id, 14, 1) = '-'
+              AND substr(binding_id, 15, 1) = '7'
+              AND substr(binding_id, 19, 1) = '-'
+              AND substr(binding_id, 20, 1) GLOB '[89ab]'
+              AND substr(binding_id, 24, 1) = '-'
+              AND length(replace(binding_id, '-', '')) = 32
+              AND replace(binding_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(canonical_application_id) = 36
+              AND lower(canonical_application_id) = canonical_application_id
+              AND substr(canonical_application_id, 9, 1) = '-'
+              AND substr(canonical_application_id, 14, 1) = '-'
+              AND substr(canonical_application_id, 15, 1) = '7'
+              AND substr(canonical_application_id, 19, 1) = '-'
+              AND substr(canonical_application_id, 20, 1) GLOB '[89ab]'
+              AND substr(canonical_application_id, 24, 1) = '-'
+              AND length(replace(canonical_application_id, '-', '')) = 32
+              AND replace(canonical_application_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
+            CHECK(length(canonical_environment_id) = 36
+              AND lower(canonical_environment_id) = canonical_environment_id
+              AND substr(canonical_environment_id, 9, 1) = '-'
+              AND substr(canonical_environment_id, 14, 1) = '-'
+              AND substr(canonical_environment_id, 15, 1) = '7'
+              AND substr(canonical_environment_id, 19, 1) = '-'
+              AND substr(canonical_environment_id, 20, 1) GLOB '[89ab]'
+              AND substr(canonical_environment_id, 24, 1) = '-'
+              AND length(replace(canonical_environment_id, '-', '')) = 32
+              AND replace(canonical_environment_id, '-', '') NOT GLOB '*[^0-9a-f]*')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_canonical_binding_ids_app
+            ON canonical_binding_ids(
+                canonical_application_id, canonical_environment_id, legacy_name
+            );
+
+        CREATE TRIGGER IF NOT EXISTS trg_canonical_binding_ids_immutable_update_v1
+        BEFORE UPDATE ON canonical_binding_ids
+        BEGIN
+            SELECT RAISE(ABORT, 'canonical binding identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_canonical_binding_ids_immutable_delete_v1
+        BEFORE DELETE ON canonical_binding_ids
+        BEGIN
+            SELECT RAISE(ABORT, 'canonical binding identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_identity_migration_apps_delete_fence_v1
+        BEFORE DELETE ON apps
+        WHEN EXISTS (
+            SELECT 1 FROM identity_migrations
+            WHERE canonical_application_id = OLD.canonical_id
+              AND state IN ('running', 'waiting', 'verified', 'cutover')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'identity migration catalog fence is active');
+        END;
+        "#,
+    )?;
+
+    // These five tables are the complete input to the catalog inventory:
+    // environments name tenants, versions declare bindings, deployments say
+    // which declaration is live, routes must move in the same cutover, and
+    // secret names are logical bindings even though their values stay sealed.
+    // Generate both a refusal trigger and monotonic revision triggers for
+    // each. Keeping this at the database boundary also covers an older writer
+    // sharing the SQLite file during an upgrade.
+    for (table, app_on_new, app_on_old) in [
+        ("versions", "NEW.app_id", "OLD.app_id"),
+        ("environments", "NEW.app_id", "OLD.app_id"),
+        ("deployments", "NEW.app_id", "OLD.app_id"),
+        ("routes", "NEW.app_id", "OLD.app_id"),
+        ("secrets", "NEW.app_id", "OLD.app_id"),
+    ] {
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_identity_migration_fence_insert_v1
+            BEFORE INSERT ON {table}
+            WHEN EXISTS (
+                SELECT 1 FROM identity_migrations AS migration
+                JOIN apps AS app ON app.id = {app_on_new}
+                WHERE migration.canonical_application_id = app.canonical_id
+                  AND state IN ('running', 'waiting', 'verified', 'cutover')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_identity_migration_fence_delete_v1
+            BEFORE DELETE ON {table}
+            WHEN EXISTS (
+                SELECT 1 FROM identity_migrations AS migration
+                JOIN apps AS app ON app.id = {app_on_old}
+                WHERE migration.canonical_application_id = app.canonical_id
+                  AND state IN ('running', 'waiting', 'verified', 'cutover')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_identity_migration_fence_update_v1
+            BEFORE UPDATE ON {table}
+            WHEN EXISTS (
+                SELECT 1 FROM identity_migrations AS migration
+                JOIN apps AS app ON app.id IN ({app_on_old}, {app_on_new})
+                WHERE migration.canonical_application_id = app.canonical_id
+                  AND state IN ('running', 'waiting', 'verified', 'cutover')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_app_revision_insert_v1
+            AFTER INSERT ON {table}
+            BEGIN
+                UPDATE apps SET revision = revision + 1 WHERE id = {app_on_new};
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_app_revision_delete_v1
+            AFTER DELETE ON {table}
+            BEGIN
+                UPDATE apps SET revision = revision + 1 WHERE id = {app_on_old};
+            END;
+
+
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_app_revision_update_v1
+            AFTER UPDATE ON {table}
+            BEGIN
+                UPDATE apps SET revision = revision + 1 WHERE id = {app_on_old};
+                UPDATE apps SET revision = revision + 1
+                    WHERE id = {app_on_new} AND {app_on_new} != {app_on_old};
+            END;
+            "#
+        ))?;
+    }
+
     Ok(())
 }
 
@@ -1409,6 +1667,8 @@ mod tests {
             "api_tokens",
             "audit_log",
             "domain_grants",
+            "identity_migrations",
+            "canonical_binding_ids",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
@@ -1559,6 +1819,26 @@ mod tests {
 
         create_tables(&conn).unwrap();
         assert_eq!(read_ids(&conn), first, "restart rewrote durable identities");
+        for table in ["apps", "versions", "environments", "deployments"] {
+            let valid_replacement = CanonicalId::new_v7().to_string();
+            let reassignment = conn.execute(
+                &format!("UPDATE {table} SET canonical_id = ?1"),
+                [&valid_replacement],
+            );
+            assert!(
+                reassignment.is_err(),
+                "database allowed a {table} canonical identity to be rebound"
+            );
+        }
+        let revision: i64 = conn
+            .query_row("SELECT revision FROM apps WHERE id = 'legacy'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            revision, 1,
+            "legacy application revision was not backfilled"
+        );
 
         // This is the INSERT shape used by a binary from before the column
         // existed. It must keep working during a rolling upgrade.
@@ -1605,6 +1885,24 @@ mod tests {
             invalid_update.is_err(),
             "database allowed a canonical identity to be erased"
         );
+
+        let valid_replacement = CanonicalId::new_v7().to_string();
+        assert!(
+            conn.execute(
+                "UPDATE apps SET canonical_id = ?1 WHERE id = 'written-by-old-control'",
+                [&valid_replacement],
+            )
+            .is_err(),
+            "database allowed one valid canonical identity to be rebound to another"
+        );
+        let still_triggered: String = conn
+            .query_row(
+                "SELECT canonical_id FROM apps WHERE id = 'written-by-old-control'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_triggered, triggered);
     }
 
     /// Versions carry a per-app monotonic number; the schema itself must

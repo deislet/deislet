@@ -30,6 +30,7 @@
 pub mod bundle;
 pub mod compatibility;
 pub mod domains;
+pub mod identity_migration;
 pub mod limits;
 pub mod model;
 pub mod secrets;
@@ -41,6 +42,12 @@ pub use compatibility::{
 };
 pub use deis_bundle::Manifest as BundleManifest;
 pub use domains::{ClaimRefusal, DomainGrant, GrantPattern, HostClaim};
+pub use identity_migration::{
+    CatalogBindingInventory, CatalogDeploymentInventory, CatalogEnvironmentInventory,
+    CatalogIdentityInventory, CatalogInventoryDigest, CatalogRouteInventory,
+    CatalogSecretInventory, CatalogVersionInventory, ComponentInventoryEvidence,
+    IdentityMigrationPlan, IdentityMigrationState, InventoryEvidenceState,
+};
 pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{
     App, Assignment, DeletedApp, DeployedVersion, Deployment, Environment, RetiredAppName, Route,

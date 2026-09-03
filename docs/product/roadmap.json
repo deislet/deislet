@@ -4,7 +4,7 @@
   "roadmapId": "deislet-productization-2026-09",
   "goal": "全面修复审查发现的问题，把 Deislet 推进为遵循单一 Edge Canon 标准、可部署到多个后端的产品级 mini Workers/Pages 系统",
   "status": "active",
-  "updatedAt": "2026-09-04T00:24:27+08:00",
+  "updatedAt": "2026-09-04T01:30:22+08:00",
   "authorities": {
     "decisionIndex": "docs/adr/README.md",
     "phaseAnalysis": "docs/product/phase-analysis-2026-09-03.zh.md",
@@ -118,11 +118,12 @@
             {"type": "local-path", "value": "crates/deis-wire/src/canonical_id.rs"},
             {"type": "local-path", "value": "crates/deis-wire/src/canonical_tenant.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/catalog/model.rs"},
+            {"type": "local-path", "value": "crates/deis-control/src/catalog/identity_migration.rs"},
             {"type": "local-path", "value": "crates/deis-control/src/database/schema.rs"},
             {"type": "local-path", "value": "crates/deis-runtime/proto/management.proto"},
             {"type": "local-path", "value": "crates/deis-runtime/src/deployment/store.rs"}
           ],
-          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-wire -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment 传输、字段成对 fail closed、节点持久化、identity 不可重绑/擦除及 runtime placement/storage authority 分离；完成前仍须验证持久 migration operation、inventory、canonical tenant/binding 双读、受 fencing 的 copy/cutover、rollback/failure 与旧 capability 撤销"
+          "verification": "python3 scripts/check-shared-contracts.py；cargo test -p deis-wire -p deis-control -p deis-runtime -p deis 已覆盖共享 UUIDv7/CanonicalTenantId、Control push/assignment、节点持久化、四类 canonical ID 的有效值改绑/擦除拒绝、runtime placement/storage authority 分离，以及持久 catalog migration plan、规范且幂等的 inventory refresh、canonical app/environment 所有权下的 binding ID、revision/token fence、旧 writer 拒绝、错误 manifest/cross-app 引用/历史歧义 fail closed 与失败事务无部分 mapping；完成前仍须验证完整公共 Operation、外部 inventory、storage-writer fence、canonical tenant/binding 双读、copy/cutover、rollback/failure 与旧 capability 撤销"
         },
         {
           "id": "P0-CI-001",

@@ -32,7 +32,7 @@ use super::model::{
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
-const APP_COLUMNS: &str = "id, canonical_id, created_at";
+const APP_COLUMNS: &str = "id, canonical_id, revision, created_at";
 const VERSION_COLUMNS: &str =
     "id, canonical_id, app_id, number, bundle_sha, bundle_path, manifest, created_at";
 const ENVIRONMENT_COLUMNS: &str = "id, canonical_id, app_id, name, created_at";
@@ -184,6 +184,7 @@ impl CatalogStore {
                 Ok(App {
                     id,
                     canonical_id,
+                    revision: 1,
                     created_at,
                 })
             })
@@ -1504,7 +1505,8 @@ fn map_app(row: &Row<'_>) -> rusqlite::Result<App> {
     Ok(App {
         id: row.get(0)?,
         canonical_id: map_canonical_id(row, 1)?,
-        created_at: row.get(2)?,
+        revision: row.get(2)?,
+        created_at: row.get(3)?,
     })
 }
 
@@ -1883,7 +1885,10 @@ mod tests {
                 // altered outside this process. Current direct writes are
                 // rejected by the schema test; the reader must still refuse
                 // pre-existing corruption instead of trusting the label.
-                conn.execute_batch("DROP TRIGGER trg_apps_canonical_id_validate_update_v1;")?;
+                conn.execute_batch(
+                    "DROP TRIGGER trg_apps_canonical_id_validate_update_v1;
+                     DROP TRIGGER trg_apps_canonical_id_immutable_v1;",
+                )?;
                 conn.execute(
                     "UPDATE apps SET canonical_id = '550e8400-e29b-41d4-a716-446655440000' \
                      WHERE id = 'demo'",

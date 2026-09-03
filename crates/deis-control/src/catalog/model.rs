@@ -30,6 +30,9 @@ pub const MAX_PATH_PREFIX_LEN: usize = 512;
 pub struct App {
     pub id: String,
     pub canonical_id: CanonicalId,
+    /// Monotonic catalog revision used to fence identity migration. It moves
+    /// whenever an environment, version, deployment, route or secret changes.
+    pub revision: i64,
     pub created_at: i64,
 }
 
